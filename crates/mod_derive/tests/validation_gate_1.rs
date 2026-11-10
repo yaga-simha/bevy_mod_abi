@@ -13,8 +13,10 @@ pub struct Vec3 {
 }
 
 /// Standard `#[repr(Rust)]` struct with mixed field types:
-/// primitives of varying alignments, nested compound struct, `String`, and `Vec<u32>`.
+/// primitives of varying alignments, nested compound struct, `String`, `Vec<u32>`,
+/// and a host-private `Option<String>` field skipped via `#[mod_field(skip)]`.
 #[derive(Debug, Clone, PartialEq, ModExposable)]
+#[mod_component(export_symbols)]
 pub struct MixedComponent {
     pub active: bool,
     pub health: i32,
@@ -22,11 +24,35 @@ pub struct MixedComponent {
     pub tag: String,
     pub ticks: u64,
     pub scores: Vec<u32>,
+    #[mod_field(skip)]
+    pub host_private_cache: Option<String>,
 }
 
 /// Tuple struct with heap-allocated `String` field (as used in `NameTag(String)`).
 #[derive(Debug, Clone, PartialEq, ModExposable)]
 pub struct NameTag(pub String);
+
+mod physics {
+    use mod_derive::ModExposable;
+
+    #[derive(Debug, Clone, PartialEq, ModExposable)]
+    #[mod_component(name = "physics::Position")]
+    pub struct Position {
+        pub x: f32,
+        pub y: f32,
+    }
+}
+
+mod ui {
+    use mod_derive::ModExposable;
+
+    #[derive(Debug, Clone, PartialEq, ModExposable)]
+    #[mod_component(name = "ui::Position")]
+    pub struct Position {
+        pub left: f32,
+        pub top: f32,
+    }
+}
 
 #[test]
 fn validation_gate_1_vtable_layout_and_field_mutations() {
@@ -58,6 +84,7 @@ fn validation_gate_1_vtable_layout_and_field_mutations() {
         tag: String::from("initial_player"),
         ticks: 999,
         scores: vec![10, 20, 30],
+        host_private_cache: Some(String::from("kept_on_host")),
     };
 
     let comp_ptr = &mut comp as *mut MixedComponent as *mut c_void;
@@ -134,7 +161,7 @@ fn validation_gate_1_vtable_layout_and_field_mutations() {
     }
 
     // 6. Verify defensive null-pointer handling (zero UB on null inputs)
-    // SAFETY: Testing defensive null checks on all generated extern "C-unwind" functions.
+    // SAFETY: Testing defensive null checks on all generated extern "C" functions.
     unsafe {
         assert!(!(vt.get_active)(core::ptr::null()));
         assert_eq!((vt.get_health)(core::ptr::null()), 0);
@@ -145,6 +172,81 @@ fn validation_gate_1_vtable_layout_and_field_mutations() {
         (vt.set_tag)(core::ptr::null_mut(), b"abc".as_ptr(), 3);
         (vt.set_tag)(comp_ptr, core::ptr::null(), 5);
     }
+
+    assert_eq!(
+        comp.host_private_cache.as_deref(),
+        Some("kept_on_host"),
+        "skipped field must remain untouched"
+    );
+}
+
+#[test]
+fn validation_gate_1_self_aliasing_string_and_vec_setters() {
+    let vt = MixedComponent::vtable();
+    let mut comp = MixedComponent {
+        active: true,
+        health: 10,
+        position: Vec3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        },
+        tag: String::from("hello_world_self_aliasing"),
+        ticks: 1,
+        scores: vec![10, 20, 30, 40, 50],
+        host_private_cache: None,
+    };
+    let ptr = &mut comp as *mut MixedComponent as *mut c_void;
+
+    // SAFETY: Passing the slice returned by `get_tag(ptr)` and a sub-slice of it directly
+    // back into `set_tag(ptr, ...)` tests the B1 self-aliasing overlap guard.
+    unsafe {
+        let full_slice = (vt.get_tag)(ptr as *const c_void);
+        (vt.set_tag)(ptr, full_slice.ptr, full_slice.len);
+        assert_eq!(comp.tag, "hello_world_self_aliasing");
+
+        let sub_slice = (vt.get_tag)(ptr as *const c_void);
+        // Pass interior sub-slice "world" (offset 6, len 5) from the String's own buffer
+        (vt.set_tag)(ptr, sub_slice.ptr.add(6), 5);
+        assert_eq!(comp.tag, "world");
+
+        // Same self-aliasing test for Vec<u32>
+        let vec_slice = (vt.get_scores)(ptr as *const c_void);
+        (vt.set_scores)(ptr, vec_slice.ptr, vec_slice.len);
+        assert_eq!(comp.scores, vec![10, 20, 30, 40, 50]);
+
+        let vec_sub = (vt.get_scores)(ptr as *const c_void);
+        (vt.set_scores)(ptr, vec_sub.ptr.add(1), 3);
+        assert_eq!(comp.scores, vec![20, 30, 40]);
+    }
+}
+
+#[test]
+fn validation_gate_1_disambiguated_modules_and_static_vtable_identity() {
+    // Verify unique static VTable address across all resolution paths (B2)
+    let vt_ref_ptr = MixedComponent::vtable() as *const MixedComponentVTable;
+    let vt_trait_ptr = <MixedComponent as ExposableComponent>::vtable_ptr();
+    let vt_sym_ptr = MixedComponent::resolve_symbol("MixedComponent_vtable")
+        .expect("MixedComponent_vtable symbol")
+        as *const MixedComponentVTable;
+    assert_eq!(vt_ref_ptr, vt_trait_ptr);
+    assert_eq!(vt_trait_ptr, vt_sym_ptr);
+
+    // Verify two structs named `Position` in different modules coexist with distinct names & UUIDs (M1)
+    assert_eq!(
+        <physics::Position as ExposableComponent>::COMPONENT_NAME,
+        "physics::Position"
+    );
+    assert_eq!(
+        <ui::Position as ExposableComponent>::COMPONENT_NAME,
+        "ui::Position"
+    );
+    assert_ne!(
+        <physics::Position as ExposableComponent>::UUID,
+        <ui::Position as ExposableComponent>::UUID
+    );
+    assert!(physics::Position::resolve_symbol("physics__Position_get_x").is_some());
+    assert!(ui::Position::resolve_symbol("ui__Position_get_left").is_some());
 }
 
 #[test]
@@ -152,7 +254,6 @@ fn validation_gate_1_byte_stride_array_iteration_and_symbol_resolution() {
     let vt = MixedComponent::vtable();
     let vec3_vt = Vec3::vtable();
 
-    // Resolve accessors dynamically via `ExposableComponent::resolve_symbol` (simulating `get_proc_address`)
     let resolved_vt_ptr =
         MixedComponent::resolve_symbol("MixedComponent_vtable").expect("vtable symbol")
             as *const MixedComponentVTable;
@@ -160,8 +261,8 @@ fn validation_gate_1_byte_stride_array_iteration_and_symbol_resolution() {
 
     let get_health_ptr = MixedComponent::resolve_symbol("MixedComponent_get_health")
         .expect("MixedComponent_get_health symbol");
-    // SAFETY: `MixedComponent_get_health` has signature `unsafe extern "C-unwind" fn(*const c_void) -> i32`.
-    let resolved_get_health: unsafe extern "C-unwind" fn(*const c_void) -> i32 =
+    // SAFETY: `MixedComponent_get_health` has signature `unsafe extern "C" fn(*const c_void) -> i32`.
+    let resolved_get_health: unsafe extern "C" fn(*const c_void) -> i32 =
         unsafe { core::mem::transmute(get_health_ptr) };
 
     let mut column: Vec<MixedComponent> = (0..64)
@@ -176,6 +277,7 @@ fn validation_gate_1_byte_stride_array_iteration_and_symbol_resolution() {
             tag: format!("entity_{i}"),
             ticks: i as u64,
             scores: vec![i as u32],
+            host_private_cache: None,
         })
         .collect();
 
