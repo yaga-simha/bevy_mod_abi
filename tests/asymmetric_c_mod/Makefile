@@ -11,11 +11,11 @@ else
     LDFLAGS = -shared -fPIC
 endif
 
-CFLAGS ?= -O3 -Wall -Wextra -std=c99
+CFLAGS ?= -O3 -Wall -Wextra -Werror -std=c99 -I../../include
 
 all: $(TARGET)
 
-$(TARGET): mod.c
+$(TARGET): mod.c ../../include/bevy_abi_mod.h
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 
 clean:
