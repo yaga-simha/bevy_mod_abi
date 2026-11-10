@@ -517,19 +517,25 @@ pub fn derive_mod_exposable(input: TokenStream) -> TokenStream {
             }
         }
 
+        // SAFETY: `#struct_ident` derives `ModExposable` and is accessed across the C-ABI strictly
+        // through its generated VTable accessors.
+        unsafe impl ::abi_contract::FfiLayout for #struct_ident {}
+
         impl ::abi_contract::ExposableComponent for #struct_ident {
             const COMPONENT_NAME: &'static str = #struct_name_str;
-            const COMPONENT_CSTR: &'static [u8] = #cstr_lit;
+            const COMPONENT_CSTR: &'static ::core::ffi::CStr =
+                match ::core::ffi::CStr::from_bytes_with_nul(#cstr_lit) {
+                    ::core::result::Result::Ok(s) => s,
+                    ::core::result::Result::Err(_) => panic!("invalid CStr literal"),
+                };
             const UUID: ::abi_contract::ComponentUuid =
                 ::abi_contract::ComponentUuid::from_name(#struct_name_str);
 
             type VTable = #vtable_ident;
 
-            const VTABLE: Self::VTable = #struct_ident::VTABLE;
-
             #[inline]
-            fn vtable_ptr() -> *const Self::VTable {
-                &#struct_ident::VTABLE as *const Self::VTable
+            fn vtable() -> &'static Self::VTable {
+                &#struct_ident::VTABLE
             }
 
             #[inline]
