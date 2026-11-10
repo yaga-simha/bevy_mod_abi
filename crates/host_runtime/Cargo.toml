@@ -1,0 +1,10 @@
+[package]
+name = "host_runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+abi_contract = { workspace = true }
+libloading = { workspace = true }

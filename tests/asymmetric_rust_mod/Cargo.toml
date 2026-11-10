@@ -1,0 +1,13 @@
+[package]
+name = "asymmetric_rust_mod"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+guest_sdk = { path = "../../crates/guest_sdk" }
+abi_contract = { path = "../../crates/abi_contract" }
