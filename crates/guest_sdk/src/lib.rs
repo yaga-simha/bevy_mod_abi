@@ -12,9 +12,10 @@ pub use abi_contract::{
     ComponentAccessDesc, ComponentAccessMode, ComponentUuid, DynamicSystemCallback,
     ExposableComponent, FfiEntity, FfiLayout, FfiResult, FfiSlice, GetProcAddressFn, HostApi,
     IterColumnMutableFn, IterColumnReadonlyFn, IterColumnStrideFn, IterEntitiesFn,
-    IterMarkChangedFn, IterNextChunkFn, ModAbiVersionFn, ModInitFn, ModShutdownFn, RawChunkIter,
-    RawCommandQueue, RegisterSystemFn, StrView, SymbolEntry, SystemDescriptor, ABI_VERSION_MAJOR,
-    ABI_VERSION_MINOR, ABI_VERSION_PACKED, ABI_VERSION_PATCH,
+    IterMarkChangedFn, IterNextChunkFn, IterResetFn, ModAbiVersionFn, ModInitFn, ModShutdownFn,
+    MultiQuerySystemCallback, MultiQuerySystemDescriptor, QuerySpec, RawChunkIter, RawCommandQueue,
+    RegisterMultiQuerySystemFn, RegisterSystemFn, StrView, SymbolEntry, SystemDescriptor,
+    ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PACKED, ABI_VERSION_PATCH,
 };
 
 /// Execute a closure inside `std::panic::catch_unwind` within the guest's own Rust runtime,
@@ -78,6 +79,25 @@ macro_rules! wrap_system_callback {
             $crate::catch_guest_panic(|| {
                 // SAFETY: Forwarding opaque handles received from the host executor.
                 unsafe { $inner_fn(iter, commands, user_data) }
+            })
+        }
+    };
+}
+
+/// Macro to wrap a guest Rust multi-query system function into a C-ABI `MultiQuerySystemCallback`
+/// (`unsafe extern "C" fn`) that catches guest panics and returns `FfiResult::PANIC_CAUGHT`.
+#[macro_export]
+macro_rules! wrap_multi_query_callback {
+    ($vis:vis fn $wrapper_name:ident calls $inner_fn:path) => {
+        $vis unsafe extern "C" fn $wrapper_name(
+            iters: *const *mut $crate::RawChunkIter,
+            iter_count: usize,
+            commands: *mut $crate::RawCommandQueue,
+            user_data: *mut ::core::ffi::c_void,
+        ) -> $crate::FfiResult {
+            $crate::catch_guest_panic(|| {
+                // SAFETY: Forwarding opaque handles received from the host executor.
+                unsafe { $inner_fn(iters, iter_count, commands, user_data) }
             })
         }
     };
@@ -364,13 +384,14 @@ impl<'a> ChunkSliceMut<'a> {
 /// Convenient prelude module for guest mod authors.
 pub mod prelude {
     pub use crate::{
-        catch_guest_panic, export_mod, wrap_system_callback, ChunkSlice, ChunkSliceMut,
-        CommandBridgeVTable, GuestChunkIter, GuestCommandQueue,
+        catch_guest_panic, export_mod, wrap_multi_query_callback, wrap_system_callback, ChunkSlice,
+        ChunkSliceMut, CommandBridgeVTable, GuestChunkIter, GuestCommandQueue,
     };
     pub use abi_contract::{
         ComponentAccessDesc, ComponentAccessMode, ComponentUuid, DynamicSystemCallback,
-        ExposableComponent, FfiEntity, FfiResult, FfiSlice, GetProcAddressFn, HostApi,
-        RawChunkIter, RawCommandQueue, RegisterSystemFn, StrView, SystemDescriptor,
+        ExposableComponent, FfiEntity, FfiResult, FfiSlice, GetProcAddressFn, HostApi, IterResetFn,
+        MultiQuerySystemCallback, MultiQuerySystemDescriptor, QuerySpec, RawChunkIter,
+        RawCommandQueue, RegisterMultiQuerySystemFn, RegisterSystemFn, StrView, SystemDescriptor,
         ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PACKED, ABI_VERSION_PATCH,
     };
 }

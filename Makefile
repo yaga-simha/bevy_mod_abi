@@ -47,12 +47,17 @@ test-e2e: ## Execute comprehensive 9-stage end-to-end verification pipeline
 	bash scripts/run_e2e_tests.sh
 
 .PHONY: bench
-bench: build-mods ## Run performance benchmarks and generate target/benchmark_results.json
-	@echo -e "$(GREEN)[BENCH]$(RESET) Running performance benchmark suite..."
-	cargo test --test benchmarks -- --nocapture
+bench: build-mods ## Run full cross-architecture & debug/release permutation benchmark matrix
+	@echo -e "$(GREEN)[BENCH]$(RESET) Running complete permutation benchmark suite (Debug + Release x Native + Rust dylib + C-ABI Rust/C99)..."
+	cargo run --release -p permutation_bench
 	@if [ -f "target/benchmark_results.json" ]; then \
 		echo -e "$(GREEN)[BENCH]$(RESET) Successfully generated target/benchmark_results.json"; \
 	fi
+
+.PHONY: bench-quick
+bench-quick: build-mods ## Run Milestone 4 host_runtime benchmark test (1k, 10k, 100k entities)
+	@echo -e "$(GREEN)[BENCH-QUICK]$(RESET) Running Milestone 4 host_runtime benchmark test..."
+	cargo test --release --test benchmarks -- --nocapture
 
 .PHONY: fmt
 fmt: ## Auto-format all Rust code across the workspace
@@ -76,7 +81,9 @@ clean: clean-mods ## Clean all cargo targets and build artifacts
 
 .PHONY: clean-mods
 clean-mods: ## Clean guest mod build artifacts
-	@echo -e "$(GREEN)[CLEAN-MODS]$(RESET) Cleaning C mod..."
+	@echo -e "$(GREEN)[CLEAN-MODS]$(RESET) Cleaning C mods..."
 	$(MAKE) -C tests/asymmetric_c_mod clean
-	@echo -e "$(GREEN)[CLEAN-MODS]$(RESET) Cleaning Rust mod..."
+	$(MAKE) -C benches/c_abi_c99_mod clean
+	@echo -e "$(GREEN)[CLEAN-MODS]$(RESET) Cleaning Rust mods..."
 	cargo clean --manifest-path tests/asymmetric_rust_mod/Cargo.toml
+	cargo clean --manifest-path benches/c_abi_rust_mod/Cargo.toml

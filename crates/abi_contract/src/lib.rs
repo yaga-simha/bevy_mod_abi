@@ -229,16 +229,19 @@ impl ComponentAccessMode {
     pub const READ: Self = Self(0);
     /// Mutable column access (`&mut T`).
     pub const WRITE: Self = Self(1);
-    /// Archetype filter-only (`With<T>`), no column pointer accessed.
+    /// Archetype inclusion filter-only (`With<T>`), no column pointer accessed.
     pub const FILTER_ONLY: Self = Self(2);
+    /// Archetype exclusion filter-only (`Without<T>`), proves disjointness across queries.
+    pub const WITHOUT: Self = Self(3);
 
     pub const Read: Self = Self::READ;
     pub const Write: Self = Self::WRITE;
     pub const FilterOnly: Self = Self::FILTER_ONLY;
+    pub const Without: Self = Self::WITHOUT;
 
     #[inline]
     pub const fn is_valid(self) -> bool {
-        self.0 <= Self::FILTER_ONLY.0
+        self.0 <= Self::WITHOUT.0
     }
 
     #[inline]
@@ -250,6 +253,11 @@ impl ComponentAccessMode {
     pub const fn is_filter_only(self) -> bool {
         self.0 == Self::FILTER_ONLY.0
     }
+
+    #[inline]
+    pub const fn is_without(self) -> bool {
+        self.0 == Self::WITHOUT.0
+    }
 }
 
 /// Component access descriptor passed in `SystemDescriptor::queries`.
@@ -258,7 +266,7 @@ impl ComponentAccessMode {
 pub struct ComponentAccessDesc {
     /// Null-terminated UTF-8 C string identifying the registered component name.
     pub name: *const c_char,
-    /// Access mode (`ComponentAccessMode::READ`, `WRITE`, or `FILTER_ONLY`).
+    /// Access mode (`ComponentAccessMode::READ`, `WRITE`, `FILTER_ONLY`, or `WITHOUT`).
     pub mode: ComponentAccessMode,
 }
 
@@ -284,6 +292,14 @@ impl ComponentAccessDesc {
         Self {
             name,
             mode: ComponentAccessMode::FILTER_ONLY,
+        }
+    }
+
+    #[inline]
+    pub const fn without(name: *const c_char) -> Self {
+        Self {
+            name,
+            mode: ComponentAccessMode::WITHOUT,
         }
     }
 }
@@ -326,6 +342,10 @@ pub type IterEntitiesFn = unsafe extern "C" fn(iter: *const RawChunkIter) -> *co
 pub type IterColumnStrideFn =
     unsafe extern "C" fn(iter: *const RawChunkIter, index: usize) -> usize;
 
+/// Reset a `RawChunkIter` cursor back to its initial matched archetype table so inner queries
+/// can be re-traversed inside nested query loops with zero heap allocations.
+pub type IterResetFn = unsafe extern "C" fn(iter: *mut RawChunkIter) -> FfiResult;
+
 /// Dynamic system callback invoked by the host during schedule execution.
 ///
 /// Returns `FfiResult::OK` on success, or `FfiResult::PANIC_CAUGHT` / error status if the
@@ -335,6 +355,48 @@ pub type DynamicSystemCallback = unsafe extern "C" fn(
     iter: *mut RawChunkIter,
     commands: *mut RawCommandQueue,
     user_data: *mut c_void,
+) -> FfiResult;
+
+/// Specification of one query clause within a multi-query dynamic system.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct QuerySpec {
+    /// Pointer to an array of `ComponentAccessDesc` of length `query_count`.
+    pub queries: *const ComponentAccessDesc,
+    /// Number of elements in `queries`.
+    pub query_count: usize,
+}
+
+/// Callback signature for a dynamic system executing multiple queries (e.g., nested queries).
+pub type MultiQuerySystemCallback = unsafe extern "C" fn(
+    iters: *const *mut RawChunkIter,
+    iter_count: usize,
+    commands: *mut RawCommandQueue,
+    user_data: *mut c_void,
+) -> FfiResult;
+
+/// Descriptor used by mods to register a multi-query `DynamicCSystem` via `register_multi_query_system`.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct MultiQuerySystemDescriptor {
+    /// Size of this struct in bytes (`core::mem::size_of::<MultiQuerySystemDescriptor>() as u32`).
+    pub struct_size: u32,
+    /// Null-terminated UTF-8 system name.
+    pub name: *const c_char,
+    /// Pointer to an array of `QuerySpec` of length `query_spec_count`.
+    pub query_specs: *const QuerySpec,
+    /// Number of query clauses in `query_specs`.
+    pub query_spec_count: usize,
+    /// Multi-query system execution callback.
+    pub callback: MultiQuerySystemCallback,
+    /// Opaque guest-owned context pointer forwarded to `callback`.
+    pub user_data: *mut c_void,
+}
+
+/// Multi-query system registration function signature resolvable via `GetProcAddressFn`.
+pub type RegisterMultiQuerySystemFn = unsafe extern "C" fn(
+    host_context: *mut c_void,
+    descriptor: *const MultiQuerySystemDescriptor,
 ) -> FfiResult;
 
 /// Descriptor used by mods to register a `DynamicCSystem` with the host.

@@ -5,5 +5,7 @@ target/
 *.dylib
 *.so
 *.dll
+*.dSYM/
+**/*.dSYM/
 .DS_Store
 .agents/

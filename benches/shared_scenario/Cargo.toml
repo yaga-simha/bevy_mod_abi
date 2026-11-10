@@ -1,0 +1,19 @@
+[package]
+name = "shared_scenario"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+crate-type = ["dylib"]
+test = false
+doctest = false
+
+[dependencies]
+abi_contract = { workspace = true }
+mod_derive = { workspace = true }
+host_runtime = { workspace = true }
+bevy_ecs = { version = "0.20.1", default-features = false, features = ["std", "async_executor"] }
+bevy_app = { version = "0.20.1", default-features = false, features = ["std"] }

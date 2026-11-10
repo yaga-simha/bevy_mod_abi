@@ -28,6 +28,10 @@ pub trait ModAppExt {
     /// Register an exposable component type with Bevy ECS and the native mod registry.
     fn register_mod_component<T: Component + ExposableComponent>(&mut self) -> &mut Self;
 
+    /// Register a nested/compound `ModExposable` helper type (without requiring `Component`)
+    /// so its VTable and field accessors are exposed via `GetProcAddressFn`.
+    fn register_mod_type<T: ExposableComponent>(&mut self) -> &mut Self;
+
     /// Load a native shared library mod into the Bevy App's update schedule.
     fn load_mod<P: AsRef<Path>>(&mut self, path: P) -> Result<&mut Self, FfiResult>;
 
@@ -46,6 +50,17 @@ impl ModAppExt for App {
         } else {
             let mut registry = ModRegistry::new();
             registry.register_component::<T>(comp_id);
+            self.insert_resource(registry);
+        }
+        self
+    }
+
+    fn register_mod_type<T: ExposableComponent>(&mut self) -> &mut Self {
+        if let Some(mut registry) = self.world_mut().get_resource_mut::<ModRegistry>() {
+            registry.register_type::<T>();
+        } else {
+            let mut registry = ModRegistry::new();
+            registry.register_type::<T>();
             self.insert_resource(registry);
         }
         self

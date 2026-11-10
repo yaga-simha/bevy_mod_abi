@@ -92,6 +92,18 @@ impl<'w> HostChunkIter<'w> {
         0
     }
 
+    /// Reset this iterator back to the first matched archetype table so nested queries
+    /// can re-traverse chunks with zero allocations.
+    #[inline]
+    pub fn reset(&mut self) {
+        self.current_table_cursor = 0;
+        self.current_table = None;
+        self.current_entity_count = 0;
+        for col in &mut self.active_columns {
+            *col = None;
+        }
+    }
+
     fn populate_active_columns(&mut self, table: &'w Table, count: usize) {
         for col in &mut self.active_columns {
             *col = None;
@@ -101,7 +113,8 @@ impl<'w> HostChunkIter<'w> {
             if i >= MAX_QUERY_COMPONENTS {
                 break;
             }
-            if q.mode == ComponentAccessMode::FILTER_ONLY {
+            if q.mode == ComponentAccessMode::FILTER_ONLY || q.mode == ComponentAccessMode::WITHOUT
+            {
                 self.active_columns[i] = None;
                 continue;
             }
@@ -162,7 +175,9 @@ pub unsafe extern "C" fn host_iter_column_readonly(
     {
         return core::ptr::null();
     }
-    if host_iter.query_columns[index].mode == ComponentAccessMode::FILTER_ONLY {
+    if host_iter.query_columns[index].mode == ComponentAccessMode::FILTER_ONLY
+        || host_iter.query_columns[index].mode == ComponentAccessMode::WITHOUT
+    {
         return core::ptr::null();
     }
     if let Some(col) = &host_iter.active_columns[index] {
@@ -286,4 +301,18 @@ pub unsafe extern "C" fn host_iter_column_stride(iter: *const RawChunkIter, inde
         return 0;
     }
     host_iter.query_columns[index].stride
+}
+
+/// Reset a `RawChunkIter` back to its first matched archetype table for nested query iteration.
+///
+/// # Safety
+/// `iter` must be a valid pointer to a `HostChunkIter` or null.
+pub unsafe extern "C" fn host_iter_reset(iter: *mut RawChunkIter) -> FfiResult {
+    if iter.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: caller passes a valid pointer to HostChunkIter cast to RawChunkIter.
+    let host_iter = unsafe { &mut *(iter as *mut HostChunkIter<'_>) };
+    host_iter.reset();
+    FfiResult::OK
 }

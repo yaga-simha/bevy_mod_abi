@@ -117,8 +117,10 @@ make bench
 cat target/benchmark_results.json
 ```
 
-### Benchmark Metrics Baseline
-- **100,000 Entities Throughput**: ~**20.3M entities/sec** (~49.3 ns / entity).
-- **10,000 Entities Throughput**: ~**19.1M entities/sec** (~52.4 ns / entity).
-- **C-ABI Boundary Overhead**: Chunk-based iteration achieves zero serialization cost, matching or outperforming standard dynamically queried Bevy query loops through pre-resolved column pointers and cache locality.
-- **Archetype Fragmentation**: Traversal remains consistent (>16M entities/sec) across 16-way fragmented archetypes.
+### Benchmark Metrics Baseline & Full Permutation Matrix
+- **Single-Query Linear Scale (`benchmarks.rs`)**:
+  - **100,000 Entities Throughput**: ~**20.3M+ entities/sec** in debug host, >**250M+ entities/sec** in release host.
+  - **Archetype Fragmentation**: Traversal remains consistent across 1-way, 4-way, and 16-way fragmented archetypes.
+- **Full Multi-Architecture × `Debug`/`Release` Nested Query Matrix (`benches/permutation_bench`, [`docs/BENCHMARKS.md`](BENCHMARKS.md))**:
+  - Evaluates a **34-archetype** world (16 active unit tables × 6 active emitter tables + 12 excluded decoy/frozen tables; nested `Transform3D` & `Kinematics` `Vec3f` sub-structs) at `49,152` and `294,912` pair evaluations/frame.
+  - Verifies mathematical oracle equivalence across Pure Native Bevy, Coupled Rust `dylib`, C-ABI Rust `cdylib`, and C-ABI C99 across all `Debug` and `Release` targets, mapping the full `1.00x` (`0.186 ms`) -> `66.47x` (`12.39 ms`) performance degradation ladder.

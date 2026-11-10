@@ -1,0 +1,15 @@
+[package]
+name = "coupled_rust_mod"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+crate-type = ["dylib"]
+test = false
+doctest = false
+
+[dependencies]
+shared_scenario = { path = "../shared_scenario" }

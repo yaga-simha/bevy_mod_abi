@@ -34,15 +34,16 @@ pub use mod_derive::ModExposable;
 
 pub use chunk_iter::{
     host_iter_column_mutable, host_iter_column_readonly, host_iter_column_stride,
-    host_iter_entities, host_iter_mark_changed, host_iter_next_chunk, HostChunkIter,
-    QueryColumnDesc, MAX_QUERY_COMPONENTS,
+    host_iter_entities, host_iter_mark_changed, host_iter_next_chunk, host_iter_reset,
+    HostChunkIter, QueryColumnDesc, MAX_QUERY_COMPONENTS,
 };
 pub use commands::{
     host_cmd_despawn, host_cmd_insert_component, host_cmd_spawn_empty, CmdDespawnFn,
     CmdInsertComponentFn, CmdSpawnEmptyFn, CommandQueueBridge,
 };
 pub use dynamic_system::{
-    host_register_system, ComponentAccessDescOwned, DynamicCSystem, ModInitContext,
+    host_register_multi_query_system, host_register_system, ComponentAccessDescOwned,
+    DynamicCSystem, ModInitContext, MAX_SYSTEM_QUERIES,
 };
 pub use host::{LoadedMod, ModHost, ModId};
 pub use plugin::{AbiModPlugin, ModAppExt};

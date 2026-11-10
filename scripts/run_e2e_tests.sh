@@ -39,8 +39,9 @@ echo "[6/9] Running Milestone 3 Bevy Runtime Testbed (integration_tests)..."
 cargo test --test integration_tests -- --test-threads=1
 
 echo ""
-echo "[7/9] Running Milestone 4 Performance Benchmarking Suite (1k, 10k, 100k entities & JSON report)..."
+echo "[7/9] Running Milestone 4 & Full Permutation Benchmarking Suite (Debug + Release x Native + Rust dylib + C-ABI Rust/C99)..."
 cargo test --test benchmarks -- --nocapture
+cargo run --release -p permutation_bench
 if [ ! -f "target/benchmark_results.json" ]; then
     echo "ERROR: target/benchmark_results.json was not generated!" >&2
     exit 1

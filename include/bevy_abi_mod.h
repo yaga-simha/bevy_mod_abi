@@ -54,6 +54,7 @@ typedef uint32_t ComponentAccessMode;
 #define COMPONENT_ACCESS_READ        0u
 #define COMPONENT_ACCESS_WRITE       1u
 #define COMPONENT_ACCESS_FILTER_ONLY 2u
+#define COMPONENT_ACCESS_WITHOUT     3u
 
 /* Component access descriptor (`abi_contract::ComponentAccessDesc`) */
 typedef struct ComponentAccessDesc {
@@ -72,12 +73,40 @@ typedef uint8_t* (*IterColumnMutableFn)(RawChunkIter* iter, size_t index);
 typedef FfiResult (*IterMarkChangedFn)(RawChunkIter* iter, size_t index, size_t row);
 typedef const FfiEntity* (*IterEntitiesFn)(const RawChunkIter* iter);
 typedef size_t (*IterColumnStrideFn)(const RawChunkIter* iter, size_t index);
+typedef FfiResult (*IterResetFn)(RawChunkIter* iter);
 
 /* Dynamic system callback (`abi_contract::DynamicSystemCallback`) */
 typedef FfiResult (*DynamicSystemCallback)(
     RawChunkIter* iter,
     RawCommandQueue* commands,
     void* user_data
+);
+
+/* Multi-query clause and descriptor (`abi_contract::QuerySpec` / `MultiQuerySystemDescriptor`) */
+typedef struct QuerySpec {
+    const ComponentAccessDesc* queries;
+    size_t query_count;
+} QuerySpec;
+
+typedef FfiResult (*MultiQuerySystemCallback)(
+    RawChunkIter* const* iters,
+    size_t iter_count,
+    RawCommandQueue* commands,
+    void* user_data
+);
+
+typedef struct MultiQuerySystemDescriptor {
+    uint32_t struct_size;
+    const char* name;
+    const QuerySpec* query_specs;
+    size_t query_spec_count;
+    MultiQuerySystemCallback callback;
+    void* user_data;
+} MultiQuerySystemDescriptor;
+
+typedef FfiResult (*RegisterMultiQuerySystemFn)(
+    void* host_context,
+    const MultiQuerySystemDescriptor* descriptor
 );
 
 /* System registration descriptor (`abi_contract::SystemDescriptor`) */

@@ -130,11 +130,15 @@ bevy_abi_mod/
   - `GetProcAddressFn = unsafe extern "C" fn(name: *const c_char) -> *const c_void`.
   - `RawChunkIter`: opaque C handle passed to mod system callbacks, paired with host C-ABI iteration functions:
     - `iter_next_chunk(iter: *mut RawChunkIter) -> usize` (returns `0` when exhausted, or `entity_count` for the active archetype table).
+    - `iter_reset(iter: *mut RawChunkIter) -> FfiResult` (rewinds chunk cursor to `0`, resolved via `get_proc_address("iter_reset")` for nested multi-query loops).
     - `iter_column_readonly(iter: *const RawChunkIter, index: usize) -> *const u8`.
     - `iter_column_mutable(iter: *mut RawChunkIter, index: usize) -> *mut u8` (marks `ComponentTicks` as changed for all entities in the chunk; returns `null_mut()` if column is read-only or filter-only).
     - `iter_mark_changed(iter: *mut RawChunkIter, index: usize, row: usize) -> FfiResult`.
     - `iter_entities(iter: *const RawChunkIter) -> *const FfiEntity`.
     - `iter_column_stride(iter: *const RawChunkIter, index: usize) -> usize`.
+  - Multi-Query & Negative Filter Extensions (resolved via `get_proc_address`):
+    - `ComponentAccessMode::WITHOUT = ComponentAccessMode(3)` (`Without<T>` archetype exclusion filter).
+    - `QuerySpec`, `MultiQuerySystemCallback`, `MultiQuerySystemDescriptor`, and `RegisterMultiQuerySystemFn` (`get_proc_address("register_multi_query_system")`), allowing up to 8 disjoint stack-allocated `RawChunkIter` handles in a single `DynamicCSystem` with intra-system borrow-conflict validation.
   - `RawCommandQueue`: opaque C handle for deferred entity spawns, despawns, and component byte insertions (`CommandQueueBridge`).
   - `FfiLayout` unsafe marker trait for types safe to expose via interior pointers or `Vec<T>` slices.
   - `ExposableComponent` trait exposing `COMPONENT_NAME`, `UUID`, `VTABLE`, `vtable_ptr()`, `size()`, `align()`, and `resolve_symbol()`.

@@ -5,9 +5,13 @@ members = [
     "crates/mod_derive",
     "crates/host_runtime",
     "crates/guest_sdk",
+    "benches/shared_scenario",
+    "benches/coupled_rust_mod",
+    "benches/permutation_bench",
 ]
 exclude = [
     "tests/asymmetric_rust_mod",
+    "benches/c_abi_rust_mod",
 ]
 
 [workspace.package]

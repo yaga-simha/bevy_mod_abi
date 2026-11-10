@@ -127,6 +127,22 @@ impl ModRegistry {
             "host_cmd_insert_component",
             crate::commands::host_cmd_insert_component as *const c_void,
         );
+        reg.insert_symbol(
+            "iter_reset",
+            crate::chunk_iter::host_iter_reset as *const c_void,
+        );
+        reg.insert_symbol(
+            "host_iter_reset",
+            crate::chunk_iter::host_iter_reset as *const c_void,
+        );
+        reg.insert_symbol(
+            "register_multi_query_system",
+            crate::dynamic_system::host_register_multi_query_system as *const c_void,
+        );
+        reg.insert_symbol(
+            "host_register_multi_query_system",
+            crate::dynamic_system::host_register_multi_query_system as *const c_void,
+        );
         reg
     }
 
@@ -165,6 +181,28 @@ impl ModRegistry {
         }
 
         // Populate global symbols fallback
+        if let Ok(mut global) = GLOBAL_SYMBOLS.write() {
+            global.insert(name.clone(), sym_addr);
+            global.insert(format!("{name}_vtable"), sym_addr);
+            for sym in T::symbols() {
+                global.insert(sym.name.to_string(), SymbolAddress(sym.ptr));
+            }
+        }
+    }
+
+    /// Register a non-component `ModExposable` helper/nested struct type (e.g. `Vec3f`)
+    /// so its static VTable and field accessors are resolvable via `GetProcAddressFn`.
+    pub fn register_type<T: ExposableComponent>(&mut self) {
+        let name = T::COMPONENT_NAME.to_string();
+        let sym_addr = SymbolAddress(T::erased_vtable_ptr());
+
+        self.symbols.insert(name.clone(), sym_addr);
+        self.symbols.insert(format!("{name}_vtable"), sym_addr);
+        for sym in T::symbols() {
+            self.symbols
+                .insert(sym.name.to_string(), SymbolAddress(sym.ptr));
+        }
+
         if let Ok(mut global) = GLOBAL_SYMBOLS.write() {
             global.insert(name.clone(), sym_addr);
             global.insert(format!("{name}_vtable"), sym_addr);

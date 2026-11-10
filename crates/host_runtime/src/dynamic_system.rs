@@ -5,8 +5,8 @@ use crate::chunk_iter::{HostChunkIter, QueryColumnDesc};
 use crate::commands::CommandQueueBridge;
 use crate::registry::ModRegistry;
 use abi_contract::{
-    ComponentAccessMode, DynamicSystemCallback, FfiResult, RawChunkIter, RawCommandQueue,
-    SystemDescriptor,
+    ComponentAccessMode, DynamicSystemCallback, FfiResult, MultiQuerySystemCallback,
+    MultiQuerySystemDescriptor, RawChunkIter, RawCommandQueue, SystemDescriptor,
 };
 use bevy_ecs::archetype::ArchetypeGeneration;
 use bevy_ecs::change_detection::{CheckChangeTicks, Tick};
@@ -20,27 +20,52 @@ use core::ffi::{c_void, CStr};
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+/// Maximum number of concurrent/nested queries supported per multi-query dynamic system.
+pub const MAX_SYSTEM_QUERIES: usize = 8;
+
 #[derive(Clone, Debug)]
 pub struct ComponentAccessDescOwned {
     pub name: String,
     pub mode: ComponentAccessMode,
 }
 
-/// Host-side Bevy System wrapping an opaque guest C-ABI system callback.
-pub struct DynamicCSystem {
-    name: String,
-    query_descs: Vec<ComponentAccessDescOwned>,
-    query_columns: Vec<QueryColumnDesc>,
-
-    archetype_generation: ArchetypeGeneration,
+#[derive(Clone, Debug)]
+struct CachedQueryGroup {
+    descs: Vec<ComponentAccessDescOwned>,
+    columns: Vec<QueryColumnDesc>,
     matched_tables: Vec<TableId>,
     matched_table_bits: Vec<bool>,
+}
 
+impl CachedQueryGroup {
+    fn new(descs: Vec<ComponentAccessDescOwned>) -> Self {
+        Self {
+            descs,
+            columns: Vec::new(),
+            matched_tables: Vec::new(),
+            matched_table_bits: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SystemCallbackKind {
+    Single(DynamicSystemCallback),
+    Multi(MultiQuerySystemCallback),
+}
+
+/// Host-side Bevy System wrapping an opaque guest C-ABI system callback (single or multi-query).
+pub struct DynamicCSystem {
+    name: String,
+    query_groups: Vec<CachedQueryGroup>,
+
+    archetype_generation: ArchetypeGeneration,
     access: SystemAccess,
+    self_conflict: bool,
     last_run: Tick,
     this_run: Tick,
 
-    callback: DynamicSystemCallback,
+    callback: SystemCallbackKind,
     user_data: *mut c_void,
 
     enabled: bool,
@@ -64,15 +89,38 @@ impl DynamicCSystem {
     ) -> Self {
         Self {
             name,
-            query_descs,
-            query_columns: Vec::new(),
+            query_groups: vec![CachedQueryGroup::new(query_descs)],
             archetype_generation: ArchetypeGeneration::initial(),
-            matched_tables: Vec::new(),
-            matched_table_bits: Vec::new(),
             access: SystemAccess::None,
+            self_conflict: false,
             last_run: Tick::new(0),
             this_run: Tick::new(0),
-            callback,
+            callback: SystemCallbackKind::Single(callback),
+            user_data,
+            enabled: true,
+            is_active: Arc::new(AtomicBool::new(true)),
+            command_queue: CommandQueue::default(),
+            registry,
+        }
+    }
+
+    pub fn new_multi_query(
+        name: String,
+        query_specs: Vec<Vec<ComponentAccessDescOwned>>,
+        callback: MultiQuerySystemCallback,
+        user_data: *mut c_void,
+        registry: Arc<ModRegistry>,
+    ) -> Self {
+        let query_groups = query_specs.into_iter().map(CachedQueryGroup::new).collect();
+        Self {
+            name,
+            query_groups,
+            archetype_generation: ArchetypeGeneration::initial(),
+            access: SystemAccess::None,
+            self_conflict: false,
+            last_run: Tick::new(0),
+            this_run: Tick::new(0),
+            callback: SystemCallbackKind::Multi(callback),
             user_data,
             enabled: true,
             is_active: Arc::new(AtomicBool::new(true)),
@@ -87,6 +135,10 @@ impl DynamicCSystem {
 
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
+    }
+
+    pub fn has_self_conflict(&self) -> bool {
+        self.self_conflict
     }
 
     pub fn is_active(&self) -> Arc<AtomicBool> {
@@ -104,24 +156,30 @@ impl DynamicCSystem {
 
     fn update_archetypes(&mut self, world: UnsafeWorldCell, current_gen: ArchetypeGeneration) {
         self.archetype_generation = current_gen;
-        self.matched_tables.clear();
-        self.matched_table_bits.clear();
-
         let archetypes = world.archetypes();
-        for archetype in archetypes.iter() {
-            let matches = self
-                .query_columns
-                .iter()
-                .all(|col| archetype.contains(col.component_id));
-            if matches {
-                let table_id = archetype.table_id();
-                let idx = table_id.as_usize();
-                if idx >= self.matched_table_bits.len() {
-                    self.matched_table_bits.resize(idx + 1, false);
-                }
-                if !self.matched_table_bits[idx] {
-                    self.matched_table_bits[idx] = true;
-                    self.matched_tables.push(table_id);
+
+        for group in &mut self.query_groups {
+            group.matched_tables.clear();
+            group.matched_table_bits.clear();
+
+            for archetype in archetypes.iter() {
+                let matches = group.columns.iter().all(|col| {
+                    if col.mode == ComponentAccessMode::WITHOUT {
+                        !archetype.contains(col.component_id)
+                    } else {
+                        archetype.contains(col.component_id)
+                    }
+                });
+                if matches {
+                    let table_id = archetype.table_id();
+                    let idx = table_id.as_usize();
+                    if idx >= group.matched_table_bits.len() {
+                        group.matched_table_bits.resize(idx + 1, false);
+                    }
+                    if !group.matched_table_bits[idx] {
+                        group.matched_table_bits[idx] = true;
+                        group.matched_tables.push(table_id);
+                    }
                 }
             }
         }
@@ -143,38 +201,53 @@ impl System for DynamicCSystem {
     fn initialize(&mut self, world: &mut World) -> SystemAccess {
         self.this_run = world.change_tick();
         self.last_run = self.this_run;
-
-        self.query_columns.clear();
-        let mut filtered_access = FilteredAccess::default();
-
-        for desc in &self.query_descs {
-            if let Some(reg) = self.registry.get_by_name(&desc.name) {
-                let comp_id = reg.component_id;
-                let stride = reg.size;
-
-                self.query_columns.push(QueryColumnDesc {
-                    component_id: comp_id,
-                    mode: desc.mode,
-                    stride,
-                });
-
-                match desc.mode {
-                    ComponentAccessMode::READ => {
-                        filtered_access.add_read(comp_id);
-                    }
-                    ComponentAccessMode::WRITE => {
-                        filtered_access.add_write(comp_id);
-                    }
-                    ComponentAccessMode::FILTER_ONLY => {
-                        filtered_access.and_with(comp_id);
-                    }
-                    _ => {}
-                }
-            }
-        }
+        self.self_conflict = false;
 
         let mut access_set = FilteredAccessSet::new();
-        access_set.add(filtered_access);
+
+        for group in &mut self.query_groups {
+            group.columns.clear();
+            let mut filtered_access = FilteredAccess::default();
+
+            for desc in &group.descs {
+                if let Some(reg) = self.registry.get_by_name(&desc.name) {
+                    let comp_id = reg.component_id;
+                    let stride = reg.size;
+
+                    group.columns.push(QueryColumnDesc {
+                        component_id: comp_id,
+                        mode: desc.mode,
+                        stride,
+                    });
+
+                    match desc.mode {
+                        ComponentAccessMode::READ => {
+                            filtered_access.add_read(comp_id);
+                        }
+                        ComponentAccessMode::WRITE => {
+                            filtered_access.add_write(comp_id);
+                        }
+                        ComponentAccessMode::FILTER_ONLY => {
+                            filtered_access.and_with(comp_id);
+                        }
+                        ComponentAccessMode::WITHOUT => {
+                            filtered_access.and_without(comp_id);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            let mut candidate_set = FilteredAccessSet::new();
+            candidate_set.add(filtered_access.clone());
+            if !access_set.is_compatible(&candidate_set) {
+                self.self_conflict = true;
+                self.enabled = false;
+            }
+
+            access_set.add(filtered_access);
+        }
+
         self.access = SystemAccess::Shared(access_set);
 
         // Scan initial archetypes
@@ -190,7 +263,7 @@ impl System for DynamicCSystem {
         _input: SystemIn<'_, Self>,
         world: UnsafeWorldCell,
     ) -> Result<Self::Out, RunSystemError> {
-        if !self.enabled || !self.is_active.load(Ordering::Acquire) {
+        if !self.enabled || self.self_conflict || !self.is_active.load(Ordering::Acquire) {
             return Ok(());
         }
 
@@ -204,14 +277,8 @@ impl System for DynamicCSystem {
             self.update_archetypes(world, current_gen);
         }
 
+        // SAFETY: Scheduler verified access via FilteredAccessSet; no intra-system conflict exists.
         let storages = unsafe { world.storages() };
-        let mut host_iter = HostChunkIter::new(
-            &storages.tables,
-            &self.matched_tables,
-            &self.query_columns,
-            self.this_run,
-        );
-        let iter_ptr = (&mut host_iter as *mut HostChunkIter<'_>).cast::<RawChunkIter>();
 
         let mut bridge = CommandQueueBridge::new(
             &mut self.command_queue,
@@ -219,13 +286,51 @@ impl System for DynamicCSystem {
             &self.registry,
         );
         let commands_ptr = (&mut bridge as *mut CommandQueueBridge<'_>).cast::<RawCommandQueue>();
-
-        // Fault-isolated execution
-        let callback = self.callback;
         let user_data = self.user_data;
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            callback(iter_ptr, commands_ptr, user_data)
-        }));
+
+        let res = match self.callback {
+            SystemCallbackKind::Single(callback) => {
+                let group = &self.query_groups[0];
+                let mut host_iter = HostChunkIter::new(
+                    &storages.tables,
+                    &group.matched_tables,
+                    &group.columns,
+                    self.this_run,
+                );
+                let iter_ptr = (&mut host_iter as *mut HostChunkIter<'_>).cast::<RawChunkIter>();
+                // SAFETY: Calling foreign C-ABI callback with valid stack-allocated iterator and command bridge.
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                    callback(iter_ptr, commands_ptr, user_data)
+                }))
+            }
+            SystemCallbackKind::Multi(callback) => {
+                let count = self.query_groups.len().min(MAX_SYSTEM_QUERIES);
+                let mut host_iters: [Option<HostChunkIter<'_>>; MAX_SYSTEM_QUERIES] =
+                    [const { None }; MAX_SYSTEM_QUERIES];
+                for (i, group) in self.query_groups.iter().take(count).enumerate() {
+                    host_iters[i] = Some(HostChunkIter::new(
+                        &storages.tables,
+                        &group.matched_tables,
+                        &group.columns,
+                        self.this_run,
+                    ));
+                }
+
+                let mut raw_ptrs: [*mut RawChunkIter; MAX_SYSTEM_QUERIES] =
+                    [core::ptr::null_mut(); MAX_SYSTEM_QUERIES];
+                for i in 0..count {
+                    if let Some(ref mut it) = host_iters[i] {
+                        raw_ptrs[i] = (it as *mut HostChunkIter<'_>).cast::<RawChunkIter>();
+                    }
+                }
+
+                // SAFETY: All `raw_ptrs[0..count]` point to disjoint stack-allocated `HostChunkIter`s
+                // whose borrow compatibility was verified by `FilteredAccessSet` in `initialize`.
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                    callback(raw_ptrs.as_ptr(), count, commands_ptr, user_data)
+                }))
+            }
+        };
 
         match res {
             Ok(status) => {
@@ -343,6 +448,86 @@ pub unsafe extern "C" fn host_register_system(
     let system = DynamicCSystem::new(
         sys_name,
         query_descs,
+        desc.callback,
+        desc.user_data,
+        Arc::clone(&init_ctx.registry),
+    )
+    .with_is_active(Arc::clone(&init_ctx.is_active));
+    init_ctx.registered_systems.push(system);
+
+    FfiResult::OK
+}
+
+/// C-ABI implementation of `register_multi_query_system` for nested / multi-query ECS systems.
+///
+/// # Safety
+/// `host_context` must point to a valid `ModInitContext`. `descriptor` must point to a valid `MultiQuerySystemDescriptor`.
+pub unsafe extern "C" fn host_register_multi_query_system(
+    host_context: *mut c_void,
+    descriptor: *const MultiQuerySystemDescriptor,
+) -> FfiResult {
+    if host_context.is_null() || descriptor.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+
+    // SAFETY: caller passes a valid pointer to MultiQuerySystemDescriptor.
+    let desc = unsafe { &*descriptor };
+    if (desc.struct_size as usize) < core::mem::size_of::<MultiQuerySystemDescriptor>() {
+        return FfiResult::INTERNAL_ERROR;
+    }
+    if desc.query_spec_count == 0 || desc.query_spec_count > MAX_SYSTEM_QUERIES {
+        return FfiResult::INTERNAL_ERROR;
+    }
+    if desc.query_specs.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+
+    let sys_name = if !desc.name.is_null() {
+        // SAFETY: desc.name is a NUL-terminated C string.
+        unsafe { CStr::from_ptr(desc.name) }
+            .to_str()
+            .unwrap_or("unnamed_multi_query_guest_system")
+            .to_string()
+    } else {
+        "unnamed_multi_query_guest_system".to_string()
+    };
+
+    // SAFETY: desc.query_specs points to an array of length desc.query_spec_count.
+    let specs_slice =
+        unsafe { core::slice::from_raw_parts(desc.query_specs, desc.query_spec_count) };
+    let mut parsed_specs = Vec::with_capacity(desc.query_spec_count);
+
+    for spec in specs_slice {
+        let mut query_descs = Vec::with_capacity(spec.query_count);
+        if spec.query_count > 0 {
+            if spec.queries.is_null() {
+                return FfiResult::NULL_POINTER;
+            }
+            // SAFETY: spec.queries points to an array of length spec.query_count.
+            let queries_slice =
+                unsafe { core::slice::from_raw_parts(spec.queries, spec.query_count) };
+            for q in queries_slice {
+                if q.name.is_null() {
+                    return FfiResult::NULL_POINTER;
+                }
+                // SAFETY: q.name is a NUL-terminated C string.
+                let Ok(q_name) = (unsafe { CStr::from_ptr(q.name) }).to_str() else {
+                    return FfiResult::INVALID_UTF8;
+                };
+                query_descs.push(ComponentAccessDescOwned {
+                    name: q_name.to_string(),
+                    mode: q.mode,
+                });
+            }
+        }
+        parsed_specs.push(query_descs);
+    }
+
+    // SAFETY: caller guarantees host_context points to a valid ModInitContext.
+    let init_ctx = unsafe { &mut *(host_context as *mut ModInitContext) };
+    let system = DynamicCSystem::new_multi_query(
+        sys_name,
+        parsed_specs,
         desc.callback,
         desc.user_data,
         Arc::clone(&init_ctx.registry),

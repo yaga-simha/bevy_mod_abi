@@ -278,6 +278,8 @@ fn test_ffi_transparent_type_safety() {
     assert_eq!(write_mode.0, 1);
     let filter_mode = ComponentAccessMode::FILTER_ONLY;
     assert_eq!(filter_mode.0, 2);
+    let without_mode = ComponentAccessMode::WITHOUT;
+    assert_eq!(without_mode.0, 3);
 
     // FfiEntity bits transparency
     let ent = FfiEntity(0x0000000100000005);
@@ -486,4 +488,199 @@ fn test_cross_runtime_panic_containment() {
 
     app.unload_mod(r_id).unwrap();
     reset_rust_mod_panic(&rust_dylib);
+}
+
+static MULTI_QUERY_PAIR_EVALS: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" fn multi_query_nested_test_cb(
+    queries: *const *mut RawChunkIter,
+    query_count: usize,
+    _commands: *mut RawCommandQueue,
+    _user_data: *mut core::ffi::c_void,
+) -> FfiResult {
+    assert_eq!(query_count, 2);
+    let q_outer = unsafe { *queries.add(0) };
+    let q_inner = unsafe { *queries.add(1) };
+
+    loop {
+        let outer_n = unsafe { host_iter_next_chunk(q_outer) };
+        if outer_n == 0 {
+            break;
+        }
+        let pos_col = unsafe { host_iter_column_mutable(q_outer, 0) };
+        let pos_stride = unsafe { host_iter_column_stride(q_outer, 0) };
+        assert!(!pos_col.is_null());
+
+        for i in 0..outer_n {
+            // Rewind inner query iterator for every outer entity
+            assert_eq!(
+                unsafe { host_runtime::host_iter_reset(q_inner) },
+                FfiResult::OK
+            );
+            loop {
+                let inner_n = unsafe { host_iter_next_chunk(q_inner) };
+                if inner_n == 0 {
+                    break;
+                }
+                let vel_col = unsafe { host_iter_column_readonly(q_inner, 0) };
+                let vel_stride = unsafe { host_iter_column_stride(q_inner, 0) };
+                assert!(!vel_col.is_null());
+                // Inner query is read-only: requesting mutable column must return NULL!
+                assert!(unsafe { host_iter_column_mutable(q_inner, 0) }.is_null());
+
+                for j in 0..inner_n {
+                    let _vel_ptr = unsafe { vel_col.add(j * vel_stride) };
+                    MULTI_QUERY_PAIR_EVALS.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            let _pos_ptr = unsafe { pos_col.add(i * pos_stride) };
+        }
+    }
+    FfiResult::OK
+}
+
+/// Test 7: Multi-Query `DynamicCSystem`, `WITHOUT` filter exclusion, `host_iter_reset` rewind,
+/// and intra-system self-conflict rejection.
+#[test]
+fn test_multi_query_without_filter_and_intra_system_conflict_detection() {
+    let mut app = App::new();
+    app.add_plugins(AbiModPlugin);
+    app.register_mod_component::<Position>();
+    app.register_mod_component::<Velocity>();
+    app.register_mod_component::<Armor>();
+    app.register_mod_component::<Mass>();
+
+    // Spawn 5 valid outer entities (Position + Mass, WITHOUT Armor) across 2 archetypes
+    for i in 0..5 {
+        if i % 2 == 0 {
+            app.world_mut().spawn((
+                Position {
+                    x: i as f32,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                Mass { value: 10.0 },
+            ));
+        } else {
+            app.world_mut().spawn((
+                Position {
+                    x: i as f32,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                Mass { value: 10.0 },
+                CombatHealth {
+                    current: 100,
+                    max: 100,
+                },
+            ));
+        }
+    }
+
+    // Spawn 3 excluded entities possessing Armor (must be filtered out by WITHOUT<Armor>)
+    for _ in 0..3 {
+        app.world_mut().spawn((
+            Position {
+                x: 99.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            Mass { value: 10.0 },
+            Armor { defense: 50 },
+        ));
+    }
+
+    // Spawn 4 valid inner entities (Velocity + Armor, WITHOUT Mass)
+    for i in 0..4 {
+        app.world_mut().spawn((
+            Velocity {
+                x: 1.0,
+                y: i as f32,
+                z: 0.0,
+            },
+            Armor { defense: 10 },
+        ));
+    }
+
+    let reg_arc = Arc::new(app.world().resource::<ModRegistry>().clone());
+
+    // 1. Verify intra-system self-conflict (Query 0 WRITE Position + Query 1 READ Position without disjoint filters)
+    // is caught and rejected during `System::initialize`!
+    {
+        let mut bad_world = World::new();
+        let pid = bad_world.register_component::<Position>();
+        let mut bad_reg = ModRegistry::new();
+        bad_reg.register_component::<Position>(pid);
+        let mut conflicting_sys = DynamicCSystem::new_multi_query(
+            "self_conflicting_multi_query".to_string(),
+            vec![
+                vec![ComponentAccessDescOwned {
+                    name: "Position".to_string(),
+                    mode: ComponentAccessMode::WRITE,
+                }],
+                vec![ComponentAccessDescOwned {
+                    name: "Position".to_string(),
+                    mode: ComponentAccessMode::READ,
+                }],
+            ],
+            multi_query_nested_test_cb,
+            core::ptr::null_mut(),
+            Arc::new(bad_reg),
+        );
+        conflicting_sys.initialize(&mut bad_world);
+        // Must have been disabled at initialization due to intra-system aliasing hazard;
+        // running it must be a safe no-op!
+        MULTI_QUERY_PAIR_EVALS.store(0, Ordering::SeqCst);
+        let mut sched = Schedule::default();
+        sched.add_systems(conflicting_sys);
+        sched.run(&mut bad_world);
+        assert_eq!(MULTI_QUERY_PAIR_EVALS.load(Ordering::SeqCst), 0);
+    }
+
+    // 2. Verify valid disjoint Multi-Query execution (5 outer x 4 inner = 20 pair evaluations)
+    MULTI_QUERY_PAIR_EVALS.store(0, Ordering::SeqCst);
+    let valid_sys = DynamicCSystem::new_multi_query(
+        "disjoint_nested_multi_query".to_string(),
+        vec![
+            vec![
+                ComponentAccessDescOwned {
+                    name: "Position".to_string(),
+                    mode: ComponentAccessMode::WRITE,
+                },
+                ComponentAccessDescOwned {
+                    name: "Mass".to_string(),
+                    mode: ComponentAccessMode::FILTER_ONLY,
+                },
+                ComponentAccessDescOwned {
+                    name: "Armor".to_string(),
+                    mode: ComponentAccessMode::WITHOUT,
+                },
+            ],
+            vec![
+                ComponentAccessDescOwned {
+                    name: "Velocity".to_string(),
+                    mode: ComponentAccessMode::READ,
+                },
+                ComponentAccessDescOwned {
+                    name: "Armor".to_string(),
+                    mode: ComponentAccessMode::FILTER_ONLY,
+                },
+                ComponentAccessDescOwned {
+                    name: "Mass".to_string(),
+                    mode: ComponentAccessMode::WITHOUT,
+                },
+            ],
+        ],
+        multi_query_nested_test_cb,
+        core::ptr::null_mut(),
+        reg_arc,
+    );
+
+    app.add_systems(bevy_app::Update, valid_sys);
+    app.update();
+    assert_eq!(
+        MULTI_QUERY_PAIR_EVALS.load(Ordering::SeqCst),
+        20,
+        "Expected 5 outer (WITHOUT Armor) * 4 inner (WITHOUT Mass) = 20 pair evaluations"
+    );
 }

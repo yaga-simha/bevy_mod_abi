@@ -69,8 +69,15 @@ bevy_abi_mod/
 ├── tests/
 │   ├── asymmetric_rust_mod/ # Standalone .cdylib Rust mod (isolated Cargo.lock)
 │   └── asymmetric_c_mod/    # Pure C99 mod compiled with clang/gcc
+├── benches/
+│   ├── shared_scenario/     # 34-archetype nested Query combat scenario & OracleDigest
+│   ├── coupled_rust_mod/    # Coupled Rust dylib plugin (unstable Rust ABI comparison)
+│   ├── c_abi_rust_mod/      # Standalone C-ABI Rust cdylib (ChunkOptimized / EntityNested / NaiveChatty)
+│   ├── c_abi_c99_mod/       # Pure ISO C99 mod (-O0 debug & -O3 release across all 3 FFI tiers)
+│   └── permutation_bench/   # Multi-profile (Debug + Release) orchestrator & report generator
 ├── docs/
 │   ├── ARCHITECTURE.md      # Detailed system design, memory layout & concurrency contracts
+│   ├── BENCHMARKS.md        # Full Debug/Release x Native/dylib/C-ABI degradation ladder
 │   ├── GUEST_MOD_GUIDE.md   # Step-by-step authoring guide for Rust, C99, C++, and Zig mods
 │   └── TESTING_AND_VERIFICATION.md # 4-tier E2E testing framework & benchmarks
 └── scripts/
@@ -221,21 +228,31 @@ The root `Makefile` provides unified workflows for building, testing, and benchm
 
 ---
 
-## Performance Benchmarks
+## Performance Benchmarks & Complete Degradation Ladder
 
-Benchmarks run directly inside live Bevy ECS worlds across monolithic and fragmented archetype distributions:
+`make bench` (`cargo run --release -p permutation_bench`) benchmarks **every permutation** of **Pure Native Bevy (no-mod)**, **Coupled Rust `dylib` Mod**, **C-ABI Rust `cdylib` Mod**, and **C-ABI C99 Mod** across both **`dev`/`debug`** and **`release`/`-O3`** targets inside a complex **34-archetype nested `Query` simulation** (`1,024` combat units across 16 archetypes × `48` aura emitters across 6 archetypes + 12 excluded decoy/frozen archetypes = **`49,152` pair evaluations/frame**, plus a **`294,912` pairs/frame** stress tier), verified bit-accurately against a Pure Native Bevy mathematical oracle:
 
-| Scale | Throughput | Latency | Iteration Overhead vs Native |
-|---|---|---|---|
-| **1,000 Entities** | **~11.6M entities/sec** | 86.4 ns / entity | Zero serialization cost |
-| **10,000 Entities** | **~19.1M entities/sec** | 52.4 ns / entity | Matches native Bevy query loop |
-| **100,000 Entities** | **~20.3M entities/sec** | 49.3 ns / entity | Direct contiguous memory traversal |
-| **16-Way Archetypes** | **~18.5M entities/sec** | 54.0 ns / entity | High cache locality across chunks |
+| Architecture | Access Pattern | Host | Mod Target | Frame (`ms`) | `ns/pair` | vs True Native | Lifecycle / ABI Compatibility |
+|---|---|---|---|---:|---:|---:|---|
+| **Pure Native Bevy (No-Mod)** | Pre-Cached SoA + Inlined `Query` | `release` | `static` | **`0.186 ms`** | `3.79 ns` | **`1.00x`** | Static baseline (`7.8 µs` schedule init) |
+| **Coupled Rust `dylib` Mod** | Pre-Cached SoA + Shared `Query` | `release` | `release` | **`0.182 ms`** | `3.71 ns` | **`0.98x`** | **ABI-Locked** across `debug`/`release` & unsafe `dlclose` |
+| **C-ABI C99 Mod** | **`ChunkOptimized` ($O(U+E)$ VTable)** | `release` | `release (-O3)` | **`0.186 ms`** | `3.78 ns` | **`1.00x`** | **`33 KB` binary, `201 µs` handshake, clean `dlclose`** |
+| **C-ABI Rust `cdylib` Mod** | **`ChunkOptimized` ($O(U+E)$ VTable)** | `release` | `release` | **`0.215 ms`** | `4.38 ns` | **`1.15x`** | **Decoupled toolchain, `152 µs` handshake, clean `dlclose`** |
+| **Pure Native Bevy (No-Mod)** | Direct Idiomatic Nested `Query` | `release` | `static` | **`0.218 ms`** | `4.43 ns` | **`1.17x`** | Re-walks 6 emitter tables per unit |
+| **C-ABI C99 / Rust Mod** | `ChunkOptimized` ($O(U+E)$ VTable) | **`debug`** | `release` | `0.39–0.44 ms` | `7.96–8.88 ns` | **`2.10x–2.34x`** | **`20x` faster than `Debug` Native Bevy (`8.26 ms`)!** |
+| **C-ABI C99 / Rust Mod** | `EntityNestedVTable` ($O(U\times E)$ Getters) | `release` | `release` | `0.70–0.72 ms` | `14.3–14.6 ns` | **`3.78x–3.85x`** | `~600k` indirect VTable calls/frame |
+| **C-ABI C99 / Rust Mod** | `ChunkOptimized` ($O(U+E)$ VTable) | `release` | **`debug`** | `0.94–1.14 ms` | `19.2–23.2 ns` | **`5.07x–6.12x`** | Source-level mod debugging at `< 7%` of 60 FPS budget |
+| **C-ABI Rust / C99 Mod** | `NaiveChattyFfi` ($O(U\times E)$ R/W + Tick) | `release` | `release` | `1.44–1.47 ms` | `29.3–29.9 ns` | **`7.72x–7.88x`** | Per-pair VTable R/W + `iter_mark_changed` |
+| **Pure Native / Coupled `dylib`** | Direct Idiomatic Nested `Query` | **`debug`** | **`debug`** | `8.26–8.32 ms` | `168–169 ns` | **`44.3x–44.6x`** | Unoptimized `bevy_ecs` iterator overhead (`50%` of 60 FPS) |
+| **C-ABI C99 / Rust Mod** | `NaiveChattyFfi` ($O(U\times E)$ R/W + Tick) | **`debug`** | **`debug`** | `12.15–12.39 ms` | `247–252 ns` | **`65.2x–66.5x`** | Worst-case unoptimized Host + unoptimized chatty Mod |
+
+See **[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)** for the full 34-row degradation table, cold vs. warm `dlopen` loading breakdown, and the `294,912` pairs/frame stress tier.
 
 ---
 
 ## Detailed Documentation
 
+- **[Comprehensive Benchmark Matrix (`Debug` & `Release`)](docs/BENCHMARKS.md)**: Full loading & nested multi-archetype execution comparison across Pure Native Bevy, Coupled Rust `dylib`, C-ABI Rust `cdylib`, and C-ABI C99.
 - **[System Architecture & Design](docs/ARCHITECTURE.md)**: Deep dive into the memory isolation model, archetype table traversal, and borrow-checked dynamic scheduling.
 - **[Guest Mod Author Guide](docs/GUEST_MOD_GUIDE.md)**: Complete guide to creating mods in Rust, C99, C++, and Zig.
 - **[Testing & Verification Framework](docs/TESTING_AND_VERIFICATION.md)**: Overview of the 4-tier E2E test suite, safety stress tests, and hot-reload lifecycle suites.
