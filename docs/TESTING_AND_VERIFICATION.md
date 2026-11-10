@@ -107,20 +107,43 @@ Loads and unloads guest shared libraries in a continuous 50-cycle loop:
 
 ---
 
-## 5. Performance Benchmarks
+## 5. Performance Benchmarks & Methodology
 
-Performance is quantitatively verified across varying entity counts and archetype distributions.
+Performance is quantitatively verified across varying entity counts, archetype fragmentation distributions, and multi-architecture FFI access patterns.
 
-To run benchmarks and inspect results:
+### 5.1 Invocation Commands
 ```bash
+# Run full cross-architecture & debug/release permutation benchmark matrix:
 make bench
+
+# Run Milestone 4 single-query linear throughput test (1k, 10k, 100k entities):
+make bench-quick
+
+# Inspect complete structured JSON results:
 cat target/benchmark_results.json
 ```
 
-### Benchmark Metrics Baseline & Full Permutation Matrix
+### 5.2 Benchmarking Methodology & Parameter Spaces
+The benchmarking suite evaluates performance across five primary independent variables:
+1. **Execution Architecture**: Pure Native Bevy (inlined monomorphized), Coupled Rust `dylib` (shared unstable ABI), C-ABI Rust `cdylib` (`guest_sdk`), C-ABI C99 (`bevy_abi_mod.h`), and Dual Concurrent C99 + Rust.
+2. **FFI Access Pattern & Call Granularity**:
+   - `Pre-Cached SoA`: Gathers fragmented inner tables into an L1-resident array once per frame ($O(E)$ prep).
+   - `ChunkOptimized`: Direct chunk slice pointer iteration with $O(U+E)$ VTable boundary crossings.
+   - `Direct Idiomatic Nested Query`: Standard Bevy query loop re-walking 6 fragmented tables per outer entity.
+   - `EntityNestedVTable`: $O(U \times E)$ indirect VTable calls inside the inner nested loop + `iter_reset`.
+   - `NaiveChattyFfi`: $O(U \times E)$ VTable reads/writes + per-pair `iter_mark_changed` invocations.
+3. **Host Build Target**: `Release` (`opt-level=3`) vs. `Debug` (`opt-level=0`, unoptimized Bevy scheduler).
+4. **Guest Mod Build Target**: `Release` / `-O3` (production mod) vs. `Debug` / `-O0` (development mod with debug symbols).
+5. **Simulation Topology & Scale**:
+   - 34 total archetypes (16 active unit tables × 6 active emitter tables + 12 excluded decoy/frozen tables).
+   - Standard Scale: 1,024 units × 48 emitters = 49,152 pair evaluations/frame.
+   - Heavy Scale: 3,072 units × 96 emitters = 294,912 pair evaluations/frame.
+
+### 5.3 Benchmark Metrics Baseline & Results Summary
 - **Single-Query Linear Scale (`benchmarks.rs`)**:
-  - **100,000 Entities Throughput**: ~**20.3M+ entities/sec** in debug host, >**250M+ entities/sec** in release host.
+  - **100,000 Entities Throughput**: ~**20.3M+ entities/sec** in debug host, >**100M+ entities/sec** in release host.
   - **Archetype Fragmentation**: Traversal remains consistent across 1-way, 4-way, and 16-way fragmented archetypes.
-- **Full Multi-Architecture × `Debug`/`Release` Nested Query Matrix (`benches/permutation_bench`, [`docs/BENCHMARKS.md`](BENCHMARKS.md))**:
-  - Evaluates a **34-archetype** world (16 active unit tables × 6 active emitter tables + 12 excluded decoy/frozen tables; nested `Transform3D` & `Kinematics` `Vec3f` sub-structs) at `49,152` and `294,912` pair evaluations/frame.
-  - Verifies mathematical oracle equivalence across Pure Native Bevy, Coupled Rust `dylib`, C-ABI Rust `cdylib`, and C-ABI C99 across all `Debug` and `Release` targets, mapping the full `1.00x` (`0.186 ms`) -> `66.47x` (`12.39 ms`) performance degradation ladder.
+- **Full Multi-Architecture × `Debug`/`Release` Nested Query Matrix ([`docs/BENCHMARKS.md`](BENCHMARKS.md))**:
+  - Proves **True Native Parity (`1.00x`–`1.15x`)**: Chunk-Optimized C-ABI (`0.186 ms` C99 / `0.215 ms` Rust) matches Pure Native Bevy (`0.186 ms` SoA / `0.218 ms` nested) within margin of error, without compiler lock-in.
+  - Maps the full **`1.00x` -> `66.47x` performance degradation ladder**, proving that chatty per-pair FFI dispatches and unoptimized debug hosts consume up to `74.3%` of the 60 FPS frame budget.
+  - Demonstrates the **Decoupled Cross-Profile Advantage**: a `Debug` Bevy Host running a `Release` C-ABI mod runs in `0.39 ms` (**`2.10x`**), which is **`20x` faster** than unoptimized Pure Native Bevy in Debug (`8.26 ms`).

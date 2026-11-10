@@ -220,7 +220,8 @@ The root `Makefile` provides unified workflows for building, testing, and benchm
 | `make build` | Compiles workspace crates and all test mods (C99 & Rust cdylib). |
 | `make test` | Runs all workspace unit and integration tests (`345+` tests). |
 | `make test-e2e` | Runs the full 9-stage end-to-end verification pipeline. |
-| `make bench` | Executes high-scale benchmarks and outputs `target/benchmark_results.json`. |
+| `make bench` | Executes full multi-architecture & cross-profile permutation benchmark matrix. |
+| `make bench-quick` | Runs Milestone 4 host_runtime single-query benchmark (1k, 10k, 100k entities). |
 | `make check` | Runs static type checks across all targets with 0 warnings/errors. |
 | `make fmt` | Formats all Rust code across the workspace. |
 | `make clean` | Cleans all target directories and build artifacts. |

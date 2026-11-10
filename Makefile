@@ -20,16 +20,24 @@ help: ## Display this help message
 	@echo ""
 
 .PHONY: build
-build: build-mods ## Build the entire workspace and all asymmetric guest mods
+build: build-mods build-bench-mods ## Build the entire workspace and all asymmetric guest mods
 	@echo -e "$(GREEN)[BUILD]$(RESET) Compiling workspace..."
 	cargo build --workspace
 
 .PHONY: build-mods
-build-mods: ## Build asymmetric C99 (.so/.dylib) and Rust (.cdylib) guest mods
+build-mods: ## Build test asymmetric C99 (.so/.dylib) and Rust (.cdylib) guest mods
 	@echo -e "$(GREEN)[BUILD-MODS]$(RESET) Compiling asymmetric C99 guest mod..."
 	$(MAKE) -C tests/asymmetric_c_mod
 	@echo -e "$(GREEN)[BUILD-MODS]$(RESET) Compiling asymmetric Rust guest mod (independent Cargo lockfile)..."
 	cargo build --manifest-path tests/asymmetric_rust_mod/Cargo.toml --release
+
+.PHONY: build-bench-mods
+build-bench-mods: ## Build benchmark guest mods (C99 debug/release & Rust cdylib debug/release)
+	@echo -e "$(GREEN)[BUILD-BENCH-MODS]$(RESET) Compiling benchmark C99 mods (-O0 debug & -O3 release)..."
+	$(MAKE) -C benches/c_abi_c99_mod
+	@echo -e "$(GREEN)[BUILD-BENCH-MODS]$(RESET) Compiling benchmark C-ABI Rust mod (debug & release)..."
+	cargo build --manifest-path benches/c_abi_rust_mod/Cargo.toml
+	cargo build --manifest-path benches/c_abi_rust_mod/Cargo.toml --release
 
 .PHONY: check
 check: ## Run static type checks across all workspace targets
@@ -47,7 +55,7 @@ test-e2e: ## Execute comprehensive 9-stage end-to-end verification pipeline
 	bash scripts/run_e2e_tests.sh
 
 .PHONY: bench
-bench: build-mods ## Run full cross-architecture & debug/release permutation benchmark matrix
+bench: build-mods build-bench-mods ## Run full cross-architecture & debug/release permutation benchmark matrix
 	@echo -e "$(GREEN)[BENCH]$(RESET) Running complete permutation benchmark suite (Debug + Release x Native + Rust dylib + C-ABI Rust/C99)..."
 	cargo run --release -p permutation_bench
 	@if [ -f "target/benchmark_results.json" ]; then \

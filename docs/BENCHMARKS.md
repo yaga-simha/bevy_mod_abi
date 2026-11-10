@@ -1,80 +1,189 @@
 # Comprehensive Benchmark Matrix: Native vs. Coupled `dylib` vs. Asymmetric C-ABI (`Debug` & `Release`)
 
-This document presents the full cross-architecture and cross-profile empirical performance evaluation of **`bevy_abi_mod`**. Every permutation of execution model, access pattern, and build target (`dev`/`debug` vs. `release`/`-O3`) is benchmarked inside a live Bevy ECS `App` running a **34-archetype nested `Query` simulation**.
+This document details the **benchmarking methodology, parameter spaces, execution flow, and empirical results** of **`bevy_abi_mod`**. Every permutation of execution architecture, FFI access pattern, and build target (`dev`/`debug` vs. `release`/`-O3`) is benchmarked inside a live Bevy ECS `App` running a **34-archetype nested `Query` simulation**.
 
-To reproduce all measurements and regenerate [`target/benchmark_results.json`](../target/benchmark_results.json):
+To execute the entire automated benchmarking matrix and regenerate [`target/benchmark_results.json`](../target/benchmark_results.json):
 
 ```bash
+# Full multi-architecture & cross-profile permutation matrix:
 make bench
-# or directly:
+
+# Or directly via cargo:
 cargo run --release -p permutation_bench
+
+# Or run the quick linear throughput benchmark (1k, 10k, 100k entities):
+make bench-quick
 ```
 
 ---
 
-## 1. Benchmark Architecture & Complex Multi-Archetype Workload
+## 1. Benchmarking Flow & Orchestration Methodology
 
-Simple single-archetype `Position += Velocity` microbenchmarks mask the real costs of dynamic ECS modding: multi-table archetype switching, negative query filters (`Without<T>`), interior pointers into nested structs, VTable dispatch overhead, change-detection tick updates, and unoptimized cross-profile FFI boundaries.
+Evaluating native modding performance requires isolating multiple compounding variables: compiler optimizations, dynamic linker overhead, archetype fragmentation, VTable dispatch costs, and cache locality. `permutation_bench` is structured as a **multi-stage orchestrator and isolated worker pipeline**:
 
-### 1.1 Nested Compound Component Graph (`benches/shared_scenario`)
+```mermaid
+flowchart TD
+    subgraph S0["Stage 0: Compilation & Artifact Preparation"]
+        B1["Build C99 Mods<br/>(-O0 debug & -O3 release)"]
+        B2["Build C-ABI Rust cdylib<br/>(dev debug & --release)"]
+        B3["Build Coupled Rust dylib<br/>(dev debug & --release)"]
+        B4["Build Host Runner<br/>(dev debug & --release)"]
+    end
 
-The benchmark world ([`benches/shared_scenario/src/lib.rs`](../benches/shared_scenario/src/lib.rs)) defines **15 ECS components** and nested `#[derive(ModExposable)]` sub-structs:
-- **`Transform3D`**: contains **two nested `Vec3f` structs** (`position: Vec3f`, `forward: Vec3f`) plus `scale: f32` (accessed across C-ABI via `Transform3D_ptr_position` / `Transform3D_ptr_mut_position` + `Vec3fVTable`).
-- **`Kinematics`**: contains a **nested `Vec3f` struct** (`velocity: Vec3f`) plus `drag: f32` and `max_speed: f32`.
-- **`Vitality`**: `health`, `max_health`, `shield`, `energy` (`f32 × 4`).
-- **`Resistance`**: `kinetic`, `thermal`, `ionic` (`f32 × 3`).
-- **`AuraEmitter`**: `radius`, `force`, `thermal_dps`, `heal_hps`, `falloff` (`f32 × 5`).
-- **`Faction`**: `team_id: u32`, `serial_id: u32`.
-- **Archetype Fragmentation & Filter Components**: `CombatUnitTag`, `EmitterBeaconTag`, `FrozenFlag`, `ArmorPlating`, `StealthCloak`, `SquadLeader`, `Overcharged`, `PulseModulator`, and heap-allocated `TelemetryTag { label: String }`.
+    subgraph S1["Stage 1: Multi-Process Profile Isolation"]
+        O["Orchestrator Binary<br/>(permutation_bench)"] -->|Spawns --worker| W_REL["Release Host Worker<br/>(opt-level=3)"]
+        O -->|Spawns --worker| W_DBG["Debug Host Worker<br/>(opt-level=0)"]
+    end
 
-### 1.2 34-Archetype World Topology
+    subgraph S2["Stage 2: Per-Worker Execution Flow"]
+        direction TB
+        STEP_A["Step A: Mathematical Oracle Verification<br/>(Assert bit-accurate float equality across all permutations)"]
+        STEP_B["Step B: Isolated Dynamic Linker & Handshake Profiling<br/>(Uncached unique copies for cold OS dlopen vs handshake/VTable init)"]
+        STEP_C["Step C: Standard Scale Nested Query Execution<br/>(1,024 units x 48 emitters across 34 archetypes = 49,152 pairs/frame)"]
+        STEP_D["Step D: High-Scale Stress Tier (Release Host)<br/>(3,072 units x 96 emitters = 294,912 pairs/frame)"]
+        STEP_A --> STEP_B --> STEP_C --> STEP_D
+    end
 
-`populate_scenario_world` deterministically populates **34+ distinct Bevy Archetype Tables**:
-1. **16 Active Combat Unit Archetypes**: Every combination of optional `[ArmorPlating, StealthCloak, SquadLeader, Overcharged]` (`2^4 = 16` tables) carrying `(Transform3D, Kinematics, Vitality, Resistance, Faction, CombatUnitTag)` and `Without<EmitterBeaconTag>`, `Without<FrozenFlag>`.
-2. **6 Active Aura Emitter Archetypes**: 6 distinct component combinations (`PulseModulator`, `Overcharged`, `StealthCloak`, `TelemetryTag(String)`) carrying `(Transform3D, AuraEmitter, Faction, EmitterBeaconTag)` and `Without<CombatUnitTag>`, `Without<FrozenFlag>`.
-3. **12 Excluded Decoy & Frozen Archetypes**: Frozen units (`With<FrozenFlag>`), frozen emitters, static props, partial-component decoys, and dual-tagged entities that must be rejected at zero runtime cost by Bevy's archetype filter graph.
+    subgraph S3["Stage 3: Aggregation & Reporting"]
+        AGG["TSV Aggregation & Statistical Ranking"]
+        CON["Terminal Comparative Degradation Ladder"]
+        JSON["target/benchmark_results.json Export"]
+        AGG --> CON
+        AGG --> JSON
+    end
 
-### 1.3 Pairwise Nested Query Workload & Mathematical Oracle
+    S0 --> S1
+    W_REL --> S2
+    W_DBG --> S2
+    S2 --> S3
+```
 
-Every frame executes an outer-by-inner pairwise spatial field simulation (`native_nested_aura_combat_system`):
-- **Standard Scale**: `1,024` active units (across 16 tables) × `48` active emitters (across 6 tables) = **`49,152` pair evaluations/frame** (`1,328` total entities).
-- **Heavy Stress Scale**: `3,072` active units × `96` active emitters = **`294,912` pair evaluations/frame** (`3,552` total entities).
-- **Oracle Verification**: Before recording any timing, `OracleDigest` runs 4 simulation frames across **every single permutation** (Pure Native Bevy, Coupled Rust `dylib`, C-ABI Rust `cdylib`, and C-ABI C99 across `Debug`, `Release`, and all 3 FFI access patterns) and asserts bit-accurate floating-point agreement (`< 1e-4` tolerance across all 1,024 units).
+### 1.1 Multi-Process Worker Isolation (`--worker`)
+Running both `Debug` and `Release` host profiles inside a single OS process is impossible in Rust because compiler optimization levels apply globally to the compiled binary.
+To solve this:
+1. `permutation_bench` builds both `target/debug/permutation_bench` and `target/release/permutation_bench`.
+2. The orchestrator launches each as a separate child process via `cargo run [-p permutation_bench -- --worker <tsv_path>]`.
+3. This eliminates process-global allocator contention, prevents dynamic linker caching between host variants, and guarantees clean statistical separation between unoptimized and optimized runtimes.
+
+### 1.2 Mathematical Oracle Verification (`OracleDigest`)
+A benchmark is invalid if different implementations take shortcuts or compute divergent results.
+Before recording any execution timing, every permutation runs 4 warmup simulation ticks under [`ScenarioConfig::oracle()`](../benches/shared_scenario/src/lib.rs):
+- Captures position, velocity, vitality (health, shield, energy), and faction checksums across all 1,024 units.
+- Compares each guest mod's output against the golden Pure Native Bevy baseline.
+- Asserts strict bit-accurate floating-point equality ($\Delta < 10^{-4}$ max component tolerance).
+- Execution aborts immediately if any implementation deviates.
+
+### 1.3 Uncached OS Dynamic Linker (`dlopen`) Measurement
+Operating systems (macOS `dyld`, Linux `ld.so`) cache loaded shared libraries. Calling `dlopen` on an already-loaded path increments an internal reference count and returns in $< 1\ \mu\text{s}$, hiding the real cost of disk I/O, Mach-O/ELF header parsing, address space layout randomization (ASLR), and symbol rebinding.
+To measure genuine dynamic loading performance:
+- For every measurement sample, the benchmark copies the compiled `.dylib`/`.so` to a unique temporary filename (`cabi_load_{target}_r{round}.dylib`).
+- It profiles the fresh OS loader mapping time separately from the `bevy_abi_mod` handshake (`get_proc_address` for 8 component VTables) and Bevy's 34-archetype schedule initialization (`Schedule::initialize`).
 
 ---
 
-## 2. Dimension 1: Mod Loading, Handshake & Unload Matrix (`Debug` vs. `Release`)
+## 2. Permutation Parameter Space (Variables & Dimensions)
 
-Each sample copies the shared library to a fresh temporary file path so the OS dynamic loader (`dyld` / `ld.so`) performs genuine Mach-O/ELF mapping and symbol binding rather than returning a `< 1 µs` cached handle. `Init+Sch` isolates the `bevy_abi_mod` handshake (`get_proc_address` for 8 VTables + `register_multi_query_system`) and Bevy's 34-archetype `Schedule::initialize`.
+The benchmarking matrix systematically explores a 5-dimensional parameter space to expose where overhead originates:
 
-| Architecture | Host Target | Mod Target | Compatibility | Binary Size | Cold OS `dlopen` | ABI Handshake + 34-Arch Schedule Init | Unload / `dlclose` | Lifecycle Notes |
+| Dimension / Variable | Parameter Choices | Purpose & Significance |
+|---|---|---|
+| **1. Execution Architecture** | • `Pure Native Bevy (No-Mod)`<br>• `Coupled Rust dylib Mod`<br>• `C-ABI Rust cdylib Mod`<br>• `C-ABI C99 Mod`<br>• `Dual Concurrent C99 + Rust` | Evaluates the cost of the ABI boundary itself: statically monomorphized inlined code vs. unstable Rust dynamic linkage vs. decoupled C-ABI boundary vs. language-agnostic C99. |
+| **2. FFI Access Pattern** | • `Pre-Cached SoA`<br>• `ChunkOptimized`<br>• `Direct Idiomatic Nested Query`<br>• `EntityNestedVTable`<br>• `NaiveChattyFfi` | Evaluates call granularity: amortized $O(U+E)$ chunk traversal vs. $O(U \times E)$ indirect VTable getters vs. chatty per-pair memory reads/writes with change-detection tick updates. |
+| **3. Host Build Profile** | • `Release` (`opt-level=3`, LTO, loop unrolling)<br>• `Debug` (`opt-level=0`, debuginfo, debug assertions) | Measures how Bevy's internal ECS storage lookups and schedule graph execution perform when unoptimized vs. fully optimized. |
+| **4. Mod Build Profile** | • `Release` / `-O3` (production mod)<br>• `Debug` / `-O0` (development mod with debug info) | Determines whether mod authors can write unoptimized code for interactive LLDB/GDB debugging without destroying game frame rates. |
+| **5. Simulation Scale & Topology** | • Standard: 1,024 units × 48 emitters (49,152 pairs/frame)<br>• Heavy: 3,072 units × 96 emitters (294,912 pairs/frame) across 34 archetypes | Tests scalability, CPU cache locality, and ensures zero per-frame heap allocations during steady-state execution. |
+
+---
+
+## 3. Workload Design: 34-Archetype Nested Spatial Combat
+
+Simple single-archetype microbenchmarks (`Position += Velocity`) mask the real-world overhead of dynamic modding. The benchmark scenario ([`benches/shared_scenario/src/lib.rs`](../benches/shared_scenario/src/lib.rs)) models a complex multi-system interaction:
+
+### 3.1 Component Graph & Nested Compound Structs
+The scenario defines **15 ECS components** and nested `#[derive(ModExposable)]` sub-structs:
+- **`Transform3D`**: contains **two nested `Vec3f` structs** (`position: Vec3f`, `forward: Vec3f`) and `scale: f32`. Accessed across the C-ABI via interior pointer accessors (`Transform3D_ptr_position` / `Transform3D_ptr_mut_position` + `Vec3fVTable`).
+- **`Kinematics`**: contains a **nested `Vec3f` struct** (`velocity: Vec3f`), `drag: f32`, and `max_speed: f32`.
+- **`Vitality`**: multi-pool health state (`health: f32`, `max_health: f32`, `shield: f32`, `energy: f32`).
+- **`Resistance`**: damage mitigation factors (`kinetic: f32`, `thermal: f32`, `ionic: f32`).
+- **`AuraEmitter`**: radial field emitter parameters (`radius`, `force`, `thermal_dps`, `heal_hps`, `falloff`).
+- **`Faction`**: team alignment (`team_id: u32`, `serial_id: u32`).
+- **Archetype Fragmentation Tags**: `CombatUnitTag`, `EmitterBeaconTag`, `FrozenFlag`, `ArmorPlating`, `StealthCloak`, `SquadLeader`, `Overcharged`, `PulseModulator`, and `TelemetryTag { label: String }`.
+
+### 3.2 34 Archetype Table Topology
+[`populate_scenario_world`](../benches/shared_scenario/src/lib.rs) deterministically populates **34+ distinct Bevy Archetype Tables**:
+1. **16 Active Unit Archetypes**: Every permutation of optional `[ArmorPlating, StealthCloak, SquadLeader, Overcharged]` ($2^4 = 16$ tables) carrying `(Transform3D, Kinematics, Vitality, Resistance, Faction, CombatUnitTag)` and filtered with `Without<EmitterBeaconTag>`, `Without<FrozenFlag>`.
+2. **6 Active Emitter Archetypes**: 6 distinct component combinations carrying `(Transform3D, AuraEmitter, Faction, EmitterBeaconTag)` and filtered with `Without<CombatUnitTag>`, `Without<FrozenFlag>`.
+3. **12 Excluded Decoy & Frozen Archetypes**: Static props, frozen units (`With<FrozenFlag>`), incomplete entities, and dual-tagged decoys that must be skipped by the schedule's filter graph at zero per-entity cost.
+
+### 3.3 Physics & Aura Interaction Math
+For each combat unit, the system evaluates all active emitters:
+- Calculates 3D distance with soft-core smoothing: $d^2 = \Delta x^2 + \Delta y^2 + \Delta z^2 + 0.25$.
+- Evaluates non-linear radial falloff: $\text{atten} = \frac{1.0 - (d / r)}{1.0 + \text{falloff} \cdot d^2}$.
+- **Friendly Emitters (`team_id == emitter.team_id`)**: applies directional impulse boost along `emitter.forward`, ionic-scaled health repair, and energy regeneration.
+- **Hostile Emitters (`team_id != emitter.team_id`)**: applies radial repulsive blast impulse attenuated by kinetic resistance, thermal damage absorbed by shields before draining health, and energy drain attenuated by ionic resistance.
+- Integrates quadratic aerodynamic drag, clamps speed to `max_speed`, advances 3D translation by $v \cdot \Delta t$, and realigns orientation vector `forward` along velocity.
+
+---
+
+## 4. The 5 Access Patterns (FFI Call Granularity)
+
+The benchmark evaluates 5 distinct access patterns to pinpoint where performance is lost or gained:
+
+```
+Pattern 1: Pre-Cached SoA (Hardware Ceiling)
+  [Outer Query] ---> Gathers 6 Emitter Tables once into L1 Local<Vec<CachedEmitter>>  (O(E) prep)
+  [Inner Loop]  ---> Contiguous L1-resident SIMD-friendly loop over flat array         (O(U * E) math)
+
+Pattern 2: ChunkOptimized (O(U + E) VTable crossings)
+  [C-ABI Boundary] -> Crosses FFI once per archetype chunk table                     (O(Chunks) FFI)
+  [Inner Loop]     -> Iterates contiguous column byte slices via direct pointers      (O(U * E) math)
+
+Pattern 3: Direct Idiomatic Nested Query (Standard Bevy)
+  [Outer Query] ---> For each unit, re-queries 6 fragmented emitter tables           (6,144 table switches)
+  [Inner Loop]  ---> Evaluates inner QueryIter per outer unit                         (O(U * E) math)
+
+Pattern 4: EntityNestedVTable (O(U * E) Getters)
+  [C-ABI Boundary] -> Rewinds inner iterator via iter_reset per outer unit           (O(U) resets)
+  [Inner Loop]     -> Calls extern "C" VTable getters for every field read           (~600,000 FFI calls)
+
+Pattern 5: NaiveChattyFfi (O(U * E) R/W + Tick)
+  [C-ABI Boundary] -> Rewinds inner iterator via iter_reset per outer unit           (O(U) resets)
+  [Inner Loop]     -> Calls VTable getters + setters + iter_mark_changed per pair    (~1,000,000 FFI calls)
+```
+
+---
+
+## 5. Dimension 1 Results: Mod Loading, Handshake & Lifecycle
+
+| Architecture | Host Target | Mod Target | Compatibility Status | Binary Size | Cold OS `dlopen` | Handshake + 34-Arch Schedule Init | Unload / `dlclose` | Key Architectural Observations |
 |---|---|---|---|---:|---:|---:|---:|---|
-| **Pure Native Bevy (No-Mod)** | `release` | `static` | **OK** | `0 KB` | `0.0 µs` | **`7.8 µs`** | `0.0 µs` | Statically linked into host binary |
-| **Pure Native Bevy (No-Mod)** | `debug` | `static` | **OK** | `0 KB` | `0.0 µs` | **`128.2 µs`** | `0.0 µs` | Unoptimized Bevy schedule graph build |
-| **Coupled Rust `dylib` Mod** | `release` | `release` | **OK (Fragile)** | `209.2 KB` | `~44–125 ms` | `134.1 µs` | *Unsafe to `dlclose`*\* | Requires identical `rustc` + flags + shared `dylib` |
-| **Coupled Rust `dylib` Mod** | `release` | `debug` | **`ABI_LOCKED`** | `N/A` | `N/A` | `N/A` | `N/A` | **Fails**: `StableCrateId` & `TypeId` hashes mismatch |
-| **Coupled Rust `dylib` Mod** | `debug` | `release` | **`ABI_LOCKED`** | `N/A` | `N/A` | `N/A` | `N/A` | **Fails**: `StableCrateId` & `TypeId` hashes mismatch |
-| **Coupled Rust `dylib` Mod** | `debug` | `debug` | **OK (Fragile)** | `478.4 KB` | `~51–236 ms` | `493.4 µs` | *Unsafe to `dlclose`*\* | Cannot safely unmap TLS/TypeId drop glue |
-| **C-ABI Rust `cdylib` Mod** | `release` | `release` | **OK (Decoupled)** | `378.2 KB` | `~48–137 ms` | **`151.8 µs`** | **`0.4–65 µs`** | Resolves 8 VTables + registers multi-query system |
-| **C-ABI Rust `cdylib` Mod** | `release` | `debug` | **OK (Decoupled)** | `493.3 KB` | `~46–180 ms` | **`180.8 µs`** | **`0.6–80 µs`** | **Works seamlessly across Release Host + Debug Mod** |
-| **C-ABI Rust `cdylib` Mod** | `debug` | `release` | **OK (Decoupled)** | `378.2 KB` | `~13.6–48 ms` | **`257.0 µs`** | **`2.0 µs`** | **Works seamlessly across Debug Host + Release Mod** |
-| **C-ABI Rust `cdylib` Mod** | `debug` | `debug` | **OK (Decoupled)** | `493.3 KB` | `~12.1–55 ms` | **`263.2 µs`** | **`2.5 µs`** | Full debug symbols on both sides |
-| **C-ABI C99 Mod** | `release` | `release (-O3)` | **OK (Decoupled)** | **`33.2 KB`** | `~42–198 ms` | **`201.4 µs`** | `915–1077 µs` | Tiny 33 KB pure C99 binary; clean `dlclose` |
-| **C-ABI C99 Mod** | `release` | `debug (-O0)` | **OK (Decoupled)** | **`34.3 KB`** | `~45–262 ms` | **`144.6 µs`** | `915.9 µs` | Debug C99 mod inside Release Bevy Host |
-| **C-ABI C99 Mod** | `debug` | `release (-O3)` | **OK (Decoupled)** | **`33.2 KB`** | `~6.8–44 ms` | **`215.9 µs`** | `876.2 µs` | Optimized C99 mod inside Debug Bevy Host |
-| **C-ABI C99 Mod** | `debug` | `debug (-O0)` | **OK (Decoupled)** | **`34.3 KB`** | `~8.3–43 ms` | **`304.5 µs`** | `877.5 µs` | Full `-O0 -g` source-level C debugging |
+| **Pure Native Bevy (No-Mod)** | `release` | `static` | **OK** | `0 KB` | `0.0 µs` | **`7.8 µs`** | `0.0 µs` | Statically linked into host binary. Zero dynamic loading. |
+| **Pure Native Bevy (No-Mod)** | `debug` | `static` | **OK** | `0 KB` | `0.0 µs` | **`128.2 µs`** | `0.0 µs` | Unoptimized Bevy schedule graph compilation overhead. |
+| **Coupled Rust `dylib` Mod** | `release` | `release` | **OK (Fragile)** | `209.2 KB` | `~44–125 ms` | `134.1 µs` | *Unsafe to `dlclose`*\* | Requires identical `rustc` + flags + shared `dylib`. |
+| **Coupled Rust `dylib` Mod** | `release` | `debug` | **`ABI_LOCKED`** | `N/A` | `N/A` | `N/A` | `N/A` | **Fails**: `StableCrateId` & `TypeId` hashes mismatch. |
+| **Coupled Rust `dylib` Mod** | `debug` | `release` | **`ABI_LOCKED`** | `N/A` | `N/A` | `N/A` | `N/A` | **Fails**: `StableCrateId` & `TypeId` hashes mismatch. |
+| **Coupled Rust `dylib` Mod** | `debug` | `debug` | **OK (Fragile)** | `478.4 KB` | `~51–236 ms` | `493.4 µs` | *Unsafe to `dlclose`*\* | Cannot safely unmap TLS/TypeId drop glue. |
+| **C-ABI Rust `cdylib` Mod** | `release` | `release` | **OK (Decoupled)** | `378.2 KB` | `~48–137 ms` | **`151.8 µs`** | **`0.4–65 µs`** | Resolves 8 VTables + registers multi-query system. |
+| **C-ABI Rust `cdylib` Mod** | `release` | `debug` | **OK (Decoupled)** | `493.3 KB` | `~46–180 ms` | **`180.8 µs`** | **`0.6–80 µs`** | **Works seamlessly across Release Host + Debug Mod.** |
+| **C-ABI Rust `cdylib` Mod** | `debug` | `release` | **OK (Decoupled)** | `378.2 KB` | `~13.6–48 ms` | **`257.0 µs`** | **`2.0 µs`** | **Works seamlessly across Debug Host + Release Mod.** |
+| **C-ABI Rust `cdylib` Mod** | `debug` | `debug` | **OK (Decoupled)** | `493.3 KB` | `~12.1–55 ms` | **`263.2 µs`** | **`2.5 µs`** | Full debug symbols on both sides. |
+| **C-ABI C99 Mod** | `release` | `release (-O3)` | **OK (Decoupled)** | **`33.2 KB`** | `~42–198 ms` | **`201.4 µs`** | `915–1077 µs` | Tiny 33 KB pure C99 binary; clean `dlclose`. |
+| **C-ABI C99 Mod** | `release` | `debug (-O0)` | **OK (Decoupled)** | **`34.3 KB`** | `~45–262 ms` | **`144.6 µs`** | `915.9 µs` | Debug C99 mod inside Release Bevy Host. |
+| **C-ABI C99 Mod** | `debug` | `release (-O3)` | **OK (Decoupled)** | **`33.2 KB`** | `~6.8–44 ms` | **`215.9 µs`** | `876.2 µs` | Optimized C99 mod inside Debug Bevy Host. |
+| **C-ABI C99 Mod** | `debug` | `debug (-O0)` | **OK (Decoupled)** | **`34.3 KB`** | `~8.3–43 ms` | **`304.5 µs`** | `877.5 µs` | Full `-O0 -g` source-level C debugging. |
 
-> **\*Critical Finding on Coupled Rust `dylib` Unloading (`SIGSEGV` Hazard):** Calling `dlclose` (`drop(Library)`) on a Coupled Rust `dylib` after registering native Rust systems into Bevy causes a `SIGSEGV` when TLS destructors or leftover `TypeId` vtables execute during shutdown because they point into unmapped `.text`/`.rodata` pages. By contrast, `bevy_abi_mod` C-ABI mods keep all Rust trait vtables (`DynamicCSystem`) inside the **Host** binary and cleanly disable/evict guest callbacks before `dlclose`.
+> **\*Coupled Rust `dylib` Unloading Hazard (`SIGSEGV`):** Calling `dlclose` (`drop(Library)`) on a Coupled Rust `dylib` after registering native Rust systems into Bevy causes a `SIGSEGV` when thread-local storage (TLS) destructors or leftover `TypeId` vtables execute during shutdown because they point into unmapped `.text`/`.rodata` pages. By contrast, `bevy_abi_mod` C-ABI mods keep all Rust trait vtables (`DynamicCSystem`) inside the **Host** binary and cleanly disable/evict guest callbacks before `dlclose`.
 >
-> **Note on Cold `dlopen` Latency on macOS:** First-time loading of a newly written unsigned `.dylib` path on macOS incurs `amfid`/signature verification (`~12–200 ms`), whereas warm/cached `dlopen` + full `bevy_abi_mod` 8-VTable handshake + 34-archetype Bevy schedule initialization completes in **`130–200 µs` (`0.15 ms`)**.
+> **Cold `dlopen` Latency on macOS:** First-time loading of a newly written unsigned `.dylib` path on macOS incurs `amfid`/Gatekeeper signature verification (`~12–200 ms`), whereas warm/cached `dlopen` + full `bevy_abi_mod` 8-VTable handshake + 34-archetype Bevy schedule initialization completes in **`130–200 µs` (`0.15 ms`)**.
 
 ---
 
-## 3. Dimension 2: The Complete Performance Degradation Ladder (`1.00x` -> `66.47x`)
+## 6. Dimension 2 Results: The Full Degradation Ladder (`1.00x` -> `66.47x`)
 
-All rows below execute the **exact same 34-archetype nested spatial combat simulation** (`1,024` active units across 16 tables × `48` active emitters across 6 tables = **`49,152` pair evaluations/frame**), ranked from **True Native Hardware Ceiling (`1.00x`)** down to the worst unoptimized/chatty FFI permutation (**`66.47x` slower**):
+Standard Scale: **`1,024` active units across 16 tables × `48` active emitters across 6 tables = `49,152` pair evaluations/frame** across 34 total archetypes.
+Ranked from **`1.00x` True Native Release Baseline (`0.186 ms`)** down to worst-case unoptimized FFI (**`66.47x` slower**):
 
-| Rank | Architecture | Access Pattern | Host Target | Mod Target | Median Frame | `ns / pair` | Slowdown vs True Native | 60 FPS Budget (`16.67 ms`) |
+| Rank | Architecture | Access Pattern | Host Target | Mod Target | Median Frame | `ns / pair` | Slowdown vs Native | 60 FPS Budget (`16.67 ms`) |
 |---:|---|---|---|---|---:|---:|---:|---:|
 | **1** | **Coupled Rust `dylib`** | Pre-Cached SoA + Shared Rust `Query` | `release` | `release` | **`0.1823 ms`** | `3.71 ns` | **`0.98x`** | `1.1%` |
 | **2** | **C-ABI C99 Mod** | **`ChunkOptimized` ($O(U+E)$ VTable)** | `release` | `release (-O3)` | **`0.1856 ms`** | `3.78 ns` | **`1.00x`** | `1.1%` |
@@ -113,9 +222,9 @@ All rows below execute the **exact same 34-archetype nested spatial combat simul
 
 ---
 
-## 4. Dimension 3: High-Scale Stress Tier (`294,912` Pairs/Frame across 34 Archetypes)
+## 7. Dimension 3 Results: High-Scale Stress Tier (`294,912` Pairs/Frame)
 
-Scaling `6x` higher (`3,072` units × `96` emitters = **`294,912` pairwise 3D combat evaluations per frame**) in a `Release` Host confirms linear scaling with zero per-frame heap allocations:
+Scaling `6x` higher (**`3,072` units × `96` emitters = `294,912` pairwise 3D evaluations per frame**) in a `Release` Host confirms linear scaling with zero steady-state heap allocations:
 
 | Architecture | Access Pattern | Host Target | Mod Target | Median Frame | `ns / pair` | Slowdown vs Native Ceiling | 60 FPS Budget |
 |---|---|---|---|---:|---:|---:|---:|
@@ -133,29 +242,32 @@ Scaling `6x` higher (`3,072` units × `96` emitters = **`294,912` pairwise 3D co
 
 ---
 
-## 5. Architectural Takeaways: Why Performance Degrades Step-by-Step
+## 8. In-Depth Analysis: Why Performance Degrades Across the Ladder
 
-1. **Tier 0 (`1.00x` — `0.186 ms` / `3.79 ns/pair`): What True Native Performance Actually Is**
-   - When both Host and Guest are compiled in `release` (`-O3`), **Chunk-Optimized C-ABI (`0.186 ms` in C99, `0.215 ms` in Rust `cdylib`) matches Pure Native Bevy (`0.186 ms` SoA-cached, `0.218 ms` idiomatic nested `Query`) within `0%–15%`**.
-   - Even better: Chunk-Optimized C-ABI (`0.186 ms` C99 / `0.215 ms` Rust) **beats idiomatic Pure Native Bevy nested `Query` (`0.218 ms`)** because hoisting the 6 fragmented inner emitter tables once per frame eliminates `1,024 × 6 = 6,144` archetype table switches per frame and reduces VTable crossings from $O(U \times E)$ (`~600,000` calls) to $O(U + E)$ (`~29,000` calls).
+### Tier 0: What True Native Performance Actually Is (`1.00x` — `0.186 ms` / `3.79 ns/pair`)
+- Statically compiled Pure Native Bevy using monomorphized `Query` iteration across 16 outer unit tables and 6 inner emitter tables achieves **`0.186 ms`** with SoA caching and **`0.218 ms`** with direct nested iteration.
+- **Chunk-Optimized C-ABI (`0.186 ms` in C99, `0.215 ms` in Rust `cdylib`) matches True Native Bevy within margin of error (`0%–15%`)**.
+- In fact, Chunk-Optimized C-ABI (`0.186 ms` C99) **outperforms idiomatic Pure Native Bevy nested `Query` (`0.218 ms`)** because hoisting the 6 fragmented inner emitter tables once per frame eliminates $1,024 \times 6 = 6,144$ archetype table switches and avoids recreating query iterators.
 
-2. **Tier 1 (`1.01x`–`1.18x`): Coupled Rust `dylib` Gives Zero Speed Advantage Over Chunk-Optimized C-ABI — At Massive Safety/Portability Cost**
-   - Coupled Rust `dylib` (`0.182 ms` SoA-cached / `0.220 ms` direct nested `Query`) runs at virtually the same speed as `bevy_abi_mod` Chunk-Optimized C-ABI (`0.186 ms`–`0.215 ms`), yet:
-     - **Cannot load across `Debug`/`Release` profiles** (`ABI_LOCKED` due to `StableCrateId` & `TypeId` hash changes).
-     - **Cannot load across `rustc` patch releases**.
-     - **Cannot safely `dlclose`** without risking `SIGSEGV` during TLS/drop teardown.
+### Tier 1: Coupled Rust `dylib` Mod (`1.01x`–`1.18x`)
+- Shared Rust ABI dynamic plugins (`0.182 ms` SoA / `0.220 ms` nested query) provide **zero performance benefit over `bevy_abi_mod` Chunk-Optimized C-ABI**, yet suffer catastrophic drawbacks:
+  1. Cannot load across mismatched compiler optimization profiles (`ABI_LOCKED`).
+  2. Cannot load across different `rustc` compiler versions.
+  3. Cannot safely unmap (`dlclose`) without `SIGSEGV` hazards on TLS/TypeId drop glue.
 
-3. **Tier 2 (`2.10x`–`2.34x`): Running a `Debug` Host with a `Release` C-ABI Mod**
-   - A `Debug` Bevy Host running a `Release` C-ABI mod takes only **`0.39–0.44 ms` (`2.1x`–`2.3x`)**, whereas Pure Native Bevy in `Debug` takes **`8.26 ms` (`44.3x` slower)**!
-   - Why? Because `ChunkOptimized` crosses into the Host VTable only $O(U + E)$ times, while `99%` of the pairwise math executes inside the `-O3` / `--release` mod. Conversely, if you compile the **Mod** in `Debug` inside a `Release` Host (`0.94–1.14 ms`, **`5.1x`–`6.1x`**), mod developers get full source-levelLLDB/GDB stepping while still keeping `93%+` of their 60 FPS frame budget!
+### Tier 2: The Decoupled Cross-Profile Advantage (`2.10x` vs. `44.3x`)
+- Running an unoptimized **`Debug` Bevy Host** with Pure Native Bevy takes **`8.26 ms` (`44.3x` slower, consuming `49.5%` of the frame)** due to unoptimized `bevy_ecs` query iterator machinery.
+- With `bevy_abi_mod`, a `Debug` Bevy Host running a `Release` C-ABI mod runs in **`0.39–0.44 ms` (`2.10x`–`2.34x`)** — **`20x` faster than native Bevy in Debug**! Because `ChunkOptimized` crosses the FFI boundary only $O(U+E)$ times, `99%` of the inner math executes in optimized machine code.
+- Conversely, a `Release` Bevy Host running a **`Debug` C-ABI Mod** runs in **`0.94–1.14 ms` (`5.1x`–`6.1x`)**, giving mod developers full source-level LLDB/GDB stepping while consuming $< 7\%$ of the 60 FPS budget.
 
-4. **Tier 3 (`3.78x`–`3.85x`): Per-Pair Indirect VTable Calls (`EntityNestedVTable`)**
-   - Calling `iter_reset` per unit and invoking indirect `extern "C"` VTable getters inside the `U × E` inner loop prevents LLVM/Clang from inlining field reads or SIMD-vectorizing across emitters, costing **`~3.8x`** (`0.71 ms` vs `0.19 ms`) in `Release`.
-   - When the **Host** is compiled in `Debug`, those `~600,000` host-side VTable getter calls become unoptimized Rust functions, jumping to **`7.04 ms` (`37.8x` slower)**!
+### Tier 3: Per-Pair Indirect VTable Calls (`EntityNestedVTable`, `3.78x`–`3.85x` in Release)
+- Moving VTable getter calls inside the $U \times E$ inner loop and invoking `iter_reset` per unit introduces $\sim 600,000$ indirect C function pointer dispatches per frame.
+- This prevents the compiler from inlining field offsets or auto-vectorizing across emitters, increasing frame time to `0.70–0.72 ms` (`~3.8x` slowdown in Release).
+- In an unoptimized `Debug` Host, those 600,000 host-side getter calls jump to **`7.04 ms` (`37.8x` slowdown)**.
 
-5. **Tier 4 (`7.72x`–`66.47x`): Naive Chatty FFI + Per-Pair Tick Marking (`NaiveChattyFfi`)**
-   - Reading and writing component fields across VTable pointers on **every pair interaction** plus calling `iter_mark_changed` inside the inner loop forces pointer-aliased memory roundtrips and ~1M indirect FFI calls/frame:
-     - `Release` Host + `Release` Mod: **`1.44–1.47 ms` (`7.7x`–`7.9x` slower)**
-     - `Release` Host + `Debug` Mod: **`2.36–2.87 ms` (`12.7x`–`15.4x` slower)**
-     - `Debug` Host + `Release` Mod: **`10.48–10.52 ms` (`56.2x`–`56.5x` slower)**
-     - `Debug` Host + `Debug` Mod: **`12.15–12.39 ms` (`65.2x`–`66.5x` slower — consuming `74.3%` of the entire 60 FPS budget!)**
+### Tier 4: Naive Chatty FFI + Per-Pair Tick Marking (`NaiveChattyFfi`, `7.72x`–`66.47x`)
+- Reading and writing component fields across VTable pointers on every interaction pair plus calling `iter_mark_changed` inside the inner loop generates $\sim 1,000,000$ indirect FFI calls per frame with pointer-aliased memory traffic:
+  - `Release` Host + `Release` Mod: **`1.44–1.47 ms` (`7.7x`–`7.9x` slower)**
+  - `Release` Host + `Debug` Mod: **`2.36–2.87 ms` (`12.7x`–`15.4x` slower)**
+  - `Debug` Host + `Release` Mod: **`10.48–10.52 ms` (`56.2x`–`56.5x` slower)**
+  - `Debug` Host + `Debug` Mod: **`12.15–12.39 ms` (`65.2x`–`66.5x` slower)** — exhausting **`74.3%` of the entire 60 FPS frame budget**.
