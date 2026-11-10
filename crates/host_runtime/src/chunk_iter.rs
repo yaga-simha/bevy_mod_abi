@@ -1,6 +1,33 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(improper_ctypes_definitions)]
 
+//! # Archetype Table Chunk Traversal & Column Access
+//!
+//! This module implements [`HostChunkIter`] and the foreign C-ABI iteration API exposed
+//! via [`RawChunkIter`].
+//!
+//! ## Key Principles
+//! 1. **Zero-Allocation Columnar Traversal**:
+//!    - Bevy stores entity components in dense contiguous columnar arrays within [`Table`]s.
+//!    - [`HostChunkIter`] traverses matched tables sequentially, skipping empty tables
+//!      (`entity_count == 0`) to prevent premature termination.
+//!    - Directly exposes raw column memory pointers without intermediate array copies.
+//! 2. **Access Mode Permission Enforcement**:
+//!    - [`host_iter_column_readonly`]: Returns `*const u8`. Forbids access if column was
+//!      declared `FILTER_ONLY` or `WITHOUT`.
+//!    - [`host_iter_column_mutable`]: Returns `*mut u8`. Strictly verifies `mode == ComponentAccessMode::WRITE`.
+//!      If a mod requested read access and attempts mutable access, it returns null.
+//! 3. **Automatic & Fine-Grained Change Detection**:
+//!    - Calling [`host_iter_column_mutable`] automatically marks all row ticks in `changed_ticks`
+//!      and `summary_tick` as changed to `this_run`.
+//!    - [`host_iter_mark_changed`] allows selective, row-by-row change marking for fine-grained updates.
+//! 4. **Zero-Copy Entity Slices**:
+//!    - Bevy's [`bevy_ecs::entity::Entity`] has `#[repr(C, align(8))]`, matching [`FfiEntity`].
+//!    - [`host_iter_entities`] performs a direct zero-copy cast to `*const FfiEntity`.
+//! 5. **Iterator Reset**:
+//!    - [`host_iter_reset`] rewinds table traversal to the beginning, enabling efficient nested
+//!      query loops with zero reallocations.
+
 use abi_contract::{ComponentAccessMode, FfiEntity, FfiResult, RawChunkIter};
 use bevy_ecs::change_detection::{AtomicTick, Tick};
 use bevy_ecs::component::ComponentId;
@@ -8,26 +35,35 @@ use bevy_ecs::storage::{Table, TableId, TableRow, Tables};
 use core::cell::UnsafeCell;
 use nonmax::NonMaxU32;
 
+/// Maximum number of component columns supported per single query.
 pub const MAX_QUERY_COMPONENTS: usize = 32;
 
 /// Descriptor of a queried component column inside a dynamic system.
 #[derive(Clone, Copy, Debug)]
 pub struct QueryColumnDesc {
+    /// Bevy component ID assigned in the host world.
     pub component_id: ComponentId,
+    /// Requested access mode (`READ`, `WRITE`, `FILTER_ONLY`, `WITHOUT`).
     pub mode: ComponentAccessMode,
+    /// Byte stride of the component type.
     pub stride: usize,
 }
 
 /// Active column state cached for the current chunk.
 pub struct ActiveColumn<'w> {
+    /// Pointer to the start of the column array in the current table chunk.
     pub data_ptr: *mut u8,
+    /// Slice of change detection ticks for rows in the current table.
     pub changed_ticks: &'w [UnsafeCell<Tick>],
+    /// Summary change tick for the entire column in the current table.
     pub summary_tick: Option<&'w AtomicTick>,
+    /// Byte stride between consecutive elements in the column.
     pub stride: usize,
+    /// Declared access mode for this column.
     pub mode: ComponentAccessMode,
 }
 
-/// Host-side concrete chunk iterator backing the opaque `RawChunkIter` handle.
+/// Host-side concrete chunk iterator backing the opaque [`RawChunkIter`] handle.
 pub struct HostChunkIter<'w> {
     tables: &'w Tables,
     matched_tables: &'w [TableId],
@@ -41,6 +77,7 @@ pub struct HostChunkIter<'w> {
 }
 
 impl<'w> HostChunkIter<'w> {
+    /// Creates a new concrete host chunk iterator for the given matched tables and query columns.
     pub fn new(
         tables: &'w Tables,
         matched_tables: &'w [TableId],

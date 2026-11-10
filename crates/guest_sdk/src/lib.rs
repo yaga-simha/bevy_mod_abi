@@ -1,12 +1,55 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(improper_ctypes_definitions)]
 
-//! # `guest_sdk`
+//! # `guest_sdk`: Zero-Bevy Ergonomic Rust SDK for Mod Authors
 //!
-//! Ergonomic, Bevy-independent SDK for guest mod authors.
-//! Wraps raw `abi_contract` C-ABI structs and function pointers into safe abstractions,
-//! and catches unwinding panics inside the guest's own `std` runtime before crossing
-//! the `extern "C"` boundary.
+//! This crate provides safe, idiomatic Rust abstractions for creating dynamic mods
+//! (`.cdylib`) that integrate seamlessly into Bevy ECS via the `bevy_abi_mod` framework.
+//!
+//! ## Architecture: Why Zero Bevy Dependency?
+//! Mod dynamic libraries must compile independently of the host game engine. If guest mods
+//! linked `bevy`, any discrepancy in `rustc` compiler version, Cargo feature flags, or standard
+//! library implementations would trigger catastrophic ABI incompatibility and undefined behavior.
+//! By depending solely on the `#![no_std]` [`abi_contract`] crate, `guest_sdk` enables mods
+//! to interact with the host exclusively over a stable `extern "C"` boundary.
+//!
+//! ## Core Architectural Features
+//! 1. **Cross-Runtime Panic Containment ([`catch_guest_panic`])**:
+//!    Each compiled `.cdylib` links its own Rust runtime. Unwinding a panic across the `extern "C"`
+//!    boundary into the host process violates the C ABI and aborts the application. The macros
+//!    [`export_mod!`] and [`wrap_system_callback!`] intercept panics using `std::panic::catch_unwind`
+//!    inside the guest runtime, translating any unwind into [`FfiResult::PANIC_CAUGHT`].
+//! 2. **Zero-Copy Archetype Iteration ([`GuestChunkIter`])**:
+//!    Bevy ECS stores components in archetype tables. The host passes a raw chunk iterator handle.
+//!    [`GuestChunkIter`] traverses chunks table-by-table and yields bounds-checked [`ChunkSlice`]
+//!    and [`ChunkSliceMut`] views with known byte strides.
+//! 3. **Deferred Commands ([`GuestCommandQueue`])**:
+//!    Direct structural mutation (entity spawning, despawning, component insertion) during query
+//!    iteration is illegal in ECS. [`GuestCommandQueue`] bridges commands to the host's Bevy command
+//!    queue, copying component bytes to maintain strict host allocator isolation.
+//!
+//! ## Example Mod Definition
+//!
+//! ```no_run
+//! use guest_sdk::prelude::*;
+//! use core::ffi::c_void;
+//!
+//! unsafe fn my_system(
+//!     _iter: *mut RawChunkIter,
+//!     _commands: *mut RawCommandQueue,
+//!     _user_data: *mut c_void,
+//! ) -> FfiResult {
+//!     FfiResult::OK
+//! }
+//!
+//! wrap_system_callback!(fn c_my_system calls my_system);
+//!
+//! fn mod_init(_get_proc_address: GetProcAddressFn, _host_api: *const HostApi, _ctx: *mut c_void) -> FfiResult {
+//!     FfiResult::OK
+//! }
+//! fn mod_shutdown(_ctx: *mut c_void) -> FfiResult { FfiResult::OK }
+//! export_mod!(mod_init, mod_shutdown);
+//! ```
 
 pub use abi_contract::{
     ComponentAccessDesc, ComponentAccessMode, ComponentUuid, DynamicSystemCallback,
@@ -18,15 +61,31 @@ pub use abi_contract::{
     ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PACKED, ABI_VERSION_PATCH,
 };
 
-/// Execute a closure inside `std::panic::catch_unwind` within the guest's own Rust runtime,
+/// Executes a closure inside `std::panic::catch_unwind` within the guest's own Rust runtime,
 /// converting any unwinding panic into `FfiResult::PANIC_CAUGHT` before crossing the `extern "C"`
 /// boundary.
 ///
-/// Why this is done on the guest side:
+/// ### Why Panic Containment is Done on the Guest Side
 /// Each `.cdylib` links its own isolated `std` runtime. Unwinding a guest panic into the host's
 /// `std::panic::catch_unwind` is classified by the Rust Reference as catching a foreign exception
 /// (which has unspecified behavior and may abort the process). Catching the unwind inside the
 /// guest's own `std` runtime and returning `FfiResult::PANIC_CAUGHT` by value is 100% well-defined.
+///
+/// # Example
+///
+/// ```
+/// use guest_sdk::{catch_guest_panic, FfiResult};
+///
+/// let status = catch_guest_panic(|| {
+///     FfiResult::OK
+/// });
+/// assert_eq!(status, FfiResult::OK);
+///
+/// let panic_status = catch_guest_panic(|| {
+///     panic!("Simulated mod panic");
+/// });
+/// assert_eq!(panic_status, FfiResult::PANIC_CAUGHT);
+/// ```
 #[inline]
 pub fn catch_guest_panic<F>(f: F) -> FfiResult
 where
@@ -40,6 +99,19 @@ where
 
 /// Macro to export a mod's lifecycle entry points (`bevy_abi_mod_abi_version`,
 /// `bevy_abi_mod_init`, and `bevy_abi_mod_shutdown`) with guest-side panic containment.
+///
+/// # Example
+///
+/// ```no_run
+/// use guest_sdk::{export_mod, FfiResult, GetProcAddressFn, HostApi};
+/// use core::ffi::c_void;
+///
+/// fn init(_get_proc: GetProcAddressFn, _api: *const HostApi, _ctx: *mut c_void) -> FfiResult {
+///     FfiResult::OK
+/// }
+/// fn shutdown(_ctx: *mut c_void) -> FfiResult { FfiResult::OK }
+/// export_mod!(init, shutdown);
+/// ```
 #[macro_export]
 macro_rules! export_mod {
     ($init_fn:path, $shutdown_fn:path) => {
@@ -68,6 +140,22 @@ macro_rules! export_mod {
 
 /// Macro to wrap a guest Rust system function into a C-ABI `DynamicSystemCallback`
 /// (`unsafe extern "C" fn`) that catches guest panics and returns `FfiResult::PANIC_CAUGHT`.
+///
+/// # Example
+///
+/// ```
+/// use guest_sdk::{wrap_system_callback, FfiResult, RawChunkIter, RawCommandQueue};
+/// use core::ffi::c_void;
+///
+/// unsafe fn movement(
+///     _iter: *mut RawChunkIter,
+///     _commands: *mut RawCommandQueue,
+///     _user_data: *mut c_void,
+/// ) -> FfiResult {
+///     FfiResult::OK
+/// }
+/// wrap_system_callback!(fn c_movement calls movement);
+/// ```
 #[macro_export]
 macro_rules! wrap_system_callback {
     ($vis:vis fn $wrapper_name:ident calls $inner_fn:path) => {
@@ -86,6 +174,23 @@ macro_rules! wrap_system_callback {
 
 /// Macro to wrap a guest Rust multi-query system function into a C-ABI `MultiQuerySystemCallback`
 /// (`unsafe extern "C" fn`) that catches guest panics and returns `FfiResult::PANIC_CAUGHT`.
+///
+/// # Example
+///
+/// ```
+/// use guest_sdk::{wrap_multi_query_callback, FfiResult, RawChunkIter, RawCommandQueue};
+/// use core::ffi::c_void;
+///
+/// unsafe fn multi_query(
+///     _iters: *const *mut RawChunkIter,
+///     _count: usize,
+///     _commands: *mut RawCommandQueue,
+///     _user_data: *mut c_void,
+/// ) -> FfiResult {
+///     FfiResult::OK
+/// }
+/// wrap_multi_query_callback!(fn c_multi_query calls multi_query);
+/// ```
 #[macro_export]
 macro_rules! wrap_multi_query_callback {
     ($vis:vis fn $wrapper_name:ident calls $inner_fn:path) => {
@@ -103,9 +208,14 @@ macro_rules! wrap_multi_query_callback {
     };
 }
 
+/// C-ABI function pointer type for deferred empty entity creation.
 pub type CmdSpawnEmptyFn = unsafe extern "C" fn(queue: *mut RawCommandQueue) -> FfiEntity;
+
+/// C-ABI function pointer type for deferred entity despawning.
 pub type CmdDespawnFn =
     unsafe extern "C" fn(queue: *mut RawCommandQueue, entity: FfiEntity) -> FfiResult;
+
+/// C-ABI function pointer type for deferred raw component byte insertion.
 pub type CmdInsertComponentFn = unsafe extern "C" fn(
     queue: *mut RawCommandQueue,
     entity: FfiEntity,
@@ -114,46 +224,57 @@ pub type CmdInsertComponentFn = unsafe extern "C" fn(
     len: usize,
 ) -> FfiResult;
 
+/// Cached function pointers for host command queue operations.
 #[derive(Clone, Copy, Default, Debug)]
 pub struct CommandBridgeVTable {
+    /// Function pointer for `cmd_spawn_empty`.
     pub spawn_empty: Option<CmdSpawnEmptyFn>,
+    /// Function pointer for `cmd_despawn`.
     pub despawn: Option<CmdDespawnFn>,
+    /// Function pointer for `cmd_insert_component`.
     pub insert_component: Option<CmdInsertComponentFn>,
 }
 
 impl CommandBridgeVTable {
+    /// Resolves command bridge functions from the host's symbol provider.
     pub fn resolve(get_proc_address: GetProcAddressFn) -> Self {
-        let mut spawn_ptr = unsafe { get_proc_address(b"cmd_spawn_empty\0".as_ptr() as *const _) };
+        let mut spawn_ptr = unsafe { get_proc_address(c"cmd_spawn_empty".as_ptr()) };
         if spawn_ptr.is_null() {
-            spawn_ptr = unsafe { get_proc_address(b"host_cmd_spawn_empty\0".as_ptr() as *const _) };
+            spawn_ptr = unsafe { get_proc_address(c"host_cmd_spawn_empty".as_ptr()) };
         }
-        let mut despawn_ptr = unsafe { get_proc_address(b"cmd_despawn\0".as_ptr() as *const _) };
+        let mut despawn_ptr = unsafe { get_proc_address(c"cmd_despawn".as_ptr()) };
         if despawn_ptr.is_null() {
-            despawn_ptr = unsafe { get_proc_address(b"host_cmd_despawn\0".as_ptr() as *const _) };
+            despawn_ptr = unsafe { get_proc_address(c"host_cmd_despawn".as_ptr()) };
         }
-        let mut insert_ptr =
-            unsafe { get_proc_address(b"cmd_insert_component\0".as_ptr() as *const _) };
+        let mut insert_ptr = unsafe { get_proc_address(c"cmd_insert_component".as_ptr()) };
         if insert_ptr.is_null() {
-            insert_ptr =
-                unsafe { get_proc_address(b"host_cmd_insert_component\0".as_ptr() as *const _) };
+            insert_ptr = unsafe { get_proc_address(c"host_cmd_insert_component".as_ptr()) };
         }
 
         Self {
             spawn_empty: if !spawn_ptr.is_null() {
                 // SAFETY: Pointer resolved from host GetProcAddress matching CmdSpawnEmptyFn signature.
-                Some(unsafe { core::mem::transmute(spawn_ptr) })
+                Some(unsafe {
+                    core::mem::transmute::<*const core::ffi::c_void, CmdSpawnEmptyFn>(spawn_ptr)
+                })
             } else {
                 None
             },
             despawn: if !despawn_ptr.is_null() {
                 // SAFETY: Pointer resolved from host GetProcAddress matching CmdDespawnFn signature.
-                Some(unsafe { core::mem::transmute(despawn_ptr) })
+                Some(unsafe {
+                    core::mem::transmute::<*const core::ffi::c_void, CmdDespawnFn>(despawn_ptr)
+                })
             } else {
                 None
             },
             insert_component: if !insert_ptr.is_null() {
                 // SAFETY: Pointer resolved from host GetProcAddress matching CmdInsertComponentFn signature.
-                Some(unsafe { core::mem::transmute(insert_ptr) })
+                Some(unsafe {
+                    core::mem::transmute::<*const core::ffi::c_void, CmdInsertComponentFn>(
+                        insert_ptr,
+                    )
+                })
             } else {
                 None
             },
@@ -161,6 +282,18 @@ impl CommandBridgeVTable {
     }
 }
 
+/// Safe wrapper around the host's deferred command queue handle ([`RawCommandQueue`]).
+///
+/// # Example
+///
+/// ```
+/// use guest_sdk::{GuestCommandQueue, CommandBridgeVTable, FfiEntity, FfiResult};
+///
+/// let mut queue = GuestCommandQueue::new(core::ptr::null_mut(), CommandBridgeVTable::default());
+/// assert_eq!(queue.spawn_empty(), FfiEntity(0));
+/// assert_eq!(queue.despawn(FfiEntity(1)), FfiResult::NULL_POINTER);
+/// assert_eq!(queue.insert_value(FfiEntity(1), c"Position", &42.0f32), FfiResult::NULL_POINTER);
+/// ```
 pub struct GuestCommandQueue<'a> {
     raw: *mut RawCommandQueue,
     vtable: CommandBridgeVTable,
@@ -168,6 +301,7 @@ pub struct GuestCommandQueue<'a> {
 }
 
 impl<'a> GuestCommandQueue<'a> {
+    /// Creates a new guest command queue wrapper from an opaque handle and resolved VTable.
     #[inline]
     pub fn new(raw: *mut RawCommandQueue, vtable: CommandBridgeVTable) -> Self {
         Self {
@@ -177,6 +311,7 @@ impl<'a> GuestCommandQueue<'a> {
         }
     }
 
+    /// Enqueues the creation of a new empty entity and returns its allocated [`FfiEntity`].
     #[inline]
     pub fn spawn_empty(&mut self) -> FfiEntity {
         if self.raw.is_null() {
@@ -190,6 +325,7 @@ impl<'a> GuestCommandQueue<'a> {
         }
     }
 
+    /// Enqueues the despawning of the specified entity.
     #[inline]
     pub fn despawn(&mut self, entity: FfiEntity) -> FfiResult {
         if self.raw.is_null() {
@@ -203,8 +339,15 @@ impl<'a> GuestCommandQueue<'a> {
         }
     }
 
+    /// Enqueues the insertion of raw component bytes for the target entity.
+    ///
+    /// # Safety
+    /// - `component_name` must point to a valid, nul-terminated UTF-8 C string.
+    /// - `data` must point to at least `len` contiguous initialized bytes matching the component layout.
+    /// - If `len > 0`, `data` must not be null.
+    /// - The memory pointed to by `data` must not be concurrently mutated during this call.
     #[inline]
-    pub fn insert_bytes(
+    pub unsafe fn insert_bytes(
         &mut self,
         entity: FfiEntity,
         component_name: *const core::ffi::c_char,
@@ -215,55 +358,96 @@ impl<'a> GuestCommandQueue<'a> {
             return FfiResult::NULL_POINTER;
         }
         if let Some(f) = self.vtable.insert_component {
-            // SAFETY: Calling resolved function pointer with valid raw queue handle, entity, and byte buffer.
+            // SAFETY: Forwarding valid raw pointers per caller's safety contract.
             unsafe { f(self.raw, entity, component_name, data, len) }
         } else {
             FfiResult::NULL_POINTER
         }
     }
+
+    /// Safely enqueues the insertion of a typed slice of elements for the target entity.
+    ///
+    /// Safe because `&core::ffi::CStr` guarantees a valid nul-terminated C string,
+    /// and `&[T]` where `T: Copy` guarantees valid initialized memory.
+    #[inline]
+    pub fn insert_slice<T: Copy>(
+        &mut self,
+        entity: FfiEntity,
+        component_name: &core::ffi::CStr,
+        data: &[T],
+    ) -> FfiResult {
+        // SAFETY: CStr is nul-terminated and &[T] is a valid contiguous byte range.
+        unsafe {
+            self.insert_bytes(
+                entity,
+                component_name.as_ptr(),
+                data.as_ptr() as *const u8,
+                core::mem::size_of_val(data),
+            )
+        }
+    }
+
+    /// Safely enqueues the insertion of a single typed component value for the target entity.
+    #[inline]
+    pub fn insert_value<T: Copy>(
+        &mut self,
+        entity: FfiEntity,
+        component_name: &core::ffi::CStr,
+        value: &T,
+    ) -> FfiResult {
+        self.insert_slice(entity, component_name, core::slice::from_ref(value))
+    }
 }
 
+/// Safe wrapper around the host's chunk iterator handle ([`RawChunkIter`]).
 pub struct GuestChunkIter<'a> {
     raw: *mut RawChunkIter,
     api: &'a HostApi,
 }
 
 impl<'a> GuestChunkIter<'a> {
+    /// Creates a new guest chunk iterator wrapper from an opaque handle and host API table.
     #[inline]
     pub fn new(raw: *mut RawChunkIter, api: &'a HostApi) -> Self {
         Self { raw, api }
     }
 
+    /// Advances to the next archetype table chunk and returns the entity count (0 when exhausted).
     #[inline]
     pub fn next_chunk(&mut self) -> usize {
         // SAFETY: Delegating to HostApi function pointer.
         unsafe { (self.api.iter_next_chunk)(self.raw) }
     }
 
+    /// Obtains a read-only pointer to the start of the specified column in the current chunk.
     #[inline]
     pub fn column_readonly(&self, index: usize) -> *const u8 {
         // SAFETY: Delegating to HostApi function pointer.
         unsafe { (self.api.iter_column_readonly)(self.raw, index) }
     }
 
+    /// Obtains a mutable pointer to the start of the specified column in the current chunk.
     #[inline]
     pub fn column_mutable(&mut self, index: usize) -> *mut u8 {
         // SAFETY: Delegating to HostApi function pointer.
         unsafe { (self.api.iter_column_mutable)(self.raw, index) }
     }
 
+    /// Explicitly marks the given row within the column as changed.
     #[inline]
     pub fn mark_changed(&mut self, index: usize, row: usize) -> FfiResult {
         // SAFETY: Delegating to HostApi function pointer.
         unsafe { (self.api.iter_mark_changed)(self.raw, index, row) }
     }
 
+    /// Obtains a pointer to the contiguous array of entity IDs in the current chunk.
     #[inline]
     pub fn entities(&self) -> *const FfiEntity {
         // SAFETY: Delegating to HostApi function pointer.
         unsafe { (self.api.iter_entities)(self.raw) }
     }
 
+    /// Returns the byte stride for elements in the specified column.
     #[inline]
     pub fn column_stride(&self, index: usize) -> usize {
         // SAFETY: Delegating to HostApi function pointer.
@@ -288,6 +472,20 @@ impl<'a> GuestChunkIter<'a> {
 }
 
 /// Safe read-only chunk slice view for iterating components in an archetype table chunk.
+///
+/// # Example
+///
+/// ```
+/// use guest_sdk::ChunkSlice;
+///
+/// let numbers = [10u32, 20, 30];
+/// let slice = ChunkSlice::new(numbers.as_ptr() as *const u8, core::mem::size_of::<u32>(), numbers.len());
+/// assert_eq!(slice.count(), 3);
+/// assert_eq!(slice.stride(), 4);
+/// assert!(!slice.is_empty());
+/// let ptr = slice.get_ptr(1).unwrap();
+/// assert_eq!(unsafe { *(ptr as *const u32) }, 20);
+/// ```
 #[derive(Clone, Copy, Debug)]
 pub struct ChunkSlice<'a> {
     ptr: *const u8,
@@ -297,6 +495,7 @@ pub struct ChunkSlice<'a> {
 }
 
 impl<'a> ChunkSlice<'a> {
+    /// Creates a new read-only chunk slice view.
     #[inline]
     pub fn new(ptr: *const u8, stride: usize, count: usize) -> Self {
         Self {
@@ -307,16 +506,19 @@ impl<'a> ChunkSlice<'a> {
         }
     }
 
+    /// Returns the number of entity elements in the current chunk.
     #[inline]
     pub fn count(&self) -> usize {
         self.count
     }
 
+    /// Returns the byte stride between consecutive elements in the column.
     #[inline]
     pub fn stride(&self) -> usize {
         self.stride
     }
 
+    /// Returns `true` if the chunk slice contains zero elements or points to null.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.count == 0 || self.ptr.is_null()
@@ -335,6 +537,18 @@ impl<'a> ChunkSlice<'a> {
 }
 
 /// Safe mutable chunk slice view for iterating components in an archetype table chunk.
+///
+/// # Example
+///
+/// ```
+/// use guest_sdk::ChunkSliceMut;
+///
+/// let mut numbers = [10u32, 20, 30];
+/// let mut slice = ChunkSliceMut::new(numbers.as_mut_ptr() as *mut u8, core::mem::size_of::<u32>(), numbers.len());
+/// let ptr = slice.get_ptr_mut(1).unwrap();
+/// unsafe { *(ptr as *mut u32) = 99 };
+/// assert_eq!(numbers[1], 99);
+/// ```
 #[derive(Debug)]
 pub struct ChunkSliceMut<'a> {
     ptr: *mut u8,
@@ -344,6 +558,7 @@ pub struct ChunkSliceMut<'a> {
 }
 
 impl<'a> ChunkSliceMut<'a> {
+    /// Creates a new mutable chunk slice view.
     #[inline]
     pub fn new(ptr: *mut u8, stride: usize, count: usize) -> Self {
         Self {
@@ -354,16 +569,19 @@ impl<'a> ChunkSliceMut<'a> {
         }
     }
 
+    /// Returns the number of entity elements in the current chunk.
     #[inline]
     pub fn count(&self) -> usize {
         self.count
     }
 
+    /// Returns the byte stride between consecutive elements in the column.
     #[inline]
     pub fn stride(&self) -> usize {
         self.stride
     }
 
+    /// Returns `true` if the chunk slice contains zero elements or points to null.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.count == 0 || self.ptr.is_null()
@@ -391,8 +609,9 @@ pub mod prelude {
         ComponentAccessDesc, ComponentAccessMode, ComponentUuid, DynamicSystemCallback,
         ExposableComponent, FfiEntity, FfiResult, FfiSlice, GetProcAddressFn, HostApi, IterResetFn,
         MultiQuerySystemCallback, MultiQuerySystemDescriptor, QuerySpec, RawChunkIter,
-        RawCommandQueue, RegisterMultiQuerySystemFn, RegisterSystemFn, StrView, SystemDescriptor,
-        ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PACKED, ABI_VERSION_PATCH,
+        RawCommandQueue, RegisterMultiQuerySystemFn, RegisterSystemFn, StrView, SymbolEntry,
+        SystemDescriptor, ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PACKED,
+        ABI_VERSION_PATCH,
     };
 }
 

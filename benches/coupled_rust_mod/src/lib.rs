@@ -1,4 +1,5 @@
 #![deny(unsafe_op_in_unsafe_fn)]
+#![allow(clippy::type_complexity)]
 
 //! Coupled Rust `dylib` Mod (`bevy_dynamic_plugin` style).
 //!

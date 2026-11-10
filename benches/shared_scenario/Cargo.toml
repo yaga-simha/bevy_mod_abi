@@ -1,9 +1,9 @@
 [package]
 name = "shared_scenario"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-authors.workspace = true
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["bevy_abi_mod authors"]
 publish = false
 
 [lib]
@@ -12,8 +12,8 @@ test = false
 doctest = false
 
 [dependencies]
-abi_contract = { workspace = true }
-mod_derive = { workspace = true }
-host_runtime = { workspace = true }
+abi_contract = { path = "../../crates/abi_contract" }
+mod_derive = { path = "../../crates/mod_derive" }
+host_runtime = { path = "../../crates/host_runtime" }
 bevy_ecs = { version = "0.20.1", default-features = false, features = ["std", "async_executor"] }
 bevy_app = { version = "0.20.1", default-features = false, features = ["std"] }

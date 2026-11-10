@@ -802,23 +802,23 @@ fn mod_init(
     FAC_VT.store(fac_ptr as *mut FactionVTable, Ordering::Release);
 
     let unit_clause = [
-        ComponentAccessDesc::write(b"Transform3D\0".as_ptr() as *const _),
-        ComponentAccessDesc::write(b"Kinematics\0".as_ptr() as *const _),
-        ComponentAccessDesc::write(b"Vitality\0".as_ptr() as *const _),
-        ComponentAccessDesc::read(b"Resistance\0".as_ptr() as *const _),
-        ComponentAccessDesc::read(b"Faction\0".as_ptr() as *const _),
-        ComponentAccessDesc::filter_only(b"CombatUnitTag\0".as_ptr() as *const _),
-        ComponentAccessDesc::without(b"EmitterBeaconTag\0".as_ptr() as *const _),
-        ComponentAccessDesc::without(b"FrozenFlag\0".as_ptr() as *const _),
+        ComponentAccessDesc::write(c"Transform3D".as_ptr()),
+        ComponentAccessDesc::write(c"Kinematics".as_ptr()),
+        ComponentAccessDesc::write(c"Vitality".as_ptr()),
+        ComponentAccessDesc::read(c"Resistance".as_ptr()),
+        ComponentAccessDesc::read(c"Faction".as_ptr()),
+        ComponentAccessDesc::filter_only(c"CombatUnitTag".as_ptr()),
+        ComponentAccessDesc::without(c"EmitterBeaconTag".as_ptr()),
+        ComponentAccessDesc::without(c"FrozenFlag".as_ptr()),
     ];
 
     let emitter_clause = [
-        ComponentAccessDesc::read(b"Transform3D\0".as_ptr() as *const _),
-        ComponentAccessDesc::read(b"AuraEmitter\0".as_ptr() as *const _),
-        ComponentAccessDesc::read(b"Faction\0".as_ptr() as *const _),
-        ComponentAccessDesc::filter_only(b"EmitterBeaconTag\0".as_ptr() as *const _),
-        ComponentAccessDesc::without(b"CombatUnitTag\0".as_ptr() as *const _),
-        ComponentAccessDesc::without(b"FrozenFlag\0".as_ptr() as *const _),
+        ComponentAccessDesc::read(c"Transform3D".as_ptr()),
+        ComponentAccessDesc::read(c"AuraEmitter".as_ptr()),
+        ComponentAccessDesc::read(c"Faction".as_ptr()),
+        ComponentAccessDesc::filter_only(c"EmitterBeaconTag".as_ptr()),
+        ComponentAccessDesc::without(c"CombatUnitTag".as_ptr()),
+        ComponentAccessDesc::without(c"FrozenFlag".as_ptr()),
     ];
 
     let specs = [
@@ -835,15 +835,15 @@ fn mod_init(
     let variant = BENCH_VARIANT.load(Ordering::SeqCst);
     let (sys_name, cb): (*const core::ffi::c_char, MultiQuerySystemCallback) = match variant {
         0 => (
-            b"rust_cabi_chunk_optimized\0".as_ptr() as *const _,
+            c"rust_cabi_chunk_optimized".as_ptr(),
             c_chunk_optimized,
         ),
         1 => (
-            b"rust_cabi_entity_nested_vtable\0".as_ptr() as *const _,
+            c"rust_cabi_entity_nested_vtable".as_ptr(),
             c_entity_nested_vtable,
         ),
         _ => (
-            b"rust_cabi_naive_chatty_ffi\0".as_ptr() as *const _,
+            c"rust_cabi_naive_chatty_ffi".as_ptr(),
             c_naive_chatty_ffi,
         ),
     };

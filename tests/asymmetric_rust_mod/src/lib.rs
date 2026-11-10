@@ -1,7 +1,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(improper_ctypes_definitions)]
 
-use core::ffi::{c_char, c_void};
+use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use guest_sdk::{
     export_mod, wrap_system_callback, CommandBridgeVTable, ComponentAccessDesc,
@@ -77,16 +77,32 @@ static SHUTDOWN_CALLED: AtomicBool = AtomicBool::new(false);
 static ACTIVE_INSTANCES: AtomicUsize = AtomicUsize::new(0);
 
 // Test harness controls
+
+/// Triggers a simulated panic during subsequent system executions.
+///
+/// # Safety
+/// This function must be called from a test harness thread when it is safe to toggle
+/// the test panic trigger flag. It operates atomically with `SeqCst` ordering.
 #[no_mangle]
 pub unsafe extern "C" fn asymmetric_rust_mod_trigger_panic() {
     PANIC_TRIGGER.store(true, Ordering::SeqCst);
 }
 
+/// Resets the simulated panic trigger so subsequent system executions run normally.
+///
+/// # Safety
+/// This function must be called from a test harness thread when it is safe to reset
+/// the test panic trigger flag. It operates atomically with `SeqCst` ordering.
 #[no_mangle]
 pub unsafe extern "C" fn asymmetric_rust_mod_reset_panic() {
     PANIC_TRIGGER.store(false, Ordering::SeqCst);
 }
 
+/// Queries whether the mod has received a shutdown signal via `bevy_abi_mod_shutdown`.
+///
+/// # Safety
+/// Callers must ensure the dynamic library remains loaded in memory during the call.
+/// It operates atomically with `SeqCst` ordering.
 #[no_mangle]
 pub unsafe extern "C" fn asymmetric_rust_mod_was_shutdown() -> bool {
     SHUTDOWN_CALLED.load(Ordering::SeqCst)
@@ -303,12 +319,14 @@ unsafe fn rust_command_system(
         y: 200.0,
         z: 300.0,
     };
-    let insert_res = cmd_queue.insert_bytes(
-        new_entity,
-        b"Position\0".as_ptr() as *const c_char,
-        &p as *const RawPos as *const u8,
-        core::mem::size_of::<RawPos>(),
-    );
+    let insert_res = unsafe {
+        cmd_queue.insert_bytes(
+            new_entity,
+            c"Position".as_ptr(),
+            &p as *const RawPos as *const u8,
+            core::mem::size_of::<RawPos>(),
+        )
+    };
     if insert_res.is_err() {
         return insert_res;
     }
@@ -357,8 +375,8 @@ fn mod_init(
     HOST_API_PTR.store(host_api as *mut HostApi, Ordering::Release);
 
     // Resolve VTables with fallback naming support
-    let pos_sym = unsafe { (get_proc_address)(b"Position_vtable\0".as_ptr() as *const c_char) };
-    let vel_sym = unsafe { (get_proc_address)(b"Velocity_vtable\0".as_ptr() as *const c_char) };
+    let pos_sym = unsafe { (get_proc_address)(c"Position_vtable".as_ptr()) };
+    let vel_sym = unsafe { (get_proc_address)(c"Velocity_vtable".as_ptr()) };
     if pos_sym.is_null() || vel_sym.is_null() {
         return FfiResult::INVALID_COMPONENT;
     }
@@ -366,18 +384,18 @@ fn mod_init(
     VEL_VTABLE.store(vel_sym as *mut VelocityVTable, Ordering::Release);
 
     let mut health_sym =
-        unsafe { (get_proc_address)(b"CombatHealth_vtable\0".as_ptr() as *const c_char) };
+        unsafe { (get_proc_address)(c"CombatHealth_vtable".as_ptr()) };
     if health_sym.is_null() {
-        health_sym = unsafe { (get_proc_address)(b"Health_vtable\0".as_ptr() as *const c_char) };
+        health_sym = unsafe { (get_proc_address)(c"Health_vtable".as_ptr()) };
     }
     if !health_sym.is_null() {
         HEALTH_VTABLE.store(health_sym as *mut CombatHealthVTable, Ordering::Release);
     }
 
     let mut tag_sym =
-        unsafe { (get_proc_address)(b"MetadataTag_vtable\0".as_ptr() as *const c_char) };
+        unsafe { (get_proc_address)(c"MetadataTag_vtable".as_ptr()) };
     if tag_sym.is_null() {
-        tag_sym = unsafe { (get_proc_address)(b"NameTag_vtable\0".as_ptr() as *const c_char) };
+        tag_sym = unsafe { (get_proc_address)(c"NameTag_vtable".as_ptr()) };
     }
     if !tag_sym.is_null() {
         TAG_VTABLE.store(tag_sym as *mut MetadataTagVTable, Ordering::Release);
@@ -395,17 +413,17 @@ fn mod_init(
     // Register System 1: Kinematics
     let kin_queries = [
         ComponentAccessDesc {
-            name: b"Position\0".as_ptr() as *const c_char,
+            name: c"Position".as_ptr(),
             mode: ComponentAccessMode::WRITE,
         },
         ComponentAccessDesc {
-            name: b"Velocity\0".as_ptr() as *const c_char,
+            name: c"Velocity".as_ptr(),
             mode: ComponentAccessMode::READ,
         },
     ];
     let kin_desc = SystemDescriptor {
         struct_size: core::mem::size_of::<SystemDescriptor>() as u32,
-        name: b"rust_kinematics\0".as_ptr() as *const c_char,
+        name: c"rust_kinematics".as_ptr(),
         queries: kin_queries.as_ptr(),
         query_count: kin_queries.len(),
         callback: c_rust_kinematics,
@@ -419,11 +437,11 @@ fn mod_init(
     // Register System 2: Combat Damage (if health component resolved)
     if !health_sym.is_null() {
         let health_name = if unsafe {
-            !(get_proc_address)(b"CombatHealth_vtable\0".as_ptr() as *const c_char).is_null()
+            !(get_proc_address)(c"CombatHealth_vtable".as_ptr()).is_null()
         } {
-            b"CombatHealth\0".as_ptr() as *const c_char
+            c"CombatHealth".as_ptr()
         } else {
-            b"Health\0".as_ptr() as *const c_char
+            c"Health".as_ptr()
         };
 
         let combat_queries = [ComponentAccessDesc {
@@ -432,7 +450,7 @@ fn mod_init(
         }];
         let combat_desc = SystemDescriptor {
             struct_size: core::mem::size_of::<SystemDescriptor>() as u32,
-            name: b"rust_combat\0".as_ptr() as *const c_char,
+            name: c"rust_combat".as_ptr(),
             queries: combat_queries.as_ptr(),
             query_count: combat_queries.len(),
             callback: c_rust_combat,
@@ -444,11 +462,11 @@ fn mod_init(
     // Register System 3: Metadata (if tag component resolved)
     if !tag_sym.is_null() {
         let tag_name = if unsafe {
-            !(get_proc_address)(b"MetadataTag_vtable\0".as_ptr() as *const c_char).is_null()
+            !(get_proc_address)(c"MetadataTag_vtable".as_ptr()).is_null()
         } {
-            b"MetadataTag\0".as_ptr() as *const c_char
+            c"MetadataTag".as_ptr()
         } else {
-            b"NameTag\0".as_ptr() as *const c_char
+            c"NameTag".as_ptr()
         };
 
         let tag_queries = [ComponentAccessDesc {
@@ -457,7 +475,7 @@ fn mod_init(
         }];
         let tag_desc = SystemDescriptor {
             struct_size: core::mem::size_of::<SystemDescriptor>() as u32,
-            name: b"rust_metadata\0".as_ptr() as *const c_char,
+            name: c"rust_metadata".as_ptr(),
             queries: tag_queries.as_ptr(),
             query_count: tag_queries.len(),
             callback: c_rust_metadata,
@@ -469,7 +487,7 @@ fn mod_init(
     // Register System 4: Command Spawner (if command symbols resolved)
     let spawner_desc = SystemDescriptor {
         struct_size: core::mem::size_of::<SystemDescriptor>() as u32,
-        name: b"rust_command_spawner\0".as_ptr() as *const c_char,
+        name: c"rust_command_spawner".as_ptr(),
         queries: core::ptr::null(),
         query_count: 0,
         callback: c_rust_command,
@@ -480,7 +498,7 @@ fn mod_init(
     // Register System 5: Panicking
     let panic_desc = SystemDescriptor {
         struct_size: core::mem::size_of::<SystemDescriptor>() as u32,
-        name: b"rust_panicking\0".as_ptr() as *const c_char,
+        name: c"rust_panicking".as_ptr(),
         queries: core::ptr::null(),
         query_count: 0,
         callback: c_rust_panicking,

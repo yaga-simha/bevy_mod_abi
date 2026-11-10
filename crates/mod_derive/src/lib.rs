@@ -1,13 +1,83 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(improper_ctypes_definitions)]
 
-//! # `mod_derive`
+//! # `mod_derive`: Procedural Macro for `#[derive(ModExposable)]`
 //!
-//! Procedural macro crate providing `#[derive(ModExposable)]` for Bevy host components.
-//! Generates `pub unsafe extern "C"` field accessors, a `#[repr(C)]` `<Struct>VTable`
-//! backed by a unique `static` instance containing exact `size` and `align` byte strides
-//! and accessor function pointers, compile-time `FfiLayout` assertions, and implements
-//! `abi_contract::ExposableComponent`.
+//! This crate provides the `#[derive(ModExposable)]` derive macro for host Bevy components
+//! and compound types. It generates C-ABI field accessors, a `#[repr(C)]` `<Struct>VTable`
+//! with static byte strides and function pointers, compile-time layout assertions, and an
+//! implementation of [`abi_contract::ExposableComponent`].
+//!
+//! ## Macro Compilation Pipeline
+//!
+//! ```text
+//! Rust Struct (#[derive(ModExposable)])
+//!         │
+//!         ▼
+//!    AST Parsing & Validation
+//!    ├── Reject generic structs
+//!    ├── Reject enums
+//!    ├── Reject unsupported heap-owning types without #[mod_field(skip)]
+//!    └── Reject colliding symbol or accessor names
+//!         │
+//!         ▼
+//!    Field Classification (classify_type)
+//!    ├── Primitive: f32, f64, i8..i64, u8..u64, usize, isize, bool
+//!    ├── HostString: String (Host-allocated)
+//!    ├── HostVec: Vec<T: FfiLayout + Copy> (Host-allocated)
+//!    └── Nested: Compound struct / array (Interior pointer accessors)
+//!         │
+//!         ▼
+//!    Code Generation (expand_mod_exposable)
+//!    ├── Extern "C" field accessors (<Prefix>_get_<field>, <Prefix>_set_<field>)
+//!    │   ├── Self-aliasing guards for String and Vec setters
+//!    │   └── Zero-cost null-pointer checks
+//!    ├── VTable Struct Definition (<Struct>VTable { size, align, ... })
+//!    ├── Static VTable Instance & Symbol Registration Table
+//!    ├── Compile-Time Layout Assertions (assert_primitive_ffi, assert_vec_elem_ffi, assert_nested_ffi)
+//!    └── Trait Implementation (impl ExposableComponent for <Struct>)
+//! ```
+//!
+//! ## Attribute Reference
+//!
+//! ### Struct-Level Attributes (`#[mod_component(...)]`)
+//! - `#[mod_component(name = "...")]`: Specifies a custom component name (e.g. `"game::Position"`),
+//!   disambiguating identically named structs across modules.
+//! - `#[mod_component(prefix = "...")]`: Custom symbol prefix. Replaces non-alphanumeric characters with `_`.
+//! - `#[mod_component(export_symbols)]`: Emits `#[no_mangle]` on accessors for direct `.cdylib` export.
+//!
+//! ### Field-Level Attributes (`#[mod_field(...)]`)
+//! - `#[mod_field(skip)]`: Skips field accessor generation (mandatory for host-private fields, closures,
+//!   raw pointers, or Rust collections like `Option<T>`, `Box<T>`, `HashMap<K, V>`).
+//! - `#[mod_field(primitive)]`: Forces classification as primitive value type.
+//! - `#[mod_field(string)]`: Forces classification as host-owned `String`.
+//! - `#[mod_field(vec)]`: Forces classification as host-owned `Vec<T>`.
+//! - `#[mod_field(nested)]`: Forces classification as nested compound struct exposed via interior pointers
+//!   (`ptr_<field>` and `ptr_mut_<field>`).
+//!
+//! ## The Self-Aliasing Problem & Defensive Resolution
+//!
+//! When guest code invokes a setter for a host-allocated collection (`String` or `Vec<T>`), it may pass
+//! a pointer to memory that resides inside the component's own existing heap buffer:
+//!
+//! ```text
+//! Component Buffer: [ "Hello World" ]
+//!                     ▲       ▲
+//!                     │       └── Guest passes subslice [6..11]: "World"
+//!                     └────────── Existing buffer start
+//! ```
+//!
+//! If the host setter naively called `field.clear(); field.push_str(incoming);`, clearing the buffer
+//! would deallocate or truncate the memory before `push_str` reads from it, causing a use-after-free
+//! or data corruption!
+//!
+//! To prevent this, the generated setters implement a **4-step self-aliasing detection algorithm**:
+//! 1. **Buffer Address Extraction**: Read existing buffer range `[buf_start .. buf_end)`.
+//! 2. **Input Address Calculation**: Calculate incoming pointer interval `[src_start .. src_end)`.
+//! 3. **Interval Intersection Check**: `let overlaps = src_start < buf_end && buf_start < src_end;`.
+//! 4. **Disjoint vs. Overlapping Branching**:
+//!    - If `overlaps`: Allocate a fresh `String` / `Vec<T>` clone *before* mutating `*field_ptr`.
+//!    - If non-overlapping: Safely update in-place with zero extra allocations.
 
 use proc_macro::TokenStream;
 use proc_macro2::Span;
@@ -32,12 +102,17 @@ enum FieldKind {
     Nested(Type),
 }
 
+/// Parsed container-level `#[mod_component(...)]` attributes.
 struct ComponentAttrs {
+    /// Custom component name override.
     custom_name: Option<String>,
+    /// Custom symbol prefix override.
     custom_prefix: Option<String>,
+    /// Whether to emit `#[no_mangle]` on accessors.
     export_symbols: bool,
 }
 
+/// Parses container-level `#[mod_component(...)]` attributes from a derive input.
 fn parse_component_attrs(input: &DeriveInput) -> syn::Result<ComponentAttrs> {
     let mut attrs = ComponentAttrs {
         custom_name: None,
@@ -74,6 +149,7 @@ fn parse_component_attrs(input: &DeriveInput) -> syn::Result<ComponentAttrs> {
     Ok(attrs)
 }
 
+/// Field-level override specified via `#[mod_field(...)]`.
 enum FieldAttrOverride {
     None,
     Skip,
@@ -83,6 +159,7 @@ enum FieldAttrOverride {
     Nested,
 }
 
+/// Parses field-level `#[mod_field(...)]` attributes.
 fn parse_field_attr(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrOverride> {
     let mut result = FieldAttrOverride::None;
     for attr in attrs {
@@ -115,6 +192,7 @@ fn parse_field_attr(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrOverride> 
     Ok(result)
 }
 
+/// Classifies a field type into primitive, string, vector, or nested representation.
 fn classify_type(ty: &Type, attr_override: FieldAttrOverride) -> syn::Result<FieldKind> {
     match attr_override {
         FieldAttrOverride::Skip => return Ok(FieldKind::Skip),
@@ -193,6 +271,7 @@ fn classify_type(ty: &Type, attr_override: FieldAttrOverride) -> syn::Result<Fie
     Ok(FieldKind::Nested(ty.clone()))
 }
 
+/// Sanitizes a string into a valid C identifier prefix.
 fn sanitize_symbol_prefix(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for ch in name.chars() {
@@ -215,6 +294,7 @@ pub fn derive_mod_exposable(input: TokenStream) -> TokenStream {
     }
 }
 
+/// Core expansion function for `#[derive(ModExposable)]`.
 fn expand_mod_exposable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     if !input.generics.params.is_empty() {
         return Err(syn::Error::new_spanned(
@@ -518,6 +598,7 @@ fn expand_mod_exposable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenSt
                             return;
                         }
 
+                        // ── Self-Aliasing Detection Algorithm (Step 1-4) ──
                         // Check whether `[utf8_ptr .. utf8_ptr + len]` overlaps the existing `String` buffer.
                         // SAFETY: Reading the current buffer pointer and length via shared reference before
                         // taking any mutable reference to `*field_ptr`.
@@ -535,7 +616,7 @@ fn expand_mod_exposable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenSt
                         let bytes: &[u8] = unsafe { ::core::slice::from_raw_parts(utf8_ptr, len) };
                         if let ::core::result::Result::Ok(valid_str) = ::core::str::from_utf8(bytes) {
                             if overlaps {
-                                // Copy into a fresh host-heap allocation before dropping/mutating the old buffer
+                                // Overlapping: allocate fresh host-heap String BEFORE mutating the buffer
                                 let replacement = ::std::string::String::from(valid_str);
                                 // SAFETY: `valid_str` is no longer used after `replacement` is constructed;
                                 // replacing `*field_ptr` drops the old buffer cleanly on the host allocator.
@@ -543,6 +624,7 @@ fn expand_mod_exposable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenSt
                                     *field_ptr = replacement;
                                 }
                             } else {
+                                // Disjoint: in-place clear and append with zero extra heap allocations
                                 // SAFETY: `valid_str` does not overlap `*field_ptr`'s buffer, so taking
                                 // `&mut *field_ptr` and copying bytes in-place is disjoint and aliasing-safe.
                                 unsafe {
@@ -662,7 +744,8 @@ fn expand_mod_exposable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenSt
                             return;
                         }
 
-                        // Check whether `[data_ptr .. data_ptr + len]` overlaps the existing `Vec` buffer.
+                        // ── Self-Aliasing Detection Algorithm for Vec<T> (Step 1-4) ──
+                        // Check whether `[data_ptr .. data_ptr + len * size_of::<T>()]` overlaps existing buffer.
                         // SAFETY: Reading current slice range before taking `&mut Vec`.
                         let (buf_start, buf_end) = unsafe {
                             let range = (*field_ptr).as_slice().as_ptr_range();
@@ -679,12 +762,14 @@ fn expand_mod_exposable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenSt
                             unsafe { ::core::slice::from_raw_parts(data_ptr, len) };
 
                         if overlaps {
+                            // Overlapping: clone elements into a fresh host-allocated Vec before mutating
                             let replacement: ::std::vec::Vec<#elem_ty> = slice.to_vec();
                             // SAFETY: `slice` is no longer accessed after `replacement` is allocated.
                             unsafe {
                                 *field_ptr = replacement;
                             }
                         } else {
+                            // Disjoint: clear and extend in-place with zero reallocations
                             // SAFETY: `slice` is disjoint from `*field_ptr`'s buffer.
                             unsafe {
                                 let field_mut = &mut *field_ptr;

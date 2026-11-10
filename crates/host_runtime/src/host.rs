@@ -1,6 +1,36 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(improper_ctypes_definitions)]
 
+//! # Dynamic Mod Host & Lifecycle Management
+//!
+//! This module manages the lifecycle of dynamic shared library mods (`.so`, `.dylib`, `.dll`)
+//! loaded at runtime via [`libloading`].
+//!
+//! ## Dynamic Lifecycle Architecture
+//! 1. **Loading (`dlopen`)**:
+//!    - Dynamically loads the shared library from the specified path.
+//!    - Resolves optional version handshake: `bevy_abi_mod_abi_version`.
+//!    - Resolves mandatory initialization entry point: `bevy_abi_mod_init`.
+//!    - Resolves optional teardown hook: `bevy_abi_mod_shutdown`.
+//! 2. **Execution & The `is_active: Arc<AtomicBool>` Tombstone Guard**:
+//!    - In Bevy ECS, systems added to a schedule graph cannot be easily excised mid-run.
+//!    - When a mod is unloaded, dropping [`libloading::Library`] issues `dlclose()`, unmapping
+//!      the executable `.text` pages of the shared library from memory.
+//!    - If the scheduler subsequently invoked the foreign function pointer, a fatal SIGSEGV
+//!      or access violation would crash the process.
+//!    - To prevent this, every [`DynamicCSystem`](crate::dynamic_system::DynamicCSystem) shares
+//!      an `Arc<AtomicBool>` tombstone guard with its [`LoadedMod`].
+//!    - When unloaded, `is_active.store(false, Ordering::Release)` is executed.
+//!    - On subsequent frames, `DynamicCSystem::run_unsafe` checks `is_active.load(Ordering::Acquire)`
+//!      and instantly returns `Ok(())` without executing foreign instructions.
+//! 3. **4-Phase Shutdown Sequence**:
+//!    - **Phase 1: Deactivation**: `is_active.store(false, Ordering::Release)` prevents any further system runs.
+//!    - **Phase 2: Guest Teardown Callback**: `shutdown_fn(null_mut())` is called while library memory
+//!      is still mapped, allowing the guest to cleanly free heap allocations, stop threads, etc.
+//!    - **Phase 3: Dynamic Unmapping**: Dropping `loaded.library` unmaps the shared object from process memory.
+//!    - **Phase 4: Reverse-Order Unloading (LIFO)**: `unload_all` unloads libraries in reverse load order,
+//!      preventing cascading dangling pointer issues between interdependent mods.
+
 use crate::dynamic_system::{DynamicCSystem, ModInitContext};
 use crate::registry::{host_get_proc_address, ModRegistry};
 use crate::HOST_API;
@@ -12,20 +42,25 @@ use libloading::{Library, Symbol};
 use std::path::Path;
 use std::sync::Arc;
 
-/// Unique identifier for a loaded mod instance.
+/// Unique generational identifier for a loaded mod instance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ModId(pub u32);
 
-/// A loaded native mod shared library.
+/// Internal record representing a loaded native mod shared library.
 pub struct LoadedMod {
+    /// Unique identifier assigned to this mod.
     pub id: ModId,
+    /// Path or human-readable name of the loaded library.
     pub name: String,
+    /// Handle to the dynamically loaded shared library (`dlopen`).
     pub library: Library,
+    /// Optional guest shutdown callback resolved from the library.
     pub shutdown_fn: Option<ModShutdownFn>,
+    /// Atomic tombstone flag shared with all systems spawned by this mod.
     pub is_active: Arc<AtomicBool>,
 }
 
-/// Host manager tracking loaded dynamic libraries and managing their lifecycle.
+/// Host resource tracking loaded dynamic libraries and managing their lifecycle.
 #[derive(Resource)]
 pub struct ModHost {
     loaded_libraries: Vec<LoadedMod>,
@@ -39,6 +74,7 @@ impl Default for ModHost {
 }
 
 impl ModHost {
+    /// Creates a new, empty mod host manager.
     pub fn new() -> Self {
         Self {
             loaded_libraries: Vec::new(),
@@ -141,7 +177,7 @@ impl ModHost {
         }
     }
 
-    /// Unload a specific mod by its `ModId`:
+    /// Unload a specific mod by its [`ModId`]:
     /// Deactivates its `is_active` atomic guard, invokes `shutdown_fn`, and drops its `Library`.
     ///
     /// # Safety
@@ -162,7 +198,7 @@ impl ModHost {
         Ok(())
     }
 
-    /// Unload all loaded mods in reverse load order:
+    /// Unload all loaded mods in reverse load order (LIFO):
     /// Deactivates each mod's `is_active` atomic guard, invokes `shutdown_fn`, and drops `Library`.
     ///
     /// # Safety
@@ -178,12 +214,12 @@ impl ModHost {
         }
     }
 
-    /// Number of loaded mod libraries.
+    /// Returns the number of currently loaded mod libraries.
     pub fn len(&self) -> usize {
         self.loaded_libraries.len()
     }
 
-    /// True if no mod libraries are loaded.
+    /// Returns `true` if no mod libraries are currently loaded.
     pub fn is_empty(&self) -> bool {
         self.loaded_libraries.is_empty()
     }

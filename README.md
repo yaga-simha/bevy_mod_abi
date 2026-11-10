@@ -76,10 +76,12 @@ bevy_abi_mod/
 │   ├── c_abi_c99_mod/       # Pure ISO C99 mod (-O0 debug & -O3 release across all 3 FFI tiers)
 │   └── permutation_bench/   # Multi-profile (Debug + Release) orchestrator & report generator
 ├── docs/
-│   ├── ARCHITECTURE.md      # Detailed system design, memory layout & concurrency contracts
-│   ├── BENCHMARKS.md        # Full Debug/Release x Native/dylib/C-ABI degradation ladder
-│   ├── GUEST_MOD_GUIDE.md   # Step-by-step authoring guide for Rust, C99, C++, and Zig mods
-│   └── TESTING_AND_VERIFICATION.md # 4-tier E2E testing framework & benchmarks
+│   ├── ARCHITECTURE.md            # System design, formal memory safety proofs & concurrency
+│   ├── HOST_INTEGRATION_GUIDE.md  # Comprehensive guide for Bevy game developers hosting mods
+│   ├── C_ABI_SPECIFICATION.md     # Formal C-ABI specification for C99, C++, and Zig mod authors
+│   ├── GUEST_MOD_GUIDE.md         # Authoring guide for Rust, C99, C++, and Zig guest mods
+│   ├── BENCHMARKS.md              # Full Debug/Release x Native/dylib/C-ABI degradation ladder
+│   └── TESTING_AND_VERIFICATION.md # 4-tier E2E testing framework & stress suites
 └── scripts/
     └── run_e2e_tests.sh     # 9-stage end-to-end verification pipeline
 ```
@@ -117,21 +119,28 @@ pub struct Velocity {
 
 ### 3. Initialize the Mod Plugin & Load Mods
 ```rust
+use bevy::prelude::*;
+use host_runtime::prelude::*;
+
 fn main() {
     let mut app = App::new();
     app.add_plugins(DefaultPlugins)
-       .add_plugins(AbiModPlugin::default());
+       .add_plugins(AbiModPlugin::default()); // or .add_plugins(AbiModPlugin)
 
     // Register exposed components with the mod registry
     app.register_mod_component::<Position>()
        .register_mod_component::<Velocity>();
 
     // Load an asymmetric native mod (.so / .dylib / .dll)
-    let mut mod_host = app.world_mut().resource_mut::<ModHost>();
-    let mod_id = mod_host.load_mod(
-        app.world_mut(),
-        "path/to/libmy_mod.dylib"
-    ).expect("Failed to load mod");
+    // Option A: Fluent loading chained on Bevy App
+    app.load_mod("path/to/libmy_mod.dylib")
+       .expect("Failed to load mod");
+
+    // Option B: Tracked loading returning ModId for runtime lifecycle management
+    // let mod_id = app.load_mod_tracked("path/to/libmy_mod.dylib")
+    //     .expect("Failed to load mod");
+    // ...
+    // app.unload_mod(mod_id).expect("Failed to unload mod");
 
     app.run();
 }
@@ -170,7 +179,7 @@ unsafe fn update_system(
 
 wrap_system_callback!(fn c_update_system calls update_system);
 
-unsafe fn mod_init(
+fn mod_init(
     get_proc_address: GetProcAddressFn,
     host_api: *const HostApi,
     host_context: *mut c_void,
@@ -179,7 +188,8 @@ unsafe fn mod_init(
     FfiResult::OK
 }
 
-unsafe fn mod_shutdown(_host_context: *mut c_void) -> FfiResult {
+fn mod_shutdown(_host_context: *mut c_void) -> FfiResult {
+    // Clean up mod-allocated resources before unmapping
     FfiResult::OK
 }
 
@@ -253,11 +263,13 @@ See **[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)** for the full 34-row degradati
 
 ## Detailed Documentation
 
+- **[System Architecture & Design](docs/ARCHITECTURE.md)**: Deep dive into the zero shared Rust ABI model, formal memory safety proofs (allocator isolation, self-aliasing prevention, atomic tombstoning), multi-query mechanics, and ASCII lifecycle flowcharts.
+- **[Host Integration Guide](docs/HOST_INTEGRATION_GUIDE.md)**: Comprehensive guide for Bevy game developers hosting native mods, configuring plugins, exposing components via `#[derive(ModExposable)]`, and managing runtime lifecycles.
+- **[C-ABI Specification](docs/C_ABI_SPECIFICATION.md)**: Formal C-ABI contract, calling conventions, struct layout specifications, and symbol resolution rules for C99, C++, and Zig mod authors.
+- **[Guest Mod Author Guide](docs/GUEST_MOD_GUIDE.md)**: Practical authoring guide for creating native mods in Rust (`guest_sdk`), ISO C99, C++, and Zig.
 - **[Comprehensive Benchmark Matrix (`Debug` & `Release`)](docs/BENCHMARKS.md)**: Full loading & nested multi-archetype execution comparison across Pure Native Bevy, Coupled Rust `dylib`, C-ABI Rust `cdylib`, and C-ABI C99.
-- **[System Architecture & Design](docs/ARCHITECTURE.md)**: Deep dive into the memory isolation model, archetype table traversal, and borrow-checked dynamic scheduling.
-- **[Guest Mod Author Guide](docs/GUEST_MOD_GUIDE.md)**: Complete guide to creating mods in Rust, C99, C++, and Zig.
 - **[Testing & Verification Framework](docs/TESTING_AND_VERIFICATION.md)**: Overview of the 4-tier E2E test suite, safety stress tests, and hot-reload lifecycle suites.
-- **[C-ABI Header](include/bevy_abi_mod.h)**: Canonical C99 header for native mod authors.
+- **[C-ABI Header](include/bevy_abi_mod.h)**: Canonical C99/C++ header for native mod authors.
 
 ---
 

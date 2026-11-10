@@ -1,0 +1,11 @@
+[package]
+name = "example_02_multi_system_pipeline"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+bevy_app = { version = "0.20.1", default-features = false, features = ["std"] }
+bevy_ecs = { version = "0.20.1", default-features = false, features = ["std", "async_executor"] }
+host_runtime = { path = "../../crates/host_runtime" }
+abi_contract = { path = "../../crates/abi_contract" }

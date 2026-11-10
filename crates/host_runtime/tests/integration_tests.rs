@@ -493,7 +493,7 @@ unsafe extern "C" fn custom_command_spawner_callback(
         host_cmd_insert_component(
             commands,
             spawned,
-            b"Position\0".as_ptr() as *const core::ffi::c_char,
+            c"Position".as_ptr(),
             &p as *const Position as *const u8,
             core::mem::size_of::<Position>(),
         );

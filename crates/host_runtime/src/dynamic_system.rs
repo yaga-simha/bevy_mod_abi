@@ -1,6 +1,37 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(improper_ctypes_definitions)]
 
+//! # Dynamic C-ABI System Adapter
+//!
+//! This module adapts foreign C-ABI function callbacks into native Bevy ECS [`System`]s.
+//!
+//! ## Core Architectural Invariants
+//! 1. **Dynamic `FilteredAccessSet` Borrow Checking**:
+//!    - During [`DynamicCSystem::initialize`], foreign query descriptors ([`ComponentAccessDescOwned`])
+//!      are parsed into Bevy's native [`FilteredAccess<ComponentId>`].
+//!    - Access modes ([`ComponentAccessMode::READ`], [`ComponentAccessMode::WRITE`],
+//!      [`ComponentAccessMode::FILTER_ONLY`], [`ComponentAccessMode::WITHOUT`]) are recorded.
+//!    - An access set is returned to Bevy via [`SystemAccess::Shared`].
+//!    - Bevy's scheduler uses this access set to guarantee data race freedom: systems accessing
+//!      disjoint components run concurrently in parallel, while conflicting systems are serialized.
+//! 2. **Intra-System Conflict Detection**:
+//!    - If a single system specifies mutually conflicting queries (e.g. Query 0 writes Component A
+//!      and Query 1 reads or writes Component A), `access_set.is_compatible(&candidate_set)` returns `false`.
+//!    - The system detects this self-conflict, flags `self_conflict = true; self.enabled = false;`,
+//!      and safely disables itself without causing undefined behavior.
+//! 3. **Steady-State Zero Allocation via `ArchetypeGeneration`**:
+//!    - Archetypes are scanned and cached in [`CachedQueryGroup`].
+//!    - In steady state, `world.archetypes().generation()` matches the cached generation,
+//!      so archetype scanning is bypassed and zero heap allocations occur per tick.
+//! 4. **Panic Containment & Fault Isolation**:
+//!    - The foreign callback invocation is wrapped in [`std::panic::catch_unwind`].
+//!    - If a guest mod panics or returns an error status ([`FfiResult::PANIC_CAUGHT`] or `is_err()`),
+//!      the system sets `self.enabled = false` and quarantines itself.
+//!    - The host Bevy engine and all other healthy systems continue running uninterrupted.
+//! 5. **Atomic Tombstone Guard**:
+//!    - Checks `self.is_active.load(Ordering::Acquire)` before every execution.
+//!    - When a mod is unloaded, this flag becomes `false`, immediately rendering the system an inert no-op.
+
 use crate::chunk_iter::{HostChunkIter, QueryColumnDesc};
 use crate::commands::CommandQueueBridge;
 use crate::registry::ModRegistry;
@@ -23,9 +54,12 @@ use std::sync::Arc;
 /// Maximum number of concurrent/nested queries supported per multi-query dynamic system.
 pub const MAX_SYSTEM_QUERIES: usize = 8;
 
+/// Owned representation of component access mode and component name for a dynamic query clause.
 #[derive(Clone, Debug)]
 pub struct ComponentAccessDescOwned {
+    /// Canonical component name.
     pub name: String,
+    /// Requested component access mode (`READ`, `WRITE`, `FILTER_ONLY`, `WITHOUT`).
     pub mode: ComponentAccessMode,
 }
 
@@ -80,6 +114,7 @@ unsafe impl Send for DynamicCSystem {}
 unsafe impl Sync for DynamicCSystem {}
 
 impl DynamicCSystem {
+    /// Creates a single-query dynamic C-ABI system.
     pub fn new(
         name: String,
         query_descs: Vec<ComponentAccessDescOwned>,
@@ -104,6 +139,7 @@ impl DynamicCSystem {
         }
     }
 
+    /// Creates a multi-query dynamic C-ABI system supporting up to [`MAX_SYSTEM_QUERIES`] nested queries.
     pub fn new_multi_query(
         name: String,
         query_specs: Vec<Vec<ComponentAccessDescOwned>>,
@@ -129,26 +165,32 @@ impl DynamicCSystem {
         }
     }
 
+    /// Returns `true` if the system is currently enabled to execute.
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }
 
+    /// Enables or disables execution of this system.
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
     }
 
+    /// Returns `true` if the system was disabled due to internal query borrow conflicts.
     pub fn has_self_conflict(&self) -> bool {
         self.self_conflict
     }
 
+    /// Obtains a clone of the atomic tombstone flag.
     pub fn is_active(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.is_active)
     }
 
+    /// Sets the atomic tombstone flag for this system.
     pub fn set_is_active(&mut self, is_active: Arc<AtomicBool>) {
         self.is_active = is_active;
     }
 
+    /// Fluent builder method to attach an atomic tombstone flag.
     pub fn with_is_active(mut self, is_active: Arc<AtomicBool>) -> Self {
         self.is_active = is_active;
         self
@@ -370,12 +412,16 @@ impl System for DynamicCSystem {
 
 /// Context passed as `host_context` to `bevy_abi_mod_init`.
 pub struct ModInitContext {
+    /// Active component and symbol registry.
     pub registry: Arc<ModRegistry>,
+    /// Accumulated dynamic systems registered during mod initialization.
     pub registered_systems: Vec<DynamicCSystem>,
+    /// Shared atomic tombstone flag.
     pub is_active: Arc<AtomicBool>,
 }
 
 impl ModInitContext {
+    /// Creates a new initialization context with a fresh active flag.
     pub fn new(registry: Arc<ModRegistry>) -> Self {
         Self {
             registry,
@@ -384,6 +430,7 @@ impl ModInitContext {
         }
     }
 
+    /// Creates an initialization context sharing a specific active flag.
     pub fn with_is_active(registry: Arc<ModRegistry>, is_active: Arc<AtomicBool>) -> Self {
         Self {
             registry,
@@ -396,7 +443,7 @@ impl ModInitContext {
 /// C-ABI implementation of `register_system`.
 ///
 /// # Safety
-/// `host_context` must point to a valid `ModInitContext`. `descriptor` must point to a valid `SystemDescriptor`.
+/// `host_context` must point to a valid [`ModInitContext`]. `descriptor` must point to a valid [`SystemDescriptor`].
 pub unsafe extern "C" fn host_register_system(
     host_context: *mut c_void,
     descriptor: *const SystemDescriptor,
@@ -461,7 +508,7 @@ pub unsafe extern "C" fn host_register_system(
 /// C-ABI implementation of `register_multi_query_system` for nested / multi-query ECS systems.
 ///
 /// # Safety
-/// `host_context` must point to a valid `ModInitContext`. `descriptor` must point to a valid `MultiQuerySystemDescriptor`.
+/// `host_context` must point to a valid [`ModInitContext`]. `descriptor` must point to a valid [`MultiQuerySystemDescriptor`].
 pub unsafe extern "C" fn host_register_multi_query_system(
     host_context: *mut c_void,
     descriptor: *const MultiQuerySystemDescriptor,

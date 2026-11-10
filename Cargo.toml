@@ -5,13 +5,28 @@ members = [
     "crates/mod_derive",
     "crates/host_runtime",
     "crates/guest_sdk",
-    "benches/shared_scenario",
     "benches/coupled_rust_mod",
     "benches/permutation_bench",
+    "examples/01_minimal_handshake",
+    "examples/02_multi_system_pipeline",
+    "examples/03_cross_language_interop",
+    "examples/04_visual_game",
 ]
 exclude = [
+    # `shared_scenario` has `crate-type = ["dylib"]` so `permutation_bench` and
+    # `coupled_rust_mod` share a single dynamic `bevy_ecs` + `std` image. Keeping it
+    # out of root workspace `members` ensures Cargo always compiles it as a non-root
+    # dependency with `-C prefer-dynamic`, preventing duplicate `std` link errors
+    # during `cargo build` / `cargo build --workspace`.
+    "benches/shared_scenario",
     "tests/asymmetric_rust_mod",
     "benches/c_abi_rust_mod",
+    "examples/01_minimal_handshake/guest_mod",
+    "examples/02_multi_system_pipeline/guest_mod",
+    "examples/03_cross_language_interop/rust_mod",
+    "examples/04_visual_game/mods/mod_gravity",
+    "examples/04_visual_game/mods/mod_rainbow",
+    "examples/04_visual_game/mods/mod_vortex",
 ]
 
 [workspace.package]

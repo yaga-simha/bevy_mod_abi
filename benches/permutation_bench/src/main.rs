@@ -1,4 +1,5 @@
 #![deny(unsafe_op_in_unsafe_fn)]
+#![allow(clippy::drop_non_drop, clippy::too_many_arguments)]
 
 //! Comprehensive Cross-Architecture & Cross-Profile Benchmark Matrix Runner.
 //!

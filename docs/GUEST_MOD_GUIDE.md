@@ -86,8 +86,12 @@ unsafe fn my_kinematics_system(
     let mut chunk_iter = GuestChunkIter::new(iter, api);
 
     // Iterate over matching archetype tables
-    while chunk_iter.next_chunk() > 0 {
-        let count = chunk_iter.next_chunk(); // or count returned by next_chunk()
+    loop {
+        let count = chunk_iter.next_chunk();
+        if count == 0 {
+            break;
+        }
+
         let pos_col = chunk_iter.column_mutable(0);
         let vel_col = chunk_iter.column_readonly(1);
 
@@ -117,23 +121,23 @@ wrap_system_callback!(fn c_kinematics_system calls my_kinematics_system);
 Export the lifecycle hooks using the `export_mod!` macro:
 
 ```rust
-unsafe fn mod_init(
+fn mod_init(
     get_proc_address: GetProcAddressFn,
     host_api: *const HostApi,
     host_context: *mut c_void,
 ) -> FfiResult {
-    HOST_API = Some(&*host_api);
+    HOST_API = Some(unsafe { &*host_api });
 
     // Resolve component VTables by symbol name
-    let pos_sym = get_proc_address(b"Position_vtable\0".as_ptr() as *const _);
-    let vel_sym = get_proc_address(b"Velocity_vtable\0".as_ptr() as *const _);
+    let pos_sym = unsafe { get_proc_address(b"Position_vtable\0".as_ptr() as *const _) };
+    let vel_sym = unsafe { get_proc_address(b"Velocity_vtable\0".as_ptr() as *const _) };
 
     if pos_sym.is_null() || vel_sym.is_null() {
         return FfiResult::INVALID_COMPONENT;
     }
 
-    POS_VTABLE = Some(&*(pos_sym as *const PositionVTable));
-    VEL_VTABLE = Some(&*(vel_sym as *const VelocityVTable));
+    POS_VTABLE = Some(unsafe { &*(pos_sym as *const PositionVTable) });
+    VEL_VTABLE = Some(unsafe { &*(vel_sym as *const VelocityVTable) });
 
     // Register our system into Bevy's schedule
     let queries = [
@@ -156,11 +160,11 @@ unsafe fn mod_init(
         user_data: core::ptr::null_mut(),
     };
 
-    let api = &*host_api;
-    (api.register_system)(host_context, &descriptor)
+    let api = unsafe { &*host_api };
+    unsafe { (api.register_system)(host_context, &descriptor) }
 }
 
-unsafe fn mod_shutdown(_host_context: *mut c_void) -> FfiResult {
+fn mod_shutdown(_host_context: *mut c_void) -> FfiResult {
     // Clean up any mod-allocated memory or background workers
     FfiResult::OK
 }
@@ -280,11 +284,42 @@ Mods can queue deferred entity operations executed during Bevy's `apply_deferred
 | **Despawn** | `cmd_despawn(queue, entity) -> FfiResult` | Despawns entity and drops components. |
 | **Insert Component** | `cmd_insert_component(queue, entity, name, bytes, len) -> FfiResult` | Adds a component to entity by raw byte copy. |
 
-In Rust with `GuestCommandQueue`:
+### 4.1 In Rust with `guest_sdk`
+
+Resolve the command bridge VTable during `mod_init`:
 ```rust
+// In mod_init:
+let cmd_vtable = CommandBridgeVTable::resolve(get_proc_address);
+```
+
+Then inside your system callback:
+```rust
+use guest_sdk::prelude::*;
+
 let mut queue = GuestCommandQueue::new(commands, cmd_vtable);
+
+// 1. Enqueue entity spawn (immediately returns allocated 64-bit entity ID)
 let new_entity = queue.spawn_empty();
-queue.insert_bytes(new_entity, b"Position\0".as_ptr() as *const _, data_ptr, data_len);
+
+// 2. Safe typed single value insertion (T: Copy):
+let initial_pos = Position { x: 100.0, y: 200.0, z: 0.0 };
+queue.insert_value(new_entity, c"Position", &initial_pos);
+
+// 3. Safe typed slice insertion (T: Copy):
+queue.insert_slice(new_entity, c"Position", &[initial_pos]);
+
+// 4. Low-level raw byte insertion (unsafe, requires explicit safety contract):
+unsafe {
+    queue.insert_bytes(
+        new_entity,
+        c"Position".as_ptr(),
+        &initial_pos as *const _ as *const u8,
+        core::mem::size_of::<Position>(),
+    );
+}
+
+// 5. Enqueue entity despawn
+queue.despawn(new_entity);
 ```
 
 ---
@@ -296,3 +331,11 @@ queue.insert_bytes(new_entity, b"Position\0".as_ptr() as *const _, data_ptr, dat
 - [x] **Avoid allocating memory across FFI**: Never attempt to `free()` a pointer returned by the host.
 - [x] **Always notify change detection**: Call `mark_changed(col, row)` when modifying component fields if downstream systems use `Changed<T>`.
 - [x] **Catch all guest panics**: Always use `wrap_system_callback!` in Rust mods to prevent abnormal process termination.
+
+---
+
+## 6. Related Documentation
+
+- **[C-ABI Specification & Non-Rust Guide](C_ABI_SPECIFICATION.md)**: Full formal memory layout, calling conventions, and complete C99, C++17, and Zig reference implementations.
+- **[Host Integration Guide](HOST_INTEGRATION_GUIDE.md)**: How game developers integrate `bevy_abi_mod` and expose components to mods.
+- **[System Architecture](ARCHITECTURE.md)**: Deep dive into the zero shared Rust ABI architecture, formal memory safety proofs, and concurrency models.

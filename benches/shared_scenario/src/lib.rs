@@ -1,5 +1,6 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(improper_ctypes_definitions)]
+#![allow(clippy::type_complexity)]
 
 //! Shared Complex Multi-Archetype Nested Query Benchmark Scenario.
 //!
