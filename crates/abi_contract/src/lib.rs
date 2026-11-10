@@ -5,8 +5,15 @@
 //! # `abi_contract`
 //!
 //! Zero-dependency `#![no_std]` C-ABI contract definitions for `bevy_abi_mod`.
-//! All types are `#[repr(C)]` or explicit primitive representations to guarantee
-//! zero shared Rust ABI assumptions across dynamic library boundaries.
+//!
+//! ## Soundness Guarantees
+//! - Every struct crossing the FFI boundary is `#[repr(C)]` or `#[repr(transparent)]`.
+//! - Status codes (`FfiResult`) and access modes (`ComponentAccessMode`) are `#[repr(transparent)]`
+//!   `u32` newtypes rather than Rust `enum`s, preventing undefined behavior if foreign C/C++/Zig
+//!   code returns or passes an out-of-range discriminant.
+//! - Every function pointer crossing the boundary is `unsafe extern "C" fn`, ensuring
+//!   foreign calls require an explicit `unsafe` block and preventing undefined unwinding across
+//!   foreign or asymmetric Rust runtime stack frames.
 
 use core::ffi::{c_char, c_void};
 
@@ -14,53 +21,58 @@ pub const ABI_VERSION_MAJOR: u32 = 0;
 pub const ABI_VERSION_MINOR: u32 = 1;
 pub const ABI_VERSION_PATCH: u32 = 0;
 
-/// FFI result status codes returned across the C-ABI boundary.
-#[repr(u32)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub enum FfiResult {
-    Ok = 0,
-    InvalidComponent = 1,
-    AccessConflict = 2,
-    PanicCaught = 3,
-    NullPointer = 4,
-    InvalidUtf8 = 5,
-    PermissionDenied = 6,
-    InvalidVersion = 7,
-    InternalError = 99,
-}
+/// Packed 32-bit ABI version: `(MAJOR << 24) | (MINOR << 16) | PATCH`.
+pub const ABI_VERSION_PACKED: u32 =
+    (ABI_VERSION_MAJOR << 24) | (ABI_VERSION_MINOR << 16) | ABI_VERSION_PATCH;
 
-/// Legacy/Signed status return codes for C-ABI lifecycle calls.
-#[repr(i32)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub enum ModStatus {
-    Success = 0,
-    ErrInvalidVersion = -1,
-    ErrNullPointer = -2,
-    ErrComponentNotFound = -3,
-    ErrAccessConflict = -4,
-    ErrPanicCaught = -5,
-    ErrPermissionDenied = -6,
-    ErrInternal = -99,
-}
+/// FFI-safe status code returned across the C-ABI boundary.
+///
+/// Represented as a `#[repr(transparent)]` `u32` newtype rather than a Rust `enum`
+/// so that arbitrary integer values returned by foreign C/C++ code can never trigger
+/// invalid-discriminant undefined behavior in Rust.
+#[repr(transparent)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Default)]
+pub struct FfiResult(pub u32);
 
-impl From<FfiResult> for ModStatus {
-    fn from(res: FfiResult) -> Self {
-        match res {
-            FfiResult::Ok => ModStatus::Success,
-            FfiResult::InvalidComponent => ModStatus::ErrComponentNotFound,
-            FfiResult::AccessConflict => ModStatus::ErrAccessConflict,
-            FfiResult::PanicCaught => ModStatus::ErrPanicCaught,
-            FfiResult::NullPointer => ModStatus::ErrNullPointer,
-            FfiResult::InvalidUtf8 => ModStatus::ErrInternal,
-            FfiResult::PermissionDenied => ModStatus::ErrPermissionDenied,
-            FfiResult::InvalidVersion => ModStatus::ErrInvalidVersion,
-            FfiResult::InternalError => ModStatus::ErrInternal,
-        }
+#[allow(non_upper_case_globals)]
+impl FfiResult {
+    pub const OK: Self = Self(0);
+    pub const INVALID_COMPONENT: Self = Self(1);
+    pub const ACCESS_CONFLICT: Self = Self(2);
+    pub const PANIC_CAUGHT: Self = Self(3);
+    pub const NULL_POINTER: Self = Self(4);
+    pub const INVALID_UTF8: Self = Self(5);
+    pub const PERMISSION_DENIED: Self = Self(6);
+    pub const INVALID_VERSION: Self = Self(7);
+    pub const INTERNAL_ERROR: Self = Self(99);
+
+    // PascalCase aliases for ergonomic pattern matching
+    pub const Ok: Self = Self::OK;
+    pub const InvalidComponent: Self = Self::INVALID_COMPONENT;
+    pub const AccessConflict: Self = Self::ACCESS_CONFLICT;
+    pub const PanicCaught: Self = Self::PANIC_CAUGHT;
+    pub const NullPointer: Self = Self::NULL_POINTER;
+    pub const InvalidUtf8: Self = Self::INVALID_UTF8;
+    pub const PermissionDenied: Self = Self::PERMISSION_DENIED;
+    pub const InvalidVersion: Self = Self::INVALID_VERSION;
+    pub const InternalError: Self = Self::INTERNAL_ERROR;
+
+    #[inline]
+    pub const fn is_ok(self) -> bool {
+        self.0 == Self::OK.0
+    }
+
+    #[inline]
+    pub const fn is_err(self) -> bool {
+        self.0 != Self::OK.0
     }
 }
 
-/// Packed 64-bit entity representation matching `bevy_ecs::entity::Entity::to_bits()`.
-#[repr(C)]
+/// Opaque 64-bit entity identifier matching `bevy_ecs::entity::Entity::to_bits()`.
+///
+/// Do not assume a specific bit split between index and generation across Bevy versions;
+/// always convert via `bevy_ecs::entity::Entity::try_from_bits` / `to_bits` on the host.
+#[repr(transparent)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Default)]
 pub struct FfiEntity(pub u64);
 
@@ -76,49 +88,15 @@ impl FfiEntity {
     pub const fn to_bits(self) -> u64 {
         self.0
     }
-
-    #[inline]
-    pub const fn index(self) -> u32 {
-        self.0 as u32
-    }
-
-    #[inline]
-    pub const fn generation(self) -> u32 {
-        (self.0 >> 32) as u32
-    }
-
-    #[inline]
-    pub const fn from_parts(index: u32, generation: u32) -> Self {
-        Self((index as u64) | ((generation as u64) << 32))
-    }
-}
-
-/// Explicit index + generation entity identifier for C99 convenience.
-#[repr(C)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Default)]
-pub struct EntityId {
-    pub index: u32,
-    pub generation: u32,
-}
-
-impl From<FfiEntity> for EntityId {
-    #[inline]
-    fn from(entity: FfiEntity) -> Self {
-        Self {
-            index: entity.index(),
-            generation: entity.generation(),
-        }
-    }
-}
-
-impl From<EntityId> for FfiEntity {
-    #[inline]
-    fn from(id: EntityId) -> Self {
-        Self::from_parts(id.index, id.generation)
-    }
 }
 
 /// ABI-safe non-owning slice representation (`#[repr(C)]` replacement for `&[T]`).
+///
+/// # Borrow Lifetime
+/// When returned by a generated component getter (e.g., `<Struct>_get_<field>`),
+/// the returned `FfiSlice` borrows directly from the host's component storage.
+/// It remains valid only until the next mutation of that field, structural ECS change,
+/// or the end of the current chunk callback.
 #[repr(C)]
 #[derive(Debug)]
 pub struct FfiSlice<T> {
@@ -201,66 +179,8 @@ impl FfiSlice<u8> {
     }
 }
 
-/// Opaque string view across the C ABI boundary.
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct StrView {
-    pub ptr: *const u8,
-    pub len: usize,
-}
-
-impl StrView {
-    #[inline]
-    pub const fn empty() -> Self {
-        Self {
-            ptr: core::ptr::null(),
-            len: 0,
-        }
-    }
-
-    #[inline]
-    pub const fn from_str(s: &str) -> Self {
-        Self {
-            ptr: s.as_ptr(),
-            len: s.len(),
-        }
-    }
-
-    /// Convert `StrView` to a UTF-8 `&str`.
-    ///
-    /// # Safety
-    /// If `self.len > 0`, `self.ptr` must be valid for `self.len` bytes for lifetime `'a`.
-    #[inline]
-    pub unsafe fn as_str<'a>(&self) -> Result<&'a str, core::str::Utf8Error> {
-        if self.len == 0 || self.ptr.is_null() {
-            Ok("")
-        } else {
-            // SAFETY: Caller guarantees `self.ptr` points to `self.len` valid bytes.
-            let bytes = unsafe { core::slice::from_raw_parts(self.ptr, self.len) };
-            core::str::from_utf8(bytes)
-        }
-    }
-}
-
-impl From<FfiSlice<u8>> for StrView {
-    #[inline]
-    fn from(slice: FfiSlice<u8>) -> Self {
-        Self {
-            ptr: slice.ptr,
-            len: slice.len,
-        }
-    }
-}
-
-impl From<StrView> for FfiSlice<u8> {
-    #[inline]
-    fn from(view: StrView) -> Self {
-        Self {
-            ptr: view.ptr,
-            len: view.len,
-        }
-    }
-}
+/// Non-owning UTF-8 string view across the C ABI boundary (`FfiSlice<u8>` alias).
+pub type StrView = FfiSlice<u8>;
 
 /// Unique 128-bit component identifier (UUID-compatible).
 #[repr(C)]
@@ -270,7 +190,8 @@ pub struct ComponentUuid {
 }
 
 impl ComponentUuid {
-    /// Deterministic FNV-1a 128-bit hash from a component name string.
+    /// Deterministic 128-bit hash computed from a component name string using two
+    /// independent 64-bit FNV-1a lanes with distinct basis constants.
     pub const fn from_name(name: &str) -> Self {
         let bytes = name.as_bytes();
         let mut h1: u64 = 0xcbf29ce484222325;
@@ -279,7 +200,7 @@ impl ComponentUuid {
         while i < bytes.len() {
             h1 ^= bytes[i] as u64;
             h1 = h1.wrapping_mul(0x100000001b3);
-            h2 ^= (bytes[i] as u64).wrapping_add(i as u64);
+            h2 ^= (bytes[i] as u64) ^ ((i as u64).wrapping_mul(0x9e3779b97f4a7c15));
             h2 = h2.wrapping_mul(0x100000001b3);
             i += 1;
         }
@@ -294,39 +215,77 @@ impl ComponentUuid {
     }
 }
 
-/// Access mode declaration for an ECS system.
-#[repr(u32)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum ComponentAccessMode {
-    Read = 0,
-    Write = 1,
-    FilterOnly = 2,
+/// FFI-safe component access mode declaration (`#[repr(transparent)]` `u32` newtype).
+///
+/// Using a single integer mode prevents contradictory states (such as simultaneous
+/// `is_mutable: true` and `is_filter_only: true`) and avoids Rust `enum`/`bool` UB from C.
+#[repr(transparent)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Default)]
+pub struct ComponentAccessMode(pub u32);
+
+#[allow(non_upper_case_globals)]
+impl ComponentAccessMode {
+    /// Read-only column access (`&T`).
+    pub const READ: Self = Self(0);
+    /// Mutable column access (`&mut T`).
+    pub const WRITE: Self = Self(1);
+    /// Archetype filter-only (`With<T>`), no column pointer accessed.
+    pub const FILTER_ONLY: Self = Self(2);
+
+    pub const Read: Self = Self::READ;
+    pub const Write: Self = Self::WRITE;
+    pub const FilterOnly: Self = Self::FILTER_ONLY;
+
+    #[inline]
+    pub const fn is_valid(self) -> bool {
+        self.0 <= Self::FILTER_ONLY.0
+    }
+
+    #[inline]
+    pub const fn is_mutable(self) -> bool {
+        self.0 == Self::WRITE.0
+    }
+
+    #[inline]
+    pub const fn is_filter_only(self) -> bool {
+        self.0 == Self::FILTER_ONLY.0
+    }
 }
 
-/// Component access descriptor using a null-terminated C string component name.
+/// Component access descriptor passed in `SystemDescriptor::queries`.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ComponentAccessDesc {
+    /// Null-terminated UTF-8 C string identifying the registered component name.
     pub name: *const c_char,
-    pub is_mutable: bool,
-    pub is_filter_only: bool,
-}
-
-/// Single component access requirement by UUID.
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct ComponentAccessRequirement {
-    pub component_uuid: ComponentUuid,
+    /// Access mode (`ComponentAccessMode::READ`, `WRITE`, or `FILTER_ONLY`).
     pub mode: ComponentAccessMode,
 }
 
-/// System access descriptor passed during system registration.
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct SystemAccessDescriptor {
-    pub name: StrView,
-    pub requirements: *const ComponentAccessRequirement,
-    pub requirements_count: usize,
+impl ComponentAccessDesc {
+    #[inline]
+    pub const fn read(name: *const c_char) -> Self {
+        Self {
+            name,
+            mode: ComponentAccessMode::READ,
+        }
+    }
+
+    #[inline]
+    pub const fn write(name: *const c_char) -> Self {
+        Self {
+            name,
+            mode: ComponentAccessMode::WRITE,
+        }
+    }
+
+    #[inline]
+    pub const fn filter_only(name: *const c_char) -> Self {
+        Self {
+            name,
+            mode: ComponentAccessMode::FILTER_ONLY,
+        }
+    }
 }
 
 /// Opaque C handle representing an active Archetype Table chunk iterator.
@@ -343,102 +302,143 @@ pub struct RawCommandQueue {
 
 /// Advance the chunk iterator to the next matching archetype table.
 /// Returns `0` when exhausted, or the `entity_count` for the active chunk.
-pub type IterNextChunkFn = unsafe extern "C-unwind" fn(iter: *mut RawChunkIter) -> usize;
+pub type IterNextChunkFn = unsafe extern "C" fn(iter: *mut RawChunkIter) -> usize;
 
 /// Obtain a read-only byte pointer to the start of column `index` in the current chunk.
 /// Returns `null` if `index` is out of bounds or is a filter-only component.
 pub type IterColumnReadonlyFn =
-    unsafe extern "C-unwind" fn(iter: *const RawChunkIter, index: usize) -> *const u8;
+    unsafe extern "C" fn(iter: *const RawChunkIter, index: usize) -> *const u8;
 
 /// Obtain a mutable byte pointer to the start of column `index` in the current chunk.
 /// Marks `ComponentTicks` as changed for all entities in the chunk.
-/// Returns `null` if the column was not declared as mutable (`is_mutable: true`).
+/// Returns `null` if the column was not declared with `ComponentAccessMode::WRITE`.
 pub type IterColumnMutableFn =
-    unsafe extern "C-unwind" fn(iter: *mut RawChunkIter, index: usize) -> *mut u8;
+    unsafe extern "C" fn(iter: *mut RawChunkIter, index: usize) -> *mut u8;
 
-/// Mark a specific entity row's component tick as changed without marking the entire column,
-/// or explicitly mark row `row` in column `index` as changed.
+/// Explicitly mark row `row` in column `index` as changed.
 pub type IterMarkChangedFn =
-    unsafe extern "C-unwind" fn(iter: *mut RawChunkIter, index: usize, row: usize) -> FfiResult;
+    unsafe extern "C" fn(iter: *mut RawChunkIter, index: usize, row: usize) -> FfiResult;
 
 /// Obtain a pointer to the contiguous `FfiEntity` array for the current chunk.
-pub type IterEntitiesFn =
-    unsafe extern "C-unwind" fn(iter: *const RawChunkIter) -> *const FfiEntity;
+pub type IterEntitiesFn = unsafe extern "C" fn(iter: *const RawChunkIter) -> *const FfiEntity;
 
 /// Return the byte stride (`size_of::<C>()`) of column `index`.
-pub type IterColumnStrideFn =
-    unsafe extern "C-unwind" fn(iter: *const RawChunkIter, index: usize) -> usize;
+pub type IterColumnStrideFn = unsafe extern "C" fn(iter: *const RawChunkIter, index: usize) -> usize;
 
 /// Dynamic system callback invoked by the host during schedule execution.
-pub type DynamicSystemCallback =
-    unsafe extern "C-unwind" fn(iter: *mut RawChunkIter, commands: *mut RawCommandQueue);
+///
+/// Returns `FfiResult::OK` on success, or `FfiResult::PANIC_CAUGHT` / error status if the
+/// guest system faulted (allowing the host to isolate and disable the faulting system
+/// without unwinding across foreign runtime boundaries).
+pub type DynamicSystemCallback = unsafe extern "C" fn(
+    iter: *mut RawChunkIter,
+    commands: *mut RawCommandQueue,
+    user_data: *mut c_void,
+) -> FfiResult;
 
 /// Descriptor used by mods to register a `DynamicCSystem` with the host.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct SystemDescriptor {
+    /// Size of this struct in bytes (`core::mem::size_of::<SystemDescriptor>() as u32`) for ABI forward compatibility.
+    pub struct_size: u32,
+    /// Null-terminated UTF-8 system name.
     pub name: *const c_char,
+    /// Pointer to an array of `ComponentAccessDesc` of length `query_count`.
     pub queries: *const ComponentAccessDesc,
+    /// Number of elements in `queries`.
     pub query_count: usize,
+    /// System execution callback.
     pub callback: DynamicSystemCallback,
+    /// Opaque guest-owned context pointer forwarded to `callback`.
+    pub user_data: *mut c_void,
 }
 
-/// Flecs-style contiguous table chunk iterator struct.
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct EcsChunkIter {
-    /// Number of matching entities in this contiguous chunk.
-    pub count: usize,
-    /// Pointer to contiguous array of EntityId (length = count).
-    pub entities: *const EntityId,
-    /// Array of column base pointers for requested components.
-    pub column_ptrs: *const *mut c_void,
-    /// Byte strides between successive elements in each column.
-    pub column_strides: *const usize,
-    /// Number of columns requested.
-    pub column_count: usize,
-}
-
-/// System execution callback type provided by guest mods (legacy/direct chunk callback).
-pub type SystemRunCallback = extern "C" fn(user_data: *mut c_void, chunk: *mut EcsChunkIter);
-
-/// System registration function signature.
-pub type RegisterSystemFn = extern "C" fn(
+/// System registration function signature exposed in `HostApi`.
+pub type RegisterSystemFn = unsafe extern "C" fn(
     host_context: *mut c_void,
-    descriptor: *const SystemAccessDescriptor,
-    callback: SystemRunCallback,
-    user_data: *mut c_void,
-) -> ModStatus;
+    descriptor: *const SystemDescriptor,
+) -> FfiResult;
 
 /// Symbol-resolver function pointer passed to the guest mod entry point (Godot GDExtension style).
-pub type GetProcAddressFn = unsafe extern "C-unwind" fn(name: *const c_char) -> *const c_void;
+pub type GetProcAddressFn = unsafe extern "C" fn(name: *const c_char) -> *const c_void;
 
-/// Host API VTable populated or queried at handshake time.
+/// Host API VTable passed to the guest mod during `bevy_abi_mod_init`.
+///
+/// Must have `'static` lifetime on the host so guest mods may store the pointer across frames.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct HostApi {
+    /// Size of this struct in bytes (`core::mem::size_of::<HostApi>() as u32`).
+    pub struct_size: u32,
+    /// Packed host ABI version (`ABI_VERSION_PACKED`).
+    pub abi_version: u32,
+    /// Register a dynamic ECS system with the host schedule.
     pub register_system: RegisterSystemFn,
+    /// Advance a `RawChunkIter` to the next table chunk.
+    pub iter_next_chunk: IterNextChunkFn,
+    /// Borrow a read-only column byte pointer from a `RawChunkIter`.
+    pub iter_column_readonly: IterColumnReadonlyFn,
+    /// Borrow a mutable column byte pointer from a `RawChunkIter` (marks chunk ticks changed).
+    pub iter_column_mutable: IterColumnMutableFn,
+    /// Mark an individual row's component tick changed.
+    pub iter_mark_changed: IterMarkChangedFn,
+    /// Borrow the contiguous `FfiEntity` column from a `RawChunkIter`.
+    pub iter_entities: IterEntitiesFn,
+    /// Query the byte stride of a column in a `RawChunkIter`.
+    pub iter_column_stride: IterColumnStrideFn,
 }
 
-/// Mod initialization entry point function signature.
-pub type ModInitFn = extern "C" fn(
+/// Mod initialization entry point function signature (`bevy_abi_mod_init`).
+pub type ModInitFn = unsafe extern "C" fn(
     get_proc_address: GetProcAddressFn,
     host_api: *const HostApi,
     host_context: *mut c_void,
-) -> ModStatus;
+) -> FfiResult;
 
-/// Mod teardown function signature.
-pub type ModShutdownFn = extern "C" fn(host_context: *mut c_void) -> ModStatus;
+/// Mod teardown function signature (`bevy_abi_mod_shutdown`).
+pub type ModShutdownFn = unsafe extern "C" fn(host_context: *mut c_void) -> FfiResult;
 
-/// Entry mapping an exported C symbol name to its function or static VTable pointer.
-#[repr(C)]
+/// Optional ABI version query entry point (`bevy_abi_mod_abi_version`).
+pub type ModAbiVersionFn = unsafe extern "C" fn() -> u32;
+
+/// Marker trait for types whose layout is safe to expose across the modding boundary
+/// via interior pointers (`<Struct>_ptr_<field>`) or contiguous `Vec<T>` slices.
+///
+/// # Safety
+/// Implementing this trait asserts that `Self` either:
+/// - Is a primitive C-compatible value type (`Copy + 'static` with no internal heap pointers), or
+/// - Derives `ModExposable` and is accessed strictly through its generated host VTable accessors.
+pub unsafe trait FfiLayout: Sized + 'static {}
+
+macro_rules! impl_ffi_layout_primitives {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            // SAFETY: Primitive value type with no drop glue, allocator ownership, or invalid bit patterns
+            // when manipulated through typed accessors.
+            unsafe impl FfiLayout for $ty {}
+        )*
+    };
+}
+
+impl_ffi_layout_primitives!(
+    u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, f32, f64, bool, FfiEntity
+);
+
+// SAFETY: Fixed-size arrays of `FfiLayout` elements have contiguous layout of `FfiLayout` items.
+unsafe impl<T: FfiLayout, const N: usize> FfiLayout for [T; N] {}
+
+/// Host-side symbol table entry mapping a symbol name to its static VTable or function pointer.
+///
+/// Intentionally a Rust metadata struct (not `#[repr(C)]`) used by `ExposableComponent::symbols()`
+/// so the host's `ModRegistry` can populate its `get_proc_address` lookup table.
 #[derive(Debug, Copy, Clone)]
 pub struct SymbolEntry {
     pub name: &'static str,
     pub ptr: *const c_void,
 }
 
-// SAFETY: `SymbolEntry` only holds a `'static` string reference and a static function/VTable pointer.
+// SAFETY: `SymbolEntry` only holds a `'static` string slice and an immutable static VTable/fn pointer.
 unsafe impl Sync for SymbolEntry {}
 // SAFETY: `SymbolEntry` only holds immutable static pointers safe to share across threads.
 unsafe impl Send for SymbolEntry {}
@@ -447,12 +447,12 @@ unsafe impl Send for SymbolEntry {}
 ///
 /// Exposes the component's string name, deterministic UUID, layout (`size` and `align`),
 /// static `#[repr(C)]` VTable, and C-ABI accessor symbol table for `ModRegistry` registration.
-pub trait ExposableComponent: Sized + 'static {
-    /// The string name of the component (e.g., `"Position"`).
+pub trait ExposableComponent: FfiLayout {
+    /// The string name of the component (e.g., `"Position"` or `"game::Position"`).
     const COMPONENT_NAME: &'static str;
 
-    /// Null-terminated C string bytes of the component name (e.g., `b"Position\0"`).
-    const COMPONENT_CSTR: &'static [u8];
+    /// Null-terminated C string literal of the component name.
+    const COMPONENT_CSTR: &'static core::ffi::CStr;
 
     /// Deterministic 128-bit UUID for this component.
     const UUID: ComponentUuid;
@@ -460,11 +460,14 @@ pub trait ExposableComponent: Sized + 'static {
     /// The generated `#[repr(C)]` VTable struct type (`<Struct>VTable`).
     type VTable: Copy + 'static;
 
-    /// Static constant value of the component's VTable.
-    const VTABLE: Self::VTable;
+    /// Returns a reference to the static VTable instance for this component.
+    fn vtable() -> &'static Self::VTable;
 
     /// Returns a pointer to the static VTable instance for this component.
-    fn vtable_ptr() -> *const Self::VTable;
+    #[inline]
+    fn vtable_ptr() -> *const Self::VTable {
+        Self::vtable() as *const Self::VTable
+    }
 
     /// Returns a type-erased pointer to the static VTable instance.
     #[inline]
@@ -507,17 +510,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ffi_entity_roundtrip() {
-        let entity = FfiEntity::from_parts(42, 7);
-        assert_eq!(entity.index(), 42);
-        assert_eq!(entity.generation(), 7);
+    fn test_ffi_entity_bits_roundtrip() {
+        let bits = 0x0000_0007_0000_002a_u64;
+        let entity = FfiEntity::from_bits(bits);
+        assert_eq!(entity.to_bits(), bits);
+    }
 
-        let id: EntityId = entity.into();
-        assert_eq!(id.index, 42);
-        assert_eq!(id.generation, 7);
+    #[test]
+    fn test_ffi_result_transparent_soundness() {
+        assert!(FfiResult::OK.is_ok());
+        assert!(!FfiResult::OK.is_err());
+        assert!(FfiResult::PANIC_CAUGHT.is_err());
 
-        let roundtrip: FfiEntity = id.into();
-        assert_eq!(roundtrip, entity);
+        // Arbitrary unknown integer from C must never cause UB
+        let unknown_from_c = FfiResult(12345);
+        assert!(unknown_from_c.is_err());
+        assert_eq!(unknown_from_c.0, 12345);
+    }
+
+    #[test]
+    fn test_component_access_mode_validity() {
+        assert!(ComponentAccessMode::READ.is_valid());
+        assert!(!ComponentAccessMode::READ.is_mutable());
+        assert!(ComponentAccessMode::WRITE.is_valid());
+        assert!(ComponentAccessMode::WRITE.is_mutable());
+        assert!(ComponentAccessMode::FILTER_ONLY.is_valid());
+        assert!(ComponentAccessMode::FILTER_ONLY.is_filter_only());
+        assert!(!ComponentAccessMode(99).is_valid());
     }
 
     #[test]
@@ -530,7 +549,7 @@ mod tests {
         let recovered = unsafe { slice.as_str().unwrap() };
         assert_eq!(recovered, "hello_mod");
 
-        let view: StrView = slice.into();
+        let view: StrView = slice;
         // SAFETY: `view` points to the same valid static `&str`.
         assert_eq!(unsafe { view.as_str().unwrap() }, "hello_mod");
 
