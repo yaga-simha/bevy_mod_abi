@@ -1,12 +1,18 @@
+#![deny(unsafe_op_in_unsafe_fn)]
+#![deny(improper_ctypes_definitions)]
+
 //! # `guest_sdk`
 //!
 //! Ergonomic, Bevy-independent SDK for guest mod authors.
 //! Wraps raw `abi_contract` C-ABI structs and function pointers into safe abstractions.
 
 pub use abi_contract::{
-    ComponentAccessMode, ComponentAccessRequirement, ComponentUuid, EcsChunkIter, EntityId,
-    GetProcAddressFn, HostApi, ModInitFn, ModShutdownFn, ModStatus, StrView,
-    SystemAccessDescriptor, SystemRunCallback,
+    ComponentAccessDesc, ComponentAccessMode, ComponentAccessRequirement, ComponentUuid,
+    DynamicSystemCallback, EcsChunkIter, EntityId, ExposableComponent, FfiEntity, FfiResult,
+    FfiSlice, GetProcAddressFn, HostApi, IterColumnMutableFn, IterColumnReadonlyFn,
+    IterColumnStrideFn, IterEntitiesFn, IterMarkChangedFn, IterNextChunkFn, ModInitFn,
+    ModShutdownFn, ModStatus, RawChunkIter, RawCommandQueue, StrView, SymbolEntry,
+    SystemAccessDescriptor, SystemDescriptor, SystemRunCallback,
 };
 
 /// Macro to export a mod's lifecycle entry points.
