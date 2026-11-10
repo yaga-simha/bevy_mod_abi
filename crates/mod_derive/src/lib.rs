@@ -902,9 +902,7 @@ mod tests {
             }
         };
         let err = expand_mod_exposable(&input).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("does not support generic structs"));
+        assert!(err.to_string().contains("does not support generic structs"));
     }
 
     #[test]
@@ -962,4 +960,3 @@ mod tests {
         assert!(err.to_string().contains("unsupported `#[mod_component"));
     }
 }
-

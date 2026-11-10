@@ -7,7 +7,16 @@ authors.workspace = true
 
 [dependencies]
 abi_contract = { workspace = true }
+mod_derive = { workspace = true }
 libloading = { workspace = true }
+bevy_ecs = { version = "0.20.1", default-features = false, features = ["std", "async_executor"] }
+bevy_app = { version = "0.20.1", default-features = false, features = ["std"] }
+nonmax = "0.5"
 
 [dev-dependencies]
 mod_derive = { workspace = true }
+
+[[bench]]
+name = "chunk_throughput"
+path = "../../benches/chunk_throughput.rs"
+harness = false

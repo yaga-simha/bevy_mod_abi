@@ -227,8 +227,7 @@ fn validation_gate_1_disambiguated_modules_and_static_vtable_identity() {
     let vt_ref_ptr = MixedComponent::vtable() as *const MixedComponentVTable;
     let vt_trait_ptr = <MixedComponent as ExposableComponent>::vtable_ptr();
     let vt_sym_ptr = MixedComponent::resolve_symbol("MixedComponent_vtable")
-        .expect("MixedComponent_vtable symbol")
-        as *const MixedComponentVTable;
+        .expect("MixedComponent_vtable symbol") as *const MixedComponentVTable;
     assert_eq!(vt_ref_ptr, vt_trait_ptr);
     assert_eq!(vt_trait_ptr, vt_sym_ptr);
 
@@ -254,9 +253,8 @@ fn validation_gate_1_byte_stride_array_iteration_and_symbol_resolution() {
     let vt = MixedComponent::vtable();
     let vec3_vt = Vec3::vtable();
 
-    let resolved_vt_ptr =
-        MixedComponent::resolve_symbol("MixedComponent_vtable").expect("vtable symbol")
-            as *const MixedComponentVTable;
+    let resolved_vt_ptr = MixedComponent::resolve_symbol("MixedComponent_vtable")
+        .expect("vtable symbol") as *const MixedComponentVTable;
     assert_eq!(resolved_vt_ptr, MixedComponent::vtable_ptr());
 
     let get_health_ptr = MixedComponent::resolve_symbol("MixedComponent_get_health")

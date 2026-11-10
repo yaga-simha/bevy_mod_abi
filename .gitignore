@@ -6,3 +6,4 @@ target/
 *.so
 *.dll
 .DS_Store
+.agents/

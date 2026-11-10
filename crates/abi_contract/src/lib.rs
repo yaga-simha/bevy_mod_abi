@@ -323,7 +323,8 @@ pub type IterMarkChangedFn =
 pub type IterEntitiesFn = unsafe extern "C" fn(iter: *const RawChunkIter) -> *const FfiEntity;
 
 /// Return the byte stride (`size_of::<C>()`) of column `index`.
-pub type IterColumnStrideFn = unsafe extern "C" fn(iter: *const RawChunkIter, index: usize) -> usize;
+pub type IterColumnStrideFn =
+    unsafe extern "C" fn(iter: *const RawChunkIter, index: usize) -> usize;
 
 /// Dynamic system callback invoked by the host during schedule execution.
 ///

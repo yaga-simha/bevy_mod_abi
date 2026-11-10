@@ -51,14 +51,6 @@ fn test_c99_shared_library_mutates_rust_components_via_vtable() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let c_mod_dir = manifest_dir.join("../../tests/asymmetric_c_mod");
 
-    // Compile the C99 shared library via `make`
-    let status = Command::new("make")
-        .arg("-C")
-        .arg(&c_mod_dir)
-        .status()
-        .expect("failed to invoke `make` for asymmetric_c_mod");
-    assert!(status.success(), "`make -C tests/asymmetric_c_mod` failed");
-
     let dylib_name = if cfg!(target_os = "macos") {
         "libasymmetric_c_mod.dylib"
     } else if cfg!(target_os = "windows") {
@@ -67,6 +59,16 @@ fn test_c99_shared_library_mutates_rust_components_via_vtable() {
         "libasymmetric_c_mod.so"
     };
     let dylib_path = c_mod_dir.join(dylib_name);
+
+    // Compile the C99 shared library via `make` if missing
+    if !dylib_path.exists() {
+        let status = Command::new("make")
+            .arg("-C")
+            .arg(&c_mod_dir)
+            .status()
+            .expect("failed to invoke `make` for asymmetric_c_mod");
+        assert!(status.success(), "`make -C tests/asymmetric_c_mod` failed");
+    }
 
     // 1. Verify `ModHost::load_mod` handshake and ABI version check succeed
     let mut host = ModHost::new();
@@ -113,5 +115,4 @@ fn test_c99_shared_library_mutates_rust_components_via_vtable() {
     }
 
     drop(host);
-    let _ = std::fs::remove_file(&dylib_path);
 }
