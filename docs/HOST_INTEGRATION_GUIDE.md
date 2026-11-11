@@ -625,7 +625,10 @@ pub fn inspect_minions(query: Query<(Entity, &MinionTag, &Position)>) {
 | **`ModErrorPolicy`** | `host_runtime` | `Quarantine` / `Log` / `ReportToBevy` | Controls runtime fault handling for dynamic mod systems. |
 | **`ModLoadError`** | `host_runtime` | Structured load/unload error enum | Typed diagnostics (`DlOpen`, `IncompatibleAbiVersion`, `InitFailed`, etc.). |
 | **`ModAppExt`** | `host_runtime` | `app.register_mod_component::<T>()` | Registers `Table` or `SparseSet` component, assigns `ComponentId`, exposes VTable. |
-| **`ModAppExt`** | `host_runtime` | `app.register_mod_component_opaque::<T>()` | Registers component for VTable access while forbidding raw-byte insertion. |
+| **`ModAppExt`** | `host_runtime` | `app.register_mod_component_with_default::<T>()` | Also registers `T::default()` for guest `cmd_insert_default` (including opaque `String`/`Vec` components). |
+| **`ModAppExt`** | `host_runtime` | `app.register_mod_component_opaque::<T>()` | Registers component for VTable access while forbidding raw-byte insertion (`_with_default` variant also available). |
+| **`ModAppExt`** | `host_runtime` | `app.register_mod_resource::<R>()` | Exposes singleton Bevy `Resource` for `RESOURCE_READ` / `RESOURCE_WRITE` (`res_readonly` / `res_mutable`). |
+| **`ModAppExt`** | `host_runtime` | `app.try_register_mod_*::<T>()` | Fallible registration variants returning `Result<_, ComponentCollisionError>` (`UuidCollision`, `MetadataMismatch`). |
 | **`ModAppExt`** | `host_runtime` | `app.register_mod_type::<T>()` | Registers helper type VTable without assigning ECS `ComponentId`. |
 | **`ModAppExt`** | `host_runtime` | `app.try_load_mod(path)` | Loads mod returning `Result<ModId, ModLoadError>`. |
 | **`ModAppExt`** | `host_runtime` | `app.try_load_mod_strict(path)` | Pre-validates component names and borrow conflicts before inserting into schedule. |

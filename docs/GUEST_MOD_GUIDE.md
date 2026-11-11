@@ -315,7 +315,11 @@ Mods can register brand-new ECS components unknown to the host at compile time (
 |---|---|
 | `commands.spawn_empty() -> FfiEntity` | Immediately allocates a valid 64-bit `FfiEntity` (`!entity.is_null()`, i.e. `!= FfiEntity::NULL` / `0`); queues deferred spawn. |
 | `commands.insert_value(entity, c"Position", &val)` | Copies `sizeof(T)` bytes into a host-owned aligned buffer. Allowed on POD/raw-insertable components and runtime-registered components; returns `FfiResult::PERMISSION_DENIED` on heap-owning (`String`/`Vec`), `bool`-bearing, or `opaque` host components. |
+| `commands.insert_default(entity, c"NameTag")` | Invokes the host's registered `Default` constructor (`register_mod_component_with_default`), safely attaching even opaque `String`/`Vec` host components without raw byte copies. |
+| `commands.remove_component(entity, c"Position")` | Queues deferred component removal (`entity_mut.remove_by_id`). |
 | `commands.despawn(entity)` | Queues recursive Bevy despawn (respecting `ChildOf` hierarchies and foreign `ComponentDropFn` hooks). |
+
+`GuestApp` also supports optional columns (`ComponentAccessDesc::optional_read` / `optional_write` with `chunk.optional_column::<T>` / `chunk.optional_column_mut::<T>`), row-level tick filters (`ComponentAccessDesc::changed` / `added`), singleton host resources (`ComponentAccessDesc::resource_read` / `resource_write` via `ctx.iter().guest_resource::<R>()` / `guest_resource_mut::<R>()` or `MultiQueryContext::guest_resource`), and conditional system execution (`app.add_system_if` / `app.add_multi_query_system_if` backed by `ConditionalSystemDescriptor`).
 
 ---
 

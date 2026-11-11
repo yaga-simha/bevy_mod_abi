@@ -97,16 +97,18 @@ All types have guaranteed `sizeof`, `alignof`, and `offsetof` across standard 64
 | 3 | **`FfiEntity`** | **8** | **8** | `(value)` | `uint64_t` | `0` | `8` | Opaque 64-bit entity handle; `BAM_ENTITY_NULL = 0ULL` is the sole invalid sentinel. |
 | 4 | **`FfiByteSlice`** | **16** | **8** | `ptr`<br>`len` | `const uint8_t*`<br>`size_t` | `0`<br>`8` | `8`<br>`8` | Borrowed byte/string slice (`StrView`). |
 | 5 | **`ComponentUuid`** | **16** | **1** | `bytes[16]` | `uint8_t[16]` | `0` | `16` | Deterministic 128-bit 2-lane FNV-1a hash. |
-| 6 | **`ComponentAccessMode`** | **4** | **4** | `(value)` | `uint32_t` | `0` | `4` | `READ=0`, `WRITE=1`, `FILTER_ONLY=2`, `WITHOUT=3`. |
+| 6 | **`ComponentAccessMode`** | **4** | **4** | `(value)` | `uint32_t` | `0` | `4` | `READ=0`, `WRITE=1`, `FILTER_ONLY=2`, `WITHOUT=3`, `OPTIONAL_READ=4`, `OPTIONAL_WRITE=5`, `CHANGED=6`, `ADDED=7`, `RESOURCE_READ=8`, `RESOURCE_WRITE=9`. |
 | 7 | **`ScheduleLabelId`** | **4** | **4** | `(value)` | `uint32_t` | `0` | `4` | `UPDATE=0`, `STARTUP=1`, `PRE_UPDATE=2`, `POST_UPDATE=3`, `FIXED_UPDATE=4`, `LAST=5`. |
 | 8 | **`ComponentAccessDesc`** | **16** | **8** | `name`<br>`mode`<br>*(padding)* | `const char*`<br>`ComponentAccessMode`<br>`-` | `0`<br>`8`<br>`12` | `8`<br>`4`<br>`4` | 4 bytes tail padding to satisfy 8-byte pointer alignment. |
 | 9 | **`QuerySpec`** | **16** | **8** | `queries`<br>`query_count` | `const ComponentAccessDesc*`<br>`size_t` | `0`<br>`8` | `8`<br>`8` | Array of component descriptors (`query_count <= 32`). |
 | 10 | **`SystemDescriptor`** | **48** | **8** | `struct_size`<br>*(padding)*<br>`name`<br>`queries`<br>`query_count`<br>`callback`<br>`user_data` | `uint32_t`<br>`-`<br>`const char*`<br>`const ComponentAccessDesc*`<br>`size_t`<br>`DynamicSystemCallback`<br>`void*` | `0`<br>`4`<br>`8`<br>`16`<br>`24`<br>`32`<br>`40` | `4`<br>`4`<br>`8`<br>`8`<br>`8`<br>`8`<br>`8` | v1 single-query descriptor (`query_count <= 32`). |
 | 11 | **`ScheduledSystemDescriptor`** | **88** | **8** | `base`<br>`schedule`<br>`flags`<br>`after`<br>`after_count`<br>`before`<br>`before_count` | `SystemDescriptor`<br>`ScheduleLabelId`<br>`uint32_t`<br>`const char* const*`<br>`size_t`<br>`const char* const*`<br>`size_t` | `0`<br>`48`<br>`52`<br>`56`<br>`64`<br>`72`<br>`80` | `48`<br>`4`<br>`4`<br>`8`<br>`8`<br>`8`<br>`8` | Alias `SystemDescriptorV2`; layout-prefixed by `SystemDescriptor` at offset `0`. |
-| 12 | **`MultiQuerySystemDescriptor`** | **48** | **8** | `struct_size`<br>*(padding)*<br>`name`<br>`query_specs`<br>`query_spec_count`<br>`callback`<br>`user_data` | `uint32_t`<br>`-`<br>`const char*`<br>`const QuerySpec*`<br>`size_t`<br>`MultiQuerySystemCallback`<br>`void*` | `0`<br>`4`<br>`8`<br>`16`<br>`24`<br>`32`<br>`40` | `4`<br>`4`<br>`8`<br>`8`<br>`8`<br>`8`<br>`8` | v1 multi-query descriptor (`1 <= query_spec_count <= 8`). |
-| 13 | **`ScheduledMultiQuerySystemDescriptor`** | **88** | **8** | `base`<br>`schedule`<br>`flags`<br>`after`<br>`after_count`<br>`before`<br>`before_count` | `MultiQuerySystemDescriptor`<br>`ScheduleLabelId`<br>`uint32_t`<br>`const char* const*`<br>`size_t`<br>`const char* const*`<br>`size_t` | `0`<br>`48`<br>`52`<br>`56`<br>`64`<br>`72`<br>`80` | `48`<br>`4`<br>`4`<br>`8`<br>`8`<br>`8`<br>`8` | Alias `MultiQuerySystemDescriptorV2`; layout-prefixed by `MultiQuerySystemDescriptor`. |
-| 14 | **`ModComponentDescriptor`** | **64** | **8** | `struct_size`<br>*(padding)*<br>`name`<br>`uuid`<br>`size`<br>`align`<br>`drop_fn`<br>`vtable_ptr` | `uint32_t`<br>`-`<br>`const char*`<br>`ComponentUuid`<br>`size_t`<br>`size_t`<br>`ComponentDropFn`<br>`const void*` | `0`<br>`4`<br>`8`<br>`16`<br>`32`<br>`40`<br>`48`<br>`56` | `4`<br>`4`<br>`8`<br>`16`<br>`8`<br>`8`<br>`8`<br>`8` | Alias `DynamicComponentDescriptor`; runtime component registration. |
-| 15 | **`HostApi`** | **72** | **8** | `struct_size`<br>`abi_version`<br>`register_system`<br>`iter_next_chunk`<br>`iter_column_readonly`<br>`iter_column_mutable`<br>`iter_mark_changed`<br>`iter_entities`<br>`iter_column_stride`<br>`register_component` | `uint32_t`<br>`uint32_t`<br>`RegisterSystemFn`<br>`IterNextChunkFn`<br>`IterColumnReadonlyFn`<br>`IterColumnMutableFn`<br>`IterMarkChangedFn`<br>`IterEntitiesFn`<br>`IterColumnStrideFn`<br>`RegisterComponentFn` | `0`<br>`4`<br>`8`<br>`16`<br>`24`<br>`32`<br>`40`<br>`48`<br>`56`<br>`64` | `4`<br>`4`<br>`8`<br>`8`<br>`8`<br>`8`<br>`8`<br>`8`<br>`8`<br>`8` | Backward-compatible with 64-byte legacy mods via `struct_size >= 64`. |
+| 12 | **`ConditionalSystemDescriptor`** | **104** | **8** | `sched`<br>`run_if`<br>`run_if_user_data` | `ScheduledSystemDescriptor`<br>`RunConditionCallback`<br>`void*` | `0`<br>`88`<br>`96` | `88`<br>`8`<br>`8` | Alias `SystemDescriptorV3` (`56`B on 32-bit); adds optional `run_if` predicate. |
+| 13 | **`MultiQuerySystemDescriptor`** | **48** | **8** | `struct_size`<br>*(padding)*<br>`name`<br>`query_specs`<br>`query_spec_count`<br>`callback`<br>`user_data` | `uint32_t`<br>`-`<br>`const char*`<br>`const QuerySpec*`<br>`size_t`<br>`MultiQuerySystemCallback`<br>`void*` | `0`<br>`4`<br>`8`<br>`16`<br>`24`<br>`32`<br>`40` | `4`<br>`4`<br>`8`<br>`8`<br>`8`<br>`8`<br>`8` | v1 multi-query descriptor (`1 <= query_spec_count <= 8`). |
+| 14 | **`ScheduledMultiQuerySystemDescriptor`** | **88** | **8** | `base`<br>`schedule`<br>`flags`<br>`after`<br>`after_count`<br>`before`<br>`before_count` | `MultiQuerySystemDescriptor`<br>`ScheduleLabelId`<br>`uint32_t`<br>`const char* const*`<br>`size_t`<br>`const char* const*`<br>`size_t` | `0`<br>`48`<br>`52`<br>`56`<br>`64`<br>`72`<br>`80` | `48`<br>`4`<br>`4`<br>`8`<br>`8`<br>`8`<br>`8` | Alias `MultiQuerySystemDescriptorV2`; layout-prefixed by `MultiQuerySystemDescriptor`. |
+| 15 | **`ConditionalMultiQuerySystemDescriptor`** | **104** | **8** | `sched`<br>`run_if`<br>`run_if_user_data` | `ScheduledMultiQuerySystemDescriptor`<br>`RunConditionCallback`<br>`void*` | `0`<br>`88`<br>`96` | `88`<br>`8`<br>`8` | Alias `MultiQuerySystemDescriptorV3` (`56`B on 32-bit); adds optional `run_if` predicate. |
+| 16 | **`ModComponentDescriptor`** | **64** | **8** | `struct_size`<br>*(padding)*<br>`name`<br>`uuid`<br>`size`<br>`align`<br>`drop_fn`<br>`vtable_ptr` | `uint32_t`<br>`-`<br>`const char*`<br>`ComponentUuid`<br>`size_t`<br>`size_t`<br>`ComponentDropFn`<br>`const void*` | `0`<br>`4`<br>`8`<br>`16`<br>`32`<br>`40`<br>`48`<br>`56` | `4`<br>`4`<br>`8`<br>`16`<br>`8`<br>`8`<br>`8`<br>`8` | Alias `DynamicComponentDescriptor`; runtime component registration. |
+| 17 | **`HostApi`** | **72** | **8** | `struct_size`<br>`abi_version`<br>`register_system`<br>`iter_next_chunk`<br>`iter_column_readonly`<br>`iter_column_mutable`<br>`iter_mark_changed`<br>`iter_entities`<br>`iter_column_stride`<br>`register_component` | `uint32_t`<br>`uint32_t`<br>`RegisterSystemFn`<br>`IterNextChunkFn`<br>`IterColumnReadonlyFn`<br>`IterColumnMutableFn`<br>`IterMarkChangedFn`<br>`IterEntitiesFn`<br>`IterColumnStrideFn`<br>`RegisterComponentFn` | `0`<br>`4`<br>`8`<br>`16`<br>`24`<br>`32`<br>`40`<br>`48`<br>`56`<br>`64` | `4`<br>`4`<br>`8`<br>`8`<br>`8`<br>`8`<br>`8`<br>`8`<br>`8`<br>`8` | Backward-compatible with 64-byte legacy mods via `struct_size >= 64`. |
 
 ### 2.2 Calling Conventions & Pointer Rules
 1. **Calling Convention:** All dynamic entry points and function pointer callbacks strictly adhere to standard C calling conventions (`cdecl` on x86, standard register conventions on x86_64 and AArch64).
@@ -204,11 +206,17 @@ The guest retrieves pointers by passing string names to `get_proc_address`:
   - `"cmd_spawn_empty"`: `CmdSpawnEmptyFn`
   - `"cmd_despawn"`: `CmdDespawnFn`
   - `"cmd_insert_component"`: `CmdInsertComponentFn`
-- **Iteration Controls:**
+  - `"cmd_remove_component"`: `CmdRemoveComponentFn`
+  - `"cmd_insert_default"`: `CmdInsertDefaultFn`
+- **Iteration & Singleton Resource Controls:**
   - `"iter_reset"`: `IterResetFn`
+  - `"res_readonly"` / `"iter_resource_readonly"`: `IterResourceReadonlyFn`
+  - `"res_mutable"` / `"iter_resource_mutable"`: `IterResourceMutableFn`
 - **Advanced System & Component Registration:**
   - `"register_scheduled_system"`: `RegisterScheduledSystemFn`
+  - `"register_conditional_system"`: `RegisterConditionalSystemFn`
   - `"register_multi_query_system"`: `RegisterMultiQuerySystemFn`
+  - `"register_conditional_multi_query_system"`: `RegisterConditionalMultiQuerySystemFn`
   - `"register_component"`: `RegisterComponentFn` (also directly on `HostApi::register_component`)
 
 SemVer handshake compatibility is checked via `bevy_abi_version_is_compatible(host_api->abi_version, BEVY_ABI_VERSION_PACKED)` (`major ==` and `guest_minor <= host_minor`), while extensible descriptors (`SystemDescriptor`, `ScheduledSystemDescriptor`, `MultiQuerySystemDescriptor`, `ScheduledMultiQuerySystemDescriptor`, `ModComponentDescriptor`) enforce `struct_size >= MIN_V1_SIZE` and zero-fill trailing fields when older minor-version descriptors are passed.
@@ -238,11 +246,17 @@ typedef struct ComponentAccessDesc {
 } ComponentAccessDesc;
 ```
 
-There are four access modes:
-1. `COMPONENT_ACCESS_READ (0)`: Read-only access (`&T`). Multiple systems may read concurrently.
-2. `COMPONENT_ACCESS_WRITE (1)`: Exclusive mutable access (`&mut T`). Bevy's scheduler guarantees that no other system accesses this component during execution.
-3. `COMPONENT_ACCESS_FILTER_ONLY (2)`: Archetype presence filter (`With<T>`). Matches entities having `T` without reading or allocating column buffers.
-4. `COMPONENT_ACCESS_WITHOUT (3)`: Archetype absence filter (`Without<T>`). Matches entities lacking `T`. Proves query disjointness to Bevy's parallel scheduler.
+There are ten `ComponentAccessMode` values:
+1. `COMPONENT_ACCESS_READ (0)`: Read-only entity column access (`&T`). Multiple systems may read concurrently.
+2. `COMPONENT_ACCESS_WRITE (1)`: Exclusive mutable entity column access (`&mut T`).
+3. `COMPONENT_ACCESS_FILTER_ONLY (2)`: Archetype presence filter (`With<T>`). Matches entities having `T` without reading column buffers.
+4. `COMPONENT_ACCESS_WITHOUT (3)`: Archetype absence filter (`Without<T>`). Matches entities lacking `T` and proves query disjointness to Bevy's parallel scheduler.
+5. `COMPONENT_ACCESS_OPTIONAL_READ (4)`: Optional read-only column (`Option<&T>`). Matches archetypes with or without `T`; `iter_column_readonly` returns non-null when present or `NULL` when absent.
+6. `COMPONENT_ACCESS_OPTIONAL_WRITE (5)`: Optional mutable column (`Option<&mut T>`). Matches archetypes with or without `T`; `iter_column_mutable` returns non-null and marks change ticks when present, or `NULL` when absent.
+7. `COMPONENT_ACCESS_CHANGED (6)`: Row-level change tick filter (`Changed<T>`). Yields contiguous runs of rows modified since `system.last_run`.
+8. `COMPONENT_ACCESS_ADDED (7)`: Row-level added tick filter (`Added<T>`). Yields contiguous runs of rows added since `system.last_run`.
+9. `COMPONENT_ACCESS_RESOURCE_READ (8)`: Shared read access to a host-registered Bevy singleton `Resource` (`Res<R>`), read via `res_readonly(iter, "ResourceName")`.
+10. `COMPONENT_ACCESS_RESOURCE_WRITE (9)`: Exclusive write access to a host-registered Bevy singleton `Resource` (`ResMut<R>`), borrowed via `res_mutable(iter, "ResourceName")` (automatically updating Bevy's resource change tick).
 
 ### 4.2 Scheduler Concurrency & Borrow Checking
 When `host_api->register_system(host_context, &desc)` is called:
@@ -410,6 +424,20 @@ typedef FfiResult (*CmdInsertComponentFn)(
     const char* component_name,
     const uint8_t* data,
     size_t len
+);
+
+/* 4. Deferred Component Removal */
+typedef FfiResult (*CmdRemoveComponentFn)(
+    RawCommandQueue* queue,
+    FfiEntity entity,
+    const char* component_name
+);
+
+/* 5. Deferred Host-Default Component Insertion (supports non-POD String/Vec components) */
+typedef FfiResult (*CmdInsertDefaultFn)(
+    RawCommandQueue* queue,
+    FfiEntity entity,
+    const char* component_name
 );
 ```
 
