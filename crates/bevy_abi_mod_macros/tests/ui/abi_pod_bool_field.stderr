@@ -1,0 +1,22 @@
+error[E0277]: the trait bound `bool: AbiPod` is not satisfied
+ --> tests/ui/abi_pod_bool_field.rs:6:17
+  |
+6 |     pub active: bool,
+  |                 ^^^^ the trait `AbiPod` is not implemented for `bool`
+  |
+  = help: the following other types implement trait `AbiPod`:
+            BoolInPod
+            FfiEntity
+            [T; N]
+            f32
+            f64
+            i128
+            i16
+            i32
+          and $N others
+note: required by a bound in `assert_field_abi_pod`
+ --> tests/ui/abi_pod_bool_field.rs:4:23
+  |
+4 | #[derive(Copy, Clone, AbiPod)]
+  |                       ^^^^^^ required by this bound in `assert_field_abi_pod`
+  = note: this error originates in the derive macro `AbiPod` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -221,7 +221,7 @@ fn validation_gate_1_self_aliasing_string_and_vec_setters() {
     let ptr = core::ptr::addr_of_mut!(comp) as *mut c_void;
 
     // SAFETY: Passing the slice returned by `get_tag(ptr)` and a sub-slice of it directly
-    // back into `set_tag(ptr, ...)` tests the B1 self-aliasing overlap guard.
+    // back into `set_tag(ptr, ...)` tests the self-aliasing overlap guard.
     unsafe {
         let full_slice = (vt.get_tag)(ptr as *const c_void);
         (vt.set_tag)(ptr, full_slice.ptr, full_slice.len);
@@ -245,7 +245,7 @@ fn validation_gate_1_self_aliasing_string_and_vec_setters() {
 
 #[test]
 fn validation_gate_1_disambiguated_modules_and_static_vtable_identity() {
-    // Verify unique static VTable address across all resolution paths (B2)
+    // Verify unique static VTable address across all resolution paths
     let vt_ref_ptr = MixedComponent::vtable() as *const MixedComponentVTable;
     let vt_trait_ptr = <MixedComponent as ExposableComponent>::vtable_ptr();
     let vt_sym_ptr = MixedComponent::resolve_symbol("MixedComponent_vtable")
@@ -253,7 +253,7 @@ fn validation_gate_1_disambiguated_modules_and_static_vtable_identity() {
     assert_eq!(vt_ref_ptr, vt_trait_ptr);
     assert_eq!(vt_trait_ptr, vt_sym_ptr);
 
-    // Verify two structs named `Position` in different modules coexist with distinct names & UUIDs (M1)
+    // Verify two structs named `Position` in different modules coexist with distinct names & UUIDs
     assert_eq!(
         <physics::Position as ExposableComponent>::COMPONENT_NAME,
         "physics::Position"
@@ -468,4 +468,110 @@ fn validation_gate_1_pod_vs_opaque_and_bool_soundness() {
         (name_vt.set_0)(inner_name_ptr, next.as_ptr(), next.len());
     }
     assert_eq!(holder.name.0, "opaque_mutated_via_vtable");
+}
+
+mod m01_facade_scope {
+    pub mod facade {
+        pub mod bevy_abi_mod_sys {
+            pub use ::bevy_abi_mod_sys::*;
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, PartialEq, ::bevy_abi_mod_macros::AbiPod)]
+    #[mod_component(crate = self::facade::bevy_abi_mod_sys)]
+    pub struct FacadePod {
+        pub x: f32,
+        pub y: f32,
+    }
+
+    #[derive(Debug, Clone, PartialEq, ::bevy_abi_mod_macros::ModExposable)]
+    #[mod_exposable(crate = self::facade::bevy_abi_mod_sys)]
+    pub struct FacadeComponent {
+        pub pod: FacadePod,
+        pub label: String,
+        pub active: bool,
+    }
+}
+
+#[test]
+fn regression_m01_crate_override_and_facade_reexport() {
+    require_abi_pod::<m01_facade_scope::FacadePod>();
+
+    let mut comp = m01_facade_scope::FacadeComponent {
+        pod: m01_facade_scope::FacadePod { x: 3.5, y: -1.5 },
+        label: String::from("facade"),
+        active: false,
+    };
+    let vt = m01_facade_scope::FacadeComponent::vtable();
+    let ptr = core::ptr::addr_of_mut!(comp) as *mut c_void;
+    // SAFETY: `ptr` points to a valid, aligned `FacadeComponent`.
+    unsafe {
+        (vt.set_active)(ptr, 1);
+        let next_label = "facade_updated";
+        (vt.set_label)(ptr, next_label.as_ptr(), next_label.len());
+    }
+    assert!(comp.active);
+    assert_eq!(comp.label, "facade_updated");
+}
+
+#[deny(non_snake_case)]
+mod m02_submodules {
+    pub mod scene_a {
+        use bevy_abi_mod_macros::ModExposable;
+
+        #[derive(Debug, Clone, PartialEq, ModExposable)]
+        pub struct DuplicateItem {
+            pub x: f32,
+            pub tag: String,
+        }
+
+        // Verify generated `DuplicateItem_get_x` lives inside `const _: () = { ... };`
+        // and never collides with items in the caller's module namespace.
+        #[allow(non_snake_case)]
+        pub fn DuplicateItem_get_x() -> i32 {
+            42
+        }
+    }
+
+    pub mod scene_b {
+        use bevy_abi_mod_macros::ModExposable;
+
+        #[derive(Debug, Clone, PartialEq, ModExposable)]
+        pub struct DuplicateItem {
+            pub x: f64,
+            pub enabled: bool,
+        }
+    }
+}
+
+#[test]
+fn regression_m02_duplicate_struct_names_in_submodules() {
+    assert_eq!(m02_submodules::scene_a::DuplicateItem_get_x(), 42);
+
+    let mut a = m02_submodules::scene_a::DuplicateItem {
+        x: 1.25,
+        tag: String::from("a"),
+    };
+    let mut b = m02_submodules::scene_b::DuplicateItem {
+        x: 9.75,
+        enabled: false,
+    };
+
+    let vt_a = m02_submodules::scene_a::DuplicateItem::vtable();
+    let vt_b = m02_submodules::scene_b::DuplicateItem::vtable();
+
+    let ptr_a = core::ptr::addr_of_mut!(a) as *mut c_void;
+    let ptr_b = core::ptr::addr_of_mut!(b) as *mut c_void;
+
+    // SAFETY: `ptr_a` and `ptr_b` point to valid instances of their respective `DuplicateItem` types.
+    unsafe {
+        assert_eq!((vt_a.get_x)(ptr_a as *const c_void), 1.25f32);
+        assert_eq!((vt_b.get_x)(ptr_b as *const c_void), 9.75f64);
+        (vt_a.set_x)(ptr_a, 5.5f32);
+        (vt_b.set_enabled)(ptr_b, 1u8);
+    }
+
+    assert_eq!(a.x, 5.5f32);
+    assert!(b.enabled);
 }

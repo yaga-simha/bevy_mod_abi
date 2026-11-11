@@ -1,0 +1,5 @@
+error: `#[derive(AbiPod)]` does not support generic structs
+ --> tests/ui/abi_pod_generic.rs:5:22
+  |
+5 | pub struct GenericPod<T> {
+  |                      ^^^

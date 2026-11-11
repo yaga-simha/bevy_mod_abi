@@ -1,0 +1,40 @@
+error[E0277]: the trait bound `DirectDropPod: Copy` is not satisfied
+ --> tests/ui/abi_pod_direct_drop.rs:5:12
+  |
+5 | pub struct DirectDropPod {
+  |            ^^^^^^^^^^^^^ the trait `Copy` is not implemented for `DirectDropPod`
+  |
+note: required by a bound in `AbiPod`
+ --> $WORKSPACE/crates/bevy_abi_mod_sys/src/lib.rs
+  |
+  | pub unsafe trait AbiPod: FfiLayout + Copy + 'static {}
+  |                                      ^^^^ required by this bound in `AbiPod`
+help: consider annotating `DirectDropPod` with `#[derive(Copy)]`
+  |
+5 + #[derive(Copy)]
+6 | pub struct DirectDropPod {
+  |
+
+error[E0080]: evaluation panicked: assertion failed: !::core::mem::needs_drop::<DirectDropPod>()
+ --> tests/ui/abi_pod_direct_drop.rs:4:10
+  |
+4 | #[derive(AbiPod)]
+  |          ^^^^^^ evaluation of `_` failed here
+
+error[E0277]: the trait bound `DirectDropPod: Copy` is not satisfied
+ --> tests/ui/abi_pod_direct_drop.rs:5:12
+  |
+5 | pub struct DirectDropPod {
+  |            ^^^^^^^^^^^^^ the trait `Copy` is not implemented for `DirectDropPod`
+  |
+note: required by a bound in `assert_self_copy`
+ --> tests/ui/abi_pod_direct_drop.rs:4:10
+  |
+4 | #[derive(AbiPod)]
+  |          ^^^^^^ required by this bound in `assert_self_copy`
+  = note: this error originates in the derive macro `AbiPod` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: consider annotating `DirectDropPod` with `#[derive(Copy)]`
+  |
+5 + #[derive(Copy)]
+6 | pub struct DirectDropPod {
+  |
