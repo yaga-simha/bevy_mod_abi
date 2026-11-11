@@ -1,0 +1,884 @@
+#![forbid(unsafe_code)]
+
+//! Workspace build, fixture, header, benchmark, Miri, and CI automation runner (`cargo xtask`).
+
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
+
+#[derive(Clone, Debug)]
+struct BuiltFixture {
+    key: &'static str,
+    language: &'static str,
+    profile: &'static str,
+    filename: String,
+    dest_path: PathBuf,
+    source_rel: String,
+}
+
+fn main() -> ExitCode {
+    let args: Vec<String> = env::args().skip(1).collect();
+    match run(&args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("xtask error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn repo_root() -> Result<PathBuf, String> {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "failed to resolve workspace root from xtask CARGO_MANIFEST_DIR".to_owned())
+}
+
+fn dylib_naming() -> (&'static str, &'static str) {
+    if cfg!(target_os = "windows") {
+        ("", "dll")
+    } else if cfg!(target_os = "macos") {
+        ("lib", "dylib")
+    } else {
+        ("lib", "so")
+    }
+}
+
+fn c_compiler() -> String {
+    env::var("CC")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            if cfg!(target_os = "windows") {
+                "gcc".to_owned()
+            } else {
+                "cc".to_owned()
+            }
+        })
+}
+
+fn cargo_bin() -> String {
+    env::var("CARGO")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "cargo".to_owned())
+}
+
+fn run(args: &[String]) -> Result<(), String> {
+    let Some(subcmd) = args.first().map(String::as_str) else {
+        print_help();
+        return Ok(());
+    };
+
+    let rest = &args[1..];
+    match subcmd {
+        "help" | "--help" | "-h" => {
+            print_help();
+            Ok(())
+        }
+        "fixtures" => cmd_fixtures(rest),
+        "ci" => cmd_ci(rest),
+        "header" => cmd_header(rest),
+        "bench" => cmd_bench(rest),
+        "miri" => cmd_miri(rest),
+        other => Err(format!(
+            "unknown subcommand `{other}` (expected `fixtures`, `ci`, `header`, `bench`, or `miri`)"
+        )),
+    }
+}
+
+fn print_help() {
+    println!("Usage: cargo xtask <subcommand> [options]");
+    println!();
+    println!("Subcommands:");
+    println!(
+        "  fixtures [--examples] [--benches] [--all]   Build guest mod fixtures into target/fixtures/"
+    );
+    println!(
+        "  ci                                          Run fmt, clippy, zero-Bevy check, fixtures, C99, and workspace tests"
+    );
+    println!(
+        "  header [--test-c99]                         Validate include/bevy_abi_mod.h as strict ISO C99"
+    );
+    println!(
+        "  bench [--permutation] [-- <args>...]        Run Criterion/host benchmarks or full permutation matrix"
+    );
+    println!(
+        "  miri [--all]                                Run Miri (-Zmiri-tree-borrows) on ABI and guest crates"
+    );
+}
+
+fn run_cmd(cmd: &mut Command, description: &str) -> Result<(), String> {
+    println!("==> {description}");
+    let status = cmd
+        .status()
+        .map_err(|e| format!("failed to spawn `{description}`: {e}"))?;
+    if !status.success() {
+        return Err(format!("`{description}` failed with status {status}"));
+    }
+    Ok(())
+}
+
+fn build_rust_cdylib(
+    root: &Path,
+    manifest_rel: &str,
+    crate_stem: &str,
+    release: bool,
+) -> Result<PathBuf, String> {
+    let manifest_path = root.join(manifest_rel);
+    let mut cmd = Command::new(cargo_bin());
+    cmd.current_dir(root)
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(&manifest_path);
+    if release {
+        cmd.arg("--release");
+    }
+    let profile_dir = if release { "release" } else { "debug" };
+    run_cmd(
+        &mut cmd,
+        &format!("cargo build {manifest_rel} ({profile_dir})"),
+    )?;
+
+    let (prefix, ext) = dylib_naming();
+    let crate_dir = manifest_path
+        .parent()
+        .ok_or_else(|| format!("invalid manifest path {manifest_rel}"))?;
+    let artifact = crate_dir
+        .join("target")
+        .join(profile_dir)
+        .join(format!("{prefix}{crate_stem}.{ext}"));
+    if !artifact.is_file() {
+        return Err(format!(
+            "expected Rust cdylib artifact was not produced at {}",
+            artifact.display()
+        ));
+    }
+    Ok(artifact)
+}
+
+fn build_c99_mod(
+    root: &Path,
+    dir_rel: &str,
+    src_file: &str,
+    artifact_stem: &str,
+    opt_flag: &str,
+    link_math: bool,
+) -> Result<PathBuf, String> {
+    let mod_dir = root.join(dir_rel);
+    let (prefix, ext) = dylib_naming();
+    let out_name = format!("{prefix}{artifact_stem}.{ext}");
+    let out_path = mod_dir.join(&out_name);
+
+    if !cfg!(target_os = "windows") && mod_dir.join("Makefile").is_file() {
+        let mut cmd = Command::new("make");
+        cmd.arg("-C").arg(&mod_dir);
+        if let Ok(cc) = env::var("CC")
+            && !cc.trim().is_empty()
+        {
+            cmd.arg(format!("CC={cc}"));
+        }
+        run_cmd(&mut cmd, &format!("make -C {dir_rel}"))?;
+    } else {
+        let cc = c_compiler();
+        let include_dir = root.join("include");
+        let mut cmd = Command::new(&cc);
+        cmd.current_dir(&mod_dir)
+            .args(["-std=c99", "-Wall", "-Wextra", "-Werror"])
+            .arg(format!("-I{}", include_dir.display()))
+            .arg(opt_flag)
+            .arg("-shared");
+        if !cfg!(target_os = "windows") {
+            cmd.arg("-fPIC");
+        }
+        cmd.arg(src_file).arg("-o").arg(&out_path);
+        if link_math && !cfg!(target_os = "windows") {
+            cmd.arg("-lm");
+        }
+        run_cmd(
+            &mut cmd,
+            &format!("{cc} {dir_rel}/{src_file} -> {out_name}"),
+        )?;
+    }
+
+    if !out_path.is_file() {
+        return Err(format!(
+            "expected C99 shared library was not produced at {}",
+            out_path.display()
+        ));
+    }
+    Ok(out_path)
+}
+
+fn stage_fixture(
+    root: &Path,
+    fixtures_dir: &Path,
+    key: &'static str,
+    language: &'static str,
+    profile: &'static str,
+    source_path: &Path,
+    dest_stem: &str,
+) -> Result<BuiltFixture, String> {
+    let (prefix, ext) = dylib_naming();
+    let filename = format!("{prefix}{dest_stem}.{ext}");
+    let dest_path = fixtures_dir.join(&filename);
+    fs::copy(source_path, &dest_path).map_err(|e| {
+        format!(
+            "failed to copy {} -> {}: {e}",
+            source_path.display(),
+            dest_path.display()
+        )
+    })?;
+
+    let source_rel = source_path
+        .strip_prefix(root)
+        .unwrap_or(source_path)
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    Ok(BuiltFixture {
+        key,
+        language,
+        profile,
+        filename,
+        dest_path,
+        source_rel,
+    })
+}
+
+fn json_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn write_manifest(fixtures_dir: &Path, built: &[BuiltFixture]) -> Result<PathBuf, String> {
+    let (prefix, ext) = dylib_naming();
+    let mut json = String::new();
+    json.push_str("{\n");
+    json.push_str("  \"schema_version\": 1,\n");
+    json.push_str(&format!(
+        "  \"os\": \"{}\",\n",
+        json_escape(env::consts::OS)
+    ));
+    json.push_str(&format!(
+        "  \"arch\": \"{}\",\n",
+        json_escape(env::consts::ARCH)
+    ));
+    json.push_str(&format!(
+        "  \"dylib_prefix\": \"{}\",\n",
+        json_escape(prefix)
+    ));
+    json.push_str(&format!(
+        "  \"dylib_extension\": \"{}\",\n",
+        json_escape(ext)
+    ));
+    json.push_str("  \"fixtures\": {\n");
+
+    for (idx, item) in built.iter().enumerate() {
+        let comma = if idx + 1 == built.len() { "" } else { "," };
+        let abs_path = item.dest_path.to_string_lossy().replace('\\', "/");
+        json.push_str(&format!("    \"{}\": {{\n", json_escape(item.key)));
+        json.push_str(&format!(
+            "      \"language\": \"{}\",\n",
+            json_escape(item.language)
+        ));
+        json.push_str(&format!(
+            "      \"profile\": \"{}\",\n",
+            json_escape(item.profile)
+        ));
+        json.push_str(&format!(
+            "      \"filename\": \"{}\",\n",
+            json_escape(&item.filename)
+        ));
+        json.push_str(&format!(
+            "      \"path\": \"{}\",\n",
+            json_escape(&abs_path)
+        ));
+        json.push_str(&format!(
+            "      \"source_path\": \"{}\"\n",
+            json_escape(&item.source_rel)
+        ));
+        json.push_str(&format!("    }}{comma}\n"));
+    }
+
+    json.push_str("  }\n");
+    json.push_str("}\n");
+
+    let manifest_path = fixtures_dir.join("manifest.json");
+    fs::write(&manifest_path, json)
+        .map_err(|e| format!("failed to write {}: {e}", manifest_path.display()))?;
+    Ok(manifest_path)
+}
+
+fn build_fixtures_internal(
+    root: &Path,
+    include_examples: bool,
+    include_benches: bool,
+) -> Result<PathBuf, String> {
+    let fixtures_dir = root.join("target").join("fixtures");
+    fs::create_dir_all(&fixtures_dir)
+        .map_err(|e| format!("failed to create {}: {e}", fixtures_dir.display()))?;
+
+    let mut built = Vec::new();
+
+    // 1. Core asymmetric test fixtures
+    let rust_mod = build_rust_cdylib(
+        root,
+        "tests/asymmetric_rust_mod/Cargo.toml",
+        "asymmetric_rust_mod",
+        true,
+    )?;
+    built.push(stage_fixture(
+        root,
+        &fixtures_dir,
+        "asymmetric_rust_mod",
+        "rust",
+        "release",
+        &rust_mod,
+        "asymmetric_rust_mod",
+    )?);
+
+    let c_mod = build_c99_mod(
+        root,
+        "tests/asymmetric_c_mod",
+        "mod.c",
+        "asymmetric_c_mod",
+        "-O3",
+        false,
+    )?;
+    built.push(stage_fixture(
+        root,
+        &fixtures_dir,
+        "asymmetric_c_mod",
+        "c99",
+        "release",
+        &c_mod,
+        "asymmetric_c_mod",
+    )?);
+
+    // 2. Optional example guest mods
+    if include_examples {
+        let rust_examples: &[(&str, &str, &str, &str)] = &[
+            (
+                "example_01_guest_mod",
+                "examples/01_minimal_handshake/guest_mod/Cargo.toml",
+                "minimal_guest_mod",
+                "minimal_guest_mod",
+            ),
+            (
+                "example_02_guest_mod",
+                "examples/02_multi_system_pipeline/guest_mod/Cargo.toml",
+                "example_02_guest_mod",
+                "example_02_guest_mod",
+            ),
+            (
+                "example_03_rust_mod",
+                "examples/03_cross_language_interop/rust_mod/Cargo.toml",
+                "rust_mod",
+                "example_03_rust_mod",
+            ),
+            (
+                "mod_gravity",
+                "examples/04_visual_game/mods/mod_gravity/Cargo.toml",
+                "mod_gravity",
+                "mod_gravity",
+            ),
+            (
+                "mod_rainbow",
+                "examples/04_visual_game/mods/mod_rainbow/Cargo.toml",
+                "mod_rainbow",
+                "mod_rainbow",
+            ),
+            (
+                "mod_vortex",
+                "examples/04_visual_game/mods/mod_vortex/Cargo.toml",
+                "mod_vortex",
+                "mod_vortex",
+            ),
+            (
+                "mod_boing",
+                "examples/05_cute_3d_winit/mods/mod_boing/Cargo.toml",
+                "mod_boing",
+                "mod_boing",
+            ),
+            (
+                "mod_carousel",
+                "examples/05_cute_3d_winit/mods/mod_carousel/Cargo.toml",
+                "mod_carousel",
+                "mod_carousel",
+            ),
+            (
+                "mod_shield_emitter",
+                "examples/06_cross_mod_components/mods/mod_shield_emitter/Cargo.toml",
+                "mod_shield_emitter",
+                "mod_shield_emitter",
+            ),
+            (
+                "mod_overcharge_siphon",
+                "examples/06_cross_mod_components/mods/mod_overcharge_siphon/Cargo.toml",
+                "mod_overcharge_siphon",
+                "mod_overcharge_siphon",
+            ),
+        ];
+
+        for &(key, manifest_rel, crate_stem, dest_stem) in rust_examples {
+            let src = build_rust_cdylib(root, manifest_rel, crate_stem, true)?;
+            built.push(stage_fixture(
+                root,
+                &fixtures_dir,
+                key,
+                "rust",
+                "release",
+                &src,
+                dest_stem,
+            )?);
+        }
+
+        let ex3_c = build_c99_mod(
+            root,
+            "examples/03_cross_language_interop/c_mod",
+            "mod.c",
+            "c_mod",
+            "-O3",
+            false,
+        )?;
+        built.push(stage_fixture(
+            root,
+            &fixtures_dir,
+            "example_03_c_mod",
+            "c99",
+            "release",
+            &ex3_c,
+            "example_03_c_mod",
+        )?);
+
+        let ex5_c = build_c99_mod(
+            root,
+            "examples/05_cute_3d_winit/mods/mod_cuddle_c99",
+            "mod.c",
+            "mod_cuddle",
+            "-O3",
+            true,
+        )?;
+        built.push(stage_fixture(
+            root,
+            &fixtures_dir,
+            "mod_cuddle",
+            "c99",
+            "release",
+            &ex5_c,
+            "mod_cuddle",
+        )?);
+    }
+
+    // 3. Optional benchmark guest mods
+    if include_benches {
+        let bench_c_rel = build_c99_mod(
+            root,
+            "benches/c_abi_c99_mod",
+            "mod.c",
+            "c_abi_c99_mod_release",
+            "-O3",
+            true,
+        )?;
+        let (prefix, ext) = dylib_naming();
+        let bench_c_dbg_path = root
+            .join("benches/c_abi_c99_mod")
+            .join(format!("{prefix}c_abi_c99_mod_debug.{ext}"));
+        let bench_c_dbg = if bench_c_dbg_path.is_file() {
+            bench_c_dbg_path
+        } else {
+            build_c99_mod(
+                root,
+                "benches/c_abi_c99_mod",
+                "mod.c",
+                "c_abi_c99_mod_debug",
+                "-O0",
+                true,
+            )?
+        };
+        built.push(stage_fixture(
+            root,
+            &fixtures_dir,
+            "c_abi_c99_mod_debug",
+            "c99",
+            "debug",
+            &bench_c_dbg,
+            "c_abi_c99_mod_debug",
+        )?);
+        built.push(stage_fixture(
+            root,
+            &fixtures_dir,
+            "c_abi_c99_mod_release",
+            "c99",
+            "release",
+            &bench_c_rel,
+            "c_abi_c99_mod_release",
+        )?);
+
+        let bench_rust_dbg = build_rust_cdylib(
+            root,
+            "benches/c_abi_rust_mod/Cargo.toml",
+            "c_abi_rust_mod",
+            false,
+        )?;
+        built.push(stage_fixture(
+            root,
+            &fixtures_dir,
+            "c_abi_rust_mod_debug",
+            "rust",
+            "debug",
+            &bench_rust_dbg,
+            "c_abi_rust_mod_debug",
+        )?);
+
+        let bench_rust_rel = build_rust_cdylib(
+            root,
+            "benches/c_abi_rust_mod/Cargo.toml",
+            "c_abi_rust_mod",
+            true,
+        )?;
+        built.push(stage_fixture(
+            root,
+            &fixtures_dir,
+            "c_abi_rust_mod_release",
+            "rust",
+            "release",
+            &bench_rust_rel,
+            "c_abi_rust_mod_release",
+        )?);
+    }
+
+    let manifest_path = write_manifest(&fixtures_dir, &built)?;
+    println!(
+        "==> Staged {} fixture(s) in {} (manifest: {})",
+        built.len(),
+        fixtures_dir.display(),
+        manifest_path.display()
+    );
+    Ok(fixtures_dir)
+}
+
+fn cmd_fixtures(args: &[String]) -> Result<(), String> {
+    let mut include_examples = false;
+    let mut include_benches = false;
+
+    for arg in args {
+        match arg.as_str() {
+            "--all" => {
+                include_examples = true;
+                include_benches = true;
+            }
+            "--examples" => include_examples = true,
+            "--benches" => include_benches = true,
+            other => {
+                return Err(format!(
+                    "unsupported `fixtures` flag `{other}` (expected `--all`, `--examples`, or `--benches`)"
+                ));
+            }
+        }
+    }
+
+    let root = repo_root()?;
+    build_fixtures_internal(&root, include_examples, include_benches)?;
+    Ok(())
+}
+
+fn verify_zero_bevy_deps(root: &Path) -> Result<(), String> {
+    println!("==> Checking zero Bevy dependencies in ABI, guest, and macro crates");
+    let output = Command::new(cargo_bin())
+        .current_dir(root)
+        .args([
+            "tree",
+            "-p",
+            "bevy_abi_mod_sys",
+            "-p",
+            "bevy_abi_mod_guest_sys",
+            "-p",
+            "bevy_abi_mod_guest",
+            "-p",
+            "bevy_abi_mod_macros",
+        ])
+        .output()
+        .map_err(|e| format!("failed to run `cargo tree`: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "`cargo tree` failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let leaked: Vec<&str> = stdout
+        .lines()
+        .filter(|line| !line.contains("bevy_abi_mod"))
+        .filter(|line| line.to_ascii_lowercase().contains("bevy"))
+        .collect();
+
+    if !leaked.is_empty() {
+        return Err(format!(
+            "Bevy dependency leaked into Bevy-free crates:\n{}",
+            leaked.join("\n")
+        ));
+    }
+    Ok(())
+}
+
+fn verify_c99_header_and_tests(root: &Path, run_standalone_test: bool) -> Result<(), String> {
+    let header_path = root.join("include").join("bevy_abi_mod.h");
+    let meta = fs::metadata(&header_path)
+        .map_err(|e| format!("missing C header {}: {e}", header_path.display()))?;
+    if meta.len() == 0 {
+        return Err(format!("C header {} is empty", header_path.display()));
+    }
+
+    let cc = c_compiler();
+    let mut syntax_cmd = Command::new(&cc);
+    syntax_cmd
+        .current_dir(root)
+        .args([
+            "-std=c99",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-fsyntax-only",
+            "-x",
+            "c",
+        ])
+        .arg(&header_path);
+    run_cmd(
+        &mut syntax_cmd,
+        &format!("{cc} -std=c99 -fsyntax-only include/bevy_abi_mod.h"),
+    )?;
+
+    if run_standalone_test {
+        let target_dir = root.join("target");
+        fs::create_dir_all(&target_dir)
+            .map_err(|e| format!("failed to create {}: {e}", target_dir.display()))?;
+        let exe_name = if cfg!(target_os = "windows") {
+            "standalone_c_test.exe"
+        } else {
+            "standalone_c_test"
+        };
+        let exe_path = target_dir.join(exe_name);
+        let mut build_test = Command::new(&cc);
+        build_test
+            .current_dir(root)
+            .args(["-std=c99", "-Wall", "-Wextra", "-Werror", "-Iinclude"])
+            .arg(root.join("tests").join("standalone_c_test.c"))
+            .arg("-o")
+            .arg(&exe_path);
+        run_cmd(
+            &mut build_test,
+            &format!("{cc} tests/standalone_c_test.c -> target/{exe_name}"),
+        )?;
+
+        let mut exec_test = Command::new(&exe_path);
+        exec_test.current_dir(root);
+        run_cmd(&mut exec_test, "target/standalone_c_test")?;
+    }
+
+    Ok(())
+}
+
+fn cmd_header(args: &[String]) -> Result<(), String> {
+    let mut run_standalone = false;
+    for arg in args {
+        match arg.as_str() {
+            "--test-c99" => run_standalone = true,
+            other => {
+                return Err(format!(
+                    "unsupported `header` flag `{other}` (expected `--test-c99`)"
+                ));
+            }
+        }
+    }
+
+    let root = repo_root()?;
+    if run_standalone {
+        build_c99_mod(
+            &root,
+            "tests/asymmetric_c_mod",
+            "mod.c",
+            "asymmetric_c_mod",
+            "-O3",
+            false,
+        )?;
+    }
+    verify_c99_header_and_tests(&root, run_standalone)
+}
+
+fn cmd_ci(args: &[String]) -> Result<(), String> {
+    if !args.is_empty() {
+        return Err(format!("unexpected arguments for `ci`: {}", args.join(" ")));
+    }
+    let root = repo_root()?;
+
+    let mut fmt_cmd = Command::new(cargo_bin());
+    fmt_cmd
+        .current_dir(&root)
+        .args(["fmt", "--all", "--", "--check"]);
+    run_cmd(&mut fmt_cmd, "cargo fmt --all -- --check")?;
+
+    let mut clippy_cmd = Command::new(cargo_bin());
+    clippy_cmd.current_dir(&root).args([
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings",
+    ]);
+    run_cmd(
+        &mut clippy_cmd,
+        "cargo clippy --workspace --all-targets -- -D warnings",
+    )?;
+
+    verify_zero_bevy_deps(&root)?;
+
+    let fixtures_dir = build_fixtures_internal(&root, false, false)?;
+    verify_c99_header_and_tests(&root, true)?;
+
+    let mut test_cmd = Command::new(cargo_bin());
+    test_cmd
+        .current_dir(&root)
+        .env("BAM_FIXTURE_DIR", &fixtures_dir)
+        .args(["test", "--", "--test-threads=1"]);
+    run_cmd(&mut test_cmd, "cargo test -- --test-threads=1")?;
+
+    Ok(())
+}
+
+fn cmd_bench(args: &[String]) -> Result<(), String> {
+    let root = repo_root()?;
+    let mut permutation = false;
+    let mut passthrough = Vec::new();
+    let mut after_sep = false;
+
+    for arg in args {
+        if after_sep {
+            passthrough.push(arg.clone());
+            continue;
+        }
+        match arg.as_str() {
+            "--" => after_sep = true,
+            "--permutation" => permutation = true,
+            other => passthrough.push(other.to_owned()),
+        }
+    }
+
+    let fixtures_dir = build_fixtures_internal(&root, false, permutation)?;
+
+    if permutation {
+        let mut cmd = Command::new(cargo_bin());
+        cmd.current_dir(&root)
+            .env("BAM_FIXTURE_DIR", &fixtures_dir)
+            .args(["run", "--release", "-p", "permutation_bench"]);
+        if !passthrough.is_empty() {
+            cmd.arg("--").args(&passthrough);
+        }
+        run_cmd(&mut cmd, "cargo run --release -p permutation_bench")
+    } else {
+        let mut cmd = Command::new(cargo_bin());
+        cmd.current_dir(&root)
+            .env("BAM_FIXTURE_DIR", &fixtures_dir)
+            .args(["bench", "-p", "bevy_abi_mod_host"]);
+        if !passthrough.is_empty() {
+            cmd.arg("--").args(&passthrough);
+        }
+        run_cmd(&mut cmd, "cargo bench -p bevy_abi_mod_host")
+    }
+}
+
+fn cmd_miri(args: &[String]) -> Result<(), String> {
+    let mut run_all = false;
+    for arg in args {
+        match arg.as_str() {
+            "--all" => run_all = true,
+            other => {
+                return Err(format!(
+                    "unsupported `miri` flag `{other}` (expected `--all`)"
+                ));
+            }
+        }
+    }
+
+    let root = repo_root()?;
+    let miriflags = match env::var("MIRIFLAGS") {
+        Ok(existing) if !existing.trim().is_empty() => format!("{existing} -Zmiri-tree-borrows"),
+        _ => "-Zmiri-tree-borrows".to_owned(),
+    };
+
+    let mut base_cmd = Command::new(cargo_bin());
+    base_cmd
+        .current_dir(&root)
+        .env("MIRIFLAGS", &miriflags)
+        .args([
+            "+nightly",
+            "miri",
+            "test",
+            "-p",
+            "bevy_abi_mod_sys",
+            "-p",
+            "bevy_abi_mod_guest_sys",
+            "-p",
+            "bevy_abi_mod_guest",
+        ]);
+    run_cmd(
+        &mut base_cmd,
+        "cargo +nightly miri test -p bevy_abi_mod_sys -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest",
+    )?;
+
+    if run_all {
+        let mut macros_cmd = Command::new(cargo_bin());
+        macros_cmd
+            .current_dir(&root)
+            .env("MIRIFLAGS", &miriflags)
+            .args([
+                "+nightly",
+                "miri",
+                "test",
+                "-p",
+                "bevy_abi_mod_macros",
+                "--lib",
+                "--test",
+                "validation_gate_1",
+            ]);
+        run_cmd(
+            &mut macros_cmd,
+            "cargo +nightly miri test -p bevy_abi_mod_macros --lib --test validation_gate_1",
+        )?;
+
+        let mut host_sys_cmd = Command::new(cargo_bin());
+        host_sys_cmd
+            .current_dir(&root)
+            .env("MIRIFLAGS", &miriflags)
+            .args([
+                "+nightly",
+                "miri",
+                "test",
+                "-p",
+                "bevy_abi_mod_host_sys",
+                "--lib",
+            ]);
+        run_cmd(
+            &mut host_sys_cmd,
+            "cargo +nightly miri test -p bevy_abi_mod_host_sys --lib",
+        )?;
+    }
+
+    Ok(())
+}
