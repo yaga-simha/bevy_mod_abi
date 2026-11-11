@@ -4,13 +4,36 @@
 mod common;
 
 use bevy_app::{App, Update};
+use bevy_ecs::component::Component;
+use bevy_ecs::ptr::OwningPtr;
 use bevy_ecs::query::With;
 use bevy_ecs::system::Query;
 use common::*;
-use host_runtime::{AbiModPlugin, ModAppExt};
+use host_runtime::{AbiModPlugin, ModAppExt, ModRegistry};
 use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
+
+#[derive(Component, Debug, Clone, Copy, PartialEq)]
+#[repr(C)]
+struct NativeCustomData {
+    power: f32,
+    shield: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(C)]
+struct RawRuntimePayload {
+    primary: f32,
+    secondary: u32,
+}
+
+fn native_custom_system(mut query: Query<&mut NativeCustomData>) {
+    for mut item in query.iter_mut() {
+        item.power += 10.0;
+        item.shield += 1;
+    }
+}
 
 // ============================================================================
 // Milestone 4: Performance Benchmarking Suite
@@ -415,6 +438,228 @@ fn test_performance_benchmarking_suite() {
         });
     }
 
+    // ------------------------------------------------------------------------
+    // Benchmark 7: Runtime-Registered Dynamic Components vs Native Bevy (10k & 100k)
+    // ------------------------------------------------------------------------
+    println!("\n--- Runtime-Registered Dynamic Components vs Native Bevy ---");
+    for &scale in &[10_000_usize, 100_000] {
+        let iterations = if scale <= 10_000 { 50 } else { 20 };
+        let total = scale * iterations;
+
+        // 7A. Native Bevy baseline (8-byte struct: power + shield)
+        let native_custom_ns = {
+            let mut app = App::new();
+            for i in 0..scale {
+                app.world_mut().spawn(NativeCustomData {
+                    power: i as f32,
+                    shield: 1,
+                });
+            }
+            app.add_systems(Update, native_custom_system);
+            for _ in 0..3 {
+                app.update();
+            }
+            let start = Instant::now();
+            for _ in 0..iterations {
+                app.update();
+            }
+            let elapsed = start.elapsed();
+            (elapsed.as_nanos() as f64) / (total as f64)
+        };
+
+        // 7B. Rust Runtime-Registered Dynamic Component (`RustModCustomData`)
+        {
+            let mut app = App::new();
+            app.add_plugins(AbiModPlugin);
+            let r_id = app.load_mod_tracked(&rust_dylib).unwrap();
+            let rust_comp_id = app
+                .world()
+                .resource::<ModRegistry>()
+                .get_by_name("RustModCustomData")
+                .unwrap()
+                .component_id;
+
+            for i in 0..scale {
+                let id = app.world_mut().spawn_empty().id();
+                let init = RawRuntimePayload {
+                    primary: i as f32,
+                    secondary: 1,
+                };
+                let mut emut = app.world_mut().entity_mut(id);
+                OwningPtr::make(init, |ptr| {
+                    // SAFETY: `RawRuntimePayload` matches `RustModCustomData` layout (size 8, align 4).
+                    unsafe {
+                        emut.insert_by_id(rust_comp_id, ptr);
+                    }
+                });
+            }
+
+            for _ in 0..3 {
+                app.update();
+            }
+            let start = Instant::now();
+            for _ in 0..iterations {
+                app.update();
+            }
+            let elapsed = start.elapsed();
+            app.unload_mod(r_id).unwrap();
+
+            let secs = elapsed.as_secs_f64();
+            let throughput = (total as f64) / secs;
+            let ns = (elapsed.as_nanos() as f64) / (total as f64);
+            let overhead_pct = ((ns - native_custom_ns) / native_custom_ns) * 100.0;
+
+            println!(
+                "[Runtime Rust Dynamic {scale:>6}] Throughput: {:>12.2} ent/sec | {:>6.2} ns/ent (Native: {:>6.2} ns/ent, Delta: {:>+6.2}%)",
+                throughput, ns, native_custom_ns, overhead_pct
+            );
+
+            measurements.push(BenchmarkMeasurement {
+                name: format!("runtime_dynamic_component_rust_{scale}"),
+                scale,
+                topology: "monolithic_soa".to_string(),
+                iterations,
+                elapsed_millis: secs * 1000.0,
+                throughput_entities_per_sec: throughput,
+                ns_per_entity: ns,
+                native_ns_per_entity: Some(native_custom_ns),
+                abi_overhead_percentage: Some(overhead_pct),
+            });
+        }
+
+        // 7C. C99 Runtime-Registered Dynamic Component (`CModCustomData`)
+        {
+            let mut app = App::new();
+            app.add_plugins(AbiModPlugin);
+            let c_id = app.load_mod_tracked(&c_dylib).unwrap();
+            let c_comp_id = app
+                .world()
+                .resource::<ModRegistry>()
+                .get_by_name("CModCustomData")
+                .unwrap()
+                .component_id;
+
+            for i in 0..scale {
+                let id = app.world_mut().spawn_empty().id();
+                let init = RawRuntimePayload {
+                    primary: i as f32,
+                    secondary: 1,
+                };
+                let mut emut = app.world_mut().entity_mut(id);
+                OwningPtr::make(init, |ptr| {
+                    // SAFETY: `RawRuntimePayload` matches `CModCustomData` layout (size 8, align 4).
+                    unsafe {
+                        emut.insert_by_id(c_comp_id, ptr);
+                    }
+                });
+            }
+
+            for _ in 0..3 {
+                app.update();
+            }
+            let start = Instant::now();
+            for _ in 0..iterations {
+                app.update();
+            }
+            let elapsed = start.elapsed();
+            app.unload_mod(c_id).unwrap();
+
+            let secs = elapsed.as_secs_f64();
+            let throughput = (total as f64) / secs;
+            let ns = (elapsed.as_nanos() as f64) / (total as f64);
+            let overhead_pct = ((ns - native_custom_ns) / native_custom_ns) * 100.0;
+
+            println!(
+                "[Runtime C99 Dynamic  {scale:>6}] Throughput: {:>12.2} ent/sec | {:>6.2} ns/ent (Native: {:>6.2} ns/ent, Delta: {:>+6.2}%)",
+                throughput, ns, native_custom_ns, overhead_pct
+            );
+
+            measurements.push(BenchmarkMeasurement {
+                name: format!("runtime_dynamic_component_c99_{scale}"),
+                scale,
+                topology: "monolithic_soa".to_string(),
+                iterations,
+                elapsed_millis: secs * 1000.0,
+                throughput_entities_per_sec: throughput,
+                ns_per_entity: ns,
+                native_ns_per_entity: Some(native_custom_ns),
+                abi_overhead_percentage: Some(overhead_pct),
+            });
+        }
+
+        // 7D. Parallel Multi-Mod Runtime Components (`RustModCustomData` + `CModCustomData`)
+        {
+            let mut app = App::new();
+            app.add_plugins(AbiModPlugin);
+            let r_id = app.load_mod_tracked(&rust_dylib).unwrap();
+            let c_id = app.load_mod_tracked(&c_dylib).unwrap();
+            let (rust_comp_id, c_comp_id) = {
+                let reg = app.world().resource::<ModRegistry>();
+                (
+                    reg.get_by_name("RustModCustomData").unwrap().component_id,
+                    reg.get_by_name("CModCustomData").unwrap().component_id,
+                )
+            };
+
+            for i in 0..scale {
+                let id = app.world_mut().spawn_empty().id();
+                let r_init = RawRuntimePayload {
+                    primary: i as f32,
+                    secondary: 1,
+                };
+                let c_init = RawRuntimePayload {
+                    primary: i as f32,
+                    secondary: 1,
+                };
+                let mut emut = app.world_mut().entity_mut(id);
+                OwningPtr::make(r_init, |ptr| {
+                    // SAFETY: Matches `RustModCustomData` layout.
+                    unsafe {
+                        emut.insert_by_id(rust_comp_id, ptr);
+                    }
+                });
+                OwningPtr::make(c_init, |ptr| {
+                    // SAFETY: Matches `CModCustomData` layout.
+                    unsafe {
+                        emut.insert_by_id(c_comp_id, ptr);
+                    }
+                });
+            }
+
+            for _ in 0..3 {
+                app.update();
+            }
+            let start = Instant::now();
+            for _ in 0..iterations {
+                app.update();
+            }
+            let elapsed = start.elapsed();
+            app.unload_mod(r_id).unwrap();
+            app.unload_mod(c_id).unwrap();
+
+            let secs = elapsed.as_secs_f64();
+            let throughput = (total as f64) / secs;
+            let ns = (elapsed.as_nanos() as f64) / (total as f64);
+
+            println!(
+                "[Runtime Dual Parallel {scale:>6}] Throughput: {:>12.2} ent/sec | {:>6.2} ns/ent",
+                throughput, ns
+            );
+
+            measurements.push(BenchmarkMeasurement {
+                name: format!("runtime_dynamic_component_parallel_dual_{scale}"),
+                scale,
+                topology: "parallel_disjoint_soa".to_string(),
+                iterations,
+                elapsed_millis: secs * 1000.0,
+                throughput_entities_per_sec: throughput,
+                ns_per_entity: ns,
+                native_ns_per_entity: Some(native_custom_ns),
+                abi_overhead_percentage: None,
+            });
+        }
+    }
+
     println!("================================================================================\n");
 
     // Serialize and write JSON report
@@ -437,5 +682,13 @@ fn test_performance_benchmarking_suite() {
     assert!(
         read_back.contains("\"chunk_iteration_100000\""),
         "JSON report must contain 100k scale"
+    );
+    assert!(
+        read_back.contains("\"runtime_dynamic_component_rust_100000\""),
+        "JSON report must contain 100k runtime Rust dynamic component benchmark"
+    );
+    assert!(
+        read_back.contains("\"runtime_dynamic_component_c99_100000\""),
+        "JSON report must contain 100k runtime C99 dynamic component benchmark"
     );
 }

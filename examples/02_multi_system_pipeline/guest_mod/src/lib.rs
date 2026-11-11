@@ -9,6 +9,7 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicPtr, Ordering};
 use guest_sdk::prelude::*;
+use std::sync::Mutex;
 
 #[repr(C)]
 pub struct PositionVTable {
@@ -80,12 +81,16 @@ pub struct PipelineState {
     pub casualties_despawned: u32,
 }
 
+struct FleetSystemContext {
+    cmd_vtable: CommandBridgeVTable,
+    state: PipelineState,
+}
+
 static HOST_API: AtomicPtr<HostApi> = AtomicPtr::new(core::ptr::null_mut());
 static POS_VTABLE: AtomicPtr<PositionVTable> = AtomicPtr::new(core::ptr::null_mut());
 static VEL_VTABLE: AtomicPtr<VelocityVTable> = AtomicPtr::new(core::ptr::null_mut());
 static HEALTH_VTABLE: AtomicPtr<HealthVTable> = AtomicPtr::new(core::ptr::null_mut());
-static CMD_VTABLE: AtomicPtr<CommandBridgeVTable> = AtomicPtr::new(core::ptr::null_mut());
-static GLOBAL_STATE: AtomicPtr<PipelineState> = AtomicPtr::new(core::ptr::null_mut());
+static ALLOCATED_CONTEXTS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 /// System 1: KinematicsMovementSystem
 /// Queries: Position (WRITE, col 0), Velocity (READ, col 1)
@@ -146,15 +151,15 @@ unsafe fn fleet_lifecycle_system(
 ) -> FfiResult {
     let api_ptr = HOST_API.load(Ordering::Acquire);
     let health_vt_ptr = HEALTH_VTABLE.load(Ordering::Acquire);
-    let cmd_vt_ptr = CMD_VTABLE.load(Ordering::Acquire);
 
-    if api_ptr.is_null() || health_vt_ptr.is_null() || cmd_vt_ptr.is_null() || user_data.is_null() {
+    if api_ptr.is_null() || health_vt_ptr.is_null() || user_data.is_null() {
         return FfiResult::INTERNAL_ERROR;
     }
     let api = unsafe { &*api_ptr };
     let health_vt = unsafe { &*health_vt_ptr };
-    let cmd_vtable = unsafe { *cmd_vt_ptr };
-    let state = unsafe { &mut *(user_data as *mut PipelineState) };
+    let ctx = unsafe { &mut *(user_data as *mut FleetSystemContext) };
+    let cmd_vtable = ctx.cmd_vtable;
+    let state = &mut ctx.state;
 
     state.tick_counter += 1;
     let mut queue = GuestCommandQueue::new(commands, cmd_vtable);
@@ -269,15 +274,17 @@ fn mod_init(
     VEL_VTABLE.store(vel_sym as *mut VelocityVTable, Ordering::Release);
     HEALTH_VTABLE.store(health_sym as *mut HealthVTable, Ordering::Release);
 
-    let cmd_vt = Box::into_raw(Box::new(CommandBridgeVTable::resolve(get_proc_address)));
-    CMD_VTABLE.store(cmd_vt, Ordering::Release);
-
-    let state = Box::into_raw(Box::new(PipelineState {
-        tick_counter: 0,
-        reinforcements_spawned: 0,
-        casualties_despawned: 0,
+    let fleet_ctx = Box::into_raw(Box::new(FleetSystemContext {
+        cmd_vtable: CommandBridgeVTable::resolve(get_proc_address),
+        state: PipelineState {
+            tick_counter: 0,
+            reinforcements_spawned: 0,
+            casualties_despawned: 0,
+        },
     }));
-    GLOBAL_STATE.store(state, Ordering::Release);
+    if let Ok(mut contexts) = ALLOCATED_CONTEXTS.lock() {
+        contexts.push(fleet_ctx as usize);
+    }
 
     let api = unsafe { &*host_api };
 
@@ -326,7 +333,7 @@ fn mod_init(
         queries: q2.as_ptr(),
         query_count: q2.len(),
         callback: c_fleet_lifecycle_system,
-        user_data: state as *mut c_void,
+        user_data: fleet_ctx as *mut c_void,
     };
     let res2 = unsafe { (api.register_system)(host_context, &desc2) };
     if res2.is_err() {
@@ -366,14 +373,13 @@ fn mod_shutdown(_host_context: *mut c_void) -> FfiResult {
     VEL_VTABLE.store(core::ptr::null_mut(), Ordering::Release);
     HEALTH_VTABLE.store(core::ptr::null_mut(), Ordering::Release);
 
-    let cmd_vt_ptr = CMD_VTABLE.swap(core::ptr::null_mut(), Ordering::AcqRel);
-    if !cmd_vt_ptr.is_null() {
-        drop(unsafe { Box::from_raw(cmd_vt_ptr) });
-    }
-
-    let state_ptr = GLOBAL_STATE.swap(core::ptr::null_mut(), Ordering::AcqRel);
-    if !state_ptr.is_null() {
-        drop(unsafe { Box::from_raw(state_ptr) });
+    if let Ok(mut contexts) = ALLOCATED_CONTEXTS.lock() {
+        for ptr_usize in contexts.drain(..) {
+            let ptr = ptr_usize as *mut FleetSystemContext;
+            if !ptr.is_null() {
+                drop(unsafe { Box::from_raw(ptr) });
+            }
+        }
     }
 
     FfiResult::OK

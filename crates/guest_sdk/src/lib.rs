@@ -548,8 +548,15 @@ impl<'a> ChunkSlice<'a> {
     #[inline]
     pub fn get_ptr(&self, index: usize) -> Option<*const u8> {
         if index < self.count && !self.ptr.is_null() {
-            // SAFETY: Bounds checked, index is strictly less than count, stride is verified.
-            unsafe { Some(self.ptr.add(index * self.stride)) }
+            let offset = index.checked_mul(self.stride)?;
+            if offset > (isize::MAX as usize) {
+                return None;
+            }
+            if (self.ptr as usize).checked_add(offset).is_none() {
+                return None;
+            }
+            // SAFETY: Bounds checked, index is strictly less than count, offset fits within isize::MAX without wrapping.
+            unsafe { Some(self.ptr.add(offset)) }
         } else {
             None
         }
@@ -560,9 +567,14 @@ impl<'a> ChunkSlice<'a> {
     /// Validates that:
     /// 1. `self.stride == core::mem::size_of::<T>()`.
     /// 2. If `self.count == 0`, returns `Some(&[])`.
-    /// 3. If `self.count > 0`: `self.ptr` is non-null and `(self.ptr as usize) % core::mem::align_of::<T>() == 0`.
+    /// 3. If `self.count > 0`:
+    ///    - `self.ptr` is non-null and `(self.ptr as usize) % core::mem::align_of::<T>() == 0`.
+    ///    - `self.count <= isize::MAX as usize`.
+    ///    - `self.count * core::mem::size_of::<T>() <= isize::MAX as usize` without integer overflow.
+    ///    - `(self.ptr as usize) + (self.count * size_of::<T>())` does not wrap around the address space.
     ///
-    /// Returns `None` if stride or alignment validation fails or if `ptr` is null when `count > 0`.
+    /// Returns `None` if stride or alignment validation fails, if `ptr` is null when `count > 0`,
+    /// or if the total byte size violates Rust slice safety preconditions.
     #[inline]
     pub fn as_typed_slice<T: Copy>(&self) -> Option<&[T]> {
         if self.stride != core::mem::size_of::<T>() {
@@ -574,9 +586,21 @@ impl<'a> ChunkSlice<'a> {
         if self.ptr.is_null() || (self.ptr as usize) % core::mem::align_of::<T>() != 0 {
             return None;
         }
+        if self.count > (isize::MAX as usize) {
+            return None;
+        }
+        let total_bytes = match self.count.checked_mul(core::mem::size_of::<T>()) {
+            Some(bytes) if bytes <= (isize::MAX as usize) => bytes,
+            _ => return None,
+        };
+        if (self.ptr as usize).checked_add(total_bytes).is_none() {
+            return None;
+        }
         // SAFETY:
         // - self.ptr is non-null and aligned for T.
         // - self.stride == size_of::<T>(), guaranteeing elements are contiguous in table storage.
+        // - self.count <= isize::MAX as usize and total_bytes <= isize::MAX as usize.
+        // - Adding total_bytes to self.ptr does not wrap around the address space.
         // - self.count elements are valid and initialized for reads during lifetime 'a.
         // - T: Copy guarantees no drop glue or ownership transfer.
         Some(unsafe { core::slice::from_raw_parts(self.ptr as *const T, self.count) })
@@ -638,8 +662,15 @@ impl<'a> ChunkSliceMut<'a> {
     #[inline]
     pub fn get_ptr_mut(&mut self, index: usize) -> Option<*mut u8> {
         if index < self.count && !self.ptr.is_null() {
-            // SAFETY: Bounds checked, index is strictly less than count, stride is verified.
-            unsafe { Some(self.ptr.add(index * self.stride)) }
+            let offset = index.checked_mul(self.stride)?;
+            if offset > (isize::MAX as usize) {
+                return None;
+            }
+            if (self.ptr as usize).checked_add(offset).is_none() {
+                return None;
+            }
+            // SAFETY: Bounds checked, index is strictly less than count, offset fits within isize::MAX without wrapping.
+            unsafe { Some(self.ptr.add(offset)) }
         } else {
             None
         }
@@ -650,9 +681,14 @@ impl<'a> ChunkSliceMut<'a> {
     /// Validates that:
     /// 1. `self.stride == core::mem::size_of::<T>()`.
     /// 2. If `self.count == 0`, returns `Some(&mut [])`.
-    /// 3. If `self.count > 0`: `self.ptr` is non-null and `(self.ptr as usize) % core::mem::align_of::<T>() == 0`.
+    /// 3. If `self.count > 0`:
+    ///    - `self.ptr` is non-null and `(self.ptr as usize) % core::mem::align_of::<T>() == 0`.
+    ///    - `self.count <= isize::MAX as usize`.
+    ///    - `self.count * core::mem::size_of::<T>() <= isize::MAX as usize` without integer overflow.
+    ///    - `(self.ptr as usize) + (self.count * size_of::<T>())` does not wrap around the address space.
     ///
-    /// Returns `None` if stride or alignment validation fails or if `ptr` is null when `count > 0`.
+    /// Returns `None` if stride or alignment validation fails, if `ptr` is null when `count > 0`,
+    /// or if the total byte size violates Rust slice safety preconditions.
     #[inline]
     pub fn as_typed_slice<T: Copy>(&mut self) -> Option<&mut [T]> {
         if self.stride != core::mem::size_of::<T>() {
@@ -664,9 +700,21 @@ impl<'a> ChunkSliceMut<'a> {
         if self.ptr.is_null() || (self.ptr as usize) % core::mem::align_of::<T>() != 0 {
             return None;
         }
+        if self.count > (isize::MAX as usize) {
+            return None;
+        }
+        let total_bytes = match self.count.checked_mul(core::mem::size_of::<T>()) {
+            Some(bytes) if bytes <= (isize::MAX as usize) => bytes,
+            _ => return None,
+        };
+        if (self.ptr as usize).checked_add(total_bytes).is_none() {
+            return None;
+        }
         // SAFETY:
         // - self.ptr is non-null and aligned for T.
         // - self.stride == size_of::<T>(), guaranteeing elements are contiguous in table storage.
+        // - self.count <= isize::MAX as usize and total_bytes <= isize::MAX as usize.
+        // - Adding total_bytes to self.ptr does not wrap around the address space.
         // - self.count elements are valid and initialized for writes.
         // - Exclusive reborrow of &mut self guarantees no aliasing for the duration of the returned slice.
         // - T: Copy guarantees no drop glue or ownership transfer.
@@ -838,12 +886,20 @@ mod tests {
         assert!(slice.get_ptr(4).is_none());
         assert!(slice.get_ptr(100).is_none());
 
+        // Arithmetic overflow and address wrapping protection in get_ptr
+        let massive_slice = ChunkSlice::new(data.as_ptr() as *const u8, stride, usize::MAX);
+        assert!(massive_slice.get_ptr(usize::MAX / 2).is_none());
+
         let mut slice_mut = ChunkSliceMut::new(data.as_mut_ptr() as *mut u8, stride, count);
         let p1 = slice_mut.get_ptr_mut(1).unwrap();
         // SAFETY: p1 is valid mutable u32 pointer.
         unsafe { *(p1 as *mut u32) = 99 };
         assert_eq!(data[1], 99);
         assert!(slice_mut.get_ptr_mut(4).is_none());
+
+        // Arithmetic overflow and address wrapping protection in get_ptr_mut
+        let mut massive_slice_mut = ChunkSliceMut::new(data.as_mut_ptr() as *mut u8, stride, usize::MAX);
+        assert!(massive_slice_mut.get_ptr_mut(usize::MAX / 2).is_none());
     }
 
     #[derive(Copy, Clone, Debug, PartialEq)]
@@ -882,6 +938,10 @@ mod tests {
         // Empty slice with invalid stride
         let empty_bad_stride = ChunkSlice::new(core::ptr::null(), stride + 1, 0);
         assert!(empty_bad_stride.as_typed_slice::<PosData>().is_none());
+
+        // Massive count check (exceeding isize::MAX)
+        let massive = ChunkSlice::new(data.as_ptr() as *const u8, stride, usize::MAX);
+        assert!(massive.as_typed_slice::<PosData>().is_none());
     }
 
     #[test]
@@ -908,6 +968,10 @@ mod tests {
         // Empty slice with valid stride
         let mut empty = ChunkSliceMut::new(core::ptr::null_mut(), stride, 0);
         assert_eq!(empty.as_typed_slice::<PosData>(), Some(&mut [][..]));
+
+        // Massive count check (exceeding isize::MAX)
+        let mut massive_mut = ChunkSliceMut::new(data.as_mut_ptr() as *mut u8, stride, usize::MAX);
+        assert!(massive_mut.as_typed_slice::<PosData>().is_none());
     }
 
     #[test]

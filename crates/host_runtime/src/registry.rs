@@ -349,17 +349,17 @@ pub unsafe extern "C" fn host_get_proc_address(name: *const c_char) -> *const c_
         return core::ptr::null();
     };
 
-    // 1. Thread-local lookup
+    // 1. Thread-local lookup (strict per-World isolation when a registry guard is active)
     let local_res = CURRENT_REGISTRY.try_with(|cell| {
         cell.borrow()
             .as_ref()
-            .and_then(|reg| reg.resolve_symbol(sym_str))
+            .map(|reg| reg.resolve_symbol(sym_str).unwrap_or(core::ptr::null()))
     });
     if let Ok(Some(ptr)) = local_res {
         return ptr;
     }
 
-    // 2. Global fallback lookup
+    // 2. Global fallback lookup (only when no thread-local ModRegistry guard is active)
     if let Ok(guard) = GLOBAL_SYMBOLS.read() {
         if let Some(&sym_addr) = guard.get(sym_str) {
             return sym_addr.0;

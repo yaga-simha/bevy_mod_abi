@@ -2,7 +2,8 @@
 #![deny(improper_ctypes_definitions)]
 
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::Mutex;
 use guest_sdk::{
     export_mod, register_runtime_component, wrap_system_callback, CommandBridgeVTable,
     ComponentAccessDesc, ComponentAccessMode, FfiEntity, FfiResult, GetProcAddressFn,
@@ -81,16 +82,10 @@ static VEL_VTABLE: AtomicPtr<VelocityVTable> = AtomicPtr::new(core::ptr::null_mu
 static HEALTH_VTABLE: AtomicPtr<CombatHealthVTable> = AtomicPtr::new(core::ptr::null_mut());
 static TAG_VTABLE: AtomicPtr<MetadataTagVTable> = AtomicPtr::new(core::ptr::null_mut());
 
-static COMMAND_VTABLE: AtomicPtr<CommandBridgeVTable> = AtomicPtr::new(core::ptr::null_mut());
-static mut STATIC_CMD_VTABLE: CommandBridgeVTable = CommandBridgeVTable {
-    spawn_empty: None,
-    despawn: None,
-    insert_component: None,
-};
+static ALLOCATED_CMD_VTABLES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 static PANIC_TRIGGER: AtomicBool = AtomicBool::new(false);
 static SHUTDOWN_CALLED: AtomicBool = AtomicBool::new(false);
-static ACTIVE_INSTANCES: AtomicUsize = AtomicUsize::new(0);
 
 // Test harness controls
 
@@ -193,11 +188,10 @@ unsafe fn rust_kinematics_system(
 unsafe fn rust_combat_system(
     iter: *mut RawChunkIter,
     commands: *mut RawCommandQueue,
-    _user_data: *mut c_void,
+    user_data: *mut c_void,
 ) -> FfiResult {
     let host_api_ptr = HOST_API_PTR.load(Ordering::Acquire);
     let health_vt_ptr = HEALTH_VTABLE.load(Ordering::Acquire);
-    let cmd_vt_ptr = COMMAND_VTABLE.load(Ordering::Acquire);
 
     if host_api_ptr.is_null() || health_vt_ptr.is_null() {
         return FfiResult::INTERNAL_ERROR;
@@ -205,8 +199,9 @@ unsafe fn rust_combat_system(
 
     let api = unsafe { &*host_api_ptr };
     let health_vt = unsafe { &*health_vt_ptr };
-    let cmd_vt = if !cmd_vt_ptr.is_null() {
-        unsafe { *cmd_vt_ptr }
+    let cmd_vt = if !user_data.is_null() {
+        // SAFETY: `user_data` points to a valid `CommandBridgeVTable` allocated in `mod_init`.
+        unsafe { *(user_data as *const CommandBridgeVTable) }
     } else {
         CommandBridgeVTable::default()
     };
@@ -303,17 +298,14 @@ unsafe fn rust_metadata_system(
 unsafe fn rust_command_system(
     _iter: *mut RawChunkIter,
     commands: *mut RawCommandQueue,
-    _user_data: *mut c_void,
+    user_data: *mut c_void,
 ) -> FfiResult {
-    if commands.is_null() {
-        return FfiResult::OK;
-    }
-    let cmd_vt_ptr = COMMAND_VTABLE.load(Ordering::Acquire);
-    if cmd_vt_ptr.is_null() {
+    if commands.is_null() || user_data.is_null() {
         return FfiResult::OK;
     }
 
-    let cmd_vt = unsafe { *cmd_vt_ptr };
+    // SAFETY: `user_data` points to a valid `CommandBridgeVTable` allocated in `mod_init`.
+    let cmd_vt = unsafe { *(user_data as *const CommandBridgeVTable) };
     let mut cmd_queue = GuestCommandQueue::new(commands, cmd_vt);
 
     // 1. Spawn a new entity
@@ -375,7 +367,7 @@ unsafe fn rust_panicking_system(
     _commands: *mut RawCommandQueue,
     _user_data: *mut c_void,
 ) -> FfiResult {
-    if PANIC_TRIGGER.load(Ordering::SeqCst) {
+    if PANIC_TRIGGER.swap(false, Ordering::SeqCst) {
         panic!("Intentional cross-runtime panic in asymmetric_rust_mod");
     }
     FfiResult::OK
@@ -404,23 +396,15 @@ unsafe fn rust_custom_system(
             break;
         }
 
-        {
-            let mut slice = chunk_iter.mutable_slice(0, count);
-            let Some(items) = slice.as_typed_slice::<RustModCustomData>() else {
-                return FfiResult::INTERNAL_ERROR;
-            };
+        // `mutable_slice` invokes `iter_column_mutable`, which marks all chunk rows changed in O(1) FFI calls.
+        let mut slice = chunk_iter.mutable_slice(0, count);
+        let Some(items) = slice.as_typed_slice::<RustModCustomData>() else {
+            return FfiResult::INTERNAL_ERROR;
+        };
 
-            for item in items.iter_mut() {
-                item.power += 10.0;
-                item.shield += 1;
-            }
-        }
-
-        for i in 0..count {
-            let mark_res = chunk_iter.mark_changed(0, i);
-            if mark_res.is_err() {
-                return mark_res;
-            }
+        for item in items.iter_mut() {
+            item.power += 10.0;
+            item.shield += 1;
         }
     }
 
@@ -443,9 +427,6 @@ fn mod_init(
     host_api: *const HostApi,
     host_context: *mut c_void,
 ) -> FfiResult {
-    PANIC_TRIGGER.store(false, Ordering::SeqCst);
-    ACTIVE_INSTANCES.fetch_add(1, Ordering::SeqCst);
-
     if host_api.is_null() {
         return FfiResult::NULL_POINTER;
     }
@@ -463,14 +444,15 @@ fn mod_init(
         return reg_res;
     }
 
-    // Resolve VTables with fallback naming support
+    // Resolve VTables with fallback naming support (store only non-null symbols so optional worlds never clobber globals)
     let pos_sym = unsafe { (get_proc_address)(c"Position_vtable".as_ptr()) };
     let vel_sym = unsafe { (get_proc_address)(c"Velocity_vtable".as_ptr()) };
-    if pos_sym.is_null() || vel_sym.is_null() {
-        return FfiResult::INVALID_COMPONENT;
+    if !pos_sym.is_null() {
+        POS_VTABLE.store(pos_sym as *mut PositionVTable, Ordering::Release);
     }
-    POS_VTABLE.store(pos_sym as *mut PositionVTable, Ordering::Release);
-    VEL_VTABLE.store(vel_sym as *mut VelocityVTable, Ordering::Release);
+    if !vel_sym.is_null() {
+        VEL_VTABLE.store(vel_sym as *mut VelocityVTable, Ordering::Release);
+    }
 
     let mut health_sym =
         unsafe { (get_proc_address)(c"CombatHealth_vtable".as_ptr()) };
@@ -490,37 +472,38 @@ fn mod_init(
         TAG_VTABLE.store(tag_sym as *mut MetadataTagVTable, Ordering::Release);
     }
 
-    // Resolve deferred command functions
-    let resolved = CommandBridgeVTable::resolve(get_proc_address);
-    unsafe {
-        STATIC_CMD_VTABLE = resolved;
-        COMMAND_VTABLE.store(core::ptr::addr_of_mut!(STATIC_CMD_VTABLE), Ordering::Release);
+    // Resolve deferred command functions into a per-instance heap box
+    let cmd_vt_ptr = Box::into_raw(Box::new(CommandBridgeVTable::resolve(get_proc_address)));
+    if let Ok(mut list) = ALLOCATED_CMD_VTABLES.lock() {
+        list.push(cmd_vt_ptr as usize);
     }
 
     let api = unsafe { &*host_api };
 
-    // Register System 1: Kinematics
-    let kin_queries = [
-        ComponentAccessDesc {
-            name: c"Position".as_ptr(),
-            mode: ComponentAccessMode::WRITE,
-        },
-        ComponentAccessDesc {
-            name: c"Velocity".as_ptr(),
-            mode: ComponentAccessMode::READ,
-        },
-    ];
-    let kin_desc = SystemDescriptor {
-        struct_size: core::mem::size_of::<SystemDescriptor>() as u32,
-        name: c"rust_kinematics".as_ptr(),
-        queries: kin_queries.as_ptr(),
-        query_count: kin_queries.len(),
-        callback: c_rust_kinematics,
-        user_data: core::ptr::null_mut(),
-    };
-    let status = unsafe { (api.register_system)(host_context, &kin_desc) };
-    if status.is_err() {
-        return status;
+    // Register System 1: Kinematics (when both Position and Velocity exist in this World)
+    if !pos_sym.is_null() && !vel_sym.is_null() {
+        let kin_queries = [
+            ComponentAccessDesc {
+                name: c"Position".as_ptr(),
+                mode: ComponentAccessMode::WRITE,
+            },
+            ComponentAccessDesc {
+                name: c"Velocity".as_ptr(),
+                mode: ComponentAccessMode::READ,
+            },
+        ];
+        let kin_desc = SystemDescriptor {
+            struct_size: core::mem::size_of::<SystemDescriptor>() as u32,
+            name: c"rust_kinematics".as_ptr(),
+            queries: kin_queries.as_ptr(),
+            query_count: kin_queries.len(),
+            callback: c_rust_kinematics,
+            user_data: core::ptr::null_mut(),
+        };
+        let status = unsafe { (api.register_system)(host_context, &kin_desc) };
+        if status.is_err() {
+            return status;
+        }
     }
 
     // Register System 2: Combat Damage (if health component resolved)
@@ -543,7 +526,7 @@ fn mod_init(
             queries: combat_queries.as_ptr(),
             query_count: combat_queries.len(),
             callback: c_rust_combat,
-            user_data: core::ptr::null_mut(),
+            user_data: cmd_vt_ptr as *mut c_void,
         };
         let _ = unsafe { (api.register_system)(host_context, &combat_desc) };
     }
@@ -573,16 +556,18 @@ fn mod_init(
         let _ = unsafe { (api.register_system)(host_context, &tag_desc) };
     }
 
-    // Register System 4: Command Spawner (if command symbols resolved)
-    let spawner_desc = SystemDescriptor {
-        struct_size: core::mem::size_of::<SystemDescriptor>() as u32,
-        name: c"rust_command_spawner".as_ptr(),
-        queries: core::ptr::null(),
-        query_count: 0,
-        callback: c_rust_command,
-        user_data: core::ptr::null_mut(),
-    };
-    let _ = unsafe { (api.register_system)(host_context, &spawner_desc) };
+    // Register System 4: Command Spawner (when Position exists in this World)
+    if !pos_sym.is_null() {
+        let spawner_desc = SystemDescriptor {
+            struct_size: core::mem::size_of::<SystemDescriptor>() as u32,
+            name: c"rust_command_spawner".as_ptr(),
+            queries: core::ptr::null(),
+            query_count: 0,
+            callback: c_rust_command,
+            user_data: cmd_vt_ptr as *mut c_void,
+        };
+        let _ = unsafe { (api.register_system)(host_context, &spawner_desc) };
+    }
 
     // Register System 6: Dynamic Custom Data Mutation (Milestone 3)
     let custom_queries = [ComponentAccessDesc {
@@ -618,24 +603,21 @@ fn mod_shutdown(_host_context: *mut c_void) -> FfiResult {
     SHUTDOWN_CALLED.store(true, Ordering::SeqCst);
     PANIC_TRIGGER.store(false, Ordering::SeqCst);
 
-    let prev = ACTIVE_INSTANCES
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |val| {
-            if val > 0 {
-                Some(val - 1)
-            } else {
-                Some(0)
+    if let Ok(mut list) = ALLOCATED_CMD_VTABLES.lock() {
+        for ptr_usize in list.drain(..) {
+            let ptr = ptr_usize as *mut CommandBridgeVTable;
+            if !ptr.is_null() {
+                // SAFETY: Allocated via Box::into_raw in mod_init; systems are deactivated prior to mod_shutdown.
+                drop(unsafe { Box::from_raw(ptr) });
             }
-        })
-        .unwrap_or(0);
-
-    if prev == 1 {
-        COMMAND_VTABLE.store(core::ptr::null_mut(), Ordering::Release);
-        POS_VTABLE.store(core::ptr::null_mut(), Ordering::Release);
-        VEL_VTABLE.store(core::ptr::null_mut(), Ordering::Release);
-        HEALTH_VTABLE.store(core::ptr::null_mut(), Ordering::Release);
-        TAG_VTABLE.store(core::ptr::null_mut(), Ordering::Release);
-        HOST_API_PTR.store(core::ptr::null_mut(), Ordering::Release);
+        }
     }
+
+    POS_VTABLE.store(core::ptr::null_mut(), Ordering::Release);
+    VEL_VTABLE.store(core::ptr::null_mut(), Ordering::Release);
+    HEALTH_VTABLE.store(core::ptr::null_mut(), Ordering::Release);
+    TAG_VTABLE.store(core::ptr::null_mut(), Ordering::Release);
+    HOST_API_PTR.store(core::ptr::null_mut(), Ordering::Release);
 
     FfiResult::OK
 }

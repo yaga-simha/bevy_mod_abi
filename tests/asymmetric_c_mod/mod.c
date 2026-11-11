@@ -1,6 +1,7 @@
 #include "../../include/bevy_abi_mod.h"
 #include <string.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdatomic.h>
 
 /* ============================================================================
@@ -102,18 +103,17 @@ BEVY_ABI_STATIC_ASSERT(offsetof(CModCustomData, level) == 4, "CModCustomData lev
  * Mod Global State
  * ============================================================================ */
 
-static const HostApi* g_c_host_api = NULL;
-static const PositionVTable* g_c_pos_vtable = NULL;
-static const VelocityVTable* g_c_vel_vtable = NULL;
-static const CombatHealthVTable* g_c_health_vtable = NULL;
-static const MetadataTagVTable* g_c_tag_vtable = NULL;
+static atomic_uintptr_t g_c_host_api = 0;
+static atomic_uintptr_t g_c_pos_vtable = 0;
+static atomic_uintptr_t g_c_vel_vtable = 0;
+static atomic_uintptr_t g_c_health_vtable = 0;
+static atomic_uintptr_t g_c_tag_vtable = 0;
 
-static CmdSpawnEmptyFn g_cmd_spawn_empty = NULL;
-static CmdDespawnFn g_cmd_despawn = NULL;
-static CmdInsertComponentFn g_cmd_insert_component = NULL;
+static atomic_uintptr_t g_cmd_spawn_empty = 0;
+static atomic_uintptr_t g_cmd_despawn = 0;
+static atomic_uintptr_t g_cmd_insert_component = 0;
 
-static bool g_c_mod_shutdown_called = false;
-static atomic_size_t g_c_active_instances = 0;
+static atomic_bool g_c_mod_shutdown_called = false;
 
 /* ============================================================================
  * Scenario Systems
@@ -133,18 +133,21 @@ static FfiResult c_kinematics_system(
 ) {
     (void)commands;
     (void)user_data;
-    if (!g_c_host_api || !g_c_pos_vtable) {
+    const HostApi* host_api = (const HostApi*)atomic_load(&g_c_host_api);
+    const PositionVTable* pos_vt = (const PositionVTable*)atomic_load(&g_c_pos_vtable);
+    const VelocityVTable* vel_vt = (const VelocityVTable*)atomic_load(&g_c_vel_vtable);
+    if (!host_api || !pos_vt) {
         return FFI_RESULT_INTERNAL_ERROR;
     }
 
     while (1) {
-        size_t count = g_c_host_api->iter_next_chunk(iter);
+        size_t count = host_api->iter_next_chunk(iter);
         if (count == 0) {
             break;
         }
 
-        uint8_t* pos_base = g_c_host_api->iter_column_mutable(iter, 0);
-        size_t pos_stride = g_c_host_api->iter_column_stride(iter, 0);
+        uint8_t* pos_base = host_api->iter_column_mutable(iter, 0);
+        size_t pos_stride = host_api->iter_column_stride(iter, 0);
 
         if (!pos_base) {
             return FFI_RESULT_NULL_POINTER;
@@ -152,25 +155,25 @@ static FfiResult c_kinematics_system(
 
         const uint8_t* vel_base = NULL;
         size_t vel_stride = 0;
-        if (g_c_vel_vtable) {
-            vel_base = g_c_host_api->iter_column_readonly(iter, 1);
-            vel_stride = g_c_host_api->iter_column_stride(iter, 1);
+        if (vel_vt) {
+            vel_base = host_api->iter_column_readonly(iter, 1);
+            vel_stride = host_api->iter_column_stride(iter, 1);
         }
 
         for (size_t i = 0; i < count; ++i) {
             void* p_ptr = (void*)(pos_base + (i * pos_stride));
-            float z = g_c_pos_vtable->get_z(p_ptr);
+            float z = pos_vt->get_z(p_ptr);
 
-            if (vel_base && g_c_vel_vtable) {
+            if (vel_base && vel_vt) {
                 const void* v_ptr = (const void*)(vel_base + (i * vel_stride));
-                float vz = g_c_vel_vtable->get_z(v_ptr);
-                g_c_pos_vtable->set_z(p_ptr, z + (vz != 0.0f ? vz : 1.0f));
+                float vz = vel_vt->get_z(v_ptr);
+                pos_vt->set_z(p_ptr, z + (vz != 0.0f ? vz : 1.0f));
             } else {
-                g_c_pos_vtable->set_z(p_ptr, z + 1.0f);
+                pos_vt->set_z(p_ptr, z + 1.0f);
             }
 
             // Explicitly mark change detection for row i in Position column
-            g_c_host_api->iter_mark_changed(iter, 0, i);
+            host_api->iter_mark_changed(iter, 0, i);
         }
     }
 
@@ -189,21 +192,24 @@ static FfiResult c_combat_system(
     void* user_data
 ) {
     (void)user_data;
-    if (!g_c_host_api || !g_c_health_vtable) {
+    const HostApi* host_api = (const HostApi*)atomic_load(&g_c_host_api);
+    const CombatHealthVTable* health_vt = (const CombatHealthVTable*)atomic_load(&g_c_health_vtable);
+    CmdDespawnFn despawn_fn = (CmdDespawnFn)atomic_load(&g_cmd_despawn);
+    if (!host_api || !health_vt) {
         return FFI_RESULT_INTERNAL_ERROR;
     }
 
     const int32_t damage = 10;
 
     while (1) {
-        size_t count = g_c_host_api->iter_next_chunk(iter);
+        size_t count = host_api->iter_next_chunk(iter);
         if (count == 0) {
             break;
         }
 
-        uint8_t* health_base = g_c_host_api->iter_column_mutable(iter, 0);
-        size_t health_stride = g_c_host_api->iter_column_stride(iter, 0);
-        const FfiEntity* entities = g_c_host_api->iter_entities(iter);
+        uint8_t* health_base = host_api->iter_column_mutable(iter, 0);
+        size_t health_stride = host_api->iter_column_stride(iter, 0);
+        const FfiEntity* entities = host_api->iter_entities(iter);
 
         if (!health_base) {
             return FFI_RESULT_NULL_POINTER;
@@ -211,16 +217,16 @@ static FfiResult c_combat_system(
 
         for (size_t i = 0; i < count; ++i) {
             void* h_ptr = (void*)(health_base + (i * health_stride));
-            int32_t cur = g_c_health_vtable->get_current(h_ptr);
+            int32_t cur = health_vt->get_current(h_ptr);
             int32_t new_hp = cur > damage ? cur - damage : 0;
-            g_c_health_vtable->set_current(h_ptr, new_hp);
+            health_vt->set_current(h_ptr, new_hp);
 
             // Mark Changed<CombatHealth>
-            g_c_host_api->iter_mark_changed(iter, 0, i);
+            host_api->iter_mark_changed(iter, 0, i);
 
             // Deferred despawn dead entities if command API available
-            if (new_hp <= 0 && commands && entities && g_cmd_despawn) {
-                g_cmd_despawn(commands, entities[i]);
+            if (new_hp <= 0 && commands && entities && despawn_fn) {
+                despawn_fn(commands, entities[i]);
             }
         }
     }
@@ -241,32 +247,34 @@ static FfiResult c_metadata_system(
 ) {
     (void)commands;
     (void)user_data;
-    if (!g_c_host_api || !g_c_tag_vtable) {
+    const HostApi* host_api = (const HostApi*)atomic_load(&g_c_host_api);
+    const MetadataTagVTable* tag_vt = (const MetadataTagVTable*)atomic_load(&g_c_tag_vtable);
+    if (!host_api || !tag_vt) {
         return FFI_RESULT_INTERNAL_ERROR;
     }
 
     while (1) {
-        size_t count = g_c_host_api->iter_next_chunk(iter);
+        size_t count = host_api->iter_next_chunk(iter);
         if (count == 0) {
             break;
         }
 
-        uint8_t* tag_base = g_c_host_api->iter_column_mutable(iter, 0);
-        size_t tag_stride = g_c_host_api->iter_column_stride(iter, 0);
+        uint8_t* tag_base = host_api->iter_column_mutable(iter, 0);
+        size_t tag_stride = host_api->iter_column_stride(iter, 0);
         if (!tag_base) {
             return FFI_RESULT_NULL_POINTER;
         }
 
         for (size_t i = 0; i < count; ++i) {
             void* elem = (void*)(tag_base + (i * tag_stride));
-            StrView view = g_c_tag_vtable->get_label(elem);
+            StrView view = tag_vt->get_label(elem);
 
             // Safe read-only inspection without allocator crossover:
             if (view.len > 0 && view.ptr != NULL) {
                 if (view.len >= 5 && memcmp(view.ptr, "grunt", 5) == 0) {
                     const char* upgraded = "elite_grunt";
-                    g_c_tag_vtable->set_label(elem, (const uint8_t*)upgraded, strlen(upgraded));
-                    g_c_host_api->iter_mark_changed(iter, 0, i);
+                    tag_vt->set_label(elem, (const uint8_t*)upgraded, strlen(upgraded));
+                    host_api->iter_mark_changed(iter, 0, i);
                 }
             }
         }
@@ -286,20 +294,24 @@ static FfiResult c_command_system(
 ) {
     (void)iter;
     (void)user_data;
-    if (!commands || !g_cmd_spawn_empty || !g_cmd_insert_component) {
+    CmdSpawnEmptyFn spawn_fn = (CmdSpawnEmptyFn)atomic_load(&g_cmd_spawn_empty);
+    CmdInsertComponentFn insert_fn = (CmdInsertComponentFn)atomic_load(&g_cmd_insert_component);
+    CmdDespawnFn despawn_fn = (CmdDespawnFn)atomic_load(&g_cmd_despawn);
+    const PositionVTable* pos_vt = (const PositionVTable*)atomic_load(&g_c_pos_vtable);
+    if (!commands || !spawn_fn || !insert_fn) {
         return FFI_RESULT_OK;
     }
 
     // Spawn an empty entity deferred on Bevy's World
-    FfiEntity spawned = g_cmd_spawn_empty(commands);
+    FfiEntity spawned = spawn_fn(commands);
     if (spawned == 0) {
         return FFI_RESULT_INTERNAL_ERROR;
     }
 
     // If Position is available, attach a Position component
-    if (g_c_pos_vtable) {
+    if (pos_vt) {
         struct { float x, y, z; } pos_init = { 50.0f, 60.0f, 70.0f };
-        FfiResult res = g_cmd_insert_component(
+        FfiResult res = insert_fn(
             commands,
             spawned,
             "Position",
@@ -311,8 +323,8 @@ static FfiResult c_command_system(
         }
     }
 
-    if (g_cmd_despawn) {
-        FfiResult despawn_res = g_cmd_despawn(commands, spawned);
+    if (despawn_fn) {
+        FfiResult despawn_res = despawn_fn(commands, spawned);
         if (despawn_res != FFI_RESULT_OK) {
             return despawn_res;
         }
@@ -333,27 +345,28 @@ static FfiResult c_custom_data_system(
 ) {
     (void)commands;
     (void)user_data;
-    if (!g_c_host_api) {
+    const HostApi* host_api = (const HostApi*)atomic_load(&g_c_host_api);
+    if (!host_api) {
         return FFI_RESULT_INTERNAL_ERROR;
     }
 
     while (1) {
-        size_t count = g_c_host_api->iter_next_chunk(iter);
+        size_t count = host_api->iter_next_chunk(iter);
         if (count == 0) {
             break;
         }
 
-        uint8_t* base = g_c_host_api->iter_column_mutable(iter, 0);
-        size_t stride = g_c_host_api->iter_column_stride(iter, 0);
+        uint8_t* base = host_api->iter_column_mutable(iter, 0);
+        size_t stride = host_api->iter_column_stride(iter, 0);
         if (!base) {
             return FFI_RESULT_NULL_POINTER;
         }
 
+        /* `iter_column_mutable` marks all chunk rows changed in a single FFI crossing */
         for (size_t i = 0; i < count; ++i) {
             CModCustomData* data = (CModCustomData*)(base + (i * stride));
             data->mana += 5.0f;
             data->level += 1;
-            g_c_host_api->iter_mark_changed(iter, 0, i);
         }
     }
 
@@ -369,7 +382,7 @@ BEVY_ABI_MOD_EXPORT uint32_t bevy_abi_mod_abi_version(void) {
 }
 
 BEVY_ABI_MOD_EXPORT bool asymmetric_c_mod_was_shutdown(void) {
-    return g_c_mod_shutdown_called;
+    return atomic_load(&g_c_mod_shutdown_called);
 }
 
 BEVY_ABI_MOD_EXPORT FfiResult bevy_abi_mod_init(
@@ -384,45 +397,82 @@ BEVY_ABI_MOD_EXPORT FfiResult bevy_abi_mod_init(
         return FFI_RESULT_INVALID_VERSION;
     }
 
-    g_c_host_api = host_api;
+    atomic_store(&g_c_host_api, (uintptr_t)host_api);
 
     if (!get_proc_address) {
         return FFI_RESULT_NULL_POINTER;
     }
 
-    // Resolve component VTables with fallbacks
-    g_c_pos_vtable = (const PositionVTable*)get_proc_address("Position_vtable");
-    g_c_vel_vtable = (const VelocityVTable*)get_proc_address("Velocity_vtable");
-    g_c_health_vtable = (const CombatHealthVTable*)get_proc_address("CombatHealth_vtable");
-    if (!g_c_health_vtable) {
-        g_c_health_vtable = (const CombatHealthVTable*)get_proc_address("Health_vtable");
-    }
-    g_c_tag_vtable = (const MetadataTagVTable*)get_proc_address("MetadataTag_vtable");
-    if (!g_c_tag_vtable) {
-        g_c_tag_vtable = (const MetadataTagVTable*)get_proc_address("NameTag_vtable");
+    // Resolve component VTables into local variables first so concurrent Worlds
+    // without optional components never overwrite active global VTable pointers with NULL.
+    const PositionVTable* local_pos_vt =
+        (const PositionVTable*)get_proc_address("Position_vtable");
+    const VelocityVTable* local_vel_vt =
+        (const VelocityVTable*)get_proc_address("Velocity_vtable");
+
+    const char* health_name = "CombatHealth";
+    const CombatHealthVTable* local_health_vt =
+        (const CombatHealthVTable*)get_proc_address("CombatHealth_vtable");
+    if (!local_health_vt) {
+        local_health_vt = (const CombatHealthVTable*)get_proc_address("Health_vtable");
+        if (local_health_vt) {
+            health_name = "Health";
+        }
     }
 
-    // Resolve deferred command functions
-    g_cmd_spawn_empty = (CmdSpawnEmptyFn)get_proc_address("cmd_spawn_empty");
-    if (!g_cmd_spawn_empty) {
-        g_cmd_spawn_empty = (CmdSpawnEmptyFn)get_proc_address("host_cmd_spawn_empty");
+    const char* tag_name = "MetadataTag";
+    const MetadataTagVTable* local_tag_vt =
+        (const MetadataTagVTable*)get_proc_address("MetadataTag_vtable");
+    if (!local_tag_vt) {
+        local_tag_vt = (const MetadataTagVTable*)get_proc_address("NameTag_vtable");
+        if (local_tag_vt) {
+            tag_name = "NameTag";
+        }
     }
-    g_cmd_despawn = (CmdDespawnFn)get_proc_address("cmd_despawn");
-    if (!g_cmd_despawn) {
-        g_cmd_despawn = (CmdDespawnFn)get_proc_address("host_cmd_despawn");
+
+    CmdSpawnEmptyFn local_spawn = (CmdSpawnEmptyFn)get_proc_address("cmd_spawn_empty");
+    if (!local_spawn) {
+        local_spawn = (CmdSpawnEmptyFn)get_proc_address("host_cmd_spawn_empty");
     }
-    g_cmd_insert_component = (CmdInsertComponentFn)get_proc_address("cmd_insert_component");
-    if (!g_cmd_insert_component) {
-        g_cmd_insert_component = (CmdInsertComponentFn)get_proc_address("host_cmd_insert_component");
+    CmdDespawnFn local_despawn = (CmdDespawnFn)get_proc_address("cmd_despawn");
+    if (!local_despawn) {
+        local_despawn = (CmdDespawnFn)get_proc_address("host_cmd_despawn");
+    }
+    CmdInsertComponentFn local_insert =
+        (CmdInsertComponentFn)get_proc_address("cmd_insert_component");
+    if (!local_insert) {
+        local_insert = (CmdInsertComponentFn)get_proc_address("host_cmd_insert_component");
+    }
+
+    if (local_pos_vt) {
+        atomic_store(&g_c_pos_vtable, (uintptr_t)local_pos_vt);
+    }
+    if (local_vel_vt) {
+        atomic_store(&g_c_vel_vtable, (uintptr_t)local_vel_vt);
+    }
+    if (local_health_vt) {
+        atomic_store(&g_c_health_vtable, (uintptr_t)local_health_vt);
+    }
+    if (local_tag_vt) {
+        atomic_store(&g_c_tag_vtable, (uintptr_t)local_tag_vt);
+    }
+    if (local_spawn) {
+        atomic_store(&g_cmd_spawn_empty, (uintptr_t)local_spawn);
+    }
+    if (local_despawn) {
+        atomic_store(&g_cmd_despawn, (uintptr_t)local_despawn);
+    }
+    if (local_insert) {
+        atomic_store(&g_cmd_insert_component, (uintptr_t)local_insert);
     }
 
     if (!host_context || !host_api->register_system) {
         return FFI_RESULT_OK;
     }
 
-    // 1. Register Kinematics System if Position is exposed
-    if (g_c_pos_vtable) {
-        static ComponentAccessDesc kin_queries[1];
+    // 1. Register Kinematics System if Position is exposed in this World
+    if (local_pos_vt) {
+        ComponentAccessDesc kin_queries[1];
         kin_queries[0].name = "Position";
         kin_queries[0].mode = COMPONENT_ACCESS_WRITE;
 
@@ -441,13 +491,9 @@ BEVY_ABI_MOD_EXPORT FfiResult bevy_abi_mod_init(
         }
     }
 
-    // 2. Register Combat Damage System if CombatHealth is exposed
-    if (g_c_health_vtable) {
-        const char* health_name = "CombatHealth";
-        if (!get_proc_address("CombatHealth_vtable") && get_proc_address("Health_vtable")) {
-            health_name = "Health";
-        }
-        static ComponentAccessDesc combat_queries[1];
+    // 2. Register Combat Damage System if CombatHealth/Health is exposed in this World
+    if (local_health_vt) {
+        ComponentAccessDesc combat_queries[1];
         combat_queries[0].name = health_name;
         combat_queries[0].mode = COMPONENT_ACCESS_WRITE;
 
@@ -466,13 +512,9 @@ BEVY_ABI_MOD_EXPORT FfiResult bevy_abi_mod_init(
         }
     }
 
-    // 3. Register Metadata Inspector System if MetadataTag is exposed
-    if (g_c_tag_vtable) {
-        const char* tag_name = "MetadataTag";
-        if (!get_proc_address("MetadataTag_vtable") && get_proc_address("NameTag_vtable")) {
-            tag_name = "NameTag";
-        }
-        static ComponentAccessDesc tag_queries[1];
+    // 3. Register Metadata Inspector System if MetadataTag/NameTag is exposed in this World
+    if (local_tag_vt) {
+        ComponentAccessDesc tag_queries[1];
         tag_queries[0].name = tag_name;
         tag_queries[0].mode = COMPONENT_ACCESS_WRITE;
 
@@ -491,8 +533,8 @@ BEVY_ABI_MOD_EXPORT FfiResult bevy_abi_mod_init(
         }
     }
 
-    // 4. Register Command System if command APIs are available
-    if (g_cmd_spawn_empty && g_cmd_insert_component) {
+    // 4. Register Command System if command APIs are available in this World
+    if (local_spawn && local_insert) {
         SystemDescriptor desc;
         memset(&desc, 0, sizeof(desc));
         desc.struct_size = (uint32_t)sizeof(SystemDescriptor);
@@ -522,7 +564,7 @@ BEVY_ABI_MOD_EXPORT FfiResult bevy_abi_mod_init(
 
         FfiResult reg_comp_res = host_api->register_component(host_context, &desc);
         if (reg_comp_res == FFI_RESULT_OK) {
-            static ComponentAccessDesc custom_queries[1];
+            ComponentAccessDesc custom_queries[1];
             custom_queries[0].name = "CModCustomData";
             custom_queries[0].mode = COMPONENT_ACCESS_WRITE;
 
@@ -542,23 +584,20 @@ BEVY_ABI_MOD_EXPORT FfiResult bevy_abi_mod_init(
         }
     }
 
-    atomic_fetch_add(&g_c_active_instances, 1);
     return FFI_RESULT_OK;
 }
 
 BEVY_ABI_MOD_EXPORT FfiResult bevy_abi_mod_shutdown(void* host_context) {
     (void)host_context;
-    g_c_mod_shutdown_called = true;
-    if (atomic_fetch_sub(&g_c_active_instances, 1) == 1) {
-        g_c_host_api = NULL;
-        g_c_pos_vtable = NULL;
-        g_c_vel_vtable = NULL;
-        g_c_health_vtable = NULL;
-        g_c_tag_vtable = NULL;
-        g_cmd_spawn_empty = NULL;
-        g_cmd_despawn = NULL;
-        g_cmd_insert_component = NULL;
-    }
+    atomic_store(&g_c_mod_shutdown_called, true);
+    atomic_store(&g_c_host_api, 0);
+    atomic_store(&g_c_pos_vtable, 0);
+    atomic_store(&g_c_vel_vtable, 0);
+    atomic_store(&g_c_health_vtable, 0);
+    atomic_store(&g_c_tag_vtable, 0);
+    atomic_store(&g_cmd_spawn_empty, 0);
+    atomic_store(&g_cmd_despawn, 0);
+    atomic_store(&g_cmd_insert_component, 0);
     return FFI_RESULT_OK;
 }
 

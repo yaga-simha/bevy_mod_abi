@@ -39,8 +39,56 @@ use bevy_ecs::prelude::Resource;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, Ordering};
 use libloading::{Library, Symbol};
-use std::path::Path;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
+
+/// OS-level identity of a shared library file so concurrent `ModHost` instances
+/// loading the same `.so`/`.dylib`/`.dll` coordinate `bevy_abi_mod_init` and
+/// `bevy_abi_mod_shutdown` across their shared `.data`/`.bss` segment.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum SharedLibKey {
+    #[cfg(unix)]
+    UnixInode { dev: u64, ino: u64 },
+    CanonicalPath(PathBuf),
+}
+
+impl SharedLibKey {
+    fn from_path(path: &Path) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(meta) = std::fs::metadata(path) {
+                return Self::UnixInode {
+                    dev: meta.dev(),
+                    ino: meta.ino(),
+                };
+            }
+        }
+        Self::CanonicalPath(
+            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+        )
+    }
+}
+
+#[derive(Default)]
+struct SharedLibState {
+    active_count: usize,
+}
+
+static ACTIVE_SHARED_LIBS: LazyLock<Mutex<HashMap<SharedLibKey, Arc<Mutex<SharedLibState>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn shared_lib_state_for_path(path: &Path) -> Arc<Mutex<SharedLibState>> {
+    let key = SharedLibKey::from_path(path);
+    let mut map = ACTIVE_SHARED_LIBS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    Arc::clone(
+        map.entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(SharedLibState::default()))),
+    )
+}
 
 /// Unique generational identifier for a loaded mod instance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -58,6 +106,33 @@ pub struct LoadedMod {
     pub shutdown_fn: Option<ModShutdownFn>,
     /// Atomic tombstone flag shared with all systems spawned by this mod.
     pub is_active: Arc<AtomicBool>,
+    /// Process-wide per-image lifecycle synchronization state.
+    lib_state: Arc<Mutex<SharedLibState>>,
+}
+
+/// Deactivates a [`LoadedMod`], decrements its process-wide shared-library reference count,
+/// invokes `bevy_abi_mod_shutdown` only when the final active instance unloads, and drops
+/// the OS library handle under the per-image lock.
+///
+/// # Safety
+/// Caller must ensure unloading the dynamic library is safe with respect to external threads.
+unsafe fn unload_loaded_mod(loaded: LoadedMod) {
+    loaded.is_active.store(false, Ordering::Release);
+    let mut state_guard = loaded
+        .lib_state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state_guard.active_count = state_guard.active_count.saturating_sub(1);
+    if state_guard.active_count == 0 {
+        if let Some(shutdown) = loaded.shutdown_fn {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // SAFETY: Invoking mod teardown hook while the shared library remains mapped
+                // and only after the final active ModHost reference is being released.
+                unsafe { shutdown(core::ptr::null_mut()) }
+            }));
+        }
+    }
+    drop(loaded.library);
 }
 
 /// Host resource tracking loaded dynamic libraries and managing their lifecycle.
@@ -105,6 +180,11 @@ impl ModHost {
         registry: &Arc<ModRegistry>,
     ) -> Result<(ModId, Vec<DynamicCSystem>), FfiResult> {
         let path = path.as_ref();
+        let lib_state = shared_lib_state_for_path(path);
+        let mut state_guard = lib_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         // SAFETY: Caller guarantees `path` points to a valid dynamic library safe to load.
         let lib = unsafe { Library::new(path) }.map_err(|_| FfiResult::INTERNAL_ERROR)?;
 
@@ -147,6 +227,9 @@ impl ModHost {
             return Err(status);
         }
 
+        state_guard.active_count += 1;
+        drop(state_guard);
+
         let mod_id = ModId(self.next_mod_id);
         self.next_mod_id += 1;
 
@@ -156,6 +239,7 @@ impl ModHost {
             library: lib,
             shutdown_fn,
             is_active,
+            lib_state,
         });
 
         Ok((mod_id, init_ctx.registered_systems))
@@ -174,11 +258,17 @@ impl ModHost {
         world: &mut bevy_ecs::world::World,
     ) -> Result<(ModId, Vec<DynamicCSystem>), FfiResult> {
         let path = path.as_ref();
+        let lib_state = shared_lib_state_for_path(path);
+        let mut state_guard = lib_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         // SAFETY: Caller guarantees `path` points to a valid dynamic library safe to load.
         let lib = unsafe { Library::new(path) }.map_err(|_| FfiResult::INTERNAL_ERROR)?;
 
         // Optional ABI version handshake check
         if let Ok(ver_fn) = unsafe { lib.get::<ModAbiVersionFn>(b"bevy_abi_mod_abi_version\0") } {
+            // SAFETY: Calling the side-effect-free version query symbol exported by the mod.
             let mod_ver = unsafe { ver_fn() };
             if mod_ver != ABI_VERSION_PACKED {
                 return Err(FfiResult::INVALID_VERSION);
@@ -223,6 +313,15 @@ impl ModHost {
             return Err(status);
         }
 
+        // Ensure all systems registered during init share the final ModRegistry snapshot
+        // (including any dynamic components registered after an earlier register_system call).
+        for sys in &mut init_ctx.registered_systems {
+            sys.set_registry(Arc::clone(&init_ctx.registry));
+        }
+
+        state_guard.active_count += 1;
+        drop(state_guard);
+
         let mod_id = ModId(self.next_mod_id);
         self.next_mod_id += 1;
 
@@ -232,6 +331,7 @@ impl ModHost {
             library: lib,
             shutdown_fn,
             is_active,
+            lib_state,
         });
 
         Ok((mod_id, init_ctx.registered_systems))
@@ -255,7 +355,8 @@ impl ModHost {
     }
 
     /// Unload a specific mod by its [`ModId`]:
-    /// Deactivates its `is_active` atomic guard, invokes `shutdown_fn`, and drops its `Library`.
+    /// Deactivates its `is_active` atomic guard, invokes `shutdown_fn` if it is the last active
+    /// instance of that shared library image, and drops its `Library`.
     ///
     /// # Safety
     /// Caller must ensure unloading the dynamic library is safe with respect to external threads.
@@ -266,28 +367,25 @@ impl ModHost {
             .position(|m| m.id == id)
             .ok_or(FfiResult::INTERNAL_ERROR)?;
         let loaded = self.loaded_libraries.remove(pos);
-        loaded.is_active.store(false, Ordering::Release);
-        if let Some(shutdown) = loaded.shutdown_fn {
-            // SAFETY: Invoking mod teardown hook prior to dropping `loaded.library` (`dlclose`).
-            let _ = unsafe { shutdown(core::ptr::null_mut()) };
+        // SAFETY: Caller guarantees unloading this mod is safe with respect to external threads.
+        unsafe {
+            unload_loaded_mod(loaded);
         }
-        drop(loaded.library);
         Ok(())
     }
 
     /// Unload all loaded mods in reverse load order (LIFO):
-    /// Deactivates each mod's `is_active` atomic guard, invokes `shutdown_fn`, and drops `Library`.
+    /// Deactivates each mod's `is_active` atomic guard, invokes `shutdown_fn` when the final
+    /// active reference to each shared library image is released, and drops `Library`.
     ///
     /// # Safety
     /// Caller must ensure unloading all libraries is safe with respect to external threads.
     pub unsafe fn unload_all(&mut self) {
         for loaded in self.loaded_libraries.drain(..).rev() {
-            loaded.is_active.store(false, Ordering::Release);
-            if let Some(shutdown) = loaded.shutdown_fn {
-                // SAFETY: Invoking mod teardown hook prior to dropping `loaded.library` (`dlclose`).
-                let _ = unsafe { shutdown(core::ptr::null_mut()) };
+            // SAFETY: Caller guarantees unloading all mods is safe with respect to external threads.
+            unsafe {
+                unload_loaded_mod(loaded);
             }
-            drop(loaded.library);
         }
     }
 

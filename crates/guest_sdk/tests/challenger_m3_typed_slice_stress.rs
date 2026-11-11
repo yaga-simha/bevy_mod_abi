@@ -186,81 +186,64 @@ fn test_as_typed_slice_zst_safety() {
     // Count == 0 for ZST with null pointer
     let empty_null_zst = ChunkSlice::new(core::ptr::null(), 0, 0);
     assert_eq!(empty_null_zst.as_typed_slice::<()>(), Some(&[][..]));
+
+    // ZST count exceeding isize::MAX must return None
+    let massive_zst = ChunkSlice::new(zst_ptr, 0, usize::MAX);
+    assert_eq!(massive_zst.as_typed_slice::<()>(), None);
+
+    let mut massive_mut_zst = ChunkSliceMut::new(zst_ptr as *mut u8, 0, usize::MAX);
+    assert_eq!(massive_mut_zst.as_typed_slice::<()>(), None);
+
+    let over_isize_zst = ChunkSlice::new(zst_ptr, 0, (isize::MAX as usize) + 1);
+    assert_eq!(over_isize_zst.as_typed_slice::<()>(), None);
+
+    let mut over_isize_mut_zst = ChunkSliceMut::new(zst_ptr as *mut u8, 0, (isize::MAX as usize) + 1);
+    assert_eq!(over_isize_mut_zst.as_typed_slice::<()>(), None);
+}
+
+#[test]
+fn test_as_typed_slice_massive_count() {
+    let mut val = 1234u32;
+    let ptr = &mut val as *mut u32 as *mut u8;
+    let size = core::mem::size_of::<u32>();
+
+    // 1. ChunkSlice (read-only) with count = usize::MAX must return None safely without aborting
+    let slice = ChunkSlice::new(ptr, size, usize::MAX);
+    assert_eq!(slice.as_typed_slice::<u32>(), None);
+
+    // 2. ChunkSliceMut with count = usize::MAX must return None safely without aborting
+    let mut slice_mut = ChunkSliceMut::new(ptr, size, usize::MAX);
+    assert_eq!(slice_mut.as_typed_slice::<u32>(), None);
+
+    // 3. Count exceeding isize::MAX in total bytes: (isize::MAX as usize / size) + 1
+    let over_isize_count = (isize::MAX as usize / size) + 1;
+    let slice_over = ChunkSlice::new(ptr, size, over_isize_count);
+    assert_eq!(slice_over.as_typed_slice::<u32>(), None);
+
+    let mut slice_over_mut = ChunkSliceMut::new(ptr, size, over_isize_count);
+    assert_eq!(slice_over_mut.as_typed_slice::<u32>(), None);
+
+    // 4. Address wrapping: pointer near the end of address space
+    let high_ptr = (usize::MAX - 2) as *mut u8;
+    let slice_wrap = ChunkSlice::new(high_ptr, 1, 4);
+    assert_eq!(slice_wrap.as_typed_slice::<u8>(), None);
+
+    let mut slice_wrap_mut = ChunkSliceMut::new(high_ptr, 1, 4);
+    assert_eq!(slice_wrap_mut.as_typed_slice::<u8>(), None);
+
+    // 5. Valid count within isize::MAX succeeds
+    let valid_count = 10;
+    let mut buffer = [0u32; 10];
+    let slice_valid = ChunkSlice::new(buffer.as_ptr() as *const u8, size, valid_count);
+    assert!(slice_valid.as_typed_slice::<u32>().is_some());
+    assert_eq!(slice_valid.as_typed_slice::<u32>().unwrap().len(), 10);
+
+    let mut slice_valid_mut = ChunkSliceMut::new(buffer.as_mut_ptr() as *mut u8, size, valid_count);
+    assert!(slice_valid_mut.as_typed_slice::<u32>().is_some());
+    assert_eq!(slice_valid_mut.as_typed_slice::<u32>().unwrap().len(), 10);
 }
 
 #[test]
 fn test_as_typed_slice_massive_count_soundness_audit() {
-    // When an external environment or corrupted chunk iterator passes a massive count
-    // (e.g. usize::MAX), a safe function ChunkSlice::as_typed_slice<T> must not violate
-    // core::slice::from_raw_parts safety contract (total size <= isize::MAX).
-    //
-    // In the current implementation, calling as_typed_slice with count = usize::MAX invokes
-    // core::slice::from_raw_parts, which triggers Rust's stdlib runtime assertion:
-    // "unsafe precondition(s) violated: slice::from_raw_parts requires the pointer to be aligned
-    // and non-null, and the total size of the slice not to exceed `isize::MAX`"
-    // and aborts the process via SIGABRT (signal 6).
-    //
-    // This test spawns a child process executing the massive slice call to empirically verify
-    // whether the current implementation aborts (demonstrating the vulnerability).
-    if std::env::var("RUN_MASSIVE_SLICE_SUBPROCESS").is_ok() {
-        let mut val = 1234u32;
-        let ptr = &mut val as *mut u32 as *mut u8;
-        let size = core::mem::size_of::<u32>();
-
-        if std::env::var("RUN_MUTABLE_SLICE").is_ok() {
-            let mut slice_mut = ChunkSliceMut::new(ptr, size, usize::MAX);
-            let _ = slice_mut.as_typed_slice::<u32>();
-        } else {
-            let slice = ChunkSlice::new(ptr, size, usize::MAX);
-            let _ = slice.as_typed_slice::<u32>();
-        }
-        return;
-    }
-
-    let current_exe = std::env::current_exe().expect("Failed to get current test binary path");
-
-    // 1. Audit ChunkSlice (read-only)
-    let output_ro = std::process::Command::new(&current_exe)
-        .arg("test_as_typed_slice_massive_count_soundness_audit")
-        .env("RUN_MASSIVE_SLICE_SUBPROCESS", "1")
-        .output()
-        .expect("Failed to execute subprocess");
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        let signal = output_ro.status.signal();
-        let stderr = String::from_utf8_lossy(&output_ro.stderr);
-        eprintln!(
-            "[ReadOnly] Subprocess status: {:?}, signal: {:?}, stderr: {}",
-            output_ro.status, signal, stderr
-        );
-        assert!(
-            signal == Some(6) || stderr.contains("precondition(s) violated") || !output_ro.status.success(),
-            "Empirically confirmed: ChunkSlice::as_typed_slice violates from_raw_parts safety precondition on massive counts"
-        );
-    }
-
-    // 2. Audit ChunkSliceMut (mutable)
-    let output_mut = std::process::Command::new(&current_exe)
-        .arg("test_as_typed_slice_massive_count_soundness_audit")
-        .env("RUN_MASSIVE_SLICE_SUBPROCESS", "1")
-        .env("RUN_MUTABLE_SLICE", "1")
-        .output()
-        .expect("Failed to execute subprocess");
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        let signal = output_mut.status.signal();
-        let stderr = String::from_utf8_lossy(&output_mut.stderr);
-        eprintln!(
-            "[Mutable] Subprocess status: {:?}, signal: {:?}, stderr: {}",
-            output_mut.status, signal, stderr
-        );
-        assert!(
-            signal == Some(6) || stderr.contains("precondition(s) violated") || !output_mut.status.success(),
-            "Empirically confirmed: ChunkSliceMut::as_typed_slice violates from_raw_parts_mut safety precondition on massive counts"
-        );
-    }
+    test_as_typed_slice_massive_count();
 }

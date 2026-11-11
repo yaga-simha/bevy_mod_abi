@@ -59,7 +59,7 @@ pub const MAX_SYSTEM_QUERIES: usize = 8;
 struct DropTrampolineSlot {
     uuid: abi_contract::ComponentUuid,
     drop_fn: unsafe extern "C" fn(ptr: *mut c_void),
-    is_active: Arc<AtomicBool>,
+    active_guards: Vec<Arc<AtomicBool>>,
 }
 
 static DROP_TRAMPOLINE_SLOTS: [Mutex<Option<DropTrampolineSlot>>; 64] = {
@@ -73,9 +73,10 @@ macro_rules! make_trampolines {
             unsafe fn $name(ptr: OwningPtr<'_>) {
                 if let Ok(guard) = DROP_TRAMPOLINE_SLOTS[$i].lock() {
                     if let Some(slot) = guard.as_ref() {
-                        if slot.is_active.load(Ordering::Acquire) {
+                        if slot.active_guards.iter().any(|g| g.load(Ordering::Acquire)) {
                             let raw = ptr.as_ptr() as *mut c_void;
-                            // SAFETY: foreign drop function called on valid instance while mod is active.
+                            // SAFETY: foreign drop function called on valid instance while at least
+                            // one loaded mod instance providing this UUID remains active and mapped.
                             unsafe { (slot.drop_fn)(raw) };
                         }
                     }
@@ -105,13 +106,16 @@ fn allocate_drop_trampoline(
     drop_fn: unsafe extern "C" fn(ptr: *mut c_void),
     is_active: Arc<AtomicBool>,
 ) -> Option<for<'a> unsafe fn(OwningPtr<'a>)> {
-    // 1. Safe reuse: Check if a slot is already assigned to this exact ComponentUuid (e.g. mod reload)
+    // 1. Safe reuse: Check if a slot is already assigned to this exact ComponentUuid (e.g. reload or multi-World load)
     for i in 0..64 {
         if let Ok(mut guard) = DROP_TRAMPOLINE_SLOTS[i].lock() {
             if let Some(slot) = guard.as_mut() {
                 if slot.uuid == uuid {
                     slot.drop_fn = drop_fn;
-                    slot.is_active = is_active;
+                    slot.active_guards.retain(|g| g.load(Ordering::Acquire));
+                    if !slot.active_guards.iter().any(|g| Arc::ptr_eq(g, &is_active)) {
+                        slot.active_guards.push(is_active);
+                    }
                     return Some(DROP_TRAMPOLINE_FNS[i]);
                 }
             }
@@ -125,7 +129,7 @@ fn allocate_drop_trampoline(
                 *guard = Some(DropTrampolineSlot {
                     uuid,
                     drop_fn,
-                    is_active,
+                    active_guards: vec![is_active],
                 });
                 return Some(DROP_TRAMPOLINE_FNS[i]);
             }
@@ -269,6 +273,11 @@ impl DynamicCSystem {
     /// Enables or disables execution of this system.
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
+    }
+
+    /// Replaces the component registry snapshot used by this system.
+    pub(crate) fn set_registry(&mut self, registry: Arc<ModRegistry>) {
+        self.registry = registry;
     }
 
     /// Returns `true` if the system was disabled due to internal query borrow conflicts.
@@ -851,6 +860,9 @@ pub unsafe extern "C" fn host_register_component(
                     name_str.to_string(),
                 );
                 init_ctx.registry = Arc::new(reg_clone);
+                crate::registry::CURRENT_REGISTRY.with(|cell| {
+                    *cell.borrow_mut() = Some(Arc::clone(&init_ctx.registry));
+                });
                 return FfiResult::OK;
             } else {
                 return FfiResult::INVALID_COMPONENT;
@@ -891,6 +903,9 @@ pub unsafe extern "C" fn host_register_component(
         let mut reg_clone = (*init_ctx.registry).clone();
         reg_clone.register_dynamic_component(comp_id, desc, name_str.to_string());
         init_ctx.registry = Arc::new(reg_clone);
+        crate::registry::CURRENT_REGISTRY.with(|cell| {
+            *cell.borrow_mut() = Some(Arc::clone(&init_ctx.registry));
+        });
     }
 
     FfiResult::OK

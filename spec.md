@@ -141,7 +141,11 @@ bevy_abi_mod/
   - Multi-Query & Negative Filter Extensions (resolved via `get_proc_address`):
     - `ComponentAccessMode::WITHOUT = ComponentAccessMode(3)` (`Without<T>` archetype exclusion filter).
     - `QuerySpec`, `MultiQuerySystemCallback`, `MultiQuerySystemDescriptor`, and `RegisterMultiQuerySystemFn` (`get_proc_address("register_multi_query_system")`), allowing up to 8 disjoint stack-allocated `RawChunkIter` handles in a single `DynamicCSystem` with intra-system borrow-conflict validation.
-  - `RawCommandQueue`: opaque C handle for deferred entity spawns, despawns, and component byte insertions (`CommandQueueBridge`).
+  - Runtime Dynamic Component Registration Extensions:
+    - `ComponentDropFn = unsafe extern "C" fn(ptr: *mut c_void)`.
+    - `ModComponentDescriptor` (`DynamicComponentDescriptor` alias): `#[repr(C)]` 64-byte descriptor (`struct_size`, `name`, `uuid`, `size`, `align`, `drop_fn: Option<ComponentDropFn>`, `vtable_ptr`) mirrored byte-for-byte with static assertions in `include/bevy_abi_mod.h`.
+    - `RegisterComponentFn` exposed directly on `HostApi::register_component` (and via `get_proc_address("register_component")`) so guest mods in Rust, C99, C++, or Zig can introduce structured components unknown at host compile time.
+  - `RawCommandQueue`: opaque C handle for deferred entity spawns, despawns, and component byte insertions (`CommandQueueBridge`, supporting both static `ModExposable` components and runtime-registered components via host-owned `AlignedBuffer` copies).
   - `FfiLayout` unsafe marker trait for types safe to expose via interior pointers or `Vec<T>` slices.
   - `ExposableComponent` trait exposing `COMPONENT_NAME`, `UUID`, `VTABLE`, `vtable_ptr()`, `size()`, `align()`, and `resolve_symbol()`.
 
@@ -160,13 +164,14 @@ For any Bevy `#[derive(Component, ModExposable)]` struct (which remains standard
 - Generates `#[repr(C)] pub struct <Struct>VTable` and a `static` VTable instance with a guaranteed unique address containing `size: usize`, `align: usize` (exact `core::mem::size_of::<Self>()` byte stride for array iteration), and all generated getter/setter function pointers.
 - Implements `ExposableComponent` and `FfiLayout`.
 
-### 4.3. `crates/host_runtime` (Dynamic System Trait & Parallel Execution)
+### 4.3. `crates/host_runtime` (Dynamic System Trait, Runtime Components & Parallel Execution)
 - Depends on `bevy_ecs` / `bevy_app` (or `bevy`), `libloading`, and `abi_contract`.
 - Implements:
-  - `AbiModPlugin` & `ModHost`: Manages library loading, static `HostApi` handshake, and deterministic `bevy_abi_mod_shutdown` invocation before `dlclose`.
-  - `ModRegistry`: Stores registered host components (`ComponentId`, `ComponentUuid`, name, VTable pointer, symbol resolver) and services `get_proc_address`.
+  - `AbiModPlugin` & `ModHost`: Manages library loading, static `HostApi` handshake, process-wide per-inode reference-counted lifecycle locking (`SharedLibState`), and deterministic `bevy_abi_mod_shutdown` invocation on final unload before `dlclose`.
+  - `ModRegistry`: Stores both compile-time `ModExposable` and runtime-registered components (`ComponentId`, `ComponentUuid`, name, size, alignment, VTable pointer, symbol resolver) and services `host_get_proc_address` with strict thread-local per-`World` symbol isolation (`CURRENT_REGISTRY`).
+  - `host_register_component`: Validates layout invariants (non-empty UTF-8 name, power-of-two alignment, size a multiple of alignment and within `isize::MAX`), constructs a raw `ComponentDescriptor::new_with_layout` (`StorageType::Table`), registers or rebinds the `ComponentId` in Bevy's `World`, and wires optional foreign `ComponentDropFn` callbacks through a 64-slot static trampoline pool (`DROP_TRAMPOLINE_SLOTS`) guarded by active mod tombstone flags (`Vec<Arc<AtomicBool>>`).
   - `DynamicCSystem` (`impl bevy_ecs::system::System<In = (), Out = ()>`):
-    - `System::initialize(&mut self, world: &mut World)`: resolves `ComponentId` for each requested component and populates `FilteredAccessSet<ComponentId>` (`add_component_read` / `add_component_write`).
+    - `System::initialize(&mut self, world: &mut World)`: resolves `ComponentId` for each requested static or runtime component and populates `FilteredAccessSet<ComponentId>` (`add_component_read` / `add_component_write`).
     - Archetype & Table Caching: tracks `ArchetypeGeneration` to incrementally update matched `TableId`s and `Access` without per-frame heap allocations (compatible with Bevy 0.16–0.20+ where `update_archetype_component_access` was unified into system execution/access updates).
     - `System::run_unsafe(&mut self, _input: (), world: UnsafeWorldCell)`: constructs `RawChunkIter` backed by `world`, the cached `TableId` list, and `world.change_tick()`; invokes the mod callback; isolates faults (`FfiResult::PANIC_CAUGHT` or caught unwind) by disabling the offending system.
     - `System::apply_deferred(&mut self, world: &mut World)`: flushes the internal `CommandQueue` (`CommandQueueBridge`).
@@ -175,15 +180,17 @@ For any Bevy `#[derive(Component, ModExposable)]` struct (which remains standard
 - Lightweight, Bevy-independent Rust wrapper over `abi_contract`.
 - Provides:
   - `export_mod!(init_fn, shutdown_fn)` macro with guest-side `catch_unwind` boundaries.
-  - `SystemBuilder` and safe chunk column wrappers.
+  - `register_runtime_component::<T>(host_api, host_context, c"Name")` with automatic layout extraction, deterministic `ComponentUuid::from_name`, and `core::mem::needs_drop::<T>()` drop-hook generation.
+  - `GuestChunkIter`, `ChunkSlice::as_typed_slice::<T>()`, and `ChunkSliceMut::as_typed_slice::<T>()` with alignment, stride, and overflow verification for zero-copy SoA slice access.
+  - `GuestCommandQueue::insert_runtime_component` for allocator-isolated deferred insertions.
 
-### 4.5. Hot-Unloading & Lifecycle Safety
-- Tracks loaded mods by `ModId`.
-- Associates all systems registered by a mod with a dedicated `SystemSet` or run-condition flag.
+### 4.5. Hot-Unloading, Tombstone Guards & Concurrency Safety
+- Tracks loaded mods by `ModId` and coordinates OS shared-library images across concurrent `World`s via per-inode `SharedLibState` locks and active reference counts.
+- Associates all systems and foreign drop trampolines registered by a mod instance with an `is_active: Arc<AtomicBool>` tombstone guard.
 - When unloading or hot-reloading a shared library:
-  1. Disables/removes the mod's systems from Bevy's schedules.
-  2. Ensures no worker threads are mid-frame.
-  3. Invokes `bevy_abi_mod_shutdown(host_context)` before dropping the `libloading::Library` handle.
+  1. Sets `is_active` to `false` (`Ordering::Release`), turning the mod's scheduled systems and drop hooks into safe no-ops without dangling jumps into unmapped `.text` pages, while preserving component data in Bevy's archetype tables for seamless hot-reload rebinding.
+  2. Decrements the shared-library `active_count` under the per-image mutex and invokes `bevy_abi_mod_shutdown` only when the last active instance unloads (`1 -> 0`).
+  3. Drops the `libloading::Library` handle under the per-image mutex.
 
 ---
 
@@ -206,3 +213,6 @@ For any Bevy `#[derive(Component, ModExposable)]` struct (which remains standard
 - **Phase 3: Asymmetric `.dll` / `.so` / `.dylib` Compilation, Fault Isolation & Hot-Unload**
   - Build `tests/asymmetric_rust_mod` and `tests/asymmetric_c_mod`.
   - **Validation Gate 3:** Load both shared libraries into a headless Bevy App, run 100 multi-threaded ticks, verify fault isolation when a mod system panics, and hot-unload both libraries cleanly followed by 10 additional schedule ticks.
+- **Phase 4: Runtime Mod Component Registration & Parallel Throughput Validation**
+  - Expose runtime component descriptors (`ModComponentDescriptor`) across Rust (`guest_sdk`) and pure C99 (`include/bevy_abi_mod.h`) shared libraries without host compile-time knowledge.
+  - **Validation Gate 4:** End-to-end multi-language integration tests, parallel `FilteredAccessSet` concurrency verification, deferred command burst & allocator-poisoning isolation tests, hot-unload/reload `ComponentId` rebinding & drop-trampoline safety tests, and 1k–100k entity benchmarks comparing runtime-registered components against static `ModExposable` components and native Bevy components.
