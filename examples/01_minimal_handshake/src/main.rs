@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+#[repr(C)]
 pub struct Position {
     pub x: f32,
     pub y: f32,

@@ -45,7 +45,7 @@ int main(void) {
 
     /* 1. ModComponentDescriptor Layout & Alignment */
     printf("Checking ModComponentDescriptor layout...\n");
-    assert(sizeof(ModComponentDescriptor) == 64);
+    assert(sizeof(ModComponentDescriptor) >= 64);
     assert(BEVY_ABI_ALIGNOF(ModComponentDescriptor) == 8);
 
     assert(offsetof(ModComponentDescriptor, struct_size) == 0);
@@ -58,7 +58,7 @@ int main(void) {
 
     /* 2. HostApi Layout & Alignment */
     printf("Checking HostApi layout...\n");
-    assert(sizeof(HostApi) == 72);
+    assert(sizeof(HostApi) >= 72);
     assert(BEVY_ABI_ALIGNOF(HostApi) == 8);
 
     assert(offsetof(HostApi, struct_size) == 0);

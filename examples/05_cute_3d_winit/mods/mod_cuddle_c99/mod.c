@@ -150,8 +150,10 @@ BEVY_ABI_MOD_EXPORT FfiResult bevy_abi_mod_init(
     const HostApi* host_api,
     void* host_context
 ) {
-    if (!host_api || host_api->struct_size < sizeof(HostApi) ||
-        host_api->abi_version != BEVY_ABI_VERSION_PACKED) {
+    if (!host_api ||
+        host_api->struct_size < (offsetof(HostApi, register_component) + sizeof(RegisterComponentFn)) ||
+        ((host_api->abi_version >> 24) & 0xFFu) != BEVY_ABI_VERSION_MAJOR ||
+        ((host_api->abi_version >> 16) & 0xFFu) < BEVY_ABI_VERSION_MINOR) {
         return FFI_RESULT_INVALID_VERSION;
     }
     if (!get_proc_address) {

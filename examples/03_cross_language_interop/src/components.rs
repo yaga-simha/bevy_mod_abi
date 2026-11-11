@@ -4,6 +4,7 @@ use bevy_ecs::component::Component;
 use host_runtime::ModExposable;
 
 #[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+#[repr(C)]
 pub struct Position {
     pub x: f32,
     pub y: f32,
@@ -11,6 +12,7 @@ pub struct Position {
 }
 
 #[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+#[repr(C)]
 pub struct Velocity {
     pub x: f32,
     pub y: f32,
@@ -18,6 +20,7 @@ pub struct Velocity {
 }
 
 #[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+#[repr(C)]
 pub struct ColorRgba {
     pub r: f32,
     pub g: f32,
