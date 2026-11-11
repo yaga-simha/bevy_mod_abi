@@ -11,7 +11,7 @@ use crate::components::{ColorRgba, CuteSpirit, Position, Scale3D};
 use crate::mod_manager::{ActiveMod, ModStatusResource};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-const MAX_INSTANCES: usize = 16384;
+const MAX_INSTANCES: usize = 32768;
 const MAX_UI_VERTICES: usize = 32768;
 
 #[repr(C)]
@@ -608,11 +608,12 @@ impl CuteRenderer {
         }
 
         // Cute Slime Spirits (Body + Bunny Ears + Glossy Eyes + Eye Sparkles + Rosy Blush + Ground Shadow)
+        let total_slimes = slimes.len();
         for s in slimes {
             if instances.len() + 12 >= MAX_INSTANCES {
                 break;
             }
-            append_cute_slime(&mut instances, s);
+            append_cute_slime(&mut instances, s, total_slimes);
         }
 
         let instance_count = instances.len().min(MAX_INSTANCES);
@@ -738,7 +739,7 @@ impl CuteRenderer {
 }
 
 /// Assembles a cute kawaii bunny-slime from smooth instanced ellipsoids!
-fn append_cute_slime(out: &mut Vec<ModelInstance>, s: &SlimeRenderData) {
+fn append_cute_slime(out: &mut Vec<ModelInstance>, s: &SlimeRenderData, total_slimes: usize) {
     let base_radius = 0.52_f32;
     let body_scale = Vec3::new(
         base_radius * s.scale.x,
@@ -778,6 +779,12 @@ fn append_cute_slime(out: &mut Vec<ModelInstance>, s: &SlimeRenderData) {
         Mat4::from_scale_rotation_translation(local_scale, rot_y * local_rot, world_pos)
     };
 
+    let local_to_world_aligned = |local_pos: Vec3, local_scale: Vec3| -> Mat4 {
+        let scaled_offset = local_pos * body_scale;
+        let world_pos = body_center + rot_y * scaled_offset;
+        Mat4::from_scale_rotation_translation(local_scale, rot_y, world_pos)
+    };
+
     // 3. Cute floppy bunny ears on top!
     let ear_col = [
         (s.color.r * 0.95 + 0.05).min(1.0),
@@ -815,38 +822,40 @@ fn append_cute_slime(out: &mut Vec<ModelInstance>, s: &SlimeRenderData) {
     let eye_col = [0.11, 0.08, 0.14, 1.0];
     let eye_scale = Vec3::new(0.085, 0.105, 0.055);
     out.push(ModelInstance::from_mat4_color(
-        local_to_world(Vec3::new(-0.34, 0.16, 0.90), Quat::IDENTITY, eye_scale),
+        local_to_world_aligned(Vec3::new(-0.34, 0.16, 0.90), eye_scale),
         eye_col,
     ));
     out.push(ModelInstance::from_mat4_color(
-        local_to_world(Vec3::new(0.34, 0.16, 0.90), Quat::IDENTITY, eye_scale),
+        local_to_world_aligned(Vec3::new(0.34, 0.16, 0.90), eye_scale),
         eye_col,
     ));
 
-    // 5. Tiny white kawaii eye-catchlight sparkles!
-    let spark_col = [1.0, 1.0, 1.0, 0.99];
-    let spark_scale = Vec3::splat(0.032);
-    out.push(ModelInstance::from_mat4_color(
-        local_to_world(Vec3::new(-0.30, 0.24, 0.99), Quat::IDENTITY, spark_scale),
-        spark_col,
-    ));
-    out.push(ModelInstance::from_mat4_color(
-        local_to_world(Vec3::new(0.38, 0.24, 0.99), Quat::IDENTITY, spark_scale),
-        spark_col,
-    ));
-
-    // 6. Rosy pink blush cheeks (grow & brighten when blushing!)
+    // 5. Rosy pink blush cheeks (grow & brighten when blushing!)
     let b = s.spirit.blush.clamp(0.15, 1.0);
     let blush_col = [1.0, 0.42 + 0.15 * (1.0 - b), 0.60, 0.99];
     let blush_scale = Vec3::new(0.095 * (0.75 + 0.45 * b), 0.058 * (0.75 + 0.45 * b), 0.045);
     out.push(ModelInstance::from_mat4_color(
-        local_to_world(Vec3::new(-0.56, -0.02, 0.78), Quat::IDENTITY, blush_scale),
+        local_to_world_aligned(Vec3::new(-0.56, -0.02, 0.78), blush_scale),
         blush_col,
     ));
     out.push(ModelInstance::from_mat4_color(
-        local_to_world(Vec3::new(0.56, -0.02, 0.78), Quat::IDENTITY, blush_scale),
+        local_to_world_aligned(Vec3::new(0.56, -0.02, 0.78), blush_scale),
         blush_col,
     ));
+
+    // 6. Tiny white kawaii eye-catchlight sparkles (rendered for populations < 450)
+    if total_slimes < 450 {
+        let spark_col = [1.0, 1.0, 1.0, 0.99];
+        let spark_scale = Vec3::splat(0.032);
+        out.push(ModelInstance::from_mat4_color(
+            local_to_world_aligned(Vec3::new(-0.30, 0.24, 0.99), spark_scale),
+            spark_col,
+        ));
+        out.push(ModelInstance::from_mat4_color(
+            local_to_world_aligned(Vec3::new(0.38, 0.24, 0.99), spark_scale),
+            spark_col,
+        ));
+    }
 }
 
 /// Builds the static cute 3D floating island meadow, giant plush spotted mushroom,

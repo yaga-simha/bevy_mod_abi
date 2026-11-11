@@ -101,15 +101,15 @@ example-4-test: build-game-mods ## Run Stage 4 Visual Game in automated headless
 
 .PHONY: example-5 game-3d
 example-5: build-3d-mods ## Run Stage 5 Cute 3D Slime Meadow (winit + wgpu) with Runtime Mod Reloading
-	@echo -e "$(GREEN)[EXAMPLE 5]$(RESET) Launching Stage 5 Cute 3D Slime Meadow (winit + wgpu)..."
-	cargo run --manifest-path examples/05_cute_3d_winit/Cargo.toml
+	@echo -e "$(GREEN)[EXAMPLE 5]$(RESET) Launching Stage 5 Cute 3D Slime Meadow (winit + wgpu) in Release Mode..."
+	cargo run --manifest-path examples/05_cute_3d_winit/Cargo.toml --release
 
 game-3d: example-5 ## Alias for example-5
 
 .PHONY: example-5-test
 example-5-test: build-3d-mods ## Run Stage 5 Cute 3D Slime Meadow in automated headless test mode
 	@echo -e "$(GREEN)[EXAMPLE 5 TEST]$(RESET) Running Stage 5 in headless 3D verification mode..."
-	cargo run --manifest-path examples/05_cute_3d_winit/Cargo.toml -- --test-mode --ticks 45
+	cargo run --manifest-path examples/05_cute_3d_winit/Cargo.toml --release -- --test-mode --ticks 45
 
 .PHONY: examples
 examples: example-1 example-2 example-3 example-4-test example-5-test ## Run all progression examples sequentially (Stages 1-5)

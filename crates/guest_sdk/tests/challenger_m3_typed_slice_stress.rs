@@ -167,14 +167,100 @@ fn test_as_typed_slice_null_with_nonzero_count() {
 }
 
 #[test]
-fn test_as_typed_slice_massive_count() {
-    let val = 1234u32;
-    let ptr = &val as *const u32 as *const u8;
-    let size = core::mem::size_of::<u32>();
+fn test_as_typed_slice_zst_safety() {
+    // Zero-Sized Types: size == 0, align == 1
+    let zst_ptr = 0x1000 as *const u8;
+    let slice_zst = ChunkSlice::new(zst_ptr, 0, 100);
+    let typed = slice_zst.as_typed_slice::<()>();
+    assert!(typed.is_some());
+    assert_eq!(typed.unwrap().len(), 100);
 
-    // Test with count = usize::MAX
-    let slice = ChunkSlice::new(ptr, size, usize::MAX);
-    let typed = slice.as_typed_slice::<u32>();
-    // In Rust, does this return Some with len usize::MAX?
-    println!("typed with usize::MAX: {:?}", typed.map(|s| s.len()));
+    // Stride mismatch for ZST (stride != 0)
+    let bad_zst = ChunkSlice::new(zst_ptr, 1, 100);
+    assert!(bad_zst.as_typed_slice::<()>().is_none());
+
+    // Null pointer for ZST with count > 0
+    let null_zst = ChunkSlice::new(core::ptr::null(), 0, 100);
+    assert!(null_zst.as_typed_slice::<()>().is_none());
+
+    // Count == 0 for ZST with null pointer
+    let empty_null_zst = ChunkSlice::new(core::ptr::null(), 0, 0);
+    assert_eq!(empty_null_zst.as_typed_slice::<()>(), Some(&[][..]));
+}
+
+#[test]
+fn test_as_typed_slice_massive_count_soundness_audit() {
+    // When an external environment or corrupted chunk iterator passes a massive count
+    // (e.g. usize::MAX), a safe function ChunkSlice::as_typed_slice<T> must not violate
+    // core::slice::from_raw_parts safety contract (total size <= isize::MAX).
+    //
+    // In the current implementation, calling as_typed_slice with count = usize::MAX invokes
+    // core::slice::from_raw_parts, which triggers Rust's stdlib runtime assertion:
+    // "unsafe precondition(s) violated: slice::from_raw_parts requires the pointer to be aligned
+    // and non-null, and the total size of the slice not to exceed `isize::MAX`"
+    // and aborts the process via SIGABRT (signal 6).
+    //
+    // This test spawns a child process executing the massive slice call to empirically verify
+    // whether the current implementation aborts (demonstrating the vulnerability).
+    if std::env::var("RUN_MASSIVE_SLICE_SUBPROCESS").is_ok() {
+        let mut val = 1234u32;
+        let ptr = &mut val as *mut u32 as *mut u8;
+        let size = core::mem::size_of::<u32>();
+
+        if std::env::var("RUN_MUTABLE_SLICE").is_ok() {
+            let mut slice_mut = ChunkSliceMut::new(ptr, size, usize::MAX);
+            let _ = slice_mut.as_typed_slice::<u32>();
+        } else {
+            let slice = ChunkSlice::new(ptr, size, usize::MAX);
+            let _ = slice.as_typed_slice::<u32>();
+        }
+        return;
+    }
+
+    let current_exe = std::env::current_exe().expect("Failed to get current test binary path");
+
+    // 1. Audit ChunkSlice (read-only)
+    let output_ro = std::process::Command::new(&current_exe)
+        .arg("test_as_typed_slice_massive_count_soundness_audit")
+        .env("RUN_MASSIVE_SLICE_SUBPROCESS", "1")
+        .output()
+        .expect("Failed to execute subprocess");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        let signal = output_ro.status.signal();
+        let stderr = String::from_utf8_lossy(&output_ro.stderr);
+        eprintln!(
+            "[ReadOnly] Subprocess status: {:?}, signal: {:?}, stderr: {}",
+            output_ro.status, signal, stderr
+        );
+        assert!(
+            signal == Some(6) || stderr.contains("precondition(s) violated") || !output_ro.status.success(),
+            "Empirically confirmed: ChunkSlice::as_typed_slice violates from_raw_parts safety precondition on massive counts"
+        );
+    }
+
+    // 2. Audit ChunkSliceMut (mutable)
+    let output_mut = std::process::Command::new(&current_exe)
+        .arg("test_as_typed_slice_massive_count_soundness_audit")
+        .env("RUN_MASSIVE_SLICE_SUBPROCESS", "1")
+        .env("RUN_MUTABLE_SLICE", "1")
+        .output()
+        .expect("Failed to execute subprocess");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        let signal = output_mut.status.signal();
+        let stderr = String::from_utf8_lossy(&output_mut.stderr);
+        eprintln!(
+            "[Mutable] Subprocess status: {:?}, signal: {:?}, stderr: {}",
+            output_mut.status, signal, stderr
+        );
+        assert!(
+            signal == Some(6) || stderr.contains("precondition(s) violated") || !output_mut.status.success(),
+            "Empirically confirmed: ChunkSliceMut::as_typed_slice violates from_raw_parts_mut safety precondition on massive counts"
+        );
+    }
 }

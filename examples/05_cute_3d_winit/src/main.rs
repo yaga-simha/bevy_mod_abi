@@ -129,6 +129,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.add_plugins(bevy_time::TimePlugin);
     app.add_plugins(bevy_transform::TransformPlugin);
     app.add_plugins(avian3d::prelude::PhysicsPlugins::default());
+    app.insert_resource(avian3d::prelude::SubstepCount(2));
     app.add_plugins(AbiModPlugin);
     app.init_resource::<MeadowClock>();
     app.register_mod_component::<Position>();
