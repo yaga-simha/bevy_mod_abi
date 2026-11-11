@@ -1,3 +1,10 @@
+#![allow(
+    clippy::undocumented_unsafe_blocks,
+    clippy::ptr_as_ptr,
+    clippy::cast_ptr_alignment,
+    clippy::transmute_ptr_to_ptr,
+    unreachable_pub
+)]
 //! Mod 2: Dynamic Rainbow Spectrum Mod (`mod_rainbow`)
 //!
 //! Generates dynamic rainbow hues across entities based on spatial position
@@ -5,9 +12,9 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+use bevy_abi_mod_guest::prelude::*;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
-use guest_sdk::prelude::*;
 
 const ARENA_WIDTH: f32 = 120.0;
 const ARENA_HEIGHT: f32 = 60.0;

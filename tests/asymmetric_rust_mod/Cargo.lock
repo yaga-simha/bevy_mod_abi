@@ -3,20 +3,28 @@
 version = 4
 
 [[package]]
-name = "abi_contract"
-version = "0.1.0"
-
-[[package]]
 name = "asymmetric_rust_mod"
 version = "0.1.0"
 dependencies = [
- "abi_contract",
- "guest_sdk",
+ "bevy_abi_mod_guest",
+ "bevy_abi_mod_sys",
 ]
 
 [[package]]
-name = "guest_sdk"
+name = "bevy_abi_mod_guest"
 version = "0.1.0"
 dependencies = [
- "abi_contract",
+ "bevy_abi_mod_guest_sys",
+ "bevy_abi_mod_sys",
 ]
+
+[[package]]
+name = "bevy_abi_mod_guest_sys"
+version = "0.1.0"
+dependencies = [
+ "bevy_abi_mod_sys",
+]
+
+[[package]]
+name = "bevy_abi_mod_sys"
+version = "0.1.0"

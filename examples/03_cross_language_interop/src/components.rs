@@ -1,7 +1,7 @@
 //! Components for Example 3: Cross-Language Interoperability
 
+use bevy_abi_mod::ModExposable;
 use bevy_ecs::component::Component;
-use host_runtime::ModExposable;
 
 #[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
 #[repr(C)]

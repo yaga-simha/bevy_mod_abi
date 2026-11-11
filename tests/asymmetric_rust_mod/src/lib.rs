@@ -1,16 +1,23 @@
+#![allow(
+    clippy::undocumented_unsafe_blocks,
+    clippy::ptr_as_ptr,
+    clippy::cast_ptr_alignment,
+    clippy::transmute_ptr_to_ptr,
+    unreachable_pub
+)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(improper_ctypes_definitions)]
 
+use bevy_abi_mod_guest::{
+    CommandBridgeVTable, CommandBridgeVTableExt, ComponentAccessDesc, ComponentAccessMode, FfiBool,
+    FfiResult, GetProcAddressFn, GuestChunkIter, GuestCommandQueue, HostApi, RawChunkIter,
+    RawCommandQueue, ResourceBridgeVTable, StrView, SystemDescriptor, export_mod, ffi_bool_to_rust,
+    register_runtime_component, resolve_register_conditional_system, wrap_run_condition,
+    wrap_system_callback,
+};
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::Mutex;
-use guest_sdk::{
-    export_mod, ffi_bool_to_rust, register_runtime_component, resolve_register_conditional_system,
-    wrap_run_condition, wrap_system_callback, CommandBridgeVTable, CommandBridgeVTableExt,
-    ComponentAccessDesc, ComponentAccessMode, FfiBool, FfiResult, GetProcAddressFn,
-    GuestChunkIter, GuestCommandQueue, HostApi, RawChunkIter, RawCommandQueue,
-    ResourceBridgeVTable, StrView, SystemDescriptor,
-};
 
 // ============================================================================
 // 1. Component VTable Definitions Matching Host Layouts
@@ -114,7 +121,7 @@ static PHASE4_RUST_RUN_ENABLED: AtomicBool = AtomicBool::new(true);
 /// # Safety
 /// This function must be called from a test harness thread when it is safe to toggle
 /// the test panic trigger flag. It operates atomically with `SeqCst` ordering.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn asymmetric_rust_mod_trigger_panic() {
     PANIC_TRIGGER.store(true, Ordering::SeqCst);
 }
@@ -124,7 +131,7 @@ pub unsafe extern "C" fn asymmetric_rust_mod_trigger_panic() {
 /// # Safety
 /// This function must be called from a test harness thread when it is safe to reset
 /// the test panic trigger flag. It operates atomically with `SeqCst` ordering.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn asymmetric_rust_mod_reset_panic() {
     PANIC_TRIGGER.store(false, Ordering::SeqCst);
 }
@@ -134,7 +141,7 @@ pub unsafe extern "C" fn asymmetric_rust_mod_reset_panic() {
 /// # Safety
 /// Callers must ensure the dynamic library remains loaded in memory during the call.
 /// It operates atomically with `SeqCst` ordering.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn asymmetric_rust_mod_was_shutdown() -> bool {
     SHUTDOWN_CALLED.load(Ordering::SeqCst)
 }
@@ -143,7 +150,7 @@ pub unsafe extern "C" fn asymmetric_rust_mod_was_shutdown() -> bool {
 ///
 /// # Safety
 /// Callers must ensure the dynamic library remains loaded in memory during the call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn asymmetric_rust_mod_set_phase4_enabled(enabled: FfiBool) {
     PHASE4_RUST_RUN_ENABLED.store(ffi_bool_to_rust(enabled), Ordering::SeqCst);
 }
@@ -373,11 +380,8 @@ unsafe fn rust_command_system(
         power: 42.0,
         shield: 100,
     };
-    let insert_custom_res = cmd_queue.insert_runtime_component(
-        new_entity,
-        c"RustModCustomData",
-        &custom_data,
-    );
+    let insert_custom_res =
+        cmd_queue.insert_runtime_component(new_entity, c"RustModCustomData", &custom_data);
     if insert_custom_res.is_err() {
         return insert_custom_res;
     }
@@ -581,8 +585,7 @@ fn mod_init(
         VEL_VTABLE.store(vel_sym as *mut VelocityVTable, Ordering::Release);
     }
 
-    let mut health_sym =
-        unsafe { (get_proc_address)(c"CombatHealth_vtable".as_ptr()) };
+    let mut health_sym = unsafe { (get_proc_address)(c"CombatHealth_vtable".as_ptr()) };
     if health_sym.is_null() {
         health_sym = unsafe { (get_proc_address)(c"Health_vtable".as_ptr()) };
     }
@@ -590,8 +593,7 @@ fn mod_init(
         HEALTH_VTABLE.store(health_sym as *mut CombatHealthVTable, Ordering::Release);
     }
 
-    let mut tag_sym =
-        unsafe { (get_proc_address)(c"MetadataTag_vtable".as_ptr()) };
+    let mut tag_sym = unsafe { (get_proc_address)(c"MetadataTag_vtable".as_ptr()) };
     if tag_sym.is_null() {
         tag_sym = unsafe { (get_proc_address)(c"NameTag_vtable".as_ptr()) };
     }
@@ -635,13 +637,12 @@ fn mod_init(
 
     // Register System 2: Combat Damage (if health component resolved)
     if !health_sym.is_null() {
-        let health_name = if unsafe {
-            !(get_proc_address)(c"CombatHealth_vtable".as_ptr()).is_null()
-        } {
-            c"CombatHealth".as_ptr()
-        } else {
-            c"Health".as_ptr()
-        };
+        let health_name =
+            if unsafe { !(get_proc_address)(c"CombatHealth_vtable".as_ptr()).is_null() } {
+                c"CombatHealth".as_ptr()
+            } else {
+                c"Health".as_ptr()
+            };
 
         let combat_queries = [ComponentAccessDesc {
             name: health_name,
@@ -660,9 +661,7 @@ fn mod_init(
 
     // Register System 3: Metadata (if tag component resolved)
     if !tag_sym.is_null() {
-        let tag_name = if unsafe {
-            !(get_proc_address)(c"MetadataTag_vtable".as_ptr()).is_null()
-        } {
+        let tag_name = if unsafe { !(get_proc_address)(c"MetadataTag_vtable".as_ptr()).is_null() } {
             c"MetadataTag".as_ptr()
         } else {
             c"NameTag".as_ptr()
@@ -742,12 +741,12 @@ fn mod_init(
             bridges_ptr as *mut c_void,
         );
         let cond_desc = base_desc.with_run_if(c_rust_phase4_run_if, core::ptr::null_mut());
-        let p4_status = if let Some(reg_cond) = resolve_register_conditional_system(get_proc_address)
-        {
-            unsafe { reg_cond(host_context, &cond_desc) }
-        } else {
-            unsafe { (api.register_system)(host_context, cond_desc.as_base_ptr()) }
-        };
+        let p4_status =
+            if let Some(reg_cond) = resolve_register_conditional_system(get_proc_address) {
+                unsafe { reg_cond(host_context, &cond_desc) }
+            } else {
+                unsafe { (api.register_system)(host_context, cond_desc.as_base_ptr()) }
+            };
         if p4_status.is_err() {
             return p4_status;
         }

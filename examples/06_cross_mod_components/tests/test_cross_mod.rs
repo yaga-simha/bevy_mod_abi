@@ -1,3 +1,10 @@
+#![allow(
+    clippy::undocumented_unsafe_blocks,
+    clippy::ptr_as_ptr,
+    clippy::cast_ptr_alignment,
+    clippy::transmute_ptr_to_ptr,
+    unreachable_pub
+)]
 //! Integration test for Example 6: Cross-Mod Dynamic Components
 //!
 //! Verifies:
@@ -7,8 +14,8 @@
 //!    queries, reads, and mutates `EnergyShield` across Bevy's archetype tables.
 //! 4. Unloading both mods leaves entity data frozen without panics.
 
+use bevy_abi_mod::prelude::*;
 use bevy_app::App;
-use host_runtime::prelude::*;
 use std::path::PathBuf;
 use std::process::Command;
 

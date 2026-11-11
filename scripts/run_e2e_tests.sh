@@ -23,24 +23,24 @@ echo "[2/9] Checking workspace static typing and target compliance (0 warnings/e
 cargo check --workspace --all-targets
 
 echo ""
-echo "[3/9] Running workspace unit & integration tests..."
-cargo test --workspace -- --test-threads=1
+echo "[3/9] Running default workspace unit & integration tests..."
+cargo test -- --test-threads=1
 
 echo ""
 echo "[4/9] Running comprehensive 4-tier E2E test suite (275 tests)..."
-cargo test --test e2e_suite
+cargo test -p bevy_abi_mod_host --test e2e_suite
 
 echo ""
 echo "[5/9] Running Validation Gate 2 integration test (10k entities, Changed<Position>, CommandQueueBridge)..."
-cargo test --test validation_gate_2
+cargo test -p bevy_abi_mod_host --test validation_gate_2
 
 echo ""
 echo "[6/9] Running Milestone 3 Bevy Runtime Testbed (integration_tests)..."
-cargo test --test integration_tests -- --test-threads=1
+cargo test -p bevy_abi_mod_host --test integration_tests -- --test-threads=1
 
 echo ""
 echo "[7/9] Running Milestone 4 & Full Permutation Benchmarking Suite (Debug + Release x Native + Rust dylib + C-ABI Rust/C99)..."
-cargo test --test benchmarks -- --nocapture
+cargo test -p bevy_abi_mod_host --test benchmarks -- --nocapture
 cargo run --release -p permutation_bench
 if [ ! -f "target/benchmark_results.json" ]; then
     echo "ERROR: target/benchmark_results.json was not generated!" >&2
@@ -50,11 +50,11 @@ echo "Verified: target/benchmark_results.json exists."
 
 echo ""
 echo "[8/9] Running Milestone 5 Safety Test Suite (alignment, bounds, borrow rules, isolation)..."
-cargo test --test safety_tests -- --test-threads=1
+cargo test -p bevy_abi_mod_host --test safety_tests -- --test-threads=1
 
 echo ""
 echo "[9/9] Running Milestone 5 Lifecycle Test Suite (50-cycle reload, post-unload immunity)..."
-cargo test --test lifecycle_tests -- --test-threads=1
+cargo test -p bevy_abi_mod_host --test lifecycle_tests -- --test-threads=1
 
 echo ""
 echo "======================================================================"

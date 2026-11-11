@@ -3,9 +3,9 @@
 //! Provides zero-serialization dynamic library loading, atomic tombstone unloading,
 //! and safe hot-reloading without OS file locking via shadow copying.
 
+use bevy_abi_mod::{ModAppExt, ModId};
 use bevy_app::App;
 use bevy_ecs::prelude::Resource;
-use host_runtime::{ModAppExt, ModId};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -114,10 +114,10 @@ impl ModManager {
 
     fn discover_mods(&mut self) {
         for kind in [ActiveMod::Gravity, ActiveMod::Rainbow, ActiveMod::Vortex] {
-            if let Some(crate_name) = kind.crate_name() {
-                if let Some(path) = Self::resolve_binary(crate_name) {
-                    self.original_paths.insert(kind, path);
-                }
+            if let Some(crate_name) = kind.crate_name()
+                && let Some(path) = Self::resolve_binary(crate_name)
+            {
+                self.original_paths.insert(kind, path);
             }
         }
     }

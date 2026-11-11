@@ -1,3 +1,10 @@
+#![allow(
+    clippy::undocumented_unsafe_blocks,
+    clippy::ptr_as_ptr,
+    clippy::cast_ptr_alignment,
+    clippy::transmute_ptr_to_ptr,
+    unreachable_pub
+)]
 //! Example 2: Multi-System Pipeline (Host Application)
 //!
 //! Demonstrates multi-component queries, all 4 query access modes (READ, WRITE,
@@ -8,12 +15,12 @@
 
 mod components;
 
+use bevy_abi_mod::prelude::*;
 use bevy_app::{App, Update};
 use bevy_ecs::entity::Entity;
 use bevy_ecs::query::Changed;
 use bevy_ecs::system::Query;
 use components::*;
-use host_runtime::prelude::*;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -231,7 +238,10 @@ fn main() {
         app.world().get_entity(e_beta).is_err(),
         "Drone Beta must be despawned after reaching 0 HP"
     );
-    println!("  [OK] Invariant B: Minion Drone Beta ({:?}) successfully despawned via CommandQueueBridge", e_beta);
+    println!(
+        "  [OK] Invariant B: Minion Drone Beta ({:?}) successfully despawned via CommandQueueBridge",
+        e_beta
+    );
 
     // Invariant C: Reinforcement Drone Gamma was spawned deferred and has Position and DroneTag
     let mut drone_gamma_found = false;
@@ -245,7 +255,10 @@ fn main() {
     for (entity, pos, health, drone_tag, player_tag) in query.iter(app.world()) {
         if player_tag.is_none() && drone_tag.is_some() && entity != e_alpha && entity != e_beacon {
             drone_gamma_found = true;
-            println!("  [OK] Invariant C: Detected reinforcement drone ({:?}) at ({:.1}, {:.1}) with HP {:.1}", entity, pos.x, pos.y, health.current);
+            println!(
+                "  [OK] Invariant C: Detected reinforcement drone ({:?}) at ({:.1}, {:.1}) with HP {:.1}",
+                entity, pos.x, pos.y, health.current
+            );
         }
     }
     assert!(

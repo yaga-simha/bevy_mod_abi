@@ -1,0 +1,20 @@
+[package]
+name = "bevy_abi_mod_host_sys"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bevy_abi_mod_sys = { workspace = true }
+bevy_ecs = { workspace = true }
+bevy_app = { workspace = true }
+libloading = { workspace = true }
+nonmax = { workspace = true }
+
+[dev-dependencies]
+bevy_abi_mod_macros = { workspace = true }

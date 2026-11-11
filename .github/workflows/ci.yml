@@ -46,6 +46,13 @@ jobs:
       - name: Build asymmetric Rust guest mod (independent Cargo.lock)
         run: cargo build --manifest-path tests/asymmetric_rust_mod/Cargo.toml --release
 
+      - name: Verify zero Bevy dependencies in ABI & guest crates
+        run: |
+          if cargo tree -p bevy_abi_mod_sys -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest | grep -v bevy_abi_mod | grep -i bevy; then
+            echo "ERROR: Bevy dependency leaked into ABI or guest crates!" >&2
+            exit 1
+          fi
+
       - name: Check formatting (Linux)
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
@@ -53,8 +60,8 @@ jobs:
       - name: Run Clippy across workspace
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Run full workspace unit, behavioral, fuzz, parity, compile-fail & doc tests
-        run: cargo test --workspace -- --test-threads=1
+      - name: Run default workspace unit, behavioral, fuzz, parity, compile-fail & doc tests
+        run: cargo test -- --test-threads=1
 
   # ============================================================================
   # 2. Strict ISO C99 & C++17 Header Verification (-Wall -Wextra -Werror)
@@ -107,19 +114,20 @@ jobs:
         with:
           key: miri-tree-borrows
 
-      - name: Run Miri on abi_contract & guest_sdk
-        run: cargo +nightly miri test -p abi_contract -p guest_sdk
+      - name: Run Miri on bevy_abi_mod_sys, bevy_abi_mod_guest_sys & bevy_abi_mod_guest
+        run: cargo +nightly miri test -p bevy_abi_mod_sys -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest
 
-      - name: Run Miri on mod_derive in-process VTable & aliasing suites
+      - name: Run Miri on bevy_abi_mod_macros in-process VTable & aliasing suites
         run: |
-          cargo +nightly miri test -p mod_derive \
+          cargo +nightly miri test -p bevy_abi_mod_macros \
             --lib \
             --test validation_gate_1 \
             --test compile_fail_tests
 
-      - name: Run Miri on host_runtime non-dlopen soundness, fuzz & parity suites
+      - name: Run Miri on bevy_abi_mod_host_sys & bevy_abi_mod_host non-dlopen soundness, fuzz & parity suites
         run: |
-          cargo +nightly miri test -p host_runtime \
+          cargo +nightly miri test -p bevy_abi_mod_host_sys --lib
+          cargo +nightly miri test -p bevy_abi_mod_host \
             --lib \
             --test bevy_alignment_soundness_tests \
             --test fuzz_abi_boundaries \
@@ -164,7 +172,7 @@ jobs:
             tests/asymmetric_c_mod/mod.c \
             -o tests/asymmetric_c_mod/libasymmetric_c_mod.so
           cargo build --manifest-path tests/asymmetric_rust_mod/Cargo.toml --release
-          cargo test -p host_runtime --test integration_tests --test c_vtable_interop -- --test-threads=1
+          cargo test -p bevy_abi_mod_host --test integration_tests --test c_vtable_interop -- --test-threads=1
 
   # ============================================================================
   # 5. Randomized Rust Layout Check (-Zrandomize-layout)
@@ -193,9 +201,10 @@ jobs:
         env:
           RUSTFLAGS: "-Zrandomize-layout"
         run: |
-          cargo +nightly test -p abi_contract -p guest_sdk
-          cargo +nightly test -p mod_derive --lib --test validation_gate_1
-          cargo +nightly test -p host_runtime \
+          cargo +nightly test -p bevy_abi_mod_sys -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest
+          cargo +nightly test -p bevy_abi_mod_macros --lib --test validation_gate_1
+          cargo +nightly test -p bevy_abi_mod_host_sys --lib -- --test-threads=1
+          cargo +nightly test -p bevy_abi_mod_host \
             --lib \
             --test integration_tests \
             --test bevy_alignment_soundness_tests \

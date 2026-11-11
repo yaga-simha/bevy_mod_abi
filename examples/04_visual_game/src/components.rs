@@ -3,8 +3,8 @@
 //! Exposes `Position`, `Velocity`, and `ColorRgba` to the native C-ABI mod catalog
 //! via `#[derive(ModExposable)]`.
 
+use bevy_abi_mod::ModExposable;
 use bevy_ecs::component::Component;
-use host_runtime::ModExposable;
 
 #[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
 #[repr(C)]

@@ -7,18 +7,18 @@ use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Frame,
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
     symbols::Marker,
     text::{Line, Span},
     widgets::{
-        canvas::{Canvas, Points},
         Block, Paragraph,
+        canvas::{Canvas, Points},
     },
-    Frame,
 };
 use std::io::stdout;
 use std::time::Duration;
@@ -67,21 +67,20 @@ pub enum UserCommand {
 
 /// Polls for user keyboard commands with non-blocking timeout.
 pub fn poll_user_command(timeout: Duration) -> Result<UserCommand, std::io::Error> {
-    if event::poll(timeout)? {
-        if let Event::Key(key) = event::read()? {
-            if key.kind == KeyEventKind::Press {
-                return Ok(match key.code {
-                    KeyCode::Char('1') => UserCommand::Load(ActiveMod::Gravity),
-                    KeyCode::Char('2') => UserCommand::Load(ActiveMod::Rainbow),
-                    KeyCode::Char('3') => UserCommand::Load(ActiveMod::Vortex),
-                    KeyCode::Char('u') | KeyCode::Char('U') => UserCommand::Unload,
-                    KeyCode::Char('r') | KeyCode::Char('R') => UserCommand::Reload,
-                    KeyCode::Char(' ') => UserCommand::TogglePause,
-                    KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => UserCommand::Quit,
-                    _ => UserCommand::None,
-                });
-            }
-        }
+    if event::poll(timeout)?
+        && let Event::Key(key) = event::read()?
+        && key.kind == KeyEventKind::Press
+    {
+        return Ok(match key.code {
+            KeyCode::Char('1') => UserCommand::Load(ActiveMod::Gravity),
+            KeyCode::Char('2') => UserCommand::Load(ActiveMod::Rainbow),
+            KeyCode::Char('3') => UserCommand::Load(ActiveMod::Vortex),
+            KeyCode::Char('u') | KeyCode::Char('U') => UserCommand::Unload,
+            KeyCode::Char('r') | KeyCode::Char('R') => UserCommand::Reload,
+            KeyCode::Char(' ') => UserCommand::TogglePause,
+            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => UserCommand::Quit,
+            _ => UserCommand::None,
+        });
     }
     Ok(UserCommand::None)
 }

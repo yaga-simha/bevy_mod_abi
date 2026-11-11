@@ -1,8 +1,8 @@
 //! Host ECS components exposed across the zero-serialization C-ABI boundary
 //! for Example 5: Cute 3D Slime Meadow (`winit` + `wgpu`).
 
+use bevy_abi_mod::ModExposable;
 use bevy_ecs::component::Component;
-use host_runtime::ModExposable;
 
 /// 3D world-space position of a slime spirit.
 #[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]

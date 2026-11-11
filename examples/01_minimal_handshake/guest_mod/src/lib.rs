@@ -1,9 +1,16 @@
+#![allow(
+    clippy::undocumented_unsafe_blocks,
+    clippy::ptr_as_ptr,
+    clippy::cast_ptr_alignment,
+    clippy::transmute_ptr_to_ptr,
+    unreachable_pub
+)]
 //! Example 1: Minimal Guest Mod (`minimal_guest_mod`)
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(improper_ctypes_definitions)]
 
+use bevy_abi_mod_guest::prelude::*;
 use core::ffi::c_void;
-use guest_sdk::prelude::*;
 
 #[repr(C)]
 #[derive(Clone, Copy)]

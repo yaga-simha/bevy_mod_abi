@@ -1,0 +1,13 @@
+[package]
+name = "bevy_abi_mod_sys"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.87"
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Zero external dependencies. Strictly no_std.

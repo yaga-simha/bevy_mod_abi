@@ -121,9 +121,9 @@ check: ## Run static type checks across all workspace targets
 	cargo check --workspace --all-targets
 
 .PHONY: test
-test: build-mods ## Run all workspace unit and integration tests
+test: build-mods ## Run unit and integration tests across default workspace members
 	@echo -e "$(GREEN)[TEST]$(RESET) Running workspace tests..."
-	cargo test --workspace -- --test-threads=1
+	cargo test -- --test-threads=1
 
 .PHONY: test-e2e
 test-e2e: ## Execute comprehensive 9-stage end-to-end verification pipeline
@@ -142,12 +142,13 @@ test-c99: ## Compile & run strict C99 header and ABI layout verification (-std=c
 
 .PHONY: miri
 miri: ## Run Miri (-Zmiri-tree-borrows) on in-process ABI, macro, SDK, fuzz, and parity suites
-	@echo -e "$(GREEN)[MIRI]$(RESET) Running Miri (-Zmiri-tree-borrows) on abi_contract & guest_sdk..."
-	MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p abi_contract -p guest_sdk
-	@echo -e "$(GREEN)[MIRI]$(RESET) Running Miri (-Zmiri-tree-borrows) on mod_derive in-process suites..."
-	MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p mod_derive --lib --test validation_gate_1 --test compile_fail_tests
-	@echo -e "$(GREEN)[MIRI]$(RESET) Running Miri (-Zmiri-tree-borrows) on host_runtime non-dlopen suites..."
-	MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p host_runtime --lib --test bevy_alignment_soundness_tests --test fuzz_abi_boundaries --test differential_bevy_parity -- --skip real_dylib_loaded_mod_entity_lifecycle_events_and_strict_validation_work
+	@echo -e "$(GREEN)[MIRI]$(RESET) Running Miri (-Zmiri-tree-borrows) on bevy_abi_mod_sys, bevy_abi_mod_guest_sys & bevy_abi_mod_guest..."
+	MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p bevy_abi_mod_sys -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest
+	@echo -e "$(GREEN)[MIRI]$(RESET) Running Miri (-Zmiri-tree-borrows) on bevy_abi_mod_macros in-process suites..."
+	MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p bevy_abi_mod_macros --lib --test validation_gate_1 --test compile_fail_tests
+	@echo -e "$(GREEN)[MIRI]$(RESET) Running Miri (-Zmiri-tree-borrows) on bevy_abi_mod_host_sys & bevy_abi_mod_host non-dlopen suites..."
+	MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p bevy_abi_mod_host_sys --lib
+	MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p bevy_abi_mod_host --lib --test bevy_alignment_soundness_tests --test fuzz_abi_boundaries --test differential_bevy_parity -- --skip real_dylib_loaded_mod_entity_lifecycle_events_and_strict_validation_work
 
 .PHONY: bench
 bench: build-mods build-bench-mods ## Run full cross-architecture & debug/release permutation benchmark matrix
@@ -158,9 +159,9 @@ bench: build-mods build-bench-mods ## Run full cross-architecture & debug/releas
 	fi
 
 .PHONY: bench-quick
-bench-quick: build-mods ## Run Milestone 4 host_runtime benchmark test (1k, 10k, 100k entities)
-	@echo -e "$(GREEN)[BENCH-QUICK]$(RESET) Running Milestone 4 host_runtime benchmark test..."
-	cargo test --release --test benchmarks -- --nocapture
+bench-quick: build-mods ## Run Milestone 4 bevy_abi_mod_host benchmark test (1k, 10k, 100k entities)
+	@echo -e "$(GREEN)[BENCH-QUICK]$(RESET) Running Milestone 4 bevy_abi_mod_host benchmark test..."
+	cargo test -p bevy_abi_mod_host --release --test benchmarks -- --nocapture
 
 .PHONY: fmt
 fmt: ## Auto-format all Rust code across the workspace

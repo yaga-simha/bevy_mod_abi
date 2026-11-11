@@ -1,3 +1,10 @@
+#![allow(
+    clippy::undocumented_unsafe_blocks,
+    clippy::ptr_as_ptr,
+    clippy::cast_ptr_alignment,
+    clippy::transmute_ptr_to_ptr,
+    unreachable_pub
+)]
 //! Mod A: Shield Emitter Mod (`mod_shield_emitter`)
 //!
 //! Demonstrates:
@@ -10,7 +17,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(improper_ctypes_definitions)]
 
-use guest_sdk::prelude::*;
+use bevy_abi_mod_guest::prelude::*;
 
 /// Runtime structured data introduced dynamically by Mod A.
 /// Layout: 12 bytes, 4-byte aligned (POD).

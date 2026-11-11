@@ -1,3 +1,10 @@
+#![allow(
+    clippy::undocumented_unsafe_blocks,
+    clippy::ptr_as_ptr,
+    clippy::cast_ptr_alignment,
+    clippy::transmute_ptr_to_ptr,
+    unreachable_pub
+)]
 //! Example 3: Rust Guest Mod for Cross-Language Interoperability
 //!
 //! Operates concurrently with the C99 mod. Mutates ColorRgba based on
@@ -5,9 +12,9 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+use bevy_abi_mod_guest::prelude::*;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicPtr, Ordering};
-use guest_sdk::prelude::*;
 
 #[repr(C)]
 pub struct PositionVTable {
