@@ -115,6 +115,8 @@ bevy_abi_mod/
         └── Makefile
 ```
 
+*(Progression examples live under `examples/01_minimal_handshake` through `examples/05_cute_3d_winit`, including 2D TUI and 3D `winit` + `wgpu` runtime dynamic mod hot-reloading across Rust and C99.)*
+
 ---
 
 ## 4. Detailed Subsystem Specifications

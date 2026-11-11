@@ -82,8 +82,12 @@ pub struct RegisteredComponent {
     pub align: usize,
     /// Pointer to the static C-ABI VTable.
     pub vtable_ptr: *const c_void,
-    /// Function pointer for deferred raw byte deserialization and insertion.
-    pub insert_raw_fn: InsertRawFn,
+    /// Function pointer for deferred raw byte deserialization and insertion (optional for dynamic components).
+    pub insert_raw_fn: Option<InsertRawFn>,
+    /// Optional foreign lifecycle drop callback.
+    pub drop_fn: Option<unsafe extern "C" fn(ptr: *mut c_void)>,
+    /// Indicates whether this component was registered dynamically at runtime.
+    pub is_dynamic: bool,
 }
 
 // SAFETY: All fields (pointers to static VTables and function pointers) are Send and Sync.
@@ -181,6 +185,14 @@ impl ModRegistry {
             "host_register_multi_query_system",
             crate::dynamic_system::host_register_multi_query_system as *const c_void,
         );
+        reg.insert_symbol(
+            "register_component",
+            crate::dynamic_system::host_register_component as *const c_void,
+        );
+        reg.insert_symbol(
+            "host_register_component",
+            crate::dynamic_system::host_register_component as *const c_void,
+        );
         reg
     }
 
@@ -203,7 +215,9 @@ impl ModRegistry {
             size: T::size(),
             align: T::align(),
             vtable_ptr,
-            insert_raw_fn: insert_raw_impl::<T>,
+            insert_raw_fn: Some(insert_raw_impl::<T>),
+            drop_fn: None,
+            is_dynamic: false,
         };
 
         self.components_by_id.insert(comp_id, reg);
@@ -224,6 +238,42 @@ impl ModRegistry {
             global.insert(format!("{name}_vtable"), sym_addr);
             for sym in T::symbols() {
                 global.insert(sym.name.to_string(), SymbolAddress(sym.ptr));
+            }
+        }
+    }
+
+    /// Register a dynamic component descriptor declared at runtime by a guest mod.
+    pub fn register_dynamic_component(
+        &mut self,
+        comp_id: ComponentId,
+        desc: &abi_contract::ModComponentDescriptor,
+        name: String,
+    ) {
+        let uuid = desc.uuid;
+        let vtable_ptr = desc.vtable_ptr;
+        let reg = RegisteredComponent {
+            name: name.clone(),
+            uuid,
+            component_id: comp_id,
+            size: desc.size,
+            align: desc.align,
+            vtable_ptr,
+            insert_raw_fn: None,
+            drop_fn: desc.drop_fn,
+            is_dynamic: true,
+        };
+
+        self.components_by_id.insert(comp_id, reg);
+        self.components_by_name.insert(name.clone(), comp_id);
+        self.components_by_uuid.insert(uuid.bytes, comp_id);
+
+        if !vtable_ptr.is_null() {
+            let sym_addr = SymbolAddress(vtable_ptr);
+            self.symbols.insert(name.clone(), sym_addr);
+            self.symbols.insert(format!("{name}_vtable"), sym_addr);
+            if let Ok(mut global) = GLOBAL_SYMBOLS.write() {
+                global.insert(name.clone(), sym_addr);
+                global.insert(format!("{name}_vtable"), sym_addr);
             }
         }
     }

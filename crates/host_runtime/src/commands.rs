@@ -28,8 +28,32 @@
 use crate::registry::ModRegistry;
 use abi_contract::{FfiEntity, FfiResult, RawCommandQueue};
 use bevy_ecs::entity::{Entity, EntityAllocator};
+use bevy_ecs::ptr::OwningPtr;
 use bevy_ecs::world::{CommandQueue, World};
 use core::ffi::{c_char, CStr};
+use std::alloc::Layout;
+
+/// Host-allocated temporary buffer aligned to the component's required memory alignment.
+/// Automatically deallocates the aligned host memory when dropped.
+struct AlignedBuffer {
+    ptr: usize,
+    layout: Layout,
+}
+
+// SAFETY: Host memory buffer ownership transferred into deferred command closure.
+unsafe impl Send for AlignedBuffer {}
+unsafe impl Sync for AlignedBuffer {}
+
+impl Drop for AlignedBuffer {
+    fn drop(&mut self) {
+        if self.layout.size() > 0 && self.ptr != 0 {
+            // SAFETY: Memory was allocated with this exact layout via std::alloc::alloc.
+            unsafe {
+                std::alloc::dealloc(self.ptr as *mut u8, self.layout);
+            }
+        }
+    }
+}
 
 /// Concrete host bridge exposed behind the opaque [`RawCommandQueue`] handle.
 pub struct CommandQueueBridge<'a> {
@@ -149,18 +173,69 @@ pub unsafe extern "C" fn host_cmd_insert_component(
         return FfiResult::INTERNAL_ERROR;
     }
 
-    // Strict Allocator Isolation: allocate host-owned Vec<u8> and copy bytes from guest memory.
-    let host_bytes = if len > 0 {
-        // SAFETY: data is non-null and points to at least len readable bytes.
-        unsafe { core::slice::from_raw_parts(data, len) }.to_vec()
+    // Static component fast-path using monomorphized insert_raw_fn
+    if !comp_meta.is_dynamic {
+        if let Some(insert_fn) = comp_meta.insert_raw_fn {
+            let host_bytes = if len > 0 {
+                // SAFETY: data is non-null and points to at least len readable bytes.
+                unsafe { core::slice::from_raw_parts(data, len) }.to_vec()
+            } else {
+                Vec::new()
+            };
+            bridge.queue.push(move |world: &mut World| {
+                // SAFETY: host_bytes matches comp_meta.size and insert_fn safely unmarshals it.
+                unsafe { insert_fn(world, bevy_entity, &host_bytes) };
+            });
+            return FfiResult::OK;
+        }
+    }
+
+    // Dynamic component deferred insertion via insert_by_id and host-aligned buffer
+    let comp_id = comp_meta.component_id;
+    let buf = if len > 0 {
+        let Ok(layout) = Layout::from_size_align(comp_meta.size, comp_meta.align) else {
+            return FfiResult::INTERNAL_ERROR;
+        };
+        // SAFETY: Allocating host memory matching component's layout (Rule 2: strict allocator isolation).
+        let host_ptr = unsafe { std::alloc::alloc(layout) };
+        if host_ptr.is_null() {
+            return FfiResult::INTERNAL_ERROR;
+        }
+        // SAFETY: Copying foreign bytes into host-allocated memory.
+        unsafe {
+            core::ptr::copy_nonoverlapping(data, host_ptr, len);
+        }
+        AlignedBuffer {
+            ptr: host_ptr as usize,
+            layout,
+        }
     } else {
-        Vec::new()
+        let Ok(layout) = Layout::from_size_align(0, comp_meta.align.max(1)) else {
+            return FfiResult::INTERNAL_ERROR;
+        };
+        AlignedBuffer {
+            ptr: core::ptr::NonNull::<u8>::dangling().as_ptr() as usize,
+            layout,
+        }
     };
 
-    let insert_fn = comp_meta.insert_raw_fn;
     bridge.queue.push(move |world: &mut World| {
-        // SAFETY: host_bytes matches comp_meta.size and insert_fn safely unmarshals it.
-        unsafe { insert_fn(world, bevy_entity, &host_bytes) };
+        let _keep_alive = &buf;
+        if let Ok(mut entity_mut) = world.get_entity_mut(bevy_entity) {
+            let non_null = if buf.layout.size() > 0 {
+                core::ptr::NonNull::new(buf.ptr as *mut u8)
+            } else {
+                Some(core::ptr::NonNull::dangling())
+            };
+            if let Some(non_null) = non_null {
+                let owning_ptr = unsafe { OwningPtr::new(non_null) };
+                unsafe {
+                    entity_mut.insert_by_id(comp_id, owning_ptr);
+                }
+            }
+        }
+        // buf is explicitly owned by the closure and dropped here after insertion.
+        drop(buf);
     });
 
     FfiResult::OK

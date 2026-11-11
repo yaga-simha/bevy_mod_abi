@@ -52,11 +52,12 @@
 //! ```
 
 pub use abi_contract::{
-    ComponentAccessDesc, ComponentAccessMode, ComponentUuid, DynamicSystemCallback,
-    ExposableComponent, FfiEntity, FfiLayout, FfiResult, FfiSlice, GetProcAddressFn, HostApi,
-    IterColumnMutableFn, IterColumnReadonlyFn, IterColumnStrideFn, IterEntitiesFn,
-    IterMarkChangedFn, IterNextChunkFn, IterResetFn, ModAbiVersionFn, ModInitFn, ModShutdownFn,
-    MultiQuerySystemCallback, MultiQuerySystemDescriptor, QuerySpec, RawChunkIter, RawCommandQueue,
+    ComponentAccessDesc, ComponentAccessMode, ComponentDropFn, ComponentUuid,
+    DynamicComponentDescriptor, DynamicSystemCallback, ExposableComponent, FfiEntity, FfiLayout,
+    FfiResult, FfiSlice, GetProcAddressFn, HostApi, IterColumnMutableFn, IterColumnReadonlyFn,
+    IterColumnStrideFn, IterEntitiesFn, IterMarkChangedFn, IterNextChunkFn, IterResetFn,
+    ModAbiVersionFn, ModComponentDescriptor, ModInitFn, ModShutdownFn, MultiQuerySystemCallback,
+    MultiQuerySystemDescriptor, QuerySpec, RawChunkIter, RawCommandQueue, RegisterComponentFn,
     RegisterMultiQuerySystemFn, RegisterSystemFn, StrView, SymbolEntry, SystemDescriptor,
     ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PACKED, ABI_VERSION_PATCH,
 };
@@ -397,6 +398,25 @@ impl<'a> GuestCommandQueue<'a> {
     ) -> FfiResult {
         self.insert_slice(entity, component_name, core::slice::from_ref(value))
     }
+
+    /// Safely enqueues the deferred insertion of a typed runtime dynamic component value onto the target entity.
+    ///
+    /// The host runtime copies the raw byte representation into host-allocated memory before
+    /// scheduling the deferred ECS insertion, maintaining strict memory allocator isolation (Rule 2).
+    ///
+    /// # Arguments
+    /// - `entity`: The target [`FfiEntity`] to attach the component to.
+    /// - `name`: The registered component name as a nul-terminated [`core::ffi::CStr`].
+    /// - `value`: Reference to the component value of type `T: Copy`.
+    #[inline]
+    pub fn insert_runtime_component<T: Copy>(
+        &mut self,
+        entity: FfiEntity,
+        name: &core::ffi::CStr,
+        value: &T,
+    ) -> FfiResult {
+        self.insert_value(entity, name, value)
+    }
 }
 
 /// Safe wrapper around the host's chunk iterator handle ([`RawChunkIter`]).
@@ -534,6 +554,33 @@ impl<'a> ChunkSlice<'a> {
             None
         }
     }
+
+    /// Converts this raw chunk slice into a typed slice of `T: Copy` elements.
+    ///
+    /// Validates that:
+    /// 1. `self.stride == core::mem::size_of::<T>()`.
+    /// 2. If `self.count == 0`, returns `Some(&[])`.
+    /// 3. If `self.count > 0`: `self.ptr` is non-null and `(self.ptr as usize) % core::mem::align_of::<T>() == 0`.
+    ///
+    /// Returns `None` if stride or alignment validation fails or if `ptr` is null when `count > 0`.
+    #[inline]
+    pub fn as_typed_slice<T: Copy>(&self) -> Option<&[T]> {
+        if self.stride != core::mem::size_of::<T>() {
+            return None;
+        }
+        if self.count == 0 {
+            return Some(&[]);
+        }
+        if self.ptr.is_null() || (self.ptr as usize) % core::mem::align_of::<T>() != 0 {
+            return None;
+        }
+        // SAFETY:
+        // - self.ptr is non-null and aligned for T.
+        // - self.stride == size_of::<T>(), guaranteeing elements are contiguous in table storage.
+        // - self.count elements are valid and initialized for reads during lifetime 'a.
+        // - T: Copy guarantees no drop glue or ownership transfer.
+        Some(unsafe { core::slice::from_raw_parts(self.ptr as *const T, self.count) })
+    }
 }
 
 /// Safe mutable chunk slice view for iterating components in an archetype table chunk.
@@ -597,21 +644,128 @@ impl<'a> ChunkSliceMut<'a> {
             None
         }
     }
+
+    /// Converts this raw mutable chunk slice into a typed mutable slice of `T: Copy` elements.
+    ///
+    /// Validates that:
+    /// 1. `self.stride == core::mem::size_of::<T>()`.
+    /// 2. If `self.count == 0`, returns `Some(&mut [])`.
+    /// 3. If `self.count > 0`: `self.ptr` is non-null and `(self.ptr as usize) % core::mem::align_of::<T>() == 0`.
+    ///
+    /// Returns `None` if stride or alignment validation fails or if `ptr` is null when `count > 0`.
+    #[inline]
+    pub fn as_typed_slice<T: Copy>(&mut self) -> Option<&mut [T]> {
+        if self.stride != core::mem::size_of::<T>() {
+            return None;
+        }
+        if self.count == 0 {
+            return Some(&mut []);
+        }
+        if self.ptr.is_null() || (self.ptr as usize) % core::mem::align_of::<T>() != 0 {
+            return None;
+        }
+        // SAFETY:
+        // - self.ptr is non-null and aligned for T.
+        // - self.stride == size_of::<T>(), guaranteeing elements are contiguous in table storage.
+        // - self.count elements are valid and initialized for writes.
+        // - Exclusive reborrow of &mut self guarantees no aliasing for the duration of the returned slice.
+        // - T: Copy guarantees no drop glue or ownership transfer.
+        Some(unsafe { core::slice::from_raw_parts_mut(self.ptr as *mut T, self.count) })
+    }
+}
+
+/// Helper trampoline for invoking drop_in_place on non-POD dynamic components.
+unsafe extern "C" fn generic_drop_trampoline<T>(ptr: *mut core::ffi::c_void) {
+    if !ptr.is_null() {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // SAFETY: ptr is non-null and points to an initialized instance of T.
+            unsafe {
+                core::ptr::drop_in_place(ptr as *mut T);
+            }
+        }));
+    }
+}
+
+/// Registers a runtime dynamic component with the host Bevy ECS World.
+///
+/// This function constructs a [`ModComponentDescriptor`] with the exact size and alignment of `T`,
+/// computes the deterministic 128-bit [`ComponentUuid`] from `name`, generates a panic-safe drop
+/// trampoline if `T` requires drop glue (`core::mem::needs_drop::<T>()`), and forwards the registration
+/// to the host via `HostApi::register_component`.
+///
+/// Plain Old Data (POD) components (`needs_drop::<T>() == false`) set `drop_fn` to `None`, avoiding
+/// consumption of slots in the host's 64-slot drop trampoline pool.
+///
+/// # Arguments
+/// - `host_api`: Non-null pointer to the host API table provided during mod initialization.
+/// - `host_context`: Non-null opaque pointer to the initialization context provided by the host.
+/// - `name`: Nul-terminated C string identifying the component name.
+///
+/// # Safety
+/// - `host_api` must point to a valid, initialized [`HostApi`] table provided by the host engine.
+/// - `host_context` must point to the valid initialization context passed to `bevy_abi_mod_init`.
+/// - `name` must be a valid, nul-terminated C string.
+/// - This function must only be called during mod initialization (`bevy_abi_mod_init`) while the host
+///   retains mutable access to the Bevy `World`.
+#[inline]
+pub unsafe fn register_runtime_component<T: 'static>(
+    host_api: *const HostApi,
+    host_context: *mut core::ffi::c_void,
+    name: &core::ffi::CStr,
+) -> FfiResult {
+    if host_api.is_null() || host_context.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+
+    // SAFETY: caller guarantees host_api is non-null and points to a valid HostApi struct.
+    let api = unsafe { &*host_api };
+    if (api.struct_size as usize) < core::mem::size_of::<HostApi>() {
+        return FfiResult::INVALID_VERSION;
+    }
+
+    let Ok(name_str) = name.to_str() else {
+        return FfiResult::INVALID_UTF8;
+    };
+
+    let uuid = ComponentUuid::from_name(name_str);
+    let size = core::mem::size_of::<T>();
+    let align = core::mem::align_of::<T>();
+
+    let drop_fn = if core::mem::needs_drop::<T>() {
+        Some(generic_drop_trampoline::<T> as unsafe extern "C" fn(*mut core::ffi::c_void))
+    } else {
+        None
+    };
+
+    let desc = ModComponentDescriptor {
+        struct_size: core::mem::size_of::<ModComponentDescriptor>() as u32,
+        name: name.as_ptr(),
+        uuid,
+        size,
+        align,
+        drop_fn,
+        vtable_ptr: core::ptr::null(),
+    };
+
+    // SAFETY: Forwarding valid descriptor and host_context to host registration callback.
+    unsafe { (api.register_component)(host_context, &desc) }
 }
 
 /// Convenient prelude module for guest mod authors.
 pub mod prelude {
     pub use crate::{
-        catch_guest_panic, export_mod, wrap_multi_query_callback, wrap_system_callback, ChunkSlice,
-        ChunkSliceMut, CommandBridgeVTable, GuestChunkIter, GuestCommandQueue,
+        catch_guest_panic, export_mod, register_runtime_component, wrap_multi_query_callback,
+        wrap_system_callback, ChunkSlice, ChunkSliceMut, CommandBridgeVTable, GuestChunkIter,
+        GuestCommandQueue,
     };
     pub use abi_contract::{
-        ComponentAccessDesc, ComponentAccessMode, ComponentUuid, DynamicSystemCallback,
-        ExposableComponent, FfiEntity, FfiResult, FfiSlice, GetProcAddressFn, HostApi, IterResetFn,
+        ComponentAccessDesc, ComponentAccessMode, ComponentDropFn, ComponentUuid,
+        DynamicComponentDescriptor, DynamicSystemCallback, ExposableComponent, FfiEntity,
+        FfiResult, FfiSlice, GetProcAddressFn, HostApi, IterResetFn, ModComponentDescriptor,
         MultiQuerySystemCallback, MultiQuerySystemDescriptor, QuerySpec, RawChunkIter,
-        RawCommandQueue, RegisterMultiQuerySystemFn, RegisterSystemFn, StrView, SymbolEntry,
-        SystemDescriptor, ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PACKED,
-        ABI_VERSION_PATCH,
+        RawCommandQueue, RegisterComponentFn, RegisterMultiQuerySystemFn, RegisterSystemFn,
+        StrView, SymbolEntry, SystemDescriptor, ABI_VERSION_MAJOR, ABI_VERSION_MINOR,
+        ABI_VERSION_PACKED, ABI_VERSION_PATCH,
     };
 }
 
@@ -690,5 +844,184 @@ mod tests {
         unsafe { *(p1 as *mut u32) = 99 };
         assert_eq!(data[1], 99);
         assert!(slice_mut.get_ptr_mut(4).is_none());
+    }
+
+    #[derive(Copy, Clone, Debug, PartialEq)]
+    #[repr(C)]
+    struct PosData {
+        x: f32,
+        y: f32,
+    }
+
+    #[test]
+    fn test_chunk_slice_as_typed_slice() {
+        let data = [
+            PosData { x: 1.0, y: 2.0 },
+            PosData { x: 3.0, y: 4.0 },
+        ];
+        let stride = core::mem::size_of::<PosData>();
+        let slice = ChunkSlice::new(data.as_ptr() as *const u8, stride, 2);
+
+        let typed = slice.as_typed_slice::<PosData>().expect("valid typed slice");
+        assert_eq!(typed.len(), 2);
+        assert_eq!(typed[0], PosData { x: 1.0, y: 2.0 });
+        assert_eq!(typed[1], PosData { x: 3.0, y: 4.0 });
+
+        // Stride mismatch
+        let wrong_stride = ChunkSlice::new(data.as_ptr() as *const u8, stride + 4, 2);
+        assert!(wrong_stride.as_typed_slice::<PosData>().is_none());
+
+        // Misaligned pointer
+        let misaligned_ptr = unsafe { (data.as_ptr() as *const u8).add(1) };
+        let misaligned = ChunkSlice::new(misaligned_ptr, stride, 1);
+        assert!(misaligned.as_typed_slice::<PosData>().is_none());
+
+        // Empty slice with valid stride
+        let empty = ChunkSlice::new(core::ptr::null(), stride, 0);
+        assert_eq!(empty.as_typed_slice::<PosData>(), Some(&[][..]));
+
+        // Empty slice with invalid stride
+        let empty_bad_stride = ChunkSlice::new(core::ptr::null(), stride + 1, 0);
+        assert!(empty_bad_stride.as_typed_slice::<PosData>().is_none());
+    }
+
+    #[test]
+    fn test_chunk_slice_mut_as_typed_slice() {
+        let mut data = [
+            PosData { x: 1.0, y: 2.0 },
+            PosData { x: 3.0, y: 4.0 },
+        ];
+        let stride = core::mem::size_of::<PosData>();
+        let mut slice_mut = ChunkSliceMut::new(data.as_mut_ptr() as *mut u8, stride, 2);
+
+        {
+            let typed_mut = slice_mut.as_typed_slice::<PosData>().expect("valid typed slice mut");
+            typed_mut[0].x = 10.0;
+            typed_mut[1].y = 40.0;
+        }
+
+        assert_eq!(data[0], PosData { x: 10.0, y: 2.0 });
+        assert_eq!(data[1], PosData { x: 3.0, y: 40.0 });
+
+        // Stride mismatch
+        let mut bad_stride_slice = ChunkSliceMut::new(data.as_mut_ptr() as *mut u8, stride + 4, 2);
+        assert!(bad_stride_slice.as_typed_slice::<PosData>().is_none());
+
+        // Empty slice with valid stride
+        let mut empty = ChunkSliceMut::new(core::ptr::null_mut(), stride, 0);
+        assert_eq!(empty.as_typed_slice::<PosData>(), Some(&mut [][..]));
+    }
+
+    #[test]
+    fn test_guest_command_queue_insert_runtime_component() {
+        static mut CAPTURED_LEN: usize = 0;
+        static mut CAPTURED_ENTITY: u64 = 0;
+
+        unsafe extern "C" fn mock_insert(
+            _queue: *mut RawCommandQueue,
+            entity: FfiEntity,
+            _name: *const core::ffi::c_char,
+            _data: *const u8,
+            len: usize,
+        ) -> FfiResult {
+            unsafe {
+                CAPTURED_LEN = len;
+                CAPTURED_ENTITY = entity.0;
+            }
+            FfiResult::OK
+        }
+
+        let mut queue = GuestCommandQueue::new(
+            0x1234 as *mut RawCommandQueue,
+            CommandBridgeVTable {
+                spawn_empty: None,
+                despawn: None,
+                insert_component: Some(mock_insert),
+            },
+        );
+
+        let pos = PosData { x: 5.0, y: 7.0 };
+        let res = queue.insert_runtime_component(FfiEntity(42), c"PosData", &pos);
+        assert_eq!(res, FfiResult::OK);
+        assert_eq!(unsafe { CAPTURED_LEN }, core::mem::size_of::<PosData>());
+        assert_eq!(unsafe { CAPTURED_ENTITY }, 42);
+    }
+
+    #[test]
+    fn test_register_runtime_component_mock() {
+        use std::sync::Mutex;
+        static CAPTURED_NAME: Mutex<Option<std::string::String>> = Mutex::new(None);
+        static CAPTURED_SIZE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static CAPTURED_ALIGN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static CAPTURED_DROP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+        unsafe extern "C" fn mock_register_component(
+            _ctx: *mut core::ffi::c_void,
+            desc: *const ModComponentDescriptor,
+        ) -> FfiResult {
+            assert!(!desc.is_null());
+            let d = unsafe { &*desc };
+            *CAPTURED_NAME.lock().unwrap() =
+                Some(unsafe { core::ffi::CStr::from_ptr(d.name) }.to_str().unwrap().to_string());
+            CAPTURED_SIZE.store(d.size, std::sync::atomic::Ordering::SeqCst);
+            CAPTURED_ALIGN.store(d.align, std::sync::atomic::Ordering::SeqCst);
+            CAPTURED_DROP.store(d.drop_fn.is_some(), std::sync::atomic::Ordering::SeqCst);
+            FfiResult::OK
+        }
+
+        let dummy_host_api = HostApi {
+            struct_size: core::mem::size_of::<HostApi>() as u32,
+            abi_version: abi_contract::ABI_VERSION_PACKED,
+            register_system: unsafe { core::mem::transmute(1usize) },
+            iter_next_chunk: unsafe { core::mem::transmute(1usize) },
+            iter_column_readonly: unsafe { core::mem::transmute(1usize) },
+            iter_column_mutable: unsafe { core::mem::transmute(1usize) },
+            iter_mark_changed: unsafe { core::mem::transmute(1usize) },
+            iter_entities: unsafe { core::mem::transmute(1usize) },
+            iter_column_stride: unsafe { core::mem::transmute(1usize) },
+            register_component: mock_register_component,
+        };
+
+        let dummy_ctx = 0x1234usize as *mut core::ffi::c_void;
+
+        // 1. POD component -> drop_fn == None
+        let res = unsafe {
+            register_runtime_component::<PosData>(
+                &dummy_host_api,
+                dummy_ctx,
+                c"PosData",
+            )
+        };
+        assert_eq!(res, FfiResult::OK);
+        assert_eq!(CAPTURED_NAME.lock().unwrap().as_deref(), Some("PosData"));
+        assert_eq!(CAPTURED_SIZE.load(std::sync::atomic::Ordering::SeqCst), core::mem::size_of::<PosData>());
+        assert_eq!(CAPTURED_ALIGN.load(std::sync::atomic::Ordering::SeqCst), core::mem::align_of::<PosData>());
+        assert_eq!(CAPTURED_DROP.load(std::sync::atomic::Ordering::SeqCst), false);
+
+        // 2. Non-POD component -> drop_fn != None
+        #[allow(dead_code)]
+        struct HasDrop(std::string::String);
+        let res_drop = unsafe {
+            register_runtime_component::<HasDrop>(
+                &dummy_host_api,
+                dummy_ctx,
+                c"HasDrop",
+            )
+        };
+        assert_eq!(res_drop, FfiResult::OK);
+        assert_eq!(CAPTURED_NAME.lock().unwrap().as_deref(), Some("HasDrop"));
+        assert_eq!(CAPTURED_SIZE.load(std::sync::atomic::Ordering::SeqCst), core::mem::size_of::<HasDrop>());
+        assert_eq!(CAPTURED_ALIGN.load(std::sync::atomic::Ordering::SeqCst), core::mem::align_of::<HasDrop>());
+        assert_eq!(CAPTURED_DROP.load(std::sync::atomic::Ordering::SeqCst), true);
+
+        // 3. Null pointer checks
+        assert_eq!(
+            unsafe { register_runtime_component::<PosData>(core::ptr::null(), dummy_ctx, c"PosData") },
+            FfiResult::NULL_POINTER
+        );
+        assert_eq!(
+            unsafe { register_runtime_component::<PosData>(&dummy_host_api, core::ptr::null_mut(), c"PosData") },
+            FfiResult::NULL_POINTER
+        );
     }
 }

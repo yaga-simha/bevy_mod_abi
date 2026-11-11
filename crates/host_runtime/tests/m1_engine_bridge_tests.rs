@@ -2,7 +2,8 @@
 #![deny(improper_ctypes_definitions)]
 
 use abi_contract::{
-    ComponentAccessMode, ExposableComponent, FfiEntity, FfiResult, RawChunkIter, RawCommandQueue,
+    ComponentAccessMode, ComponentUuid, ExposableComponent, FfiEntity, FfiResult, HostApi,
+    ModComponentDescriptor, RawChunkIter, RawCommandQueue,
 };
 use bevy_app::{App, Update};
 use bevy_ecs::component::Component;
@@ -14,8 +15,9 @@ use core::ffi::c_void;
 use host_runtime::{
     host_cmd_despawn, host_cmd_insert_component, host_cmd_spawn_empty, host_get_proc_address,
     host_iter_column_mutable, host_iter_column_readonly, host_iter_column_stride,
-    host_iter_entities, host_iter_mark_changed, host_iter_next_chunk, AbiModPlugin,
-    CommandQueueBridge, DynamicCSystem, HostChunkIter, ModAppExt, ModRegistry, QueryColumnDesc,
+    host_iter_entities, host_iter_mark_changed, host_iter_next_chunk, host_register_component,
+    AbiModPlugin, CommandQueueBridge, DynamicCSystem, HostChunkIter, ModAppExt, ModRegistry,
+    QueryColumnDesc, HOST_API,
 };
 use mod_derive::ModExposable;
 use std::ffi::CString;
@@ -631,4 +633,135 @@ fn test_dynamic_system_panic_and_error_containment() {
         !err_sys.is_enabled(),
         "System returning error status must be disabled"
     );
+}
+
+// ============================================================================
+// 10. Dynamic Component Registration C-ABI Tests
+// ============================================================================
+
+#[test]
+fn test_host_register_component_defensive_validation() {
+    let dummy_ctx = 0xdead_beef_usize as *mut c_void;
+    let name = c"CustomRuntimeComponent".as_ptr();
+    let uuid = ComponentUuid::from_name("CustomRuntimeComponent");
+
+    // 1. Valid descriptor and host context
+    let valid_desc = ModComponentDescriptor::new(name, uuid, 16, 8);
+    let res = unsafe { host_register_component(dummy_ctx, &valid_desc) };
+    assert_eq!(res, FfiResult::OK);
+
+    // 2. Null host context
+    let res = unsafe { host_register_component(core::ptr::null_mut(), &valid_desc) };
+    assert_eq!(res, FfiResult::NULL_POINTER);
+
+    // 3. Null descriptor pointer
+    let res = unsafe { host_register_component(dummy_ctx, core::ptr::null()) };
+    assert_eq!(res, FfiResult::NULL_POINTER);
+
+    // 4. Truncated descriptor struct_size
+    let mut truncated_desc = valid_desc;
+    truncated_desc.struct_size = 32;
+    let res = unsafe { host_register_component(dummy_ctx, &truncated_desc) };
+    assert_eq!(res, FfiResult::INVALID_VERSION);
+
+    // 5. Forward-compatible descriptor struct_size (>= 64)
+    let mut extended_desc = valid_desc;
+    extended_desc.struct_size = 128;
+    let res = unsafe { host_register_component(dummy_ctx, &extended_desc) };
+    assert_eq!(res, FfiResult::OK);
+
+    // 6. Null component name
+    let null_name_desc = ModComponentDescriptor::new(core::ptr::null(), uuid, 16, 8);
+    let res = unsafe { host_register_component(dummy_ctx, &null_name_desc) };
+    assert_eq!(res, FfiResult::NULL_POINTER);
+
+    // 7. Invalid UTF-8 in component name
+    let invalid_utf8_bytes = [0xff, 0xfe, 0x00];
+    let bad_utf8_desc = ModComponentDescriptor::new(
+        invalid_utf8_bytes.as_ptr() as *const core::ffi::c_char,
+        uuid,
+        16,
+        8,
+    );
+    let res = unsafe { host_register_component(dummy_ctx, &bad_utf8_desc) };
+    assert_eq!(res, FfiResult::INVALID_UTF8);
+
+    // 8. Invalid zero alignment
+    let mut zero_align = valid_desc;
+    zero_align.align = 0;
+    let res = unsafe { host_register_component(dummy_ctx, &zero_align) };
+    assert_eq!(res, FfiResult::INTERNAL_ERROR);
+
+    // 9. Invalid non-power-of-two alignment
+    let mut non_pot_align = valid_desc;
+    non_pot_align.align = 6;
+    let res = unsafe { host_register_component(dummy_ctx, &non_pot_align) };
+    assert_eq!(res, FfiResult::INTERNAL_ERROR);
+
+    // 10. Invalid misaligned size (size % align != 0)
+    let mut misaligned = valid_desc;
+    misaligned.size = 15;
+    misaligned.align = 8;
+    let res = unsafe { host_register_component(dummy_ctx, &misaligned) };
+    assert_eq!(res, FfiResult::INTERNAL_ERROR);
+
+    // 11. Valid Zero-Sized Type (ZST)
+    let zst_desc = ModComponentDescriptor::new(name, uuid, 0, 1);
+    let res = unsafe { host_register_component(dummy_ctx, &zst_desc) };
+    assert_eq!(res, FfiResult::OK);
+
+    // 12. Valid over-aligned ZST
+    let overaligned_zst = ModComponentDescriptor::new(name, uuid, 0, 16);
+    let res = unsafe { host_register_component(dummy_ctx, &overaligned_zst) };
+    assert_eq!(res, FfiResult::OK);
+}
+
+#[test]
+fn test_host_get_proc_address_resolves_register_component() {
+    let registry = ModRegistry::new();
+
+    // Registry symbol table lookup
+    assert_eq!(
+        registry.resolve_symbol("register_component"),
+        Some(host_register_component as *const c_void)
+    );
+    assert_eq!(
+        registry.resolve_symbol("host_register_component"),
+        Some(host_register_component as *const c_void)
+    );
+
+    // Global / thread-local host_get_proc_address resolution
+    let reg_arc = Arc::new(registry);
+    let _guard = reg_arc.make_current();
+
+    let sym_ptr = unsafe { host_get_proc_address(c"register_component".as_ptr()) };
+    assert_eq!(sym_ptr, host_register_component as *const c_void);
+
+    let host_sym_ptr = unsafe { host_get_proc_address(c"host_register_component".as_ptr()) };
+    assert_eq!(host_sym_ptr, host_register_component as *const c_void);
+}
+
+#[test]
+fn test_host_api_vtable_and_register_component_offsets() {
+    // 64-bit layout assertions
+    assert_eq!(core::mem::size_of::<HostApi>(), 72);
+    assert_eq!(core::mem::align_of::<HostApi>(), 8);
+    assert_eq!(HOST_API.struct_size, 72);
+
+    assert_eq!(core::mem::offset_of!(HostApi, register_component), 64);
+
+    // Ensure HOST_API function pointer points to host_register_component
+    assert_eq!(
+        HOST_API.register_component as *const () as usize,
+        host_register_component as *const () as usize
+    );
+
+    // Direct invocation via HOST_API
+    let dummy_ctx = 0xfeed_beef_usize as *mut c_void;
+    let name = c"HealthPoints".as_ptr();
+    let uuid = ComponentUuid::from_name("HealthPoints");
+    let desc = ModComponentDescriptor::new(name, uuid, 4, 4);
+
+    let res = unsafe { (HOST_API.register_component)(dummy_ctx, &desc) };
+    assert_eq!(res, FfiResult::OK);
 }

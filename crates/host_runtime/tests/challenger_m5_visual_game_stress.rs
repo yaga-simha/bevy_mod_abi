@@ -130,7 +130,8 @@ fn create_shadow_copy(original: &PathBuf, tag: &str) -> PathBuf {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let ext = original.extension().unwrap().to_string_lossy();
-    let shadow_dir = std::env::temp_dir().join(format!("bevy_stress_shadow_{}_{}", std::process::id(), id));
+    let shadow_dir =
+        std::env::temp_dir().join(format!("bevy_stress_shadow_{}_{}", std::process::id(), id));
     fs::create_dir_all(&shadow_dir).expect("create shadow dir");
     let shadow_file = shadow_dir.join(format!("{tag}_{id}.{ext}"));
     fs::copy(original, &shadow_file).expect("copy shadow dylib");
@@ -155,8 +156,17 @@ fn test_adversarial_rapid_mod_cycling_50_cycles() {
         let y = 10.0 + (i as f32 * 0.9);
         app.world_mut().spawn((
             Position { x, y, z: 0.0 },
-            Velocity { x: 1.5, y: -0.5, z: 0.0 },
-            ColorRgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+            Velocity {
+                x: 1.5,
+                y: -0.5,
+                z: 0.0,
+            },
+            ColorRgba {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 1.0,
+            },
         ));
     }
 
@@ -194,16 +204,36 @@ fn test_adversarial_rapid_mod_cycling_50_cycles() {
 
     // After 50 cycles (200 dynamic systems loaded & deactivated in Bevy schedule),
     // verify all 50 entities are completely intact and physically valid
-    let mut query = app.world_mut().query::<(&Position, &Velocity, &ColorRgba)>();
+    let mut query = app
+        .world_mut()
+        .query::<(&Position, &Velocity, &ColorRgba)>();
     let count = query.iter(app.world()).count();
-    assert_eq!(count, 50, "All 50 entities must survive 50 rapid cycling loops");
+    assert_eq!(
+        count, 50,
+        "All 50 entities must survive 50 rapid cycling loops"
+    );
 
     for (pos, vel, col) in query.iter(app.world()) {
-        assert!(!pos.x.is_nan() && !pos.y.is_nan(), "Position must not be NaN");
-        assert!(!vel.x.is_nan() && !vel.y.is_nan(), "Velocity must not be NaN");
-        assert!(!col.r.is_nan() && !col.g.is_nan() && !col.b.is_nan(), "Color must not be NaN");
-        assert!(pos.x >= 1.0 && pos.x <= ARENA_WIDTH - 1.0, "Position x within arena bounds");
-        assert!(pos.y >= 1.0 && pos.y <= ARENA_HEIGHT - 1.0, "Position y within arena bounds");
+        assert!(
+            !pos.x.is_nan() && !pos.y.is_nan(),
+            "Position must not be NaN"
+        );
+        assert!(
+            !vel.x.is_nan() && !vel.y.is_nan(),
+            "Velocity must not be NaN"
+        );
+        assert!(
+            !col.r.is_nan() && !col.g.is_nan() && !col.b.is_nan(),
+            "Color must not be NaN"
+        );
+        assert!(
+            pos.x >= 1.0 && pos.x <= ARENA_WIDTH - 1.0,
+            "Position x within arena bounds"
+        );
+        assert!(
+            pos.y >= 1.0 && pos.y <= ARENA_HEIGHT - 1.0,
+            "Position y within arena bounds"
+        );
     }
 }
 
@@ -228,11 +258,27 @@ fn test_adversarial_shadow_copying_and_file_lock_bypass() {
     let mut app = setup_base_app();
 
     // Spawn 1 particle at (60.0, 30.0) with zero velocity
-    let e = app.world_mut().spawn((
-        Position { x: 60.0, y: 30.0, z: 0.0 },
-        Velocity { x: 0.0, y: 0.0, z: 0.0 },
-        ColorRgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
-    )).id();
+    let e = app
+        .world_mut()
+        .spawn((
+            Position {
+                x: 60.0,
+                y: 30.0,
+                z: 0.0,
+            },
+            Velocity {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            ColorRgba {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 1.0,
+            },
+        ))
+        .id();
 
     // Shadow copy into temp execution cache (simulating ModManager::load_mod)
     let shadow_1 = create_shadow_copy(&dev_mod_path, "shadow_run1");
@@ -243,7 +289,10 @@ fn test_adversarial_shadow_copying_and_file_lock_bypass() {
         app.update();
     }
     let vy_gravity = app.world().get::<Velocity>(e).unwrap().y;
-    assert!(vy_gravity < -0.5, "Gravity mod must produce negative vy: got {vy_gravity}");
+    assert!(
+        vy_gravity < -0.5,
+        "Gravity mod must produce negative vy: got {vy_gravity}"
+    );
 
     // 2. CONCURRENT RECOMPILATION / OVERWRITE:
     // While the game is ACTIVELY RUNNING and mod is loaded, developer recompiles mod into Vortex!
@@ -270,7 +319,9 @@ fn test_adversarial_shadow_copying_and_file_lock_bypass() {
     }
 
     let shadow_2 = create_shadow_copy(&dev_mod_path, "shadow_run2");
-    let mod_id_2 = app.load_mod_tracked(&shadow_2).expect("load reloaded vortex mod");
+    let mod_id_2 = app
+        .load_mod_tracked(&shadow_2)
+        .expect("load reloaded vortex mod");
 
     // Advance 1 tick: now VORTEX physics must execute!
     app.update();
@@ -291,7 +342,8 @@ fn test_adversarial_shadow_copying_and_file_lock_bypass() {
     );
 
     // Teardown
-    app.unload_mod(mod_id_2).expect("unload reloaded vortex mod");
+    app.unload_mod(mod_id_2)
+        .expect("unload reloaded vortex mod");
     let _ = fs::remove_file(&shadow_2);
     let _ = fs::remove_file(&dev_mod_path);
     let _ = fs::remove_dir_all(&staging_dir);
@@ -307,11 +359,27 @@ fn test_adversarial_gravity_physical_kinematics_oracle() {
     let shadow = create_shadow_copy(&grav_dylib, "grav_oracle");
     let mut app = setup_base_app();
 
-    let e = app.world_mut().spawn((
-        Position { x: 50.0, y: 15.0, z: 0.0 },
-        Velocity { x: 10.0, y: 0.0, z: 0.0 },
-        ColorRgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
-    )).id();
+    let e = app
+        .world_mut()
+        .spawn((
+            Position {
+                x: 50.0,
+                y: 15.0,
+                z: 0.0,
+            },
+            Velocity {
+                x: 10.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            ColorRgba {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 1.0,
+            },
+        ))
+        .id();
 
     let mod_id = app.load_mod_tracked(&shadow).expect("load gravity mod");
 
@@ -322,7 +390,8 @@ fn test_adversarial_gravity_physical_kinematics_oracle() {
     assert!(
         (vel1.y - expected_vy).abs() < 1e-2,
         "Downward acceleration must match gravitational formula: got {}, expected {}",
-        vel1.y, expected_vy
+        vel1.y,
+        expected_vy
     );
 
     // Run until floor collision
@@ -348,17 +417,49 @@ fn test_adversarial_rainbow_color_spectrum_oracle() {
     let shadow = create_shadow_copy(&rain_dylib, "rain_oracle");
     let mut app = setup_base_app();
 
-    let e1 = app.world_mut().spawn((
-        Position { x: 10.0, y: 10.0, z: 0.0 },
-        Velocity { x: 0.0, y: 0.0, z: 0.0 },
-        ColorRgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
-    )).id();
+    let e1 = app
+        .world_mut()
+        .spawn((
+            Position {
+                x: 10.0,
+                y: 10.0,
+                z: 0.0,
+            },
+            Velocity {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            ColorRgba {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 1.0,
+            },
+        ))
+        .id();
 
-    let e2 = app.world_mut().spawn((
-        Position { x: 100.0, y: 50.0, z: 0.0 },
-        Velocity { x: 0.0, y: 0.0, z: 0.0 },
-        ColorRgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
-    )).id();
+    let e2 = app
+        .world_mut()
+        .spawn((
+            Position {
+                x: 100.0,
+                y: 50.0,
+                z: 0.0,
+            },
+            Velocity {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            ColorRgba {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 1.0,
+            },
+        ))
+        .id();
 
     let mod_id = app.load_mod_tracked(&shadow).expect("load rainbow mod");
     app.update();
@@ -372,15 +473,22 @@ fn test_adversarial_rainbow_color_spectrum_oracle() {
 
     // Spatial diversity oracle: particles at (10, 10) vs (100, 50) have distinct hues
     let color_delta = (c1.r - c2.r).abs() + (c1.g - c2.g).abs() + (c1.b - c2.b).abs();
-    assert!(color_delta > 0.1, "Rainbow colors must vary across 2D spatial coordinates: delta={color_delta}");
+    assert!(
+        color_delta > 0.1,
+        "Rainbow colors must vary across 2D spatial coordinates: delta={color_delta}"
+    );
 
     // Temporal wave oracle: tick 30 times and verify color evolves
     for _ in 0..30 {
         app.update();
     }
     let c1_later = *app.world().get::<ColorRgba>(e1).unwrap();
-    let time_delta = (c1.r - c1_later.r).abs() + (c1.g - c1_later.g).abs() + (c1.b - c1_later.b).abs();
-    assert!(time_delta > 0.1, "Rainbow colors must evolve over simulation ticks: delta={time_delta}");
+    let time_delta =
+        (c1.r - c1_later.r).abs() + (c1.g - c1_later.g).abs() + (c1.b - c1_later.b).abs();
+    assert!(
+        time_delta > 0.1,
+        "Rainbow colors must evolve over simulation ticks: delta={time_delta}"
+    );
 
     app.unload_mod(mod_id).expect("unload rainbow mod");
     let _ = fs::remove_file(&shadow);
@@ -393,18 +501,50 @@ fn test_adversarial_vortex_orbital_cyclone_oracle() {
     let mut app = setup_base_app();
 
     // Spawn orbiting particle at (90.0, 30.0) -> center is (60.0, 30.0)
-    let e_orbit = app.world_mut().spawn((
-        Position { x: 90.0, y: 30.0, z: 0.0 },
-        Velocity { x: 0.0, y: 0.0, z: 0.0 },
-        ColorRgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
-    )).id();
+    let e_orbit = app
+        .world_mut()
+        .spawn((
+            Position {
+                x: 90.0,
+                y: 30.0,
+                z: 0.0,
+            },
+            Velocity {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            ColorRgba {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 1.0,
+            },
+        ))
+        .id();
 
     // Spawn core particle inside r < 5.0 at (62.0, 30.0) to test soft core repulsion
-    let e_core = app.world_mut().spawn((
-        Position { x: 62.0, y: 30.0, z: 0.0 },
-        Velocity { x: 0.0, y: 0.0, z: 0.0 },
-        ColorRgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
-    )).id();
+    let e_core = app
+        .world_mut()
+        .spawn((
+            Position {
+                x: 62.0,
+                y: 30.0,
+                z: 0.0,
+            },
+            Velocity {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            ColorRgba {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 1.0,
+            },
+        ))
+        .id();
 
     let mod_id = app.load_mod_tracked(&shadow).expect("load vortex mod");
     app.update();
@@ -413,11 +553,23 @@ fn test_adversarial_vortex_orbital_cyclone_oracle() {
     let vel_core = *app.world().get::<Velocity>(e_core).unwrap();
 
     // Orbit particle: centripetal vx < 0, tangential vy != 0
-    assert!(vel_orbit.x < -0.05, "Orbit particle must be drawn toward center (vx < 0): {}", vel_orbit.x);
-    assert!(vel_orbit.y.abs() > 0.01, "Orbit particle must swirl tangentially: {}", vel_orbit.y);
+    assert!(
+        vel_orbit.x < -0.05,
+        "Orbit particle must be drawn toward center (vx < 0): {}",
+        vel_orbit.x
+    );
+    assert!(
+        vel_orbit.y.abs() > 0.01,
+        "Orbit particle must swirl tangentially: {}",
+        vel_orbit.y
+    );
 
     // Core particle: r = 2.0 < 5.0 -> repulsive core pushes away from center (vx > 0)
-    assert!(vel_core.x > 0.05, "Core particle (r < 5.0) must experience repulsive push outward (vx > 0): {}", vel_core.x);
+    assert!(
+        vel_core.x > 0.05,
+        "Core particle (r < 5.0) must experience repulsive push outward (vx > 0): {}",
+        vel_core.x
+    );
 
     app.unload_mod(mod_id).expect("unload vortex mod");
     let _ = fs::remove_file(&shadow);
@@ -434,7 +586,9 @@ fn test_adversarial_boundary_empty_world() {
     let mut app = setup_base_app();
 
     // 0 entities in the entire ECS world
-    let mod_id = app.load_mod_tracked(&shadow).expect("load into empty world");
+    let mod_id = app
+        .load_mod_tracked(&shadow)
+        .expect("load into empty world");
     for _ in 0..10 {
         app.update(); // Must not panic or segfault
     }
@@ -454,12 +608,23 @@ fn test_adversarial_scale_2500_entities() {
         let y = 10.0 + (i / 100) as f32 * 1.8;
         app.world_mut().spawn((
             Position { x, y, z: 0.0 },
-            Velocity { x: 0.5, y: 0.5, z: 0.0 },
-            ColorRgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+            Velocity {
+                x: 0.5,
+                y: 0.5,
+                z: 0.0,
+            },
+            ColorRgba {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 1.0,
+            },
         ));
     }
 
-    let mod_id = app.load_mod_tracked(&shadow).expect("load rainbow at scale");
+    let mod_id = app
+        .load_mod_tracked(&shadow)
+        .expect("load rainbow at scale");
     for _ in 0..5 {
         app.update();
     }
@@ -502,7 +667,10 @@ fn test_adversarial_double_unload_and_invalid_mod_id() {
 
     // Unload bogus ModId: must fail cleanly
     let res3 = app.unload_mod(ModId(999_999));
-    assert!(res3.is_err(), "Unload non-existent ModId must return error, not crash");
+    assert!(
+        res3.is_err(),
+        "Unload non-existent ModId must return error, not crash"
+    );
 
     // App must still run smoothly after failed unloads
     app.update();
@@ -520,15 +688,30 @@ fn test_adversarial_entity_churn_spawn_despawn_with_active_mod() {
         .map(|i| {
             app.world_mut()
                 .spawn((
-                    Position { x: 10.0 + i as f32, y: 15.0, z: 0.0 },
-                    Velocity { x: 1.0, y: 0.5, z: 0.0 },
-                    ColorRgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+                    Position {
+                        x: 10.0 + i as f32,
+                        y: 15.0,
+                        z: 0.0,
+                    },
+                    Velocity {
+                        x: 1.0,
+                        y: 0.5,
+                        z: 0.0,
+                    },
+                    ColorRgba {
+                        r: 1.0,
+                        g: 1.0,
+                        b: 1.0,
+                        a: 1.0,
+                    },
                 ))
                 .id()
         })
         .collect();
 
-    let mod_id = app.load_mod_tracked(&shadow).expect("load rainbow mod for churn");
+    let mod_id = app
+        .load_mod_tracked(&shadow)
+        .expect("load rainbow mod for churn");
     app.update();
 
     // 2. Despawn 25 entities (triggers table compaction and archetypal chunk restructuring)
@@ -539,11 +722,25 @@ fn test_adversarial_entity_churn_spawn_despawn_with_active_mod() {
 
     // 3. Spawn 40 new entities (triggers capacity growth and chunk expansion)
     for i in 0..40 {
-        let id = app.world_mut()
+        let id = app
+            .world_mut()
             .spawn((
-                Position { x: 50.0 + i as f32, y: 25.0, z: 0.0 },
-                Velocity { x: -0.5, y: -0.5, z: 0.0 },
-                ColorRgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+                Position {
+                    x: 50.0 + i as f32,
+                    y: 25.0,
+                    z: 0.0,
+                },
+                Velocity {
+                    x: -0.5,
+                    y: -0.5,
+                    z: 0.0,
+                },
+                ColorRgba {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 1.0,
+                },
             ))
             .id();
         entities.push(id);
@@ -553,11 +750,24 @@ fn test_adversarial_entity_churn_spawn_despawn_with_active_mod() {
     // 4. Verify all 65 remaining entities have valid, non-corrupted colors and positions
     let mut query = app.world_mut().query::<(&Position, &ColorRgba)>();
     let total = query.iter(app.world()).count();
-    assert_eq!(total, 65, "Total entity count must equal remaining count (25 survived + 40 spawned)");
+    assert_eq!(
+        total, 65,
+        "Total entity count must equal remaining count (25 survived + 40 spawned)"
+    );
 
     for (pos, col) in query.iter(app.world()) {
-        assert!(!pos.x.is_nan() && !pos.y.is_nan(), "Position must remain valid");
-        assert!(col.r >= 0.0 && col.r <= 1.0 && col.g >= 0.0 && col.g <= 1.0 && col.b >= 0.0 && col.b <= 1.0);
+        assert!(
+            !pos.x.is_nan() && !pos.y.is_nan(),
+            "Position must remain valid"
+        );
+        assert!(
+            col.r >= 0.0
+                && col.r <= 1.0
+                && col.g >= 0.0
+                && col.g <= 1.0
+                && col.b >= 0.0
+                && col.b <= 1.0
+        );
     }
 
     app.unload_mod(mod_id).expect("unload rainbow after churn");
@@ -572,9 +782,22 @@ fn test_adversarial_color_restoration_oracle() {
 
     for i in 0..20 {
         app.world_mut().spawn((
-            Position { x: 5.0 + i as f32 * 5.0, y: 20.0, z: 0.0 },
-            Velocity { x: 0.0, y: 0.0, z: 0.0 },
-            ColorRgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+            Position {
+                x: 5.0 + i as f32 * 5.0,
+                y: 20.0,
+                z: 0.0,
+            },
+            Velocity {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            ColorRgba {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 1.0,
+            },
         ));
     }
 
@@ -600,9 +823,19 @@ fn test_adversarial_color_restoration_oracle() {
         let mut toggle = false;
         for mut col in query.iter_mut(app.world_mut()) {
             if toggle {
-                *col = ColorRgba { r: 0.2, g: 0.8, b: 1.0, a: 1.0 }; // cyan
+                *col = ColorRgba {
+                    r: 0.2,
+                    g: 0.8,
+                    b: 1.0,
+                    a: 1.0,
+                }; // cyan
             } else {
-                *col = ColorRgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }; // white
+                *col = ColorRgba {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 1.0,
+                }; // white
             }
             toggle = !toggle;
         }
@@ -614,11 +847,15 @@ fn test_adversarial_color_restoration_oracle() {
     }
 
     for col in app.world_mut().query::<&ColorRgba>().iter(app.world()) {
-        let is_cyan = (col.r - 0.2).abs() < 1e-4 && (col.g - 0.8).abs() < 1e-4 && (col.b - 1.0).abs() < 1e-4;
-        let is_white = (col.r - 1.0).abs() < 1e-4 && (col.g - 1.0).abs() < 1e-4 && (col.b - 1.0).abs() < 1e-4;
-        assert!(is_cyan || is_white, "Colors must remain strictly baseline after unload");
+        let is_cyan =
+            (col.r - 0.2).abs() < 1e-4 && (col.g - 0.8).abs() < 1e-4 && (col.b - 1.0).abs() < 1e-4;
+        let is_white =
+            (col.r - 1.0).abs() < 1e-4 && (col.g - 1.0).abs() < 1e-4 && (col.b - 1.0).abs() < 1e-4;
+        assert!(
+            is_cyan || is_white,
+            "Colors must remain strictly baseline after unload"
+        );
     }
 
     let _ = fs::remove_file(&shadow);
 }
-

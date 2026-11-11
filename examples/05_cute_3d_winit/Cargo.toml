@@ -1,0 +1,16 @@
+[package]
+name = "example_05_cute_3d_winit"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+bevy_app = { version = "0.20.1", default-features = false, features = ["std"] }
+bevy_ecs = { version = "0.20.1", default-features = false, features = ["std", "async_executor"] }
+host_runtime = { path = "../../crates/host_runtime" }
+abi_contract = { path = "../../crates/abi_contract" }
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
+wgpu = "29.0.4"
+glam = "0.33"
+bytemuck = { version = "1.25", features = ["derive"] }
+futures-executor = "0.3.34"

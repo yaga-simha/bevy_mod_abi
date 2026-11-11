@@ -307,7 +307,22 @@ pub static MOCK_HOST_API: HostApi = HostApi {
     iter_mark_changed: mock_iter_mark_changed,
     iter_entities: mock_iter_entities,
     iter_column_stride: mock_iter_column_stride,
+    register_component: mock_register_component,
 };
+
+pub unsafe extern "C" fn mock_register_component(
+    _host_context: *mut c_void,
+    descriptor: *const abi_contract::ModComponentDescriptor,
+) -> FfiResult {
+    if descriptor.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    let desc = unsafe { &*descriptor };
+    if desc.struct_size < core::mem::size_of::<abi_contract::ModComponentDescriptor>() as u32 {
+        return FfiResult::INVALID_VERSION;
+    }
+    FfiResult::OK
+}
 
 pub unsafe extern "C" fn mock_register_system(
     _host_context: *mut c_void,

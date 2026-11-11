@@ -24,7 +24,6 @@ use abi_contract::{ExposableComponent, FfiResult};
 use bevy_app::{App, Plugin, Update};
 use bevy_ecs::component::Component;
 use std::path::Path;
-use std::sync::Arc;
 
 /// Bevy Plugin initializing the native ABI modding framework.
 ///
@@ -108,18 +107,19 @@ impl ModAppExt for App {
     }
 
     fn load_mod_tracked<P: AsRef<Path>>(&mut self, path: P) -> Result<ModId, FfiResult> {
-        let registry = self
-            .world()
-            .get_resource::<ModRegistry>()
-            .cloned()
-            .unwrap_or_default();
-        let registry_arc = Arc::new(registry);
+        if !self.world().contains_resource::<ModHost>() {
+            self.insert_resource(ModHost::new());
+        }
+        if !self.world().contains_resource::<ModRegistry>() {
+            self.insert_resource(ModRegistry::new());
+        }
 
-        let (mod_id, systems) = {
-            let mut mod_host = self.world_mut().get_resource_or_init::<ModHost>();
-            // SAFETY: Loading dynamic library specified by path.
-            unsafe { mod_host.load_mod_tracked_with_registry(path, &registry_arc)? }
-        };
+        let (mod_id, systems) =
+            self.world_mut()
+                .resource_scope::<ModHost, _>(|world, mut mod_host| {
+                    // SAFETY: Loading dynamic library specified by path with mutable World access.
+                    unsafe { mod_host.load_mod_tracked_with_world(path, world) }
+                })?;
 
         for sys in systems {
             self.add_systems(Update, sys);

@@ -132,6 +132,83 @@ impl ModHost {
             ModInitContext::with_is_active(Arc::clone(registry), Arc::clone(&is_active));
 
         let _guard = registry.make_current();
+        let _init_guard = init_ctx.make_active();
+
+        // SAFETY: Passing valid `host_get_proc_address`, static `HOST_API`, and `ModInitContext`.
+        let status = unsafe {
+            init_fn(
+                host_get_proc_address,
+                &HOST_API,
+                &mut init_ctx as *mut ModInitContext as *mut c_void,
+            )
+        };
+
+        if status.is_err() {
+            return Err(status);
+        }
+
+        let mod_id = ModId(self.next_mod_id);
+        self.next_mod_id += 1;
+
+        self.loaded_libraries.push(LoadedMod {
+            id: mod_id,
+            name: path.to_string_lossy().to_string(),
+            library: lib,
+            shutdown_fn,
+            is_active,
+        });
+
+        Ok((mod_id, init_ctx.registered_systems))
+    }
+
+    /// Load a native mod library with a mutable reference to the Bevy [`World`],
+    /// allowing dynamic components declared at runtime by the mod to be registered
+    /// into the engine's ECS world and [`ModRegistry`].
+    ///
+    /// # Safety
+    /// Loading a dynamic library executes foreign initialization code (`bevy_abi_mod_init`).
+    /// The caller must ensure `path` points to a trusted, valid mod shared library.
+    pub unsafe fn load_mod_tracked_with_world<P: AsRef<Path>>(
+        &mut self,
+        path: P,
+        world: &mut bevy_ecs::world::World,
+    ) -> Result<(ModId, Vec<DynamicCSystem>), FfiResult> {
+        let path = path.as_ref();
+        // SAFETY: Caller guarantees `path` points to a valid dynamic library safe to load.
+        let lib = unsafe { Library::new(path) }.map_err(|_| FfiResult::INTERNAL_ERROR)?;
+
+        // Optional ABI version handshake check
+        if let Ok(ver_fn) = unsafe { lib.get::<ModAbiVersionFn>(b"bevy_abi_mod_abi_version\0") } {
+            let mod_ver = unsafe { ver_fn() };
+            if mod_ver != ABI_VERSION_PACKED {
+                return Err(FfiResult::INVALID_VERSION);
+            }
+        }
+
+        // SAFETY: Resolving standard C-ABI entry point `bevy_abi_mod_init`.
+        let init_fn: Symbol<ModInitFn> =
+            unsafe { lib.get(b"bevy_abi_mod_init\0") }.map_err(|_| FfiResult::INTERNAL_ERROR)?;
+
+        // SAFETY: Resolving optional C-ABI teardown point `bevy_abi_mod_shutdown`.
+        let shutdown_fn: Option<ModShutdownFn> = unsafe { lib.get(b"bevy_abi_mod_shutdown\0") }
+            .ok()
+            .map(|sym| *sym);
+
+        let is_active = Arc::new(AtomicBool::new(true));
+
+        if !world.contains_resource::<ModRegistry>() {
+            world.insert_resource(ModRegistry::new());
+        }
+        let registry = Arc::new(world.get_resource::<ModRegistry>().unwrap().clone());
+
+        let mut init_ctx = ModInitContext::with_world(
+            Arc::clone(&registry),
+            Arc::clone(&is_active),
+            world as *mut bevy_ecs::world::World,
+        );
+
+        let _guard = registry.make_current();
+        let _init_guard = init_ctx.make_active();
 
         // SAFETY: Passing valid `host_get_proc_address`, static `HOST_API`, and `ModInitContext`.
         let status = unsafe {

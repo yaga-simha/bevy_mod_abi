@@ -71,6 +71,7 @@ pub static HOST_API: HostApi = HostApi {
     iter_mark_changed: chunk_iter::host_iter_mark_changed,
     iter_entities: chunk_iter::host_iter_entities,
     iter_column_stride: chunk_iter::host_iter_column_stride,
+    register_component: dynamic_system::host_register_component,
 };
 
 // Re-exports
@@ -87,8 +88,9 @@ pub use commands::{
     CmdInsertComponentFn, CmdSpawnEmptyFn, CommandQueueBridge,
 };
 pub use dynamic_system::{
-    host_register_multi_query_system, host_register_system, ComponentAccessDescOwned,
-    DynamicCSystem, ModInitContext, MAX_SYSTEM_QUERIES,
+    host_register_component, host_register_multi_query_system, host_register_system,
+    reset_drop_trampolines_for_testing, ComponentAccessDescOwned, DynamicCSystem, ModInitContext,
+    MAX_SYSTEM_QUERIES,
 };
 pub use host::{LoadedMod, ModHost, ModId};
 pub use plugin::{AbiModPlugin, ModAppExt};

@@ -52,7 +52,8 @@
 //! 4. **Command Queue & Registration**: [`RawCommandQueue`], [`DynamicSystemCallback`], [`QuerySpec`],
 //!    [`MultiQuerySystemCallback`], [`MultiQuerySystemDescriptor`], [`SystemDescriptor`], [`HostApi`],
 //!    [`RegisterSystemFn`], [`RegisterMultiQuerySystemFn`], [`GetProcAddressFn`].
-//! 5. **Reflection & VTables**: [`FfiLayout`], [`SymbolEntry`], [`ExposableComponent`].
+//! 5. **Dynamic Components & Reflection**: [`ComponentDropFn`], [`ModComponentDescriptor`],
+//!    [`DynamicComponentDescriptor`], [`RegisterComponentFn`], [`FfiLayout`], [`SymbolEntry`], [`ExposableComponent`].
 
 use core::ffi::{c_char, c_void};
 
@@ -639,6 +640,197 @@ pub type RegisterSystemFn = unsafe extern "C" fn(
 /// `name` must be a valid nul-terminated C string or null.
 pub type GetProcAddressFn = unsafe extern "C" fn(name: *const c_char) -> *const c_void;
 
+/// Function pointer callback invoked by the host to drop resources of a dynamic component instance.
+///
+/// For POD (Plain Old Data) components that do not own heap allocations or external handles,
+/// this callback is unnecessary and should be set to `None` (`NULL` in C).
+///
+/// # Safety
+/// - `ptr` is a non-null, properly aligned pointer to an initialized instance of the component.
+/// - The callback must contain any internal panics; unwinding across the FFI boundary is undefined behavior.
+pub type ComponentDropFn = unsafe extern "C" fn(ptr: *mut core::ffi::c_void);
+
+/// Descriptor used by dynamic mods to declare and register dynamic components with the host engine at runtime.
+///
+/// Provides complete memory layout specification (`size`, `align`), identification (`name`, `uuid`),
+/// and optional lifecycle hooks (`drop_fn`, `vtable_ptr`) across the `extern "C"` boundary without
+/// requiring compile-time host knowledge.
+///
+/// # Binary Layout (64-bit Architecture)
+/// - `struct_size`: offset 0, size 4 (4 bytes padding follows)
+/// - `name`: offset 8, size 8
+/// - `uuid`: offset 16, size 16
+/// - `size`: offset 32, size 8
+/// - `align`: offset 40, size 8
+/// - `drop_fn`: offset 48, size 8
+/// - `vtable_ptr`: offset 56, size 8
+/// - Total size: 64 bytes, alignment: 8 bytes.
+///
+/// # Example
+///
+/// ```
+/// use abi_contract::{ModComponentDescriptor, ComponentUuid, FfiResult};
+///
+/// let desc = ModComponentDescriptor::new(
+///     c"Health".as_ptr(),
+///     ComponentUuid::from_name("Health"),
+///     4, // size_of::<u32>()
+///     4, // align_of::<u32>()
+/// );
+///
+/// assert!(desc.is_valid());
+/// assert_eq!(desc.validate(), FfiResult::OK);
+/// assert!(!desc.is_zst());
+/// assert!(desc.is_pod());
+/// ```
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ModComponentDescriptor {
+    /// Size of this struct in bytes (`core::mem::size_of::<ModComponentDescriptor>() as u32`).
+    ///
+    /// Enables forward and backward ABI compatibility negotiation between host and mods.
+    pub struct_size: u32,
+
+    /// Null-terminated UTF-8 C string identifying the component name (e.g., `c"CustomTag"`).
+    pub name: *const core::ffi::c_char,
+
+    /// Deterministic 128-bit component UUID.
+    pub uuid: ComponentUuid,
+
+    /// Byte size (`core::mem::size_of::<T>()`) of the component.
+    ///
+    /// Must be a multiple of `align` (or `0` for zero-sized types).
+    pub size: usize,
+
+    /// Memory alignment (`core::mem::align_of::<T>()`) in bytes.
+    ///
+    /// Must be a non-zero power of two.
+    pub align: usize,
+
+    /// Optional lifecycle drop callback.
+    ///
+    /// If `Some`, invoked when an entity possessing this component is despawned or the component
+    /// is removed from an entity. If `None`, the component is treated as POD.
+    pub drop_fn: Option<ComponentDropFn>,
+
+    /// Optional static type-erased VTable pointer for foreign accessor functions.
+    ///
+    /// May be null if the component is accessed purely via direct contiguous column pointers.
+    pub vtable_ptr: *const core::ffi::c_void,
+}
+
+/// Ergonomic type alias for [`ModComponentDescriptor`].
+pub type DynamicComponentDescriptor = ModComponentDescriptor;
+
+impl ModComponentDescriptor {
+    /// Constructs a basic descriptor for a Plain Old Data (POD) component with no custom drop glue.
+    #[inline]
+    pub const fn new(
+        name: *const core::ffi::c_char,
+        uuid: ComponentUuid,
+        size: usize,
+        align: usize,
+    ) -> Self {
+        Self {
+            struct_size: core::mem::size_of::<Self>() as u32,
+            name,
+            uuid,
+            size,
+            align,
+            drop_fn: None,
+            vtable_ptr: core::ptr::null(),
+        }
+    }
+
+    /// Attaches an optional lifecycle drop hook to this descriptor.
+    #[inline]
+    pub const fn with_drop(mut self, drop_fn: ComponentDropFn) -> Self {
+        self.drop_fn = Some(drop_fn);
+        self
+    }
+
+    /// Attaches an optional static VTable pointer to this descriptor.
+    #[inline]
+    pub const fn with_vtable(mut self, vtable_ptr: *const core::ffi::c_void) -> Self {
+        self.vtable_ptr = vtable_ptr;
+        self
+    }
+
+    /// Validates the memory layout and pointer integrity of this descriptor.
+    ///
+    /// Returns `true` if and only if all of the following conditions are met:
+    /// 1. `struct_size` is at least the size of [`ModComponentDescriptor`] (ABI forward compatibility).
+    /// 2. `name` is non-null.
+    /// 3. `align` is a non-zero power of two.
+    /// 4. `size` is an integer multiple of `align` (`size % align == 0`), which also holds for ZSTs (`size == 0`).
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        self.validate().is_ok()
+    }
+
+    /// Validates the descriptor and returns a specific [`FfiResult`] error code on failure.
+    #[inline]
+    pub fn validate(&self) -> FfiResult {
+        if (self.struct_size as usize) < core::mem::size_of::<Self>() {
+            return FfiResult::INVALID_VERSION;
+        }
+        if self.name.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if !self.align.is_power_of_two() || !self.size.is_multiple_of(self.align) {
+            return FfiResult::INVALID_COMPONENT;
+        }
+        FfiResult::OK
+    }
+
+    /// Returns `true` if this component is a Zero-Sized Type (ZST).
+    #[inline]
+    pub const fn is_zst(&self) -> bool {
+        self.size == 0
+    }
+
+    /// Returns `true` if this component does not require a custom drop callback.
+    #[inline]
+    pub const fn is_pod(&self) -> bool {
+        self.drop_fn.is_none()
+    }
+
+    /// Returns the verified [`core::alloc::Layout`] for this component descriptor,
+    /// or `None` if the alignment is invalid or the size overflows address space bounds.
+    #[inline]
+    pub fn layout(&self) -> Option<core::alloc::Layout> {
+        if !self.align.is_power_of_two() || !self.size.is_multiple_of(self.align) {
+            return None;
+        }
+        core::alloc::Layout::from_size_align(self.size, self.align).ok()
+    }
+
+    /// Borrows the component name as a C string reference if `self.name` is non-null.
+    ///
+    /// # Safety
+    /// Caller guarantees that if `self.name` is non-null, it points to a valid null-terminated C string
+    /// that remains valid for lifetime `'a`.
+    #[inline]
+    pub unsafe fn name_cstr<'a>(&self) -> Option<&'a core::ffi::CStr> {
+        if self.name.is_null() {
+            None
+        } else {
+            // SAFETY: Caller upholds valid null-terminated C string pointer for lifetime `'a`.
+            Some(unsafe { core::ffi::CStr::from_ptr(self.name) })
+        }
+    }
+}
+
+/// Dynamic component registration function signature exposed in [`HostApi`] and via `get_proc_address`.
+///
+/// # Safety
+/// - `host_context` must point to valid host engine context provided during mod initialization.
+/// - `descriptor` must point to a valid, initialized [`ModComponentDescriptor`].
+pub type RegisterComponentFn = unsafe extern "C" fn(
+    host_context: *mut core::ffi::c_void,
+    descriptor: *const ModComponentDescriptor,
+) -> FfiResult;
+
 /// Host API VTable passed to the guest mod during `bevy_abi_mod_init`.
 ///
 /// Must have `'static` lifetime on the host so guest mods may store the pointer across frames.
@@ -663,6 +855,8 @@ pub struct HostApi {
     pub iter_entities: IterEntitiesFn,
     /// Query the byte stride of a column in a `RawChunkIter`.
     pub iter_column_stride: IterColumnStrideFn,
+    /// Register a runtime dynamic component with the host Bevy ECS World.
+    pub register_component: RegisterComponentFn,
 }
 
 /// Mod initialization entry point function signature (`bevy_abi_mod_init`).
@@ -865,5 +1059,132 @@ mod tests {
         let u3 = ComponentUuid::from_name("Velocity");
         assert_eq!(u1, u2);
         assert_ne!(u1, u3);
+    }
+
+    #[test]
+    fn test_mod_component_descriptor_layout_and_offsets() {
+        assert_eq!(core::mem::size_of::<ModComponentDescriptor>(), 64);
+        assert_eq!(core::mem::align_of::<ModComponentDescriptor>(), 8);
+
+        assert_eq!(
+            core::mem::offset_of!(ModComponentDescriptor, struct_size),
+            0
+        );
+        assert_eq!(core::mem::offset_of!(ModComponentDescriptor, name), 8);
+        assert_eq!(core::mem::offset_of!(ModComponentDescriptor, uuid), 16);
+        assert_eq!(core::mem::offset_of!(ModComponentDescriptor, size), 32);
+        assert_eq!(core::mem::offset_of!(ModComponentDescriptor, align), 40);
+        assert_eq!(core::mem::offset_of!(ModComponentDescriptor, drop_fn), 48);
+        assert_eq!(
+            core::mem::offset_of!(ModComponentDescriptor, vtable_ptr),
+            56
+        );
+    }
+
+    #[test]
+    fn test_host_api_layout_and_offsets() {
+        assert_eq!(core::mem::size_of::<HostApi>(), 72);
+        assert_eq!(core::mem::align_of::<HostApi>(), 8);
+
+        assert_eq!(core::mem::offset_of!(HostApi, struct_size), 0);
+        assert_eq!(core::mem::offset_of!(HostApi, abi_version), 4);
+        assert_eq!(core::mem::offset_of!(HostApi, register_system), 8);
+        assert_eq!(core::mem::offset_of!(HostApi, iter_next_chunk), 16);
+        assert_eq!(core::mem::offset_of!(HostApi, iter_column_readonly), 24);
+        assert_eq!(core::mem::offset_of!(HostApi, iter_column_mutable), 32);
+        assert_eq!(core::mem::offset_of!(HostApi, iter_mark_changed), 40);
+        assert_eq!(core::mem::offset_of!(HostApi, iter_entities), 48);
+        assert_eq!(core::mem::offset_of!(HostApi, iter_column_stride), 56);
+        assert_eq!(core::mem::offset_of!(HostApi, register_component), 64);
+    }
+
+    #[test]
+    fn test_mod_component_descriptor_validation_matrix() {
+        let name = c"CustomData".as_ptr();
+        let uuid = ComponentUuid::from_name("CustomData");
+
+        // 1. Valid standard POD component
+        let valid_desc = ModComponentDescriptor::new(name, uuid, 16, 8);
+        assert!(valid_desc.is_valid());
+        assert_eq!(valid_desc.validate(), FfiResult::OK);
+        assert!(!valid_desc.is_zst());
+        assert!(valid_desc.is_pod());
+        assert!(valid_desc.layout().is_some());
+        unsafe {
+            assert_eq!(
+                valid_desc.name_cstr().unwrap().to_str().unwrap(),
+                "CustomData"
+            );
+        }
+
+        // 2. Valid Zero-Sized Type (ZST)
+        let zst_desc = ModComponentDescriptor::new(name, uuid, 0, 1);
+        assert!(zst_desc.is_valid());
+        assert_eq!(zst_desc.validate(), FfiResult::OK);
+        assert!(zst_desc.is_zst());
+        assert!(zst_desc.is_pod());
+        assert_eq!(zst_desc.layout().unwrap().size(), 0);
+        assert_eq!(zst_desc.layout().unwrap().align(), 1);
+
+        // 3. Valid over-aligned ZST
+        let overaligned_zst = ModComponentDescriptor::new(name, uuid, 0, 16);
+        assert!(overaligned_zst.is_valid());
+        assert_eq!(overaligned_zst.validate(), FfiResult::OK);
+        assert_eq!(overaligned_zst.layout().unwrap().align(), 16);
+
+        // 4. Invalid null name
+        let null_name = ModComponentDescriptor::new(core::ptr::null(), uuid, 16, 8);
+        assert!(!null_name.is_valid());
+        assert_eq!(null_name.validate(), FfiResult::NULL_POINTER);
+        unsafe {
+            assert!(null_name.name_cstr().is_none());
+        }
+
+        // 5. Invalid zero alignment
+        let mut zero_align = valid_desc;
+        zero_align.align = 0;
+        assert!(!zero_align.is_valid());
+        assert_eq!(zero_align.validate(), FfiResult::INVALID_COMPONENT);
+        assert!(zero_align.layout().is_none());
+
+        // 6. Invalid non-power-of-two alignment
+        let mut non_pot_align = valid_desc;
+        non_pot_align.align = 7;
+        assert!(!non_pot_align.is_valid());
+        assert_eq!(non_pot_align.validate(), FfiResult::INVALID_COMPONENT);
+        assert!(non_pot_align.layout().is_none());
+
+        // 7. Invalid misaligned size (size % align != 0)
+        let mut misaligned = valid_desc;
+        misaligned.size = 10;
+        misaligned.align = 4;
+        assert!(!misaligned.is_valid());
+        assert_eq!(misaligned.validate(), FfiResult::INVALID_COMPONENT);
+        assert!(misaligned.layout().is_none());
+
+        // 8. Invalid truncated struct_size (< 64)
+        let mut truncated = valid_desc;
+        truncated.struct_size = 40;
+        assert!(!truncated.is_valid());
+        assert_eq!(truncated.validate(), FfiResult::INVALID_VERSION);
+
+        // 9. Valid forward-compatible struct_size (>= 64)
+        let mut forward_compat = valid_desc;
+        forward_compat.struct_size = 128;
+        assert!(forward_compat.is_valid());
+        assert_eq!(forward_compat.validate(), FfiResult::OK);
+
+        // 10. with_drop and with_vtable
+        unsafe extern "C" fn dummy_drop(_ptr: *mut core::ffi::c_void) {}
+        let with_drop = valid_desc.with_drop(dummy_drop);
+        assert!(!with_drop.is_pod());
+        assert_eq!(
+            with_drop.drop_fn.map(|f| f as *const () as usize),
+            Some(dummy_drop as *const () as usize)
+        );
+
+        let vtable_dummy = 0x1234usize as *const core::ffi::c_void;
+        let with_vtable = valid_desc.with_vtable(vtable_dummy);
+        assert_eq!(with_vtable.vtable_ptr, vtable_dummy);
     }
 }

@@ -48,8 +48,17 @@ build-game-mods: ## Build the 3 distinct guest mods for Example 4 (Gravity, Rain
 	@echo -e "$(GREEN)[BUILD-GAME-MODS]$(RESET) Compiling Vortex guest mod..."
 	cargo build --manifest-path examples/04_visual_game/mods/mod_vortex/Cargo.toml --release
 
+.PHONY: build-3d-mods
+build-3d-mods: ## Build the 3 cute 3D guest mods for Example 5 (Rust Boing, Rust Carousel, C99 Cuddle)
+	@echo -e "$(GREEN)[BUILD-3D-MODS]$(RESET) Compiling Jelly Boing Rust guest mod..."
+	cargo build --manifest-path examples/05_cute_3d_winit/mods/mod_boing/Cargo.toml --release
+	@echo -e "$(GREEN)[BUILD-3D-MODS]$(RESET) Compiling Pastel Carousel Rust guest mod..."
+	cargo build --manifest-path examples/05_cute_3d_winit/mods/mod_carousel/Cargo.toml --release
+	@echo -e "$(GREEN)[BUILD-3D-MODS]$(RESET) Compiling Cozy Cuddle C99 guest mod..."
+	$(MAKE) -C examples/05_cute_3d_winit/mods/mod_cuddle_c99
+
 .PHONY: build-example-mods
-build-example-mods: build-game-mods ## Build guest mods for all progression examples (Stage 1, 2, 3, 4)
+build-example-mods: build-game-mods build-3d-mods ## Build guest mods for all progression examples (Stages 1-5)
 	@echo -e "$(GREEN)[BUILD-EXAMPLE-MODS]$(RESET) Compiling Example 1 guest mod..."
 	cargo build --manifest-path examples/01_minimal_handshake/guest_mod/Cargo.toml --release
 	@echo -e "$(GREEN)[BUILD-EXAMPLE-MODS]$(RESET) Compiling Example 2 guest mod..."
@@ -90,8 +99,20 @@ example-4-test: build-game-mods ## Run Stage 4 Visual Game in automated headless
 	@echo -e "$(GREEN)[EXAMPLE 4 TEST]$(RESET) Running Stage 4 in headless verification mode..."
 	cargo run --manifest-path examples/04_visual_game/Cargo.toml -- --test-mode --ticks 30
 
+.PHONY: example-5 game-3d
+example-5: build-3d-mods ## Run Stage 5 Cute 3D Slime Meadow (winit + wgpu) with Runtime Mod Reloading
+	@echo -e "$(GREEN)[EXAMPLE 5]$(RESET) Launching Stage 5 Cute 3D Slime Meadow (winit + wgpu)..."
+	cargo run --manifest-path examples/05_cute_3d_winit/Cargo.toml
+
+game-3d: example-5 ## Alias for example-5
+
+.PHONY: example-5-test
+example-5-test: build-3d-mods ## Run Stage 5 Cute 3D Slime Meadow in automated headless test mode
+	@echo -e "$(GREEN)[EXAMPLE 5 TEST]$(RESET) Running Stage 5 in headless 3D verification mode..."
+	cargo run --manifest-path examples/05_cute_3d_winit/Cargo.toml -- --test-mode --ticks 45
+
 .PHONY: examples
-examples: example-1 example-2 example-3 example-4-test ## Run all progression examples sequentially (Stages 1-4)
+examples: example-1 example-2 example-3 example-4-test example-5-test ## Run all progression examples sequentially (Stages 1-5)
 
 
 .PHONY: check
@@ -170,4 +191,13 @@ clean-mods: ## Clean guest mod build artifacts
 	fi
 	@if [ -f "examples/04_visual_game/mods/mod_vortex/Cargo.toml" ]; then \
 		cargo clean --manifest-path examples/04_visual_game/mods/mod_vortex/Cargo.toml; \
+	fi
+	@if [ -f "examples/05_cute_3d_winit/mods/mod_boing/Cargo.toml" ]; then \
+		cargo clean --manifest-path examples/05_cute_3d_winit/mods/mod_boing/Cargo.toml; \
+	fi
+	@if [ -f "examples/05_cute_3d_winit/mods/mod_carousel/Cargo.toml" ]; then \
+		cargo clean --manifest-path examples/05_cute_3d_winit/mods/mod_carousel/Cargo.toml; \
+	fi
+	@if [ -f "examples/05_cute_3d_winit/mods/mod_cuddle_c99/Makefile" ]; then \
+		$(MAKE) -C examples/05_cute_3d_winit/mods/mod_cuddle_c99 clean; \
 	fi

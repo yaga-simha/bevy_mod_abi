@@ -34,13 +34,15 @@
 
 use crate::chunk_iter::{HostChunkIter, QueryColumnDesc};
 use crate::commands::CommandQueueBridge;
-use crate::registry::ModRegistry;
+use crate::registry::{ModRegistry, RegisteredComponent};
 use abi_contract::{
     ComponentAccessMode, DynamicSystemCallback, FfiResult, MultiQuerySystemCallback,
     MultiQuerySystemDescriptor, RawChunkIter, RawCommandQueue, SystemDescriptor,
 };
 use bevy_ecs::archetype::ArchetypeGeneration;
 use bevy_ecs::change_detection::{CheckChangeTicks, Tick};
+use bevy_ecs::component::{ComponentCloneBehavior, ComponentDescriptor, StorageType};
+use bevy_ecs::ptr::OwningPtr;
 use bevy_ecs::query::{FilteredAccess, FilteredAccessSet};
 use bevy_ecs::storage::TableId;
 use bevy_ecs::system::{RunSystemError, System, SystemAccess, SystemIn, SystemStateFlags};
@@ -49,10 +51,104 @@ use bevy_ecs::world::unsafe_world_cell::UnsafeWorldCell;
 use bevy_ecs::world::{CommandQueue, DeferredWorld, World};
 use core::ffi::{c_void, CStr};
 use core::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Maximum number of concurrent/nested queries supported per multi-query dynamic system.
 pub const MAX_SYSTEM_QUERIES: usize = 8;
+
+struct DropTrampolineSlot {
+    uuid: abi_contract::ComponentUuid,
+    drop_fn: unsafe extern "C" fn(ptr: *mut c_void),
+    is_active: Arc<AtomicBool>,
+}
+
+static DROP_TRAMPOLINE_SLOTS: [Mutex<Option<DropTrampolineSlot>>; 64] = {
+    const INIT: Mutex<Option<DropTrampolineSlot>> = Mutex::new(None);
+    [INIT; 64]
+};
+
+macro_rules! make_trampolines {
+    ($($name:ident => $i:expr),* $(,)?) => {
+        $(
+            unsafe fn $name(ptr: OwningPtr<'_>) {
+                if let Ok(guard) = DROP_TRAMPOLINE_SLOTS[$i].lock() {
+                    if let Some(slot) = guard.as_ref() {
+                        if slot.is_active.load(Ordering::Acquire) {
+                            let raw = ptr.as_ptr() as *mut c_void;
+                            // SAFETY: foreign drop function called on valid instance while mod is active.
+                            unsafe { (slot.drop_fn)(raw) };
+                        }
+                    }
+                }
+            }
+        )*
+
+        static DROP_TRAMPOLINE_FNS: [for<'a> unsafe fn(OwningPtr<'a>); 64] = [
+            $($name),*
+        ];
+    };
+}
+
+make_trampolines!(
+    t0 => 0, t1 => 1, t2 => 2, t3 => 3, t4 => 4, t5 => 5, t6 => 6, t7 => 7,
+    t8 => 8, t9 => 9, t10 => 10, t11 => 11, t12 => 12, t13 => 13, t14 => 14, t15 => 15,
+    t16 => 16, t17 => 17, t18 => 18, t19 => 19, t20 => 20, t21 => 21, t22 => 22, t23 => 23,
+    t24 => 24, t25 => 25, t26 => 26, t27 => 27, t28 => 28, t29 => 29, t30 => 30, t31 => 31,
+    t32 => 32, t33 => 33, t34 => 34, t35 => 35, t36 => 36, t37 => 37, t38 => 38, t39 => 39,
+    t40 => 40, t41 => 41, t42 => 42, t43 => 43, t44 => 44, t45 => 45, t46 => 46, t47 => 47,
+    t48 => 48, t49 => 49, t50 => 50, t51 => 51, t52 => 52, t53 => 53, t54 => 54, t55 => 55,
+    t56 => 56, t57 => 57, t58 => 58, t59 => 59, t60 => 60, t61 => 61, t62 => 62, t63 => 63,
+);
+
+fn allocate_drop_trampoline(
+    uuid: abi_contract::ComponentUuid,
+    drop_fn: unsafe extern "C" fn(ptr: *mut c_void),
+    is_active: Arc<AtomicBool>,
+) -> Option<for<'a> unsafe fn(OwningPtr<'a>)> {
+    // 1. Safe reuse: Check if a slot is already assigned to this exact ComponentUuid (e.g. mod reload)
+    for i in 0..64 {
+        if let Ok(mut guard) = DROP_TRAMPOLINE_SLOTS[i].lock() {
+            if let Some(slot) = guard.as_mut() {
+                if slot.uuid == uuid {
+                    slot.drop_fn = drop_fn;
+                    slot.is_active = is_active;
+                    return Some(DROP_TRAMPOLINE_FNS[i]);
+                }
+            }
+        }
+    }
+
+    // 2. Allocate an unassigned slot (None)
+    for i in 0..64 {
+        if let Ok(mut guard) = DROP_TRAMPOLINE_SLOTS[i].lock() {
+            if guard.is_none() {
+                *guard = Some(DropTrampolineSlot {
+                    uuid,
+                    drop_fn,
+                    is_active,
+                });
+                return Some(DROP_TRAMPOLINE_FNS[i]);
+            }
+        }
+    }
+
+    // 3. Pool is exhausted by distinct ComponentUuids.
+    // NEVER reuse an inactive slot belonging to a different ComponentUuid.
+    None
+}
+
+/// Resets all drop trampoline slots to `None`.
+///
+/// # Safety / Warning
+/// This function is intended strictly for resetting global trampoline state between integration tests.
+#[doc(hidden)]
+pub fn reset_drop_trampolines_for_testing() {
+    for i in 0..64 {
+        if let Ok(mut guard) = DROP_TRAMPOLINE_SLOTS[i].lock() {
+            *guard = None;
+        }
+    }
+}
 
 /// Owned representation of component access mode and component name for a dynamic query clause.
 #[derive(Clone, Debug)]
@@ -245,39 +341,68 @@ impl System for DynamicCSystem {
         self.last_run = self.this_run;
         self.self_conflict = false;
 
+        // Synchronize with world's ModRegistry to ensure dynamically registered components are available
+        if let Some(world_reg) = world.get_resource::<ModRegistry>() {
+            self.registry = Arc::new(world_reg.clone());
+        }
+
         let mut access_set = FilteredAccessSet::new();
 
         for group in &mut self.query_groups {
             group.columns.clear();
             let mut filtered_access = FilteredAccess::default();
+            let mut read_components = std::collections::HashSet::new();
+            let mut write_components = std::collections::HashSet::new();
 
             for desc in &group.descs {
-                if let Some(reg) = self.registry.get_by_name(&desc.name) {
-                    let comp_id = reg.component_id;
-                    let stride = reg.size;
+                let Some(reg) = self.registry.get_by_name(&desc.name) else {
+                    // Missing component: disable system and return SystemAccess::None
+                    self.enabled = false;
+                    self.access = SystemAccess::None;
+                    return self.access.clone();
+                };
 
-                    group.columns.push(QueryColumnDesc {
-                        component_id: comp_id,
-                        mode: desc.mode,
-                        stride,
-                    });
+                let comp_id = reg.component_id;
+                let stride = reg.size;
 
-                    match desc.mode {
-                        ComponentAccessMode::READ => {
-                            filtered_access.add_read(comp_id);
+                match desc.mode {
+                    ComponentAccessMode::READ => {
+                        // Intra-query conflict check: cannot READ if component is already declared for WRITE
+                        if write_components.contains(&comp_id) {
+                            self.self_conflict = true;
+                            self.enabled = false;
+                            self.access = SystemAccess::None;
+                            return self.access.clone();
                         }
-                        ComponentAccessMode::WRITE => {
-                            filtered_access.add_write(comp_id);
-                        }
-                        ComponentAccessMode::FILTER_ONLY => {
-                            filtered_access.and_with(comp_id);
-                        }
-                        ComponentAccessMode::WITHOUT => {
-                            filtered_access.and_without(comp_id);
-                        }
-                        _ => {}
+                        read_components.insert(comp_id);
+                        filtered_access.add_read(comp_id);
                     }
+                    ComponentAccessMode::WRITE => {
+                        // Intra-query conflict check: cannot WRITE if component is already declared for READ or WRITE
+                        if read_components.contains(&comp_id) || write_components.contains(&comp_id)
+                        {
+                            self.self_conflict = true;
+                            self.enabled = false;
+                            self.access = SystemAccess::None;
+                            return self.access.clone();
+                        }
+                        write_components.insert(comp_id);
+                        filtered_access.add_write(comp_id);
+                    }
+                    ComponentAccessMode::FILTER_ONLY => {
+                        filtered_access.and_with(comp_id);
+                    }
+                    ComponentAccessMode::WITHOUT => {
+                        filtered_access.and_without(comp_id);
+                    }
+                    _ => {}
                 }
+
+                group.columns.push(QueryColumnDesc {
+                    component_id: comp_id,
+                    mode: desc.mode,
+                    stride,
+                });
             }
 
             let mut candidate_set = FilteredAccessSet::new();
@@ -288,6 +413,11 @@ impl System for DynamicCSystem {
             }
 
             access_set.add(filtered_access);
+        }
+
+        if self.self_conflict || !self.enabled {
+            self.access = SystemAccess::None;
+            return self.access.clone();
         }
 
         self.access = SystemAccess::Shared(access_set);
@@ -418,6 +548,10 @@ pub struct ModInitContext {
     pub registered_systems: Vec<DynamicCSystem>,
     /// Shared atomic tombstone flag.
     pub is_active: Arc<AtomicBool>,
+    /// Pointer to the Bevy World during mod initialization (null if not in World scope).
+    pub world: *mut World,
+    /// Dynamic components registered during initialization.
+    pub registered_components: Vec<RegisteredComponent>,
 }
 
 impl ModInitContext {
@@ -427,6 +561,8 @@ impl ModInitContext {
             registry,
             registered_systems: Vec::new(),
             is_active: Arc::new(AtomicBool::new(true)),
+            world: core::ptr::null_mut(),
+            registered_components: Vec::new(),
         }
     }
 
@@ -436,8 +572,52 @@ impl ModInitContext {
             registry,
             registered_systems: Vec::new(),
             is_active,
+            world: core::ptr::null_mut(),
+            registered_components: Vec::new(),
         }
     }
+
+    /// Creates an initialization context with a specific active flag and mutable World access.
+    pub fn with_world(
+        registry: Arc<ModRegistry>,
+        is_active: Arc<AtomicBool>,
+        world: *mut World,
+    ) -> Self {
+        Self {
+            registry,
+            registered_systems: Vec::new(),
+            is_active,
+            world,
+            registered_components: Vec::new(),
+        }
+    }
+
+    /// Marks this context as active on the current thread for the duration of the returned guard.
+    pub fn make_active(&mut self) -> ActiveInitContextGuard {
+        set_active_init_context(self as *mut ModInitContext)
+    }
+}
+
+thread_local! {
+    /// Active initialization context on the current thread.
+    pub static ACTIVE_INIT_CONTEXT: std::cell::Cell<*mut ModInitContext> = const { std::cell::Cell::new(core::ptr::null_mut()) };
+}
+
+/// RAII guard restoring the previous thread-local [`ACTIVE_INIT_CONTEXT`] on drop.
+pub struct ActiveInitContextGuard {
+    prev: *mut ModInitContext,
+}
+
+impl Drop for ActiveInitContextGuard {
+    fn drop(&mut self) {
+        ACTIVE_INIT_CONTEXT.with(|c| c.set(self.prev));
+    }
+}
+
+/// Sets the thread-local active [`ModInitContext`].
+pub fn set_active_init_context(ctx: *mut ModInitContext) -> ActiveInitContextGuard {
+    let prev = ACTIVE_INIT_CONTEXT.with(|c| c.replace(ctx));
+    ActiveInitContextGuard { prev }
 }
 
 /// C-ABI implementation of `register_system`.
@@ -581,6 +761,137 @@ pub unsafe extern "C" fn host_register_multi_query_system(
     )
     .with_is_active(Arc::clone(&init_ctx.is_active));
     init_ctx.registered_systems.push(system);
+
+    FfiResult::OK
+}
+
+/// C-ABI implementation of `register_component` for registering dynamic runtime components.
+///
+/// Performs comprehensive defensive C-ABI validation on the component descriptor and host context.
+/// If called with an active `ModInitContext` backed by a Bevy `World`, dynamically registers the
+/// component in the `World` and `ModRegistry`.
+///
+/// # Safety
+/// - `host_context` must point to a valid host context (e.g. [`ModInitContext`]).
+/// - `descriptor` must point to a valid [`abi_contract::ModComponentDescriptor`].
+pub unsafe extern "C" fn host_register_component(
+    host_context: *mut c_void,
+    descriptor: *const abi_contract::ModComponentDescriptor,
+) -> FfiResult {
+    if host_context.is_null() || descriptor.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+
+    // SAFETY: caller passes a valid pointer to ModComponentDescriptor.
+    let desc = unsafe { &*descriptor };
+    if (desc.struct_size as usize) < core::mem::size_of::<abi_contract::ModComponentDescriptor>() {
+        return FfiResult::INVALID_VERSION;
+    }
+    if desc.name.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: desc.name is checked non-null and is assumed to point to a NUL-terminated C string.
+    let Ok(name_str) = (unsafe { CStr::from_ptr(desc.name) }).to_str() else {
+        return FfiResult::INVALID_UTF8;
+    };
+    if desc.align == 0 || !desc.align.is_power_of_two() {
+        return FfiResult::INTERNAL_ERROR;
+    }
+    if !desc.size.is_multiple_of(desc.align) {
+        return FfiResult::INTERNAL_ERROR;
+    }
+    let Some(layout) = desc.layout() else {
+        return FfiResult::INTERNAL_ERROR;
+    };
+
+    let active_ptr = ACTIVE_INIT_CONTEXT.with(|c| c.get());
+    if !active_ptr.is_null() {
+        if host_context != (active_ptr as *mut c_void) {
+            return FfiResult::INTERNAL_ERROR;
+        }
+        // SAFETY: active_ptr was set from a valid reference to ModInitContext on this thread.
+        let init_ctx = unsafe { &mut *active_ptr };
+        if init_ctx.world.is_null() {
+            return FfiResult::INTERNAL_ERROR;
+        }
+        // SAFETY: init_ctx.world was created from a valid &mut World.
+        let world = unsafe { &mut *init_ctx.world };
+
+        // Check if component already exists with identical layout (idempotent registration / reload)
+        if let Some(existing) = world
+            .get_resource::<ModRegistry>()
+            .and_then(|r| r.get_by_name(name_str))
+        {
+            if existing.size == desc.size
+                && existing.align == desc.align
+                && existing.uuid == desc.uuid
+            {
+                // Update drop trampoline slot for the reloaded mod instance
+                if let Some(drop_fn) = desc.drop_fn {
+                    match allocate_drop_trampoline(
+                        desc.uuid,
+                        drop_fn,
+                        Arc::clone(&init_ctx.is_active),
+                    ) {
+                        Some(_) => {}
+                        None => return FfiResult::INTERNAL_ERROR,
+                    }
+                }
+                if !init_ctx
+                    .registered_components
+                    .iter()
+                    .any(|c| c.component_id == existing.component_id)
+                {
+                    init_ctx.registered_components.push(existing.clone());
+                }
+                let mut reg_clone = (*init_ctx.registry).clone();
+                reg_clone.register_dynamic_component(
+                    existing.component_id,
+                    desc,
+                    name_str.to_string(),
+                );
+                init_ctx.registry = Arc::new(reg_clone);
+                return FfiResult::OK;
+            } else {
+                return FfiResult::INVALID_COMPONENT;
+            }
+        }
+
+        let drop_trampoline = if let Some(drop_fn) = desc.drop_fn {
+            match allocate_drop_trampoline(desc.uuid, drop_fn, Arc::clone(&init_ctx.is_active)) {
+                Some(t) => Some(t),
+                None => return FfiResult::INTERNAL_ERROR,
+            }
+        } else {
+            None
+        };
+
+        // SAFETY: layout verified above; drop_trampoline satisfies OwningPtr signature; Table storage used.
+        let bevy_desc = unsafe {
+            ComponentDescriptor::new_with_layout(
+                name_str.to_string(),
+                StorageType::Table,
+                layout,
+                drop_trampoline,
+                true,
+                true,
+                ComponentCloneBehavior::Default,
+                None,
+            )
+        };
+        let comp_id = world.register_component_with_descriptor(bevy_desc);
+
+        if let Some(mut registry) = world.get_resource_mut::<ModRegistry>() {
+            registry.register_dynamic_component(comp_id, desc, name_str.to_string());
+            if let Some(reg_comp) = registry.get_by_id(comp_id) {
+                init_ctx.registered_components.push(reg_comp.clone());
+            }
+        }
+
+        let mut reg_clone = (*init_ctx.registry).clone();
+        reg_clone.register_dynamic_component(comp_id, desc, name_str.to_string());
+        init_ctx.registry = Arc::new(reg_clone);
+    }
 
     FfiResult::OK
 }

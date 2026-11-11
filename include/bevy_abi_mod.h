@@ -21,6 +21,46 @@ extern "C" {
     #define BEVY_ABI_MOD_EXPORT __attribute__((visibility("default")))
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+    #define BEVY_ABI_UNUSED __attribute__((unused))
+#else
+    #define BEVY_ABI_UNUSED
+#endif
+
+#if defined(__cplusplus)
+    #if __cplusplus >= 201103L
+        #define BEVY_ABI_ALIGNOF(type) alignof(type)
+    #else
+        #define BEVY_ABI_ALIGNOF(type) __alignof__(type)
+    #endif
+#elif defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
+    #define BEVY_ABI_ALIGNOF(type) _Alignof(type)
+#elif defined(__GNUC__) || defined(__clang__)
+    #define BEVY_ABI_ALIGNOF(type) __alignof__(type)
+#else
+    #define BEVY_ABI_ALIGNOF(type) sizeof(type)
+#endif
+
+#if defined(__cplusplus)
+    #if __cplusplus >= 201103L
+        #define BEVY_ABI_STATIC_ASSERT(cond, msg) static_assert(cond, msg)
+    #else
+        #define BEVY_ABI_STATIC_ASSERT_INNER(a, b) a##b
+        #define BEVY_ABI_STATIC_ASSERT_CONCAT(a, b) BEVY_ABI_STATIC_ASSERT_INNER(a, b)
+        #define BEVY_ABI_STATIC_ASSERT(cond, msg) \
+            typedef char BEVY_ABI_STATIC_ASSERT_CONCAT(bevy_abi_static_assert_, __LINE__)[(cond) ? 1 : -1]
+    #endif
+#elif defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
+    #define BEVY_ABI_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
+#elif defined(__GNUC__) || defined(__clang__)
+    #define BEVY_ABI_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
+#else
+    #define BEVY_ABI_STATIC_ASSERT_INNER(a, b) a##b
+    #define BEVY_ABI_STATIC_ASSERT_CONCAT(a, b) BEVY_ABI_STATIC_ASSERT_INNER(a, b)
+    #define BEVY_ABI_STATIC_ASSERT(cond, msg) \
+        typedef char BEVY_ABI_STATIC_ASSERT_CONCAT(bevy_abi_static_assert_, __LINE__)[(cond) ? 1 : -1]
+#endif
+
 /* Status codes (matches `abi_contract::FfiResult`) */
 typedef uint32_t FfiResult;
 #define FFI_RESULT_OK                 0u
@@ -48,6 +88,33 @@ typedef FfiByteSlice StrView;
 typedef struct ComponentUuid {
     uint8_t bytes[16];
 } ComponentUuid;
+
+/**
+ * Compute deterministic 128-bit UUID from component name string using 2-lane 64-bit FNV-1a.
+ * Matches `abi_contract::ComponentUuid::from_name` byte-for-byte across all platforms.
+ */
+static inline BEVY_ABI_UNUSED ComponentUuid bevy_abi_uuid_from_name(const char* name) {
+    ComponentUuid id = {{0}};
+    if (!name) {
+        return id;
+    }
+    uint64_t h1 = 0xcbf29ce484222325ULL;
+    uint64_t h2 = 0x84222325cbf29ce4ULL;
+    size_t i = 0;
+    while (name[i] != '\0') {
+        uint64_t b = (uint8_t)name[i];
+        h1 ^= b;
+        h1 *= 0x100000001b3ULL;
+        h2 ^= b ^ (i * 0x9e3779b97f4a7c15ULL);
+        h2 *= 0x100000001b3ULL;
+        i++;
+    }
+    for (int j = 0; j < 8; ++j) {
+        id.bytes[j] = (uint8_t)((h1 >> (j * 8)) & 0xff);
+        id.bytes[8 + j] = (uint8_t)((h2 >> (j * 8)) & 0xff);
+    }
+    return id;
+}
 
 /* Component access mode (`abi_contract::ComponentAccessMode`) */
 typedef uint32_t ComponentAccessMode;
@@ -128,6 +195,29 @@ typedef FfiResult (*RegisterSystemFn)(
 /* Symbol resolver function pointer (`abi_contract::GetProcAddressFn`) */
 typedef const void* (*GetProcAddressFn)(const char* name);
 
+/* Component lifecycle drop callback (`abi_contract::ComponentDropFn`) */
+typedef void (*ComponentDropFn)(void* ptr);
+
+/* Dynamic component registration descriptor (`abi_contract::ModComponentDescriptor`) */
+typedef struct ModComponentDescriptor {
+    uint32_t struct_size;
+    const char* name;
+    ComponentUuid uuid;
+    size_t size;
+    size_t align;
+    ComponentDropFn drop_fn;
+    const void* vtable_ptr;
+} ModComponentDescriptor;
+
+/* Ergonomic type alias */
+typedef ModComponentDescriptor DynamicComponentDescriptor;
+
+/* Dynamic component registration function signature (`abi_contract::RegisterComponentFn`) */
+typedef FfiResult (*RegisterComponentFn)(
+    void* host_context,
+    const ModComponentDescriptor* descriptor
+);
+
 /* Host API VTable (`abi_contract::HostApi`) */
 typedef struct HostApi {
     uint32_t struct_size;
@@ -139,7 +229,59 @@ typedef struct HostApi {
     IterMarkChangedFn iter_mark_changed;
     IterEntitiesFn iter_entities;
     IterColumnStrideFn iter_column_stride;
+    RegisterComponentFn register_component;
 } HostApi;
+
+/* Static ABI layout assertions for 64-bit architectures */
+#if defined(__LP64__) || defined(_WIN64) || (defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 8)
+BEVY_ABI_STATIC_ASSERT(sizeof(ModComponentDescriptor) == 64, "ModComponentDescriptor 64-bit size must be 64");
+BEVY_ABI_STATIC_ASSERT(BEVY_ABI_ALIGNOF(ModComponentDescriptor) == 8, "ModComponentDescriptor 64-bit align must be 8");
+BEVY_ABI_STATIC_ASSERT(offsetof(ModComponentDescriptor, struct_size) == 0, "offset of struct_size must be 0");
+BEVY_ABI_STATIC_ASSERT(offsetof(ModComponentDescriptor, name) == 8, "offset of name must be 8");
+BEVY_ABI_STATIC_ASSERT(offsetof(ModComponentDescriptor, uuid) == 16, "offset of uuid must be 16");
+BEVY_ABI_STATIC_ASSERT(offsetof(ModComponentDescriptor, size) == 32, "offset of size must be 32");
+BEVY_ABI_STATIC_ASSERT(offsetof(ModComponentDescriptor, align) == 40, "offset of align must be 40");
+BEVY_ABI_STATIC_ASSERT(offsetof(ModComponentDescriptor, drop_fn) == 48, "offset of drop_fn must be 48");
+BEVY_ABI_STATIC_ASSERT(offsetof(ModComponentDescriptor, vtable_ptr) == 56, "offset of vtable_ptr must be 56");
+
+BEVY_ABI_STATIC_ASSERT(sizeof(HostApi) == 72, "HostApi 64-bit size must be 72");
+BEVY_ABI_STATIC_ASSERT(BEVY_ABI_ALIGNOF(HostApi) == 8, "HostApi 64-bit align must be 8");
+BEVY_ABI_STATIC_ASSERT(offsetof(HostApi, struct_size) == 0, "offset of struct_size must be 0");
+BEVY_ABI_STATIC_ASSERT(offsetof(HostApi, abi_version) == 4, "offset of abi_version must be 4");
+BEVY_ABI_STATIC_ASSERT(offsetof(HostApi, register_system) == 8, "offset of register_system must be 8");
+BEVY_ABI_STATIC_ASSERT(offsetof(HostApi, iter_next_chunk) == 16, "offset of iter_next_chunk must be 16");
+BEVY_ABI_STATIC_ASSERT(offsetof(HostApi, iter_column_readonly) == 24, "offset of iter_column_readonly must be 24");
+BEVY_ABI_STATIC_ASSERT(offsetof(HostApi, iter_column_mutable) == 32, "offset of iter_column_mutable must be 32");
+BEVY_ABI_STATIC_ASSERT(offsetof(HostApi, iter_mark_changed) == 40, "offset of iter_mark_changed must be 40");
+BEVY_ABI_STATIC_ASSERT(offsetof(HostApi, iter_entities) == 48, "offset of iter_entities must be 48");
+BEVY_ABI_STATIC_ASSERT(offsetof(HostApi, iter_column_stride) == 56, "offset of iter_column_stride must be 56");
+BEVY_ABI_STATIC_ASSERT(offsetof(HostApi, register_component) == 64, "offset of register_component must be 64");
+
+/* Static ABI layout assertions for 32-bit architectures */
+#elif defined(__ILP32__) || (defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 4)
+BEVY_ABI_STATIC_ASSERT(sizeof(ModComponentDescriptor) == 40, "ModComponentDescriptor 32-bit size must be 40");
+BEVY_ABI_STATIC_ASSERT(BEVY_ABI_ALIGNOF(ModComponentDescriptor) == 4, "ModComponentDescriptor 32-bit align must be 4");
+BEVY_ABI_STATIC_ASSERT(offsetof(ModComponentDescriptor, struct_size) == 0, "offset of struct_size must be 0");
+BEVY_ABI_STATIC_ASSERT(offsetof(ModComponentDescriptor, name) == 4, "offset of name must be 4");
+BEVY_ABI_STATIC_ASSERT(offsetof(ModComponentDescriptor, uuid) == 8, "offset of uuid must be 8");
+BEVY_ABI_STATIC_ASSERT(offsetof(ModComponentDescriptor, size) == 24, "offset of size must be 24");
+BEVY_ABI_STATIC_ASSERT(offsetof(ModComponentDescriptor, align) == 28, "offset of align must be 28");
+BEVY_ABI_STATIC_ASSERT(offsetof(ModComponentDescriptor, drop_fn) == 32, "offset of drop_fn must be 32");
+BEVY_ABI_STATIC_ASSERT(offsetof(ModComponentDescriptor, vtable_ptr) == 36, "offset of vtable_ptr must be 36");
+
+BEVY_ABI_STATIC_ASSERT(sizeof(HostApi) == 40, "HostApi 32-bit size must be 40");
+BEVY_ABI_STATIC_ASSERT(BEVY_ABI_ALIGNOF(HostApi) == 4, "HostApi 32-bit align must be 4");
+BEVY_ABI_STATIC_ASSERT(offsetof(HostApi, struct_size) == 0, "offset of struct_size must be 0");
+BEVY_ABI_STATIC_ASSERT(offsetof(HostApi, abi_version) == 4, "offset of abi_version must be 4");
+BEVY_ABI_STATIC_ASSERT(offsetof(HostApi, register_system) == 8, "offset of register_system must be 8");
+BEVY_ABI_STATIC_ASSERT(offsetof(HostApi, iter_next_chunk) == 12, "offset of iter_next_chunk must be 12");
+BEVY_ABI_STATIC_ASSERT(offsetof(HostApi, iter_column_readonly) == 16, "offset of iter_column_readonly must be 16");
+BEVY_ABI_STATIC_ASSERT(offsetof(HostApi, iter_column_mutable) == 20, "offset of iter_column_mutable must be 20");
+BEVY_ABI_STATIC_ASSERT(offsetof(HostApi, iter_mark_changed) == 24, "offset of iter_mark_changed must be 24");
+BEVY_ABI_STATIC_ASSERT(offsetof(HostApi, iter_entities) == 28, "offset of iter_entities must be 28");
+BEVY_ABI_STATIC_ASSERT(offsetof(HostApi, iter_column_stride) == 32, "offset of iter_column_stride must be 32");
+BEVY_ABI_STATIC_ASSERT(offsetof(HostApi, register_component) == 36, "offset of register_component must be 36");
+#endif
 
 /* Mod lifecycle entry points */
 typedef uint32_t (*ModAbiVersionFn)(void);

@@ -1,6 +1,5 @@
 use crossterm::{
-    cursor,
-    execute,
+    cursor, execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use std::io::stdout;
@@ -119,4 +118,3 @@ fn test_terminal_guard_unwind_drops_guard_safely() {
         "Guard drop must execute during panic stack unwinding"
     );
 }
-

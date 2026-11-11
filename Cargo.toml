@@ -11,6 +11,7 @@ members = [
     "examples/02_multi_system_pipeline",
     "examples/03_cross_language_interop",
     "examples/04_visual_game",
+    "examples/05_cute_3d_winit",
 ]
 exclude = [
     # `shared_scenario` has `crate-type = ["dylib"]` so `permutation_bench` and
@@ -27,6 +28,8 @@ exclude = [
     "examples/04_visual_game/mods/mod_gravity",
     "examples/04_visual_game/mods/mod_rainbow",
     "examples/04_visual_game/mods/mod_vortex",
+    "examples/05_cute_3d_winit/mods/mod_boing",
+    "examples/05_cute_3d_winit/mods/mod_carousel",
 ]
 
 [workspace.package]

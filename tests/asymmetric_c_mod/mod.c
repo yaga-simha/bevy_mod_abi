@@ -85,6 +85,20 @@ typedef FfiResult (*CmdInsertComponentFn)(
 );
 
 /* ============================================================================
+ * Dynamic Component Definitions (Milestone 3)
+ * ============================================================================ */
+
+typedef struct CModCustomData {
+    float mana;
+    int32_t level;
+} CModCustomData;
+
+BEVY_ABI_STATIC_ASSERT(sizeof(CModCustomData) == 8, "CModCustomData size must be 8");
+BEVY_ABI_STATIC_ASSERT(BEVY_ABI_ALIGNOF(CModCustomData) == 4, "CModCustomData align must be 4");
+BEVY_ABI_STATIC_ASSERT(offsetof(CModCustomData, mana) == 0, "CModCustomData mana offset must be 0");
+BEVY_ABI_STATIC_ASSERT(offsetof(CModCustomData, level) == 4, "CModCustomData level offset must be 4");
+
+/* ============================================================================
  * Mod Global State
  * ============================================================================ */
 
@@ -307,6 +321,45 @@ static FfiResult c_command_system(
     return FFI_RESULT_OK;
 }
 
+/*
+ * Scenario 5: Dynamic Component System (Milestone 3)
+ * Queries CModCustomData (WRITE) registered at runtime across the C-ABI.
+ * Traverses chunks using raw column stride and applies in-place field updates.
+ */
+static FfiResult c_custom_data_system(
+    RawChunkIter* iter,
+    RawCommandQueue* commands,
+    void* user_data
+) {
+    (void)commands;
+    (void)user_data;
+    if (!g_c_host_api) {
+        return FFI_RESULT_INTERNAL_ERROR;
+    }
+
+    while (1) {
+        size_t count = g_c_host_api->iter_next_chunk(iter);
+        if (count == 0) {
+            break;
+        }
+
+        uint8_t* base = g_c_host_api->iter_column_mutable(iter, 0);
+        size_t stride = g_c_host_api->iter_column_stride(iter, 0);
+        if (!base) {
+            return FFI_RESULT_NULL_POINTER;
+        }
+
+        for (size_t i = 0; i < count; ++i) {
+            CModCustomData* data = (CModCustomData*)(base + (i * stride));
+            data->mana += 5.0f;
+            data->level += 1;
+            g_c_host_api->iter_mark_changed(iter, 0, i);
+        }
+    }
+
+    return FFI_RESULT_OK;
+}
+
 /* ============================================================================
  * Exported Mod Entry Points & Lifecycle
  * ============================================================================ */
@@ -452,6 +505,42 @@ BEVY_ABI_MOD_EXPORT FfiResult bevy_abi_mod_init(
         FfiResult reg_res = host_api->register_system(host_context, &desc);
         if (reg_res != FFI_RESULT_OK) {
             return reg_res;
+        }
+    }
+
+    // 5. Register CModCustomData dynamic component and system (Milestone 3)
+    if (host_api->register_component) {
+        ModComponentDescriptor desc;
+        memset(&desc, 0, sizeof(desc));
+        desc.struct_size = (uint32_t)sizeof(ModComponentDescriptor);
+        desc.name = "CModCustomData";
+        desc.uuid = bevy_abi_uuid_from_name("CModCustomData");
+        desc.size = sizeof(CModCustomData);
+        desc.align = BEVY_ABI_ALIGNOF(CModCustomData);
+        desc.drop_fn = NULL;
+        desc.vtable_ptr = NULL;
+
+        FfiResult reg_comp_res = host_api->register_component(host_context, &desc);
+        if (reg_comp_res != FFI_RESULT_OK) {
+            return reg_comp_res;
+        }
+
+        static ComponentAccessDesc custom_queries[1];
+        custom_queries[0].name = "CModCustomData";
+        custom_queries[0].mode = COMPONENT_ACCESS_WRITE;
+
+        SystemDescriptor sys_desc;
+        memset(&sys_desc, 0, sizeof(sys_desc));
+        sys_desc.struct_size = (uint32_t)sizeof(SystemDescriptor);
+        sys_desc.name = "c_custom_data_system";
+        sys_desc.queries = custom_queries;
+        sys_desc.query_count = 1;
+        sys_desc.callback = c_custom_data_system;
+        sys_desc.user_data = NULL;
+
+        FfiResult reg_sys_res = host_api->register_system(host_context, &sys_desc);
+        if (reg_sys_res != FFI_RESULT_OK) {
+            return reg_sys_res;
         }
     }
 

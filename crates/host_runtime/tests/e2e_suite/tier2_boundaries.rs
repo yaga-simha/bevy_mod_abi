@@ -1322,6 +1322,7 @@ fn t2_f22_04_init_version_mismatch() {
         iter_mark_changed: mock_iter_mark_changed,
         iter_entities: mock_iter_entities,
         iter_column_stride: mock_iter_column_stride,
+        register_component: mock_register_component,
     };
     assert_ne!(api.abi_version, ABI_VERSION_PACKED);
 }
