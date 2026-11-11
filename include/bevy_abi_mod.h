@@ -3,7 +3,6 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -14,6 +13,13 @@ extern "C" {
 #define BEVY_ABI_VERSION_PATCH 0u
 #define BEVY_ABI_VERSION_PACKED \
     ((BEVY_ABI_VERSION_MAJOR << 24) | (BEVY_ABI_VERSION_MINOR << 16) | BEVY_ABI_VERSION_PATCH)
+
+/* FFI-safe boolean byte (`abi_contract::FfiBool`).
+ * Rust's `bool` makes byte values 2..=255 undefined behavior across `extern "C"`,
+ * so all C-ABI boolean fields and accessors use `uint8_t` (0 = false, non-zero = true). */
+typedef uint8_t FfiBool;
+#define FFI_BOOL_FALSE ((FfiBool)0u)
+#define FFI_BOOL_TRUE  ((FfiBool)1u)
 
 #if defined(_WIN32)
     #define BEVY_ABI_MOD_EXPORT __declspec(dllexport)
@@ -61,6 +67,30 @@ extern "C" {
         typedef char BEVY_ABI_STATIC_ASSERT_CONCAT(bevy_abi_static_assert_, __LINE__)[(cond) ? 1 : -1]
 #endif
 
+/* Packed SemVer helpers (`abi_contract::pack_abi_version`, `abi_version_is_compatible`) */
+static inline BEVY_ABI_UNUSED uint32_t bevy_abi_pack_version(uint32_t major, uint32_t minor, uint32_t patch) {
+    return ((major & 0xFFu) << 24) | ((minor & 0xFFu) << 16) | (patch & 0xFFFFu);
+}
+
+static inline BEVY_ABI_UNUSED uint32_t bevy_abi_version_major(uint32_t packed) {
+    return (packed >> 24) & 0xFFu;
+}
+
+static inline BEVY_ABI_UNUSED uint32_t bevy_abi_version_minor(uint32_t packed) {
+    return (packed >> 16) & 0xFFu;
+}
+
+static inline BEVY_ABI_UNUSED uint32_t bevy_abi_version_patch(uint32_t packed) {
+    return packed & 0xFFFFu;
+}
+
+static inline BEVY_ABI_UNUSED FfiBool bevy_abi_version_is_compatible(uint32_t host_packed, uint32_t guest_packed) {
+    return (bevy_abi_version_major(host_packed) == bevy_abi_version_major(guest_packed) &&
+            bevy_abi_version_minor(guest_packed) <= bevy_abi_version_minor(host_packed))
+        ? FFI_BOOL_TRUE
+        : FFI_BOOL_FALSE;
+}
+
 /* Status codes (matches `abi_contract::FfiResult`) */
 typedef uint32_t FfiResult;
 #define FFI_RESULT_OK                 0u
@@ -73,8 +103,16 @@ typedef uint32_t FfiResult;
 #define FFI_RESULT_INVALID_VERSION    7u
 #define FFI_RESULT_INTERNAL_ERROR     99u
 
-/* Opaque 64-bit entity identifier (matches `abi_contract::FfiEntity`) */
+/* Opaque 64-bit entity identifier (`abi_contract::FfiEntity`).
+ * In Bevy 0.20+, `0` (`BAM_ENTITY_NULL`) is guaranteed never to be a valid `Entity`
+ * (`Entity::try_from_bits(0) == None`), whereas `UINT64_MAX` is a valid entity bit pattern. */
 typedef uint64_t FfiEntity;
+#define BAM_ENTITY_NULL ((FfiEntity)0ULL)
+#define FFI_ENTITY_NULL BAM_ENTITY_NULL
+
+static inline BEVY_ABI_UNUSED FfiBool bam_entity_is_null(FfiEntity entity) {
+    return entity == BAM_ENTITY_NULL ? FFI_BOOL_TRUE : FFI_BOOL_FALSE;
+}
 
 /* Non-owning byte/UTF-8 slice (`abi_contract::FfiSlice<u8>` / `StrView`) */
 typedef struct FfiByteSlice {
@@ -149,6 +187,22 @@ typedef FfiResult (*DynamicSystemCallback)(
     void* user_data
 );
 
+/* Bevy schedule identifier (`abi_contract::ScheduleLabelId`) */
+typedef uint32_t ScheduleLabelId;
+#define SCHEDULE_LABEL_UPDATE       0u
+#define SCHEDULE_LABEL_STARTUP      1u
+#define SCHEDULE_LABEL_PRE_UPDATE   2u
+#define SCHEDULE_LABEL_POST_UPDATE  3u
+#define SCHEDULE_LABEL_FIXED_UPDATE 4u
+#define SCHEDULE_LABEL_LAST         5u
+
+#define BAM_SCHEDULE_UPDATE         SCHEDULE_LABEL_UPDATE
+#define BAM_SCHEDULE_STARTUP        SCHEDULE_LABEL_STARTUP
+#define BAM_SCHEDULE_PRE_UPDATE     SCHEDULE_LABEL_PRE_UPDATE
+#define BAM_SCHEDULE_POST_UPDATE    SCHEDULE_LABEL_POST_UPDATE
+#define BAM_SCHEDULE_FIXED_UPDATE   SCHEDULE_LABEL_FIXED_UPDATE
+#define BAM_SCHEDULE_LAST           SCHEDULE_LABEL_LAST
+
 /* Multi-query clause and descriptor (`abi_contract::QuerySpec` / `MultiQuerySystemDescriptor`) */
 typedef struct QuerySpec {
     const ComponentAccessDesc* queries;
@@ -171,6 +225,19 @@ typedef struct MultiQuerySystemDescriptor {
     void* user_data;
 } MultiQuerySystemDescriptor;
 
+/* Extended multi-query descriptor (`abi_contract::ScheduledMultiQuerySystemDescriptor`) */
+typedef struct ScheduledMultiQuerySystemDescriptor {
+    MultiQuerySystemDescriptor base;
+    ScheduleLabelId schedule;
+    uint32_t flags;
+    const char* const* after;
+    size_t after_count;
+    const char* const* before;
+    size_t before_count;
+} ScheduledMultiQuerySystemDescriptor;
+
+typedef ScheduledMultiQuerySystemDescriptor MultiQuerySystemDescriptorV2;
+
 typedef FfiResult (*RegisterMultiQuerySystemFn)(
     void* host_context,
     const MultiQuerySystemDescriptor* descriptor
@@ -186,10 +253,28 @@ typedef struct SystemDescriptor {
     void* user_data;
 } SystemDescriptor;
 
-/* System registration function signature (`abi_contract::RegisterSystemFn`) */
+/* Extended system descriptor (`abi_contract::ScheduledSystemDescriptor`) */
+typedef struct ScheduledSystemDescriptor {
+    SystemDescriptor base;
+    ScheduleLabelId schedule;
+    uint32_t flags;
+    const char* const* after;
+    size_t after_count;
+    const char* const* before;
+    size_t before_count;
+} ScheduledSystemDescriptor;
+
+typedef ScheduledSystemDescriptor SystemDescriptorV2;
+
+/* System registration function signatures (`abi_contract::RegisterSystemFn` / `RegisterScheduledSystemFn`) */
 typedef FfiResult (*RegisterSystemFn)(
     void* host_context,
     const SystemDescriptor* descriptor
+);
+
+typedef FfiResult (*RegisterScheduledSystemFn)(
+    void* host_context,
+    const ScheduledSystemDescriptor* descriptor
 );
 
 /* Symbol resolver function pointer (`abi_contract::GetProcAddressFn`) */
@@ -257,6 +342,18 @@ BEVY_ABI_STATIC_ASSERT(offsetof(HostApi, iter_entities) == 48, "offset of iter_e
 BEVY_ABI_STATIC_ASSERT(offsetof(HostApi, iter_column_stride) == 56, "offset of iter_column_stride must be 56");
 BEVY_ABI_STATIC_ASSERT(offsetof(HostApi, register_component) == 64, "offset of register_component must be 64");
 
+BEVY_ABI_STATIC_ASSERT(sizeof(SystemDescriptor) == 48, "SystemDescriptor 64-bit size must be 48");
+BEVY_ABI_STATIC_ASSERT(sizeof(ScheduledSystemDescriptor) == 88, "ScheduledSystemDescriptor 64-bit size must be 88");
+BEVY_ABI_STATIC_ASSERT(BEVY_ABI_ALIGNOF(ScheduledSystemDescriptor) == 8, "ScheduledSystemDescriptor 64-bit align must be 8");
+BEVY_ABI_STATIC_ASSERT(offsetof(ScheduledSystemDescriptor, base) == 0, "offset of base must be 0");
+BEVY_ABI_STATIC_ASSERT(offsetof(ScheduledSystemDescriptor, schedule) == 48, "offset of schedule must be 48");
+BEVY_ABI_STATIC_ASSERT(offsetof(ScheduledSystemDescriptor, flags) == 52, "offset of flags must be 52");
+BEVY_ABI_STATIC_ASSERT(offsetof(ScheduledSystemDescriptor, after) == 56, "offset of after must be 56");
+BEVY_ABI_STATIC_ASSERT(offsetof(ScheduledSystemDescriptor, after_count) == 64, "offset of after_count must be 64");
+BEVY_ABI_STATIC_ASSERT(offsetof(ScheduledSystemDescriptor, before) == 72, "offset of before must be 72");
+BEVY_ABI_STATIC_ASSERT(offsetof(ScheduledSystemDescriptor, before_count) == 80, "offset of before_count must be 80");
+BEVY_ABI_STATIC_ASSERT(sizeof(ScheduledMultiQuerySystemDescriptor) == 88, "ScheduledMultiQuerySystemDescriptor 64-bit size must be 88");
+
 /* Static ABI layout assertions for 32-bit architectures */
 #elif defined(__ILP32__) || (defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 4)
 BEVY_ABI_STATIC_ASSERT(sizeof(ModComponentDescriptor) == 40, "ModComponentDescriptor 32-bit size must be 40");
@@ -281,6 +378,18 @@ BEVY_ABI_STATIC_ASSERT(offsetof(HostApi, iter_mark_changed) == 24, "offset of it
 BEVY_ABI_STATIC_ASSERT(offsetof(HostApi, iter_entities) == 28, "offset of iter_entities must be 28");
 BEVY_ABI_STATIC_ASSERT(offsetof(HostApi, iter_column_stride) == 32, "offset of iter_column_stride must be 32");
 BEVY_ABI_STATIC_ASSERT(offsetof(HostApi, register_component) == 36, "offset of register_component must be 36");
+
+BEVY_ABI_STATIC_ASSERT(sizeof(SystemDescriptor) == 24, "SystemDescriptor 32-bit size must be 24");
+BEVY_ABI_STATIC_ASSERT(sizeof(ScheduledSystemDescriptor) == 48, "ScheduledSystemDescriptor 32-bit size must be 48");
+BEVY_ABI_STATIC_ASSERT(BEVY_ABI_ALIGNOF(ScheduledSystemDescriptor) == 4, "ScheduledSystemDescriptor 32-bit align must be 4");
+BEVY_ABI_STATIC_ASSERT(offsetof(ScheduledSystemDescriptor, base) == 0, "offset of base must be 0");
+BEVY_ABI_STATIC_ASSERT(offsetof(ScheduledSystemDescriptor, schedule) == 24, "offset of schedule must be 24");
+BEVY_ABI_STATIC_ASSERT(offsetof(ScheduledSystemDescriptor, flags) == 28, "offset of flags must be 28");
+BEVY_ABI_STATIC_ASSERT(offsetof(ScheduledSystemDescriptor, after) == 32, "offset of after must be 32");
+BEVY_ABI_STATIC_ASSERT(offsetof(ScheduledSystemDescriptor, after_count) == 36, "offset of after_count must be 36");
+BEVY_ABI_STATIC_ASSERT(offsetof(ScheduledSystemDescriptor, before) == 40, "offset of before must be 40");
+BEVY_ABI_STATIC_ASSERT(offsetof(ScheduledSystemDescriptor, before_count) == 44, "offset of before_count must be 44");
+BEVY_ABI_STATIC_ASSERT(sizeof(ScheduledMultiQuerySystemDescriptor) == 48, "ScheduledMultiQuerySystemDescriptor 32-bit size must be 48");
 #endif
 
 /* Mod lifecycle entry points */

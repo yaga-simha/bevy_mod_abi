@@ -380,11 +380,11 @@ static void test_newer_mod_on_legacy_host(void) {
     const HostApi* modern_view = (const HostApi*)(const void*)&legacy_host;
 
     /* Newer mod checks whether register_component is available */
-    bool has_register_component = (modern_view->struct_size >= (offsetof(HostApi, register_component) + sizeof(RegisterComponentFn)));
+    FfiBool has_register_component = (modern_view->struct_size >= (offsetof(HostApi, register_component) + sizeof(RegisterComponentFn))) ? FFI_BOOL_TRUE : FFI_BOOL_FALSE;
     assert(!has_register_component);
 
     /* Also verify strict sizeof check */
-    bool meets_full_size = (modern_view->struct_size >= sizeof(HostApi));
+    FfiBool meets_full_size = (modern_view->struct_size >= sizeof(HostApi)) ? FFI_BOOL_TRUE : FFI_BOOL_FALSE;
     assert(!meets_full_size);
 
     /* Older functionality remains callable without touching offset 64 */
@@ -393,6 +393,53 @@ static void test_newer_mod_on_legacy_host(void) {
     assert(modern_view->iter_column_stride(NULL, 0) == 16);
 
     printf("  -> OK (boundary check correctly prevents reading or calling past 64-byte boundary)\n");
+}
+
+/* Test Suite 6: Entity Null Sentinel, SemVer Helpers, FfiBool & Scheduled Descriptors */
+static void test_entity_null_semver_and_scheduled_descriptors(void) {
+    printf("[6/6] Testing BAM_ENTITY_NULL, SemVer helpers, FfiBool & ScheduledSystemDescriptor...\n");
+
+    /* 1. Entity null sentinel (0ULL, never UINT64_MAX) */
+    assert(BAM_ENTITY_NULL == 0ULL);
+    assert(FFI_ENTITY_NULL == 0ULL);
+    assert(bam_entity_is_null(BAM_ENTITY_NULL) == FFI_BOOL_TRUE);
+    assert(bam_entity_is_null(1ULL) == FFI_BOOL_FALSE);
+    assert(bam_entity_is_null(UINT64_MAX) == FFI_BOOL_FALSE);
+
+    /* 2. SemVer compatibility helper */
+    uint32_t v0_1_0 = bevy_abi_pack_version(0, 1, 0);
+    uint32_t v0_1_5 = bevy_abi_pack_version(0, 1, 5);
+    uint32_t v0_2_0 = bevy_abi_pack_version(0, 2, 0);
+    uint32_t v1_0_0 = bevy_abi_pack_version(1, 0, 0);
+    assert(v0_1_0 == BEVY_ABI_VERSION_PACKED);
+    assert(bevy_abi_version_is_compatible(v0_1_0, v0_1_5) == FFI_BOOL_TRUE);
+    assert(bevy_abi_version_is_compatible(v0_2_0, v0_1_0) == FFI_BOOL_TRUE);
+    assert(bevy_abi_version_is_compatible(v0_1_0, v0_2_0) == FFI_BOOL_FALSE);
+    assert(bevy_abi_version_is_compatible(v1_0_0, v0_1_0) == FFI_BOOL_FALSE);
+
+    /* 3. ScheduleLabelId constants & ScheduledSystemDescriptor layout */
+    assert(SCHEDULE_LABEL_UPDATE == 0u);
+    assert(SCHEDULE_LABEL_STARTUP == 1u);
+    assert(SCHEDULE_LABEL_PRE_UPDATE == 2u);
+    assert(SCHEDULE_LABEL_POST_UPDATE == 3u);
+    assert(SCHEDULE_LABEL_FIXED_UPDATE == 4u);
+    assert(SCHEDULE_LABEL_LAST == 5u);
+
+    const char* after_names[1] = { "physics_step" };
+    ScheduledSystemDescriptor sched_desc;
+    memset(&sched_desc, 0, sizeof(sched_desc));
+    sched_desc.base.struct_size = (uint32_t)sizeof(ScheduledSystemDescriptor);
+    sched_desc.base.name = "render_sync";
+    sched_desc.schedule = BAM_SCHEDULE_POST_UPDATE;
+    sched_desc.after = after_names;
+    sched_desc.after_count = 1;
+
+    assert(sched_desc.base.struct_size == sizeof(ScheduledSystemDescriptor));
+    assert(((const SystemDescriptor*)&sched_desc)->struct_size == sizeof(ScheduledSystemDescriptor));
+    assert(sched_desc.schedule == 3u);
+    assert(sched_desc.after_count == 1u);
+
+    printf("  -> OK (BAM_ENTITY_NULL=0, SemVer matrix, FfiBool & ScheduledSystemDescriptor verified)\n");
 }
 
 /* ============================================================================
@@ -405,6 +452,7 @@ int main(void) {
     test_adversarial_descriptors();
     test_legacy_mod_on_newer_host();
     test_newer_mod_on_legacy_host();
+    test_entity_null_semver_and_scheduled_descriptors();
     printf("=== All C Header & ABI Compatibility Tests Passed! ===\n");
     return 0;
 }
