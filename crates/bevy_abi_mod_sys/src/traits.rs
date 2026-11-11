@@ -1,60 +1,125 @@
-//! POD / raw-insertion marker traits and host component VTable metadata traits.
+//! `RawInsertable`, `AbiPod`, and `ModComponent` traits for component layout and VTable metadata.
 
 use core::ffi::c_void;
 
-use crate::primitives::{ComponentUuid, FfiEntity};
+use crate::primitives::{BamComponent, ComponentUuid, FfiBool, FfiEntity};
 
 /// Marker trait for types without internal heap ownership, drop glue, or invalid bit patterns
-/// that are safe to expose via interior pointers (`<Struct>_ptr_<field>`) or raw byte reads.
+/// that support same-process raw byte moves and unaligned reads.
+///
+/// Platform-sized integers (`usize`, `isize`) and 128-bit integers (`u128`, `i128`) implement
+/// `RawInsertable` without implementing [`AbiPod`] because their size or alignment varies across
+/// C99/C++/Zig compilers and target architectures.
 ///
 /// # Safety
-/// Implementing this trait asserts that `Self`:
-/// - Contains **no** heap-allocated collections (`String`, `Vec`, `Box`, etc.) or non-`'static` borrows,
-/// - Requires **no** drop glue (`!core::mem::needs_drop::<Self>()`), and
-/// - Has **no** invalid bit-pattern hazards (`bool`, `char`, `enum`, `NonZero*`, references, or `fn` pointers
-///   do **not** implement `FfiLayout`).
-///
-/// Note: `FfiLayout` does **not** require `#[repr(C)]` field ordering. For cross-language C-ABI
-/// column slicing, `Vec<T>` element slices, and mirrored guest structs, require [`AbiPod`].
-pub unsafe trait FfiLayout: Sized + 'static {}
+/// Implementing `RawInsertable` asserts that `Self`:
+/// - Contains no heap-owned allocations (`String`, `Vec`, `Box`) or non-`'static` borrows,
+/// - Requires no drop glue (`!core::mem::needs_drop::<Self>()`), and
+/// - Has no invalid bit-pattern hazards (`bool`, `char`, `enum`, `NonZero*`, references, and bare
+///   `fn` pointers must not implement `RawInsertable`).
+pub unsafe trait RawInsertable: Sized + Send + Sync + 'static {}
 
-/// Marker trait for Plain Old Data (POD) types with a guaranteed `#[repr(C)]` (or primitive /
-/// `#[repr(transparent)]`) memory representation, `Copy` semantics, no heap pointers or drop glue,
-/// and all bit patterns valid across FFI.
+/// Marker trait for cross-language Plain Old Data (POD) types with deterministic C99/C++/Zig/Rust
+/// `#[repr(C)]` or `#[repr(transparent)]` layout, `Copy` semantics, no drop glue, and universal
+/// bit validity across all fields.
+///
+/// Natural C inter-field or trailing alignment padding is permitted when every field is `AbiPod`.
+///
+/// # Excluded Primitives
+/// - `u128` and `i128` do not implement `AbiPod` (no ISO C99 equivalent; 8-byte vs 16-byte
+///   alignment divergence across compilers and targets):
+///
+/// ```compile_fail
+/// use bevy_abi_mod_sys::assert_abi_pod;
+/// assert_abi_pod::<u128>();
+/// ```
+///
+/// ```compile_fail
+/// use bevy_abi_mod_sys::assert_abi_pod;
+/// assert_abi_pod::<i128>();
+/// ```
+///
+/// - `usize` and `isize` do not implement `AbiPod` (pointer-width dependent):
+///
+/// ```compile_fail
+/// use bevy_abi_mod_sys::assert_abi_pod;
+/// assert_abi_pod::<usize>();
+/// ```
+///
+/// ```compile_fail
+/// use bevy_abi_mod_sys::assert_abi_pod;
+/// assert_abi_pod::<isize>();
+/// ```
+///
+/// - `bool` and `char` do not implement `AbiPod` (invalid bit patterns; use [`FfiBool`] instead):
+///
+/// ```compile_fail
+/// use bevy_abi_mod_sys::assert_abi_pod;
+/// assert_abi_pod::<bool>();
+/// ```
 ///
 /// # Safety
-/// Implementing `AbiPod` asserts all invariants of [`FfiLayout`] **plus**:
-/// - `Self: Copy + 'static`,
-/// - `Self` is a C-compatible primitive, `[T; N]` where `T: AbiPod`, or a `#[repr(C)]` /
-///   `#[repr(transparent)]` struct whose fields all implement `AbiPod` (with no skipped fields),
-/// - `bool` is **not** `AbiPod` because byte values `2..=255` are undefined behavior in Rust.
-pub unsafe trait AbiPod: FfiLayout + Copy + 'static {}
+/// Implementing `AbiPod` asserts all invariants of [`RawInsertable`] plus:
+/// - `Self: Copy + Send + Sync + 'static`, and
+/// - `Self` is a permitted fixed-width C primitive, `[T; N]` where `T: AbiPod`, or a non-packed
+///   `#[repr(C)]` / `#[repr(transparent)]` struct whose fields all implement `AbiPod`.
+pub unsafe trait AbiPod: RawInsertable + Copy + Send + Sync + 'static {}
+
+/// Compile-time helper asserting `T: AbiPod` (used by `#[derive(AbiPod)]` per-field checks).
+#[inline]
+pub const fn assert_abi_pod<T: AbiPod>() {}
+
+/// Compile-time helper asserting `T: RawInsertable`.
+#[inline]
+pub const fn assert_raw_insertable<T: RawInsertable>() {}
 
 macro_rules! impl_abi_pod_primitives {
     ($($ty:ty),* $(,)?) => {
         $(
-            // SAFETY: Numeric/opaque-integer primitive with `Copy`, `'static`, zero drop glue,
-            // zero heap ownership, deterministic C ABI representation, and all bit patterns valid.
-            unsafe impl FfiLayout for $ty {}
-            // SAFETY: Every bit pattern is valid and representation matches C primitive layout.
+            // SAFETY: Fixed-width primitive or transparent newtype with `Copy`, `Send + Sync`,
+            // zero drop glue, deterministic C99 layout, and every bit pattern valid.
+            unsafe impl RawInsertable for $ty {}
+            // SAFETY: Layout and alignment match fixed-width C99 representation across targets.
             unsafe impl AbiPod for $ty {}
         )*
     };
 }
 
+macro_rules! impl_raw_insertable_only {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            // SAFETY: Integer primitive with `Copy`, `Send + Sync`, zero drop glue, and all bit
+            // patterns valid within the same process, excluded from cross-language `AbiPod`.
+            unsafe impl RawInsertable for $ty {}
+        )*
+    };
+}
+
 impl_abi_pod_primitives!(
-    u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, f32, f64, FfiEntity
+    u8,
+    i8,
+    u16,
+    i16,
+    u32,
+    i32,
+    u64,
+    i64,
+    f32,
+    f64,
+    FfiBool,
+    BamComponent,
+    FfiEntity,
+    ComponentUuid,
 );
 
-// SAFETY: Fixed-size arrays `[T; N]` have contiguous in-line storage with no extra metadata or drop glue.
-unsafe impl<T: FfiLayout, const N: usize> FfiLayout for [T; N] {}
-// SAFETY: `[T; N]` has identical layout to C's `T[N]` when `T: AbiPod`.
+impl_raw_insertable_only!(u128, i128, usize, isize);
+
+// SAFETY: Fixed-size arrays `[T; N]` have contiguous inline storage with no drop glue or metadata.
+unsafe impl<T: RawInsertable, const N: usize> RawInsertable for [T; N] {}
+// SAFETY: `[T; N]` matches C's `T[N]` layout identically when `T: AbiPod`.
 unsafe impl<T: AbiPod, const N: usize> AbiPod for [T; N] {}
 
-/// Host-side symbol table entry mapping a symbol name to its static VTable or function pointer.
-///
-/// Intentionally a Rust metadata struct (not `#[repr(C)]`) used by `ExposableComponent::symbols()`
-/// so the host's `ModRegistry` can populate its `get_proc_address` lookup table.
+/// Host-side symbol table entry mapping a `"bam.v0.*"` symbol name to its static VTable or fn pointer.
 ///
 /// # Example
 ///
@@ -62,59 +127,57 @@ unsafe impl<T: AbiPod, const N: usize> AbiPod for [T; N] {}
 /// use bevy_abi_mod_sys::SymbolEntry;
 ///
 /// let entry = SymbolEntry {
-///     name: "Position_vtable",
+///     name: "bam.v0.my_game::Position.vtable",
 ///     ptr: core::ptr::null(),
 /// };
-/// assert_eq!(entry.name, "Position_vtable");
+/// assert_eq!(entry.name, "bam.v0.my_game::Position.vtable");
 /// ```
 #[derive(Debug, Copy, Clone)]
 pub struct SymbolEntry {
-    /// Symbol name exposed to `get_proc_address`.
+    /// Namespaced symbol name exposed to `BamHostApi::get_proc_address`.
     pub name: &'static str,
-    /// Function or static VTable pointer.
+    /// Static VTable or function pointer.
     pub ptr: *const c_void,
 }
 
-// SAFETY: `SymbolEntry` only holds a `'static` string slice and an immutable static VTable/fn pointer.
+// SAFETY: `SymbolEntry` holds an immutable `'static` string slice and a static pointer requiring
+// `unsafe` to dereference.
 unsafe impl Sync for SymbolEntry {}
-// SAFETY: `SymbolEntry` only holds immutable static pointers safe to share across threads.
+// SAFETY: `SymbolEntry` holds immutable static metadata safe to transfer across threads.
 unsafe impl Send for SymbolEntry {}
 
-/// Trait implemented by `#[derive(ModExposable)]` on host components.
+/// Trait implemented by `#[derive(ModComponent)]` on host components and sub-structs.
 ///
-/// Exposes the component's string name, deterministic UUID, layout (`size` and `align`),
-/// POD/raw-insertion safety capability flags (`IS_POD`, `IS_RAW_INSERTABLE`),
-/// static `#[repr(C)]` VTable, and C-ABI accessor symbol table for `ModRegistry` registration.
-///
-/// Decoupled from [`FfiLayout`] and [`AbiPod`] so components containing `String`, `Vec<T>`, `bool`,
-/// or `#[mod_field(skip)]` fields can safely expose VTable accessors without falsely claiming raw
-/// byte-copy soundness.
-pub trait ExposableComponent: Sized + 'static {
-    /// The string name of the component (e.g., `"Position"` or `"game::Position"`).
-    const COMPONENT_NAME: &'static str;
+/// Lives in `bevy_abi_mod_sys` without any `bevy_ecs`, [`RawInsertable`], or `Default` supertrait
+/// so `#[repr(Rust)]` components containing `String`, `Vec<T>`, `bool`, `#[mod_field(skip)]`, or
+/// `#[mod_component(opaque)]` can expose [`crate::VTableHeader`]-prefixed VTables cleanly.
+pub trait ModComponent: Sized + 'static {
+    /// Canonical namespaced component name (`"<namespace>::<Name>"`, e.g. `"my_game::Position"`).
+    const CANONICAL_NAME: &'static str;
 
-    /// Null-terminated C string literal of the component name.
+    /// NUL-terminated C string literal of [`Self::CANONICAL_NAME`].
     const COMPONENT_CSTR: &'static core::ffi::CStr;
 
     /// Deterministic 128-bit UUID for this component.
     const UUID: ComponentUuid;
 
-    /// `true` if and only if `Self` is `#[repr(C)]` / `#[repr(transparent)]`, has no skipped fields,
-    /// and every field is [`AbiPod`] (safe for cross-language column slicing and raw byte insertion).
-    const IS_POD: bool = false;
+    /// `true` iff `Self` is `#[repr(C)]` / `#[repr(transparent)]`, has no skipped fields, and
+    /// every field implements [`AbiPod`].
+    const IS_ABI_POD: bool = false;
 
-    /// `true` if and only if `Self` contains no heap pointers (`String`, `Vec`), no drop glue,
-    /// no invalid bit-pattern types (`bool`), and no skipped fields, making `ptr::read_unaligned`
-    /// from foreign command-queue bytes free of allocator-crossover and invalid-value UB.
+    /// `true` iff `Self` supports same-process raw byte insertion ([`RawInsertable`]).
     const IS_RAW_INSERTABLE: bool = false;
 
-    /// The generated `#[repr(C)]` VTable struct type (`<Struct>VTable`).
+    /// Component registration flags (`BAM_COMPONENT_FLAG_*`, default `0`).
+    const COMPONENT_FLAGS: u32 = 0;
+
+    /// Generated `#[repr(C)]` VTable struct prefixed at offset `0` by [`crate::VTableHeader`].
     type VTable: Copy + 'static;
 
     /// Returns a reference to the static VTable instance for this component.
     fn vtable() -> &'static Self::VTable;
 
-    /// Returns a pointer to the static VTable instance for this component.
+    /// Returns a typed pointer to the static VTable instance for this component.
     #[inline]
     fn vtable_ptr() -> *const Self::VTable {
         Self::vtable() as *const Self::VTable
@@ -126,7 +189,7 @@ pub trait ExposableComponent: Sized + 'static {
         Self::vtable_ptr().cast::<c_void>()
     }
 
-    /// Exact byte stride (`core::mem::size_of::<Self>()`) for contiguous array iteration.
+    /// Exact byte size (`core::mem::size_of::<Self>()`).
     #[inline]
     fn size() -> usize {
         core::mem::size_of::<Self>()
@@ -138,10 +201,10 @@ pub trait ExposableComponent: Sized + 'static {
         core::mem::align_of::<Self>()
     }
 
-    /// Returns all exported C-ABI accessor symbols and VTable pointers for this component.
+    /// Returns all exported `"bam.v0.*"` symbols and VTable entries for this component.
     fn symbols() -> &'static [SymbolEntry];
 
-    /// Look up a symbol pointer by name (e.g. `"Position_get_x"`, `"Position_vtable"`).
+    /// Looks up a symbol pointer by exact name (for example `"bam.v0.my_game::Position.vtable"`).
     #[inline]
     fn resolve_symbol(name: &str) -> Option<*const c_void> {
         let syms = Self::symbols();

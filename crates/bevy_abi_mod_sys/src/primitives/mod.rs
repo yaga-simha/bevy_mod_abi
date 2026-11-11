@@ -1,4 +1,4 @@
-//! Core FFI primitive types and status codes.
+//! Core FFI primitive types, handles, and status codes.
 
 mod bool;
 mod entity;
@@ -6,16 +6,16 @@ mod slice;
 mod uuid;
 
 pub use self::{
-    bool::{FFI_BOOL_FALSE, FFI_BOOL_TRUE, FfiBool, ffi_bool_to_rust, rust_bool_to_ffi},
-    entity::FfiEntity,
+    bool::FfiBool,
+    entity::{BamComponent, FfiEntity},
     slice::{FfiSlice, StrView},
-    uuid::ComponentUuid,
+    uuid::{ComponentUuid, SIPHASH_KEY_0, SIPHASH_KEY_1, siphash24_128},
 };
 
-/// FFI-safe status code returned across the C-ABI boundary.
+/// FFI-safe status code returned across the C-ABI boundary (`typedef uint32_t BamResult;`).
 ///
 /// Represented as a `#[repr(transparent)]` `u32` newtype rather than a Rust `enum`
-/// so that arbitrary integer values returned by foreign C/C++ code can never trigger
+/// so that arbitrary integer values returned by foreign C, C++, or Zig code never trigger
 /// invalid-discriminant undefined behavior in Rust.
 ///
 /// # Example
@@ -27,57 +27,48 @@ pub use self::{
 /// assert!(res.is_ok());
 /// assert!(!res.is_err());
 /// assert_eq!(res.name(), "OK");
-///
-/// match res {
-///     FfiResult::OK => {},
-///     FfiResult::PANIC_CAUGHT => panic!("caught panic"),
-///     _ => {},
-/// }
 /// ```
 #[repr(transparent)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Default)]
 pub struct FfiResult(pub u32);
 
 impl FfiResult {
-    /// Operation succeeded without error.
+    /// Operation succeeded without error (`0`).
     pub const OK: Self = Self(0);
-    /// Component name or UUID was not found or invalid in the host registry.
+    /// Component handle or registration descriptor is invalid (`1`).
     pub const INVALID_COMPONENT: Self = Self(1);
-    /// Requested query access declarations conflict with scheduler borrow rules.
+    /// Requested query or resource access declarations conflict with borrow rules (`2`).
     pub const ACCESS_CONFLICT: Self = Self(2);
-    /// Mod system panicked; caught within the guest `.cdylib` without unwinding into the host.
+    /// Guest callback panicked; caught inside the guest runtime without unwinding across FFI (`3`).
     pub const PANIC_CAUGHT: Self = Self(3);
-    /// Null pointer was passed for a mandatory reference or slice argument.
+    /// Null pointer passed for a mandatory pointer or non-empty slice argument (`4`).
     pub const NULL_POINTER: Self = Self(4);
-    /// String view contains non-UTF-8 bytes.
+    /// String or C string contains invalid UTF-8 bytes (`5`).
     pub const INVALID_UTF8: Self = Self(5);
-    /// Unauthorized operation attempted (e.g. attempting mutable access on a read-only column).
+    /// Unauthorized operation attempted, such as mutating a read-only or immutable column (`6`).
     pub const PERMISSION_DENIED: Self = Self(6);
-    /// ABI version or descriptor `struct_size` mismatch between host and mod.
+    /// ABI version or `struct_size` incompatibility between host and guest (`7`).
     pub const INVALID_VERSION: Self = Self(7);
-    /// Invalid layout, size, alignment, or non-zero reserved argument.
+    /// Invalid layout, size, alignment, duplicate component batch, or non-zero reserved field (`8`).
     pub const INVALID_ARGUMENT: Self = Self(8);
-    /// Row, column, term, or query index out of bounds.
+    /// Row, term, or query index out of bounds (`9`).
     pub const OUT_OF_RANGE: Self = Self(9);
-    /// Requested symbol, component, resource, or schedule was not found.
+    /// Requested symbol, component, resource, or custom schedule was not found (`10`).
     pub const NOT_FOUND: Self = Self(10);
-    /// Operation invoked in an invalid lifecycle state (e.g. registration outside `init`).
+    /// Operation invoked in an invalid lifecycle state, such as registration outside `init` (`11`).
     pub const INVALID_STATE: Self = Self(11);
-    /// Entity bit pattern is null, placeholder, or despawned.
+    /// Entity bit pattern is null, `Entity::PLACEHOLDER`, or despawned (`12`).
     pub const INVALID_ENTITY: Self = Self(12);
-    /// Fixed capacity limit exceeded (e.g. drop pool, query terms, or query count).
+    /// Fixed capacity limit exceeded (drop pool, query terms, query count, or spawn batch) (`13`).
     pub const CAPACITY_EXCEEDED: Self = Self(13);
-    /// Unknown descriptor flag bit or unsupported storage capability requested.
+    /// Unknown descriptor flag bit or unsupported storage capability requested (`14`).
     pub const UNSUPPORTED: Self = Self(14);
-    /// Unexpected internal host or guest invariant fault.
+    /// Component UUID, size, or alignment disagrees with an existing registration (`15`).
+    pub const TYPE_MISMATCH: Self = Self(15);
+    /// Genuine internal host or guest invariant fault (`99`).
     pub const INTERNAL_ERROR: Self = Self(99);
 
-    /// Transitional alias retained for existing host integration tests.
-    #[allow(non_upper_case_globals)]
-    #[doc(hidden)]
-    pub const PanicCaught: Self = Self::PANIC_CAUGHT;
-
-    /// Returns `true` if this result indicates success (`OK`).
+    /// Returns `true` if this result indicates success (`Self::OK`).
     #[inline]
     pub const fn is_ok(self) -> bool {
         self.0 == Self::OK.0
@@ -109,6 +100,7 @@ impl FfiResult {
             Self::INVALID_ENTITY => "INVALID_ENTITY",
             Self::CAPACITY_EXCEEDED => "CAPACITY_EXCEEDED",
             Self::UNSUPPORTED => "UNSUPPORTED",
+            Self::TYPE_MISMATCH => "TYPE_MISMATCH",
             Self::INTERNAL_ERROR => "INTERNAL_ERROR",
             _ => "UNKNOWN",
         }
@@ -126,3 +118,8 @@ impl core::fmt::Display for FfiResult {
         }
     }
 }
+
+const _: () = {
+    assert!(core::mem::size_of::<FfiResult>() == 4);
+    assert!(core::mem::align_of::<FfiResult>() == 4);
+};

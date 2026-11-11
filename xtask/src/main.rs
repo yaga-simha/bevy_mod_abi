@@ -2,6 +2,8 @@
 
 //! Workspace build, fixture, header, benchmark, Miri, and CI automation runner (`cargo xtask`).
 
+mod header_gen;
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -105,7 +107,7 @@ fn print_help() {
         "  ci                                          Run fmt, clippy, zero-Bevy check, fixtures, C99, and workspace tests"
     );
     println!(
-        "  header [--test-c99]                         Validate include/bevy_abi_mod.h as strict ISO C99"
+        "  header [--check] [--test-c99]               Generate & validate include/bevy_abi_mod.h as strict ISO C99"
     );
     println!(
         "  bench [--permutation] [-- <args>...]        Run Criterion/host benchmarks or full permutation matrix"
@@ -736,6 +738,7 @@ fn verify_c99_header_and_tests(root: &Path, run_standalone_test: bool) -> Result
             "-Wall",
             "-Wextra",
             "-Werror",
+            "-pedantic",
             "-fsyntax-only",
             "-x",
             "c",
@@ -743,7 +746,7 @@ fn verify_c99_header_and_tests(root: &Path, run_standalone_test: bool) -> Result
         .arg(&header_path);
     run_cmd(
         &mut syntax_cmd,
-        &format!("{cc} -std=c99 -fsyntax-only include/bevy_abi_mod.h"),
+        &format!("{cc} -std=c99 -pedantic -fsyntax-only include/bevy_abi_mod.h"),
     )?;
 
     if run_standalone_test {
@@ -759,13 +762,20 @@ fn verify_c99_header_and_tests(root: &Path, run_standalone_test: bool) -> Result
         let mut build_test = Command::new(&cc);
         build_test
             .current_dir(root)
-            .args(["-std=c99", "-Wall", "-Wextra", "-Werror", "-Iinclude"])
+            .args([
+                "-std=c99",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-pedantic",
+                "-Iinclude",
+            ])
             .arg(root.join("tests").join("standalone_c_test.c"))
             .arg("-o")
             .arg(&exe_path);
         run_cmd(
             &mut build_test,
-            &format!("{cc} tests/standalone_c_test.c -> target/{exe_name}"),
+            &format!("{cc} -std=c99 -pedantic tests/standalone_c_test.c -> target/{exe_name}"),
         )?;
 
         let mut exec_test = Command::new(&exe_path);
@@ -778,28 +788,21 @@ fn verify_c99_header_and_tests(root: &Path, run_standalone_test: bool) -> Result
 
 fn cmd_header(args: &[String]) -> Result<(), String> {
     let mut run_standalone = false;
+    let mut check_only = false;
     for arg in args {
         match arg.as_str() {
             "--test-c99" => run_standalone = true,
+            "--check" => check_only = true,
             other => {
                 return Err(format!(
-                    "unsupported `header` flag `{other}` (expected `--test-c99`)"
+                    "unsupported `header` flag `{other}` (expected `--check` or `--test-c99`)"
                 ));
             }
         }
     }
 
     let root = repo_root()?;
-    if run_standalone {
-        build_c99_mod(
-            &root,
-            "tests/asymmetric_c_mod",
-            "mod.c",
-            "asymmetric_c_mod",
-            "-O3",
-            false,
-        )?;
-    }
+    header_gen::write_or_check_header(&root, check_only)?;
     verify_c99_header_and_tests(&root, run_standalone)
 }
 
@@ -840,6 +843,7 @@ fn cmd_lint(args: &[String]) -> Result<(), String> {
 
     verify_zero_bevy_deps(&root)?;
     verify_forbid_unsafe(&root)?;
+    header_gen::write_or_check_header(&root, true)?;
     verify_c99_header_and_tests(&root, !quick)?;
     check_or_run_bevy_lint(&root)?;
     audit_bevy_idioms(&root)?;
@@ -879,6 +883,7 @@ fn cmd_ci(args: &[String]) -> Result<(), String> {
     verify_zero_bevy_deps(&root)?;
 
     let fixtures_dir = build_fixtures_internal(&root, false, false)?;
+    header_gen::write_or_check_header(&root, true)?;
     verify_c99_header_and_tests(&root, true)?;
 
     let mut test_cmd = Command::new(cargo_bin());

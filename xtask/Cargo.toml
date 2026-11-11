@@ -7,5 +7,8 @@ license.workspace = true
 authors.workspace = true
 publish = false
 
+[dependencies]
+bevy_abi_mod_sys = { workspace = true }
+
 [lints]
 workspace = true

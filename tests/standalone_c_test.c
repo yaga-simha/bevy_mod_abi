@@ -1,531 +1,865 @@
-#include "../include/bevy_abi_mod.h"
+/*
+ * Standalone ISO C99 Conformance, Layout & Mock Lifecycle Suite (`ABI 0.2.0`)
+ * Compiled with: `cc -std=c99 -Wall -Wextra -Werror -pedantic -Iinclude tests/standalone_c_test.c`
+ */
+
+#include "bevy_abi_mod.h"
+
+#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
 
-/* ============================================================================
- * 1. Legacy HostApi Definition (64-byte HostApi prior to register_component)
- * ============================================================================ */
-typedef struct LegacyHostApi {
-    uint32_t struct_size;
-    uint32_t abi_version;
-    RegisterSystemFn register_system;
-    IterNextChunkFn iter_next_chunk;
-    IterColumnReadonlyFn iter_column_readonly;
-    IterColumnMutableFn iter_column_mutable;
-    IterMarkChangedFn iter_mark_changed;
-    IterEntitiesFn iter_entities;
-    IterColumnStrideFn iter_column_stride;
-} LegacyHostApi;
+/* ==========================================================================
+ * Mock Host & Guest Structures
+ * ========================================================================== */
 
-/* Static assertions on LegacyHostApi */
-BEVY_ABI_STATIC_ASSERT(sizeof(LegacyHostApi) == 64, "LegacyHostApi size must be 64");
-BEVY_ABI_STATIC_ASSERT(BEVY_ABI_ALIGNOF(LegacyHostApi) == 8, "LegacyHostApi align must be 8");
-BEVY_ABI_STATIC_ASSERT(offsetof(LegacyHostApi, iter_column_stride) == 56, "LegacyHostApi offset of iter_column_stride must be 56");
+typedef struct MockPosition {
+    float x;
+    float y;
+} MockPosition;
 
-/* ============================================================================
- * 2. Static Assertions on Current 64-bit ABI Structures
- * ============================================================================ */
-BEVY_ABI_STATIC_ASSERT(sizeof(ModComponentDescriptor) == 64, "ModComponentDescriptor size must be 64");
-BEVY_ABI_STATIC_ASSERT(BEVY_ABI_ALIGNOF(ModComponentDescriptor) == 8, "ModComponentDescriptor align must be 8");
-BEVY_ABI_STATIC_ASSERT(sizeof(DynamicComponentDescriptor) == 64, "DynamicComponentDescriptor alias size must be 64");
-BEVY_ABI_STATIC_ASSERT(sizeof(HostApi) == 72, "HostApi size must be 72");
-BEVY_ABI_STATIC_ASSERT(BEVY_ABI_ALIGNOF(HostApi) == 8, "HostApi align must be 8");
-BEVY_ABI_STATIC_ASSERT(offsetof(HostApi, register_component) == 64, "HostApi register_component offset must be 64");
+typedef struct MockPositionVTable {
+    BamVTableHeader header;
+    float (*get_x)(const MockPosition* self_ptr);
+} MockPositionVTable;
 
-/* ============================================================================
- * 3. Mock Context & Implementation for HostApi
- * ============================================================================ */
-typedef struct MockHostContext {
-    int registration_count;
-    ModComponentDescriptor last_registered_desc;
-    char last_name_buffer[128];
-} MockHostContext;
-
-static FfiResult mock_register_system_dummy(void* host_context, const SystemDescriptor* descriptor) {
-    (void)host_context;
-    (void)descriptor;
-    return FFI_RESULT_OK;
+static float mock_pos_get_x(const MockPosition* self_ptr) {
+    return self_ptr->x;
 }
 
-static size_t mock_iter_next_chunk_dummy(RawChunkIter* iter) {
-    (void)iter;
-    return 0;
+struct BamHostCtx {
+    char         last_err[128];
+    const void*  vtable_symbol;
+    BamComponent health_handle;
+    BamComponent pos_handle;
+    BamComponent dt_res_handle;
+};
+
+struct BamLoadCtx {
+    BamHostCtx*    host_ctx;
+    uint32_t       registered_components;
+    uint32_t       registered_systems;
+    BamSystemDesc  last_system;
+};
+
+struct BamIter {
+    uint32_t      chunk_step;
+    BamEntity     entities[2];
+    float         health_dense[2];
+    MockPosition  sparse_rows_storage[2];
+    uint8_t*      sparse_row_ptrs[2];
+    float         dt_resource;
+    uint32_t      marked_start;
+    uint32_t      marked_count;
+    BamComponentUuid health_uuid;
+};
+
+struct BamCommands {
+    uint32_t  spawned_count;
+    uint32_t  batch_component_count;
+    uint32_t  inserted_count;
+    uint32_t  despawned_count;
+    BamEntity next_entity;
+};
+
+struct BamSystemCtx {
+    BamHostCtx*  host_ctx;
+    BamIter*     iter0;
+    BamCommands* commands;
+};
+
+struct BamInstance {
+    const BamHostCtx* host_ctx;
+    BamComponent      health_comp;
+    BamComponent      pos_comp;
+    BamComponent      dt_res;
+    uint32_t          ticks_executed;
+    BamBool           enabled;
+};
+
+static MockPositionVTable g_mock_pos_vtable;
+static uint32_t g_shutdown_calls = 0u;
+static uint32_t g_drop_calls = 0u;
+
+static void mock_health_drop(void* ptr) {
+    (void)ptr;
+    g_drop_calls += 1u;
 }
 
-static const uint8_t* mock_iter_col_ro_dummy(const RawChunkIter* iter, size_t index) {
-    (void)iter;
-    (void)index;
+/* ==========================================================================
+ * Mock Host Implementation of All 27 `BamHostApi` Slots
+ * ========================================================================== */
+
+static const void* host_get_proc_address(const BamHostCtx* ctx, const char* name) {
+    if (ctx == NULL || name == NULL) {
+        return NULL;
+    }
+    if (strcmp(name, "bam.v0.game::MockPosition.vtable") == 0) {
+        return ctx->vtable_symbol;
+    }
     return NULL;
 }
 
-static uint8_t* mock_iter_col_mut_dummy(RawChunkIter* iter, size_t index) {
-    (void)iter;
-    (void)index;
-    return NULL;
-}
-
-static FfiResult mock_iter_mark_changed_dummy(RawChunkIter* iter, size_t index, size_t row) {
-    (void)iter;
-    (void)index;
-    (void)row;
-    return FFI_RESULT_OK;
-}
-
-static const FfiEntity* mock_iter_entities_dummy(const RawChunkIter* iter) {
-    (void)iter;
-    return NULL;
-}
-
-static size_t mock_iter_stride_dummy(const RawChunkIter* iter, size_t index) {
-    (void)iter;
-    (void)index;
-    return 16;
-}
-
-static FfiResult mock_register_component(void* host_context, const ModComponentDescriptor* descriptor) {
-    if (!host_context || !descriptor) {
-        return FFI_RESULT_NULL_POINTER;
+static size_t host_last_error(const BamHostCtx* ctx, char* buf, size_t cap) {
+    size_t msg_len;
+    size_t copy_n;
+    if (ctx == NULL) {
+        return 0u;
     }
-    if (descriptor->struct_size < sizeof(ModComponentDescriptor)) {
-        return FFI_RESULT_INVALID_VERSION;
+    msg_len = strlen(ctx->last_err);
+    if (buf != NULL && cap > 0u) {
+        copy_n = (msg_len < (cap - 1u)) ? msg_len : (cap - 1u);
+        memcpy(buf, ctx->last_err, copy_n);
+        buf[copy_n] = '\0';
     }
-    if (!descriptor->name) {
-        return FFI_RESULT_NULL_POINTER;
+    return msg_len;
+}
+
+static const BamHostCtx* host_load_host_ctx(const BamLoadCtx* load_ctx) {
+    return (load_ctx != NULL) ? load_ctx->host_ctx : NULL;
+}
+
+static BamResult host_register_component(
+    BamLoadCtx* load_ctx,
+    const BamComponentDesc* desc,
+    BamComponent* out_component
+) {
+    if (load_ctx == NULL || desc == NULL || out_component == NULL) {
+        return BAM_RESULT_NULL_POINTER;
     }
-    if (descriptor->align == 0 || (descriptor->align & (descriptor->align - 1)) != 0) {
-        return FFI_RESULT_INTERNAL_ERROR;
+    if (desc->struct_size < BAM_COMPONENT_DESC_MIN_V0_2_SIZE) {
+        return BAM_RESULT_INVALID_VERSION;
     }
-    if (descriptor->size % descriptor->align != 0) {
-        return FFI_RESULT_INTERNAL_ERROR;
+    if ((desc->flags & ~BAM_COMPONENT_KNOWN_FLAGS) != 0u) {
+        return BAM_RESULT_UNSUPPORTED;
+    }
+    load_ctx->registered_components += 1u;
+    *out_component = load_ctx->host_ctx->health_handle;
+    return BAM_RESULT_OK;
+}
+
+static BamResult host_resolve_component(
+    const BamHostCtx* ctx,
+    const char* name,
+    const BamComponentUuid* uuid,
+    BamComponent* out_component
+) {
+    if (ctx == NULL || out_component == NULL || (name == NULL && uuid == NULL)) {
+        return BAM_RESULT_NULL_POINTER;
+    }
+    if (name != NULL && strcmp(name, "game::MockPosition") == 0) {
+        *out_component = ctx->pos_handle;
+        return BAM_RESULT_OK;
+    }
+    if (name != NULL && strcmp(name, "game::DeltaTime") == 0) {
+        *out_component = ctx->dt_res_handle;
+        return BAM_RESULT_OK;
+    }
+    strcpy(((BamHostCtx*)ctx)->last_err, "component not registered in mock world");
+    return BAM_RESULT_NOT_FOUND;
+}
+
+static BamResult host_register_system(BamLoadCtx* load_ctx, const BamSystemDesc* desc) {
+    if (load_ctx == NULL || desc == NULL || desc->name == NULL || desc->callback == NULL) {
+        return BAM_RESULT_NULL_POINTER;
+    }
+    if (desc->struct_size < BAM_SYSTEM_DESC_MIN_V0_2_SIZE) {
+        return BAM_RESULT_INVALID_VERSION;
+    }
+    if ((desc->flags & ~BAM_SYSTEM_KNOWN_FLAGS) != 0u) {
+        return BAM_RESULT_UNSUPPORTED;
+    }
+    if (desc->reserved0 != 0u) {
+        return BAM_RESULT_INVALID_ARGUMENT;
+    }
+    load_ctx->registered_systems += 1u;
+    load_ctx->last_system = *desc;
+    return BAM_RESULT_OK;
+}
+
+static const BamHostCtx* host_sys_host_ctx(const BamSystemCtx* sys_ctx) {
+    return (sys_ctx != NULL) ? sys_ctx->host_ctx : NULL;
+}
+
+static BamResult host_sys_query(BamSystemCtx* sys_ctx, size_t query_index, BamIter** out_iter) {
+    if (sys_ctx == NULL || out_iter == NULL) {
+        return BAM_RESULT_NULL_POINTER;
+    }
+    if (query_index != 0u) {
+        return BAM_RESULT_OUT_OF_RANGE;
+    }
+    *out_iter = sys_ctx->iter0;
+    return BAM_RESULT_OK;
+}
+
+static BamResult host_sys_commands(BamSystemCtx* sys_ctx, BamCommands** out_commands) {
+    if (sys_ctx == NULL || out_commands == NULL) {
+        return BAM_RESULT_NULL_POINTER;
+    }
+    *out_commands = sys_ctx->commands;
+    return BAM_RESULT_OK;
+}
+
+static BamBool host_iter_next_chunk(BamIter* iter, size_t* out_len) {
+    if (iter == NULL || out_len == NULL) {
+        return BAM_FALSE;
+    }
+    if (iter->chunk_step == 0u) {
+        iter->chunk_step = 1u;
+        *out_len = 2u;
+        return BAM_TRUE;
+    }
+    *out_len = 0u;
+    return BAM_FALSE;
+}
+
+static BamResult host_iter_reset(BamIter* iter) {
+    if (iter == NULL) {
+        return BAM_RESULT_NULL_POINTER;
+    }
+    iter->chunk_step = 0u;
+    return BAM_RESULT_OK;
+}
+
+static const BamEntity* host_iter_entities(const BamIter* iter) {
+    return (iter != NULL) ? iter->entities : NULL;
+}
+
+static const uint8_t* host_iter_column_readonly(const BamIter* iter, size_t term_index) {
+    if (iter == NULL || term_index != 0u) {
+        return NULL;
+    }
+    return (const uint8_t*)iter->health_dense;
+}
+
+static uint8_t* host_iter_column_mutable(BamIter* iter, size_t term_index) {
+    if (iter == NULL || term_index != 0u) {
+        return NULL;
+    }
+    return (uint8_t*)iter->health_dense;
+}
+
+static uint8_t* host_iter_column_mutable_untracked(BamIter* iter, size_t term_index) {
+    if (iter == NULL || term_index != 0u) {
+        return NULL;
+    }
+    return (uint8_t*)iter->health_dense;
+}
+
+static BamResult host_iter_mark_changed_range(
+    BamIter* iter,
+    size_t term_index,
+    size_t start_row,
+    size_t row_count
+) {
+    if (iter == NULL) {
+        return BAM_RESULT_NULL_POINTER;
+    }
+    if (term_index != 0u || start_row + row_count > 2u) {
+        return BAM_RESULT_OUT_OF_RANGE;
+    }
+    iter->marked_start = (uint32_t)start_row;
+    iter->marked_count = (uint32_t)row_count;
+    return BAM_RESULT_OK;
+}
+
+static const uint8_t* const* host_iter_column_rows_readonly(BamIter* iter, size_t term_index) {
+    if (iter == NULL || term_index != 1u) {
+        return NULL;
+    }
+    return (const uint8_t* const*)iter->sparse_row_ptrs;
+}
+
+static uint8_t* const* host_iter_column_rows_mutable(BamIter* iter, size_t term_index) {
+    if (iter == NULL || term_index != 1u) {
+        return NULL;
+    }
+    return iter->sparse_row_ptrs;
+}
+
+static BamResult host_iter_column_info(
+    const BamIter* iter,
+    size_t term_index,
+    BamColumnInfo* out_info
+) {
+    if (iter == NULL || out_info == NULL) {
+        return BAM_RESULT_NULL_POINTER;
+    }
+    if (term_index != 0u) {
+        return BAM_RESULT_OUT_OF_RANGE;
+    }
+    out_info->component = 1u;
+    out_info->mode = BAM_ACCESS_WRITE;
+    out_info->uuid = iter->health_uuid;
+    out_info->size = sizeof(float);
+    out_info->align = BAM_ALIGNOF(float);
+    out_info->storage_flags = BAM_STORAGE_FLAG_SPARSE_SET;
+    out_info->reserved0 = 0u;
+    return BAM_RESULT_OK;
+}
+
+static const uint8_t* host_res_ptr(const BamIter* iter, size_t term_index) {
+    if (iter == NULL || term_index != 2u) {
+        return NULL;
+    }
+    return (const uint8_t*)&iter->dt_resource;
+}
+
+static uint8_t* host_res_mut_ptr(BamIter* iter, size_t term_index) {
+    if (iter == NULL || term_index != 2u) {
+        return NULL;
+    }
+    return (uint8_t*)&iter->dt_resource;
+}
+
+static BamResult host_cmd_spawn_empty(BamCommands* commands, BamEntity* out_entity) {
+    if (commands == NULL || out_entity == NULL) {
+        return BAM_RESULT_NULL_POINTER;
+    }
+    commands->next_entity += 1ull;
+    commands->spawned_count += 1u;
+    *out_entity = commands->next_entity;
+    return BAM_RESULT_OK;
+}
+
+static BamResult host_cmd_spawn(
+    BamCommands* commands,
+    const BamComponent* components,
+    const uint8_t* const* data_ptrs,
+    size_t count,
+    BamEntity* out_entity
+) {
+    if (commands == NULL || out_entity == NULL || (count > 0u && (components == NULL || data_ptrs == NULL))) {
+        return BAM_RESULT_NULL_POINTER;
+    }
+    commands->next_entity += 1ull;
+    commands->spawned_count += 1u;
+    commands->batch_component_count += (uint32_t)count;
+    *out_entity = commands->next_entity;
+    return BAM_RESULT_OK;
+}
+
+static BamResult host_cmd_despawn(BamCommands* commands, BamEntity entity) {
+    if (commands == NULL) {
+        return BAM_RESULT_NULL_POINTER;
+    }
+    if (bam_entity_is_null(entity)) {
+        return BAM_RESULT_INVALID_ENTITY;
+    }
+    commands->despawned_count += 1u;
+    return BAM_RESULT_OK;
+}
+
+static BamResult host_cmd_insert(
+    BamCommands* commands,
+    BamEntity entity,
+    BamComponent component,
+    const uint8_t* data_ptr,
+    size_t data_len
+) {
+    if (commands == NULL || (data_len > 0u && data_ptr == NULL)) {
+        return BAM_RESULT_NULL_POINTER;
+    }
+    if (bam_entity_is_null(entity)) {
+        return BAM_RESULT_INVALID_ENTITY;
+    }
+    if (!bam_component_is_valid(component)) {
+        return BAM_RESULT_INVALID_COMPONENT;
+    }
+    commands->inserted_count += 1u;
+    return BAM_RESULT_OK;
+}
+
+static BamResult host_cmd_insert_default(
+    BamCommands* commands,
+    BamEntity entity,
+    BamComponent component
+) {
+    if (commands == NULL) {
+        return BAM_RESULT_NULL_POINTER;
+    }
+    if (bam_entity_is_null(entity)) {
+        return BAM_RESULT_INVALID_ENTITY;
+    }
+    if (!bam_component_is_valid(component)) {
+        return BAM_RESULT_INVALID_COMPONENT;
+    }
+    commands->inserted_count += 1u;
+    return BAM_RESULT_OK;
+}
+
+static BamResult host_cmd_remove(
+    BamCommands* commands,
+    BamEntity entity,
+    BamComponent component
+) {
+    if (commands == NULL) {
+        return BAM_RESULT_NULL_POINTER;
+    }
+    if (bam_entity_is_null(entity)) {
+        return BAM_RESULT_INVALID_ENTITY;
+    }
+    if (!bam_component_is_valid(component)) {
+        return BAM_RESULT_INVALID_COMPONENT;
+    }
+    return BAM_RESULT_OK;
+}
+
+static BamHostApi build_mock_host_api(void) {
+    BamHostApi api;
+    memset(&api, 0, sizeof(api));
+    api.struct_size = (uint32_t)sizeof(BamHostApi);
+    api.abi_version = BAM_ABI_VERSION;
+    api.get_proc_address = host_get_proc_address;
+    api.last_error = host_last_error;
+    api.load_host_ctx = host_load_host_ctx;
+    api.register_component = host_register_component;
+    api.resolve_component = host_resolve_component;
+    api.register_system = host_register_system;
+    api.sys_host_ctx = host_sys_host_ctx;
+    api.sys_query = host_sys_query;
+    api.sys_commands = host_sys_commands;
+    api.iter_next_chunk = host_iter_next_chunk;
+    api.iter_reset = host_iter_reset;
+    api.iter_entities = host_iter_entities;
+    api.iter_column_readonly = host_iter_column_readonly;
+    api.iter_column_mutable = host_iter_column_mutable;
+    api.iter_column_mutable_untracked = host_iter_column_mutable_untracked;
+    api.iter_mark_changed_range = host_iter_mark_changed_range;
+    api.iter_column_rows_readonly = host_iter_column_rows_readonly;
+    api.iter_column_rows_mutable = host_iter_column_rows_mutable;
+    api.iter_column_info = host_iter_column_info;
+    api.res_ptr = host_res_ptr;
+    api.res_mut_ptr = host_res_mut_ptr;
+    api.cmd_spawn_empty = host_cmd_spawn_empty;
+    api.cmd_spawn = host_cmd_spawn;
+    api.cmd_despawn = host_cmd_despawn;
+    api.cmd_insert = host_cmd_insert;
+    api.cmd_insert_default = host_cmd_insert_default;
+    api.cmd_remove = host_cmd_remove;
+    return api;
+}
+
+/* ==========================================================================
+ * Mock Guest Mod Entry Points & Unified System Callback
+ * ========================================================================== */
+
+static BamHostApi g_guest_api;
+
+static const BamManifest g_guest_manifest = {
+    (uint32_t)sizeof(BamManifest),
+    BAM_ABI_VERSION,
+    "combat_mod",
+    "0.2.0",
+    0u,
+    0u
+};
+
+static const BamManifest* mock_guest_manifest(void) {
+    return &g_guest_manifest;
+}
+
+static BamBool mock_guest_run_if(void* user_data) {
+    const BamInstance* inst = (const BamInstance*)user_data;
+    return (inst != NULL) ? inst->enabled : BAM_FALSE;
+}
+
+static BamResult mock_guest_system(BamSystemCtx* sys_ctx, void* user_data) {
+    BamInstance* inst = (BamInstance*)user_data;
+    BamIter* iter = NULL;
+    BamCommands* cmds = NULL;
+    BamColumnInfo col_info;
+    size_t chunk_len = 0u;
+    BamResult rc;
+
+    rc = g_guest_api.sys_query(sys_ctx, 0u, &iter);
+    if (rc != BAM_RESULT_OK) {
+        return rc;
+    }
+    rc = g_guest_api.sys_commands(sys_ctx, &cmds);
+    if (rc != BAM_RESULT_OK) {
+        return rc;
     }
 
-    MockHostContext* ctx = (MockHostContext*)host_context;
-    ctx->registration_count++;
-    ctx->last_registered_desc = *descriptor;
-    strncpy(ctx->last_name_buffer, descriptor->name, sizeof(ctx->last_name_buffer) - 1);
-    ctx->last_name_buffer[sizeof(ctx->last_name_buffer) - 1] = '\0';
-    return FFI_RESULT_OK;
+    rc = g_guest_api.iter_column_info(iter, 0u, &col_info);
+    if (rc != BAM_RESULT_OK) {
+        return rc;
+    }
+    assert(col_info.size == sizeof(float));
+    assert((col_info.storage_flags & BAM_STORAGE_FLAG_SPARSE_SET) != 0u);
+
+    while (g_guest_api.iter_next_chunk(iter, &chunk_len) != BAM_FALSE) {
+        const BamEntity* entities = g_guest_api.iter_entities(iter);
+        float* health = (float*)g_guest_api.iter_column_mutable_untracked(iter, 0u);
+        uint8_t* const* pos_rows = g_guest_api.iter_column_rows_mutable(iter, 1u);
+        const float* dt = (const float*)g_guest_api.res_ptr(iter, 2u);
+        size_t row;
+
+        assert(entities != NULL && health != NULL && pos_rows != NULL && dt != NULL);
+        for (row = 0u; row < chunk_len; ++row) {
+            MockPosition* pos = (MockPosition*)pos_rows[row];
+            pos->x += *dt;
+            if (row == 1u) {
+                health[row] += 5.0f;
+            }
+        }
+        rc = g_guest_api.iter_mark_changed_range(iter, 0u, 1u, 1u);
+        assert(rc == BAM_RESULT_OK);
+    }
+
+    /* Reset iterator for re-traversal */
+    rc = g_guest_api.iter_reset(iter);
+    assert(rc == BAM_RESULT_OK);
+
+    /* Batched spawn + handle-based insert */
+    {
+        float initial_hp = 100.0f;
+        MockPosition initial_pos = { 4.0f, 8.0f };
+        BamComponent batch_comps[2];
+        const uint8_t* batch_ptrs[2];
+        BamEntity spawned = BAM_ENTITY_NULL;
+
+        batch_comps[0] = inst->health_comp;
+        batch_comps[1] = inst->pos_comp;
+        batch_ptrs[0] = (const uint8_t*)&initial_hp;
+        batch_ptrs[1] = (const uint8_t*)&initial_pos;
+
+        rc = g_guest_api.cmd_spawn(cmds, batch_comps, batch_ptrs, 2u, &spawned);
+        assert(rc == BAM_RESULT_OK);
+        assert(!bam_entity_is_null(spawned));
+
+        rc = g_guest_api.cmd_insert(
+            cmds,
+            spawned,
+            inst->health_comp,
+            (const uint8_t*)&initial_hp,
+            sizeof(initial_hp)
+        );
+        assert(rc == BAM_RESULT_OK);
+    }
+
+    inst->ticks_executed += 1u;
+    return BAM_RESULT_OK;
 }
 
-/* Lifecycle Drop callback tracker */
-static int g_drop_invocations = 0;
-static void test_custom_drop_hook(void* ptr) {
-    if (ptr) {
-        g_drop_invocations++;
+static BamResult mock_guest_init(
+    const BamHostApi* api,
+    BamLoadCtx* load_ctx,
+    BamInstance** instance_out
+) {
+    BamResult rc;
+    const BamHostCtx* host_ctx;
+    BamInstance* inst;
+    BamComponentDesc comp_desc;
+    BamTermDesc terms[3];
+    BamQueryDesc query_desc;
+    BamSystemDesc sys_desc;
+    const char* after_sets[1] = { "physics_prepare" };
+
+    if (instance_out == NULL) {
+        return BAM_RESULT_NULL_POINTER;
+    }
+    rc = bam_host_api_copy_bounded(&g_guest_api, sizeof(g_guest_api), api);
+    if (rc != BAM_RESULT_OK) {
+        return rc;
+    }
+
+    host_ctx = g_guest_api.load_host_ctx(load_ctx);
+    if (host_ctx == NULL) {
+        return BAM_RESULT_NULL_POINTER;
+    }
+
+    inst = (BamInstance*)calloc(1u, sizeof(BamInstance));
+    if (inst == NULL) {
+        return BAM_RESULT_INTERNAL_ERROR;
+    }
+    inst->host_ctx = host_ctx;
+    inst->enabled = BAM_TRUE;
+
+    memset(&comp_desc, 0, sizeof(comp_desc));
+    comp_desc.struct_size = (uint32_t)sizeof(BamComponentDesc);
+    comp_desc.flags = BAM_COMPONENT_FLAG_SPARSE_SET;
+    comp_desc.name = "combat_mod::Health";
+    comp_desc.uuid = bam_uuid_from_parts("combat_mod::Health", sizeof(float), BAM_ALIGNOF(float), 0ull);
+    comp_desc.size = sizeof(float);
+    comp_desc.align = BAM_ALIGNOF(float);
+    comp_desc.drop_fn = mock_health_drop;
+    comp_desc.vtable_ptr = NULL;
+
+    rc = g_guest_api.register_component(load_ctx, &comp_desc, &inst->health_comp);
+    if (rc != BAM_RESULT_OK) {
+        free(inst);
+        return rc;
+    }
+
+    rc = g_guest_api.resolve_component(host_ctx, "game::MockPosition", NULL, &inst->pos_comp);
+    if (rc != BAM_RESULT_OK) {
+        free(inst);
+        return rc;
+    }
+
+    rc = g_guest_api.resolve_component(host_ctx, "game::DeltaTime", NULL, &inst->dt_res);
+    if (rc != BAM_RESULT_OK) {
+        free(inst);
+        return rc;
+    }
+
+    terms[0] = bam_term_desc(inst->health_comp, BAM_ACCESS_WRITE, 0u);
+    terms[1] = bam_term_desc(inst->pos_comp, BAM_ACCESS_WRITE, 0u);
+    terms[2] = bam_term_desc(inst->dt_res, BAM_ACCESS_RESOURCE_READ, 0u);
+
+    memset(&query_desc, 0, sizeof(query_desc));
+    query_desc.struct_size = (uint32_t)sizeof(BamQueryDesc);
+    query_desc.flags = 0u;
+    query_desc.terms = terms;
+    query_desc.term_count = 3u;
+
+    memset(&sys_desc, 0, sizeof(sys_desc));
+    sys_desc.struct_size = (uint32_t)sizeof(BamSystemDesc);
+    sys_desc.flags = BAM_SYSTEM_FLAG_MAIN_THREAD;
+    sys_desc.name = "combat_mod::regen_and_step";
+    sys_desc.queries = &query_desc;
+    sys_desc.query_count = 1u;
+    sys_desc.callback = mock_guest_system;
+    sys_desc.user_data = inst;
+    sys_desc.schedule = BAM_SCHEDULE_CUSTOM_BASE + 1u;
+    sys_desc.reserved0 = 0u;
+    sys_desc.after = after_sets;
+    sys_desc.after_count = 1u;
+    sys_desc.before = NULL;
+    sys_desc.before_count = 0u;
+    sys_desc.run_if = mock_guest_run_if;
+    sys_desc.run_if_user_data = inst;
+
+    rc = g_guest_api.register_system(load_ctx, &sys_desc);
+    if (rc != BAM_RESULT_OK) {
+        free(inst);
+        return rc;
+    }
+
+    *instance_out = inst;
+    return BAM_RESULT_OK;
+}
+
+static void mock_guest_shutdown(BamInstance* instance) {
+    g_shutdown_calls += 1u;
+    if (instance != NULL) {
+        free(instance);
     }
 }
 
-/* ============================================================================
- * 4. Test Suites
- * ============================================================================ */
+/* ==========================================================================
+ * Test Suites
+ * ========================================================================== */
 
-/* Test Suite 1: Layout & Field Offsets */
-static void test_layout_and_offsets(void) {
-    printf("[1/5] Testing layout and field offsets...\n");
+static void test_versions_and_result_names(void) {
+    assert(BAM_ABI_VERSION == 0x00020000u);
+    assert(bam_version_major(BAM_ABI_VERSION) == 0u);
+    assert(bam_version_minor(BAM_ABI_VERSION) == 2u);
+    assert(bam_version_patch(BAM_ABI_VERSION) == 0u);
 
-    assert(sizeof(ModComponentDescriptor) == 64);
-    assert(BEVY_ABI_ALIGNOF(ModComponentDescriptor) == 8);
-    assert(offsetof(ModComponentDescriptor, struct_size) == 0);
-    assert(offsetof(ModComponentDescriptor, name) == 8);
-    assert(offsetof(ModComponentDescriptor, uuid) == 16);
-    assert(offsetof(ModComponentDescriptor, size) == 32);
-    assert(offsetof(ModComponentDescriptor, align) == 40);
-    assert(offsetof(ModComponentDescriptor, drop_fn) == 48);
-    assert(offsetof(ModComponentDescriptor, vtable_ptr) == 56);
+    assert(bam_version_is_compatible(bam_pack_abi_version(0u, 2u, 0u), bam_pack_abi_version(0u, 2u, 7u)));
+    assert(!bam_version_is_compatible(bam_pack_abi_version(0u, 2u, 0u), bam_pack_abi_version(0u, 1u, 0u)));
+    assert(!bam_version_is_compatible(bam_pack_abi_version(0u, 3u, 0u), bam_pack_abi_version(0u, 2u, 0u)));
+    assert(bam_version_is_compatible(bam_pack_abi_version(1u, 2u, 0u), bam_pack_abi_version(1u, 1u, 0u)));
+    assert(!bam_version_is_compatible(bam_pack_abi_version(1u, 1u, 0u), bam_pack_abi_version(1u, 2u, 0u)));
 
-    assert(sizeof(HostApi) == 72);
-    assert(BEVY_ABI_ALIGNOF(HostApi) == 8);
-    assert(offsetof(HostApi, struct_size) == 0);
-    assert(offsetof(HostApi, abi_version) == 4);
-    assert(offsetof(HostApi, register_system) == 8);
-    assert(offsetof(HostApi, iter_next_chunk) == 16);
-    assert(offsetof(HostApi, iter_column_readonly) == 24);
-    assert(offsetof(HostApi, iter_column_mutable) == 32);
-    assert(offsetof(HostApi, iter_mark_changed) == 40);
-    assert(offsetof(HostApi, iter_entities) == 48);
-    assert(offsetof(HostApi, iter_column_stride) == 56);
-    assert(offsetof(HostApi, register_component) == 64);
+    assert(strcmp(bam_result_name(BAM_RESULT_OK), "OK") == 0);
+    assert(strcmp(bam_result_name(BAM_RESULT_UNSUPPORTED), "UNSUPPORTED") == 0);
+    assert(strcmp(bam_result_name(BAM_RESULT_TYPE_MISMATCH), "TYPE_MISMATCH") == 0);
+    assert(strcmp(bam_result_name(BAM_RESULT_INTERNAL_ERROR), "INTERNAL_ERROR") == 0);
+    assert(strcmp(bam_result_name((BamResult)777u), "UNKNOWN") == 0);
 
-    printf("  -> OK (all struct sizes and field offsets verified)\n");
+    {
+        BamStrView view = bam_str_view("bevy_abi_mod");
+        BamStrView empty_view = bam_str_view(NULL);
+        assert(view.len == 12u);
+        assert(memcmp(view.ptr, "bevy_abi_mod", 12u) == 0);
+        assert(empty_view.ptr == NULL && empty_view.len == 0u);
+    }
 }
 
-/* Test Suite 2: Component Declaration & Mock Registration */
-static void test_dynamic_component_registration(void) {
-    printf("[2/5] Testing dynamic component declaration & registration in C...\n");
+static void test_cross_language_siphash_uuids(void) {
+    /* Exact 16-byte golden digests produced by `bevy_abi_mod_sys::ComponentUuid::from_parts` */
+    static const uint8_t expected_health_uuid[16] = {
+        0x45u, 0x1cu, 0x42u, 0x67u, 0x54u, 0xb2u, 0xcdu, 0x60u,
+        0xc6u, 0x72u, 0x1cu, 0x1fu, 0xf8u, 0x89u, 0x07u, 0xbdu
+    };
+    static const uint8_t expected_inventory_uuid[16] = {
+        0xe0u, 0x21u, 0x62u, 0xedu, 0x29u, 0xacu, 0xc1u, 0x48u,
+        0x32u, 0xa1u, 0x71u, 0x6cu, 0x5bu, 0x7bu, 0x9cu, 0xcbu
+    };
 
-    MockHostContext ctx;
-    memset(&ctx, 0, sizeof(ctx));
+    BamComponentUuid c_health = bam_uuid_from_parts("combat_mod::Health", 4u, 4u, 0ull);
+    BamComponentUuid c_other_ns = bam_uuid_from_parts("ui_mod::Health", 4u, 4u, 0ull);
+    BamComponentUuid c_inventory = bam_uuid_from_canonical_name("my_game::Inventory");
 
-    HostApi host_api;
-    memset(&host_api, 0, sizeof(host_api));
-    host_api.struct_size = (uint32_t)sizeof(HostApi);
-    host_api.abi_version = BEVY_ABI_VERSION_PACKED;
-    host_api.register_system = mock_register_system_dummy;
-    host_api.iter_next_chunk = mock_iter_next_chunk_dummy;
-    host_api.iter_column_readonly = mock_iter_col_ro_dummy;
-    host_api.iter_column_mutable = mock_iter_col_mut_dummy;
-    host_api.iter_mark_changed = mock_iter_mark_changed_dummy;
-    host_api.iter_entities = mock_iter_entities_dummy;
-    host_api.iter_column_stride = mock_iter_stride_dummy;
-    host_api.register_component = mock_register_component;
-
-    /* A. Plain Old Data (POD) Component */
-    ModComponentDescriptor pod_desc;
-    memset(&pod_desc, 0, sizeof(pod_desc));
-    pod_desc.struct_size = (uint32_t)sizeof(ModComponentDescriptor);
-    pod_desc.name = "Health";
-    memset(pod_desc.uuid.bytes, 0x11, 16);
-    pod_desc.size = sizeof(uint32_t);
-    pod_desc.align = BEVY_ABI_ALIGNOF(uint32_t);
-    pod_desc.drop_fn = NULL;
-    pod_desc.vtable_ptr = NULL;
-
-    FfiResult res = host_api.register_component(&ctx, &pod_desc);
-    assert(res == FFI_RESULT_OK);
-    assert(ctx.registration_count == 1);
-    assert(strcmp(ctx.last_name_buffer, "Health") == 0);
-    assert(ctx.last_registered_desc.size == 4);
-    assert(ctx.last_registered_desc.align == 4);
-    assert(ctx.last_registered_desc.drop_fn == NULL);
-
-    /* B. Component with Lifecycle Drop Hook */
-    ModComponentDescriptor drop_desc;
-    memset(&drop_desc, 0, sizeof(drop_desc));
-    drop_desc.struct_size = (uint32_t)sizeof(ModComponentDescriptor);
-    drop_desc.name = "ManagedString";
-    memset(drop_desc.uuid.bytes, 0x22, 16);
-    drop_desc.size = 16;
-    drop_desc.align = 8;
-    drop_desc.drop_fn = test_custom_drop_hook;
-    drop_desc.vtable_ptr = NULL;
-
-    res = host_api.register_component(&ctx, &drop_desc);
-    assert(res == FFI_RESULT_OK);
-    assert(ctx.registration_count == 2);
-    assert(strcmp(ctx.last_name_buffer, "ManagedString") == 0);
-    assert(ctx.last_registered_desc.drop_fn == test_custom_drop_hook);
-
-    /* Verify executing drop hook through function pointer */
-    int dummy_resource = 42;
-    ctx.last_registered_desc.drop_fn(&dummy_resource);
-    assert(g_drop_invocations == 1);
-
-    /* C. Zero-Sized Type (ZST) Marker Component */
-    ModComponentDescriptor zst_desc;
-    memset(&zst_desc, 0, sizeof(zst_desc));
-    zst_desc.struct_size = (uint32_t)sizeof(ModComponentDescriptor);
-    zst_desc.name = "PlayerTag";
-    memset(zst_desc.uuid.bytes, 0x33, 16);
-    zst_desc.size = 0;
-    zst_desc.align = 1;
-    zst_desc.drop_fn = NULL;
-    zst_desc.vtable_ptr = NULL;
-
-    res = host_api.register_component(&ctx, &zst_desc);
-    assert(res == FFI_RESULT_OK);
-    assert(ctx.registration_count == 3);
-    assert(strcmp(ctx.last_name_buffer, "PlayerTag") == 0);
-    assert(ctx.last_registered_desc.size == 0);
-
-    /* D. Over-aligned Type (SIMD Vector 16-byte alignment) */
-    ModComponentDescriptor simd_desc;
-    memset(&simd_desc, 0, sizeof(simd_desc));
-    simd_desc.struct_size = (uint32_t)sizeof(ModComponentDescriptor);
-    simd_desc.name = "SimdVec4";
-    memset(simd_desc.uuid.bytes, 0x44, 16);
-    simd_desc.size = 32;
-    simd_desc.align = 16;
-    simd_desc.drop_fn = NULL;
-
-    res = host_api.register_component(&ctx, &simd_desc);
-    assert(res == FFI_RESULT_OK);
-    assert(ctx.registration_count == 4);
-    assert(strcmp(ctx.last_name_buffer, "SimdVec4") == 0);
-    assert(ctx.last_registered_desc.align == 16);
-
-    printf("  -> OK (POD, drop-hook, ZST, and overaligned components registered successfully)\n");
+    assert(memcmp(c_health.bytes, expected_health_uuid, 16u) == 0);
+    assert(memcmp(c_inventory.bytes, expected_inventory_uuid, 16u) == 0);
+    assert(!bam_uuid_equals(c_health, c_other_ns));
+    assert(bam_uuid_equals(c_health, c_health));
 }
 
-/* Test Suite 3: Defensive Validation Against Adversarial Descriptors */
-static void test_adversarial_descriptors(void) {
-    printf("[3/5] Testing defensive validation against adversarial descriptors...\n");
+static void test_extensible_host_api_copy_bounded(void) {
+    typedef struct FutureGuestHostApiV03 {
+        BamHostApi v0_2;
+        void*      future_slot_a;
+        void*      future_slot_b;
+    } FutureGuestHostApiV03;
 
-    MockHostContext ctx;
-    memset(&ctx, 0, sizeof(ctx));
+    BamHostApi host_v02 = build_mock_host_api();
+    FutureGuestHostApiV03 guest_v03;
+    BamHostApi tiny_bad;
 
-    HostApi host_api;
-    memset(&host_api, 0, sizeof(host_api));
-    host_api.struct_size = (uint32_t)sizeof(HostApi);
-    host_api.abi_version = BEVY_ABI_VERSION_PACKED;
-    host_api.register_component = mock_register_component;
+    memset(&guest_v03, 0xAA, sizeof(guest_v03));
+    assert(
+        bam_host_api_copy_bounded(
+            &guest_v03.v0_2,
+            sizeof(guest_v03),
+            &host_v02
+        ) == BAM_RESULT_OK
+    );
+    assert(guest_v03.v0_2.struct_size == sizeof(BamHostApi));
+    assert(guest_v03.v0_2.cmd_remove == host_cmd_remove);
+    assert(guest_v03.future_slot_a == NULL);
+    assert(guest_v03.future_slot_b == NULL);
 
-    ModComponentDescriptor valid_desc;
-    memset(&valid_desc, 0, sizeof(valid_desc));
-    valid_desc.struct_size = (uint32_t)sizeof(ModComponentDescriptor);
-    valid_desc.name = "TestComp";
-    valid_desc.size = 8;
-    valid_desc.align = 8;
-
-    /* A. Null Host Context */
-    FfiResult res = host_api.register_component(NULL, &valid_desc);
-    assert(res == FFI_RESULT_NULL_POINTER);
-
-    /* B. Null Descriptor Pointer */
-    res = host_api.register_component(&ctx, NULL);
-    assert(res == FFI_RESULT_NULL_POINTER);
-
-    /* C. Truncated struct_size (< 64) */
-    ModComponentDescriptor truncated = valid_desc;
-    truncated.struct_size = 48;
-    res = host_api.register_component(&ctx, &truncated);
-    assert(res == FFI_RESULT_INVALID_VERSION);
-
-    /* D. Null Name Pointer */
-    ModComponentDescriptor null_name = valid_desc;
-    null_name.name = NULL;
-    res = host_api.register_component(&ctx, &null_name);
-    assert(res == FFI_RESULT_NULL_POINTER);
-
-    /* E. Alignment == 0 */
-    ModComponentDescriptor zero_align = valid_desc;
-    zero_align.align = 0;
-    res = host_api.register_component(&ctx, &zero_align);
-    assert(res == FFI_RESULT_INTERNAL_ERROR);
-
-    /* F. Non-power-of-two Alignment */
-    ModComponentDescriptor bad_align = valid_desc;
-    bad_align.align = 7;
-    bad_align.size = 14;
-    res = host_api.register_component(&ctx, &bad_align);
-    assert(res == FFI_RESULT_INTERNAL_ERROR);
-
-    /* G. Misaligned Size (size % align != 0) */
-    ModComponentDescriptor bad_size = valid_desc;
-    bad_size.size = 13;
-    bad_size.align = 8;
-    res = host_api.register_component(&ctx, &bad_size);
-    assert(res == FFI_RESULT_INTERNAL_ERROR);
-
-    /* H. Forward Compatible struct_size (> 64) */
-    ModComponentDescriptor extended = valid_desc;
-    extended.struct_size = 128;
-    res = host_api.register_component(&ctx, &extended);
-    assert(res == FFI_RESULT_OK);
-
-    printf("  -> OK (all defensive error checks passed)\n");
+    memset(&tiny_bad, 0, sizeof(tiny_bad));
+    tiny_bad.struct_size = 8u;
+    tiny_bad.abi_version = BAM_ABI_VERSION;
+    assert(
+        bam_host_api_copy_bounded(&guest_v03.v0_2, sizeof(guest_v03), &tiny_bad)
+        == BAM_RESULT_INVALID_VERSION
+    );
 }
 
-/* Test Suite 4: Monotonic Version Compatibility: Older Mod (64B) against Newer Host (72B) */
-static void test_legacy_mod_on_newer_host(void) {
-    printf("[4/5] Testing legacy 64-byte mod against newer 72-byte HostApi...\n");
+static void test_end_to_end_c99_lifecycle_and_vtable(void) {
+    BamManifestFn manifest_fn = mock_guest_manifest;
+    BamInitFn init_fn = mock_guest_init;
+    BamShutdownFn shutdown_fn = mock_guest_shutdown;
 
-    /* Simulates a modern 72-byte HostApi instance supplied by host */
-    HostApi modern_host;
-    memset(&modern_host, 0, sizeof(modern_host));
-    modern_host.struct_size = (uint32_t)sizeof(HostApi); /* 72 bytes */
-    modern_host.abi_version = BEVY_ABI_VERSION_PACKED;
-    modern_host.register_system = mock_register_system_dummy;
-    modern_host.iter_next_chunk = mock_iter_next_chunk_dummy;
-    modern_host.iter_column_readonly = mock_iter_col_ro_dummy;
-    modern_host.iter_column_mutable = mock_iter_col_mut_dummy;
-    modern_host.iter_mark_changed = mock_iter_mark_changed_dummy;
-    modern_host.iter_entities = mock_iter_entities_dummy;
-    modern_host.iter_column_stride = mock_iter_stride_dummy;
-    modern_host.register_component = mock_register_component;
+    BamHostApi host_api = build_mock_host_api();
+    BamHostCtx host_ctx;
+    BamLoadCtx load_ctx;
+    BamIter iter0;
+    BamCommands cmds;
+    BamSystemCtx sys_ctx;
+    BamInstance* instance = NULL;
+    const BamManifest* manifest;
+    const MockPositionVTable* resolved_vt;
+    MockPosition sample_pos = { 42.5f, -1.0f };
+    BamComponent missing = BAM_COMPONENT_INVALID;
+    char err_buf[64];
+    size_t err_len;
 
-    /* A legacy C mod compiled against LegacyHostApi (64 bytes) receives modern_host */
-    const LegacyHostApi* legacy_view = (const LegacyHostApi*)(const void*)&modern_host;
+    /* Populate VTable symbol */
+    g_mock_pos_vtable.header.struct_size = (uint32_t)sizeof(MockPositionVTable);
+    g_mock_pos_vtable.header.abi_version = BAM_ABI_VERSION;
+    g_mock_pos_vtable.header.uuid = bam_uuid_from_parts(
+        "game::MockPosition",
+        sizeof(MockPosition),
+        BAM_ALIGNOF(MockPosition),
+        0ull
+    );
+    g_mock_pos_vtable.header.size = sizeof(MockPosition);
+    g_mock_pos_vtable.header.align = BAM_ALIGNOF(MockPosition);
+    g_mock_pos_vtable.get_x = mock_pos_get_x;
 
-    /* 1. Legacy mod performs monotonic struct_size negotiation */
-    assert(legacy_view->struct_size >= sizeof(LegacyHostApi));
-    assert(legacy_view->struct_size == 72);
-    assert(legacy_view->abi_version == BEVY_ABI_VERSION_PACKED);
+    memset(&host_ctx, 0, sizeof(host_ctx));
+    host_ctx.vtable_symbol = &g_mock_pos_vtable;
+    host_ctx.health_handle = 1u;
+    host_ctx.pos_handle = 2u;
+    host_ctx.dt_res_handle = 3u;
 
-    /* 2. Legacy mod accesses its recognized function pointers (offsets 8..56) */
-    assert(legacy_view->register_system == mock_register_system_dummy);
-    assert(legacy_view->iter_next_chunk == mock_iter_next_chunk_dummy);
-    assert(legacy_view->iter_column_readonly == mock_iter_col_ro_dummy);
-    assert(legacy_view->iter_column_mutable == mock_iter_col_mut_dummy);
-    assert(legacy_view->iter_mark_changed == mock_iter_mark_changed_dummy);
-    assert(legacy_view->iter_entities == mock_iter_entities_dummy);
-    assert(legacy_view->iter_column_stride == mock_iter_stride_dummy);
+    memset(&load_ctx, 0, sizeof(load_ctx));
+    load_ctx.host_ctx = &host_ctx;
 
-    /* 3. Invoke a legacy function through the pointer */
-    size_t stride = legacy_view->iter_column_stride(NULL, 0);
-    assert(stride == 16);
+    /* 1. Manifest verification */
+    manifest = manifest_fn();
+    assert(manifest != NULL);
+    assert(manifest->struct_size >= BAM_MANIFEST_MIN_V0_2_SIZE);
+    assert(bam_version_is_compatible(BAM_ABI_VERSION, manifest->abi_version));
+    assert(strcmp(manifest->name, "combat_mod") == 0);
+    assert(strcmp(manifest->version, "0.2.0") == 0);
+    assert(manifest->flags == 0u && manifest->reserved0 == 0u);
 
-    printf("  -> OK (72-byte HostApi backward-compatible with 64-byte mod; no memory corruption)\n");
+    /* 2. Init & registration */
+    assert(init_fn(&host_api, &load_ctx, &instance) == BAM_RESULT_OK);
+    assert(instance != NULL);
+    assert(load_ctx.registered_components == 1u);
+    assert(load_ctx.registered_systems == 1u);
+    assert((load_ctx.last_system.flags & BAM_SYSTEM_FLAG_MAIN_THREAD) != 0u);
+    assert(load_ctx.last_system.schedule == BAM_SCHEDULE_CUSTOM_BASE + 1u);
+
+    /* 3. VTable discovery & `last_error` diagnostic check */
+    resolved_vt = (const MockPositionVTable*)host_api.get_proc_address(
+        &host_ctx,
+        "bam.v0.game::MockPosition.vtable"
+    );
+    assert(resolved_vt != NULL);
+    assert(resolved_vt->header.struct_size >= BAM_VTABLE_HEADER_MIN_V0_2_SIZE);
+    assert(resolved_vt->get_x(&sample_pos) == 42.5f);
+
+    assert(
+        host_api.resolve_component(&host_ctx, "game::Unknown", NULL, &missing)
+        == BAM_RESULT_NOT_FOUND
+    );
+    err_len = host_api.last_error(&host_ctx, err_buf, sizeof(err_buf));
+    assert(err_len > 0u);
+    assert(strcmp(err_buf, "component not registered in mock world") == 0);
+
+    /* 4. Run predicate + system execution */
+    memset(&iter0, 0, sizeof(iter0));
+    iter0.entities[0] = 101ull;
+    iter0.entities[1] = 102ull;
+    iter0.health_dense[0] = 20.0f;
+    iter0.health_dense[1] = 30.0f;
+    iter0.sparse_rows_storage[0].x = 1.0f;
+    iter0.sparse_rows_storage[0].y = 2.0f;
+    iter0.sparse_rows_storage[1].x = 10.0f;
+    iter0.sparse_rows_storage[1].y = 20.0f;
+    iter0.sparse_row_ptrs[0] = (uint8_t*)&iter0.sparse_rows_storage[0];
+    iter0.sparse_row_ptrs[1] = (uint8_t*)&iter0.sparse_rows_storage[1];
+    iter0.dt_resource = 0.5f;
+    iter0.health_uuid = bam_uuid_from_parts("combat_mod::Health", sizeof(float), BAM_ALIGNOF(float), 0ull);
+
+    memset(&cmds, 0, sizeof(cmds));
+    cmds.next_entity = 1000ull;
+
+    sys_ctx.host_ctx = &host_ctx;
+    sys_ctx.iter0 = &iter0;
+    sys_ctx.commands = &cmds;
+
+    assert(load_ctx.last_system.run_if(load_ctx.last_system.run_if_user_data) == BAM_TRUE);
+    assert(
+        load_ctx.last_system.callback(&sys_ctx, load_ctx.last_system.user_data)
+        == BAM_RESULT_OK
+    );
+    assert(instance->ticks_executed == 1u);
+    assert(iter0.health_dense[0] == 20.0f);
+    assert(iter0.health_dense[1] == 35.0f);
+    assert(iter0.sparse_rows_storage[0].x == 1.5f);
+    assert(iter0.sparse_rows_storage[1].x == 10.5f);
+    assert(iter0.marked_start == 1u && iter0.marked_count == 1u);
+    assert(cmds.spawned_count == 1u);
+    assert(cmds.batch_component_count == 2u);
+    assert(cmds.inserted_count == 1u);
+
+    mock_health_drop(&iter0.health_dense[0]);
+    assert(g_drop_calls == 1u);
+
+    /* 5. Per-instance shutdown */
+    shutdown_fn(instance);
+    assert(g_shutdown_calls == 1u);
 }
 
-/* Test Suite 5: Monotonic Version Compatibility: Newer Mod (72B) against Older Host (64B) */
-static void test_newer_mod_on_legacy_host(void) {
-    printf("[5/5] Testing newer 72-byte mod against older 64-byte HostApi...\n");
-
-    /* Simulates an older host providing only a 64-byte LegacyHostApi */
-    LegacyHostApi legacy_host;
-    memset(&legacy_host, 0, sizeof(legacy_host));
-    legacy_host.struct_size = (uint32_t)sizeof(LegacyHostApi); /* 64 bytes */
-    legacy_host.abi_version = BEVY_ABI_VERSION_PACKED;
-    legacy_host.register_system = mock_register_system_dummy;
-    legacy_host.iter_next_chunk = mock_iter_next_chunk_dummy;
-    legacy_host.iter_column_readonly = mock_iter_col_ro_dummy;
-    legacy_host.iter_column_mutable = mock_iter_col_mut_dummy;
-    legacy_host.iter_mark_changed = mock_iter_mark_changed_dummy;
-    legacy_host.iter_entities = mock_iter_entities_dummy;
-    legacy_host.iter_column_stride = mock_iter_stride_dummy;
-
-    /* Newer mod expects HostApi (72 bytes): inspect header via raw_struct_size without
-     * forming a 72-byte HostApi lvalue over the 64-byte legacy allocation. */
-    const HostApi* modern_view = (const HostApi*)(const void*)&legacy_host;
-    uint32_t raw_size = bam_host_api_raw_struct_size(modern_view);
-    assert(raw_size == sizeof(LegacyHostApi));
-
-    /* Newer mod checks whether register_component is available */
-    FfiBool has_register_component = (raw_size >= (offsetof(HostApi, register_component) + sizeof(RegisterComponentFn))) ? FFI_BOOL_TRUE : FFI_BOOL_FALSE;
-    assert(!has_register_component);
-
-    /* Also verify strict sizeof check */
-    FfiBool meets_full_size = (raw_size >= sizeof(HostApi)) ? FFI_BOOL_TRUE : FFI_BOOL_FALSE;
-    assert(!meets_full_size);
-
-    /* Materialize bounded local HostApi copy; trailing fields past 64 bytes stay NULL */
-    HostApi bounded_api;
-    bam_host_api_copy_bounded(modern_view, &bounded_api);
-    assert(bounded_api.struct_size >= sizeof(LegacyHostApi));
-    assert(bounded_api.register_component == NULL);
-    assert(bounded_api.register_system == mock_register_system_dummy);
-    assert(bounded_api.iter_column_stride(NULL, 0) == 16);
-
-    printf("  -> OK (boundary check correctly prevents reading or calling past 64-byte boundary)\n");
-}
-
-/* Test Suite 6: Entity Null Sentinel, SemVer Helpers, FfiBool & Scheduled Descriptors */
-static void test_entity_null_semver_and_scheduled_descriptors(void) {
-    printf("[6/6] Testing BAM_ENTITY_NULL, SemVer helpers, FfiBool & ScheduledSystemDescriptor...\n");
-
-    /* 1. Entity null sentinel (0ULL, never UINT64_MAX) */
-    assert(BAM_ENTITY_NULL == 0ULL);
-    assert(FFI_ENTITY_NULL == 0ULL);
-    assert(bam_entity_is_null(BAM_ENTITY_NULL) == FFI_BOOL_TRUE);
-    assert(bam_entity_is_null(1ULL) == FFI_BOOL_FALSE);
-    assert(bam_entity_is_null(UINT64_MAX) == FFI_BOOL_FALSE);
-
-    /* 2. SemVer compatibility helper (Cargo 0.x exact-minor vs 1.x additive-minor rules) */
-    uint32_t v0_0_9 = bevy_abi_pack_version(0, 0, 9);
-    uint32_t v0_1_0 = bevy_abi_pack_version(0, 1, 0);
-    uint32_t v0_1_5 = bevy_abi_pack_version(0, 1, 5);
-    uint32_t v0_2_0 = bevy_abi_pack_version(0, 2, 0);
-    uint32_t v1_0_0 = bevy_abi_pack_version(1, 0, 0);
-    uint32_t v1_1_0 = bevy_abi_pack_version(1, 1, 0);
-    uint32_t v1_2_0 = bevy_abi_pack_version(1, 2, 0);
-    assert(v0_1_0 == BEVY_ABI_VERSION_PACKED);
-    assert(bevy_abi_version_is_compatible(v0_1_0, v0_1_5) == FFI_BOOL_TRUE);
-    assert(bevy_abi_version_is_compatible(v0_1_5, v0_1_0) == FFI_BOOL_TRUE);
-    assert(bevy_abi_version_is_compatible(v0_2_0, v0_1_0) == FFI_BOOL_FALSE);
-    assert(bevy_abi_version_is_compatible(v0_1_0, v0_2_0) == FFI_BOOL_FALSE);
-    assert(bevy_abi_version_is_compatible(v0_1_0, v0_0_9) == FFI_BOOL_FALSE);
-    assert(bevy_abi_version_is_compatible(v1_2_0, v1_1_0) == FFI_BOOL_TRUE);
-    assert(bevy_abi_version_is_compatible(v1_1_0, v1_2_0) == FFI_BOOL_FALSE);
-    assert(bevy_abi_version_is_compatible(v1_0_0, v0_1_0) == FFI_BOOL_FALSE);
-
-    /* Verify extended FfiResult taxonomy constants */
-    assert(FFI_RESULT_INVALID_ARGUMENT == 8u);
-    assert(FFI_RESULT_OUT_OF_RANGE == 9u);
-    assert(FFI_RESULT_NOT_FOUND == 10u);
-    assert(FFI_RESULT_INVALID_STATE == 11u);
-    assert(FFI_RESULT_INVALID_ENTITY == 12u);
-    assert(FFI_RESULT_CAPACITY_EXCEEDED == 13u);
-    assert(FFI_RESULT_UNSUPPORTED == 14u);
-    assert(FFI_RESULT_INTERNAL_ERROR == 99u);
-
-    /* 3. ScheduleLabelId constants & ScheduledSystemDescriptor layout */
-    assert(SCHEDULE_LABEL_UPDATE == 0u);
-    assert(SCHEDULE_LABEL_STARTUP == 1u);
-    assert(SCHEDULE_LABEL_PRE_UPDATE == 2u);
-    assert(SCHEDULE_LABEL_POST_UPDATE == 3u);
-    assert(SCHEDULE_LABEL_FIXED_UPDATE == 4u);
-    assert(SCHEDULE_LABEL_LAST == 5u);
-
-    const char* after_names[1] = { "physics_step" };
-    ScheduledSystemDescriptor sched_desc;
-    memset(&sched_desc, 0, sizeof(sched_desc));
-    sched_desc.base.struct_size = (uint32_t)sizeof(ScheduledSystemDescriptor);
-    sched_desc.base.name = "render_sync";
-    sched_desc.schedule = BAM_SCHEDULE_POST_UPDATE;
-    sched_desc.after = after_names;
-    sched_desc.after_count = 1;
-
-    assert(sched_desc.base.struct_size == sizeof(ScheduledSystemDescriptor));
-    assert(((const SystemDescriptor*)&sched_desc)->struct_size == sizeof(ScheduledSystemDescriptor));
-    assert(sched_desc.schedule == 3u);
-    assert(sched_desc.after_count == 1u);
-
-    printf("  -> OK (BAM_ENTITY_NULL=0, SemVer matrix, FfiBool & ScheduledSystemDescriptor verified)\n");
-}
-
-static FfiBool mock_run_condition(void* user_data) {
-    return user_data != NULL ? FFI_BOOL_TRUE : FFI_BOOL_FALSE;
-}
-
-/* Test Suite 7: Phase 3 & Phase 4 Access Modes, Resource/Command Typedefs & Conditional Descriptors */
-static void test_phase3_phase4_abi_extensions(void) {
-    printf("[7/7] Testing Phase 3/4 access modes, command/resource fn typedefs & ConditionalSystemDescriptor...\n");
-
-    assert(COMPONENT_ACCESS_READ == 0u);
-    assert(COMPONENT_ACCESS_WRITE == 1u);
-    assert(COMPONENT_ACCESS_FILTER_ONLY == 2u);
-    assert(COMPONENT_ACCESS_WITHOUT == 3u);
-    assert(COMPONENT_ACCESS_OPTIONAL_READ == 4u);
-    assert(COMPONENT_ACCESS_OPTIONAL_WRITE == 5u);
-    assert(COMPONENT_ACCESS_CHANGED == 6u);
-    assert(COMPONENT_ACCESS_ADDED == 7u);
-    assert(COMPONENT_ACCESS_RESOURCE_READ == 8u);
-    assert(COMPONENT_ACCESS_RESOURCE_WRITE == 9u);
-
-    ComponentAccessDesc opt_ro = bam_access_desc("Velocity", COMPONENT_ACCESS_OPTIONAL_READ);
-    ComponentAccessDesc chg = bam_access_desc("Position", COMPONENT_ACCESS_CHANGED);
-    ComponentAccessDesc res_rw = bam_access_desc("ScoreBoard", COMPONENT_ACCESS_RESOURCE_WRITE);
-    assert(opt_ro.mode == COMPONENT_ACCESS_OPTIONAL_READ);
-    assert(chg.mode == COMPONENT_ACCESS_CHANGED);
-    assert(res_rw.mode == COMPONENT_ACCESS_RESOURCE_WRITE);
-
-    int flag = 1;
-    ConditionalSystemDescriptor cond_desc;
-    memset(&cond_desc, 0, sizeof(cond_desc));
-    cond_desc.sched.base.struct_size = (uint32_t)sizeof(ConditionalSystemDescriptor);
-    cond_desc.sched.base.name = "conditional_sys";
-    cond_desc.sched.schedule = BAM_SCHEDULE_UPDATE;
-    cond_desc.run_if = mock_run_condition;
-    cond_desc.run_if_user_data = &flag;
-
-    assert(((const SystemDescriptor*)&cond_desc)->struct_size == sizeof(ConditionalSystemDescriptor));
-    assert(cond_desc.run_if(cond_desc.run_if_user_data) == FFI_BOOL_TRUE);
-    assert(cond_desc.run_if(NULL) == FFI_BOOL_FALSE);
-
-    /* Verify function pointer typedef usability */
-    IterResourceReadonlyFn fn_res_ro = NULL;
-    IterResourceMutableFn fn_res_mut = NULL;
-    CmdRemoveComponentFn fn_cmd_rm = NULL;
-    CmdInsertDefaultFn fn_cmd_def = NULL;
-    assert(fn_res_ro == NULL && fn_res_mut == NULL && fn_cmd_rm == NULL && fn_cmd_def == NULL);
-
-    printf("  -> OK (Phase 3/4 constants, typedefs & ConditionalSystemDescriptor verified)\n");
-}
-
-/* ============================================================================
- * Main Entry Point
- * ============================================================================ */
 int main(void) {
-    printf("=== Starting C Header & ABI Compatibility Harness ===\n");
-    test_layout_and_offsets();
-    test_dynamic_component_registration();
-    test_adversarial_descriptors();
-    test_legacy_mod_on_newer_host();
-    test_newer_mod_on_legacy_host();
-    test_entity_null_semver_and_scheduled_descriptors();
-    test_phase3_phase4_abi_extensions();
-    printf("=== All C Header & ABI Compatibility Tests Passed! ===\n");
+    test_versions_and_result_names();
+    test_cross_language_siphash_uuids();
+    test_extensible_host_api_copy_bounded();
+    test_end_to_end_c99_lifecycle_and_vtable();
+
+    printf("All ABI v0.2.0 ISO C99 conformance & layout checks passed.\n");
     return 0;
 }
