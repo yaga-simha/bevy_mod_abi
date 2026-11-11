@@ -70,14 +70,16 @@ pub use commands::{
     CmdInsertComponentFn, CmdSpawnEmptyFn, CommandQueueBridge,
 };
 pub use dynamic_system::{
-    host_register_component, host_register_multi_query_system, host_register_system,
-    host_register_system_in_schedule, reset_drop_trampolines_for_testing, ComponentAccessDescOwned,
-    DynamicCSystem, ModErrorPolicy, ModErrorPolicyConfig, ModInitContext, ModSchedule,
-    ModSystemError, ModSystemFaulted, ModSystemSet, MAX_DROP_TRAMPOLINES, MAX_SYSTEM_QUERIES,
+    host_register_component, host_register_multi_query_system, host_register_scheduled_system,
+    host_register_system, host_register_system_in_schedule, reset_drop_trampolines_for_testing,
+    ComponentAccessDescOwned, DynamicCSystem, ModErrorPolicy, ModErrorPolicyConfig, ModInitContext,
+    ModSchedule, ModSystemError, ModSystemFaulted, ModSystemSet, MAX_DROP_TRAMPOLINES,
+    MAX_SYSTEM_QUERIES,
 };
 pub use host::{is_abi_version_compatible, LoadedMod, ModHost, ModId, ModLoadError};
 pub use plugin::{
-    AbiModPlugin, ConfiguredAbiModPlugin, LoadedModInfo, ModAppExt, ModLoaded, ModUnloaded,
+    AbiModPlugin, ConfiguredAbiModPlugin, LoadedModInfo, ModAppExt, ModLoaded, ModNamedSystemSet,
+    ModUnloaded,
 };
 pub use registry::{
     host_get_proc_address, CurrentRegistryGuard, InsertRawFn, ModRegistry, RegisteredComponent,
@@ -91,12 +93,14 @@ pub mod prelude {
     };
     pub use crate::host::{LoadedMod, ModHost, ModId, ModLoadError};
     pub use crate::plugin::{
-        AbiModPlugin, ConfiguredAbiModPlugin, LoadedModInfo, ModAppExt, ModLoaded, ModUnloaded,
+        AbiModPlugin, ConfiguredAbiModPlugin, LoadedModInfo, ModAppExt, ModLoaded,
+        ModNamedSystemSet, ModUnloaded,
     };
     pub use crate::registry::ModRegistry;
     pub use crate::ModExposable;
     pub use abi_contract::{
         ComponentAccessDesc, ComponentAccessMode, ComponentUuid, ExposableComponent, FfiEntity,
-        FfiResult, FfiSlice, StrView,
+        FfiResult, FfiSlice, ScheduleLabelId, ScheduledMultiQuerySystemDescriptor,
+        ScheduledSystemDescriptor, StrView,
     };
 }

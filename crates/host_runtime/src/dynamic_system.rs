@@ -37,8 +37,10 @@ use crate::commands::CommandQueueBridge;
 use crate::host::ModId;
 use crate::registry::{ModRegistry, RegisteredComponent};
 use abi_contract::{
-    ComponentAccessMode, DynamicSystemCallback, FfiResult, MultiQuerySystemCallback,
-    MultiQuerySystemDescriptor, RawChunkIter, RawCommandQueue, SystemDescriptor,
+    read_descriptor, ComponentAccessMode, ComponentDropFn, DynamicSystemCallback, FfiResult,
+    MultiQuerySystemCallback, MultiQuerySystemDescriptor, RawChunkIter, RawCommandQueue,
+    ScheduleLabelId, ScheduledMultiQuerySystemDescriptor, ScheduledSystemDescriptor,
+    SystemDescriptor,
 };
 use bevy_ecs::archetype::{ArchetypeGeneration, ArchetypeId};
 use bevy_ecs::change_detection::{CheckChangeTicks, Tick};
@@ -65,9 +67,10 @@ pub const MAX_SYSTEM_QUERIES: usize = 8;
 /// Maximum number of distinct `(WorldId, ComponentUuid)` foreign drop trampolines supported per process.
 pub const MAX_DROP_TRAMPOLINES: usize = 1024;
 
+type DropGuardPair = (ComponentDropFn, Arc<AtomicBool>);
+
 struct DropSlotSnapshot {
-    drop_fn: unsafe extern "C" fn(ptr: *mut c_void),
-    active_guards: Box<[Arc<AtomicBool>]>,
+    entries: Box<[DropGuardPair]>,
 }
 
 static DROP_SLOT_SNAPSHOTS: [AtomicPtr<DropSlotSnapshot>; MAX_DROP_TRAMPOLINES] =
@@ -76,7 +79,7 @@ static DROP_SLOT_SNAPSHOTS: [AtomicPtr<DropSlotSnapshot>; MAX_DROP_TRAMPOLINES] 
 struct DropSlotMeta {
     world_id: WorldId,
     uuid: abi_contract::ComponentUuid,
-    guards: Vec<Arc<AtomicBool>>,
+    entries: Vec<DropGuardPair>,
 }
 
 struct DropRegistryState {
@@ -99,11 +102,16 @@ unsafe fn drop_trampoline<const SLOT: usize>(ptr: OwningPtr<'_>) {
         // SAFETY: `snap_ptr` points to a valid `DropSlotSnapshot` whose lifetime is retained
         // for the lifetime of the process (or in `DROP_REGISTRY.retired` across updates).
         let snap = unsafe { &*snap_ptr };
-        if snap.active_guards.iter().any(|g| g.load(Ordering::Acquire)) {
+        if let Some(&(drop_fn, _)) = snap
+            .entries
+            .iter()
+            .rev()
+            .find(|(_, guard)| guard.load(Ordering::Acquire))
+        {
             let raw = ptr.as_ptr() as *mut c_void;
-            // SAFETY: Foreign drop function invoked on valid component instance while at least
-            // one loaded mod instance providing this `(WorldId, ComponentUuid)` remains mapped.
-            unsafe { (snap.drop_fn)(raw) };
+            // SAFETY: Foreign drop function invoked on valid component instance while its own
+            // paired mod instance (`guard == true`) remains mapped in memory.
+            unsafe { drop_fn(raw) };
         }
     }
 }
@@ -183,21 +191,27 @@ fn allocate_drop_trampoline(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    // 1. Same-(WorldId, ComponentUuid) hot-reload rebinding: isolated per World so concurrent
-    //    Worlds registering the same ComponentUuid never overwrite each other's drop_fn!
+    // 1. Same-(WorldId, ComponentUuid) hot-reload / multi-mod binding: isolated per World, and
+    //    each `drop_fn` stays strictly paired with its own `is_active` guard so unloading one mod
+    //    never invokes its unmapped `drop_fn` via another still-loaded mod's guard!
     if let Some((slot_idx, meta)) = reg
         .slots
         .iter_mut()
         .enumerate()
         .find(|(_, m)| m.world_id == world_id && m.uuid == uuid)
     {
-        meta.guards.retain(|g| g.load(Ordering::Acquire));
-        if !meta.guards.iter().any(|g| Arc::ptr_eq(g, &is_active)) {
-            meta.guards.push(is_active);
+        meta.entries.retain(|(_, g)| g.load(Ordering::Acquire));
+        if let Some(existing) = meta
+            .entries
+            .iter_mut()
+            .find(|(_, g)| Arc::ptr_eq(g, &is_active))
+        {
+            existing.0 = drop_fn;
+        } else {
+            meta.entries.push((drop_fn, is_active));
         }
         let new_snap = Box::into_raw(Box::new(DropSlotSnapshot {
-            drop_fn,
-            active_guards: meta.guards.clone().into_boxed_slice(),
+            entries: meta.entries.clone().into_boxed_slice(),
         }));
         let old_snap = DROP_SLOT_SNAPSHOTS[slot_idx].swap(new_snap, Ordering::AcqRel);
         if !old_snap.is_null() {
@@ -212,10 +226,9 @@ fn allocate_drop_trampoline(
         return None;
     }
 
-    let guards = vec![is_active];
+    let entries = vec![(drop_fn, is_active)];
     let new_snap = Box::into_raw(Box::new(DropSlotSnapshot {
-        drop_fn,
-        active_guards: guards.clone().into_boxed_slice(),
+        entries: entries.clone().into_boxed_slice(),
     }));
     let old_snap = DROP_SLOT_SNAPSHOTS[slot_idx].swap(new_snap, Ordering::AcqRel);
     if !old_snap.is_null() {
@@ -224,7 +237,7 @@ fn allocate_drop_trampoline(
     reg.slots.push(DropSlotMeta {
         world_id,
         uuid,
-        guards,
+        entries,
     });
     Some(drop_trampoline_fn_for_slot(slot_idx))
 }
@@ -289,6 +302,18 @@ impl ModSchedule {
             5 => Some(Self::Last),
             _ => None,
         }
+    }
+
+    /// Converts an [`abi_contract::ScheduleLabelId`] into [`ModSchedule`].
+    #[inline]
+    pub const fn from_label_id(id: ScheduleLabelId) -> Option<Self> {
+        Self::from_raw(id.0)
+    }
+
+    /// Converts this [`ModSchedule`] into an [`abi_contract::ScheduleLabelId`].
+    #[inline]
+    pub const fn to_label_id(self) -> ScheduleLabelId {
+        ScheduleLabelId(self as u32)
     }
 }
 
@@ -447,6 +472,8 @@ pub struct DynamicCSystem {
 
     mod_id: Option<ModId>,
     schedule: ModSchedule,
+    after_systems: Vec<String>,
+    before_systems: Vec<String>,
     error_policy: ModErrorPolicy,
     error_policy_explicit: bool,
 
@@ -482,6 +509,8 @@ impl DynamicCSystem {
             user_data,
             mod_id: None,
             schedule: ModSchedule::Update,
+            after_systems: Vec::new(),
+            before_systems: Vec::new(),
             error_policy: ModErrorPolicy::Quarantine,
             error_policy_explicit: false,
             enabled: true,
@@ -512,6 +541,8 @@ impl DynamicCSystem {
             user_data,
             mod_id: None,
             schedule: ModSchedule::Update,
+            after_systems: Vec::new(),
+            before_systems: Vec::new(),
             error_policy: ModErrorPolicy::Quarantine,
             error_policy_explicit: false,
             enabled: true,
@@ -599,6 +630,23 @@ impl DynamicCSystem {
     pub fn with_schedule(mut self, schedule: ModSchedule) -> Self {
         self.schedule = schedule;
         self
+    }
+
+    /// Builder helper to configure explicit `after` and `before` system-name ordering dependencies.
+    pub fn with_ordering(mut self, after: Vec<String>, before: Vec<String>) -> Self {
+        self.after_systems = after;
+        self.before_systems = before;
+        self
+    }
+
+    /// System names declared in `ScheduledSystemDescriptor::after`.
+    pub fn after_systems(&self) -> &[String] {
+        &self.after_systems
+    }
+
+    /// System names declared in `ScheduledSystemDescriptor::before`.
+    pub fn before_systems(&self) -> &[String] {
+        &self.before_systems
     }
 
     /// Returns the [`ModErrorPolicy`] governing faults in this system.
@@ -1085,20 +1133,75 @@ pub fn set_active_init_context(ctx: *mut ModInitContext) -> ActiveInitContextGua
     ActiveInitContextGuard { prev }
 }
 
-unsafe fn register_system_with_schedule_impl(
+unsafe fn parse_cstr_name_array(
+    ptr: *const *const core::ffi::c_char,
+    count: usize,
+) -> Result<Vec<String>, FfiResult> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if ptr.is_null() {
+        return Err(FfiResult::NULL_POINTER);
+    }
+    // SAFETY: Caller passes an array of `count` C-string pointers.
+    let slice = unsafe { core::slice::from_raw_parts(ptr, count) };
+    let mut out = Vec::with_capacity(count);
+    for &entry in slice {
+        if entry.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        // SAFETY: `entry` is checked non-null and points to a NUL-terminated C string.
+        let Ok(s) = (unsafe { CStr::from_ptr(entry) }).to_str() else {
+            return Err(FfiResult::INVALID_UTF8);
+        };
+        out.push(s.to_string());
+    }
+    Ok(out)
+}
+
+unsafe fn register_system_from_extensible_ptr(
     host_context: *mut c_void,
-    descriptor: *const SystemDescriptor,
-    schedule: ModSchedule,
+    descriptor_ptr: *const c_void,
+    schedule_override: Option<ModSchedule>,
+    truncated_err: FfiResult,
 ) -> FfiResult {
-    if host_context.is_null() || descriptor.is_null() {
+    if host_context.is_null() || descriptor_ptr.is_null() {
         return FfiResult::NULL_POINTER;
     }
 
-    // SAFETY: caller passes a valid pointer to SystemDescriptor.
-    let desc = unsafe { &*descriptor };
-    if (desc.struct_size as usize) < core::mem::size_of::<SystemDescriptor>() {
-        return FfiResult::INTERNAL_ERROR;
-    }
+    // SAFETY: Reads `struct_size` and copies at most `min(struct_size, size_of::<ScheduledSystemDescriptor>())`
+    // bytes into a zero-filled `MaybeUninit`, validating non-null `callback` BEFORE `assume_init()`
+    // to eliminate truncated-provenance and null-`fn`-niche UB!
+    let sched_desc = match unsafe { read_descriptor::<ScheduledSystemDescriptor>(descriptor_ptr) } {
+        Ok(d) => d,
+        Err(FfiResult::INVALID_VERSION) => return truncated_err,
+        Err(err) => return err,
+    };
+
+    let schedule = match schedule_override {
+        Some(s) => s,
+        None => {
+            let Some(s) = ModSchedule::from_label_id(sched_desc.schedule) else {
+                return FfiResult::INVALID_VERSION;
+            };
+            s
+        }
+    };
+
+    // SAFETY: `sched_desc.after` / `before` are zero-filled (`count == 0`) for v1 descriptors,
+    // or caller-provided arrays when `struct_size` covers `ScheduledSystemDescriptor`.
+    let after = match unsafe { parse_cstr_name_array(sched_desc.after, sched_desc.after_count) } {
+        Ok(v) => v,
+        Err(err) => return err,
+    };
+    // SAFETY: Same contract for `before`.
+    let before = match unsafe { parse_cstr_name_array(sched_desc.before, sched_desc.before_count) }
+    {
+        Ok(v) => v,
+        Err(err) => return err,
+    };
+
+    let desc = sched_desc.base;
 
     // D8 fix: never silently truncate query columns beyond MAX_QUERY_COMPONENTS!
     if desc.query_count > MAX_QUERY_COMPONENTS {
@@ -1150,22 +1253,53 @@ unsafe fn register_system_with_schedule_impl(
         Arc::clone(&init_ctx.registry),
     )
     .with_schedule(schedule)
+    .with_ordering(after, before)
     .with_is_active(Arc::clone(&init_ctx.is_active));
     init_ctx.registered_systems.push(system);
 
     FfiResult::OK
 }
 
-/// C-ABI implementation of `register_system` (defaults to [`ModSchedule::Update`]).
+/// C-ABI implementation of `register_system` (defaults to [`ModSchedule::Update`] for v1
+/// [`SystemDescriptor`]s, and transparently honors `schedule` / `after` / `before` when passed
+/// an extended [`ScheduledSystemDescriptor`] via [`ScheduledSystemDescriptor::as_base_ptr`]).
 ///
 /// # Safety
-/// `host_context` must point to a valid [`ModInitContext`]. `descriptor` must point to a valid [`SystemDescriptor`].
+/// `host_context` must point to a valid [`ModInitContext`]. `descriptor` must point to a valid
+/// [`SystemDescriptor`] or [`ScheduledSystemDescriptor`].
 pub unsafe extern "C" fn host_register_system(
     host_context: *mut c_void,
     descriptor: *const SystemDescriptor,
 ) -> FfiResult {
-    // SAFETY: Delegating with identical safety invariants.
-    unsafe { register_system_with_schedule_impl(host_context, descriptor, ModSchedule::Update) }
+    // SAFETY: Delegating through `read_descriptor::<ScheduledSystemDescriptor>`.
+    unsafe {
+        register_system_from_extensible_ptr(
+            host_context,
+            descriptor.cast::<c_void>(),
+            None,
+            FfiResult::INTERNAL_ERROR,
+        )
+    }
+}
+
+/// C-ABI symbol `register_scheduled_system` matching [`abi_contract::RegisterScheduledSystemFn`].
+///
+/// # Safety
+/// `host_context` must point to a valid [`ModInitContext`]. `descriptor` must point to a valid
+/// [`ScheduledSystemDescriptor`].
+pub unsafe extern "C" fn host_register_scheduled_system(
+    host_context: *mut c_void,
+    descriptor: *const ScheduledSystemDescriptor,
+) -> FfiResult {
+    // SAFETY: Delegating through `read_descriptor::<ScheduledSystemDescriptor>`.
+    unsafe {
+        register_system_from_extensible_ptr(
+            host_context,
+            descriptor.cast::<c_void>(),
+            None,
+            FfiResult::INVALID_VERSION,
+        )
+    }
 }
 
 /// C-ABI symbol `register_system_in_schedule` allowing a guest mod to target a specific
@@ -1181,14 +1315,24 @@ pub unsafe extern "C" fn host_register_system_in_schedule(
     let Some(schedule) = ModSchedule::from_raw(schedule_raw) else {
         return FfiResult::INTERNAL_ERROR;
     };
-    // SAFETY: Delegating with identical safety invariants.
-    unsafe { register_system_with_schedule_impl(host_context, descriptor, schedule) }
+    // SAFETY: Delegating through `read_descriptor::<ScheduledSystemDescriptor>`.
+    unsafe {
+        register_system_from_extensible_ptr(
+            host_context,
+            descriptor.cast::<c_void>(),
+            Some(schedule),
+            FfiResult::INTERNAL_ERROR,
+        )
+    }
 }
 
 /// C-ABI implementation of `register_multi_query_system` for nested / multi-query ECS systems.
+/// Transparently supports both v1 [`MultiQuerySystemDescriptor`] and extended
+/// [`ScheduledMultiQuerySystemDescriptor`] via `struct_size` negotiation.
 ///
 /// # Safety
-/// `host_context` must point to a valid [`ModInitContext`]. `descriptor` must point to a valid [`MultiQuerySystemDescriptor`].
+/// `host_context` must point to a valid [`ModInitContext`]. `descriptor` must point to a valid
+/// [`MultiQuerySystemDescriptor`] or [`ScheduledMultiQuerySystemDescriptor`].
 pub unsafe extern "C" fn host_register_multi_query_system(
     host_context: *mut c_void,
     descriptor: *const MultiQuerySystemDescriptor,
@@ -1197,11 +1341,33 @@ pub unsafe extern "C" fn host_register_multi_query_system(
         return FfiResult::NULL_POINTER;
     }
 
-    // SAFETY: caller passes a valid pointer to MultiQuerySystemDescriptor.
-    let desc = unsafe { &*descriptor };
-    if (desc.struct_size as usize) < core::mem::size_of::<MultiQuerySystemDescriptor>() {
-        return FfiResult::INTERNAL_ERROR;
-    }
+    // SAFETY: Safely copies `min(struct_size, size_of::<ScheduledMultiQuerySystemDescriptor>())`
+    // and checks `callback != 0` before `assume_init()` (no provenance or `fn`-niche UB).
+    let sched_desc = match unsafe {
+        read_descriptor::<ScheduledMultiQuerySystemDescriptor>(descriptor.cast::<c_void>())
+    } {
+        Ok(d) => d,
+        Err(FfiResult::INVALID_VERSION) => return FfiResult::INTERNAL_ERROR,
+        Err(err) => return err,
+    };
+
+    let Some(schedule) = ModSchedule::from_label_id(sched_desc.schedule) else {
+        return FfiResult::INVALID_VERSION;
+    };
+
+    // SAFETY: Zero-filled for v1 descriptors or caller-supplied pointer array for v2 descriptors.
+    let after = match unsafe { parse_cstr_name_array(sched_desc.after, sched_desc.after_count) } {
+        Ok(v) => v,
+        Err(err) => return err,
+    };
+    // SAFETY: Same contract for `before`.
+    let before = match unsafe { parse_cstr_name_array(sched_desc.before, sched_desc.before_count) }
+    {
+        Ok(v) => v,
+        Err(err) => return err,
+    };
+
+    let desc = sched_desc.base;
     if desc.query_spec_count == 0 || desc.query_spec_count > MAX_SYSTEM_QUERIES {
         return FfiResult::INTERNAL_ERROR;
     }
@@ -1266,6 +1432,8 @@ pub unsafe extern "C" fn host_register_multi_query_system(
         desc.user_data,
         Arc::clone(&init_ctx.registry),
     )
+    .with_schedule(schedule)
+    .with_ordering(after, before)
     .with_is_active(Arc::clone(&init_ctx.is_active));
     init_ctx.registered_systems.push(system);
 
@@ -1289,11 +1457,14 @@ pub unsafe extern "C" fn host_register_component(
         return FfiResult::NULL_POINTER;
     }
 
-    // SAFETY: caller passes a valid pointer to ModComponentDescriptor.
-    let desc = unsafe { &*descriptor };
-    if (desc.struct_size as usize) < core::mem::size_of::<abi_contract::ModComponentDescriptor>() {
-        return FfiResult::INVALID_VERSION;
-    }
+    // SAFETY: Safely reads `struct_size` first and copies `min(struct_size, size_of::<ModComponentDescriptor>())`
+    // without forming `&ModComponentDescriptor` on truncated C buffers (preventing provenance UB).
+    let desc = match unsafe {
+        read_descriptor::<abi_contract::ModComponentDescriptor>(descriptor.cast::<c_void>())
+    } {
+        Ok(d) => d,
+        Err(err) => return err,
+    };
     if desc.name.is_null() {
         return FfiResult::NULL_POINTER;
     }
@@ -1356,7 +1527,7 @@ pub unsafe extern "C" fn host_register_component(
                 let mut reg_clone = (*init_ctx.registry).clone();
                 reg_clone.register_dynamic_component(
                     existing.component_id,
-                    desc,
+                    &desc,
                     name_str.to_string(),
                 );
                 init_ctx.registry = Arc::new(reg_clone);
@@ -1406,14 +1577,14 @@ pub unsafe extern "C" fn host_register_component(
         let comp_id = world.register_component_with_descriptor(bevy_desc);
 
         if let Some(mut registry) = world.get_resource_mut::<ModRegistry>() {
-            registry.register_dynamic_component(comp_id, desc, name_str.to_string());
+            registry.register_dynamic_component(comp_id, &desc, name_str.to_string());
             if let Some(reg_comp) = registry.get_by_id(comp_id) {
                 init_ctx.registered_components.push(reg_comp.clone());
             }
         }
 
         let mut reg_clone = (*init_ctx.registry).clone();
-        reg_clone.register_dynamic_component(comp_id, desc, name_str.to_string());
+        reg_clone.register_dynamic_component(comp_id, &desc, name_str.to_string());
         init_ctx.registry = Arc::new(reg_clone);
         crate::registry::CURRENT_REGISTRY.with(|cell| {
             *cell.borrow_mut() = Some(Arc::clone(&init_ctx.registry));

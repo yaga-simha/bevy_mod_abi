@@ -34,8 +34,16 @@ use bevy_ecs::entity::Entity;
 use bevy_ecs::event::Event;
 use bevy_ecs::message::{Message, Messages};
 use bevy_ecs::name::Name;
-use bevy_ecs::schedule::{InternedScheduleLabel, ScheduleCleanupPolicy, ScheduleLabel, Schedules};
+use bevy_ecs::schedule::{
+    IntoScheduleConfigs, InternedScheduleLabel, ScheduleCleanupPolicy, ScheduleLabel, Schedules,
+    SystemSet,
+};
 use std::path::{Path, PathBuf};
+
+/// Named [`SystemSet`] used to resolve intra-mod and cross-mod `after` / `before` ordering
+/// constraints declared in [`abi_contract::ScheduledSystemDescriptor`].
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ModNamedSystemSet(pub String);
 
 /// ECS [`Component`] attached to the entity spawned for each active native mod.
 #[derive(Component, Debug, Clone, PartialEq, Eq)]
@@ -140,26 +148,59 @@ fn ensure_mod_infrastructure(app: &mut App) {
     }
 }
 
-fn add_system_for_mod_schedule(app: &mut App, schedule: ModSchedule, sys: DynamicCSystem) {
+fn add_configured_system_to_label<S: ScheduleLabel>(
+    app: &mut App,
+    label: S,
+    sys: DynamicCSystem,
+    with_named_sets: bool,
+) {
+    if !with_named_sets {
+        app.add_systems(label, sys);
+        return;
+    }
+
+    let own_name = sys.system_name().to_string();
+    let after = sys.after_systems().to_vec();
+    let before = sys.before_systems().to_vec();
+    let mut cfg = sys.in_set(ModNamedSystemSet(own_name));
+    for dep in after {
+        cfg = cfg.after(ModNamedSystemSet(dep));
+    }
+    for dep in before {
+        cfg = cfg.before(ModNamedSystemSet(dep));
+    }
+    app.add_systems(label, cfg);
+}
+
+fn add_system_for_mod_schedule(
+    app: &mut App,
+    schedule: ModSchedule,
+    sys: DynamicCSystem,
+    with_named_sets: bool,
+) {
     match schedule {
-        ModSchedule::Update => {
-            app.add_systems(Update, sys);
-        }
-        ModSchedule::Startup => {
-            app.add_systems(Startup, sys);
-        }
+        ModSchedule::Update => add_configured_system_to_label(app, Update, sys, with_named_sets),
+        ModSchedule::Startup => add_configured_system_to_label(app, Startup, sys, with_named_sets),
         ModSchedule::PreUpdate => {
-            app.add_systems(PreUpdate, sys);
+            add_configured_system_to_label(app, PreUpdate, sys, with_named_sets)
         }
         ModSchedule::PostUpdate => {
-            app.add_systems(PostUpdate, sys);
+            add_configured_system_to_label(app, PostUpdate, sys, with_named_sets)
         }
         ModSchedule::FixedUpdate => {
-            app.add_systems(FixedUpdate, sys);
+            add_configured_system_to_label(app, FixedUpdate, sys, with_named_sets)
         }
-        ModSchedule::Last => {
-            app.add_systems(Last, sys);
-        }
+        ModSchedule::Last => add_configured_system_to_label(app, Last, sys, with_named_sets),
+    }
+}
+
+fn add_systems_batch(app: &mut App, systems: Vec<DynamicCSystem>) {
+    let has_ordering = systems
+        .iter()
+        .any(|s| !s.after_systems().is_empty() || !s.before_systems().is_empty());
+    for sys in systems {
+        let sched = sys.schedule();
+        add_system_for_mod_schedule(app, sched, sys, has_ordering);
     }
 }
 
@@ -306,10 +347,7 @@ impl ModAppExt for App {
                 })?;
 
         let system_count = systems.len();
-        for sys in systems {
-            let sched = sys.schedule();
-            add_system_for_mod_schedule(self, sched, sys);
-        }
+        add_systems_batch(self, systems);
 
         finalize_mod_load_in_world(self.world_mut(), mod_id, path_buf, system_count);
         Ok(mod_id)
@@ -345,10 +383,7 @@ impl ModAppExt for App {
         }
 
         let system_count = systems.len();
-        for sys in systems {
-            let sched = sys.schedule();
-            add_system_for_mod_schedule(self, sched, sys);
-        }
+        add_systems_batch(self, systems);
 
         finalize_mod_load_in_world(self.world_mut(), mod_id, path_buf, system_count);
         Ok(mod_id)
@@ -370,8 +405,11 @@ impl ModAppExt for App {
                 })?;
 
         let system_count = systems.len();
+        let has_ordering = systems
+            .iter()
+            .any(|s| !s.after_systems().is_empty() || !s.before_systems().is_empty());
         for sys in systems {
-            self.add_systems(schedule.clone(), sys);
+            add_configured_system_to_label(self, schedule.clone(), sys, has_ordering);
         }
 
         finalize_mod_load_in_world(self.world_mut(), mod_id, path_buf, system_count);

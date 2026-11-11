@@ -201,6 +201,14 @@ impl ModRegistry {
             crate::dynamic_system::host_register_system_in_schedule as *const c_void,
         );
         reg.insert_symbol(
+            "register_scheduled_system",
+            crate::dynamic_system::host_register_scheduled_system as *const c_void,
+        );
+        reg.insert_symbol(
+            "host_register_scheduled_system",
+            crate::dynamic_system::host_register_scheduled_system as *const c_void,
+        );
+        reg.insert_symbol(
             "register_component",
             crate::dynamic_system::host_register_component as *const c_void,
         );
@@ -219,11 +227,11 @@ impl ModRegistry {
 
     /// Register an exposable component type with its Bevy [`ComponentId`].
     ///
-    /// Automatically disables raw byte insertion (`insert_raw_fn = None`) if `T` owns heap
-    /// resources or drop glue (`core::mem::needs_drop::<T>()`), preventing foreign bytes from
-    /// forging host `String`/`Vec` pointers (D3 soundness protection).
+    /// Automatically disables raw byte insertion (`insert_raw_fn = None`) unless
+    /// `T::IS_RAW_INSERTABLE && !core::mem::needs_drop::<T>()`, preventing foreign bytes from
+    /// forging host `String`/`Vec` pointers or invalid `bool` bit patterns (D3/D6 soundness protection).
     pub fn register_component<T: Component + ExposableComponent>(&mut self, comp_id: ComponentId) {
-        let allow_raw_insert = !core::mem::needs_drop::<T>();
+        let allow_raw_insert = T::IS_RAW_INSERTABLE && !core::mem::needs_drop::<T>();
         self.register_component_with_raw_policy::<T>(comp_id, allow_raw_insert);
     }
 

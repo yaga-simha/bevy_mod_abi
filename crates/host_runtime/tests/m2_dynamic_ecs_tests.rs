@@ -179,7 +179,7 @@ fn test_m2_deferred_dynamic_component_insertion() {
     let mut spawned_entities = Vec::new();
     for vel in &vel_data {
         let ffi_entity = unsafe { host_cmd_spawn_empty(raw_queue) };
-        assert_ne!(ffi_entity, FfiEntity::PLACEHOLDER);
+        assert_ne!(ffi_entity, FfiEntity::NULL);
 
         let insert_res = unsafe {
             host_cmd_insert_component(

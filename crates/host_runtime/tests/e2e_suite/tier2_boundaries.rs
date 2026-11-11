@@ -196,6 +196,7 @@ fn t2_f03_05_mark_changed_out_of_bounds_column() {
 // --- Feature 4: Deferred Command Bridge (CommandQueueBridge) ---
 
 #[test]
+#[allow(deprecated)]
 fn t2_f04_01_despawn_placeholder_entity() {
     let mut q = MockCommandQueueState::new();
     q.push(MockCommand::Despawn(FfiEntity::PLACEHOLDER));

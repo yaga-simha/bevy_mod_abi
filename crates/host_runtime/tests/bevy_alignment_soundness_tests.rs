@@ -4,9 +4,11 @@
 mod common;
 
 use abi_contract::{
-    ComponentAccessDesc, ComponentAccessMode, ComponentUuid, FfiEntity, FfiResult,
-    ModComponentDescriptor, MultiQuerySystemDescriptor, QuerySpec, RawChunkIter, RawCommandQueue,
-    SystemDescriptor, ABI_VERSION_PACKED,
+    ComponentAccessDesc, ComponentAccessMode, ComponentUuid, ExposableComponent, FfiEntity,
+    FfiResult, ModComponentDescriptor, MultiQuerySystemDescriptor, QuerySpec, RawChunkIter,
+    RawCommandQueue, RegisterScheduledSystemFn, ScheduleLabelId,
+    ScheduledMultiQuerySystemDescriptor, ScheduledSystemDescriptor, SystemDescriptor,
+    ABI_VERSION_PACKED,
 };
 use bevy_app::{App, Startup, Update};
 use bevy_ecs::component::Component;
@@ -24,10 +26,11 @@ use host_runtime::{
     host_cmd_despawn, host_cmd_insert_component, host_cmd_spawn_empty, host_get_proc_address,
     host_iter_column_mutable, host_iter_column_readonly, host_iter_entities, host_iter_next_chunk,
     host_iter_reset, host_register_component, host_register_multi_query_system,
-    host_register_system, host_register_system_in_schedule, is_abi_version_compatible,
-    AbiModPlugin, CommandQueueBridge, ComponentAccessDescOwned, DynamicCSystem, LoadedModInfo,
-    ModAppExt, ModErrorPolicy, ModId, ModInitContext, ModLoadError, ModLoaded, ModRegistry,
-    ModSchedule, ModSystemFaulted, ModSystemSet, ModUnloaded, MAX_QUERY_COMPONENTS,
+    host_register_scheduled_system, host_register_system, host_register_system_in_schedule,
+    is_abi_version_compatible, AbiModPlugin, CommandQueueBridge, ComponentAccessDescOwned,
+    DynamicCSystem, LoadedModInfo, ModAppExt, ModErrorPolicy, ModId, ModInitContext, ModLoadError,
+    ModLoaded, ModRegistry, ModSchedule, ModSystemFaulted, ModSystemSet, ModUnloaded,
+    MAX_QUERY_COMPONENTS,
 };
 use std::sync::{Arc, Mutex};
 
@@ -460,10 +463,20 @@ fn dynamic_system_advances_world_change_tick_correctly() {
 
 #[test]
 fn d3_forbids_raw_byte_insertion_on_heap_owning_and_opaque_components() {
+    const {
+        assert!(!NameTag::IS_RAW_INSERTABLE);
+        assert!(!FlaggedComp::IS_RAW_INSERTABLE);
+        assert!(common::Velocity::IS_RAW_INSERTABLE);
+    }
+
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
     app.register_mod_component::<NameTag>();
-    app.register_mod_component_opaque::<FlaggedComp>();
+    // Standard `register_mod_component` must automatically block invalid-`bool` raw byte insertion
+    // via `FlaggedComp::IS_RAW_INSERTABLE == false`!
+    app.register_mod_component::<FlaggedComp>();
+    // Explicit opaque registration also blocks raw insertion on `IS_RAW_INSERTABLE == true` types.
+    app.register_mod_component_opaque::<common::Velocity>();
 
     let entity = app.world_mut().spawn_empty().id();
     let reg = app.world().resource::<ModRegistry>().clone();
@@ -489,7 +502,7 @@ fn d3_forbids_raw_byte_insertion_on_heap_owning_and_opaque_components() {
         "Raw byte insertion onto String-owning component MUST return PERMISSION_DENIED"
     );
 
-    // Invalid bool pattern `2u8` rejected on opaque component
+    // Invalid bool pattern `2u8` rejected automatically on `register_mod_component::<FlaggedComp>()`
     let forged_bool = [2u8; core::mem::size_of::<FlaggedComp>()];
     // SAFETY: Passing valid command queue, component C string, and byte slice.
     let res_bool = unsafe {
@@ -503,9 +516,24 @@ fn d3_forbids_raw_byte_insertion_on_heap_owning_and_opaque_components() {
     };
     assert_eq!(res_bool, FfiResult::PERMISSION_DENIED);
 
+    // Opaque POD component also rejects raw bytes
+    let vel_bytes = [0u8; core::mem::size_of::<common::Velocity>()];
+    // SAFETY: Passing valid command queue, component C string, and byte slice.
+    let res_vel = unsafe {
+        host_cmd_insert_component(
+            raw_queue,
+            FfiEntity::from_bits(entity.to_bits()),
+            c"Velocity".as_ptr(),
+            vel_bytes.as_ptr(),
+            vel_bytes.len(),
+        )
+    };
+    assert_eq!(res_vel, FfiResult::PERMISSION_DENIED);
+
     queue.apply(app.world_mut());
     assert!(app.world().get::<NameTag>(entity).is_none());
     assert!(app.world().get::<FlaggedComp>(entity).is_none());
+    assert!(app.world().get::<common::Velocity>(entity).is_none());
 }
 
 static D7_CLONE_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -1163,5 +1191,392 @@ fn real_dylib_loaded_mod_entity_lifecycle_events_and_strict_validation_work() {
     assert_eq!(u_events[0].id, mod_id);
     assert!(u_events[0].removed_systems >= 1);
     assert_eq!(app.world().resource::<Messages<ModUnloaded>>().len(), 1);
+}
+
+// ============================================================================
+// 8. Verifier Regression Suite: Paired Drop Guards, Truncated Descriptors, & Scheduled v2
+// ============================================================================
+
+static MOD1_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+static MOD2_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" fn mod1_drop_fn(_ptr: *mut c_void) {
+    MOD1_DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+}
+
+unsafe extern "C" fn mod2_drop_fn(_ptr: *mut c_void) {
+    MOD2_DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+}
+
+#[test]
+fn partial_unload_of_second_mod_never_invokes_unmapped_drop_fn() {
+    MOD1_DROP_COUNT.store(0, Ordering::SeqCst);
+    MOD2_DROP_COUNT.store(0, Ordering::SeqCst);
+
+    let mut world = World::new();
+    let reg = Arc::new(ModRegistry::new());
+    world.insert_resource((*reg).clone());
+
+    let uuid = ComponentUuid::from_name("SharedMultiModDroppable");
+
+    // Mod 1 registers `SharedMultiModDroppable` with `mod1_drop_fn` and `active_1 = true`.
+    let active_1 = Arc::new(AtomicBool::new(true));
+    {
+        let mut ctx1 = ModInitContext::with_world(
+            Arc::clone(&reg),
+            Arc::clone(&active_1),
+            &mut world as *mut World,
+        );
+        let _g1 = ctx1.make_active();
+        let desc1 = ModComponentDescriptor::new(c"SharedMultiModDroppable".as_ptr(), uuid, 8, 8)
+            .with_drop(mod1_drop_fn);
+        // SAFETY: Valid active context and descriptor.
+        assert_eq!(
+            unsafe {
+                host_register_component(&mut ctx1 as *mut ModInitContext as *mut c_void, &desc1)
+            },
+            FfiResult::OK
+        );
+    }
+
+    // Mod 2 registers the SAME `(WorldId, ComponentUuid)` with `mod2_drop_fn` and `active_2 = true`.
+    let active_2 = Arc::new(AtomicBool::new(true));
+    {
+        let world_reg = Arc::new(world.resource::<ModRegistry>().clone());
+        let mut ctx2 = ModInitContext::with_world(
+            world_reg,
+            Arc::clone(&active_2),
+            &mut world as *mut World,
+        );
+        let _g2 = ctx2.make_active();
+        let desc2 = ModComponentDescriptor::new(c"SharedMultiModDroppable".as_ptr(), uuid, 8, 8)
+            .with_drop(mod2_drop_fn);
+        // SAFETY: Valid active context and idempotent component descriptor.
+        assert_eq!(
+            unsafe {
+                host_register_component(&mut ctx2 as *mut ModInitContext as *mut c_void, &desc2)
+            },
+            FfiResult::OK
+        );
+    }
+
+    // Spawn 2 entities carrying `SharedMultiModDroppable`.
+    let reg_snap = world.resource::<ModRegistry>().clone();
+    let mut queue = CommandQueue::default();
+    let mut bridge = CommandQueueBridge::new(&mut queue, world.entity_allocator(), &reg_snap);
+    let raw_q = (&mut bridge as *mut CommandQueueBridge<'_>).cast::<RawCommandQueue>();
+    let payload = 42u64.to_ne_bytes();
+    // SAFETY: Valid raw_q and 8-byte payload.
+    let e1 = unsafe { host_cmd_spawn_empty(raw_q) };
+    // SAFETY: Valid raw_q and 8-byte payload.
+    let e2 = unsafe { host_cmd_spawn_empty(raw_q) };
+    // SAFETY: Valid raw_q, entity, component name, and payload.
+    assert_eq!(
+        unsafe {
+            host_cmd_insert_component(
+                raw_q,
+                e1,
+                c"SharedMultiModDroppable".as_ptr(),
+                payload.as_ptr(),
+                8,
+            )
+        },
+        FfiResult::OK
+    );
+    // SAFETY: Valid raw_q, entity, component name, and payload.
+    assert_eq!(
+        unsafe {
+            host_cmd_insert_component(
+                raw_q,
+                e2,
+                c"SharedMultiModDroppable".as_ptr(),
+                payload.as_ptr(),
+                8,
+            )
+        },
+        FfiResult::OK
+    );
+    queue.apply(&mut world);
+
+    // Unload Mod 2 (`active_2 = false`, simulating `mod_2` unmapped!) while Mod 1 remains loaded!
+    active_2.store(false, Ordering::Release);
+
+    // Despawn `e1`: MUST NOT call unmapped `mod2_drop_fn`! Must fall back to mapped `mod1_drop_fn`!
+    world.despawn(Entity::try_from_bits(e1.to_bits()).unwrap());
+    assert_eq!(
+        MOD2_DROP_COUNT.load(Ordering::SeqCst),
+        0,
+        "Unmapped mod2_drop_fn must NEVER execute after active_2 == false!"
+    );
+    assert_eq!(
+        MOD1_DROP_COUNT.load(Ordering::SeqCst),
+        1,
+        "Still-mapped mod1_drop_fn must execute while active_1 == true!"
+    );
+
+    // Now unload Mod 1 (`active_1 = false`) as well; despawning `e2` must invoke neither!
+    active_1.store(false, Ordering::Release);
+    world.despawn(Entity::try_from_bits(e2.to_bits()).unwrap());
+    assert_eq!(MOD2_DROP_COUNT.load(Ordering::SeqCst), 0);
+    assert_eq!(MOD1_DROP_COUNT.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn truncated_descriptors_and_null_callbacks_rejected_without_ub() {
+    let mut init_ctx = ModInitContext::new(Arc::new(ModRegistry::new()));
+    let ctx_ptr = (&mut init_ctx as *mut ModInitContext).cast::<c_void>();
+
+    // 1. Genuinely 4-byte stack allocation (`struct_size == 4`) — forming `&SystemDescriptor` or
+    //    `&ModComponentDescriptor` directly would be immediate out-of-bounds provenance UB!
+    let tiny_4byte_header: u32 = 4;
+    let tiny_ptr = &tiny_4byte_header as *const u32;
+
+    // SAFETY: `read_descriptor` reads only the 4-byte `struct_size` header when `< MIN_V1_SIZE`.
+    assert_eq!(
+        unsafe { host_register_system(ctx_ptr, tiny_ptr.cast::<SystemDescriptor>()) },
+        FfiResult::INTERNAL_ERROR
+    );
+    // SAFETY: Same 4-byte header safety invariant.
+    assert_eq!(
+        unsafe {
+            host_register_scheduled_system(ctx_ptr, tiny_ptr.cast::<ScheduledSystemDescriptor>())
+        },
+        FfiResult::INVALID_VERSION
+    );
+    // SAFETY: Same 4-byte header safety invariant.
+    assert_eq!(
+        unsafe {
+            host_register_multi_query_system(
+                ctx_ptr,
+                tiny_ptr.cast::<MultiQuerySystemDescriptor>(),
+            )
+        },
+        FfiResult::INTERNAL_ERROR
+    );
+    // SAFETY: Same 4-byte header safety invariant.
+    assert_eq!(
+        unsafe {
+            host_register_component(ctx_ptr, tiny_ptr.cast::<ModComponentDescriptor>())
+        },
+        FfiResult::INVALID_VERSION
+    );
+
+    // 2. Zero-initialized C descriptor buffers with `callback == NULL` (`0`):
+    //    materializing `&SystemDescriptor` before checking `callback` would violate Rust's non-null `fn` niche!
+    #[repr(align(8))]
+    struct AlignedBuf([u8; 128]);
+
+    let mut zeroed_sys = AlignedBuf([0u8; 128]);
+    let sys_sz = (core::mem::size_of::<SystemDescriptor>() as u32).to_ne_bytes();
+    zeroed_sys.0[..4].copy_from_slice(&sys_sz);
+    // SAFETY: Aligned, initialized byte buffer of size >= SystemDescriptor with null callback.
+    assert_eq!(
+        unsafe {
+            host_register_system(ctx_ptr, zeroed_sys.0.as_ptr().cast::<SystemDescriptor>())
+        },
+        FfiResult::NULL_POINTER
+    );
+
+    let mut zeroed_sched = AlignedBuf([0u8; 128]);
+    let sched_sz = (core::mem::size_of::<ScheduledSystemDescriptor>() as u32).to_ne_bytes();
+    zeroed_sched.0[..4].copy_from_slice(&sched_sz);
+    // SAFETY: Aligned, initialized byte buffer of size >= ScheduledSystemDescriptor with null callback.
+    assert_eq!(
+        unsafe {
+            host_register_scheduled_system(
+                ctx_ptr,
+                zeroed_sched.0.as_ptr().cast::<ScheduledSystemDescriptor>(),
+            )
+        },
+        FfiResult::NULL_POINTER
+    );
+
+    let mut zeroed_multi = AlignedBuf([0u8; 128]);
+    let multi_sz = (core::mem::size_of::<ScheduledMultiQuerySystemDescriptor>() as u32).to_ne_bytes();
+    zeroed_multi.0[..4].copy_from_slice(&multi_sz);
+    // SAFETY: Aligned, initialized byte buffer of size >= MultiQuerySystemDescriptor with null callback.
+    assert_eq!(
+        unsafe {
+            host_register_multi_query_system(
+                ctx_ptr,
+                zeroed_multi.0.as_ptr().cast::<MultiQuerySystemDescriptor>(),
+            )
+        },
+        FfiResult::NULL_POINTER
+    );
+}
+
+unsafe extern "C" fn order_step_push(
+    _iter: *mut RawChunkIter,
+    _commands: *mut RawCommandQueue,
+    user_data: *mut c_void,
+) -> FfiResult {
+    // SAFETY: `user_data` points to `OrderPushCtx` outliving the test schedule run.
+    let ctx = unsafe { &*(user_data as *const OrderPushCtx) };
+    ctx.log.lock().unwrap().push(ctx.tag);
+    FfiResult::OK
+}
+
+unsafe extern "C" fn multi_startup_cb(
+    _iters: *const *mut RawChunkIter,
+    _iter_count: usize,
+    _commands: *mut RawCommandQueue,
+    user_data: *mut c_void,
+) -> FfiResult {
+    // SAFETY: `user_data` points to `OrderPushCtx` outliving the test schedule run.
+    let ctx = unsafe { &*(user_data as *const OrderPushCtx) };
+    ctx.log.lock().unwrap().push(ctx.tag);
+    FfiResult::OK
+}
+
+struct OrderPushCtx {
+    tag: &'static str,
+    log: Arc<Mutex<Vec<&'static str>>>,
+}
+
+#[test]
+fn scheduled_system_and_multi_query_descriptors_with_ordering_work() {
+    let mut app = App::new();
+    app.add_plugins(AbiModPlugin);
+    app.register_mod_component::<Position>();
+
+    let reg = Arc::new(app.world().resource::<ModRegistry>().clone());
+    let _reg_guard = reg.make_current();
+
+    // Verify `register_scheduled_system` resolves via `host_get_proc_address`
+    // SAFETY: Valid C string literal while `_reg_guard` is active.
+    let sym = unsafe { host_get_proc_address(c"register_scheduled_system".as_ptr()) };
+    assert!(!sym.is_null());
+    // SAFETY: Symbol matches `RegisterScheduledSystemFn` signature.
+    let reg_sched_fn: RegisterScheduledSystemFn = unsafe { core::mem::transmute(sym) };
+
+    let log = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+    let ctx_startup_single = Box::new(OrderPushCtx {
+        tag: "startup_single",
+        log: Arc::clone(&log),
+    });
+    let ctx_startup_multi = Box::new(OrderPushCtx {
+        tag: "startup_multi",
+        log: Arc::clone(&log),
+    });
+    let ctx_second = Box::new(OrderPushCtx {
+        tag: "update_second",
+        log: Arc::clone(&log),
+    });
+    let ctx_first = Box::new(OrderPushCtx {
+        tag: "update_first",
+        log: Arc::clone(&log),
+    });
+
+    let mut init_ctx = ModInitContext::new(Arc::clone(&reg));
+    let ctx_ptr = (&mut init_ctx as *mut ModInitContext).cast::<c_void>();
+
+    // 1. Register `startup_single` via `ScheduledSystemDescriptor::as_base_ptr()` through `host_register_system`!
+    let startup_v2 = SystemDescriptor::new(
+        c"startup_single".as_ptr(),
+        core::ptr::null(),
+        0,
+        order_step_push,
+        (&*ctx_startup_single as *const OrderPushCtx as *mut OrderPushCtx).cast::<c_void>(),
+    )
+    .with_schedule(ScheduleLabelId::STARTUP);
+    // SAFETY: Valid context and ScheduledSystemDescriptor passed via `as_base_ptr()`.
+    assert_eq!(
+        unsafe { host_register_system(ctx_ptr, startup_v2.as_base_ptr()) },
+        FfiResult::OK
+    );
+
+    // 2. Register `startup_multi` via `ScheduledMultiQuerySystemDescriptor` (`after = ["startup_single"]`)!
+    let pos_read = [ComponentAccessDesc::read(c"Position".as_ptr())];
+    let specs = [QuerySpec {
+        queries: pos_read.as_ptr(),
+        query_count: pos_read.len(),
+    }];
+    let after_startup = [c"startup_single".as_ptr()];
+    let multi_v2 = MultiQuerySystemDescriptor::new(
+        c"startup_multi".as_ptr(),
+        specs.as_ptr(),
+        specs.len(),
+        multi_startup_cb,
+        (&*ctx_startup_multi as *const OrderPushCtx as *mut OrderPushCtx).cast::<c_void>(),
+    )
+    .with_schedule(ScheduleLabelId::STARTUP)
+    .with_after(after_startup.as_ptr(), after_startup.len());
+    // SAFETY: Valid context and ScheduledMultiQuerySystemDescriptor passed via `as_base_ptr()`.
+    assert_eq!(
+        unsafe { host_register_multi_query_system(ctx_ptr, multi_v2.as_base_ptr()) },
+        FfiResult::OK
+    );
+
+    // 3. Register `update_second` BEFORE `update_first`, declaring `after = ["update_first"]` via `reg_sched_fn`!
+    let after_first = [c"update_first".as_ptr()];
+    let second_desc = SystemDescriptor::new(
+        c"update_second".as_ptr(),
+        core::ptr::null(),
+        0,
+        order_step_push,
+        (&*ctx_second as *const OrderPushCtx as *mut OrderPushCtx).cast::<c_void>(),
+    )
+    .with_schedule(ScheduleLabelId::UPDATE)
+    .with_after(after_first.as_ptr(), after_first.len());
+    // SAFETY: Valid context and ScheduledSystemDescriptor.
+    assert_eq!(unsafe { reg_sched_fn(ctx_ptr, &second_desc) }, FfiResult::OK);
+
+    let first_desc = SystemDescriptor::new(
+        c"update_first".as_ptr(),
+        core::ptr::null(),
+        0,
+        order_step_push,
+        (&*ctx_first as *const OrderPushCtx as *mut OrderPushCtx).cast::<c_void>(),
+    )
+    .with_schedule(ScheduleLabelId::UPDATE);
+    // SAFETY: Valid context and ScheduledSystemDescriptor.
+    assert_eq!(unsafe { reg_sched_fn(ctx_ptr, &first_desc) }, FfiResult::OK);
+
+    // Wire registered systems into `app` using `ModNamedSystemSet` ordering
+    for sys in init_ctx.registered_systems {
+        let sched = sys.schedule();
+        let own_set = host_runtime::ModNamedSystemSet(sys.system_name().to_string());
+        let after = sys.after_systems().to_vec();
+        let mut cfg = sys.in_set(own_set);
+        for dep in after {
+            cfg = cfg.after(host_runtime::ModNamedSystemSet(dep));
+        }
+        match sched {
+            ModSchedule::Startup => {
+                app.add_systems(Startup, cfg);
+            }
+            ModSchedule::Update => {
+                app.add_systems(Update, cfg);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // Frame 1: Startup runs (`startup_single` -> `startup_multi`), then Update (`update_first` -> `update_second`).
+    app.update();
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![
+            "startup_single",
+            "startup_multi",
+            "update_first",
+            "update_second",
+        ]
+    );
+
+    // Frame 2: Only Update runs (`update_first` -> `update_second`), Startup does NOT re-run!
+    app.update();
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![
+            "startup_single",
+            "startup_multi",
+            "update_first",
+            "update_second",
+            "update_first",
+            "update_second",
+        ]
+    );
 }
 

@@ -1130,6 +1130,7 @@ fn t1_f16_04_access_mode_filter_only() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn t1_f16_05_ffi_entity_placeholder() {
     assert_eq!(FfiEntity::PLACEHOLDER.to_bits(), u64::MAX);
 }

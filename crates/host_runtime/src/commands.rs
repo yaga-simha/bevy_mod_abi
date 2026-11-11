@@ -101,13 +101,13 @@ pub type CmdInsertComponentFn = unsafe extern "C" fn(
 ) -> FfiResult;
 
 /// Spawns an empty entity deferred on the Bevy world and returns its 64-bit ID immediately.
-/// Returns `FfiEntity(0)` (null sentinel) if `queue` is null.
+/// Returns [`FfiEntity::NULL`] (`0`) if `queue` is null.
 ///
 /// # Safety
 /// `queue` must be a valid pointer to a [`CommandQueueBridge`] or null.
 pub unsafe extern "C" fn host_cmd_spawn_empty(queue: *mut RawCommandQueue) -> FfiEntity {
     if queue.is_null() {
-        return FfiEntity(0);
+        return FfiEntity::NULL;
     }
     // SAFETY: caller passes a valid pointer to CommandQueueBridge cast to RawCommandQueue.
     let bridge = unsafe { &mut *(queue as *mut CommandQueueBridge<'_>) };
@@ -119,7 +119,7 @@ pub unsafe extern "C" fn host_cmd_spawn_empty(queue: *mut RawCommandQueue) -> Ff
 }
 
 /// Queues deferred despawning of an entity.
-/// Rejects null sentinels (`FfiEntity(0)`), invalid bit patterns, and `Entity::PLACEHOLDER`.
+/// Rejects [`FfiEntity::NULL`] (`0`), invalid bit patterns, and `Entity::PLACEHOLDER`.
 ///
 /// # Safety
 /// `queue` must be a valid pointer to a [`CommandQueueBridge`] or null.
@@ -130,7 +130,7 @@ pub unsafe extern "C" fn host_cmd_despawn(
     if queue.is_null() {
         return FfiResult::NULL_POINTER;
     }
-    if entity.to_bits() == 0 {
+    if entity.is_null() {
         return FfiResult::INTERNAL_ERROR;
     }
     let Some(bevy_entity) = Entity::try_from_bits(entity.to_bits()) else {
@@ -187,8 +187,8 @@ pub unsafe extern "C" fn host_cmd_insert_component(
         return FfiResult::INTERNAL_ERROR;
     }
 
-    // Reject null sentinel (0), invalid entity bits, and Bevy's Entity::PLACEHOLDER (D9 guard).
-    if entity.to_bits() == 0 {
+    // Reject FfiEntity::NULL (0), invalid entity bits, and Bevy's Entity::PLACEHOLDER (D9 guard).
+    if entity.is_null() {
         return FfiResult::INTERNAL_ERROR;
     }
     let Some(bevy_entity) = Entity::try_from_bits(entity.to_bits()) else {

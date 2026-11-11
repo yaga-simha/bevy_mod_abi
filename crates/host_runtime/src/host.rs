@@ -40,14 +40,10 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 /// Checks semver compatibility between packed `(major << 24) | (minor << 16) | patch` ABI versions.
 ///
-/// Compatible when `host_major == guest_major` and `guest_minor <= host_minor`.
+/// Delegates directly to [`abi_contract::abi_version_is_compatible`].
 #[inline]
 pub const fn is_abi_version_compatible(host_packed: u32, guest_packed: u32) -> bool {
-    let host_major = host_packed >> 24;
-    let guest_major = guest_packed >> 24;
-    let host_minor = (host_packed >> 16) & 0xFF;
-    let guest_minor = (guest_packed >> 16) & 0xFF;
-    host_major == guest_major && guest_minor <= host_minor
+    abi_contract::abi_version_is_compatible(host_packed, guest_packed)
 }
 
 /// Rich, typed diagnostic error returned when loading or unloading a native mod fails.

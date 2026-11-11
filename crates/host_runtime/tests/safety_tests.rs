@@ -284,7 +284,10 @@ fn test_ffi_transparent_type_safety() {
     // FfiEntity bits transparency
     let ent = FfiEntity(0x0000000100000005);
     assert_eq!(ent.0, 0x0000000100000005);
-    assert_eq!(FfiEntity::PLACEHOLDER.0, u64::MAX);
+    assert_eq!(FfiEntity::NULL.0, 0);
+    #[allow(deprecated)]
+    let legacy_placeholder = FfiEntity::PLACEHOLDER;
+    assert_eq!(legacy_placeholder.0, u64::MAX);
 }
 
 /// Test 4: Bevy ECS Borrow conflict detection across guest systems.
