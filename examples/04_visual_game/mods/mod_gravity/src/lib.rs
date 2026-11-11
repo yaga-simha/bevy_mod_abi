@@ -72,7 +72,7 @@ unsafe fn gravity_physics_system(
     let pos_vt = unsafe { &*pos_vt_ptr };
     let vel_vt = unsafe { &*vel_vt_ptr };
 
-    let mut chunk_iter = GuestChunkIter::new(iter, api);
+    let mut chunk_iter = unsafe { GuestChunkIter::new(iter, api) };
 
     loop {
         let count = chunk_iter.next_chunk();

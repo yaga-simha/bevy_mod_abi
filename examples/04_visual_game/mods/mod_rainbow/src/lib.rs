@@ -89,7 +89,7 @@ unsafe fn rainbow_spectrum_system(
     let pos_vt = unsafe { &*pos_vt_ptr };
 
     let tick = TICK_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut chunk_iter = GuestChunkIter::new(iter, api);
+    let mut chunk_iter = unsafe { GuestChunkIter::new(iter, api) };
 
     loop {
         let count = chunk_iter.next_chunk();

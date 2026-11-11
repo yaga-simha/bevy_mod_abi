@@ -18,62 +18,57 @@
 use bevy_abi_mod_guest::prelude::*;
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, AbiPod)]
 pub struct Position {
     pub x: f32,
     pub y: f32,
     pub z: f32,
 }
 
-// SAFETY: `Position` is `#[repr(C)]` POD (`3 * f32`) matching host `components::Position`.
-unsafe impl GuestComponent for Position {
+impl GuestComponent for Position {
     const NAME: &'static core::ffi::CStr = c"Position";
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, AbiPod)]
 pub struct Velocity {
     pub x: f32,
     pub y: f32,
     pub z: f32,
 }
 
-// SAFETY: `Velocity` is `#[repr(C)]` POD (`3 * f32`) matching host `components::Velocity`.
-unsafe impl GuestComponent for Velocity {
+impl GuestComponent for Velocity {
     const NAME: &'static core::ffi::CStr = c"Velocity";
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, AbiPod)]
 pub struct Health {
     pub current: f32,
     pub max: f32,
 }
 
-// SAFETY: `Health` is `#[repr(C)]` POD (`2 * f32`) matching host `components::Health`.
-unsafe impl GuestComponent for Health {
+impl GuestComponent for Health {
     const NAME: &'static core::ffi::CStr = c"Health";
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, AbiPod)]
 pub struct PlayerTag {
     pub id: u32,
 }
 
-// SAFETY: `PlayerTag` is `#[repr(C)]` POD (`u32`) matching host `components::PlayerTag`.
-unsafe impl GuestComponent for PlayerTag {
+impl GuestComponent for PlayerTag {
     const NAME: &'static core::ffi::CStr = c"PlayerTag";
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, AbiPod)]
 pub struct DroneTag {
     pub squad: u32,
 }
 
-// SAFETY: `DroneTag` is `#[repr(C)]` POD (`u32`) matching host `components::DroneTag`.
-unsafe impl GuestComponent for DroneTag {
+impl GuestComponent for DroneTag {
     const NAME: &'static core::ffi::CStr = c"DroneTag";
 }
 

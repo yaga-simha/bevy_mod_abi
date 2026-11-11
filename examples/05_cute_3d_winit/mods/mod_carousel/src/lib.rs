@@ -124,7 +124,7 @@ unsafe fn starlight_carousel_system(
     let tick = TICK.fetch_add(1, Ordering::Relaxed);
     let t = (tick as f32) * DT;
 
-    let mut chunk_iter = GuestChunkIter::new(iter, api);
+    let mut chunk_iter = unsafe { GuestChunkIter::new(iter, api) };
     let mut global_idx: usize = 0;
 
     loop {

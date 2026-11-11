@@ -19,7 +19,7 @@
 use bevy_abi_mod_guest::prelude::*;
 
 /// C-ABI layout mirror of `EnergyShield` introduced by Mod A.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, AbiPod)]
 #[repr(C)]
 pub struct EnergyShield {
     pub current: f32,
@@ -27,8 +27,7 @@ pub struct EnergyShield {
     pub frequency_mhz: u32,
 }
 
-// SAFETY: `EnergyShield` is `#[repr(C)]` POD (`f32, f32, u32`) matching Mod A's registered layout.
-unsafe impl GuestComponent for EnergyShield {
+impl GuestComponent for EnergyShield {
     const NAME: &'static core::ffi::CStr = c"EnergyShield";
 }
 

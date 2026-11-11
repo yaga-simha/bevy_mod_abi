@@ -9,11 +9,11 @@
 #![deny(improper_ctypes_definitions)]
 
 use bevy_abi_mod_guest::{
-    CommandBridgeVTable, CommandBridgeVTableExt, ComponentAccessDesc, ComponentAccessMode, FfiBool,
-    FfiResult, GetProcAddressFn, GuestChunkIter, GuestCommandQueue, HostApi, RawChunkIter,
-    RawCommandQueue, ResourceBridgeVTable, StrView, SystemDescriptor, export_mod, ffi_bool_to_rust,
-    register_runtime_component, resolve_register_conditional_system, wrap_run_condition,
-    wrap_system_callback,
+    AbiPod, CommandBridgeVTable, CommandBridgeVTableExt, ComponentAccessDesc, ComponentAccessMode,
+    FfiBool, FfiResult, GetProcAddressFn, GuestChunkIter, GuestChunkIterRawExt, GuestCommandQueue,
+    GuestCommandQueueRawExt, HostApi, RawChunkIter, RawCommandQueue, ResourceBridgeVTable, StrView,
+    SystemDescriptor, export_mod, ffi_bool_to_rust, register_runtime_component,
+    resolve_register_conditional_system, wrap_run_condition, wrap_system_callback,
 };
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
@@ -69,20 +69,20 @@ pub struct MetadataTagVTable {
 // 1b. Dynamic Runtime Component Definitions (Milestone 3)
 // ============================================================================
 
-/// Milestone 3: Dynamic runtime component defined purely by the guest mod.
+/// Dynamic runtime component defined purely by the guest mod.
 ///
 /// This component is not known to the host application at compile time.
 /// It is registered dynamically with Bevy ECS during `mod_init` via `register_runtime_component`.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, AbiPod)]
 pub struct RustModCustomData {
     pub power: f32,
     pub shield: u32,
 }
 
-/// Phase 3 + Phase 4 POD resource layout mirrored in the Rust guest mod.
+/// POD resource layout mirrored in the Rust guest mod.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, AbiPod)]
 pub struct Phase4RustRes {
     pub scale: f32,
     pub matched_rows: u32,
@@ -241,7 +241,7 @@ unsafe fn rust_combat_system(
     } else {
         CommandBridgeVTable::default()
     };
-    let mut cmd_queue = GuestCommandQueue::new(commands, cmd_vt);
+    let mut cmd_queue = unsafe { GuestCommandQueue::new(commands, cmd_vt) };
 
     loop {
         let count = unsafe { (api.iter_next_chunk)(iter) };
@@ -342,7 +342,7 @@ unsafe fn rust_command_system(
 
     // SAFETY: `user_data` points to a valid `CommandBridgeVTable` allocated in `mod_init`.
     let cmd_vt = unsafe { *(user_data as *const CommandBridgeVTable) };
-    let mut cmd_queue = GuestCommandQueue::new(commands, cmd_vt);
+    let mut cmd_queue = unsafe { GuestCommandQueue::new(commands, cmd_vt) };
 
     // 1. Spawn a new entity
     let new_entity = cmd_queue.spawn_empty();
@@ -421,7 +421,7 @@ unsafe fn rust_custom_system(
     }
 
     let api = unsafe { &*host_api_ptr };
-    let mut chunk_iter = GuestChunkIter::new(iter, api);
+    let mut chunk_iter = unsafe { GuestChunkIter::new(iter, api) };
 
     loop {
         let count = chunk_iter.next_chunk();
@@ -430,7 +430,7 @@ unsafe fn rust_custom_system(
         }
 
         // `mutable_slice` invokes `iter_column_mutable`, which marks all chunk rows changed in O(1) FFI calls.
-        let mut slice = chunk_iter.mutable_slice(0, count);
+        let mut slice = chunk_iter.mutable_slice(0);
         let Some(items) = slice.as_typed_slice::<RustModCustomData>() else {
             return FfiResult::INTERNAL_ERROR;
         };
@@ -478,8 +478,8 @@ unsafe fn rust_phase4_ecs_system(
     }
     let pos_vt = unsafe { &*bridges.pos_vt };
 
-    let mut chunk_iter = GuestChunkIter::with_bridges(iter, api, None, bridges.res_vt);
-    let mut cmd_queue = GuestCommandQueue::with_ext(commands, bridges.cmd_ext);
+    let mut chunk_iter = unsafe { GuestChunkIter::with_bridges(iter, api, None, bridges.res_vt) };
+    let mut cmd_queue = unsafe { GuestCommandQueue::with_ext(commands, bridges.cmd_ext) };
 
     let (scale, need_spawn_default) = {
         let Some(res) = chunk_iter.resource::<Phase4RustRes>(c"Phase4RustRes") else {
@@ -602,7 +602,9 @@ fn mod_init(
     }
 
     // Resolve deferred command functions into a per-instance heap box
-    let cmd_vt_ptr = Box::into_raw(Box::new(CommandBridgeVTable::resolve(get_proc_address)));
+    let cmd_vt_ptr = Box::into_raw(Box::new(unsafe {
+        CommandBridgeVTable::resolve(get_proc_address)
+    }));
     if let Ok(mut list) = ALLOCATED_CMD_VTABLES.lock() {
         list.push(cmd_vt_ptr as usize);
     }
@@ -719,8 +721,8 @@ fn mod_init(
     if !phase4_res_sym.is_null() && !phase4_tf_sym.is_null() {
         let bridges_ptr = Box::into_raw(Box::new(Phase4BridgeState {
             pos_vt: phase4_tf_sym as *const PositionVTable,
-            cmd_ext: CommandBridgeVTableExt::resolve(get_proc_address),
-            res_vt: ResourceBridgeVTable::resolve(get_proc_address),
+            cmd_ext: unsafe { CommandBridgeVTableExt::resolve(get_proc_address) },
+            res_vt: unsafe { ResourceBridgeVTable::resolve(get_proc_address) },
         }));
         if let Ok(mut list) = ALLOCATED_PHASE4_BRIDGES.lock() {
             list.push(bridges_ptr as usize);
@@ -741,12 +743,13 @@ fn mod_init(
             bridges_ptr as *mut c_void,
         );
         let cond_desc = base_desc.with_run_if(c_rust_phase4_run_if, core::ptr::null_mut());
-        let p4_status =
-            if let Some(reg_cond) = resolve_register_conditional_system(get_proc_address) {
-                unsafe { reg_cond(host_context, &cond_desc) }
-            } else {
-                unsafe { (api.register_system)(host_context, cond_desc.as_base_ptr()) }
-            };
+        let p4_status = if let Some(reg_cond) =
+            unsafe { resolve_register_conditional_system(get_proc_address) }
+        {
+            unsafe { reg_cond(host_context, &cond_desc) }
+        } else {
+            unsafe { (api.register_system)(host_context, cond_desc.as_base_ptr()) }
+        };
         if p4_status.is_err() {
             return p4_status;
         }

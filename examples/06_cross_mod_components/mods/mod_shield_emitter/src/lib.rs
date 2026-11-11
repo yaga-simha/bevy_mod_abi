@@ -21,7 +21,7 @@ use bevy_abi_mod_guest::prelude::*;
 
 /// Runtime structured data introduced dynamically by Mod A.
 /// Layout: 12 bytes, 4-byte aligned (POD).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, AbiPod)]
 #[repr(C)]
 pub struct EnergyShield {
     /// Current shield charge (MW).
@@ -32,8 +32,7 @@ pub struct EnergyShield {
     pub frequency_mhz: u32,
 }
 
-// SAFETY: `EnergyShield` is `#[repr(C)]` POD (`f32, f32, u32`) with no invalid bit patterns or heap pointers.
-unsafe impl GuestComponent for EnergyShield {
+impl GuestComponent for EnergyShield {
     const NAME: &'static core::ffi::CStr = c"EnergyShield";
 }
 

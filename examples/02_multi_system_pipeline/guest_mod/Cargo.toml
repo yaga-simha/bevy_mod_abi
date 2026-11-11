@@ -11,5 +11,5 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-bevy_abi_mod_guest = { path = "../../../crates/bevy_abi_mod_guest" }
+bevy_abi_mod_guest = { path = "../../../crates/bevy_abi_mod_guest", features = ["derive"] }
 bevy_abi_mod_sys = { path = "../../../crates/bevy_abi_mod_sys" }

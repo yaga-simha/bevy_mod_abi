@@ -5,9 +5,20 @@
     clippy::transmute_ptr_to_ptr,
     unreachable_pub
 )]
-use bevy_abi_mod_guest::{CommandBridgeVTable, GuestCommandQueue};
+use bevy_abi_mod_guest::{
+    AbiPod, CommandBridgeVTable, FfiLayout, GuestCommandQueue, GuestCommandQueueRawExt,
+};
 use bevy_abi_mod_sys::{FfiEntity, FfiResult, RawCommandQueue};
 use core::ffi::{CStr, c_char};
+
+macro_rules! impl_test_pod {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            unsafe impl FfiLayout for $ty {}
+            unsafe impl AbiPod for $ty {}
+        )+
+    };
+}
 
 #[derive(Default, Debug)]
 struct TestContext {
@@ -56,6 +67,7 @@ unsafe extern "C" fn mock_insert_error(
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(C)]
 struct EmptyZst;
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -67,7 +79,7 @@ struct SimplePos {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[repr(align(64))]
+#[repr(C, align(64))]
 struct OverAligned {
     tag: u64,
     bytes: [u8; 56],
@@ -77,21 +89,27 @@ struct OverAligned {
 #[repr(C)]
 struct PaddedStruct {
     a: u8,
+    _pad0: [u8; 3],
     b: u32,
     c: u16,
+    _pad1: [u8; 6],
     d: u64,
 }
 
+impl_test_pod!(EmptyZst, SimplePos, OverAligned, PaddedStruct);
+
 #[test]
 fn test_insert_null_queue_returns_null_pointer() {
-    let mut queue = GuestCommandQueue::new(
-        core::ptr::null_mut(),
-        CommandBridgeVTable {
-            spawn_empty: None,
-            despawn: None,
-            insert_component: Some(mock_insert_ok),
-        },
-    );
+    let mut queue = unsafe {
+        GuestCommandQueue::new(
+            core::ptr::null_mut(),
+            CommandBridgeVTable {
+                spawn_empty: None,
+                despawn: None,
+                insert_component: Some(mock_insert_ok),
+            },
+        )
+    };
 
     let val = 42u32;
     let res_val = queue.insert_value(FfiEntity(1), c"MyComponent", &val);
@@ -105,14 +123,16 @@ fn test_insert_null_queue_returns_null_pointer() {
 #[test]
 fn test_insert_missing_vtable_function_returns_null_pointer() {
     let mut ctx = TestContext::default();
-    let mut queue = GuestCommandQueue::new(
-        core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
-        CommandBridgeVTable {
-            spawn_empty: None,
-            despawn: None,
-            insert_component: None,
-        },
-    );
+    let mut queue = unsafe {
+        GuestCommandQueue::new(
+            core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
+            CommandBridgeVTable {
+                spawn_empty: None,
+                despawn: None,
+                insert_component: None,
+            },
+        )
+    };
 
     let val = 42u32;
     let res_val = queue.insert_value(FfiEntity(1), c"MyComponent", &val);
@@ -126,14 +146,16 @@ fn test_insert_missing_vtable_function_returns_null_pointer() {
 #[test]
 fn test_insert_error_propagation() {
     let mut ctx = TestContext::default();
-    let mut queue = GuestCommandQueue::new(
-        core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
-        CommandBridgeVTable {
-            spawn_empty: None,
-            despawn: None,
-            insert_component: Some(mock_insert_error),
-        },
-    );
+    let mut queue = unsafe {
+        GuestCommandQueue::new(
+            core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
+            CommandBridgeVTable {
+                spawn_empty: None,
+                despawn: None,
+                insert_component: Some(mock_insert_error),
+            },
+        )
+    };
 
     let val = 42u32;
     let res = queue.insert_value(FfiEntity(1), c"MyComponent", &val);
@@ -147,14 +169,16 @@ fn test_insert_error_propagation() {
 #[test]
 fn test_insert_value_and_slice_valid_data() {
     let mut ctx = TestContext::default();
-    let mut queue = GuestCommandQueue::new(
-        core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
-        CommandBridgeVTable {
-            spawn_empty: None,
-            despawn: None,
-            insert_component: Some(mock_insert_ok),
-        },
-    );
+    let mut queue = unsafe {
+        GuestCommandQueue::new(
+            core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
+            CommandBridgeVTable {
+                spawn_empty: None,
+                despawn: None,
+                insert_component: Some(mock_insert_ok),
+            },
+        )
+    };
 
     let pos = SimplePos {
         x: 10.0,
@@ -194,19 +218,23 @@ fn test_insert_value_and_slice_valid_data() {
 #[test]
 fn test_data_content_fidelity() {
     let mut ctx = TestContext::default();
-    let mut queue = GuestCommandQueue::new(
-        core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
-        CommandBridgeVTable {
-            spawn_empty: None,
-            despawn: None,
-            insert_component: Some(mock_insert_ok),
-        },
-    );
+    let mut queue = unsafe {
+        GuestCommandQueue::new(
+            core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
+            CommandBridgeVTable {
+                spawn_empty: None,
+                despawn: None,
+                insert_component: Some(mock_insert_ok),
+            },
+        )
+    };
 
     let padded = PaddedStruct {
         a: 0x42,
+        _pad0: [0; 3],
         b: 0xDEADBEEF,
         c: 0x1234,
+        _pad1: [0; 6],
         d: 0xCAFEBABE_FEEDFACE,
     };
 
@@ -222,16 +250,17 @@ fn test_data_content_fidelity() {
 #[test]
 fn test_insert_zero_sized_types_and_empty_slices() {
     let mut ctx = TestContext::default();
-    let mut queue = GuestCommandQueue::new(
-        core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
-        CommandBridgeVTable {
-            spawn_empty: None,
-            despawn: None,
-            insert_component: Some(mock_insert_ok),
-        },
-    );
+    let mut queue = unsafe {
+        GuestCommandQueue::new(
+            core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
+            CommandBridgeVTable {
+                spawn_empty: None,
+                despawn: None,
+                insert_component: Some(mock_insert_ok),
+            },
+        )
+    };
 
-    // 1. ZST value
     let zst = EmptyZst;
     let res = queue.insert_value(FfiEntity(100), c"EmptyZst", &zst);
     assert_eq!(res, FfiResult::OK);
@@ -239,7 +268,6 @@ fn test_insert_zero_sized_types_and_empty_slices() {
     assert_eq!(ctx.last_len, 0);
     assert!(ctx.captured_bytes.is_empty());
 
-    // 2. ZST slice
     let zst_slice = [EmptyZst, EmptyZst, EmptyZst];
     let res = queue.insert_slice(FfiEntity(101), c"EmptyZstSlice", &zst_slice);
     assert_eq!(res, FfiResult::OK);
@@ -247,7 +275,6 @@ fn test_insert_zero_sized_types_and_empty_slices() {
     assert_eq!(ctx.last_len, 0);
     assert!(ctx.captured_bytes.is_empty());
 
-    // 3. Empty slice of sized type
     let empty_u32: [u32; 0] = [];
     let res = queue.insert_slice(FfiEntity(102), c"EmptyU32Slice", &empty_u32);
     assert_eq!(res, FfiResult::OK);
@@ -259,14 +286,16 @@ fn test_insert_zero_sized_types_and_empty_slices() {
 #[test]
 fn test_insert_overaligned_type() {
     let mut ctx = TestContext::default();
-    let mut queue = GuestCommandQueue::new(
-        core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
-        CommandBridgeVTable {
-            spawn_empty: None,
-            despawn: None,
-            insert_component: Some(mock_insert_ok),
-        },
-    );
+    let mut queue = unsafe {
+        GuestCommandQueue::new(
+            core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
+            CommandBridgeVTable {
+                spawn_empty: None,
+                despawn: None,
+                insert_component: Some(mock_insert_ok),
+            },
+        )
+    };
 
     let aligned = OverAligned {
         tag: 0xCAFEBABE,
@@ -281,14 +310,16 @@ fn test_insert_overaligned_type() {
 #[test]
 fn test_insert_large_slice_scale() {
     let mut ctx = TestContext::default();
-    let mut queue = GuestCommandQueue::new(
-        core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
-        CommandBridgeVTable {
-            spawn_empty: None,
-            despawn: None,
-            insert_component: Some(mock_insert_ok),
-        },
-    );
+    let mut queue = unsafe {
+        GuestCommandQueue::new(
+            core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
+            CommandBridgeVTable {
+                spawn_empty: None,
+                despawn: None,
+                insert_component: Some(mock_insert_ok),
+            },
+        )
+    };
 
     let large_buffer = vec![123456789u64; 10_000];
     let res = queue.insert_slice(FfiEntity(888), c"LargeU64Array", &large_buffer);
@@ -300,14 +331,16 @@ fn test_insert_large_slice_scale() {
 #[test]
 fn test_multiple_sequential_insertions_stress() {
     let mut ctx = TestContext::default();
-    let mut queue = GuestCommandQueue::new(
-        core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
-        CommandBridgeVTable {
-            spawn_empty: None,
-            despawn: None,
-            insert_component: Some(mock_insert_ok),
-        },
-    );
+    let mut queue = unsafe {
+        GuestCommandQueue::new(
+            core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
+            CommandBridgeVTable {
+                spawn_empty: None,
+                despawn: None,
+                insert_component: Some(mock_insert_ok),
+            },
+        )
+    };
 
     let iterations = if cfg!(miri) { 100 } else { 5000 };
 
@@ -325,20 +358,20 @@ fn test_multiple_sequential_insertions_stress() {
 #[test]
 fn test_edge_case_component_names() {
     let mut ctx = TestContext::default();
-    let mut queue = GuestCommandQueue::new(
-        core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
-        CommandBridgeVTable {
-            spawn_empty: None,
-            despawn: None,
-            insert_component: Some(mock_insert_ok),
-        },
-    );
+    let mut queue = unsafe {
+        GuestCommandQueue::new(
+            core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
+            CommandBridgeVTable {
+                spawn_empty: None,
+                despawn: None,
+                insert_component: Some(mock_insert_ok),
+            },
+        )
+    };
 
-    // Empty string
     let res = queue.insert_value(FfiEntity(1), c"", &1u8);
     assert_eq!(res, FfiResult::OK);
 
-    // UTF-8 multibyte name
     let res2 = queue.insert_value(FfiEntity(2), c"Mod_🦀_Rocket🚀", &2u8);
     assert_eq!(res2, FfiResult::OK);
 }

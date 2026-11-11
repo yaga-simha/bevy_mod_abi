@@ -41,8 +41,10 @@ struct Pos {
     y: f32,
 }
 
-// SAFETY: `Pos` is `#[repr(C)]` composed solely of `f32` primitives.
-unsafe impl GuestComponent for Pos {
+unsafe impl FfiLayout for Pos {}
+unsafe impl AbiPod for Pos {}
+
+impl GuestComponent for Pos {
     const NAME: &'static CStr = c"Pos";
 }
 
@@ -53,8 +55,10 @@ struct Vel {
     vy: f32,
 }
 
-// SAFETY: `Vel` is `#[repr(C)]` composed solely of `f32` primitives.
-unsafe impl GuestComponent for Vel {
+unsafe impl FfiLayout for Vel {}
+unsafe impl AbiPod for Vel {}
+
+impl GuestComponent for Vel {
     const NAME: &'static CStr = c"Vel";
 }
 
@@ -64,8 +68,10 @@ struct Shield {
     hp: i32,
 }
 
-// SAFETY: `Shield` is `#[repr(C)]` composed solely of `i32`.
-unsafe impl GuestComponent for Shield {
+unsafe impl FfiLayout for Shield {}
+unsafe impl AbiPod for Shield {}
+
+impl GuestComponent for Shield {
     const NAME: &'static CStr = c"Shield";
 }
 
@@ -293,7 +299,8 @@ fn test_chunk_disjoint_read_write_and_entities_simultaneous_borrow() {
         reset_calls: 0,
     };
 
-    let mut iter = GuestChunkIter::new(&mut state as *mut MockIterState as *mut RawChunkIter, &api);
+    let mut iter =
+        unsafe { GuestChunkIter::new(&mut state as *mut MockIterState as *mut RawChunkIter, &api) };
     let mut seen_entities = Vec::new();
 
     while let Some(mut chunk) = iter.next_chunk_view() {
@@ -360,11 +367,13 @@ fn test_columns_mut_3_way_and_split_slices_disjoint_borrows() {
         reset_calls: 0,
     };
 
-    let mut iter = GuestChunkIter::with_reset(
-        &mut state as *mut MockIterState as *mut RawChunkIter,
-        &api,
-        Some(mock_iter_reset),
-    );
+    let mut iter = unsafe {
+        GuestChunkIter::with_reset(
+            &mut state as *mut MockIterState as *mut RawChunkIter,
+            &api,
+            Some(mock_iter_reset),
+        )
+    };
 
     // Pass 1: 3 simultaneous mutable columns via `columns_mut` + `into_typed_slice`
     {
@@ -441,7 +450,8 @@ fn test_rejects_duplicate_column_indices_preventing_mutable_aliasing() {
         reset_calls: 0,
     };
 
-    let mut iter = GuestChunkIter::new(&mut state as *mut MockIterState as *mut RawChunkIter, &api);
+    let mut iter =
+        unsafe { GuestChunkIter::new(&mut state as *mut MockIterState as *mut RawChunkIter, &api) };
     let mut chunk = iter.next_chunk_view().expect("chunk must exist");
 
     // Duplicate mutable index (0, 0) MUST return None
@@ -498,7 +508,8 @@ fn test_rejects_overlapping_host_byte_ranges_even_with_distinct_indices() {
         reset_calls: 0,
     };
 
-    let mut iter = GuestChunkIter::new(&mut state as *mut MockIterState as *mut RawChunkIter, &api);
+    let mut iter =
+        unsafe { GuestChunkIter::new(&mut state as *mut MockIterState as *mut RawChunkIter, &api) };
     let mut chunk = iter.next_chunk_view().expect("chunk exists");
 
     // Distinct indices (0, 1) with overlapping memory ranges MUST be rejected!
@@ -525,6 +536,7 @@ fn test_entities_slice_defensive_bounds_and_empty_chunks() {
         unsafe { (unaligned_buf.as_ptr() as *const u8).add(1) } as *const FfiEntity;
     let wrapping_entities_ptr = core::ptr::without_provenance::<FfiEntity>(usize::MAX - 3);
 
+    let huge_count = (isize::MAX as usize / core::mem::size_of::<FfiEntity>()) + 1;
     let mut state = MockIterState {
         chunks: vec![
             // Chunk 0: valid entities
@@ -551,28 +563,34 @@ fn test_entities_slice_defensive_bounds_and_empty_chunks() {
                 entities_ptr: wrapping_entities_ptr,
                 columns: Vec::new(),
             },
+            // Chunk 4: oversized count exceeding `isize::MAX` bytes
+            MockChunk {
+                count: huge_count,
+                entities_ptr: valid_entities.as_ptr(),
+                columns: Vec::new(),
+            },
         ],
         cursor: 0,
         reset_calls: 0,
     };
 
     // Null RawChunkIter handle safety
-    let mut null_iter = GuestChunkIter::new(core::ptr::null_mut(), &api);
+    let mut null_iter = unsafe { GuestChunkIter::new(core::ptr::null_mut(), &api) };
     assert_eq!(null_iter.next_chunk(), 0);
     assert!(null_iter.next_chunk_view().is_none());
-    assert!(null_iter.entities_slice(4).is_empty());
+    assert!(null_iter.entities_slice().is_empty());
     assert_eq!(null_iter.reset(), FfiResult::NULL_POINTER);
 
-    let mut iter = GuestChunkIter::new(&mut state as *mut MockIterState as *mut RawChunkIter, &api);
+    let mut iter =
+        unsafe { GuestChunkIter::new(&mut state as *mut MockIterState as *mut RawChunkIter, &api) };
+
+    // Before `next_chunk()`, `current_len == 0` -> empty slice
+    assert!(iter.entities_slice().is_empty());
 
     // Chunk 0: valid
     let c0 = iter.next_chunk();
     assert_eq!(c0, 2);
-    assert_eq!(iter.entities_slice(c0), &valid_entities);
-    assert!(iter.entities_slice(0).is_empty());
-    // Oversized count exceeding `isize::MAX` bytes must return empty slice without UB
-    let huge_count = (isize::MAX as usize / core::mem::size_of::<FfiEntity>()) + 1;
-    assert!(iter.entities_slice(huge_count).is_empty());
+    assert_eq!(iter.entities_slice(), &valid_entities);
 
     // Chunk 1: null pointer -> `&[]`
     let chunk1 = iter.next_chunk_view().unwrap();
@@ -586,8 +604,14 @@ fn test_entities_slice_defensive_bounds_and_empty_chunks() {
     let chunk3 = iter.next_chunk_view().unwrap();
     assert!(chunk3.entities().is_empty());
 
+    // Chunk 4: oversized count exceeding `isize::MAX` bytes must return empty slice without UB
+    let c4 = iter.next_chunk();
+    assert_eq!(c4, huge_count);
+    assert!(iter.entities_slice().is_empty());
+
     // End of iteration
     assert!(iter.next_chunk_view().is_none());
+    assert!(iter.entities_slice().is_empty());
     // Without `IterResetFn` configured, `reset()` returns `NULL_POINTER`
     assert_eq!(iter.reset(), FfiResult::NULL_POINTER);
 }
@@ -734,7 +758,7 @@ fn test_guest_app_zero_leak_shutdown_and_lifo_drop_order() {
     let order_clone = Arc::clone(&drop_order);
 
     let init_status = unsafe {
-        run_guest_app_init(
+        GuestApp::run_init(
             mock_get_proc_address,
             &api,
             core::ptr::addr_of_mut!(world) as *mut c_void,
@@ -959,7 +983,7 @@ fn test_guest_app_rollback_on_failed_or_panicking_init_leaves_zero_leaks() {
         let live_clone = Arc::clone(&live_count);
         let order_clone = Arc::clone(&drop_order);
         let res = unsafe {
-            run_guest_app_init(
+            GuestApp::run_init(
                 mock_get_proc_address,
                 &api,
                 core::ptr::addr_of_mut!(world) as *mut c_void,
@@ -1003,7 +1027,7 @@ fn test_guest_app_rollback_on_failed_or_panicking_init_leaves_zero_leaks() {
         let live_clone = Arc::clone(&live_count);
         let order_clone = Arc::clone(&drop_order);
         let res = unsafe {
-            run_guest_app_init(
+            GuestApp::run_init(
                 mock_get_proc_address,
                 &api,
                 core::ptr::addr_of_mut!(world) as *mut c_void,
@@ -1057,7 +1081,7 @@ fn test_reentrant_closure_invocation_returns_access_conflict() {
     };
 
     let init_res =
-        unsafe { run_guest_app_init(mock_get_proc_address, &api, world_ptr as *mut c_void, setup) };
+        unsafe { GuestApp::run_init(mock_get_proc_address, &api, world_ptr as *mut c_void, setup) };
     assert_eq!(init_res, FfiResult::OK);
 
     let (_name, cb, ud) = world.registered_single[0].clone();

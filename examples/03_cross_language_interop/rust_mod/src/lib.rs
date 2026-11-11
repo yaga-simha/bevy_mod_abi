@@ -63,7 +63,7 @@ unsafe fn rust_color_system(
     let pos_vt = unsafe { &*pos_vt_ptr };
     let color_vt = unsafe { &*color_vt_ptr };
 
-    let mut chunk_iter = GuestChunkIter::new(iter, api);
+    let mut chunk_iter = unsafe { GuestChunkIter::new(iter, api) };
 
     loop {
         let count = chunk_iter.next_chunk();

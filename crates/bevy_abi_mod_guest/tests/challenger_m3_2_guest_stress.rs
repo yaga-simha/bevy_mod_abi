@@ -5,23 +5,11 @@
     clippy::transmute_ptr_to_ptr,
     unreachable_pub
 )]
-//! # Challenger 2 Guest SDK Empirical Stress Suite
-//!
-//! Empirical tests for Milestone 3 Guest SDK dynamic components:
-//! 1. `register_runtime_component`:
-//!    - POD types set `drop_fn` to `None`.
-//!    - Non-POD types set `drop_fn` to `Some(generic_drop_trampoline::<T>)`.
-//!    - Panic containment: `generic_drop_trampoline` intercepts panics using `catch_unwind`.
-//! 2. `ChunkSlice` & `ChunkSliceMut::as_typed_slice`:
-//!    - Stride mismatch returns `None`.
-//!    - Misaligned pointer returns `None`.
-//!    - Null pointer with count > 0 returns `None`.
-//!    - Zero-count slice returns `Some(&[])` without pointer dereference.
-//! 3. `GuestCommandQueue::insert_runtime_component`:
-//!    - Validates correct name, size, data forwarding.
+//! Guest SDK dynamic component and typed slice stress suite.
 
 use bevy_abi_mod_guest::{
-    ChunkSlice, ChunkSliceMut, CommandBridgeVTable, GuestCommandQueue, register_runtime_component,
+    AbiPod, ChunkSlice, ChunkSliceMut, ChunkSliceMutRawExt, ChunkSliceRawExt, CommandBridgeVTable,
+    FfiLayout, GuestCommandQueue, GuestCommandQueueRawExt, register_runtime_component,
 };
 use bevy_abi_mod_sys::{
     FfiEntity, FfiResult, HostApi, ModComponentDescriptor, RawCommandQueue, RegisterComponentFn,
@@ -35,6 +23,9 @@ struct PodComponent {
     x: f32,
     y: u32,
 }
+
+unsafe impl FfiLayout for PodComponent {}
+unsafe impl AbiPod for PodComponent {}
 
 static NON_POD_DROPPED: AtomicBool = AtomicBool::new(false);
 
@@ -138,19 +129,14 @@ fn test_register_runtime_component_pod_vs_non_pod() {
     };
     let ctx_ptr = core::ptr::addr_of_mut!(ctx) as *mut c_void;
 
-    // 1. POD component registration: drop_fn MUST be None!
     let res = unsafe { register_runtime_component::<PodComponent>(&api, ctx_ptr, c"PodComponent") };
     assert_eq!(res, FfiResult::OK);
 
     let desc_pod = ctx.captured_desc.take().expect("Descriptor captured");
     assert_eq!(desc_pod.size, 8);
     assert_eq!(desc_pod.align, 4);
-    assert!(
-        desc_pod.drop_fn.is_none(),
-        "POD components MUST set drop_fn to None, consuming 0 drop trampoline slots"
-    );
+    assert!(desc_pod.drop_fn.is_none());
 
-    // 2. Non-POD component registration: drop_fn MUST be Some!
     let res_non_pod =
         unsafe { register_runtime_component::<NonPodComponent>(&api, ctx_ptr, c"NonPodComponent") };
     assert_eq!(res_non_pod, FfiResult::OK);
@@ -158,12 +144,8 @@ fn test_register_runtime_component_pod_vs_non_pod() {
     let desc_non_pod = ctx.captured_desc.take().expect("Descriptor captured");
     assert_eq!(desc_non_pod.size, core::mem::size_of::<NonPodComponent>());
     assert_eq!(desc_non_pod.align, core::mem::align_of::<NonPodComponent>());
-    assert!(
-        desc_non_pod.drop_fn.is_some(),
-        "Non-POD components MUST set drop_fn to generic_drop_trampoline"
-    );
+    assert!(desc_non_pod.drop_fn.is_some());
 
-    // Verify drop_fn works properly
     NON_POD_DROPPED.store(false, Ordering::SeqCst);
     let instance = Box::new(NonPodComponent {
         _tag: "Hello".to_string(),
@@ -174,11 +156,7 @@ fn test_register_runtime_component_pod_vs_non_pod() {
     unsafe {
         drop_fn(raw_instance);
     }
-    assert!(
-        NON_POD_DROPPED.load(Ordering::SeqCst),
-        "generic_drop_trampoline must execute drop_in_place"
-    );
-    // Deallocate the memory buffer
+    assert!(NON_POD_DROPPED.load(Ordering::SeqCst));
     unsafe {
         std::alloc::dealloc(
             raw_instance as *mut u8,
@@ -207,12 +185,9 @@ fn test_generic_drop_trampoline_panic_containment() {
     let mut item = core::mem::ManuallyDrop::new(PanickingDropComponent);
     let ptr = &mut *item as *mut PanickingDropComponent as *mut c_void;
 
-    // Invoking drop_fn on panicking component must NOT unwind into caller!
-    // generic_drop_trampoline catches the unwind using std::panic::catch_unwind
     unsafe {
         drop_fn(ptr);
     }
-    // Execution continues without crashing!
 }
 
 #[test]
@@ -220,54 +195,31 @@ fn test_chunk_slice_as_typed_slice_defensive_checks() {
     let data = [10u32, 20, 30, 40];
     let raw_ptr = data.as_ptr() as *const u8;
 
-    // 1. Valid typed slice
-    let slice_valid = ChunkSlice::new(raw_ptr, 4, 4);
+    let slice_valid = unsafe { ChunkSlice::new(raw_ptr, 4, 4) };
     let typed = slice_valid.as_typed_slice::<u32>().expect("Valid slice");
     assert_eq!(typed, &[10, 20, 30, 40]);
 
-    // 2. Stride mismatch: stride is 8, but u32 is 4
-    let slice_bad_stride = ChunkSlice::new(raw_ptr, 8, 2);
-    assert!(
-        slice_bad_stride.as_typed_slice::<u32>().is_none(),
-        "Stride mismatch must return None"
-    );
+    let slice_bad_stride = unsafe { ChunkSlice::new(raw_ptr, 8, 2) };
+    assert!(slice_bad_stride.as_typed_slice::<u32>().is_none());
 
-    // 3. Stride mismatch: stride is 2, but u32 is 4
-    let slice_small_stride = ChunkSlice::new(raw_ptr, 2, 8);
-    assert!(
-        slice_small_stride.as_typed_slice::<u32>().is_none(),
-        "Stride mismatch must return None"
-    );
+    let slice_small_stride = unsafe { ChunkSlice::new(raw_ptr, 2, 8) };
+    assert!(slice_small_stride.as_typed_slice::<u32>().is_none());
 
-    // 4. Misaligned pointer: raw_ptr + 1 is misaligned for u32
     let misaligned_ptr = unsafe { raw_ptr.add(1) };
-    let slice_misaligned = ChunkSlice::new(misaligned_ptr, 4, 3);
-    assert!(
-        slice_misaligned.as_typed_slice::<u32>().is_none(),
-        "Misaligned pointer must return None"
-    );
+    let slice_misaligned = unsafe { ChunkSlice::new(misaligned_ptr, 4, 3) };
+    assert!(slice_misaligned.as_typed_slice::<u32>().is_none());
 
-    // 5. Zero elements: count == 0 returns Some(&[]) safely even with null or misaligned pointer
-    let slice_empty_null = ChunkSlice::new(core::ptr::null(), 4, 0);
-    assert_eq!(
-        slice_empty_null.as_typed_slice::<u32>(),
-        Some(&[][..]),
-        "Empty slice must return Some(&[])"
-    );
+    let slice_empty_null = unsafe { ChunkSlice::new(core::ptr::null(), 4, 0) };
+    assert_eq!(slice_empty_null.as_typed_slice::<u32>(), Some(&[][..]));
 
-    let slice_empty_misaligned = ChunkSlice::new(misaligned_ptr, 4, 0);
+    let slice_empty_misaligned = unsafe { ChunkSlice::new(misaligned_ptr, 4, 0) };
     assert_eq!(
         slice_empty_misaligned.as_typed_slice::<u32>(),
-        Some(&[][..]),
-        "Empty slice with misaligned pointer must return Some(&[]) without dereference"
+        Some(&[][..])
     );
 
-    // 6. Null pointer with count > 0 returns None
-    let slice_null_with_count = ChunkSlice::new(core::ptr::null(), 4, 5);
-    assert!(
-        slice_null_with_count.as_typed_slice::<u32>().is_none(),
-        "Null pointer with count > 0 must return None"
-    );
+    let slice_null_with_count = unsafe { ChunkSlice::new(core::ptr::null(), 4, 5) };
+    assert!(slice_null_with_count.as_typed_slice::<u32>().is_none());
 }
 
 #[test]
@@ -275,25 +227,21 @@ fn test_chunk_slice_mut_as_typed_slice_defensive_checks() {
     let mut data = [10u32, 20, 30, 40];
     let raw_ptr = data.as_mut_ptr() as *mut u8;
 
-    // 1. Valid mutable slice
-    let mut slice_valid = ChunkSliceMut::new(raw_ptr, 4, 4);
+    let mut slice_valid = unsafe { ChunkSliceMut::new(raw_ptr, 4, 4) };
     {
         let typed = slice_valid.as_typed_slice::<u32>().expect("Valid slice");
         typed[1] = 999;
     }
     assert_eq!(data[1], 999);
 
-    // 2. Stride mismatch
-    let mut slice_bad_stride = ChunkSliceMut::new(raw_ptr, 8, 2);
+    let mut slice_bad_stride = unsafe { ChunkSliceMut::new(raw_ptr, 8, 2) };
     assert!(slice_bad_stride.as_typed_slice::<u32>().is_none());
 
-    // 3. Misaligned pointer
     let misaligned_ptr = unsafe { raw_ptr.add(2) };
-    let mut slice_misaligned = ChunkSliceMut::new(misaligned_ptr, 4, 3);
+    let mut slice_misaligned = unsafe { ChunkSliceMut::new(misaligned_ptr, 4, 3) };
     assert!(slice_misaligned.as_typed_slice::<u32>().is_none());
 
-    // 4. Zero elements
-    let mut slice_empty_null = ChunkSliceMut::new(core::ptr::null_mut(), 4, 0);
+    let mut slice_empty_null = unsafe { ChunkSliceMut::new(core::ptr::null_mut(), 4, 0) };
     assert_eq!(slice_empty_null.as_typed_slice::<u32>(), Some(&mut [][..]));
 }
 
@@ -330,10 +278,12 @@ fn test_guest_command_queue_insert_runtime_component_contract() {
         insert_component: Some(mock_insert),
     };
 
-    let mut queue = GuestCommandQueue::new(
-        core::ptr::addr_of_mut!(q_ctx) as *mut RawCommandQueue,
-        vtable,
-    );
+    let mut queue = unsafe {
+        GuestCommandQueue::new(
+            core::ptr::addr_of_mut!(q_ctx) as *mut RawCommandQueue,
+            vtable,
+        )
+    };
 
     let comp = PodComponent { x: 2.5, y: 42 };
     let res = queue.insert_runtime_component(FfiEntity(123), c"PodComponent", &comp);
