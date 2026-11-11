@@ -3,9 +3,9 @@
 //! Supports zero-serialization dynamic loading, hot-reloading via shadow copies,
 //! and clean unloading of both Rust (`.cdylib`) and pure ISO C99 (`.dylib`/`.so`/`.dll`) mods!
 
+use bevy_abi_mod::{ModAppExt, ModId};
 use bevy_app::App;
 use bevy_ecs::prelude::Resource;
-use host_runtime::{ModAppExt, ModId};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;

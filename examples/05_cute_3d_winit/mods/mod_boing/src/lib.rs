@@ -1,3 +1,10 @@
+#![allow(
+    clippy::undocumented_unsafe_blocks,
+    clippy::ptr_as_ptr,
+    clippy::cast_ptr_alignment,
+    clippy::transmute_ptr_to_ptr,
+    unreachable_pub
+)]
 //! Mod 1: Jelly Boing Hop (`mod_boing`)
 //!
 //! Makes every slime spirit playfully hop across the 3D meadow!
@@ -8,9 +15,9 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+use bevy_abi_mod_guest::prelude::*;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
-use guest_sdk::prelude::*;
 
 const MEADOW_RADIUS: f32 = 8.2;
 const GRAVITY: f32 = 16.0;

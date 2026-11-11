@@ -1,3 +1,10 @@
+#![allow(
+    clippy::undocumented_unsafe_blocks,
+    clippy::ptr_as_ptr,
+    clippy::cast_ptr_alignment,
+    clippy::transmute_ptr_to_ptr,
+    unreachable_pub
+)]
 //! Mod B: Overcharge Siphon Mod (`mod_overcharge_siphon`)
 //!
 //! Demonstrates:
@@ -9,7 +16,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(improper_ctypes_definitions)]
 
-use guest_sdk::prelude::*;
+use bevy_abi_mod_guest::prelude::*;
 
 /// C-ABI layout mirror of `EnergyShield` introduced by Mod A.
 #[derive(Clone, Copy, Debug, PartialEq)]

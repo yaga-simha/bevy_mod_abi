@@ -1,3 +1,10 @@
+#![allow(
+    clippy::undocumented_unsafe_blocks,
+    clippy::ptr_as_ptr,
+    clippy::cast_ptr_alignment,
+    clippy::transmute_ptr_to_ptr,
+    unreachable_pub
+)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![allow(clippy::drop_non_drop, clippy::too_many_arguments)]
 
@@ -7,7 +14,7 @@
 //! - Execution Architecture:
 //!     1. Pure Native Bevy (No-Mod, statically compiled Rust)
 //!     2. Coupled Rust `dylib` Mod (shared Rust ABI & `bevy_ecs` `Query` via `libloading`)
-//!     3. Asymmetric C-ABI Rust `cdylib` Mod (`bevy_abi_mod` + `guest_sdk`):
+//!     3. Asymmetric C-ABI Rust `cdylib` Mod (`bevy_abi_mod` + `bevy_abi_mod_guest`):
 //!        - `ChunkOptimized` ($O(U + E)$ VTable crossings)
 //!        - `EntityNestedVTable` ($O(U \times E)$ VTable getters + `iter_reset`)
 //!        - `NaiveChattyFfi` ($O(U \times E)$ VTable reads/writes + per-pair `iter_mark_changed`)
@@ -21,13 +28,13 @@
 //!     - Steady-State Complex Nested Multi-Archetype Query Frame Time (`ms`, `ns/pair`, slowdown `x`)
 
 use libloading::{Library, Symbol};
+use shared_scenario::bevy_abi_mod_host::{AbiModPlugin, ModAppExt, ModHost};
 use shared_scenario::bevy_app::{App, Update};
 use shared_scenario::bevy_ecs::schedule::ScheduleLabel;
-use shared_scenario::host_runtime::{AbiModPlugin, ModAppExt, ModHost};
 use shared_scenario::{
-    native_cached_soa_nested_aura_combat_system, native_nested_aura_combat_system,
-    populate_scenario_world, register_all_scenario_components, register_pure_native_components,
-    OracleDigest, ScenarioConfig,
+    OracleDigest, ScenarioConfig, native_cached_soa_nested_aura_combat_system,
+    native_nested_aura_combat_system, populate_scenario_world, register_all_scenario_components,
+    register_pure_native_components,
 };
 use std::env;
 use std::fs;
@@ -464,7 +471,7 @@ fn measure_loading_permutations(
 
             let registry = app
                 .world()
-                .resource::<shared_scenario::host_runtime::ModRegistry>()
+                .resource::<shared_scenario::bevy_abi_mod_host::ModRegistry>()
                 .clone();
             let registry_arc = std::sync::Arc::new(registry);
 
@@ -486,7 +493,7 @@ fn measure_loading_permutations(
             let reg_cached = std::sync::Arc::new(
                 app_cached
                     .world()
-                    .resource::<shared_scenario::host_runtime::ModRegistry>()
+                    .resource::<shared_scenario::bevy_abi_mod_host::ModRegistry>()
                     .clone(),
             );
 
@@ -1154,15 +1161,27 @@ fn print_comprehensive_report(loads: &[LoadRecord], execs: &[ExecRecord]) -> (f6
         .map(|e| e.ns_per_pair)
         .unwrap_or(true_native_std);
 
-    println!("\n================================================================================================================================");
+    println!(
+        "\n================================================================================================================================"
+    );
     println!(" BEVY_ABI_MOD: COMPLETE ARCHITECTURE x TARGET PROFILE BENCHMARK MATRIX");
-    println!(" Scenario: Complex Nested Multi-Archetype Query (34 Total Bevy Archetypes: 16 Unit Tables x 6 Emitter Tables + 12 Decoy/Frozen)");
-    println!(" Mathematical Oracle: VERIFIED EQUIVALENT across Pure Native Bevy, Coupled Rust dylib, C-ABI Rust cdylib & C-ABI C99");
-    println!("================================================================================================================================");
+    println!(
+        " Scenario: Complex Nested Multi-Archetype Query (34 Total Bevy Archetypes: 16 Unit Tables x 6 Emitter Tables + 12 Decoy/Frozen)"
+    );
+    println!(
+        " Mathematical Oracle: VERIFIED EQUIVALENT across Pure Native Bevy, Coupled Rust dylib, C-ABI Rust cdylib & C-ABI C99"
+    );
+    println!(
+        "================================================================================================================================"
+    );
 
     // Table 1: Mod Loading & Lifecycle Performance
-    println!("\n[1] MOD LOADING, ABI HANDSHAKE, 34-ARCHETYPE SCHEDULE INIT & UNLOAD LATENCY (microseconds)");
-    println!("--------------------------------------------------------------------------------------------------------------------------------");
+    println!(
+        "\n[1] MOD LOADING, ABI HANDSHAKE, 34-ARCHETYPE SCHEDULE INIT & UNLOAD LATENCY (microseconds)"
+    );
+    println!(
+        "--------------------------------------------------------------------------------------------------------------------------------"
+    );
     println!(
         "{:<28} | {:<7} | {:<14} | {:<8} | {:>9} | {:>10} | {:>11} | {:>9} | {:>10}",
         "Architecture",
@@ -1175,7 +1194,9 @@ fn print_comprehensive_report(loads: &[LoadRecord], execs: &[ExecRecord]) -> (f6
         "Close(us)",
         "Total(us)"
     );
-    println!("--------------------------------------------------------------------------------------------------------------------------------");
+    println!(
+        "--------------------------------------------------------------------------------------------------------------------------------"
+    );
     for l in loads {
         if l.status != "OK" {
             println!(
@@ -1205,7 +1226,9 @@ fn print_comprehensive_report(loads: &[LoadRecord], execs: &[ExecRecord]) -> (f6
             );
         }
     }
-    println!("  * LOCKED: Coupled Rust dylib mods cannot load across mismatched dev/release profiles due to Rust StableCrateId/TypeId hash mismatch.");
+    println!(
+        "  * LOCKED: Coupled Rust dylib mods cannot load across mismatched dev/release profiles due to Rust StableCrateId/TypeId hash mismatch."
+    );
 
     // Table 2: Standard Scale Ranked from Fastest (True Native) to Slowest (Worst Degradation)
     let mut std_execs: Vec<&ExecRecord> = execs
@@ -1214,9 +1237,15 @@ fn print_comprehensive_report(loads: &[LoadRecord], execs: &[ExecRecord]) -> (f6
         .collect();
     std_execs.sort_by(|a, b| a.median_frame_ms.partial_cmp(&b.median_frame_ms).unwrap());
 
-    println!("\n[2] COMPLEX NESTED MULTI-ARCHETYPE QUERY — DEGRADATION LADDER (1,024 Units x 48 Emitters = 49,152 Pairs/Frame across 34 Archetypes)");
-    println!("    Ranked from 1.00x True Native Release Baseline down to Worst-Case Unoptimized / Naive FFI Permutations:");
-    println!("--------------------------------------------------------------------------------------------------------------------------------");
+    println!(
+        "\n[2] COMPLEX NESTED MULTI-ARCHETYPE QUERY — DEGRADATION LADDER (1,024 Units x 48 Emitters = 49,152 Pairs/Frame across 34 Archetypes)"
+    );
+    println!(
+        "    Ranked from 1.00x True Native Release Baseline down to Worst-Case Unoptimized / Naive FFI Permutations:"
+    );
+    println!(
+        "--------------------------------------------------------------------------------------------------------------------------------"
+    );
     println!(
         "{:<24} | {:<35} | {:<7} | {:<14} | {:>9} | {:>9} | {:>9} | {:>9}",
         "Architecture",
@@ -1228,7 +1257,9 @@ fn print_comprehensive_report(loads: &[LoadRecord], execs: &[ExecRecord]) -> (f6
         "Slowdown",
         "60FPS Bgt"
     );
-    println!("--------------------------------------------------------------------------------------------------------------------------------");
+    println!(
+        "--------------------------------------------------------------------------------------------------------------------------------"
+    );
     for e in &std_execs {
         let slow = e.ns_per_pair / true_native_std;
         let bgt = (e.median_frame_ms / 16.6667) * 100.0;
@@ -1253,8 +1284,12 @@ fn print_comprehensive_report(loads: &[LoadRecord], execs: &[ExecRecord]) -> (f6
     heavy_execs.sort_by(|a, b| a.median_frame_ms.partial_cmp(&b.median_frame_ms).unwrap());
 
     if !heavy_execs.is_empty() {
-        println!("\n[3] HIGH-SCALE STRESS TIER — RELEASE HOST (3,072 Units x 96 Emitters = 294,912 Pairs/Frame across 34 Archetypes)");
-        println!("--------------------------------------------------------------------------------------------------------------------------------");
+        println!(
+            "\n[3] HIGH-SCALE STRESS TIER — RELEASE HOST (3,072 Units x 96 Emitters = 294,912 Pairs/Frame across 34 Archetypes)"
+        );
+        println!(
+            "--------------------------------------------------------------------------------------------------------------------------------"
+        );
         println!(
             "{:<24} | {:<35} | {:<7} | {:<14} | {:>9} | {:>9} | {:>9} | {:>9}",
             "Architecture",
@@ -1266,7 +1301,9 @@ fn print_comprehensive_report(loads: &[LoadRecord], execs: &[ExecRecord]) -> (f6
             "Slowdown",
             "60FPS Bgt"
         );
-        println!("--------------------------------------------------------------------------------------------------------------------------------");
+        println!(
+            "--------------------------------------------------------------------------------------------------------------------------------"
+        );
         for e in &heavy_execs {
             let slow = e.ns_per_pair / true_native_heavy;
             let bgt = (e.median_frame_ms / 16.6667) * 100.0;
@@ -1284,7 +1321,9 @@ fn print_comprehensive_report(loads: &[LoadRecord], execs: &[ExecRecord]) -> (f6
         }
     }
 
-    println!("================================================================================================================================\n");
+    println!(
+        "================================================================================================================================\n"
+    );
     (true_native_std, true_native_heavy)
 }
 
@@ -1385,7 +1424,7 @@ fn orchestrate_all_profiles() {
     for dest in [
         root.join("target/benchmark_results.json"),
         root.join("target/benchmarks/benchmark_results.json"),
-        root.join("crates/host_runtime/target/benchmark_results.json"),
+        root.join("crates/bevy_abi_mod_host/target/benchmark_results.json"),
     ] {
         if let Some(parent) = dest.parent() {
             let _ = fs::create_dir_all(parent);
@@ -1416,7 +1455,9 @@ fn run_worker(out_tsv: &Path) {
     // 2. Measure Mod Loading / Init / Schedule / Unload latency
     let loads = measure_loading_permutations(&root, &mods, host_prof);
 
-    eprintln!("  [worker:{host_prof}] Step C: measuring standard-scale nested multi-archetype execution...");
+    eprintln!(
+        "  [worker:{host_prof}] Step C: measuring standard-scale nested multi-archetype execution..."
+    );
     // 3. Measure Standard Scale (34 archetypes, 1,024 units x 48 emitters = 49,152 pairs/frame)
     let mut execs = measure_execution_suite_at_scale(
         &mods,
@@ -1428,7 +1469,9 @@ fn run_worker(out_tsv: &Path) {
 
     // 4. In Release Host, also run High-Scale Stress Tier (3,072 units x 96 emitters = 294,912 pairs/frame)
     if host_prof == "release" {
-        eprintln!("  [worker:{host_prof}] Step D: measuring heavy-scale stress tier (294,912 pairs/frame)...");
+        eprintln!(
+            "  [worker:{host_prof}] Step D: measuring heavy-scale stress tier (294,912 pairs/frame)..."
+        );
         let heavy_execs = measure_execution_suite_at_scale(
             &mods,
             host_prof,

@@ -1,3 +1,10 @@
+#![allow(
+    clippy::undocumented_unsafe_blocks,
+    clippy::ptr_as_ptr,
+    clippy::cast_ptr_alignment,
+    clippy::transmute_ptr_to_ptr,
+    unreachable_pub
+)]
 //! Stage 4 Example: Visual Game with Runtime Mod Reloading
 //!
 //! A 2D kinetic particle arena rendered in terminal Braille characters with
@@ -8,14 +15,14 @@ mod components;
 mod mod_manager;
 mod ui;
 
+use bevy_abi_mod::prelude::*;
 use bevy_app::{App, PostUpdate};
-use host_runtime::prelude::*;
 use std::time::{Duration, Instant};
 
-use arena::{host_physics_integration, spawn_particles, ARENA_HEIGHT, ARENA_WIDTH};
+use arena::{ARENA_HEIGHT, ARENA_WIDTH, host_physics_integration, spawn_particles};
 use components::{ColorRgba, Position, Velocity};
 use mod_manager::{ActiveMod, ModManager, ModStatusResource};
-use ui::{poll_user_command, render_ui, TelemetryState, TerminalGuard, UserCommand};
+use ui::{TelemetryState, TerminalGuard, UserCommand, poll_user_command, render_ui};
 
 struct CliArgs {
     headless: bool,
@@ -291,7 +298,9 @@ fn run_headless_test_sequence(
     }
     println!("  -> PASS: Mod successfully unloaded; particles returned to baseline drift.");
 
-    println!("\n[TEST_MODE] SUCCESS: All 3 mods (gravity, rainbow, vortex), hot-reloading, and unloading verified!");
+    println!(
+        "\n[TEST_MODE] SUCCESS: All 3 mods (gravity, rainbow, vortex), hot-reloading, and unloading verified!"
+    );
     Ok(())
 }
 

@@ -1,3 +1,10 @@
+#![allow(
+    clippy::undocumented_unsafe_blocks,
+    clippy::ptr_as_ptr,
+    clippy::cast_ptr_alignment,
+    clippy::transmute_ptr_to_ptr,
+    unreachable_pub
+)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![allow(clippy::type_complexity)]
 
@@ -16,14 +23,14 @@ use shared_scenario::bevy_ecs::query::{With, Without};
 use shared_scenario::bevy_ecs::system::{Local, Query};
 use shared_scenario::{
     AuraEmitter, CachedNativeEmitter, CombatUnitTag, EmitterBeaconTag, Faction, FrozenFlag,
-    Kinematics, Resistance, Transform3D, Vitality, SIM_DT,
+    Kinematics, Resistance, SIM_DT, Transform3D, Vitality,
 };
 
 static ACTIVE: AtomicBool = AtomicBool::new(true);
 static COUPLED_VARIANT: AtomicU32 = AtomicU32::new(0);
 
 /// Selects `0 = Direct Nested Query`, `1 = Pre-Cached SoA + Query`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn coupled_rust_mod_set_variant(variant: u32) {
     COUPLED_VARIANT.store(variant, Ordering::Release);
 }
@@ -300,7 +307,7 @@ pub fn coupled_cached_soa_nested_aura_combat_system(
 }
 
 /// Entry point using unstable Rust ABI (`&mut App`).
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(improper_ctypes_definitions)]
 pub extern "Rust" fn coupled_rust_mod_register(app: &mut App) {
     ACTIVE.store(true, Ordering::Release);
@@ -311,7 +318,7 @@ pub extern "Rust" fn coupled_rust_mod_register(app: &mut App) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn coupled_rust_mod_shutdown() {
     ACTIVE.store(false, Ordering::Release);
 }

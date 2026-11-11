@@ -1,3 +1,10 @@
+#![allow(
+    clippy::undocumented_unsafe_blocks,
+    clippy::ptr_as_ptr,
+    clippy::cast_ptr_alignment,
+    clippy::transmute_ptr_to_ptr,
+    unreachable_pub
+)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(improper_ctypes_definitions)]
 
@@ -9,9 +16,9 @@
 //! - `1` (`EntityNestedVTable`): Re-traverses emitter chunks per unit via `iter_reset`, invoking VTable getters on every `(u, e)` pair ($O(U \times E)$ cross-ABI calls).
 //! - `2` (`NaiveChattyFfi`): Re-reads both unit & emitter via VTable on every pair and performs immediate VTable writes + `iter_mark_changed` inside the inner loop.
 
+use bevy_abi_mod_guest::prelude::*;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
-use guest_sdk::prelude::*;
 
 const SIM_DT: f32 = 0.016_f32;
 const MAX_CACHED_EMITTERS: usize = 512;
@@ -124,7 +131,7 @@ static RES_VT: AtomicPtr<ResistanceVTable> = AtomicPtr::new(core::ptr::null_mut(
 static AURA_VT: AtomicPtr<AuraEmitterVTable> = AtomicPtr::new(core::ptr::null_mut());
 static FAC_VT: AtomicPtr<FactionVTable> = AtomicPtr::new(core::ptr::null_mut());
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn c_abi_rust_mod_set_variant(variant: u32) {
     BENCH_VARIANT.store(variant, Ordering::SeqCst);
 }
@@ -834,18 +841,12 @@ fn mod_init(
 
     let variant = BENCH_VARIANT.load(Ordering::SeqCst);
     let (sys_name, cb): (*const core::ffi::c_char, MultiQuerySystemCallback) = match variant {
-        0 => (
-            c"rust_cabi_chunk_optimized".as_ptr(),
-            c_chunk_optimized,
-        ),
+        0 => (c"rust_cabi_chunk_optimized".as_ptr(), c_chunk_optimized),
         1 => (
             c"rust_cabi_entity_nested_vtable".as_ptr(),
             c_entity_nested_vtable,
         ),
-        _ => (
-            c"rust_cabi_naive_chatty_ffi".as_ptr(),
-            c_naive_chatty_ffi,
-        ),
+        _ => (c"rust_cabi_naive_chatty_ffi".as_ptr(), c_naive_chatty_ffi),
     };
 
     let desc = MultiQuerySystemDescriptor {

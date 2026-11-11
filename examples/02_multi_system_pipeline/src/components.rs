@@ -1,7 +1,7 @@
 //! Components for Example 2: Multi-System Pipeline
 
+use bevy_abi_mod::ModExposable;
 use bevy_ecs::component::Component;
-use host_runtime::ModExposable;
 
 #[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
 #[repr(C)]

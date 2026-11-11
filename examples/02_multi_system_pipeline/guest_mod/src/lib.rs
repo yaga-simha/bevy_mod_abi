@@ -1,3 +1,10 @@
+#![allow(
+    clippy::undocumented_unsafe_blocks,
+    clippy::ptr_as_ptr,
+    clippy::cast_ptr_alignment,
+    clippy::transmute_ptr_to_ptr,
+    unreachable_pub
+)]
 //! Example 2: Multi-System Pipeline Guest Mod
 //!
 //! Demonstrates 3 interacting systems, all 4 query filter modes (READ, WRITE,
@@ -8,7 +15,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(improper_ctypes_definitions)]
 
-use guest_sdk::prelude::*;
+use bevy_abi_mod_guest::prelude::*;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -135,9 +142,29 @@ fn setup(app: &mut GuestApp<'_>) -> FfiResult {
             if drone.0 == 0 {
                 return FfiResult::INTERNAL_ERROR;
             }
-            queue.insert_component(drone, &Position { x: 30.0, y: 0.0, z: 0.0 });
-            queue.insert_component(drone, &Velocity { x: 2.0, y: 1.0, z: 0.0 });
-            queue.insert_component(drone, &Health { current: 50.0, max: 50.0 });
+            queue.insert_component(
+                drone,
+                &Position {
+                    x: 30.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+            );
+            queue.insert_component(
+                drone,
+                &Velocity {
+                    x: 2.0,
+                    y: 1.0,
+                    z: 0.0,
+                },
+            );
+            queue.insert_component(
+                drone,
+                &Health {
+                    current: 50.0,
+                    max: 50.0,
+                },
+            );
             queue.insert_component(drone, &DroneTag { squad: 2 });
             state.reinforcements_spawned += 1;
         }

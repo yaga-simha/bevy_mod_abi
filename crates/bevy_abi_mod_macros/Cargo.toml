@@ -1,0 +1,21 @@
+[package]
+name = "bevy_abi_mod_macros"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.87"
+license.workspace = true
+authors.workspace = true
+
+[lib]
+proc-macro = true
+
+[lints]
+workspace = true
+
+[dependencies]
+syn = { workspace = true }
+quote = { workspace = true }
+proc-macro2 = { workspace = true }
+
+[dev-dependencies]
+bevy_abi_mod_sys = { workspace = true }

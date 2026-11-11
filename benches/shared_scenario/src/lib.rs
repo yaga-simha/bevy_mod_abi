@@ -1,3 +1,10 @@
+#![allow(
+    clippy::undocumented_unsafe_blocks,
+    clippy::ptr_as_ptr,
+    clippy::cast_ptr_alignment,
+    clippy::transmute_ptr_to_ptr,
+    unreachable_pub
+)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(improper_ctypes_definitions)]
 #![allow(clippy::type_complexity)]
@@ -10,17 +17,17 @@
 //!    `bevy_ecs`, `bevy_app`, and component `TypeId` definitions in memory — modeling unstable
 //!    Rust-ABI dynamic plugins (`bevy_dynamic_plugin` style).
 
+pub use bevy_abi_mod_host;
 pub use bevy_app;
 pub use bevy_ecs;
-pub use host_runtime;
 
+use bevy_abi_mod_host::ModAppExt;
+use bevy_abi_mod_macros::ModExposable;
 use bevy_app::App;
 use bevy_ecs::component::Component;
 use bevy_ecs::query::{With, Without};
 use bevy_ecs::system::Query;
 use bevy_ecs::world::World;
-use host_runtime::ModAppExt;
-use mod_derive::ModExposable;
 
 pub const SIM_DT: f32 = 0.016_f32;
 

@@ -1,3 +1,10 @@
+#![allow(
+    clippy::undocumented_unsafe_blocks,
+    clippy::ptr_as_ptr,
+    clippy::cast_ptr_alignment,
+    clippy::transmute_ptr_to_ptr,
+    unreachable_pub
+)]
 //! Stage 5 Example: Cute 3D Slime Meadow with Dynamic Mod Loading (`winit` + `wgpu`)
 //!
 //! Replaces the 2D terminal TUI with an interactive, toy-diorama 3D window powered by `winit`
@@ -15,8 +22,8 @@ mod meadow;
 mod mod_manager;
 mod renderer;
 
+use bevy_abi_mod::prelude::*;
 use bevy_app::{App, PostUpdate};
-use host_runtime::prelude::*;
 use std::sync::Arc;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
@@ -27,7 +34,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use components::{ColorRgba, CuteSpirit, Position, Scale3D, Velocity};
-use meadow::{host_meadow_post_physics, spawn_slimes, MeadowClock};
+use meadow::{MeadowClock, host_meadow_post_physics, spawn_slimes};
 use mod_manager::{ActiveMod, ModManager, ModStatusResource};
 use renderer::{CuteRenderer, OrbitCamera, SlimeRenderData};
 
@@ -355,85 +362,86 @@ impl ApplicationHandler for CuteMeadowWinitApp {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == ElementState::Pressed && !event.repeat {
-                    if let PhysicalKey::Code(code) = event.physical_key {
-                        match code {
-                            KeyCode::Digit1 | KeyCode::Numpad1 => {
-                                match self
-                                    .mod_manager
-                                    .load_mod(&mut self.ecs_app, ActiveMod::Boing)
-                                {
-                                    Ok(()) => self.log_mod_status(),
-                                    Err(e) => eprintln!("[ModManager] {e}"),
-                                }
-                                self.refresh_window_title();
+                if event.state == ElementState::Pressed
+                    && !event.repeat
+                    && let PhysicalKey::Code(code) = event.physical_key
+                {
+                    match code {
+                        KeyCode::Digit1 | KeyCode::Numpad1 => {
+                            match self
+                                .mod_manager
+                                .load_mod(&mut self.ecs_app, ActiveMod::Boing)
+                            {
+                                Ok(()) => self.log_mod_status(),
+                                Err(e) => eprintln!("[ModManager] {e}"),
                             }
-                            KeyCode::Digit2 | KeyCode::Numpad2 => {
-                                match self
-                                    .mod_manager
-                                    .load_mod(&mut self.ecs_app, ActiveMod::Carousel)
-                                {
-                                    Ok(()) => self.log_mod_status(),
-                                    Err(e) => eprintln!("[ModManager] {e}"),
-                                }
-                                self.refresh_window_title();
-                            }
-                            KeyCode::Digit3 | KeyCode::Numpad3 => {
-                                match self
-                                    .mod_manager
-                                    .load_mod(&mut self.ecs_app, ActiveMod::CuddleC99)
-                                {
-                                    Ok(()) => self.log_mod_status(),
-                                    Err(e) => eprintln!("[ModManager] {e}"),
-                                }
-                                self.refresh_window_title();
-                            }
-                            KeyCode::KeyU | KeyCode::Digit0 => {
-                                if self.mod_manager.unload_mod(&mut self.ecs_app).is_ok() {
-                                    self.log_mod_status();
-                                }
-                                self.refresh_window_title();
-                            }
-                            KeyCode::KeyR => {
-                                match self.mod_manager.reload_mod(&mut self.ecs_app) {
-                                    Ok(()) => self.log_mod_status(),
-                                    Err(e) => eprintln!("[ModManager] {e}"),
-                                }
-                                self.refresh_window_title();
-                            }
-                            KeyCode::Equal | KeyCode::NumpadAdd | KeyCode::KeyB => {
-                                self.spawn_more_slimes(8);
-                            }
-                            KeyCode::Minus | KeyCode::NumpadSubtract => {
-                                self.remove_slimes(8);
-                            }
-                            KeyCode::Space => {
-                                self.paused = !self.paused;
-                                self.refresh_window_title();
-                            }
-                            KeyCode::KeyO => {
-                                self.camera.auto_orbit = !self.camera.auto_orbit;
-                            }
-                            KeyCode::ArrowLeft | KeyCode::KeyA => {
-                                self.camera.auto_orbit = false;
-                                self.camera.yaw -= 0.14;
-                            }
-                            KeyCode::ArrowRight | KeyCode::KeyD => {
-                                self.camera.auto_orbit = false;
-                                self.camera.yaw += 0.14;
-                            }
-                            KeyCode::ArrowUp | KeyCode::KeyW => {
-                                self.camera.pitch = (self.camera.pitch + 0.08).clamp(0.12, 1.35);
-                            }
-                            KeyCode::ArrowDown | KeyCode::KeyS => {
-                                self.camera.pitch = (self.camera.pitch - 0.08).clamp(0.12, 1.35);
-                            }
-                            KeyCode::Escape | KeyCode::KeyQ => {
-                                let _ = self.mod_manager.unload_mod(&mut self.ecs_app);
-                                event_loop.exit();
-                            }
-                            _ => {}
+                            self.refresh_window_title();
                         }
+                        KeyCode::Digit2 | KeyCode::Numpad2 => {
+                            match self
+                                .mod_manager
+                                .load_mod(&mut self.ecs_app, ActiveMod::Carousel)
+                            {
+                                Ok(()) => self.log_mod_status(),
+                                Err(e) => eprintln!("[ModManager] {e}"),
+                            }
+                            self.refresh_window_title();
+                        }
+                        KeyCode::Digit3 | KeyCode::Numpad3 => {
+                            match self
+                                .mod_manager
+                                .load_mod(&mut self.ecs_app, ActiveMod::CuddleC99)
+                            {
+                                Ok(()) => self.log_mod_status(),
+                                Err(e) => eprintln!("[ModManager] {e}"),
+                            }
+                            self.refresh_window_title();
+                        }
+                        KeyCode::KeyU | KeyCode::Digit0 => {
+                            if self.mod_manager.unload_mod(&mut self.ecs_app).is_ok() {
+                                self.log_mod_status();
+                            }
+                            self.refresh_window_title();
+                        }
+                        KeyCode::KeyR => {
+                            match self.mod_manager.reload_mod(&mut self.ecs_app) {
+                                Ok(()) => self.log_mod_status(),
+                                Err(e) => eprintln!("[ModManager] {e}"),
+                            }
+                            self.refresh_window_title();
+                        }
+                        KeyCode::Equal | KeyCode::NumpadAdd | KeyCode::KeyB => {
+                            self.spawn_more_slimes(8);
+                        }
+                        KeyCode::Minus | KeyCode::NumpadSubtract => {
+                            self.remove_slimes(8);
+                        }
+                        KeyCode::Space => {
+                            self.paused = !self.paused;
+                            self.refresh_window_title();
+                        }
+                        KeyCode::KeyO => {
+                            self.camera.auto_orbit = !self.camera.auto_orbit;
+                        }
+                        KeyCode::ArrowLeft | KeyCode::KeyA => {
+                            self.camera.auto_orbit = false;
+                            self.camera.yaw -= 0.14;
+                        }
+                        KeyCode::ArrowRight | KeyCode::KeyD => {
+                            self.camera.auto_orbit = false;
+                            self.camera.yaw += 0.14;
+                        }
+                        KeyCode::ArrowUp | KeyCode::KeyW => {
+                            self.camera.pitch = (self.camera.pitch + 0.08).clamp(0.12, 1.35);
+                        }
+                        KeyCode::ArrowDown | KeyCode::KeyS => {
+                            self.camera.pitch = (self.camera.pitch - 0.08).clamp(0.12, 1.35);
+                        }
+                        KeyCode::Escape | KeyCode::KeyQ => {
+                            let _ = self.mod_manager.unload_mod(&mut self.ecs_app);
+                            event_loop.exit();
+                        }
+                        _ => {}
                     }
                 }
             }

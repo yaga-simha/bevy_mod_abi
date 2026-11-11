@@ -1,10 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/abi_contract",
-    "crates/mod_derive",
-    "crates/host_runtime",
-    "crates/guest_sdk",
+    "crates/bevy_abi_mod_sys",
+    "crates/bevy_abi_mod_macros",
+    "crates/bevy_abi_mod_host_sys",
+    "crates/bevy_abi_mod_host",
+    "crates/bevy_abi_mod_guest_sys",
+    "crates/bevy_abi_mod_guest",
+    "crates/bevy_abi_mod",
     "benches/coupled_rust_mod",
     "benches/permutation_bench",
     "examples/01_minimal_handshake",
@@ -12,6 +15,19 @@ members = [
     "examples/03_cross_language_interop",
     "examples/04_visual_game",
     "examples/05_cute_3d_winit",
+    "examples/06_cross_mod_components",
+]
+default-members = [
+    "crates/bevy_abi_mod_sys",
+    "crates/bevy_abi_mod_macros",
+    "crates/bevy_abi_mod_host_sys",
+    "crates/bevy_abi_mod_host",
+    "crates/bevy_abi_mod_guest_sys",
+    "crates/bevy_abi_mod_guest",
+    "crates/bevy_abi_mod",
+    "examples/01_minimal_handshake",
+    "examples/02_multi_system_pipeline",
+    "examples/03_cross_language_interop",
     "examples/06_cross_mod_components",
 ]
 exclude = [
@@ -37,16 +53,34 @@ exclude = [
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 authors = ["bevy_abi_mod authors"]
 
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+improper_ctypes_definitions = "deny"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+ptr_as_ptr = "warn"
+cast_ptr_alignment = "warn"
+transmute_ptr_to_ptr = "warn"
+
 [workspace.dependencies]
-abi_contract = { path = "crates/abi_contract" }
-mod_derive = { path = "crates/mod_derive" }
-host_runtime = { path = "crates/host_runtime" }
-guest_sdk = { path = "crates/guest_sdk" }
+bevy_abi_mod_sys = { path = "crates/bevy_abi_mod_sys" }
+bevy_abi_mod_macros = { path = "crates/bevy_abi_mod_macros" }
+bevy_abi_mod_host_sys = { path = "crates/bevy_abi_mod_host_sys" }
+bevy_abi_mod_host = { path = "crates/bevy_abi_mod_host" }
+bevy_abi_mod_guest_sys = { path = "crates/bevy_abi_mod_guest_sys" }
+bevy_abi_mod_guest = { path = "crates/bevy_abi_mod_guest" }
+bevy_abi_mod = { path = "crates/bevy_abi_mod" }
+bevy_ecs = { version = "0.20.1", default-features = false, features = ["std", "async_executor"] }
+bevy_app = { version = "0.20.1", default-features = false, features = ["std"] }
 libloading = "0.8"
+nonmax = "0.5"
 syn = { version = "2.0", features = ["full"] }
 quote = "1.0"
 proc-macro2 = "1.0"
