@@ -246,7 +246,6 @@ unsafe extern "C" fn dynamic_chunk_pointer_arithmetic_verifier(
 ) -> FfiResult {
     let count = unsafe { host_iter_next_chunk(iter) };
     if count > 0 {
-
         // Columns: 0: CompAlign1, 1: CompAlign16, 2: CompAlign64
         let p1 = unsafe { host_iter_column_mutable(iter, 0) };
         let p16 = unsafe { host_iter_column_mutable(iter, 1) };

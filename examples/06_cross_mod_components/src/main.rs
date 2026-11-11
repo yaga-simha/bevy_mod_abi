@@ -100,7 +100,10 @@ fn main() {
         })
         .id();
     println!("[HOST] Phase 1: Engine Initialization");
-    println!("  • Host registered base component `FleetSector` and spawned Flagship {:?}", flagship);
+    println!(
+        "  • Host registered base component `FleetSector` and spawned Flagship {:?}",
+        flagship
+    );
     println!("  • NOTE: Host has ZERO compile-time registration for `EnergyShield`!\n");
 
     // 3. Load Mod A (The Introducer / Spawner)
@@ -132,7 +135,9 @@ fn main() {
         .load_mod_tracked(&mod_b_dylib)
         .expect("Failed to load mod_overcharge_siphon");
     println!("  • Successfully loaded Mod B (ID: {:?})", mod_b_id);
-    println!("  • Mod B successfully resolved 'EnergyShield' from ModRegistry and bound its system!\n");
+    println!(
+        "  • Mod B successfully resolved 'EnergyShield' from ModRegistry and bound its system!\n"
+    );
 
     // 5. Run simulation frames
     println!("[HOST] Phase 4: Simulating 5 Engine Ticks");
@@ -175,7 +180,10 @@ fn main() {
         }
     }
 
-    println!("  • Total drones managed across both mods: {}", final_shields.len());
+    println!(
+        "  • Total drones managed across both mods: {}",
+        final_shields.len()
+    );
     for (i, s) in final_shields.iter().enumerate() {
         println!(
             "  • Drone #{}: Final Shield = {:.1} MW (Max: {:.1} MW, Freq: {} MHz)",
@@ -185,7 +193,10 @@ fn main() {
             s.frequency_mhz
         );
         // Verified: values changed from initial because Mod B siphoned from Mod A's spawned shields
-        assert!(s.current < s.max, "Mod B must have siphoned energy from Mod A's shields");
+        assert!(
+            s.current < s.max,
+            "Mod B must have siphoned energy from Mod A's shields"
+        );
     }
 
     // 7. Clean unload

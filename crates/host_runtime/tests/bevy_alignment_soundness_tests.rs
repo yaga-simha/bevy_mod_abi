@@ -16,7 +16,9 @@ use bevy_ecs::entity::Entity;
 use bevy_ecs::message::Messages;
 use bevy_ecs::observer::On;
 use bevy_ecs::query::{Changed, With};
-use bevy_ecs::schedule::{IntoScheduleConfigs, ScheduleBuildSettings, ScheduleCleanupPolicy, Schedules};
+use bevy_ecs::schedule::{
+    IntoScheduleConfigs, ScheduleBuildSettings, ScheduleCleanupPolicy, Schedules,
+};
 use bevy_ecs::system::RunSystemOnce;
 use bevy_ecs::world::{CommandQueue, World};
 use common::{NameTag, Position};
@@ -341,9 +343,10 @@ fn d2_sparse_set_read_write_columns_and_changed_ticks_work_end_to_end() {
         reg,
     );
 
-    let observe_changed = move |q: bevy_ecs::system::Query<&SparseShield, Changed<SparseShield>>| {
-        changed_obs_clone.store(q.iter().count(), Ordering::SeqCst);
-    };
+    let observe_changed =
+        move |q: bevy_ecs::system::Query<&SparseShield, Changed<SparseShield>>| {
+            changed_obs_clone.store(q.iter().count(), Ordering::SeqCst);
+        };
 
     app.add_systems(Update, (dyn_sparse_rw, observe_changed).chain());
 
@@ -697,8 +700,7 @@ fn d9_and_d10_null_placeholder_entities_rejected_and_overaligned_zst_succeeds() 
     // Register a 64-byte aligned ZST dynamic component (D10)
     let reg_arc = Arc::new(world.resource::<ModRegistry>().clone());
     let is_active = Arc::new(AtomicBool::new(true));
-    let mut init_ctx =
-        ModInitContext::with_world(reg_arc, is_active, &mut world as *mut World);
+    let mut init_ctx = ModInitContext::with_world(reg_arc, is_active, &mut world as *mut World);
     let _guard = init_ctx.make_active();
     let zst_desc = ModComponentDescriptor::new(
         c"Aligned64Zst".as_ptr(),
@@ -709,7 +711,10 @@ fn d9_and_d10_null_placeholder_entities_rejected_and_overaligned_zst_succeeds() 
     // SAFETY: Valid ModInitContext and descriptor.
     assert_eq!(
         unsafe {
-            host_register_component(&mut init_ctx as *mut ModInitContext as *mut c_void, &zst_desc)
+            host_register_component(
+                &mut init_ctx as *mut ModInitContext as *mut c_void,
+                &zst_desc,
+            )
         },
         FfiResult::OK
     );
@@ -823,8 +828,9 @@ fn two_worlds_same_uuid_keep_isolated_drop_callbacks_including_world_drop() {
             &mut world_a as *mut World,
         );
         let _g = ctx_a.make_active();
-        let desc_a = ModComponentDescriptor::new(c"SharedCrossWorldComp".as_ptr(), shared_uuid, 8, 8)
-            .with_drop(drop_world_a);
+        let desc_a =
+            ModComponentDescriptor::new(c"SharedCrossWorldComp".as_ptr(), shared_uuid, 8, 8)
+                .with_drop(drop_world_a);
         assert_eq!(
             unsafe {
                 host_register_component(&mut ctx_a as *mut ModInitContext as *mut c_void, &desc_a)
@@ -844,8 +850,9 @@ fn two_worlds_same_uuid_keep_isolated_drop_callbacks_including_world_drop() {
             &mut world_b as *mut World,
         );
         let _g = ctx_b.make_active();
-        let desc_b = ModComponentDescriptor::new(c"SharedCrossWorldComp".as_ptr(), shared_uuid, 8, 8)
-            .with_drop(drop_world_b);
+        let desc_b =
+            ModComponentDescriptor::new(c"SharedCrossWorldComp".as_ptr(), shared_uuid, 8, 8)
+                .with_drop(drop_world_b);
         assert_eq!(
             unsafe {
                 host_register_component(&mut ctx_b as *mut ModInitContext as *mut c_void, &desc_b)
@@ -983,7 +990,9 @@ fn mod_schedule_startup_error_policy_report_to_bevy_and_fault_events_work() {
     assert_eq!(startup_sys.schedule(), ModSchedule::Startup);
 
     let mut app = App::new();
-    app.add_plugins(AbiModPlugin::with_error_policy(ModErrorPolicy::ReportToBevy));
+    app.add_plugins(AbiModPlugin::with_error_policy(
+        ModErrorPolicy::ReportToBevy,
+    ));
     app.add_systems(Startup, startup_sys);
 
     // Startup system should run exactly once across multiple `app.update()` frames!
@@ -1014,10 +1023,7 @@ fn mod_schedule_startup_error_policy_report_to_bevy_and_fault_events_work() {
         run_res.is_err(),
         "ModErrorPolicy::ReportToBevy must return Err(RunSystemError::Failed)"
     );
-    assert!(run_res
-        .unwrap_err()
-        .to_string()
-        .contains("faulting_sys"));
+    assert!(run_res.unwrap_err().to_string().contains("faulting_sys"));
 
     let obs = observed_faults.lock().unwrap();
     assert_eq!(obs.len(), 1);
@@ -1087,11 +1093,26 @@ fn semver_abi_compatibility_and_typed_mod_load_error_work() {
     }
 
     // Host is 0.1.0 (`ABI_VERSION_PACKED`)
-    assert!(is_abi_version_compatible(ABI_VERSION_PACKED, ABI_VERSION_PACKED));
-    assert!(is_abi_version_compatible(ABI_VERSION_PACKED, pack_ver(0, 0, 9)));
-    assert!(is_abi_version_compatible(ABI_VERSION_PACKED, pack_ver(0, 1, 99)));
-    assert!(!is_abi_version_compatible(ABI_VERSION_PACKED, pack_ver(0, 2, 0)));
-    assert!(!is_abi_version_compatible(ABI_VERSION_PACKED, pack_ver(1, 0, 0)));
+    assert!(is_abi_version_compatible(
+        ABI_VERSION_PACKED,
+        ABI_VERSION_PACKED
+    ));
+    assert!(is_abi_version_compatible(
+        ABI_VERSION_PACKED,
+        pack_ver(0, 0, 9)
+    ));
+    assert!(is_abi_version_compatible(
+        ABI_VERSION_PACKED,
+        pack_ver(0, 1, 99)
+    ));
+    assert!(!is_abi_version_compatible(
+        ABI_VERSION_PACKED,
+        pack_ver(0, 2, 0)
+    ));
+    assert!(!is_abi_version_compatible(
+        ABI_VERSION_PACKED,
+        pack_ver(1, 0, 0)
+    ));
 
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
@@ -1140,7 +1161,10 @@ fn real_dylib_loaded_mod_entity_lifecycle_events_and_strict_validation_work() {
             }
             other => panic!("Expected ModLoadError::MissingComponents, got {other:?}"),
         }
-        assert_eq!(strict_app.world().resource::<host_runtime::ModHost>().len(), 0);
+        assert_eq!(
+            strict_app.world().resource::<host_runtime::ModHost>().len(),
+            0
+        );
     }
 
     let mut app = App::new();
@@ -1154,10 +1178,9 @@ fn real_dylib_loaded_mod_entity_lifecycle_events_and_strict_validation_work() {
     let l_clone = Arc::clone(&loaded_obs);
     let u_clone = Arc::clone(&unloaded_obs);
 
-    app.world_mut()
-        .add_observer(move |trigger: On<ModLoaded>| {
-            l_clone.lock().unwrap().push(trigger.event().clone());
-        });
+    app.world_mut().add_observer(move |trigger: On<ModLoaded>| {
+        l_clone.lock().unwrap().push(trigger.event().clone());
+    });
     app.world_mut()
         .add_observer(move |trigger: On<ModUnloaded>| {
             u_clone.lock().unwrap().push(trigger.event().clone());
@@ -1243,11 +1266,8 @@ fn partial_unload_of_second_mod_never_invokes_unmapped_drop_fn() {
     let active_2 = Arc::new(AtomicBool::new(true));
     {
         let world_reg = Arc::new(world.resource::<ModRegistry>().clone());
-        let mut ctx2 = ModInitContext::with_world(
-            world_reg,
-            Arc::clone(&active_2),
-            &mut world as *mut World,
-        );
+        let mut ctx2 =
+            ModInitContext::with_world(world_reg, Arc::clone(&active_2), &mut world as *mut World);
         let _g2 = ctx2.make_active();
         let desc2 = ModComponentDescriptor::new(c"SharedMultiModDroppable".as_ptr(), uuid, 8, 8)
             .with_drop(mod2_drop_fn);
@@ -1346,18 +1366,13 @@ fn truncated_descriptors_and_null_callbacks_rejected_without_ub() {
     // SAFETY: Same 4-byte header safety invariant.
     assert_eq!(
         unsafe {
-            host_register_multi_query_system(
-                ctx_ptr,
-                tiny_ptr.cast::<MultiQuerySystemDescriptor>(),
-            )
+            host_register_multi_query_system(ctx_ptr, tiny_ptr.cast::<MultiQuerySystemDescriptor>())
         },
         FfiResult::INTERNAL_ERROR
     );
     // SAFETY: Same 4-byte header safety invariant.
     assert_eq!(
-        unsafe {
-            host_register_component(ctx_ptr, tiny_ptr.cast::<ModComponentDescriptor>())
-        },
+        unsafe { host_register_component(ctx_ptr, tiny_ptr.cast::<ModComponentDescriptor>()) },
         FfiResult::INVALID_VERSION
     );
 
@@ -1371,9 +1386,7 @@ fn truncated_descriptors_and_null_callbacks_rejected_without_ub() {
     zeroed_sys.0[..4].copy_from_slice(&sys_sz);
     // SAFETY: Aligned, initialized byte buffer of size >= SystemDescriptor with null callback.
     assert_eq!(
-        unsafe {
-            host_register_system(ctx_ptr, zeroed_sys.0.as_ptr().cast::<SystemDescriptor>())
-        },
+        unsafe { host_register_system(ctx_ptr, zeroed_sys.0.as_ptr().cast::<SystemDescriptor>()) },
         FfiResult::NULL_POINTER
     );
 
@@ -1392,7 +1405,8 @@ fn truncated_descriptors_and_null_callbacks_rejected_without_ub() {
     );
 
     let mut zeroed_multi = AlignedBuf([0u8; 128]);
-    let multi_sz = (core::mem::size_of::<ScheduledMultiQuerySystemDescriptor>() as u32).to_ne_bytes();
+    let multi_sz =
+        (core::mem::size_of::<ScheduledMultiQuerySystemDescriptor>() as u32).to_ne_bytes();
     zeroed_multi.0[..4].copy_from_slice(&multi_sz);
     // SAFETY: Aligned, initialized byte buffer of size >= MultiQuerySystemDescriptor with null callback.
     assert_eq!(
@@ -1520,7 +1534,10 @@ fn scheduled_system_and_multi_query_descriptors_with_ordering_work() {
     .with_schedule(ScheduleLabelId::UPDATE)
     .with_after(after_first.as_ptr(), after_first.len());
     // SAFETY: Valid context and ScheduledSystemDescriptor.
-    assert_eq!(unsafe { reg_sched_fn(ctx_ptr, &second_desc) }, FfiResult::OK);
+    assert_eq!(
+        unsafe { reg_sched_fn(ctx_ptr, &second_desc) },
+        FfiResult::OK
+    );
 
     let first_desc = SystemDescriptor::new(
         c"update_first".as_ptr(),
@@ -1579,4 +1596,3 @@ fn scheduled_system_and_multi_query_descriptors_with_ordering_work() {
         ]
     );
 }
-

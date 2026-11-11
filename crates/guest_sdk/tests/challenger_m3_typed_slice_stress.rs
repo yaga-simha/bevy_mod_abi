@@ -197,7 +197,8 @@ fn test_as_typed_slice_zst_safety() {
     let over_isize_zst = ChunkSlice::new(zst_ptr, 0, (isize::MAX as usize) + 1);
     assert_eq!(over_isize_zst.as_typed_slice::<()>(), None);
 
-    let mut over_isize_mut_zst = ChunkSliceMut::new(zst_ptr as *mut u8, 0, (isize::MAX as usize) + 1);
+    let mut over_isize_mut_zst =
+        ChunkSliceMut::new(zst_ptr as *mut u8, 0, (isize::MAX as usize) + 1);
     assert_eq!(over_isize_mut_zst.as_typed_slice::<()>(), None);
 }
 

@@ -75,19 +75,19 @@ use std::sync::Mutex;
 pub use abi_contract::{
     ffi_bool_to_rust, rust_bool_to_ffi, CmdInsertDefaultFn, CmdRemoveComponentFn,
     ComponentAccessDesc, ComponentAccessMode, ComponentDropFn, ComponentUuid,
-    ConditionalMultiQuerySystemDescriptor, ConditionalSystemDescriptor,
-    DynamicComponentDescriptor, DynamicSystemCallback, ExposableComponent, ExtensibleStruct,
-    FfiBool, FfiEntity, FfiLayout, FfiResult, FfiSlice, GetProcAddressFn, HostApi,
-    IterColumnMutableFn, IterColumnReadonlyFn, IterColumnStrideFn, IterEntitiesFn,
-    IterMarkChangedFn, IterNextChunkFn, IterResetFn, IterResourceMutableFn,
-    IterResourceReadonlyFn, ModAbiVersionFn, ModComponentDescriptor, ModInitFn, ModShutdownFn,
-    MultiQuerySystemCallback, MultiQuerySystemDescriptor, MultiQuerySystemDescriptorV2,
-    MultiQuerySystemDescriptorV3, QuerySpec, RawChunkIter, RawCommandQueue, RegisterComponentFn,
-    RegisterConditionalMultiQuerySystemFn, RegisterConditionalSystemFn,
-    RegisterMultiQuerySystemFn, RegisterSystemFn, RunConditionCallback, ScheduleLabelId,
-    ScheduledMultiQuerySystemDescriptor, ScheduledSystemDescriptor, StrView, SymbolEntry,
-    SystemDescriptor, SystemDescriptorV2, SystemDescriptorV3, ABI_VERSION_MAJOR, ABI_VERSION_MINOR,
-    ABI_VERSION_PACKED, ABI_VERSION_PATCH, FFI_BOOL_FALSE, FFI_BOOL_TRUE,
+    ConditionalMultiQuerySystemDescriptor, ConditionalSystemDescriptor, DynamicComponentDescriptor,
+    DynamicSystemCallback, ExposableComponent, ExtensibleStruct, FfiBool, FfiEntity, FfiLayout,
+    FfiResult, FfiSlice, GetProcAddressFn, HostApi, IterColumnMutableFn, IterColumnReadonlyFn,
+    IterColumnStrideFn, IterEntitiesFn, IterMarkChangedFn, IterNextChunkFn, IterResetFn,
+    IterResourceMutableFn, IterResourceReadonlyFn, ModAbiVersionFn, ModComponentDescriptor,
+    ModInitFn, ModShutdownFn, MultiQuerySystemCallback, MultiQuerySystemDescriptor,
+    MultiQuerySystemDescriptorV2, MultiQuerySystemDescriptorV3, QuerySpec, RawChunkIter,
+    RawCommandQueue, RegisterComponentFn, RegisterConditionalMultiQuerySystemFn,
+    RegisterConditionalSystemFn, RegisterMultiQuerySystemFn, RegisterSystemFn,
+    RunConditionCallback, ScheduleLabelId, ScheduledMultiQuerySystemDescriptor,
+    ScheduledSystemDescriptor, StrView, SymbolEntry, SystemDescriptor, SystemDescriptorV2,
+    SystemDescriptorV3, ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PACKED,
+    ABI_VERSION_PATCH, FFI_BOOL_FALSE, FFI_BOOL_TRUE,
 };
 
 /// Maximum number of simultaneous queries supported per [`MultiQueryContext`] without heap allocation.
@@ -223,7 +223,9 @@ macro_rules! export_mod {
             host_context: *mut ::core::ffi::c_void,
         ) -> $crate::FfiResult {
             // SAFETY: Entry point invoked by host during `load_mod` with valid handshake pointers.
-            unsafe { $crate::run_guest_app_init(get_proc_address, host_api, host_context, $build_fn) }
+            unsafe {
+                $crate::run_guest_app_init(get_proc_address, host_api, host_context, $build_fn)
+            }
         }
 
         #[no_mangle]
@@ -263,7 +265,8 @@ macro_rules! export_mod {
         pub unsafe extern "C" fn bevy_abi_mod_shutdown(
             _host_context: *mut ::core::ffi::c_void,
         ) -> $crate::FfiResult {
-            let status = $crate::catch_guest_panic(|| <$plugin_ty as $crate::GuestPlugin>::shutdown());
+            let status =
+                $crate::catch_guest_panic(|| <$plugin_ty as $crate::GuestPlugin>::shutdown());
             $crate::cleanup_registered_guest_state();
             status
         }
@@ -542,13 +545,17 @@ impl ResourceBridgeVTable {
         Self {
             res_readonly: if !ro_ptr.is_null() {
                 // SAFETY: Symbol `"res_readonly"` resolved from host matches `IterResourceReadonlyFn`.
-                Some(unsafe { core::mem::transmute::<*const c_void, IterResourceReadonlyFn>(ro_ptr) })
+                Some(unsafe {
+                    core::mem::transmute::<*const c_void, IterResourceReadonlyFn>(ro_ptr)
+                })
             } else {
                 None
             },
             res_mutable: if !rw_ptr.is_null() {
                 // SAFETY: Symbol `"res_mutable"` resolved from host matches `IterResourceMutableFn`.
-                Some(unsafe { core::mem::transmute::<*const c_void, IterResourceMutableFn>(rw_ptr) })
+                Some(unsafe {
+                    core::mem::transmute::<*const c_void, IterResourceMutableFn>(rw_ptr)
+                })
             } else {
                 None
             },
@@ -612,8 +619,7 @@ pub fn resolve_register_conditional_multi_query(
 ) -> Option<RegisterConditionalMultiQuerySystemFn> {
     let mut ptr = unsafe { get_proc_address(c"register_conditional_multi_query_system".as_ptr()) };
     if ptr.is_null() {
-        ptr =
-            unsafe { get_proc_address(c"host_register_conditional_multi_query_system".as_ptr()) };
+        ptr = unsafe { get_proc_address(c"host_register_conditional_multi_query_system".as_ptr()) };
     }
     if ptr.is_null() {
         None
@@ -953,7 +959,11 @@ impl<'a> GuestChunkIter<'a> {
 
     /// Creates a new guest chunk iterator wrapper with a pre-resolved [`IterResetFn`] for nested loops.
     #[inline]
-    pub fn with_reset(raw: *mut RawChunkIter, api: &'a HostApi, reset_fn: Option<IterResetFn>) -> Self {
+    pub fn with_reset(
+        raw: *mut RawChunkIter,
+        api: &'a HostApi,
+        reset_fn: Option<IterResetFn>,
+    ) -> Self {
         Self {
             raw,
             api,
@@ -1396,7 +1406,8 @@ impl<'a> GuestChunkIter<'a> {
             {
                 return None;
             }
-            if count > 0 && byte_ranges_overlap(w_ptr as usize, w_bytes, opt_ptr as usize, opt_bytes)
+            if count > 0
+                && byte_ranges_overlap(w_ptr as usize, w_bytes, opt_ptr as usize, opt_bytes)
             {
                 return None;
             }
@@ -3256,10 +3267,7 @@ mod tests {
         ) -> *const u8 {
             core::ptr::null()
         }
-        unsafe extern "C" fn stub_iter_column_mutable(
-            _: *mut RawChunkIter,
-            _: usize,
-        ) -> *mut u8 {
+        unsafe extern "C" fn stub_iter_column_mutable(_: *mut RawChunkIter, _: usize) -> *mut u8 {
             core::ptr::null_mut()
         }
         unsafe extern "C" fn stub_iter_mark_changed(
@@ -3398,9 +3406,15 @@ mod tests {
             insert_default: Some(mock_insert_default),
         };
         let mut queue = GuestCommandQueue::with_ext(0x9999 as *mut RawCommandQueue, ext);
-        assert_eq!(queue.remove_guest_component::<PosData>(FfiEntity(77)), FfiResult::OK);
+        assert_eq!(
+            queue.remove_guest_component::<PosData>(FfiEntity(77)),
+            FfiResult::OK
+        );
         assert_eq!(REMOVED_ENT.load(std::sync::atomic::Ordering::SeqCst), 77);
-        assert_eq!(queue.insert_guest_default::<PosData>(FfiEntity(88)), FfiResult::OK);
+        assert_eq!(
+            queue.insert_guest_default::<PosData>(FfiEntity(88)),
+            FfiResult::OK
+        );
         assert_eq!(DEFAULT_ENT.load(std::sync::atomic::Ordering::SeqCst), 88);
     }
 
@@ -3416,7 +3430,10 @@ mod tests {
     #[test]
     fn test_wrap_run_condition_panic_containment() {
         // SAFETY: Passing null opaque pointer to test run conditions that do not dereference it.
-        assert_eq!(unsafe { c_panicking_cond(core::ptr::null_mut()) }, FFI_BOOL_FALSE);
+        assert_eq!(
+            unsafe { c_panicking_cond(core::ptr::null_mut()) },
+            FFI_BOOL_FALSE
+        );
         // SAFETY: Passing null opaque pointer to test run condition.
         assert_eq!(unsafe { c_true_cond(core::ptr::null_mut()) }, FFI_BOOL_TRUE);
     }
@@ -3479,10 +3496,7 @@ mod tests {
             }
         }
 
-        unsafe extern "C" fn stub_reg_sys(
-            _: *mut c_void,
-            _: *const SystemDescriptor,
-        ) -> FfiResult {
+        unsafe extern "C" fn stub_reg_sys(_: *mut c_void, _: *const SystemDescriptor) -> FfiResult {
             FfiResult::OK
         }
         unsafe extern "C" fn stub_next(_: *mut RawChunkIter) -> usize {

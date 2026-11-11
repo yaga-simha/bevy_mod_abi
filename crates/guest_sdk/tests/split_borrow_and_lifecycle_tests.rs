@@ -396,10 +396,7 @@ fn test_columns_mut_3_way_and_split_slices_disjoint_borrows() {
         }
     }
 
-    assert_eq!(
-        positions,
-        [Pos { x: 1.5, y: 5.0 }, Pos { x: 5.5, y: 11.0 }]
-    );
+    assert_eq!(positions, [Pos { x: 1.5, y: 5.0 }, Pos { x: 5.5, y: 11.0 }]);
     assert_eq!(shields, [Shield { hp: 16 }, Shield { hp: 26 }]);
 }
 
@@ -678,12 +675,9 @@ unsafe extern "C" fn world_register_multi_query(
     let name = unsafe { CStr::from_ptr(desc.name) }
         .to_string_lossy()
         .into_owned();
-    world.registered_multi.push((
-        name,
-        desc.callback,
-        desc.user_data,
-        desc.query_spec_count,
-    ));
+    world
+        .registered_multi
+        .push((name, desc.callback, desc.user_data, desc.query_spec_count));
     FfiResult::OK
 }
 
@@ -716,7 +710,9 @@ unsafe extern "C" fn mock_get_proc_address(symbol: *const c_char) -> *const c_vo
 
 #[test]
 fn test_guest_app_zero_leak_shutdown_and_lifo_drop_order() {
-    let _guard = LIFECYCLE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _guard = LIFECYCLE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     cleanup_registered_guest_state();
 
     let live_count = Arc::new(AtomicUsize::new(0));
@@ -742,8 +738,7 @@ fn test_guest_app_zero_leak_shutdown_and_lifo_drop_order() {
                 ));
                 assert!(!raw_ctx.is_null());
 
-                let sys_tracker =
-                    DropTracker::new("system_closure_2", &live_clone, &order_clone);
+                let sys_tracker = DropTracker::new("system_closure_2", &live_clone, &order_clone);
                 let mut tick_count = 0usize;
                 let res = app.add_system(
                     c"kinematics_closure",
@@ -775,10 +770,8 @@ fn test_guest_app_zero_leak_shutdown_and_lifo_drop_order() {
                     DropTracker::new("multi_query_closure_3", &live_clone, &order_clone);
                 let mq_q0 = [Pos::write_desc()];
                 let mq_q1 = [Vel::read_desc()];
-                let mq_res = app.add_multi_query_system(
-                    c"nested_cartesian",
-                    &[&mq_q0, &mq_q1],
-                    move |mq| {
+                let mq_res =
+                    app.add_multi_query_system(c"nested_cartesian", &[&mq_q0, &mq_q1], move |mq| {
                         let _keep_alive = &mq_tracker;
                         // Duplicate query index must fail safely with None
                         assert!(mq.iters_2_mut(0, 0).is_none());
@@ -807,8 +800,7 @@ fn test_guest_app_zero_leak_shutdown_and_lifo_drop_order() {
                         }
                         let _ = cmds.spawn_empty();
                         FfiResult::OK
-                    },
-                );
+                    });
                 if mq_res.is_err() {
                     return mq_res;
                 }
@@ -940,7 +932,9 @@ fn test_guest_app_zero_leak_shutdown_and_lifo_drop_order() {
 
 #[test]
 fn test_guest_app_rollback_on_failed_or_panicking_init_leaves_zero_leaks() {
-    let _guard = LIFECYCLE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _guard = LIFECYCLE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     cleanup_registered_guest_state();
 
     let live_count = Arc::new(AtomicUsize::new(0));
@@ -1026,7 +1020,9 @@ fn test_guest_app_rollback_on_failed_or_panicking_init_leaves_zero_leaks() {
 
 #[test]
 fn test_reentrant_closure_invocation_returns_access_conflict() {
-    let _guard = LIFECYCLE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _guard = LIFECYCLE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     cleanup_registered_guest_state();
 
     let mut api = mock_host_api();

@@ -465,7 +465,10 @@ fn test_changed_and_added_row_level_coalescing_and_differential_bevy_parity() {
         changed_pos_cb,
         log_ptr,
     );
-    assert_eq!(register_inline_system(&mut app, &changed_desc), FfiResult::OK);
+    assert_eq!(
+        register_inline_system(&mut app, &changed_desc),
+        FfiResult::OK
+    );
 
     // System B: `[ADDED(Sensor)]`
     let added_queries = [ComponentAccessDesc::added(c"Sensor".as_ptr())];
@@ -527,7 +530,10 @@ fn test_changed_and_added_row_level_coalescing_and_differential_bevy_parity() {
     for &idx in &mutated_indices {
         app.world_mut().get_mut::<Pos3>(entities[idx]).unwrap().x += 50.0;
     }
-    app.world_mut().get_mut::<Sensor>(entities[5]).unwrap().signal = 999;
+    app.world_mut()
+        .get_mut::<Sensor>(entities[5])
+        .unwrap()
+        .signal = 999;
 
     let e_new_1 = app
         .world_mut()
@@ -561,8 +567,10 @@ fn test_changed_and_added_row_level_coalescing_and_differential_bevy_parity() {
         let c_added: BTreeSet<u64> = guard.added_entities.drain(..).collect();
         let chunks = std::mem::take(&mut guard.chunk_lengths);
 
-        let mut expected_changed: BTreeSet<u64> =
-            mutated_indices.iter().map(|&i| entities[i].to_bits()).collect();
+        let mut expected_changed: BTreeSet<u64> = mutated_indices
+            .iter()
+            .map(|&i| entities[i].to_bits())
+            .collect();
         expected_changed.insert(e_new_1.to_bits());
         expected_changed.insert(e_new_2.to_bits());
 
@@ -960,8 +968,22 @@ fn test_run_if_condition_skips_execution_preserves_changed_ticks_and_contains_pa
     app.add_plugins(AbiModPlugin);
     app.register_mod_component::<Pos3>();
 
-    let e1 = app.world_mut().spawn(Pos3 { x: 1.0, y: 0.0, z: 0.0 }).id();
-    let e2 = app.world_mut().spawn(Pos3 { x: 2.0, y: 0.0, z: 0.0 }).id();
+    let e1 = app
+        .world_mut()
+        .spawn(Pos3 {
+            x: 1.0,
+            y: 0.0,
+            z: 0.0,
+        })
+        .id();
+    let e2 = app
+        .world_mut()
+        .spawn(Pos3 {
+            x: 2.0,
+            y: 0.0,
+            z: 0.0,
+        })
+        .id();
 
     // Mode: 0 -> return FALSE (0), 1 -> return non-canonical TRUE (42), 2 -> guest panic caught at C-ABI boundary!
     let cond_mode = Arc::new(AtomicU8::new(1));
@@ -1069,7 +1091,11 @@ fn test_run_if_condition_skips_execution_preserves_changed_ticks_and_contains_pa
     app.update();
     assert_eq!(exec_count.load(Ordering::SeqCst), 2);
     assert_eq!(
-        observed_changed.lock().unwrap().drain(..).collect::<Vec<_>>(),
+        observed_changed
+            .lock()
+            .unwrap()
+            .drain(..)
+            .collect::<Vec<_>>(),
         vec![e1.to_bits()]
     );
 
@@ -1088,7 +1114,11 @@ fn test_run_if_condition_skips_execution_preserves_changed_ticks_and_contains_pa
     app.update();
     assert_eq!(exec_count.load(Ordering::SeqCst), 3);
     assert_eq!(
-        observed_changed.lock().unwrap().drain(..).collect::<Vec<_>>(),
+        observed_changed
+            .lock()
+            .unwrap()
+            .drain(..)
+            .collect::<Vec<_>>(),
         vec![e2.to_bits()]
     );
 
@@ -1190,7 +1220,8 @@ fn test_cmd_remove_component_and_cmd_insert_default_opaque_string_workflow() {
             unsafe { host_cmd_insert_default(commands, spawned, c"DefaultableTag".as_ptr()) };
         assert_eq!(def_status, FfiResult::OK);
 
-        ctx.spawned_entity.store(spawned.0 as usize, Ordering::SeqCst);
+        ctx.spawned_entity
+            .store(spawned.0 as usize, Ordering::SeqCst);
         FfiResult::OK
     }
 
@@ -1257,7 +1288,10 @@ fn test_cmd_remove_component_and_cmd_insert_default_opaque_string_workflow() {
     // Frame 2: `tag_vtable_mutator_sys` mutates the default-inserted `DefaultableTag` via VTable!
     app.update();
     assert_eq!(
-        app.world().get::<DefaultableTag>(spawned_entity).unwrap().label,
+        app.world()
+            .get::<DefaultableTag>(spawned_entity)
+            .unwrap()
+            .label,
         "created_via_default_and_vtable"
     );
 
@@ -1491,11 +1525,8 @@ fn test_end_to_end_asymmetric_rust_and_c99_dylibs_phase3_phase4() {
             .unwrap()
     };
     // SAFETY: Symbol matches `unsafe extern "C" fn(FfiBool)`.
-    let set_c_enabled: Symbol<unsafe extern "C" fn(FfiBool)> = unsafe {
-        c_lib
-            .get(b"asymmetric_c_mod_set_phase4_enabled\0")
-            .unwrap()
-    };
+    let set_c_enabled: Symbol<unsafe extern "C" fn(FfiBool)> =
+        unsafe { c_lib.get(b"asymmetric_c_mod_set_phase4_enabled\0").unwrap() };
     // SAFETY: Setting atomic flags to TRUE before Frame 1.
     unsafe {
         set_rust_enabled(FFI_BOOL_TRUE);
@@ -1611,8 +1642,14 @@ fn test_end_to_end_asymmetric_rust_and_c99_dylibs_phase3_phase4() {
     // Frame 2: Mutate `Phase4Sensor` ONLY (without re-adding `Phase4FreshTag`!).
     // Because the query requires BOTH `Changed<Phase4Sensor>` AND `Added<Phase4FreshTag>`,
     // mutating `Phase4Sensor` alone MUST match 0 rows!
-    app.world_mut().get_mut::<Phase4Sensor>(r_with_vel).unwrap().val = 77;
-    app.world_mut().get_mut::<Phase4CSensor>(c_with_vel).unwrap().val = 77;
+    app.world_mut()
+        .get_mut::<Phase4Sensor>(r_with_vel)
+        .unwrap()
+        .val = 77;
+    app.world_mut()
+        .get_mut::<Phase4CSensor>(c_with_vel)
+        .unwrap()
+        .val = 77;
     app.update();
     assert_eq!(app.world().resource::<Phase4RustRes>().matched_rows, 2);
     assert_eq!(app.world().resource::<Phase4CRes>().matched_rows, 2);
@@ -1652,8 +1689,14 @@ fn test_end_to_end_asymmetric_rust_and_c99_dylibs_phase3_phase4() {
     app.update();
     assert_eq!(app.world().resource::<Phase4RustRes>().matched_rows, 2);
     assert_eq!(app.world().resource::<Phase4CRes>().matched_rows, 2);
-    assert_eq!(app.world().get::<Phase4Transform>(r_delayed).unwrap().x, 50.0);
-    assert_eq!(app.world().get::<Phase4CTransform>(c_delayed).unwrap().y, 60.0);
+    assert_eq!(
+        app.world().get::<Phase4Transform>(r_delayed).unwrap().x,
+        50.0
+    );
+    assert_eq!(
+        app.world().get::<Phase4CTransform>(c_delayed).unwrap().y,
+        60.0
+    );
 
     // Frame 4: Re-enable `run_if` (`FFI_BOOL_TRUE`)! Because `last_run` was preserved across
     // the skipped Frame 3, `r_delayed` and `c_delayed` MUST STILL match `Added + Changed` now!
@@ -1665,11 +1708,16 @@ fn test_end_to_end_asymmetric_rust_and_c99_dylibs_phase3_phase4() {
     app.update();
     assert_eq!(app.world().resource::<Phase4RustRes>().matched_rows, 3);
     assert_eq!(app.world().resource::<Phase4CRes>().matched_rows, 3);
-    assert_eq!(app.world().get::<Phase4Transform>(r_delayed).unwrap().x, 52.0);
-    assert_eq!(app.world().get::<Phase4CTransform>(c_delayed).unwrap().y, 63.0);
+    assert_eq!(
+        app.world().get::<Phase4Transform>(r_delayed).unwrap().x,
+        52.0
+    );
+    assert_eq!(
+        app.world().get::<Phase4CTransform>(c_delayed).unwrap().y,
+        63.0
+    );
 
     // Cleanly unload both mods!
     app.unload_mod(rust_mod_id).expect("Unload Rust mod");
     app.unload_mod(c_mod_id).expect("Unload C mod");
 }
-

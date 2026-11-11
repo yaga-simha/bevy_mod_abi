@@ -1036,7 +1036,11 @@ fn test_milestone_4_high_throughput_archetype_permutations() {
         assert!(c_meta.is_dynamic);
         assert_eq!(r_meta.size, 8);
         assert_eq!(c_meta.size, 8);
-        (r_meta.component_id, c_meta.component_id, p_meta.component_id)
+        (
+            r_meta.component_id,
+            c_meta.component_id,
+            p_meta.component_id,
+        )
     };
 
     const PER_ARCHETYPE: usize = 2_500;
@@ -1157,9 +1161,8 @@ fn test_milestone_4_high_throughput_archetype_permutations() {
     // Check Permutation 1 (Rust only): power +10/tick, shield +1/tick
     for (i, &e) in arch1_entities.iter().enumerate() {
         let ent = app.world().entity(e);
-        let data = unsafe {
-            *(ent.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData)
-        };
+        let data =
+            unsafe { *(ent.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData) };
         assert_eq!(data.power, 100.0 + (i as f32) + (SIM_TICKS as f32 * 10.0));
         assert_eq!(data.shield, 10 + ((i % 50) as u32) + (SIM_TICKS as u32));
         assert!(ent.get_by_id(c_comp_id).is_err());
@@ -1172,9 +1175,8 @@ fn test_milestone_4_high_throughput_archetype_permutations() {
     // Check Permutation 2 (C only): mana +5/tick, level +1/tick
     for (i, &e) in arch2_entities.iter().enumerate() {
         let ent = app.world().entity(e);
-        let data = unsafe {
-            *(ent.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData)
-        };
+        let data =
+            unsafe { *(ent.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData) };
         assert_eq!(data.mana, 50.0 + (i as f32) + (SIM_TICKS as f32 * 5.0));
         assert_eq!(data.level, 1 + ((i % 20) as i32) + (SIM_TICKS as i32));
         assert!(ent.get_by_id(rust_comp_id).is_err());
@@ -1187,12 +1189,10 @@ fn test_milestone_4_high_throughput_archetype_permutations() {
     // Check Permutation 3 (Both dynamic): mutated by both foreign systems
     for (i, &e) in arch3_entities.iter().enumerate() {
         let ent = app.world().entity(e);
-        let data_r = unsafe {
-            *(ent.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData)
-        };
-        let data_c = unsafe {
-            *(ent.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData)
-        };
+        let data_r =
+            unsafe { *(ent.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData) };
+        let data_c =
+            unsafe { *(ent.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData) };
         assert_eq!(data_r.power, 200.0 + (i as f32) + (SIM_TICKS as f32 * 10.0));
         assert_eq!(data_r.shield, 20 + ((i % 50) as u32) + (SIM_TICKS as u32));
         assert_eq!(data_c.mana, 100.0 + (i as f32) + (SIM_TICKS as f32 * 5.0));
@@ -1208,12 +1208,10 @@ fn test_milestone_4_high_throughput_archetype_permutations() {
         assert_eq!(pos.y, 0.0);
         assert_eq!(pos.z, SIM_TICKS as f32 * 1.0);
 
-        let data_r = unsafe {
-            *(ent.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData)
-        };
-        let data_c = unsafe {
-            *(ent.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData)
-        };
+        let data_r =
+            unsafe { *(ent.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData) };
+        let data_c =
+            unsafe { *(ent.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData) };
         assert_eq!(data_r.power, 300.0 + (i as f32) + (SIM_TICKS as f32 * 10.0));
         assert_eq!(data_r.shield, 30 + ((i % 50) as u32) + (SIM_TICKS as u32));
         assert_eq!(data_c.mana, 150.0 + (i as f32) + (SIM_TICKS as f32 * 5.0));
@@ -1223,8 +1221,7 @@ fn test_milestone_4_high_throughput_archetype_permutations() {
     // 8. Unload both mods cleanly
     app.unload_mod(rust_mod_id)
         .expect("Rust mod must unload cleanly");
-    app.unload_mod(c_mod_id)
-        .expect("C mod must unload cleanly");
+    app.unload_mod(c_mod_id).expect("C mod must unload cleanly");
 
     // 9. Post-unload ticks: foreign systems deactivated, values frozen
     for _ in 0..5 {
@@ -1428,8 +1425,14 @@ fn test_milestone_4_deferred_command_queue_burst_and_allocator_isolation() {
         .expect("Failed to load asymmetric_c_mod");
 
     let world_reg = app.world().resource::<ModRegistry>().clone();
-    let rust_comp_id = world_reg.get_by_name("RustModCustomData").unwrap().component_id;
-    let c_comp_id = world_reg.get_by_name("CModCustomData").unwrap().component_id;
+    let rust_comp_id = world_reg
+        .get_by_name("RustModCustomData")
+        .unwrap()
+        .component_id;
+    let c_comp_id = world_reg
+        .get_by_name("CModCustomData")
+        .unwrap()
+        .component_id;
 
     let mut command_queue = CommandQueue::default();
     let mut bridge = CommandQueueBridge::new(
@@ -1548,7 +1551,9 @@ fn test_milestone_4_deferred_command_queue_burst_and_allocator_isolation() {
     // 5. Verify Memory Poisoning: Host stored the original bytes, NOT the poisoned bytes
     {
         let ent_r = app.world().entity(Entity::from_bits(ffi_poison_rust.0));
-        let ptr_r = ent_r.get_by_id(rust_comp_id).expect("Poison test Rust entity exists");
+        let ptr_r = ent_r
+            .get_by_id(rust_comp_id)
+            .expect("Poison test Rust entity exists");
         let data_r = unsafe { *(ptr_r.as_ptr() as *const RustModCustomData) };
         assert_eq!(
             data_r,
@@ -1560,7 +1565,9 @@ fn test_milestone_4_deferred_command_queue_burst_and_allocator_isolation() {
         );
 
         let ent_c = app.world().entity(Entity::from_bits(ffi_poison_c.0));
-        let ptr_c = ent_c.get_by_id(c_comp_id).expect("Poison test C entity exists");
+        let ptr_c = ent_c
+            .get_by_id(c_comp_id)
+            .expect("Poison test C entity exists");
         let data_c = unsafe { *(ptr_c.as_ptr() as *const CModCustomData) };
         assert_eq!(
             data_c,
@@ -1781,26 +1788,22 @@ fn test_milestone_4_hot_unload_reload_and_tombstone_lifecycle_safety() {
     // Verify values after 5 ticks (Rust: +50 power, +5 shield; C: +25 mana, +5 level)
     {
         let ent = app.world().entity(rust_only_entities[0]);
-        let data = unsafe {
-            *(ent.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData)
-        };
+        let data =
+            unsafe { *(ent.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData) };
         assert_eq!(data.power, 150.0);
         assert_eq!(data.shield, 15);
 
         let ent = app.world().entity(c_only_entities[0]);
-        let data = unsafe {
-            *(ent.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData)
-        };
+        let data =
+            unsafe { *(ent.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData) };
         assert_eq!(data.mana, 75.0);
         assert_eq!(data.level, 6);
 
         let ent = app.world().entity(shared_entities[0]);
-        let r_data = unsafe {
-            *(ent.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData)
-        };
-        let c_data = unsafe {
-            *(ent.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData)
-        };
+        let r_data =
+            unsafe { *(ent.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData) };
+        let c_data =
+            unsafe { *(ent.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData) };
         assert_eq!(r_data.power, 250.0);
         assert_eq!(r_data.shield, 25);
         assert_eq!(c_data.mana, 125.0);
@@ -1820,9 +1823,8 @@ fn test_milestone_4_hot_unload_reload_and_tombstone_lifecycle_safety() {
     // C mod continues running -> mana +25, level +5
     {
         let ent = app.world().entity(rust_only_entities[0]);
-        let data = unsafe {
-            *(ent.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData)
-        };
+        let data =
+            unsafe { *(ent.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData) };
         assert_eq!(
             data.power, 150.0,
             "RustModCustomData must be frozen after Rust mod unload"
@@ -1833,9 +1835,8 @@ fn test_milestone_4_hot_unload_reload_and_tombstone_lifecycle_safety() {
         );
 
         let ent = app.world().entity(c_only_entities[0]);
-        let data = unsafe {
-            *(ent.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData)
-        };
+        let data =
+            unsafe { *(ent.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData) };
         assert_eq!(
             data.mana, 100.0,
             "CModCustomData must continue advancing while C mod is active"
@@ -1846,12 +1847,10 @@ fn test_milestone_4_hot_unload_reload_and_tombstone_lifecycle_safety() {
         );
 
         let ent = app.world().entity(shared_entities[0]);
-        let r_data = unsafe {
-            *(ent.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData)
-        };
-        let c_data = unsafe {
-            *(ent.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData)
-        };
+        let r_data =
+            unsafe { *(ent.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData) };
+        let c_data =
+            unsafe { *(ent.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData) };
         assert_eq!(r_data.power, 250.0, "Shared Rust data must be frozen");
         assert_eq!(r_data.shield, 25, "Shared Rust data must be frozen");
         assert_eq!(c_data.mana, 150.0, "Shared C data must advance to 150.0");
@@ -1869,19 +1868,16 @@ fn test_milestone_4_hot_unload_reload_and_tombstone_lifecycle_safety() {
     // Verify all values remain frozen
     {
         let ent = app.world().entity(c_only_entities[0]);
-        let data = unsafe {
-            *(ent.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData)
-        };
+        let data =
+            unsafe { *(ent.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData) };
         assert_eq!(data.mana, 100.0);
         assert_eq!(data.level, 11);
 
         let ent = app.world().entity(shared_entities[0]);
-        let r_data = unsafe {
-            *(ent.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData)
-        };
-        let c_data = unsafe {
-            *(ent.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData)
-        };
+        let r_data =
+            unsafe { *(ent.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData) };
+        let c_data =
+            unsafe { *(ent.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData) };
         assert_eq!(r_data.power, 250.0);
         assert_eq!(c_data.mana, 150.0);
     }
@@ -1964,26 +1960,22 @@ fn test_milestone_4_hot_unload_reload_and_tombstone_lifecycle_safety() {
     // Surviving Shared: Rust was 250.0/25 -> 300.0/30; C was 150.0/15 -> 175.0/20
     {
         let ent = app.world().entity(rust_only_entities[0]);
-        let data = unsafe {
-            *(ent.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData)
-        };
+        let data =
+            unsafe { *(ent.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData) };
         assert_eq!(data.power, 200.0);
         assert_eq!(data.shield, 20);
 
         let ent = app.world().entity(c_only_entities[0]);
-        let data = unsafe {
-            *(ent.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData)
-        };
+        let data =
+            unsafe { *(ent.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData) };
         assert_eq!(data.mana, 125.0);
         assert_eq!(data.level, 16);
 
         let ent = app.world().entity(shared_entities[0]);
-        let r_data = unsafe {
-            *(ent.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData)
-        };
-        let c_data = unsafe {
-            *(ent.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData)
-        };
+        let r_data =
+            unsafe { *(ent.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData) };
+        let c_data =
+            unsafe { *(ent.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData) };
         assert_eq!(r_data.power, 300.0);
         assert_eq!(r_data.shield, 30);
         assert_eq!(c_data.mana, 175.0);
@@ -1994,12 +1986,10 @@ fn test_milestone_4_hot_unload_reload_and_tombstone_lifecycle_safety() {
     // New: power was 500.0 -> 550.0; shield was 50 -> 55; mana was 200.0 -> 225.0; level was 20 -> 25
     {
         let ent = app.world().entity(new_entities[0]);
-        let r_data = unsafe {
-            *(ent.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData)
-        };
-        let c_data = unsafe {
-            *(ent.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData)
-        };
+        let r_data =
+            unsafe { *(ent.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData) };
+        let c_data =
+            unsafe { *(ent.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData) };
         assert_eq!(r_data.power, 550.0);
         assert_eq!(r_data.shield, 55);
         assert_eq!(c_data.mana, 225.0);
@@ -2009,8 +1999,7 @@ fn test_milestone_4_hot_unload_reload_and_tombstone_lifecycle_safety() {
     // Final clean teardown
     app.unload_mod(rust_mod_id_2)
         .expect("Unload reloaded Rust mod");
-    app.unload_mod(c_mod_id_2)
-        .expect("Unload reloaded C mod");
+    app.unload_mod(c_mod_id_2).expect("Unload reloaded C mod");
 
     for e in rust_only_entities
         .into_iter()
@@ -2021,4 +2010,3 @@ fn test_milestone_4_hot_unload_reload_and_tombstone_lifecycle_safety() {
         app.world_mut().despawn(e);
     }
 }
-

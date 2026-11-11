@@ -2621,7 +2621,13 @@ mod tests {
         }
 
         // v1 (48B) -> v3 (104B) zero-extension
-        let v1 = SystemDescriptor::new(c"sys".as_ptr(), core::ptr::null(), 0, dummy_sys, core::ptr::null_mut());
+        let v1 = SystemDescriptor::new(
+            c"sys".as_ptr(),
+            core::ptr::null(),
+            0,
+            dummy_sys,
+            core::ptr::null_mut(),
+        );
         // SAFETY: `v1` is valid and readable for `v1.struct_size` bytes.
         let from_v1 = unsafe {
             read_descriptor::<ConditionalSystemDescriptor>(&v1 as *const _ as *const c_void)

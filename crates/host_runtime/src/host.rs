@@ -186,7 +186,10 @@ impl std::error::Error for ModLoadError {}
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum SharedLibKey {
     #[cfg(unix)]
-    UnixInode { dev: u64, ino: u64 },
+    UnixInode {
+        dev: u64,
+        ino: u64,
+    },
     CanonicalPath(PathBuf),
 }
 
@@ -202,9 +205,7 @@ impl SharedLibKey {
                 };
             }
         }
-        Self::CanonicalPath(
-            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
-        )
+        Self::CanonicalPath(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
     }
 }
 
@@ -425,13 +426,7 @@ impl ModHost {
         registry: &Arc<ModRegistry>,
     ) -> Result<(ModId, Vec<DynamicCSystem>), ModLoadError> {
         // SAFETY: Caller upholds library validity; `world_ptr` is null for registry-only loads.
-        unsafe {
-            self.load_mod_core(
-                path.as_ref(),
-                Arc::clone(registry),
-                core::ptr::null_mut(),
-            )
-        }
+        unsafe { self.load_mod_core(path.as_ref(), Arc::clone(registry), core::ptr::null_mut()) }
     }
 
     /// Load a native mod library with a specific `ModRegistry`, returning the assigned `ModId`
@@ -556,7 +551,11 @@ impl ModHost {
     /// Caller must ensure unloading the dynamic library is safe with respect to external threads.
     pub unsafe fn unload_mod(&mut self, id: ModId) -> Result<(), FfiResult> {
         // SAFETY: Delegating to typed `try_unload_mod`.
-        unsafe { self.try_unload_mod(id).map(|_| ()).map_err(ModLoadError::into) }
+        unsafe {
+            self.try_unload_mod(id)
+                .map(|_| ())
+                .map_err(ModLoadError::into)
+        }
     }
 
     /// Unload all loaded mods in reverse load order (LIFO):

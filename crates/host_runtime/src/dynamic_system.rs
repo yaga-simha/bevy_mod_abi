@@ -865,7 +865,11 @@ impl System for DynamicCSystem {
                         if system_res_reads.insert(comp_id) {
                             system_res_order.push(comp_id);
                         }
-                        if !group.declared_resources.iter().any(|&(cid, _)| cid == comp_id) {
+                        if !group
+                            .declared_resources
+                            .iter()
+                            .any(|&(cid, _)| cid == comp_id)
+                        {
                             group.declared_resources.push((comp_id, false));
                         }
                     }
@@ -1134,7 +1138,11 @@ impl System for DynamicCSystem {
                         )
                     }
                     .with_last_run(last_run)
-                    .with_resources(world, registry_ref, &group.declared_resources);
+                    .with_resources(
+                        world,
+                        registry_ref,
+                        &group.declared_resources,
+                    );
                     host_iters[i] = Some(iter);
                 }
 
@@ -1358,9 +1366,7 @@ unsafe fn register_system_from_extensible_ptr(
     };
 
     let desc = sched_desc.base;
-    let run_if = cond_desc
-        .run_if
-        .map(|cb| (cb, cond_desc.run_if_user_data));
+    let run_if = cond_desc.run_if.map(|cb| (cb, cond_desc.run_if_user_data));
 
     // D8 fix: never silently truncate query columns beyond MAX_QUERY_COMPONENTS!
     if desc.query_count > MAX_QUERY_COMPONENTS {
@@ -1517,13 +1523,12 @@ unsafe fn register_multi_query_from_extensible_ptr(
 
     // SAFETY: Safely copies `min(struct_size, size_of::<ConditionalMultiQuerySystemDescriptor>())`
     // and checks `callback != 0` before `assume_init()` (no provenance or `fn`-niche UB).
-    let cond_desc = match unsafe {
-        read_descriptor::<ConditionalMultiQuerySystemDescriptor>(descriptor_ptr)
-    } {
-        Ok(d) => d,
-        Err(FfiResult::INVALID_VERSION) => return truncated_err,
-        Err(err) => return err,
-    };
+    let cond_desc =
+        match unsafe { read_descriptor::<ConditionalMultiQuerySystemDescriptor>(descriptor_ptr) } {
+            Ok(d) => d,
+            Err(FfiResult::INVALID_VERSION) => return truncated_err,
+            Err(err) => return err,
+        };
     let sched_desc = cond_desc.sched;
 
     let Some(schedule) = ModSchedule::from_label_id(sched_desc.schedule) else {
@@ -1543,9 +1548,7 @@ unsafe fn register_multi_query_from_extensible_ptr(
     };
 
     let desc = sched_desc.base;
-    let run_if = cond_desc
-        .run_if
-        .map(|cb| (cb, cond_desc.run_if_user_data));
+    let run_if = cond_desc.run_if.map(|cb| (cb, cond_desc.run_if_user_data));
 
     if desc.query_spec_count == 0 || desc.query_spec_count > MAX_SYSTEM_QUERIES {
         return FfiResult::INTERNAL_ERROR;

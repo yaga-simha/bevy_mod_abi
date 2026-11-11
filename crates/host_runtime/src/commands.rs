@@ -28,8 +28,8 @@
 //!      aligned host-owned buffer (or constructs a properly aligned dangling pointer for ZSTs)
 //!      before transferring ownership into Bevy via [`OwningPtr`].
 
-pub use abi_contract::{CmdInsertDefaultFn, CmdRemoveComponentFn};
 use crate::registry::ModRegistry;
+pub use abi_contract::{CmdInsertDefaultFn, CmdRemoveComponentFn};
 use abi_contract::{FfiEntity, FfiResult, RawCommandQueue};
 use bevy_ecs::entity::{Entity, EntityAllocator};
 use bevy_ecs::ptr::OwningPtr;
@@ -244,10 +244,7 @@ pub unsafe extern "C" fn host_cmd_insert_component(
         let Ok(layout) = Layout::from_size_align(0, align) else {
             return FfiResult::INTERNAL_ERROR;
         };
-        AlignedBuffer {
-            ptr: align,
-            layout,
-        }
+        AlignedBuffer { ptr: align, layout }
     };
 
     bridge.queue.push(move |world: &mut World| {

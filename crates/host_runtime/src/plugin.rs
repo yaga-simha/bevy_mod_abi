@@ -36,7 +36,7 @@ use bevy_ecs::message::{Message, Messages};
 use bevy_ecs::name::Name;
 use bevy_ecs::prelude::Resource;
 use bevy_ecs::schedule::{
-    IntoScheduleConfigs, InternedScheduleLabel, ScheduleCleanupPolicy, ScheduleLabel, Schedules,
+    InternedScheduleLabel, IntoScheduleConfigs, ScheduleCleanupPolicy, ScheduleLabel, Schedules,
     SystemSet,
 };
 use std::path::{Path, PathBuf};
@@ -548,10 +548,7 @@ impl ModAppExt for App {
             let target_labels: Vec<InternedScheduleLabel> = schedules
                 .iter()
                 .filter(|(_, schedule)| {
-                    schedule
-                        .graph()
-                        .system_sets
-                        .contains(ModSystemSet::Mod(id))
+                    schedule.graph().system_sets.contains(ModSystemSet::Mod(id))
                 })
                 .map(|(_, schedule)| schedule.label())
                 .collect();
@@ -593,10 +590,10 @@ impl ModAppExt for App {
 
         // 4. Invoke guest shutdown hook and drop shared library handle.
         let unloaded_path = {
-            let mut mod_host =
-                self.world_mut()
-                    .get_resource_mut::<ModHost>()
-                    .ok_or(ModLoadError::ModNotFound { id })?;
+            let mut mod_host = self
+                .world_mut()
+                .get_resource_mut::<ModHost>()
+                .ok_or(ModLoadError::ModNotFound { id })?;
             // SAFETY: Systems were deactivated and removed from schedules above.
             unsafe { mod_host.try_unload_mod(id)? }
         };

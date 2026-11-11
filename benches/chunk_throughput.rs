@@ -91,7 +91,12 @@ fn get_dylib_paths() -> (PathBuf, PathBuf) {
     (rust_dylib, c_dylib)
 }
 
-fn measure_app_rounds(app: &mut App, warmup: usize, rounds: usize, entity_count: usize) -> (f64, f64, f64) {
+fn measure_app_rounds(
+    app: &mut App,
+    warmup: usize,
+    rounds: usize,
+    entity_count: usize,
+) -> (f64, f64, f64) {
     for _ in 0..warmup {
         app.update();
     }
@@ -135,11 +140,16 @@ fn main() {
     const TOTAL_TICKS: usize = WARMUP + ROUNDS;
 
     println!("==========================================================================================");
-    println!(" MICROBENCHMARK: Runtime-Registered vs. Static ModExposable vs. Native Bevy Throughput");
+    println!(
+        " MICROBENCHMARK: Runtime-Registered vs. Static ModExposable vs. Native Bevy Throughput"
+    );
     println!("==========================================================================================");
 
     for &entity_count in &[1_000_usize, 10_000, 100_000] {
-        println!("\n--- Scale: {:>6} Entities ({ROUNDS} measured frames) ---", entity_count);
+        println!(
+            "\n--- Scale: {:>6} Entities ({ROUNDS} measured frames) ---",
+            entity_count
+        );
 
         // 1. Native Bevy Component (8-byte struct: power + shield)
         let (nat_med_ms, nat_tput, nat_ns) = {

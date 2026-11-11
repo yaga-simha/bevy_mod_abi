@@ -29,10 +29,18 @@ fn test_zst_slices_adversarial_matrix() {
     // 1. ZST with align 1
     // Valid aligned pointer (0x1 is aligned to 1)
     let slice_zst1 = ChunkSlice::new(core::ptr::dangling::<u8>(), 0, 100);
-    assert_eq!(slice_zst1.as_typed_slice::<ZstAlign1>().map(|s| s.len()), Some(100));
+    assert_eq!(
+        slice_zst1.as_typed_slice::<ZstAlign1>().map(|s| s.len()),
+        Some(100)
+    );
 
     let mut slice_mut_zst1 = ChunkSliceMut::new(core::ptr::dangling_mut::<u8>(), 0, 100);
-    assert_eq!(slice_mut_zst1.as_typed_slice::<ZstAlign1>().map(|s| s.len()), Some(100));
+    assert_eq!(
+        slice_mut_zst1
+            .as_typed_slice::<ZstAlign1>()
+            .map(|s| s.len()),
+        Some(100)
+    );
 
     // 2. ZST with alignments 4, 16, 64
     let aligned_64 = 0x1000 as *const u8;
@@ -42,16 +50,30 @@ fn test_zst_slices_adversarial_matrix() {
     assert_eq!((aligned_64 as usize) % 64, 0);
 
     let slice_zst4 = ChunkSlice::new(aligned_64, 0, 50);
-    assert_eq!(slice_zst4.as_typed_slice::<ZstAlign4>().map(|s| s.len()), Some(50));
+    assert_eq!(
+        slice_zst4.as_typed_slice::<ZstAlign4>().map(|s| s.len()),
+        Some(50)
+    );
 
     let slice_zst16 = ChunkSlice::new(aligned_64, 0, 50);
-    assert_eq!(slice_zst16.as_typed_slice::<ZstAlign16>().map(|s| s.len()), Some(50));
+    assert_eq!(
+        slice_zst16.as_typed_slice::<ZstAlign16>().map(|s| s.len()),
+        Some(50)
+    );
 
     let slice_zst64 = ChunkSlice::new(aligned_64, 0, 50);
-    assert_eq!(slice_zst64.as_typed_slice::<ZstAlign64>().map(|s| s.len()), Some(50));
+    assert_eq!(
+        slice_zst64.as_typed_slice::<ZstAlign64>().map(|s| s.len()),
+        Some(50)
+    );
 
     let mut slice_mut_zst64 = ChunkSliceMut::new(aligned_64 as *mut u8, 0, 50);
-    assert_eq!(slice_mut_zst64.as_typed_slice::<ZstAlign64>().map(|s| s.len()), Some(50));
+    assert_eq!(
+        slice_mut_zst64
+            .as_typed_slice::<ZstAlign64>()
+            .map(|s| s.len()),
+        Some(50)
+    );
 
     // Unaligned pointer for ZST with align 64 (0x1001 % 64 != 0)
     let unaligned_64 = 0x1001 as *const u8;
@@ -74,13 +96,17 @@ fn test_zst_slices_adversarial_matrix() {
     // Count exactly isize::MAX as usize: MUST be accepted according to Rust slice invariants
     let slice_at_isize = ChunkSlice::new(aligned_64, 0, isize::MAX as usize);
     assert_eq!(
-        slice_at_isize.as_typed_slice::<ZstAlign64>().map(|s| s.len()),
+        slice_at_isize
+            .as_typed_slice::<ZstAlign64>()
+            .map(|s| s.len()),
         Some(isize::MAX as usize)
     );
 
     let mut slice_mut_at_isize = ChunkSliceMut::new(aligned_64 as *mut u8, 0, isize::MAX as usize);
     assert_eq!(
-        slice_mut_at_isize.as_typed_slice::<ZstAlign64>().map(|s| s.len()),
+        slice_mut_at_isize
+            .as_typed_slice::<ZstAlign64>()
+            .map(|s| s.len()),
         Some(isize::MAX as usize)
     );
 
@@ -88,7 +114,8 @@ fn test_zst_slices_adversarial_matrix() {
     let slice_over_isize = ChunkSlice::new(aligned_64, 0, (isize::MAX as usize) + 1);
     assert_eq!(slice_over_isize.as_typed_slice::<ZstAlign64>(), None);
 
-    let mut slice_mut_over_isize = ChunkSliceMut::new(aligned_64 as *mut u8, 0, (isize::MAX as usize) + 1);
+    let mut slice_mut_over_isize =
+        ChunkSliceMut::new(aligned_64 as *mut u8, 0, (isize::MAX as usize) + 1);
     assert_eq!(slice_mut_over_isize.as_typed_slice::<ZstAlign64>(), None);
 
     // Count = usize::MAX: MUST be rejected (returns None)
@@ -135,7 +162,10 @@ fn test_pointer_wrapping_address_space() {
     assert_eq!(slice_ptr_wrap.get_ptr(1), None);
 
     let mut slice_mut_ptr_wrap = ChunkSliceMut::new(top_aligned_8 as *mut u8, size, 2);
-    assert_eq!(slice_mut_ptr_wrap.get_ptr_mut(0), Some(top_aligned_8 as *mut u8));
+    assert_eq!(
+        slice_mut_ptr_wrap.get_ptr_mut(0),
+        Some(top_aligned_8 as *mut u8)
+    );
     assert_eq!(slice_mut_ptr_wrap.get_ptr_mut(1), None);
 
     // 3. Pointer at usize::MAX for u8 (align 1)
@@ -221,7 +251,10 @@ fn test_stride_mismatches_exhaustive() {
 
     let mut mut_val = 0x42u32;
     let mut valid_slice_mut = ChunkSliceMut::new(&mut mut_val as *mut u32 as *mut u8, size, 1);
-    assert_eq!(valid_slice_mut.as_typed_slice::<u32>(), Some(&mut [0x42u32][..]));
+    assert_eq!(
+        valid_slice_mut.as_typed_slice::<u32>(),
+        Some(&mut [0x42u32][..])
+    );
 }
 
 #[test]
@@ -246,7 +279,10 @@ fn test_null_pointer_handling_exhaustive() {
 
     // 2. Mutable slice with null pointer
     let mut slice_mut_null_zero = ChunkSliceMut::new(core::ptr::null_mut(), size, 0);
-    assert_eq!(slice_mut_null_zero.as_typed_slice::<u64>(), Some(&mut [][..]));
+    assert_eq!(
+        slice_mut_null_zero.as_typed_slice::<u64>(),
+        Some(&mut [][..])
+    );
     assert!(slice_mut_null_zero.is_empty());
     assert_eq!(slice_mut_null_zero.get_ptr_mut(0), None);
 
