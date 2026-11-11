@@ -3,6 +3,10 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use std::io::stdout;
+use std::sync::Mutex;
+
+/// Global test lock to serialize terminal and panic hook modifications across test threads.
+static TERMINAL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 pub struct TestTerminalGuard;
 
@@ -31,16 +35,22 @@ impl Drop for TestTerminalGuard {
 
 #[test]
 fn test_terminal_guard_raii_drop() {
+    let _lock = TERMINAL_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let prev_hook = std::panic::take_hook();
+
     // Standard RAII drop check
     {
         if let Ok(guard) = TestTerminalGuard::enter() {
             drop(guard);
         }
     }
+
+    std::panic::set_hook(prev_hook);
 }
 
 #[test]
 fn test_terminal_guard_panic_hook_emits_cleanup_sequences() {
+    let _lock = TERMINAL_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let hook_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let hook_called_clone = hook_called.clone();
 
@@ -69,21 +79,43 @@ fn test_terminal_guard_panic_hook_emits_cleanup_sequences() {
 
 #[test]
 fn test_terminal_guard_nested_reentry_and_idempotent_drop() {
+    let _lock = TERMINAL_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let prev_hook = std::panic::take_hook();
+
     // Stress test: consecutive and nested entries must not panic or abort
     for _ in 0..5 {
-        let guard1 = TestTerminalGuard::enter();
-        assert!(guard1.is_ok(), "Guard 1 enter must succeed");
-        {
-            let guard2 = TestTerminalGuard::enter();
-            assert!(guard2.is_ok(), "Nested guard 2 enter must succeed");
-            drop(guard2);
+        match TestTerminalGuard::enter() {
+            Ok(guard1) => {
+                // If a controlling terminal is available, nested re-entry must also succeed
+                // and dropping inner then outer guard must be completely idempotent.
+                let guard2 = TestTerminalGuard::enter();
+                assert!(
+                    guard2.is_ok(),
+                    "Nested guard 2 enter must succeed when raw mode is active"
+                );
+                drop(guard2);
+                drop(guard1);
+            }
+            Err(err) => {
+                // In headless, non-TTY, or container environments (e.g. CI without /dev/tty),
+                // raw mode cannot be initialized. Nested entry must also return Err gracefully
+                // without panicking or aborting the process.
+                let nested = TestTerminalGuard::enter();
+                assert!(
+                    nested.is_err(),
+                    "Nested entry must also return Err when no TTY is available"
+                );
+                let _ = err;
+            }
         }
-        drop(guard1);
     }
+
+    std::panic::set_hook(prev_hook);
 }
 
 #[test]
 fn test_terminal_guard_unwind_drops_guard_safely() {
+    let _lock = TERMINAL_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let drop_executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let drop_executed_clone = drop_executed.clone();
 
