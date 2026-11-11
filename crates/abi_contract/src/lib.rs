@@ -45,17 +45,32 @@
 //! return [`FfiResult::PANIC_CAUGHT`] by value.
 //!
 //! ## Subsystem Map
-//! 1. **Core Primitives**: [`FfiResult`], [`FfiEntity`], [`FfiSlice`], [`StrView`], [`ComponentUuid`].
-//! 2. **Query Access Declarations**: [`ComponentAccessMode`], [`ComponentAccessDesc`].
+//! 1. **Core Primitives**: [`FfiResult`], [`FfiBool`], [`FfiEntity`], [`FfiSlice`], [`StrView`], [`ComponentUuid`].
+//! 2. **Query & Schedule Declarations**: [`ComponentAccessMode`], [`ComponentAccessDesc`], [`ScheduleLabelId`].
 //! 3. **Archetype Traversal Handles**: [`RawChunkIter`], [`IterNextChunkFn`], [`IterColumnReadonlyFn`],
 //!    [`IterColumnMutableFn`], [`IterMarkChangedFn`], [`IterEntitiesFn`], [`IterColumnStrideFn`], [`IterResetFn`].
-//! 4. **Command Queue & Registration**: [`RawCommandQueue`], [`DynamicSystemCallback`], [`QuerySpec`],
-//!    [`MultiQuerySystemCallback`], [`MultiQuerySystemDescriptor`], [`SystemDescriptor`], [`HostApi`],
+//! 4. **Command Queue, Registration & Versioning**: [`RawCommandQueue`], [`DynamicSystemCallback`], [`QuerySpec`],
+//!    [`MultiQuerySystemCallback`], [`MultiQuerySystemDescriptor`], [`ScheduledMultiQuerySystemDescriptor`],
+//!    [`SystemDescriptor`], [`ScheduledSystemDescriptor`], [`HostApi`], [`ExtensibleStruct`],
+//!    [`read_extensible_struct`], [`read_descriptor`], [`abi_version_is_compatible`],
 //!    [`RegisterSystemFn`], [`RegisterMultiQuerySystemFn`], [`GetProcAddressFn`].
-//! 5. **Dynamic Components & Reflection**: [`ComponentDropFn`], [`ModComponentDescriptor`],
-//!    [`DynamicComponentDescriptor`], [`RegisterComponentFn`], [`FfiLayout`], [`SymbolEntry`], [`ExposableComponent`].
+//! 5. **Dynamic Components & POD Traits**: [`ComponentDropFn`], [`ModComponentDescriptor`],
+//!    [`DynamicComponentDescriptor`], [`RegisterComponentFn`], [`FfiLayout`], [`AbiPod`],
+//!    [`SymbolEntry`], [`ExposableComponent`].
 
 use core::ffi::{c_char, c_void};
+
+/// ABI-safe 8-bit boolean flag (`0` = `false`, non-zero = `true`).
+///
+/// Rust's `bool` only permits byte values `0` and `1`; passing any other byte (`2..=255`) from
+/// C/C++/Zig into an `extern "C"` Rust `bool` parameter is immediate undefined behavior.
+/// All boolean values crossing the C-ABI use `FfiBool` (`u8`) instead.
+pub type FfiBool = u8;
+
+/// Canonical `false` value for [`FfiBool`].
+pub const FFI_BOOL_FALSE: FfiBool = 0;
+/// Canonical `true` value for [`FfiBool`].
+pub const FFI_BOOL_TRUE: FfiBool = 1;
 
 /// Major version of the ABI contract. Incremented for breaking ABI layout or signature changes.
 pub const ABI_VERSION_MAJOR: u32 = 0;
@@ -64,6 +79,42 @@ pub const ABI_VERSION_MINOR: u32 = 1;
 /// Patch version of the ABI contract. Incremented for backward-compatible internal bug fixes.
 pub const ABI_VERSION_PATCH: u32 = 0;
 
+/// Packs `(major, minor, patch)` into a 32-bit ABI version word: `(major << 24) | (minor << 16) | patch`.
+#[inline]
+pub const fn pack_abi_version(major: u32, minor: u32, patch: u32) -> u32 {
+    ((major & 0xFF) << 24) | ((minor & 0xFF) << 16) | (patch & 0xFFFF)
+}
+
+/// Extracts the 8-bit major version from a packed ABI version word.
+#[inline]
+pub const fn abi_version_major(packed: u32) -> u32 {
+    (packed >> 24) & 0xFF
+}
+
+/// Extracts the 8-bit minor version from a packed ABI version word.
+#[inline]
+pub const fn abi_version_minor(packed: u32) -> u32 {
+    (packed >> 16) & 0xFF
+}
+
+/// Extracts the 16-bit patch version from a packed ABI version word.
+#[inline]
+pub const fn abi_version_patch(packed: u32) -> u32 {
+    packed & 0xFFFF
+}
+
+/// Returns `true` if a guest mod compiled against `guest_packed` is semver-compatible with a
+/// host running `host_packed`.
+///
+/// Compatibility requires identical major versions (`host_major == guest_major`) and a guest minor
+/// version no newer than the host's (`guest_minor <= host_minor`). Patch differences are always
+/// compatible in both directions.
+#[inline]
+pub const fn abi_version_is_compatible(host_packed: u32, guest_packed: u32) -> bool {
+    abi_version_major(host_packed) == abi_version_major(guest_packed)
+        && abi_version_minor(guest_packed) <= abi_version_minor(host_packed)
+}
+
 /// Packed 32-bit ABI version: `(MAJOR << 24) | (MINOR << 16) | PATCH`.
 ///
 /// Bit packing allows host and guest to negotiate compatibility with a single 32-bit integer comparison.
@@ -71,14 +122,18 @@ pub const ABI_VERSION_PATCH: u32 = 0;
 /// # Example
 ///
 /// ```
-/// use abi_contract::{ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PATCH, ABI_VERSION_PACKED};
+/// use abi_contract::{
+///     abi_version_is_compatible, pack_abi_version, ABI_VERSION_MAJOR, ABI_VERSION_MINOR,
+///     ABI_VERSION_PACKED, ABI_VERSION_PATCH,
+/// };
 ///
 /// assert_eq!((ABI_VERSION_PACKED >> 24) & 0xFF, ABI_VERSION_MAJOR);
 /// assert_eq!((ABI_VERSION_PACKED >> 16) & 0xFF, ABI_VERSION_MINOR);
 /// assert_eq!(ABI_VERSION_PACKED & 0xFFFF, ABI_VERSION_PATCH);
+/// assert!(abi_version_is_compatible(pack_abi_version(0, 2, 0), ABI_VERSION_PACKED));
 /// ```
 pub const ABI_VERSION_PACKED: u32 =
-    (ABI_VERSION_MAJOR << 24) | (ABI_VERSION_MINOR << 16) | ABI_VERSION_PATCH;
+    pack_abi_version(ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PATCH);
 
 /// FFI-safe status code returned across the C-ABI boundary.
 ///
@@ -162,6 +217,11 @@ impl FfiResult {
 /// Opaque 64-bit entity identifier matching `bevy_ecs::entity::Entity::to_bits()`.
 ///
 /// Foreign code must treat this as an opaque token (never assuming index vs generation bit widths).
+/// In Bevy 0.20+, `EntityIndex` is backed by a `NonMaxU32` stored on the wire via `NonZero<u32>`
+/// bit encoding, so `0` (`FfiEntity::NULL`) is **never** a valid Bevy `Entity`
+/// (`Entity::try_from_bits(0)` is guaranteed `None`), whereas `u64::MAX` is a valid entity bit pattern
+/// and Bevy's `Entity::PLACEHOLDER.to_bits()` is `0x1`. Always use [`FfiEntity::NULL`] (`0`) as the
+/// invalid/null entity sentinel across the C-ABI.
 ///
 /// # Example
 ///
@@ -170,14 +230,28 @@ impl FfiResult {
 ///
 /// let entity = FfiEntity::from_bits(42);
 /// assert_eq!(entity.to_bits(), 42);
-/// assert_ne!(entity, FfiEntity::PLACEHOLDER);
+/// assert!(!entity.is_null());
+/// assert!(FfiEntity::NULL.is_null());
+/// assert_eq!(FfiEntity::default(), FfiEntity::NULL);
 /// ```
 #[repr(transparent)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Default)]
 pub struct FfiEntity(pub u64);
 
 impl FfiEntity {
-    /// Sentinel placeholder entity value (`u64::MAX`).
+    /// Canonical null / invalid entity sentinel (`0`).
+    ///
+    /// Guaranteed never to collide with any allocated Bevy `Entity` (`Entity::try_from_bits(0) == None`).
+    pub const NULL: Self = Self(0);
+
+    /// Legacy placeholder constant (`u64::MAX`).
+    ///
+    /// **Deprecated**: In Bevy 0.20+, `u64::MAX` does **not** match `Entity::PLACEHOLDER.to_bits()` (`0x1`)
+    /// and decodes as a valid `Entity` (`index = 0`). Use [`FfiEntity::NULL`] (`0`) instead.
+    #[deprecated(
+        since = "0.1.1",
+        note = "Use `FfiEntity::NULL` (`0`). `u64::MAX` does not match Bevy 0.20's `Entity::PLACEHOLDER` (`0x1`)."
+    )]
     pub const PLACEHOLDER: Self = Self(u64::MAX);
 
     /// Constructs an `FfiEntity` from raw 64-bit bits.
@@ -190,6 +264,12 @@ impl FfiEntity {
     #[inline]
     pub const fn to_bits(self) -> u64 {
         self.0
+    }
+
+    /// Returns `true` if this entity equals the invalid [`FfiEntity::NULL`] sentinel (`0`).
+    #[inline]
+    pub const fn is_null(self) -> bool {
+        self.0 == Self::NULL.0
     }
 }
 
@@ -580,6 +660,140 @@ pub type MultiQuerySystemCallback = unsafe extern "C" fn(
     user_data: *mut c_void,
 ) -> FfiResult;
 
+/// FFI-safe Bevy schedule identifier (`#[repr(transparent)]` `u32` newtype).
+///
+/// Defaults to [`ScheduleLabelId::UPDATE`] (`0`), so older `SystemDescriptor` instances zero-extended
+/// via [`read_extensible_struct`] automatically run in Bevy's `Update` schedule.
+#[repr(transparent)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Default)]
+pub struct ScheduleLabelId(pub u32);
+
+#[allow(non_upper_case_globals)]
+impl ScheduleLabelId {
+    /// Main per-frame `Update` schedule (`0`, default).
+    pub const UPDATE: Self = Self(0);
+    /// One-shot `Startup` schedule (`1`).
+    pub const STARTUP: Self = Self(1);
+    /// Per-frame `PreUpdate` schedule (`2`).
+    pub const PRE_UPDATE: Self = Self(2);
+    /// Per-frame `PostUpdate` schedule (`3`).
+    pub const POST_UPDATE: Self = Self(3);
+    /// Fixed-timestep `FixedUpdate` schedule (`4`).
+    pub const FIXED_UPDATE: Self = Self(4);
+    /// End-of-frame `Last` schedule (`5`).
+    pub const LAST: Self = Self(5);
+
+    /// Alias for [`Self::UPDATE`].
+    pub const Update: Self = Self::UPDATE;
+    /// Alias for [`Self::STARTUP`].
+    pub const Startup: Self = Self::STARTUP;
+    /// Alias for [`Self::PRE_UPDATE`].
+    pub const PreUpdate: Self = Self::PRE_UPDATE;
+    /// Alias for [`Self::POST_UPDATE`].
+    pub const PostUpdate: Self = Self::POST_UPDATE;
+    /// Alias for [`Self::FIXED_UPDATE`].
+    pub const FixedUpdate: Self = Self::FIXED_UPDATE;
+    /// Alias for [`Self::LAST`].
+    pub const Last: Self = Self::LAST;
+
+    /// Returns `true` if this schedule label ID is one of the recognized built-in variants (`0..=5`).
+    #[inline]
+    pub const fn is_valid(self) -> bool {
+        self.0 <= Self::LAST.0
+    }
+}
+
+/// Marker trait for `#[repr(C)]` ABI descriptor or VTable structs prefixed with `struct_size: u32`
+/// at byte offset `0` whose trailing fields beyond [`Self::MIN_V1_SIZE`] are valid when zero-filled.
+///
+/// # Safety
+/// Implementing `ExtensibleStruct` asserts that:
+/// 1. `Self` is `#[repr(C)]` and begins with `struct_size: u32` at byte offset `0`.
+/// 2. `core::mem::size_of::<u32>() <= Self::MIN_V1_SIZE <= core::mem::size_of::<Self>()`.
+/// 3. Every field in `Self` located at byte offset `>= Self::MIN_V1_SIZE` is valid when all-bits-zero
+///    (e.g. integers, `ScheduleLabelId`, raw pointers `*const T` / `*mut T`, or `Option<extern "C" fn(...)>`,
+///    never non-`Option` bare `fn` pointers or references).
+/// 4. Any non-nullable fields inside `0..Self::MIN_V1_SIZE` (such as bare `extern "C" fn` pointers
+///    that C callers might erroneously pass as `NULL`) are verified in [`Self::validate_raw_slot`]
+///    before `MaybeUninit::assume_init()` is called.
+pub unsafe trait ExtensibleStruct: Copy + 'static {
+    /// Minimum valid `struct_size` in bytes (the base v0.1 layout size).
+    const MIN_V1_SIZE: usize;
+
+    /// Validates raw slot bytes (e.g., checking non-nullable `fn` pointer offsets) before
+    /// `MaybeUninit::assume_init()` materializes `Self`.
+    ///
+    /// # Safety
+    /// `slot_ptr` must point to a `MaybeUninit<Self>` buffer whose first `copy_len >= Self::MIN_V1_SIZE`
+    /// bytes were copied from caller memory and whose remaining trailing bytes are zero-initialized.
+    #[inline]
+    unsafe fn validate_raw_slot(slot_ptr: *const Self) -> FfiResult {
+        let _ = slot_ptr;
+        FfiResult::OK
+    }
+}
+
+/// Reads a variable-length `#[repr(C)]` descriptor or API table across the FFI boundary using
+/// Vulkan / Godot GDExtension `struct_size` rules:
+/// - Returns `Err(FfiResult::NULL_POINTER)` if `ptr` is null.
+/// - Returns `Err(FfiResult::INVALID_VERSION)` if `struct_size < T::MIN_V1_SIZE`.
+/// - Copies `min(struct_size, size_of::<T>())` bytes into a zero-initialized `MaybeUninit<T>`,
+///   zero-filling newer trailing fields when `struct_size < size_of::<T>()` and ignoring unknown
+///   future trailing bytes when `struct_size > size_of::<T>()`.
+/// - Runs [`ExtensibleStruct::validate_raw_slot`] before `assume_init()` so null function pointers
+///   from foreign C callers return `Err(FfiResult::NULL_POINTER)` without Rust niche UB.
+///
+/// # Safety
+/// If `ptr` is non-null and `struct_size >= T::MIN_V1_SIZE`, `ptr` must be readable for at least
+/// `min(struct_size, core::mem::size_of::<T>())` bytes with valid field values for `T`'s prefix.
+#[inline]
+pub unsafe fn read_extensible_struct<T: ExtensibleStruct>(
+    ptr: *const u8,
+    struct_size: usize,
+) -> Result<T, FfiResult> {
+    if ptr.is_null() {
+        return Err(FfiResult::NULL_POINTER);
+    }
+    if struct_size < T::MIN_V1_SIZE {
+        return Err(FfiResult::INVALID_VERSION);
+    }
+    let mut slot = core::mem::MaybeUninit::<T>::zeroed();
+    let copy_len = if struct_size < core::mem::size_of::<T>() {
+        struct_size
+    } else {
+        core::mem::size_of::<T>()
+    };
+    // SAFETY: `ptr` is non-null and caller guarantees `copy_len` readable bytes; `slot` has
+    // `size_of::<T>() >= copy_len` writable bytes on the local stack and cannot overlap `ptr`.
+    unsafe {
+        core::ptr::copy_nonoverlapping(ptr, slot.as_mut_ptr() as *mut u8, copy_len);
+    }
+    // SAFETY: `slot` holds `copy_len >= T::MIN_V1_SIZE` copied prefix bytes and zeroed trailing bytes.
+    let status = unsafe { T::validate_raw_slot(slot.as_ptr()) };
+    if status.is_err() {
+        return Err(status);
+    }
+    // SAFETY: Prefix `0..copy_len` is valid per caller, trailing `copy_len..size_of::<T>()` is
+    // zero-valid per `T: ExtensibleStruct`, and `validate_raw_slot` verified non-null fn slots.
+    Ok(unsafe { slot.assume_init() })
+}
+
+/// Reads an extensible `#[repr(C)]` descriptor starting with `struct_size: u32` at offset `0`.
+///
+/// # Safety
+/// If `ptr` is non-null, it must be readable for at least 4 bytes to inspect `struct_size`, and
+/// if `struct_size >= T::MIN_V1_SIZE`, readable for `min(struct_size, size_of::<T>())` bytes.
+#[inline]
+pub unsafe fn read_descriptor<T: ExtensibleStruct>(ptr: *const c_void) -> Result<T, FfiResult> {
+    if ptr.is_null() {
+        return Err(FfiResult::NULL_POINTER);
+    }
+    // SAFETY: Caller guarantees at least 4 readable bytes at `ptr` for the leading `struct_size: u32`.
+    let declared_size = unsafe { core::ptr::read_unaligned(ptr as *const u32) } as usize;
+    // SAFETY: Forwarding `ptr` and its declared `struct_size` under caller's readability contract.
+    unsafe { read_extensible_struct::<T>(ptr as *const u8, declared_size) }
+}
+
 /// Descriptor used by mods to register a multi-query `DynamicCSystem` via `register_multi_query_system`.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -596,6 +810,178 @@ pub struct MultiQuerySystemDescriptor {
     pub callback: MultiQuerySystemCallback,
     /// Opaque guest-owned context pointer forwarded to `callback`.
     pub user_data: *mut c_void,
+}
+
+impl MultiQuerySystemDescriptor {
+    /// Minimum valid v0.1 descriptor size in bytes (`48` on 64-bit, `24` on 32-bit).
+    pub const MIN_V1_SIZE: usize = core::mem::size_of::<Self>();
+
+    /// Constructs a v0.1 multi-query system descriptor.
+    #[inline]
+    pub const fn new(
+        name: *const c_char,
+        query_specs: *const QuerySpec,
+        query_spec_count: usize,
+        callback: MultiQuerySystemCallback,
+        user_data: *mut c_void,
+    ) -> Self {
+        Self {
+            struct_size: core::mem::size_of::<Self>() as u32,
+            name,
+            query_specs,
+            query_spec_count,
+            callback,
+            user_data,
+        }
+    }
+
+    /// Promotes this descriptor into a [`ScheduledMultiQuerySystemDescriptor`] targeting `schedule`.
+    #[inline]
+    pub const fn with_schedule(
+        self,
+        schedule: ScheduleLabelId,
+    ) -> ScheduledMultiQuerySystemDescriptor {
+        ScheduledMultiQuerySystemDescriptor::from_base(self, schedule)
+    }
+
+    /// Validates `struct_size` and mandatory pointer invariants.
+    #[inline]
+    pub fn validate(&self) -> FfiResult {
+        if (self.struct_size as usize) < Self::MIN_V1_SIZE {
+            return FfiResult::INVALID_VERSION;
+        }
+        if self.name.is_null() || (self.query_spec_count > 0 && self.query_specs.is_null()) {
+            return FfiResult::NULL_POINTER;
+        }
+        FfiResult::OK
+    }
+}
+
+// SAFETY: `MultiQuerySystemDescriptor` is `#[repr(C)]` with `struct_size: u32` at offset 0 and
+// `validate_raw_slot` verifies the non-nullable `callback` pointer before `assume_init()`.
+unsafe impl ExtensibleStruct for MultiQuerySystemDescriptor {
+    const MIN_V1_SIZE: usize = Self::MIN_V1_SIZE;
+
+    #[inline]
+    unsafe fn validate_raw_slot(slot_ptr: *const Self) -> FfiResult {
+        let cb_offset = core::mem::offset_of!(Self, callback);
+        // SAFETY: `cb_offset + size_of::<usize>() <= size_of::<Self>()` inside `slot_ptr`.
+        let cb_addr = unsafe {
+            core::ptr::read_unaligned((slot_ptr as *const u8).add(cb_offset) as *const usize)
+        };
+        if cb_addr == 0 {
+            return FfiResult::NULL_POINTER;
+        }
+        FfiResult::OK
+    }
+}
+
+/// Extended multi-query system descriptor adding Bevy schedule selection and intra-mod ordering.
+///
+/// Layout-prefixed by [`MultiQuerySystemDescriptor`] at offset `0`, so older v0.1 descriptors
+/// zero-extend cleanly into `ScheduledMultiQuerySystemDescriptor` (`schedule = UPDATE`, empty
+/// `before`/`after` arrays), and newer guests may pass [`Self::as_base_ptr`] directly to
+/// [`RegisterMultiQuerySystemFn`].
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ScheduledMultiQuerySystemDescriptor {
+    /// Base v0.1 multi-query descriptor header (`base.struct_size` set to `size_of::<Self>() as u32`).
+    pub base: MultiQuerySystemDescriptor,
+    /// Target Bevy schedule (`ScheduleLabelId::UPDATE` = `0` when zero-extended).
+    pub schedule: ScheduleLabelId,
+    /// Reserved flags word (`0` by default).
+    pub flags: u32,
+    /// Optional array of NUL-terminated system names this system must run after.
+    pub after: *const *const c_char,
+    /// Number of entries in `after`.
+    pub after_count: usize,
+    /// Optional array of NUL-terminated system names this system must run before.
+    pub before: *const *const c_char,
+    /// Number of entries in `before`.
+    pub before_count: usize,
+}
+
+/// Alias for [`ScheduledMultiQuerySystemDescriptor`].
+pub type MultiQuerySystemDescriptorV2 = ScheduledMultiQuerySystemDescriptor;
+
+impl ScheduledMultiQuerySystemDescriptor {
+    /// Minimum valid descriptor size (`MultiQuerySystemDescriptor::MIN_V1_SIZE` for backward compatibility).
+    pub const MIN_V1_SIZE: usize = MultiQuerySystemDescriptor::MIN_V1_SIZE;
+
+    /// Wraps a base [`MultiQuerySystemDescriptor`] with a target [`ScheduleLabelId`].
+    #[inline]
+    pub const fn from_base(
+        mut base: MultiQuerySystemDescriptor,
+        schedule: ScheduleLabelId,
+    ) -> Self {
+        base.struct_size = core::mem::size_of::<Self>() as u32;
+        Self {
+            base,
+            schedule,
+            flags: 0,
+            after: core::ptr::null(),
+            after_count: 0,
+            before: core::ptr::null(),
+            before_count: 0,
+        }
+    }
+
+    /// Declares NUL-terminated system names that this system must run after.
+    #[inline]
+    pub const fn with_after(mut self, after: *const *const c_char, after_count: usize) -> Self {
+        self.after = after;
+        self.after_count = after_count;
+        self
+    }
+
+    /// Declares NUL-terminated system names that this system must run before.
+    #[inline]
+    pub const fn with_before(mut self, before: *const *const c_char, before_count: usize) -> Self {
+        self.before = before;
+        self.before_count = before_count;
+        self
+    }
+
+    /// Returns a base-compatible pointer suitable for passing to [`RegisterMultiQuerySystemFn`].
+    #[inline]
+    pub const fn as_base_ptr(&self) -> *const MultiQuerySystemDescriptor {
+        &self.base
+    }
+
+    /// Validates base descriptor fields, schedule label validity, and ordering array pointers.
+    #[inline]
+    pub fn validate(&self) -> FfiResult {
+        let base_res = self.base.validate();
+        if base_res.is_err() {
+            return base_res;
+        }
+        if !self.schedule.is_valid() {
+            return FfiResult::INVALID_VERSION;
+        }
+        if (self.after_count > 0 && self.after.is_null())
+            || (self.before_count > 0 && self.before.is_null())
+        {
+            return FfiResult::NULL_POINTER;
+        }
+        FfiResult::OK
+    }
+}
+
+// SAFETY: `ScheduledMultiQuerySystemDescriptor` starts with `base: MultiQuerySystemDescriptor`
+// (`struct_size` at offset 0), all fields after `MIN_V1_SIZE` (`schedule`, `flags`, `after*`, `before*`)
+// are valid when zero-filled, and `validate_raw_slot` checks `base.callback != 0`.
+unsafe impl ExtensibleStruct for ScheduledMultiQuerySystemDescriptor {
+    const MIN_V1_SIZE: usize = Self::MIN_V1_SIZE;
+
+    #[inline]
+    unsafe fn validate_raw_slot(slot_ptr: *const Self) -> FfiResult {
+        // SAFETY: `base` is at byte offset 0 of `Self`.
+        unsafe {
+            MultiQuerySystemDescriptor::validate_raw_slot(
+                slot_ptr as *const MultiQuerySystemDescriptor,
+            )
+        }
+    }
 }
 
 /// Multi-query system registration function signature resolvable via `GetProcAddressFn`.
@@ -625,6 +1011,169 @@ pub struct SystemDescriptor {
     pub user_data: *mut c_void,
 }
 
+impl SystemDescriptor {
+    /// Minimum valid v0.1 descriptor size in bytes (`48` on 64-bit, `24` on 32-bit).
+    pub const MIN_V1_SIZE: usize = core::mem::size_of::<Self>();
+
+    /// Constructs a v0.1 `SystemDescriptor`.
+    #[inline]
+    pub const fn new(
+        name: *const c_char,
+        queries: *const ComponentAccessDesc,
+        query_count: usize,
+        callback: DynamicSystemCallback,
+        user_data: *mut c_void,
+    ) -> Self {
+        Self {
+            struct_size: core::mem::size_of::<Self>() as u32,
+            name,
+            queries,
+            query_count,
+            callback,
+            user_data,
+        }
+    }
+
+    /// Promotes this descriptor into a [`ScheduledSystemDescriptor`] targeting `schedule`.
+    #[inline]
+    pub const fn with_schedule(self, schedule: ScheduleLabelId) -> ScheduledSystemDescriptor {
+        ScheduledSystemDescriptor::from_base(self, schedule)
+    }
+
+    /// Validates `struct_size` and mandatory pointer invariants.
+    #[inline]
+    pub fn validate(&self) -> FfiResult {
+        if (self.struct_size as usize) < Self::MIN_V1_SIZE {
+            return FfiResult::INVALID_VERSION;
+        }
+        if self.name.is_null() || (self.query_count > 0 && self.queries.is_null()) {
+            return FfiResult::NULL_POINTER;
+        }
+        FfiResult::OK
+    }
+}
+
+// SAFETY: `SystemDescriptor` is `#[repr(C)]` with `struct_size: u32` at offset 0 and
+// `validate_raw_slot` verifies the non-nullable `callback` pointer before `assume_init()`.
+unsafe impl ExtensibleStruct for SystemDescriptor {
+    const MIN_V1_SIZE: usize = Self::MIN_V1_SIZE;
+
+    #[inline]
+    unsafe fn validate_raw_slot(slot_ptr: *const Self) -> FfiResult {
+        let cb_offset = core::mem::offset_of!(Self, callback);
+        // SAFETY: `cb_offset + size_of::<usize>() <= size_of::<Self>()` inside `slot_ptr`.
+        let cb_addr = unsafe {
+            core::ptr::read_unaligned((slot_ptr as *const u8).add(cb_offset) as *const usize)
+        };
+        if cb_addr == 0 {
+            return FfiResult::NULL_POINTER;
+        }
+        FfiResult::OK
+    }
+}
+
+/// Extended system registration descriptor adding Bevy schedule selection and intra-mod ordering.
+///
+/// Layout-prefixed by [`SystemDescriptor`] at offset `0` (`88` bytes on 64-bit, `48` bytes on 32-bit).
+/// When an older v0.1 [`SystemDescriptor`] (`48` bytes) is read via
+/// `read_descriptor::<ScheduledSystemDescriptor>`, the trailing fields are zero-filled to
+/// `schedule = ScheduleLabelId::UPDATE` (`0`), `flags = 0`, and empty `after`/`before` slices.
+/// Newer guests can pass [`Self::as_base_ptr`] directly to `HostApi::register_system`.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ScheduledSystemDescriptor {
+    /// Base v0.1 system descriptor header (`base.struct_size` set to `size_of::<Self>() as u32`).
+    pub base: SystemDescriptor,
+    /// Target Bevy schedule (`ScheduleLabelId::UPDATE` = `0` when zero-extended).
+    pub schedule: ScheduleLabelId,
+    /// Reserved flags word (`0` by default).
+    pub flags: u32,
+    /// Optional array of NUL-terminated system names this system must run after.
+    pub after: *const *const c_char,
+    /// Number of entries in `after`.
+    pub after_count: usize,
+    /// Optional array of NUL-terminated system names this system must run before.
+    pub before: *const *const c_char,
+    /// Number of entries in `before`.
+    pub before_count: usize,
+}
+
+/// Alias for [`ScheduledSystemDescriptor`].
+pub type SystemDescriptorV2 = ScheduledSystemDescriptor;
+
+impl ScheduledSystemDescriptor {
+    /// Minimum valid descriptor size (`SystemDescriptor::MIN_V1_SIZE` for backward compatibility).
+    pub const MIN_V1_SIZE: usize = SystemDescriptor::MIN_V1_SIZE;
+
+    /// Wraps a base [`SystemDescriptor`] with a target [`ScheduleLabelId`].
+    #[inline]
+    pub const fn from_base(mut base: SystemDescriptor, schedule: ScheduleLabelId) -> Self {
+        base.struct_size = core::mem::size_of::<Self>() as u32;
+        Self {
+            base,
+            schedule,
+            flags: 0,
+            after: core::ptr::null(),
+            after_count: 0,
+            before: core::ptr::null(),
+            before_count: 0,
+        }
+    }
+
+    /// Declares NUL-terminated system names that this system must run after.
+    #[inline]
+    pub const fn with_after(mut self, after: *const *const c_char, after_count: usize) -> Self {
+        self.after = after;
+        self.after_count = after_count;
+        self
+    }
+
+    /// Declares NUL-terminated system names that this system must run before.
+    #[inline]
+    pub const fn with_before(mut self, before: *const *const c_char, before_count: usize) -> Self {
+        self.before = before;
+        self.before_count = before_count;
+        self
+    }
+
+    /// Returns a base-compatible pointer suitable for passing to [`RegisterSystemFn`].
+    #[inline]
+    pub const fn as_base_ptr(&self) -> *const SystemDescriptor {
+        &self.base
+    }
+
+    /// Validates base descriptor fields, schedule label validity, and ordering array pointers.
+    #[inline]
+    pub fn validate(&self) -> FfiResult {
+        let base_res = self.base.validate();
+        if base_res.is_err() {
+            return base_res;
+        }
+        if !self.schedule.is_valid() {
+            return FfiResult::INVALID_VERSION;
+        }
+        if (self.after_count > 0 && self.after.is_null())
+            || (self.before_count > 0 && self.before.is_null())
+        {
+            return FfiResult::NULL_POINTER;
+        }
+        FfiResult::OK
+    }
+}
+
+// SAFETY: `ScheduledSystemDescriptor` starts with `base: SystemDescriptor` (`struct_size` at offset 0),
+// all fields after `MIN_V1_SIZE` (`schedule`, `flags`, `after*`, `before*`) are valid when zero-filled,
+// and `validate_raw_slot` checks `base.callback != 0`.
+unsafe impl ExtensibleStruct for ScheduledSystemDescriptor {
+    const MIN_V1_SIZE: usize = Self::MIN_V1_SIZE;
+
+    #[inline]
+    unsafe fn validate_raw_slot(slot_ptr: *const Self) -> FfiResult {
+        // SAFETY: `base` is at byte offset 0 of `Self`.
+        unsafe { SystemDescriptor::validate_raw_slot(slot_ptr as *const SystemDescriptor) }
+    }
+}
+
 /// System registration function signature exposed in [`HostApi`].
 ///
 /// # Safety
@@ -632,6 +1181,15 @@ pub struct SystemDescriptor {
 pub type RegisterSystemFn = unsafe extern "C" fn(
     host_context: *mut c_void,
     descriptor: *const SystemDescriptor,
+) -> FfiResult;
+
+/// Explicit scheduled system registration function signature resolvable via `GetProcAddressFn`.
+///
+/// # Safety
+/// `host_context` must point to host initialization context; `descriptor` must point to a valid descriptor.
+pub type RegisterScheduledSystemFn = unsafe extern "C" fn(
+    host_context: *mut c_void,
+    descriptor: *const ScheduledSystemDescriptor,
 ) -> FfiResult;
 
 /// Symbol-resolver function pointer passed to the guest mod entry point (Godot GDExtension style).
@@ -723,6 +1281,14 @@ pub struct ModComponentDescriptor {
 pub type DynamicComponentDescriptor = ModComponentDescriptor;
 
 impl ModComponentDescriptor {
+    /// Minimum valid base v0.1 descriptor size (`64` bytes on 64-bit, `40` bytes on 32-bit).
+    ///
+    /// If future minor ABI revisions append optional fields to `ModComponentDescriptor`, descriptors
+    /// from v0.1 mods with `struct_size >= MIN_V1_SIZE` remain valid and have trailing fields
+    /// zero-filled via [`read_extensible_struct`].
+    pub const MIN_V1_SIZE: usize =
+        core::mem::offset_of!(Self, vtable_ptr) + core::mem::size_of::<*const core::ffi::c_void>();
+
     /// Constructs a basic descriptor for a Plain Old Data (POD) component with no custom drop glue.
     #[inline]
     pub const fn new(
@@ -759,7 +1325,7 @@ impl ModComponentDescriptor {
     /// Validates the memory layout and pointer integrity of this descriptor.
     ///
     /// Returns `true` if and only if all of the following conditions are met:
-    /// 1. `struct_size` is at least the size of [`ModComponentDescriptor`] (ABI forward compatibility).
+    /// 1. `struct_size` is at least [`ModComponentDescriptor::MIN_V1_SIZE`] (ABI compatibility).
     /// 2. `name` is non-null.
     /// 3. `align` is a non-zero power of two.
     /// 4. `size` is an integer multiple of `align` (`size % align == 0`), which also holds for ZSTs (`size == 0`).
@@ -771,7 +1337,7 @@ impl ModComponentDescriptor {
     /// Validates the descriptor and returns a specific [`FfiResult`] error code on failure.
     #[inline]
     pub fn validate(&self) -> FfiResult {
-        if (self.struct_size as usize) < core::mem::size_of::<Self>() {
+        if (self.struct_size as usize) < Self::MIN_V1_SIZE {
             return FfiResult::INVALID_VERSION;
         }
         if self.name.is_null() {
@@ -821,6 +1387,12 @@ impl ModComponentDescriptor {
     }
 }
 
+// SAFETY: `ModComponentDescriptor` is `#[repr(C)]` with `struct_size: u32` at offset 0 and all
+// fields (`drop_fn: Option<...>`, `vtable_ptr: *const c_void`, etc.) are valid when zero-filled.
+unsafe impl ExtensibleStruct for ModComponentDescriptor {
+    const MIN_V1_SIZE: usize = Self::MIN_V1_SIZE;
+}
+
 /// Dynamic component registration function signature exposed in [`HostApi`] and via `get_proc_address`.
 ///
 /// # Safety
@@ -859,6 +1431,98 @@ pub struct HostApi {
     pub register_component: RegisterComponentFn,
 }
 
+impl HostApi {
+    /// Size of the legacy 7-function `HostApi` prior to `register_component` (`64` on 64-bit, `36` on 32-bit).
+    pub const LEGACY_64_SIZE: usize = core::mem::offset_of!(Self, register_component);
+    /// Minimum valid full v0.1 `HostApi` size (`72` on 64-bit, `40` on 32-bit).
+    pub const MIN_V1_SIZE: usize = core::mem::size_of::<Self>();
+
+    /// Safely reads the `struct_size` header from a potentially smaller/older `HostApi` pointer
+    /// without forming a full `&HostApi` reference (preventing out-of-bounds provenance UB).
+    ///
+    /// # Safety
+    /// If `api_ptr` is non-null, it must be aligned and readable for at least `size_of::<u32>()` bytes.
+    #[inline]
+    pub unsafe fn raw_struct_size(api_ptr: *const Self) -> Option<u32> {
+        if api_ptr.is_null() {
+            return None;
+        }
+        // SAFETY: Caller guarantees at least 4 readable, aligned bytes at offset 0 (`struct_size`).
+        Some(unsafe { core::ptr::read(core::ptr::addr_of!((*api_ptr).struct_size)) })
+    }
+
+    /// Safely reads the `abi_version` header from a potentially smaller/older `HostApi` pointer
+    /// without forming a full `&HostApi` reference.
+    ///
+    /// # Safety
+    /// If `api_ptr` is non-null, it must be aligned and readable for at least 8 bytes.
+    #[inline]
+    pub unsafe fn raw_abi_version(api_ptr: *const Self) -> Option<u32> {
+        let sz = unsafe { Self::raw_struct_size(api_ptr) }?;
+        if (sz as usize) < core::mem::offset_of!(Self, register_system) {
+            return None;
+        }
+        // SAFETY: Verified `struct_size >= 8`, so `abi_version` at offset 4 is initialized and readable.
+        Some(unsafe { core::ptr::read(core::ptr::addr_of!((*api_ptr).abi_version)) })
+    }
+
+    /// Returns `true` if `api_ptr` is non-null and its `struct_size` covers `register_component`.
+    ///
+    /// # Safety
+    /// If `api_ptr` is non-null, it must be aligned and readable for at least `size_of::<u32>()` bytes.
+    #[inline]
+    pub unsafe fn has_register_component_raw(api_ptr: *const Self) -> bool {
+        match unsafe { Self::raw_struct_size(api_ptr) } {
+            Some(sz) => (sz as usize) >= Self::MIN_V1_SIZE,
+            None => false,
+        }
+    }
+
+    /// Validates `struct_size` and semver compatibility against a guest's `guest_packed_version`.
+    #[inline]
+    pub fn validate_for_guest(&self, guest_packed_version: u32) -> FfiResult {
+        if (self.struct_size as usize) < Self::MIN_V1_SIZE {
+            return FfiResult::INVALID_VERSION;
+        }
+        if !abi_version_is_compatible(self.abi_version, guest_packed_version) {
+            return FfiResult::INVALID_VERSION;
+        }
+        FfiResult::OK
+    }
+}
+
+// SAFETY: `HostApi` is `#[repr(C)]` with `struct_size: u32` at offset 0 and `validate_raw_slot`
+// verifies all 8 non-nullable function pointers before `assume_init()`.
+unsafe impl ExtensibleStruct for HostApi {
+    const MIN_V1_SIZE: usize = Self::MIN_V1_SIZE;
+
+    #[inline]
+    unsafe fn validate_raw_slot(slot_ptr: *const Self) -> FfiResult {
+        let fn_offsets = [
+            core::mem::offset_of!(Self, register_system),
+            core::mem::offset_of!(Self, iter_next_chunk),
+            core::mem::offset_of!(Self, iter_column_readonly),
+            core::mem::offset_of!(Self, iter_column_mutable),
+            core::mem::offset_of!(Self, iter_mark_changed),
+            core::mem::offset_of!(Self, iter_entities),
+            core::mem::offset_of!(Self, iter_column_stride),
+            core::mem::offset_of!(Self, register_component),
+        ];
+        let mut i = 0;
+        while i < fn_offsets.len() {
+            // SAFETY: Every offset in `fn_offsets` lies strictly within `0..size_of::<Self>()`.
+            let addr = unsafe {
+                core::ptr::read_unaligned((slot_ptr as *const u8).add(fn_offsets[i]) as *const usize)
+            };
+            if addr == 0 {
+                return FfiResult::NULL_POINTER;
+            }
+            i += 1;
+        }
+        FfiResult::OK
+    }
+}
+
 /// Mod initialization entry point function signature (`bevy_abi_mod_init`).
 ///
 /// # Safety
@@ -881,31 +1545,52 @@ pub type ModShutdownFn = unsafe extern "C" fn(host_context: *mut c_void) -> FfiR
 /// Must be side-effect free and return packed ABI version.
 pub type ModAbiVersionFn = unsafe extern "C" fn() -> u32;
 
-/// Marker trait for types whose layout is safe to expose across the modding boundary
-/// via interior pointers (`<Struct>_ptr_<field>`) or contiguous `Vec<T>` slices.
+/// Marker trait for types without internal heap ownership, drop glue, or invalid bit patterns
+/// that are safe to expose via interior pointers (`<Struct>_ptr_<field>`) or raw byte reads.
 ///
 /// # Safety
-/// Implementing this trait asserts that `Self` either:
-/// - Is a primitive C-compatible value type (`Copy + 'static` with no internal heap pointers), or
-/// - Derives `ModExposable` and is accessed strictly through its generated host VTable accessors.
+/// Implementing this trait asserts that `Self`:
+/// - Contains **no** heap-allocated collections (`String`, `Vec`, `Box`, etc.) or non-`'static` borrows,
+/// - Requires **no** drop glue (`!core::mem::needs_drop::<Self>()`), and
+/// - Has **no** invalid bit-pattern hazards (`bool`, `char`, `enum`, `NonZero*`, references, or `fn` pointers
+///   do **not** implement `FfiLayout`).
+///
+/// Note: `FfiLayout` does **not** require `#[repr(C)]` field ordering. For cross-language C-ABI
+/// column slicing, `Vec<T>` element slices, and mirrored guest structs, require [`AbiPod`].
 pub unsafe trait FfiLayout: Sized + 'static {}
 
-macro_rules! impl_ffi_layout_primitives {
+/// Marker trait for Plain Old Data (POD) types with a guaranteed `#[repr(C)]` (or primitive /
+/// `#[repr(transparent)]`) memory representation, `Copy` semantics, no heap pointers or drop glue,
+/// and all bit patterns valid across FFI.
+///
+/// # Safety
+/// Implementing `AbiPod` asserts all invariants of [`FfiLayout`] **plus**:
+/// - `Self: Copy + 'static`,
+/// - `Self` is a C-compatible primitive, `[T; N]` where `T: AbiPod`, or a `#[repr(C)]` /
+///   `#[repr(transparent)]` struct whose fields all implement `AbiPod` (with no skipped fields),
+/// - `bool` is **not** `AbiPod` because byte values `2..=255` are undefined behavior in Rust.
+pub unsafe trait AbiPod: FfiLayout + Copy + 'static {}
+
+macro_rules! impl_abi_pod_primitives {
     ($($ty:ty),* $(,)?) => {
         $(
-            // SAFETY: Primitive value type with no drop glue, allocator ownership, or invalid bit patterns
-            // when manipulated through typed accessors.
+            // SAFETY: Numeric/opaque-integer primitive with `Copy`, `'static`, zero drop glue,
+            // zero heap ownership, deterministic C ABI representation, and all bit patterns valid.
             unsafe impl FfiLayout for $ty {}
+            // SAFETY: Every bit pattern is valid and representation matches C primitive layout.
+            unsafe impl AbiPod for $ty {}
         )*
     };
 }
 
-impl_ffi_layout_primitives!(
-    u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, f32, f64, bool, FfiEntity
+impl_abi_pod_primitives!(
+    u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, f32, f64, FfiEntity
 );
 
-// SAFETY: Fixed-size arrays of `FfiLayout` elements have contiguous layout of `FfiLayout` items.
+// SAFETY: Fixed-size arrays `[T; N]` have contiguous in-line storage with no extra metadata or drop glue.
 unsafe impl<T: FfiLayout, const N: usize> FfiLayout for [T; N] {}
+// SAFETY: `[T; N]` has identical layout to C's `T[N]` when `T: AbiPod`.
+unsafe impl<T: AbiPod, const N: usize> AbiPod for [T; N] {}
 
 /// Host-side symbol table entry mapping a symbol name to its static VTable or function pointer.
 ///
@@ -939,8 +1624,13 @@ unsafe impl Send for SymbolEntry {}
 /// Trait implemented by `#[derive(ModExposable)]` on host components.
 ///
 /// Exposes the component's string name, deterministic UUID, layout (`size` and `align`),
+/// POD/raw-insertion safety capability flags (`IS_POD`, `IS_RAW_INSERTABLE`),
 /// static `#[repr(C)]` VTable, and C-ABI accessor symbol table for `ModRegistry` registration.
-pub trait ExposableComponent: FfiLayout {
+///
+/// Decoupled from [`FfiLayout`] and [`AbiPod`] so components containing `String`, `Vec<T>`, `bool`,
+/// or `#[mod_field(skip)]` fields can safely expose VTable accessors without falsely claiming raw
+/// byte-copy soundness.
+pub trait ExposableComponent: Sized + 'static {
     /// The string name of the component (e.g., `"Position"` or `"game::Position"`).
     const COMPONENT_NAME: &'static str;
 
@@ -949,6 +1639,15 @@ pub trait ExposableComponent: FfiLayout {
 
     /// Deterministic 128-bit UUID for this component.
     const UUID: ComponentUuid;
+
+    /// `true` if and only if `Self` is `#[repr(C)]` / `#[repr(transparent)]`, has no skipped fields,
+    /// and every field is [`AbiPod`] (safe for cross-language column slicing and raw byte insertion).
+    const IS_POD: bool = false;
+
+    /// `true` if and only if `Self` contains no heap pointers (`String`, `Vec`), no drop glue,
+    /// no invalid bit-pattern types (`bool`), and no skipped fields, making `ptr::read_unaligned`
+    /// from foreign command-queue bytes free of allocator-crossover and invalid-value UB.
+    const IS_RAW_INSERTABLE: bool = false;
 
     /// The generated `#[repr(C)]` VTable struct type (`<Struct>VTable`).
     type VTable: Copy + 'static;
@@ -1186,5 +1885,260 @@ mod tests {
         let vtable_dummy = 0x1234usize as *const core::ffi::c_void;
         let with_vtable = valid_desc.with_vtable(vtable_dummy);
         assert_eq!(with_vtable.vtable_ptr, vtable_dummy);
+    }
+
+    #[test]
+    fn test_ffi_entity_null_sentinel() {
+        assert_eq!(FfiEntity::NULL.to_bits(), 0);
+        assert!(FfiEntity::NULL.is_null());
+        assert_eq!(FfiEntity::default(), FfiEntity::NULL);
+
+        let valid_first_entity = FfiEntity::from_bits(0xFFFF_FFFE);
+        assert!(!valid_first_entity.is_null());
+        let bevy_placeholder_bits = FfiEntity::from_bits(1);
+        assert!(!bevy_placeholder_bits.is_null());
+    }
+
+    #[test]
+    fn test_abi_version_semver_compatibility_matrix() {
+        let host_0_1_0 = pack_abi_version(0, 1, 0);
+        let host_0_3_2 = pack_abi_version(0, 3, 2);
+        let host_1_0_0 = pack_abi_version(1, 0, 0);
+
+        // Exact match and patch differences
+        assert!(abi_version_is_compatible(
+            host_0_1_0,
+            pack_abi_version(0, 1, 0)
+        ));
+        assert!(abi_version_is_compatible(
+            host_0_1_0,
+            pack_abi_version(0, 1, 9)
+        ));
+        assert!(abi_version_is_compatible(
+            pack_abi_version(0, 1, 5),
+            host_0_1_0
+        ));
+
+        // Older minor guest on newer minor host -> compatible
+        assert!(abi_version_is_compatible(
+            host_0_3_2,
+            pack_abi_version(0, 1, 0)
+        ));
+        assert!(abi_version_is_compatible(
+            host_0_3_2,
+            pack_abi_version(0, 2, 7)
+        ));
+        assert!(abi_version_is_compatible(
+            host_0_3_2,
+            pack_abi_version(0, 3, 99)
+        ));
+
+        // Newer minor guest on older minor host -> incompatible
+        assert!(!abi_version_is_compatible(
+            host_0_1_0,
+            pack_abi_version(0, 2, 0)
+        ));
+        assert!(!abi_version_is_compatible(
+            host_0_3_2,
+            pack_abi_version(0, 4, 0)
+        ));
+
+        // Different major version -> always incompatible
+        assert!(!abi_version_is_compatible(host_1_0_0, host_0_1_0));
+        assert!(!abi_version_is_compatible(host_0_3_2, host_1_0_0));
+    }
+
+    #[test]
+    fn test_schedule_label_id_variants_and_default() {
+        assert_eq!(ScheduleLabelId::default(), ScheduleLabelId::UPDATE);
+        assert_eq!(ScheduleLabelId::UPDATE.0, 0);
+        assert_eq!(ScheduleLabelId::STARTUP.0, 1);
+        assert_eq!(ScheduleLabelId::PRE_UPDATE.0, 2);
+        assert_eq!(ScheduleLabelId::POST_UPDATE.0, 3);
+        assert_eq!(ScheduleLabelId::FIXED_UPDATE.0, 4);
+        assert_eq!(ScheduleLabelId::LAST.0, 5);
+
+        for raw in 0..=5 {
+            assert!(ScheduleLabelId(raw).is_valid());
+        }
+        assert!(!ScheduleLabelId(6).is_valid());
+        assert!(!ScheduleLabelId(u32::MAX).is_valid());
+    }
+
+    #[test]
+    fn test_scheduled_system_descriptor_layout_and_zero_extension() {
+        unsafe extern "C" fn dummy_sys(
+            _iter: *mut RawChunkIter,
+            _cmds: *mut RawCommandQueue,
+            _ud: *mut c_void,
+        ) -> FfiResult {
+            FfiResult::OK
+        }
+
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(core::mem::size_of::<SystemDescriptor>(), 48);
+            assert_eq!(core::mem::size_of::<ScheduledSystemDescriptor>(), 88);
+            assert_eq!(core::mem::align_of::<ScheduledSystemDescriptor>(), 8);
+            assert_eq!(core::mem::offset_of!(ScheduledSystemDescriptor, base), 0);
+            assert_eq!(
+                core::mem::offset_of!(ScheduledSystemDescriptor, schedule),
+                48
+            );
+            assert_eq!(core::mem::offset_of!(ScheduledSystemDescriptor, flags), 52);
+            assert_eq!(core::mem::offset_of!(ScheduledSystemDescriptor, after), 56);
+            assert_eq!(
+                core::mem::offset_of!(ScheduledSystemDescriptor, after_count),
+                64
+            );
+            assert_eq!(core::mem::offset_of!(ScheduledSystemDescriptor, before), 72);
+            assert_eq!(
+                core::mem::offset_of!(ScheduledSystemDescriptor, before_count),
+                80
+            );
+        }
+
+        // 1. Older v0.1 SystemDescriptor (48 bytes) zero-extended to ScheduledSystemDescriptor (88 bytes)
+        let v1_desc = SystemDescriptor::new(
+            c"legacy_sys".as_ptr(),
+            core::ptr::null(),
+            0,
+            dummy_sys,
+            0xBEEFusize as *mut c_void,
+        );
+        assert_eq!(v1_desc.validate(), FfiResult::OK);
+
+        // SAFETY: `v1_desc` is a valid initialized `SystemDescriptor` on the stack.
+        let promoted = unsafe {
+            read_descriptor::<ScheduledSystemDescriptor>(&v1_desc as *const _ as *const c_void)
+        }
+        .expect("v0.1 SystemDescriptor must zero-extend cleanly");
+
+        assert_eq!(
+            promoted.base.struct_size,
+            core::mem::size_of::<SystemDescriptor>() as u32
+        );
+        assert_eq!(promoted.schedule, ScheduleLabelId::UPDATE);
+        assert_eq!(promoted.flags, 0);
+        assert!(promoted.after.is_null());
+        assert_eq!(promoted.after_count, 0);
+        assert!(promoted.before.is_null());
+        assert_eq!(promoted.before_count, 0);
+        assert_eq!(promoted.base.user_data as usize, 0xBEEF);
+        assert_eq!(promoted.validate(), FfiResult::OK);
+
+        // 2. Full ScheduledSystemDescriptor with Startup schedule and ordering arrays
+        let after_names = [c"init_world".as_ptr()];
+        let v2_desc = v1_desc
+            .with_schedule(ScheduleLabelId::STARTUP)
+            .with_after(after_names.as_ptr(), after_names.len());
+        assert_eq!(v2_desc.validate(), FfiResult::OK);
+
+        // Passing `as_base_ptr()` through `RegisterSystemFn`-compatible pointer round-trips all v2 fields
+        // SAFETY: `v2_desc` is valid for all `size_of::<ScheduledSystemDescriptor>()` bytes.
+        let roundtrip = unsafe {
+            read_descriptor::<ScheduledSystemDescriptor>(v2_desc.as_base_ptr() as *const c_void)
+        }
+        .expect("v2 descriptor must read cleanly");
+        assert_eq!(roundtrip.schedule, ScheduleLabelId::STARTUP);
+        assert_eq!(roundtrip.after_count, 1);
+        assert_eq!(roundtrip.after, after_names.as_ptr());
+
+        // 3. Forward-compatible future descriptor (larger than ScheduledSystemDescriptor)
+        #[repr(C)]
+        #[derive(Copy, Clone)]
+        struct FutureSystemDescriptor {
+            v2: ScheduledSystemDescriptor,
+            future_extra: [u64; 4],
+        }
+        let mut future_desc = FutureSystemDescriptor {
+            v2: v2_desc,
+            future_extra: [0xDEAD_BEEF; 4],
+        };
+        future_desc.v2.base.struct_size = core::mem::size_of::<FutureSystemDescriptor>() as u32;
+
+        // SAFETY: `future_desc` is readable for `size_of::<FutureSystemDescriptor>()` bytes.
+        let truncated_future = unsafe {
+            read_descriptor::<ScheduledSystemDescriptor>(&future_desc as *const _ as *const c_void)
+        }
+        .expect("future descriptor with larger struct_size must be accepted");
+        assert_eq!(truncated_future.schedule, ScheduleLabelId::STARTUP);
+        assert_eq!(truncated_future.after_count, 1);
+
+        // 4. Truncated descriptor (< MIN_V1_SIZE) rejected
+        let mut too_small = v1_desc;
+        too_small.struct_size = 16;
+        // SAFETY: `too_small` is readable for at least 4 bytes (`struct_size`).
+        let err = unsafe {
+            read_descriptor::<ScheduledSystemDescriptor>(&too_small as *const _ as *const c_void)
+        }
+        .unwrap_err();
+        assert_eq!(err, FfiResult::INVALID_VERSION);
+
+        // 5. Foreign C struct with zeroed/NULL callback pointer rejected BEFORE assume_init() (no niche UB!)
+        let mut raw_c_zeroed = [0u8; core::mem::size_of::<SystemDescriptor>()];
+        let sz_bytes = (core::mem::size_of::<SystemDescriptor>() as u32).to_ne_bytes();
+        raw_c_zeroed[..4].copy_from_slice(&sz_bytes);
+        // SAFETY: `raw_c_zeroed` has `size_of::<SystemDescriptor>()` readable bytes with null callback.
+        let null_cb_err = unsafe {
+            read_descriptor::<ScheduledSystemDescriptor>(raw_c_zeroed.as_ptr() as *const c_void)
+        }
+        .unwrap_err();
+        assert_eq!(null_cb_err, FfiResult::NULL_POINTER);
+
+        // 6. Null descriptor pointer rejected
+        // SAFETY: Testing null pointer check.
+        assert_eq!(
+            unsafe { read_descriptor::<ScheduledSystemDescriptor>(core::ptr::null()) }.unwrap_err(),
+            FfiResult::NULL_POINTER
+        );
+    }
+
+    #[test]
+    fn test_host_api_raw_header_inspection_on_legacy_buffer() {
+        #[repr(C)]
+        struct Legacy64Buffer {
+            struct_size: u32,
+            abi_version: u32,
+            ptrs: [usize; 7],
+        }
+        let legacy = Legacy64Buffer {
+            struct_size: core::mem::size_of::<Legacy64Buffer>() as u32,
+            abi_version: ABI_VERSION_PACKED,
+            ptrs: [1; 7],
+        };
+        let api_ptr = &legacy as *const Legacy64Buffer as *const HostApi;
+        // SAFETY: `legacy` is aligned and readable for 64 bytes (`>= 8` bytes for header fields).
+        unsafe {
+            assert_eq!(
+                HostApi::raw_struct_size(api_ptr),
+                Some(core::mem::size_of::<Legacy64Buffer>() as u32)
+            );
+            assert_eq!(HostApi::raw_abi_version(api_ptr), Some(ABI_VERSION_PACKED));
+            assert!(!HostApi::has_register_component_raw(api_ptr));
+            assert_eq!(HostApi::raw_struct_size(core::ptr::null()), None);
+        }
+    }
+
+    #[test]
+    fn test_abi_pod_primitives_and_arrays() {
+        fn assert_pod<T: AbiPod>() {}
+        assert_pod::<u8>();
+        assert_pod::<u16>();
+        assert_pod::<u32>();
+        assert_pod::<u64>();
+        assert_pod::<u128>();
+        assert_pod::<usize>();
+        assert_pod::<i8>();
+        assert_pod::<i16>();
+        assert_pod::<i32>();
+        assert_pod::<i64>();
+        assert_pod::<i128>();
+        assert_pod::<isize>();
+        assert_pod::<f32>();
+        assert_pod::<f64>();
+        assert_pod::<FfiEntity>();
+        assert_pod::<[f32; 4]>();
+        assert_pod::<[[u32; 4]; 4]>();
     }
 }

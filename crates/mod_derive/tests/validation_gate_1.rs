@@ -1,9 +1,9 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(improper_ctypes_definitions)]
 
-use abi_contract::{ExposableComponent, FfiSlice};
+use abi_contract::{AbiPod, ExposableComponent, FfiEntity, FfiLayout, FfiSlice};
 use core::ffi::c_void;
-use mod_derive::ModExposable;
+use mod_derive::{AbiPod, ModExposable};
 
 #[derive(Debug, Clone, PartialEq, ModExposable)]
 pub struct Vec3 {
@@ -90,20 +90,36 @@ fn validation_gate_1_vtable_layout_and_field_mutations() {
     let comp_ptr = &mut comp as *mut MixedComponent as *mut c_void;
     let comp_const_ptr = comp_ptr as *const c_void;
 
-    // 2. Verify primitive getters & setters via VTable function pointers
+    // 2. Verify primitive and u8-bool getters & setters via VTable function pointers
     // SAFETY: `comp_const_ptr` and `comp_ptr` point to a valid, aligned `MixedComponent`.
     unsafe {
-        assert!(!(vt.get_active)(comp_const_ptr));
+        assert_eq!((vt.get_active)(comp_const_ptr), 0u8);
         assert_eq!((vt.get_health)(comp_const_ptr), 100);
         assert_eq!((vt.get_ticks)(comp_const_ptr), 999);
 
-        (vt.set_active)(comp_ptr, true);
+        (vt.set_active)(comp_ptr, 1u8);
         (vt.set_health)(comp_ptr, 250);
         (vt.set_ticks)(comp_ptr, 123_456_789);
 
-        assert!((vt.get_active)(comp_const_ptr));
+        assert_eq!((vt.get_active)(comp_const_ptr), 1u8);
+        assert!(comp.active);
         assert_eq!((vt.get_health)(comp_const_ptr), 250);
         assert_eq!((vt.get_ticks)(comp_const_ptr), 123_456_789);
+
+        // Non-canonical C boolean bytes (2 and 255) must normalize cleanly to `true` (1u8) without UB
+        (vt.set_active)(comp_ptr, 2u8);
+        assert!(comp.active);
+        assert_eq!((vt.get_active)(comp_const_ptr), 1u8);
+
+        (vt.set_active)(comp_ptr, 255u8);
+        assert!(comp.active);
+        assert_eq!((vt.get_active)(comp_const_ptr), 1u8);
+
+        (vt.set_active)(comp_ptr, 0u8);
+        assert!(!comp.active);
+        assert_eq!((vt.get_active)(comp_const_ptr), 0u8);
+
+        (vt.set_active)(comp_ptr, 1u8);
     }
 
     // 3. Verify nested compound struct interior pointers & mutations
@@ -163,7 +179,8 @@ fn validation_gate_1_vtable_layout_and_field_mutations() {
     // 6. Verify defensive null-pointer handling (zero UB on null inputs)
     // SAFETY: Testing defensive null checks on all generated extern "C" functions.
     unsafe {
-        assert!(!(vt.get_active)(core::ptr::null()));
+        assert_eq!((vt.get_active)(core::ptr::null()), 0u8);
+        (vt.set_active)(core::ptr::null_mut(), 255u8);
         assert_eq!((vt.get_health)(core::ptr::null()), 0);
         (vt.set_health)(core::ptr::null_mut(), 999);
         assert!((vt.ptr_position)(core::ptr::null()).is_null());
@@ -324,4 +341,126 @@ fn validation_gate_1_byte_stride_array_iteration_and_symbol_resolution() {
         (name_tag_vt.set_0)(nt_ptr, replacement.as_ptr(), replacement.len());
     }
     assert_eq!(name_tag.0, "legendary_hero");
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, ModExposable)]
+pub struct PodPosition {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, ModExposable)]
+pub struct PodEntityTransform {
+    pub target: FfiEntity,
+    pub origin: PodPosition,
+    pub weights: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, ModExposable)]
+pub struct BoolFlagReprC {
+    pub enabled: bool,
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, ModExposable)]
+#[mod_component(opaque)]
+pub struct OpaqueNamedHolder {
+    pub name: NameTag,
+    pub score: i32,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, AbiPod)]
+pub struct StandalonePodPair {
+    pub a: u64,
+    pub b: f32,
+    pub _pad: u32,
+}
+
+#[repr(transparent)]
+#[derive(Debug, Copy, Clone, PartialEq, AbiPod)]
+pub struct TransparentEntityId(pub FfiEntity);
+
+fn require_ffi_layout<T: FfiLayout>() {}
+fn require_abi_pod<T: AbiPod>() {}
+
+#[test]
+fn validation_gate_1_pod_vs_opaque_and_bool_soundness() {
+    // 1. Structs containing String, Vec, bool, skip, or marked `opaque` are neither POD nor raw-insertable
+    const {
+        assert!(!<MixedComponent as ExposableComponent>::IS_POD);
+        assert!(!<MixedComponent as ExposableComponent>::IS_RAW_INSERTABLE);
+        assert!(!<NameTag as ExposableComponent>::IS_POD);
+        assert!(!<NameTag as ExposableComponent>::IS_RAW_INSERTABLE);
+        assert!(!<BoolFlagReprC as ExposableComponent>::IS_POD);
+        assert!(!<BoolFlagReprC as ExposableComponent>::IS_RAW_INSERTABLE);
+        assert!(!<OpaqueNamedHolder as ExposableComponent>::IS_POD);
+        assert!(!<OpaqueNamedHolder as ExposableComponent>::IS_RAW_INSERTABLE);
+    }
+
+    // 2. `#[repr(Rust)]` struct with all POD primitives is raw-insertable (`FfiLayout`) on same Rust host,
+    //    but NOT `AbiPod` (`IS_POD == false`) because cross-language C layout is not guaranteed without `#[repr(C)]`.
+    const {
+        assert!(!<Vec3 as ExposableComponent>::IS_POD);
+        assert!(<Vec3 as ExposableComponent>::IS_RAW_INSERTABLE);
+    }
+    require_ffi_layout::<Vec3>();
+
+    // 3. `#[repr(C)]` + `Copy` + all-`AbiPod` structs implement both `FfiLayout` and `AbiPod` (`IS_POD == true`)
+    const {
+        assert!(<PodPosition as ExposableComponent>::IS_POD);
+        assert!(<PodPosition as ExposableComponent>::IS_RAW_INSERTABLE);
+        assert!(<PodEntityTransform as ExposableComponent>::IS_POD);
+        assert!(<PodEntityTransform as ExposableComponent>::IS_RAW_INSERTABLE);
+    }
+    require_ffi_layout::<PodPosition>();
+    require_abi_pod::<PodPosition>();
+    require_abi_pod::<PodEntityTransform>();
+
+    // 4. Standalone `#[derive(AbiPod)]` works on `#[repr(C)]` and `#[repr(transparent)]`
+    require_abi_pod::<StandalonePodPair>();
+    require_abi_pod::<TransparentEntityId>();
+
+    // 5. Verify `FfiEntity` primitive accessor uses `FfiEntity::NULL` (0) on null pointer
+    let mut xform = PodEntityTransform {
+        target: FfiEntity::NULL,
+        origin: PodPosition {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+        },
+        weights: [0.25, 0.25, 0.25, 0.25],
+    };
+    let xform_vt = PodEntityTransform::vtable();
+    let xform_ptr = &mut xform as *mut PodEntityTransform as *mut c_void;
+    // SAFETY: `xform_ptr` points to a valid `PodEntityTransform`, and null check is tested explicitly.
+    unsafe {
+        assert!((xform_vt.get_target)(core::ptr::null()).is_null());
+        assert!((xform_vt.get_target)(xform_ptr as *const c_void).is_null());
+        (xform_vt.set_target)(xform_ptr, FfiEntity::from_bits(99));
+        assert_eq!(
+            (xform_vt.get_target)(xform_ptr as *const c_void),
+            FfiEntity::from_bits(99)
+        );
+    }
+
+    // 6. Verify `#[mod_component(opaque)]` nested VTable mutation on `NameTag` (`String`)
+    let mut holder = OpaqueNamedHolder {
+        name: NameTag(String::from("opaque_init")),
+        score: 7,
+    };
+    let holder_vt = OpaqueNamedHolder::vtable();
+    let name_vt = NameTag::vtable();
+    let holder_ptr = &mut holder as *mut OpaqueNamedHolder as *mut c_void;
+    // SAFETY: `holder_ptr` points to a valid `OpaqueNamedHolder` and `ptr_mut_name` returns interior `&mut NameTag`.
+    unsafe {
+        let inner_name_ptr = (holder_vt.ptr_mut_name)(holder_ptr);
+        let next = "opaque_mutated_via_vtable";
+        (name_vt.set_0)(inner_name_ptr, next.as_ptr(), next.len());
+    }
+    assert_eq!(holder.name.0, "opaque_mutated_via_vtable");
 }

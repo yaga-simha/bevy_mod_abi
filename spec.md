@@ -73,12 +73,16 @@ In Rust game development with Bevy Engine (v0.20+), dynamically loading external
    }
    ```
 4. **Borrowed Slice Lifetimes & Aliasing Safety:** Any `FfiSlice<T>` or `StrView` returned by a component getter borrows directly from the host's component storage. It is valid only until the next mutation of that field, structural ECS change, or the end of the current chunk iteration step. Host string/vec setters detect overlapping source buffers (`get` slice passed directly back into `set`) and copy via a host-side temporary before clearing to prevent aliasing UB.
-5. **No Rust `enum` or `bool` Return/Input Hazards Across FFI:** Any status code or access-mode field written by C/foreign code and read by Rust uses a `#[repr(transparent)]` primitive integer newtype (`FfiResult(pub u32)`, `ComponentAccessMode(pub u32)`, `u8` boolean flags) so arbitrary bit patterns from foreign code can never construct an invalid Rust enum discriminant or invalid `bool` (which would be immediate UB).
-6. **Cross-Runtime Panic Isolation:** Because an asymmetrically compiled Rust `.cdylib` links its own isolated `std` runtime, an unwinding panic from the guest is a foreign exception to the host (`std::panic::catch_unwind` on a foreign exception has unspecified behavior and may abort). Therefore:
+5. **No Rust `enum` or `bool` Return/Input Hazards Across FFI:** Any status code, access-mode, or schedule field written by C/foreign code and read by Rust uses a `#[repr(transparent)]` primitive integer newtype (`FfiResult(pub u32)`, `ComponentAccessMode(pub u32)`, `ScheduleLabelId(pub u32)`), and boolean fields/accessors use `FfiBool` (`u8`: `0` = false, non-zero = true; `<stdbool.h>` is omitted from `include/bevy_abi_mod.h`) so arbitrary bit patterns from foreign code (such as `2` or `255`) can never construct an invalid Rust enum discriminant or invalid `bool` (which would be immediate UB).
+6. **POD vs. Opaque Separation (`AbiPod` vs. `FfiLayout` vs. `ExposableComponent`):**
+   - `AbiPod: FfiLayout + Copy + 'static` marks strictly `#[repr(C)]` / `#[repr(transparent)]` non-packed Plain Old Data types with deterministic cross-language layout, zero drop glue, and universal bit validity (numeric primitives, `FfiEntity`, `[T; N] where T: AbiPod`, and `#[derive(AbiPod)]` / `#[repr(C)]` `ModExposable` structs — never `bool`, `String`, or `Vec<T>`).
+   - `FfiLayout: Sized + 'static` marks types safe for interior-pointer exposure and same-host raw-byte insertion (`IS_RAW_INSERTABLE = true`, zero drop glue, no `String`/`Vec`/`bool`/skipped fields).
+   - `ExposableComponent: Sized + 'static` is decoupled from `FfiLayout` and exposes `const IS_POD: bool` and `const IS_RAW_INSERTABLE: bool` so `host_runtime` rejects raw byte `cmd_insert_component` on heap-owning or `bool`-bearing components (`D3`/`D4`) and `guest_sdk` restricts typed column slices to `T: AbiPod` (`D5`).
+7. **Cross-Runtime Panic Isolation:** Because an asymmetrically compiled Rust `.cdylib` links its own isolated `std` runtime, an unwinding panic from the guest is a foreign exception to the host (`std::panic::catch_unwind` on a foreign exception has unspecified behavior and may abort). Therefore:
    - Guest-side callbacks return `FfiResult` (`FfiResult::OK` or `FfiResult::PANIC_CAUGHT`).
    - `guest_sdk` wraps guest Rust callbacks in `std::panic::catch_unwind` **inside the guest runtime** before crossing the `extern "C"` boundary and translates panics into `FfiResult::PANIC_CAUGHT`.
    - Host-side `DynamicCSystem::run_unsafe` checks for `FfiResult::PANIC_CAUGHT` (and also guards in-process test callbacks with `catch_unwind`), logs the fault, and marks the offending system/mod disabled.
-7. **Component Access Bounds:** Access sets are validated by the host prior to scheduling. A guest mod attempting to write to a component column marked read-only or filter-only receives a null pointer (`ptr::null_mut()`).
+8. **Component Access Bounds:** Access sets are validated by the host prior to scheduling. A guest mod attempting to write to a component column marked read-only or filter-only receives a null pointer (`ptr::null_mut()`).
 
 ---
 
@@ -123,11 +127,13 @@ bevy_abi_mod/
 
 ### 4.1. `crates/abi_contract` (The Immutable C-ABI Boundary)
 - Compiles with `#![no_std]`, `#![deny(unsafe_op_in_unsafe_fn)]`, and `#![deny(improper_ctypes_definitions)]`.
-- Version handshake constants (`ABI_VERSION_MAJOR`, `ABI_VERSION_MINOR`, `ABI_VERSION_PATCH`, `ABI_VERSION_PACKED`) and `struct_size: u32` headers on extensible descriptor structs.
+- Version handshake constants (`ABI_VERSION_MAJOR`, `ABI_VERSION_MINOR`, `ABI_VERSION_PATCH`, `ABI_VERSION_PACKED`), SemVer helper `abi_version_is_compatible(host_packed, guest_packed) -> bool` (`major ==` and `guest_minor <= host_minor`), and Vulkan/GDExtension-style extensible `struct_size: u32` readers (`ExtensibleStruct`, `read_extensible_struct::<T>`, `read_descriptor::<T>`) that validate `struct_size >= T::MIN_V1_SIZE`, check non-nullable function-pointer slots prior to `MaybeUninit::assume_init()`, and zero-fill newer trailing fields when reading older minor-version descriptors.
 - Defines `#[repr(C)]` / `#[repr(transparent)]` types:
-  - `FfiEntity(pub u64)` (opaque 64-bit entity bits matching `bevy_ecs::entity::Entity::to_bits()`).
+  - `FfiBool = u8` (`FFI_BOOL_FALSE = 0`, `FFI_BOOL_TRUE = 1`).
+  - `FfiEntity(pub u64)`: opaque 64-bit entity bits matching `bevy_ecs::entity::Entity::to_bits()`. `FfiEntity::NULL = FfiEntity(0)` (`BAM_ENTITY_NULL = 0ULL` in C) with `is_null(self) -> bool` is the canonical invalid entity sentinel across the C-ABI (`Entity::try_from_bits(0) == None` in Bevy 0.20+, whereas `u64::MAX` is a valid entity and `Entity::PLACEHOLDER.to_bits() == 0x1`).
   - `FfiSlice<T> { pub ptr: *const T, pub len: usize }` and `StrView { pub ptr: *const u8, pub len: usize }`.
   - `FfiResult(pub u32)` transparent status code (`OK = 0`, `INVALID_COMPONENT = 1`, `ACCESS_CONFLICT = 2`, `PANIC_CAUGHT = 3`, `NULL_POINTER = 4`, `INVALID_UTF8 = 5`, `PERMISSION_DENIED = 6`, `INVALID_VERSION = 7`, `INTERNAL_ERROR = 99`).
+  - `ScheduleLabelId(pub u32)` transparent Bevy schedule selector (`UPDATE = 0`, `STARTUP = 1`, `PRE_UPDATE = 2`, `POST_UPDATE = 3`, `FIXED_UPDATE = 4`, `LAST = 5`).
   - `ComponentUuid { pub bytes: [u8; 16] }`.
   - `GetProcAddressFn = unsafe extern "C" fn(name: *const c_char) -> *const c_void`.
   - `RawChunkIter`: opaque C handle passed to mod system callbacks, paired with host C-ABI iteration functions:
@@ -138,6 +144,8 @@ bevy_abi_mod/
     - `iter_mark_changed(iter: *mut RawChunkIter, index: usize, row: usize) -> FfiResult`.
     - `iter_entities(iter: *const RawChunkIter) -> *const FfiEntity`.
     - `iter_column_stride(iter: *const RawChunkIter, index: usize) -> usize`.
+  - Schedule & System Ordering Extensions:
+    - `ScheduledSystemDescriptor` (`SystemDescriptorV2`) and `ScheduledMultiQuerySystemDescriptor` (`MultiQuerySystemDescriptorV2`), layout-prefixed at offset `0` by `SystemDescriptor` / `MultiQuerySystemDescriptor` (`88` bytes on 64-bit, `48` bytes on 32-bit) and adding `schedule: ScheduleLabelId`, `flags: u32`, `after` (`*const *const c_char`, `after_count`), and `before` (`*const *const c_char`, `before_count`), plus `RegisterScheduledSystemFn`.
   - Multi-Query & Negative Filter Extensions (resolved via `get_proc_address`):
     - `ComponentAccessMode::WITHOUT = ComponentAccessMode(3)` (`Without<T>` archetype exclusion filter).
     - `QuerySpec`, `MultiQuerySystemCallback`, `MultiQuerySystemDescriptor`, and `RegisterMultiQuerySystemFn` (`get_proc_address("register_multi_query_system")`), allowing up to 8 disjoint stack-allocated `RawChunkIter` handles in a single `DynamicCSystem` with intra-system borrow-conflict validation.
@@ -145,24 +153,26 @@ bevy_abi_mod/
     - `ComponentDropFn = unsafe extern "C" fn(ptr: *mut c_void)`.
     - `ModComponentDescriptor` (`DynamicComponentDescriptor` alias): `#[repr(C)]` 64-byte descriptor (`struct_size`, `name`, `uuid`, `size`, `align`, `drop_fn: Option<ComponentDropFn>`, `vtable_ptr`) mirrored byte-for-byte with static assertions in `include/bevy_abi_mod.h`.
     - `RegisterComponentFn` exposed directly on `HostApi::register_component` (and via `get_proc_address("register_component")`) so guest mods in Rust, C99, C++, or Zig can introduce structured components unknown at host compile time.
-  - `RawCommandQueue`: opaque C handle for deferred entity spawns, despawns, and component byte insertions (`CommandQueueBridge`, supporting both static `ModExposable` components and runtime-registered components via host-owned `AlignedBuffer` copies).
-  - `FfiLayout` unsafe marker trait for types safe to expose via interior pointers or `Vec<T>` slices.
-  - `ExposableComponent` trait exposing `COMPONENT_NAME`, `UUID`, `VTABLE`, `vtable_ptr()`, `size()`, `align()`, and `resolve_symbol()`.
+  - `RawCommandQueue`: opaque C handle for deferred entity spawns, despawns, and component byte insertions (`CommandQueueBridge`, supporting POD/raw-insertable `ModExposable` components and runtime-registered components via host-owned `AlignedBuffer` copies).
+  - `FfiLayout` unsafe marker trait for bit-valid types without heap ownership or drop glue, and `AbiPod: FfiLayout + Copy + 'static` for `#[repr(C)]` / `#[repr(transparent)]` cross-language POD types (`u8..u128`, `i8..i128`, `usize`, `isize`, `f32`, `f64`, `FfiEntity`, `[T; N] where T: AbiPod`).
+  - `ExposableComponent: Sized + 'static` trait exposing `COMPONENT_NAME`, `UUID`, `IS_POD`, `IS_RAW_INSERTABLE`, `VTABLE`, `vtable_ptr()`, `size()`, `align()`, and `resolve_symbol()`.
 
-### 4.2. `crates/mod_derive` (`#[derive(ModExposable)]`)
-For any Bevy `#[derive(Component, ModExposable)]` struct (which remains standard `#[repr(Rust)]`):
+### 4.2. `crates/mod_derive` (`#[derive(ModExposable)]` & `#[derive(AbiPod)]`)
+For any Bevy `#[derive(Component, ModExposable)]` struct (standard `#[repr(Rust)]` or `#[repr(C)]`):
 - Supports attributes:
-  - `#[mod_component(name = "...", uuid = "...", export_symbols)]`
+  - `#[mod_component(name = "...", prefix = "...", export_symbols, no_pod, opaque)]`
   - `#[mod_field(skip | nested | primitive | string | vec)]`
-- Rejects generic structs, enums, and unions with clear compile-time diagnostics.
+- Also provides standalone `#[derive(AbiPod)]` for guest/host `#[repr(C)]` or `#[repr(transparent)]` non-packed `Copy` POD structs, verifying at compile time that every field implements `AbiPod` and `!needs_drop::<Self>()`.
+- Rejects generic structs, enums, unions, and `#[repr(packed)]` structs with clear compile-time diagnostics.
 - Generates `pub unsafe extern "C"` accessors (and optional `#[no_mangle]` exports):
-  - **Primitives (`f32`, `i32`, `u64`, `bool`, etc.):** `<Struct>_get_<field>(ptr: *const c_void) -> <Type>` and `<Struct>_set_<field>(ptr: *mut c_void, val: <Type>)`.
-  - **Nested Compound Types (`Vec3`, sub-structs implementing `FfiLayout`):** `<Struct>_ptr_<field>(ptr: *const c_void) -> *const c_void` and `<Struct>_ptr_mut_<field>(ptr: *mut c_void) -> *mut c_void`.
-  - **Heap-Allocated Fields (`String`, `Vec<T>` where `T: FfiLayout + Copy`):** Never passes owned Rust `String` or `Vec` across the boundary. Generates host-allocated mutators:
+  - **Booleans (`bool`):** `<Struct>_get_<field>(ptr: *const c_void) -> u8` (`u8::from(val)`) and `<Struct>_set_<field>(ptr: *mut c_void, val: u8)` (`val != 0`), preventing invalid-bool UB across `extern "C"`.
+  - **Primitives (`f32`, `i32`, `u64`, `FfiEntity`, etc. implementing `AbiPod`):** `<Struct>_get_<field>(ptr: *const c_void) -> <Type>` and `<Struct>_set_<field>(ptr: *mut c_void, val: <Type>)`.
+  - **Nested Compound Types (`Vec3`, sub-structs implementing `FfiLayout`, or `ExposableComponent` under `#[mod_component(opaque)]`):** `<Struct>_ptr_<field>(ptr: *const c_void) -> *const c_void` and `<Struct>_ptr_mut_<field>(ptr: *mut c_void) -> *mut c_void`.
+  - **Heap-Allocated Fields (`String`, `Vec<T>` where `T: AbiPod`):** Never passes owned Rust `String` or `Vec` across the boundary. Generates host-allocated mutators:
     - `<Struct>_get_<string_field>(ptr: *const c_void) -> FfiSlice<u8>`
-    - `<Struct>_set_<string_field>(ptr: *mut c_void, utf8_ptr: *const u8, len: usize) -> FfiResult` (validates null pointers, UTF-8 validity, and self-aliasing overlap; host allocates/resizes its own `String` and copies bytes).
+    - `<Struct>_set_<string_field>(ptr: *mut c_void, utf8_ptr: *const u8, len: usize)` (validates null pointers, UTF-8 validity, and self-aliasing overlap; host allocates/resizes its own `String` and copies bytes).
 - Generates `#[repr(C)] pub struct <Struct>VTable` and a `static` VTable instance with a guaranteed unique address containing `size: usize`, `align: usize` (exact `core::mem::size_of::<Self>()` byte stride for array iteration), and all generated getter/setter function pointers.
-- Implements `ExposableComponent` and `FfiLayout`.
+- Implements `ExposableComponent` with computed `IS_RAW_INSERTABLE` and `IS_POD`, conditionally implements `FfiLayout` **only** when `IS_RAW_INSERTABLE == true` (no `String`, `Vec`, `bool`, `skip`, or `opaque`, and `!needs_drop`), and conditionally implements `AbiPod` **only** when `IS_POD == true` (`IS_RAW_INSERTABLE` + `#[repr(C)]`/`#[repr(transparent)]` + all fields `AbiPod` + `Copy`).
 
 ### 4.3. `crates/host_runtime` (Dynamic System Trait, Runtime Components & Parallel Execution)
 - Depends on `bevy_ecs` / `bevy_app` (or `bevy`), `libloading`, and `abi_contract`.
