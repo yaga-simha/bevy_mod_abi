@@ -183,7 +183,7 @@ fn t3_05_hot_reloading_teardown_and_panic_containment() {
     });
     assert!(panic_result.is_err());
     let status = FfiResult::PANIC_CAUGHT;
-    assert_eq!(status, FfiResult::PanicCaught);
+    assert_eq!(status, FfiResult(3));
 
     // Teardown hook
     MOD_CLEANED_UP.store(true, Ordering::SeqCst);

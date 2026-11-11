@@ -652,6 +652,7 @@ unsafe extern "C" fn noop_multi_cb(
 fn d8_rejects_query_count_exceeding_max_query_components() {
     let registry = Arc::new(ModRegistry::new());
     let mut init_ctx = ModInitContext::new(registry);
+    let _guard = init_ctx.make_active();
     let ctx_ptr = (&mut init_ctx as *mut ModInitContext).cast::<c_void>();
 
     let names: Vec<std::ffi::CString> = (0..=MAX_QUERY_COMPONENTS)
@@ -674,10 +675,13 @@ fn d8_rejects_query_count_exceeding_max_query_components() {
     // SAFETY: Valid pointers and initialized slices.
     assert_eq!(
         unsafe { host_register_system(ctx_ptr, &single_desc) },
-        FfiResult::INVALID_COMPONENT
+        FfiResult::OUT_OF_RANGE
     );
+    drop(_guard);
     assert!(init_ctx.registered_systems.is_empty());
 
+    let _guard = init_ctx.make_active();
+    let ctx_ptr = (&mut init_ctx as *mut ModInitContext).cast::<c_void>();
     let spec = QuerySpec {
         queries: queries.as_ptr(),
         query_count: queries.len(),
@@ -693,8 +697,9 @@ fn d8_rejects_query_count_exceeding_max_query_components() {
     // SAFETY: Valid pointers and initialized slices.
     assert_eq!(
         unsafe { host_register_multi_query_system(ctx_ptr, &multi_desc) },
-        FfiResult::INVALID_COMPONENT
+        FfiResult::OUT_OF_RANGE
     );
+    drop(_guard);
     assert!(init_ctx.registered_systems.is_empty());
 }
 
@@ -752,11 +757,11 @@ fn d9_and_d10_null_placeholder_entities_rejected_and_overaligned_zst_succeeds() 
     // Reject FfiEntity(0) and Entity::PLACEHOLDER in both despawn and insert_component!
     assert_eq!(
         unsafe { host_cmd_despawn(raw_queue, FfiEntity(0)) },
-        FfiResult::INTERNAL_ERROR
+        FfiResult::INVALID_ENTITY
     );
     assert_eq!(
         unsafe { host_cmd_despawn(raw_queue, placeholder_ffi) },
-        FfiResult::INTERNAL_ERROR
+        FfiResult::INVALID_ENTITY
     );
     assert_eq!(
         unsafe {
@@ -768,7 +773,7 @@ fn d9_and_d10_null_placeholder_entities_rejected_and_overaligned_zst_succeeds() 
                 pos_bytes.len(),
             )
         },
-        FfiResult::INTERNAL_ERROR
+        FfiResult::INVALID_ENTITY
     );
     assert_eq!(
         unsafe {
@@ -780,7 +785,7 @@ fn d9_and_d10_null_placeholder_entities_rejected_and_overaligned_zst_succeeds() 
                 pos_bytes.len(),
             )
         },
-        FfiResult::INTERNAL_ERROR
+        FfiResult::INVALID_ENTITY
     );
 
     // D10: Insert 64-byte-aligned ZST onto a real spawned entity without panicking in OwningPtr::new!
@@ -980,6 +985,7 @@ fn mod_schedule_startup_error_policy_report_to_bevy_and_fault_events_work() {
     let startup_runs = Arc::new(AtomicUsize::new(0));
     let reg = Arc::new(ModRegistry::new());
     let mut init_ctx = ModInitContext::new(Arc::clone(&reg));
+    let _guard = init_ctx.make_active();
     let desc = SystemDescriptor {
         struct_size: core::mem::size_of::<SystemDescriptor>() as u32,
         name: c"startup_guest_sys".as_ptr(),
@@ -998,6 +1004,7 @@ fn mod_schedule_startup_error_policy_report_to_bevy_and_fault_events_work() {
         },
         FfiResult::OK
     );
+    drop(_guard);
     let startup_sys = init_ctx.registered_systems.pop().unwrap();
     assert_eq!(startup_sys.schedule(), ModSchedule::Startup);
 
@@ -1109,12 +1116,12 @@ fn semver_abi_compatibility_and_typed_mod_load_error_work() {
         (maj << 24) | (min << 16) | patch
     }
 
-    // Host is 0.1.0 (`ABI_VERSION_PACKED`)
+    // Host is 0.1.0 (`ABI_VERSION_PACKED`): pre-1.0 requires exact minor match (`C-06`)
     assert!(is_abi_version_compatible(
         ABI_VERSION_PACKED,
         ABI_VERSION_PACKED
     ));
-    assert!(is_abi_version_compatible(
+    assert!(!is_abi_version_compatible(
         ABI_VERSION_PACKED,
         pack_ver(0, 0, 9)
     ));
@@ -1371,6 +1378,7 @@ fn partial_unload_of_second_mod_never_invokes_unmapped_drop_fn() {
 #[test]
 fn truncated_descriptors_and_null_callbacks_rejected_without_ub() {
     let mut init_ctx = ModInitContext::new(Arc::new(ModRegistry::new()));
+    let _guard = init_ctx.make_active();
     let ctx_ptr = (&mut init_ctx as *mut ModInitContext).cast::<c_void>();
 
     // 1. Genuinely 4-byte stack allocation (`struct_size == 4`) — forming `&SystemDescriptor` or
@@ -1381,7 +1389,7 @@ fn truncated_descriptors_and_null_callbacks_rejected_without_ub() {
     // SAFETY: `read_descriptor` reads only the 4-byte `struct_size` header when `< MIN_V1_SIZE`.
     assert_eq!(
         unsafe { host_register_system(ctx_ptr, tiny_ptr.cast::<SystemDescriptor>()) },
-        FfiResult::INTERNAL_ERROR
+        FfiResult::INVALID_VERSION
     );
     // SAFETY: Same 4-byte header safety invariant.
     assert_eq!(
@@ -1395,7 +1403,7 @@ fn truncated_descriptors_and_null_callbacks_rejected_without_ub() {
         unsafe {
             host_register_multi_query_system(ctx_ptr, tiny_ptr.cast::<MultiQuerySystemDescriptor>())
         },
-        FfiResult::INTERNAL_ERROR
+        FfiResult::INVALID_VERSION
     );
     // SAFETY: Same 4-byte header safety invariant.
     assert_eq!(
@@ -1510,6 +1518,7 @@ fn scheduled_system_and_multi_query_descriptors_with_ordering_work() {
     });
 
     let mut init_ctx = ModInitContext::new(Arc::clone(&reg));
+    let _init_guard = init_ctx.make_active();
     let ctx_ptr = (&mut init_ctx as *mut ModInitContext).cast::<c_void>();
 
     // 1. Register `startup_single` via `ScheduledSystemDescriptor::as_base_ptr()` through `host_register_system`!
@@ -1576,15 +1585,16 @@ fn scheduled_system_and_multi_query_descriptors_with_ordering_work() {
     .with_schedule(ScheduleLabelId::UPDATE);
     // SAFETY: Valid context and ScheduledSystemDescriptor.
     assert_eq!(unsafe { reg_sched_fn(ctx_ptr, &first_desc) }, FfiResult::OK);
+    drop(_init_guard);
 
     // Wire registered systems into `app` using `ModNamedSystemSet` ordering
     for sys in init_ctx.registered_systems {
         let sched = sys.schedule();
-        let own_set = bevy_abi_mod_host::ModNamedSystemSet(sys.system_name().to_string());
+        let own_set = bevy_abi_mod_host::ModNamedSystemSet::new("test_mod", sys.system_name());
         let after = sys.after_systems().to_vec();
         let mut cfg = sys.in_set(own_set);
         for dep in after {
-            cfg = cfg.after(bevy_abi_mod_host::ModNamedSystemSet(dep));
+            cfg = cfg.after(bevy_abi_mod_host::ModNamedSystemSet::new("test_mod", dep));
         }
         match sched {
             ModSchedule::Startup => {

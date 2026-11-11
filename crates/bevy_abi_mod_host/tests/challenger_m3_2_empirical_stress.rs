@@ -34,13 +34,11 @@ mod common;
 
 use bevy_abi_mod_host::ModAppExt;
 use bevy_abi_mod_host::plugin::AbiModPlugin;
-use bevy_abi_mod_host_sys::commands::{
-    CommandQueueBridge, host_cmd_despawn, host_cmd_insert_component, host_cmd_spawn_empty,
-};
-use bevy_abi_mod_host_sys::dynamic_system::{
-    ModInitContext, host_register_component, reset_drop_trampolines_for_testing,
-};
 use bevy_abi_mod_host_sys::registry::ModRegistry;
+use bevy_abi_mod_host_sys::{
+    CommandQueueBridge, ModInitContext, host_cmd_despawn, host_cmd_insert_component,
+    host_cmd_spawn_empty, host_register_component, reset_drop_trampolines_for_testing,
+};
 use bevy_abi_mod_sys::{
     ComponentUuid, FfiEntity, FfiResult, ModComponentDescriptor, RawCommandQueue,
 };
@@ -215,7 +213,7 @@ fn test_pod_components_consume_zero_drop_trampoline_slots() {
     };
     assert_eq!(
         res_overflow,
-        FfiResult::INTERNAL_ERROR,
+        FfiResult::CAPACITY_EXCEEDED,
         "65th Non-POD component must fail due to exhausted 64-slot trampoline pool"
     );
 

@@ -174,7 +174,6 @@ fn make_sized_descriptor_buffer<T: Copy>(
 fn fuzz_host_register_system_family_adversarial_inputs() {
     let registry = Arc::new(ModRegistry::new());
     let mut init_ctx = ModInitContext::new(Arc::clone(&registry));
-    let ctx_ptr = core::ptr::addr_of_mut!(init_ctx).cast::<c_void>();
 
     // Exhaustive `struct_size` sweep 0..128 + u32::MAX (both aligned and 1-byte misaligned!)
     let valid_base = SystemDescriptor::new(
@@ -188,6 +187,8 @@ fn fuzz_host_register_system_family_adversarial_inputs() {
 
     for misalign in [0usize, 1usize] {
         for sz in (0u32..128).chain(core::iter::once(u32::MAX)) {
+            let _guard = init_ctx.make_active();
+            let ctx_ptr = core::ptr::addr_of_mut!(init_ctx).cast::<c_void>();
             let (_buf, raw_ptr) = make_sized_descriptor_buffer(&valid_base, sz, misalign);
             let min_v1 = SystemDescriptor::MIN_V1_SIZE as u32;
 
@@ -202,7 +203,7 @@ fn fuzz_host_register_system_family_adversarial_inputs() {
             if sz < min_v1 {
                 assert_eq!(
                     r_legacy,
-                    FfiResult::INTERNAL_ERROR,
+                    FfiResult::INVALID_VERSION,
                     "legacy register_system must reject truncated struct_size={sz}"
                 );
                 assert_eq!(
@@ -219,46 +220,50 @@ fn fuzz_host_register_system_family_adversarial_inputs() {
 
     // Null pointer & zeroed callback slot (niche UB protection!) checks
     // SAFETY: Testing explicit null guards.
-    unsafe {
-        assert_eq!(
-            host_register_system(core::ptr::null_mut(), core::ptr::null()),
-            FfiResult::NULL_POINTER
-        );
-        assert_eq!(
-            host_register_system(ctx_ptr, core::ptr::null()),
-            FfiResult::NULL_POINTER
-        );
-        assert_eq!(
-            host_register_scheduled_system(core::ptr::null_mut(), core::ptr::null()),
-            FfiResult::NULL_POINTER
-        );
-        assert_eq!(
-            host_register_scheduled_system(ctx_ptr, core::ptr::null()),
-            FfiResult::NULL_POINTER
-        );
-        assert_eq!(
-            host_register_system_in_schedule(ctx_ptr, core::ptr::null(), 0),
-            FfiResult::NULL_POINTER
-        );
-    }
+    {
+        let _guard = init_ctx.make_active();
+        let ctx_ptr = core::ptr::addr_of_mut!(init_ctx).cast::<c_void>();
+        unsafe {
+            assert_eq!(
+                host_register_system(core::ptr::null_mut(), core::ptr::null()),
+                FfiResult::NULL_POINTER
+            );
+            assert_eq!(
+                host_register_system(ctx_ptr, core::ptr::null()),
+                FfiResult::NULL_POINTER
+            );
+            assert_eq!(
+                host_register_scheduled_system(core::ptr::null_mut(), core::ptr::null()),
+                FfiResult::NULL_POINTER
+            );
+            assert_eq!(
+                host_register_scheduled_system(ctx_ptr, core::ptr::null()),
+                FfiResult::NULL_POINTER
+            );
+            assert_eq!(
+                host_register_system_in_schedule(ctx_ptr, core::ptr::null(), 0),
+                FfiResult::NULL_POINTER
+            );
+        }
 
-    // Zeroed callback pointer inside raw byte buffer (C caller passing `callback = NULL`)
-    let mut zero_cb_bytes = vec![0u8; core::mem::size_of::<ScheduledSystemDescriptor>()];
-    let full_sz = core::mem::size_of::<ScheduledSystemDescriptor>() as u32;
-    zero_cb_bytes[..4].copy_from_slice(&full_sz.to_ne_bytes());
-    // SAFETY: Fully zeroed buffer with valid `struct_size` tests `validate_raw_slot` null-fn guard.
-    unsafe {
-        assert_eq!(
-            host_register_system(ctx_ptr, zero_cb_bytes.as_ptr().cast::<SystemDescriptor>()),
-            FfiResult::NULL_POINTER
-        );
-        assert_eq!(
-            host_register_scheduled_system(
-                ctx_ptr,
-                zero_cb_bytes.as_ptr().cast::<ScheduledSystemDescriptor>()
-            ),
-            FfiResult::NULL_POINTER
-        );
+        // Zeroed callback pointer inside raw byte buffer (C caller passing `callback = NULL`)
+        let mut zero_cb_bytes = vec![0u8; core::mem::size_of::<ScheduledSystemDescriptor>()];
+        let full_sz = core::mem::size_of::<ScheduledSystemDescriptor>() as u32;
+        zero_cb_bytes[..4].copy_from_slice(&full_sz.to_ne_bytes());
+        // SAFETY: Fully zeroed buffer with valid `struct_size` tests `validate_raw_slot` null-fn guard.
+        unsafe {
+            assert_eq!(
+                host_register_system(ctx_ptr, zero_cb_bytes.as_ptr().cast::<SystemDescriptor>()),
+                FfiResult::NULL_POINTER
+            );
+            assert_eq!(
+                host_register_scheduled_system(
+                    ctx_ptr,
+                    zero_cb_bytes.as_ptr().cast::<ScheduledSystemDescriptor>()
+                ),
+                FfiResult::NULL_POINTER
+            );
+        }
     }
 
     // Randomized fuzz loop over malformed combinations
@@ -267,6 +272,8 @@ fn fuzz_host_register_system_family_adversarial_inputs() {
 
     for step in 0..FUZZ_ITERS {
         init_ctx.registered_systems.clear();
+        let _guard = init_ctx.make_active();
+        let ctx_ptr = core::ptr::addr_of_mut!(init_ctx).cast::<c_void>();
         let mutation = rng.range(12);
 
         match mutation {
@@ -283,7 +290,8 @@ fn fuzz_host_register_system_family_adversarial_inputs() {
                 desc.base.query_count = bad_count;
                 // SAFETY: `query_count > MAX_QUERY_COMPONENTS` is validated before slice construction.
                 let res = unsafe { host_register_scheduled_system(ctx_ptr, &desc) };
-                assert_eq!(res, FfiResult::INVALID_COMPONENT, "step {step}");
+                assert_eq!(res, FfiResult::OUT_OF_RANGE, "step {step}");
+                drop(_guard);
                 assert!(init_ctx.registered_systems.is_empty());
             }
             1 => {
@@ -296,10 +304,10 @@ fn fuzz_host_register_system_family_adversarial_inputs() {
                 assert_eq!(res, FfiResult::NULL_POINTER, "step {step}");
             }
             2 => {
-                // Invalid `ComponentAccessMode(4..=u32::MAX)` inside query array
+                // Invalid `ComponentAccessMode(10..=u32::MAX)` inside query array
                 let q_len = 1 + rng.range(MAX_QUERY_COMPONENTS);
                 let bad_idx = rng.range(q_len);
-                let bad_mode = 4u32.saturating_add(rng.next_u32()).max(4);
+                let bad_mode = 10u32.saturating_add(rng.next_u32()).max(10);
                 let queries: Vec<ComponentAccessDesc> = (0..q_len)
                     .map(|i| ComponentAccessDesc {
                         name: valid_comp_names[i % valid_comp_names.len()].as_ptr(),
@@ -315,7 +323,7 @@ fn fuzz_host_register_system_family_adversarial_inputs() {
                 desc.base.query_count = queries.len();
                 // SAFETY: `queries` slice and C strings are valid.
                 let res = unsafe { host_register_scheduled_system(ctx_ptr, &desc) };
-                assert_eq!(res, FfiResult::INVALID_COMPONENT, "step {step}");
+                assert_eq!(res, FfiResult::INVALID_ARGUMENT, "step {step}");
             }
             3 => {
                 // Null component `name` inside `ComponentAccessDesc`
@@ -364,6 +372,7 @@ fn fuzz_host_register_system_family_adversarial_inputs() {
                 // SAFETY: `bad_sys_name` is NUL-terminated (or null).
                 let res = unsafe { host_register_scheduled_system(ctx_ptr, &desc) };
                 assert_eq!(res, FfiResult::OK, "step {step}");
+                drop(_guard);
                 assert_eq!(init_ctx.registered_systems.len(), 1);
             }
             6 => {
@@ -390,7 +399,7 @@ fn fuzz_host_register_system_family_adversarial_inputs() {
                 // SAFETY: Valid `SystemDescriptor` with invalid `schedule_raw`.
                 let res_in_sched =
                     unsafe { host_register_system_in_schedule(ctx_ptr, &legacy_desc, bad_sched) };
-                assert_eq!(res_in_sched, FfiResult::INTERNAL_ERROR, "step {step}");
+                assert_eq!(res_in_sched, FfiResult::INVALID_ARGUMENT, "step {step}");
             }
             7 => {
                 // Malformed `after` / `before`: non-zero count with null outer pointer
@@ -470,6 +479,7 @@ fn fuzz_host_register_system_family_adversarial_inputs() {
                 // SAFETY: Valid max-size query array and schedule ID.
                 let res = unsafe { host_register_scheduled_system(ctx_ptr, &desc) };
                 assert_eq!(res, FfiResult::OK, "step {step}");
+                drop(_guard);
                 assert_eq!(init_ctx.registered_systems.len(), 1);
             }
         }
@@ -484,7 +494,6 @@ fn fuzz_host_register_system_family_adversarial_inputs() {
 fn fuzz_host_register_multi_query_system_adversarial_inputs() {
     let registry = Arc::new(ModRegistry::new());
     let mut init_ctx = ModInitContext::new(Arc::clone(&registry));
-    let ctx_ptr = core::ptr::addr_of_mut!(init_ctx).cast::<c_void>();
 
     let valid_q = ComponentAccessDesc::read(c"Position".as_ptr());
     let valid_spec = QuerySpec {
@@ -502,6 +511,8 @@ fn fuzz_host_register_multi_query_system_adversarial_inputs() {
 
     // Exhaustive `struct_size` sweep 0..128 + u32::MAX
     for sz in (0u32..128).chain(core::iter::once(u32::MAX)) {
+        let _guard = init_ctx.make_active();
+        let ctx_ptr = core::ptr::addr_of_mut!(init_ctx).cast::<c_void>();
         let (_buf, raw_ptr) = make_sized_descriptor_buffer(&valid_base, sz, 0);
         let min_v1 = MultiQuerySystemDescriptor::MIN_V1_SIZE as u32;
         // SAFETY: `_buf` is readable for `read_descriptor`.
@@ -509,7 +520,7 @@ fn fuzz_host_register_multi_query_system_adversarial_inputs() {
             host_register_multi_query_system(ctx_ptr, raw_ptr.cast::<MultiQuerySystemDescriptor>())
         };
         if sz < min_v1 {
-            assert_eq!(res, FfiResult::INTERNAL_ERROR, "sz={sz}");
+            assert_eq!(res, FfiResult::INVALID_VERSION, "sz={sz}");
         } else {
             assert_eq!(res, FfiResult::OK, "sz={sz}");
         }
@@ -517,31 +528,38 @@ fn fuzz_host_register_multi_query_system_adversarial_inputs() {
 
     // Null & zero-callback checks
     // SAFETY: Testing explicit null guards and zeroed callback slot.
-    unsafe {
-        assert_eq!(
-            host_register_multi_query_system(core::ptr::null_mut(), core::ptr::null()),
-            FfiResult::NULL_POINTER
-        );
-        assert_eq!(
-            host_register_multi_query_system(ctx_ptr, core::ptr::null()),
-            FfiResult::NULL_POINTER
-        );
+    {
+        let _guard = init_ctx.make_active();
+        let ctx_ptr = core::ptr::addr_of_mut!(init_ctx).cast::<c_void>();
+        unsafe {
+            assert_eq!(
+                host_register_multi_query_system(core::ptr::null_mut(), core::ptr::null()),
+                FfiResult::NULL_POINTER
+            );
+            assert_eq!(
+                host_register_multi_query_system(ctx_ptr, core::ptr::null()),
+                FfiResult::NULL_POINTER
+            );
 
-        let mut zero_cb = vec![0u8; core::mem::size_of::<ScheduledMultiQuerySystemDescriptor>()];
-        let full_sz = core::mem::size_of::<ScheduledMultiQuerySystemDescriptor>() as u32;
-        zero_cb[..4].copy_from_slice(&full_sz.to_ne_bytes());
-        assert_eq!(
-            host_register_multi_query_system(
-                ctx_ptr,
-                zero_cb.as_ptr().cast::<MultiQuerySystemDescriptor>()
-            ),
-            FfiResult::NULL_POINTER
-        );
+            let mut zero_cb =
+                vec![0u8; core::mem::size_of::<ScheduledMultiQuerySystemDescriptor>()];
+            let full_sz = core::mem::size_of::<ScheduledMultiQuerySystemDescriptor>() as u32;
+            zero_cb[..4].copy_from_slice(&full_sz.to_ne_bytes());
+            assert_eq!(
+                host_register_multi_query_system(
+                    ctx_ptr,
+                    zero_cb.as_ptr().cast::<MultiQuerySystemDescriptor>()
+                ),
+                FfiResult::NULL_POINTER
+            );
+        }
     }
 
     let mut rng = Rng::new(0xBADC_0FFE_E002_2222);
     for step in 0..FUZZ_ITERS {
         init_ctx.registered_systems.clear();
+        let _guard = init_ctx.make_active();
+        let ctx_ptr = core::ptr::addr_of_mut!(init_ctx).cast::<c_void>();
         match rng.range(9) {
             0 => {
                 // `query_spec_count == 0` or `> MAX_SYSTEM_QUERIES` (`9..=usize::MAX`)
@@ -556,7 +574,7 @@ fn fuzz_host_register_multi_query_system_adversarial_inputs() {
                 desc.base.query_spec_count = bad_spec_count;
                 // SAFETY: `query_spec_count` bounds check runs before dereferencing `query_specs`.
                 let res = unsafe { host_register_multi_query_system(ctx_ptr, desc.as_base_ptr()) };
-                assert_eq!(res, FfiResult::INTERNAL_ERROR, "step {step}");
+                assert_eq!(res, FfiResult::OUT_OF_RANGE, "step {step}");
             }
             1 => {
                 // Valid `query_spec_count` (`1..=8`) with null `query_specs`
@@ -592,7 +610,7 @@ fn fuzz_host_register_multi_query_system_adversarial_inputs() {
                 desc.base.query_spec_count = specs.len();
                 // SAFETY: `spec.query_count > MAX_QUERY_COMPONENTS` checked before `from_raw_parts`.
                 let res = unsafe { host_register_multi_query_system(ctx_ptr, desc.as_base_ptr()) };
-                assert_eq!(res, FfiResult::INVALID_COMPONENT, "step {step}");
+                assert_eq!(res, FfiResult::OUT_OF_RANGE, "step {step}");
             }
             3 => {
                 // Inner spec has `query_count > 0` with null `queries`
@@ -609,8 +627,8 @@ fn fuzz_host_register_multi_query_system_adversarial_inputs() {
                 assert_eq!(res, FfiResult::NULL_POINTER, "step {step}");
             }
             4 => {
-                // Invalid `ComponentAccessMode(4..=u32::MAX)` in one of the specs
-                let bad_mode = (4 + (rng.next_u32() % (u32::MAX - 4))).max(4);
+                // Invalid `ComponentAccessMode(10..=u32::MAX)` in one of the specs
+                let bad_mode = (10 + (rng.next_u32() % (u32::MAX - 10))).max(10);
                 let bad_q = ComponentAccessDesc {
                     name: c"Velocity".as_ptr(),
                     mode: ComponentAccessMode(bad_mode),
@@ -625,7 +643,7 @@ fn fuzz_host_register_multi_query_system_adversarial_inputs() {
                 desc.base.query_spec_count = specs.len();
                 // SAFETY: Valid slices and C strings.
                 let res = unsafe { host_register_multi_query_system(ctx_ptr, desc.as_base_ptr()) };
-                assert_eq!(res, FfiResult::INVALID_COMPONENT, "step {step}");
+                assert_eq!(res, FfiResult::INVALID_ARGUMENT, "step {step}");
             }
             5 => {
                 // Non-UTF8 component name in one of the specs
@@ -674,6 +692,7 @@ fn fuzz_host_register_multi_query_system_adversarial_inputs() {
                 // SAFETY: Valid 8-spec multi-query descriptor.
                 let res = unsafe { host_register_multi_query_system(ctx_ptr, desc.as_base_ptr()) };
                 assert_eq!(res, FfiResult::OK, "step {step}");
+                drop(_guard);
                 assert_eq!(init_ctx.registered_systems.len(), 1);
             }
         }
@@ -762,20 +781,21 @@ fn fuzz_host_register_component_layouts_and_contexts() {
             FfiResult::NULL_POINTER
         );
 
-        // Active context has null `world` -> INTERNAL_ERROR
+        // Active context has null `world` -> INVALID_STATE
         let _guard = dummy_ctx.make_active();
+        let dummy_ptr = (&mut dummy_ctx as *mut ModInitContext).cast::<c_void>();
         assert_eq!(
             host_register_component(dummy_ptr, &template_desc),
-            FfiResult::INTERNAL_ERROR
+            FfiResult::INVALID_STATE
         );
-        // Passing a forged/different non-null `ctx` while `dummy_ctx` is active -> INTERNAL_ERROR
+        // Passing a forged/different non-null `ctx` while `dummy_ctx` is active -> INVALID_STATE
         let mut other_ctx = ModInitContext::new(Arc::clone(&registry));
         assert_eq!(
             host_register_component(
                 (&mut other_ctx as *mut ModInitContext).cast::<c_void>(),
                 &template_desc
             ),
-            FfiResult::INTERNAL_ERROR
+            FfiResult::INVALID_STATE
         );
     }
 
@@ -824,19 +844,19 @@ fn fuzz_host_register_component_layouts_and_contexts() {
                 );
             }
             2 => {
-                // Non-power-of-two or zero alignment -> INTERNAL_ERROR
+                // Non-power-of-two or zero alignment -> INVALID_ARGUMENT
                 let align = non_pow2_aligns[rng.range(non_pow2_aligns.len())];
                 let size = rng.range(128);
                 let desc = ModComponentDescriptor::new(name_cstr.as_ptr(), uuid, size, align);
                 // SAFETY: Valid descriptor with invalid alignment.
                 assert_eq!(
                     unsafe { host_register_component(ctx_ptr, &desc) },
-                    FfiResult::INTERNAL_ERROR,
+                    FfiResult::INVALID_ARGUMENT,
                     "step {step}: align={align} size={size}"
                 );
             }
             3 => {
-                // Valid power-of-two `align >= 2`, but `size % align != 0` -> INTERNAL_ERROR
+                // Valid power-of-two `align >= 2`, but `size % align != 0` -> INVALID_ARGUMENT
                 let shift = 1 + rng.range(10); // align in 2..=1024
                 let align = 1usize << shift;
                 let rem = 1 + rng.range(align - 1);
@@ -845,12 +865,12 @@ fn fuzz_host_register_component_layouts_and_contexts() {
                 // SAFETY: Valid descriptor with unpadded size (`size % align != 0`).
                 assert_eq!(
                     unsafe { host_register_component(ctx_ptr, &desc) },
-                    FfiResult::INTERNAL_ERROR,
+                    FfiResult::INVALID_ARGUMENT,
                     "step {step}: size={size} align={align}"
                 );
             }
             4 => {
-                // `usize::MAX` or `> isize::MAX` overflow sizes -> INTERNAL_ERROR
+                // `usize::MAX` or `> isize::MAX` overflow sizes -> INVALID_ARGUMENT
                 let shift = rng.range(8);
                 let align = 1usize << shift;
                 let overflow_size = match rng.range(3) {
@@ -863,7 +883,7 @@ fn fuzz_host_register_component_layouts_and_contexts() {
                 // SAFETY: Overflow layout rejected cleanly before allocation.
                 assert_eq!(
                     unsafe { host_register_component(ctx_ptr, &desc) },
-                    FfiResult::INTERNAL_ERROR,
+                    FfiResult::INVALID_ARGUMENT,
                     "step {step}: overflow_size={overflow_size} align={align}"
                 );
             }
@@ -1126,7 +1146,7 @@ fn fuzz_host_iter_state_machine_and_bounds() {
                     } else if cols_ref[col_idx].mode != ComponentAccessMode::WRITE {
                         assert_eq!(res, FfiResult::PERMISSION_DENIED, "step {step}");
                     } else if row >= active_len {
-                        assert_eq!(res, FfiResult::INTERNAL_ERROR, "step {step}");
+                        assert_eq!(res, FfiResult::OUT_OF_RANGE, "step {step}");
                     } else {
                         assert_eq!(res, FfiResult::OK, "step {step}");
                     }
@@ -1262,7 +1282,7 @@ fn fuzz_host_cmd_and_proc_address_adversarial_inputs() {
                         || Entity::try_from_bits(bad_entity.to_bits()).is_none()
                         || Entity::try_from_bits(bad_entity.to_bits()) == Some(Entity::PLACEHOLDER)
                     {
-                        assert_eq!(res, FfiResult::INTERNAL_ERROR, "step {step}");
+                        assert_eq!(res, FfiResult::INVALID_ENTITY, "step {step}");
                     } else {
                         // Valid `Entity` bit encoding (even if unspawned/stale) queues silent Bevy despawn safely!
                         assert_eq!(res, FfiResult::OK, "step {step}");
@@ -1399,10 +1419,10 @@ fn fuzz_host_cmd_and_proc_address_adversarial_inputs() {
                             wrong_len,
                         )
                     };
-                    assert_eq!(res, FfiResult::INTERNAL_ERROR, "step {step}");
+                    assert_eq!(res, FfiResult::INVALID_ARGUMENT, "step {step}");
                 }
                 8 => {
-                    // Invalid entity (`NULL` or `PLACEHOLDER`) with otherwise valid component & size -> INTERNAL_ERROR
+                    // Invalid entity (`NULL` or `PLACEHOLDER`) with otherwise valid component & size -> INVALID_ENTITY
                     let bad_ent = if rng.gen_bool() {
                         FfiEntity::NULL
                     } else {
@@ -1418,7 +1438,7 @@ fn fuzz_host_cmd_and_proc_address_adversarial_inputs() {
                             core::mem::size_of::<Velocity>(),
                         )
                     };
-                    assert_eq!(res, FfiResult::INTERNAL_ERROR, "step {step}");
+                    assert_eq!(res, FfiResult::INVALID_ENTITY, "step {step}");
                 }
                 9 => {
                     // Valid POD / ZST / Dynamic insertion (even onto potentially despawned/forged valid-bits entity!)

@@ -21,18 +21,13 @@
 
 use bevy_abi_mod_host::ModAppExt;
 use bevy_abi_mod_host::plugin::AbiModPlugin;
-use bevy_abi_mod_host_sys::chunk_iter::{
-    host_iter_column_mutable, host_iter_column_readonly, host_iter_column_stride,
-    host_iter_mark_changed, host_iter_next_chunk,
-};
-use bevy_abi_mod_host_sys::commands::{
-    CommandQueueBridge, host_cmd_despawn, host_cmd_insert_component, host_cmd_spawn_empty,
-};
-use bevy_abi_mod_host_sys::dynamic_system::{
-    ComponentAccessDescOwned, DynamicCSystem, ModInitContext, host_register_component,
-    reset_drop_trampolines_for_testing,
-};
 use bevy_abi_mod_host_sys::registry::ModRegistry;
+use bevy_abi_mod_host_sys::{
+    CommandQueueBridge, ComponentAccessDescOwned, DynamicCSystem, ModInitContext, host_cmd_despawn,
+    host_cmd_insert_component, host_cmd_spawn_empty, host_iter_column_mutable,
+    host_iter_column_readonly, host_iter_column_stride, host_iter_mark_changed,
+    host_iter_next_chunk, host_register_component, reset_drop_trampolines_for_testing,
+};
 use bevy_abi_mod_macros::ModExposable;
 use bevy_abi_mod_sys::{
     ComponentAccessMode, ComponentUuid, FfiEntity, FfiResult, ModComponentDescriptor, RawChunkIter,
@@ -651,10 +646,10 @@ unsafe extern "C" fn bounds_stress_callback(
         assert_eq!(unsafe { host_iter_column_stride(iter, 1) }, 0);
         assert_eq!(unsafe { host_iter_column_stride(iter, 99999) }, 0);
 
-        // Out-of-bounds row index in host_iter_mark_changed must return INTERNAL_ERROR
+        // Out-of-bounds row index in host_iter_mark_changed must return OUT_OF_RANGE
         assert_eq!(
             unsafe { host_iter_mark_changed(iter, 0, count + 100) },
-            FfiResult::INTERNAL_ERROR
+            FfiResult::OUT_OF_RANGE
         );
         // Out-of-bounds column index in host_iter_mark_changed must return INVALID_COMPONENT
         assert_eq!(
@@ -790,8 +785,8 @@ fn test_challenge_drop_trampoline_saturation_and_reclamation() {
     };
     assert_eq!(
         res_overflow,
-        FfiResult::INTERNAL_ERROR,
-        "65th non-POD component registration must return INTERNAL_ERROR when trampoline pool is full"
+        FfiResult::CAPACITY_EXCEEDED,
+        "65th non-POD component registration must return CAPACITY_EXCEEDED when trampoline pool is full"
     );
 
     // But a POD component (drop_fn == None) MUST still succeed!
@@ -836,7 +831,7 @@ fn test_challenge_drop_trampoline_saturation_and_reclamation() {
     };
     assert_eq!(
         res_reclaim,
-        FfiResult::INTERNAL_ERROR,
+        FfiResult::CAPACITY_EXCEEDED,
         "Trampoline pool must reject alien component UUID when saturated even if slots are inactive"
     );
 
@@ -1024,8 +1019,8 @@ fn test_challenge_deferred_command_error_conditions() {
     };
     assert_eq!(
         err_mismatch,
-        FfiResult::INTERNAL_ERROR,
-        "Size mismatch on host_cmd_insert_component must return INTERNAL_ERROR"
+        FfiResult::INVALID_ARGUMENT,
+        "Size mismatch on host_cmd_insert_component must return INVALID_ARGUMENT"
     );
 
     // 2. Unknown component name on insertion

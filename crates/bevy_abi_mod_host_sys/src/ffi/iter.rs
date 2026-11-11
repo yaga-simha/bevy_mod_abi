@@ -1,45 +1,20 @@
-//! # Archetype & Table Chunk Traversal & Column Access
-//!
-//! This module implements [`HostChunkIter`] and the foreign C-ABI iteration API exposed
-//! via [`RawChunkIter`].
-//!
-//! ## Key Principles
-//! 1. **Zero-Allocation Dense & Archetypal Traversal**:
-//!    - When all queried and filtered components use [`StorageType::Table`](bevy_ecs::component::StorageType::Table),
-//!      [`HostChunkIter::new`] traverses matched [`Table`]s sequentially in dense columnar chunks,
-//!      skipping empty tables (`entity_count == 0`).
-//!    - When any queried or filtered component uses [`StorageType::SparseSet`](bevy_ecs::component::StorageType::SparseSet),
-//!      [`HostChunkIter::new_archetypal`] traverses only matching [`Archetype`](bevy_ecs::archetype::Archetype)s:
-//!      coalescing contiguous [`TableRow`] runs when all accessed data columns are `Table`-stored,
-//!      or yielding zero-copy 1-row chunks directly from `Table` + `ComponentSparseSet` storage when
-//!      any accessed data column is `SparseSet`-stored.
-//! 2. **Access Mode Permission Enforcement**:
-//!    - [`host_iter_column_readonly`]: Returns `*const u8`. Forbids access if column was
-//!      declared `FILTER_ONLY` or `WITHOUT`.
-//!    - [`host_iter_column_mutable`]: Returns `*mut u8`. Strictly verifies `mode == ComponentAccessMode::WRITE`.
-//!      If a mod requested read access and attempts mutable access, it returns null.
-//! 3. **Automatic & Fine-Grained Change Detection**:
-//!    - Calling [`host_iter_column_mutable`] automatically marks all row ticks in `changed_ticks`
-//!      and `summary_tick` as changed to `this_run`.
-//!    - [`host_iter_mark_changed`] allows selective, row-by-row change marking for fine-grained updates.
-//! 4. **Zero-Copy Entity Slices**:
-//!    - Bevy's [`bevy_ecs::entity::Entity`] has `#[repr(C, align(8))]`, matching [`FfiEntity`].
-//!    - [`host_iter_entities`] returns a direct zero-copy pointer into `&'w Table::entities()`,
-//!      ensuring Stacked/Tree Borrows provenance stability across subsequent `&mut HostChunkIter` calls.
-//! 5. **Iterator Reset**:
-//!    - [`host_iter_reset`] rewinds traversal to the beginning, enabling efficient nested
-//!      query loops with zero reallocations.
+//! Archetype and table chunk traversal and C-ABI column access functions.
 
 use crate::registry::ModRegistry;
 use bevy_abi_mod_sys::{ComponentAccessMode, FfiEntity, FfiResult, RawChunkIter};
 use bevy_ecs::archetype::{ArchetypeId, Archetypes};
 use bevy_ecs::change_detection::{AtomicTick, Tick};
 use bevy_ecs::component::ComponentId;
+use bevy_ecs::entity::Entity;
 use bevy_ecs::storage::{SparseSets, Table, TableId, TableRow, Tables};
 use bevy_ecs::world::unsafe_world_cell::UnsafeWorldCell;
 use core::cell::UnsafeCell;
 use core::ffi::{CStr, c_char};
 use nonmax::NonMaxU32;
+
+// Compile-time layout assertions guarding zero-copy `Entity` -> `FfiEntity` slice casts.
+const _: () = assert!(core::mem::size_of::<Entity>() == core::mem::size_of::<FfiEntity>());
+const _: () = assert!(core::mem::align_of::<Entity>() == core::mem::align_of::<FfiEntity>());
 
 /// Maximum number of component columns supported per single query.
 pub const MAX_QUERY_COMPONENTS: usize = 32;
@@ -49,24 +24,17 @@ pub const MAX_QUERY_COMPONENTS: usize = 32;
 pub struct QueryColumnDesc {
     /// Bevy component ID assigned in the host world.
     pub component_id: ComponentId,
-    /// Requested access mode (`READ`, `WRITE`, `FILTER_ONLY`, `WITHOUT`).
+    /// Requested access mode (`READ`, `WRITE`, `FILTER_ONLY`, `WITHOUT`, etc.).
     pub mode: ComponentAccessMode,
     /// Byte stride of the component type.
     pub stride: usize,
 }
 
 /// Active column state cached for the current chunk.
-pub struct ActiveColumn<'w> {
-    /// Pointer to the start of the column array in the current chunk.
-    pub data_ptr: *mut u8,
-    /// Slice of change detection ticks for rows in the current chunk.
-    pub changed_ticks: &'w [UnsafeCell<Tick>],
-    /// Summary change tick for the entire column in the current storage.
-    pub summary_tick: Option<&'w AtomicTick>,
-    /// Byte stride between consecutive elements in the column.
-    pub stride: usize,
-    /// Declared access mode for this column.
-    pub mode: ComponentAccessMode,
+struct ActiveColumn<'w> {
+    data_ptr: *mut u8,
+    changed_ticks: &'w [UnsafeCell<Tick>],
+    summary_tick: Option<&'w AtomicTick>,
 }
 
 enum IterBacking<'w> {
@@ -104,8 +72,8 @@ pub struct HostChunkIter<'w> {
 }
 
 impl<'w> HostChunkIter<'w> {
-    /// Creates a new dense table chunk iterator for queries whose accessed and filtered
-    /// components all use [`StorageType::Table`](bevy_ecs::component::StorageType::Table).
+    /// Creates a dense table chunk iterator for queries whose accessed and filtered components all
+    /// use [`StorageType::Table`](bevy_ecs::component::StorageType::Table).
     pub fn new(
         tables: &'w Tables,
         matched_tables: &'w [TableId],
@@ -136,11 +104,7 @@ impl<'w> HostChunkIter<'w> {
     }
 
     /// Creates an archetype-aware chunk iterator for queries involving at least one
-    /// [`StorageType::SparseSet`](bevy_ecs::component::StorageType::SparseSet) component
-    /// in either data access (`READ`/`WRITE`/`OPTIONAL_*`) or filters (`FILTER_ONLY`/`WITHOUT`/`CHANGED`/`ADDED`).
-    ///
-    /// - `sparse_column_mask`: bit `i` is set (`1 << i`) iff `query_columns[i]` is stored in
-    ///   `SparseSets` rather than `Tables`.
+    /// [`StorageType::SparseSet`](bevy_ecs::component::StorageType::SparseSet) component.
     pub fn new_archetypal(
         tables: &'w Tables,
         archetypes: &'w Archetypes,
@@ -244,7 +208,7 @@ impl<'w> HostChunkIter<'w> {
         table: &'w Table,
         table_len: usize,
         sparse_sets: &'w SparseSets,
-        entity: bevy_ecs::entity::Entity,
+        entity: Entity,
         table_row_idx: usize,
         query_columns: &'w [QueryColumnDesc],
         last_run: Tick,
@@ -302,8 +266,7 @@ impl<'w> HostChunkIter<'w> {
         true
     }
 
-    /// Advance to the next non-empty matching chunk.
-    /// Returns 0 when all matching entities have been traversed.
+    /// Advances to the next non-empty matching chunk, returning 0 when exhausted.
     pub fn next_chunk(&mut self) -> usize {
         let has_tick_filters = self.has_tick_filters;
         let last_run = self.last_run;
@@ -340,7 +303,6 @@ impl<'w> HostChunkIter<'w> {
                         return count;
                     }
 
-                    // Scan from `*row_cursor` for the next contiguous run of rows matching `CHANGED`/`ADDED`
                     let mut start_row_idx = *row_cursor;
                     while start_row_idx < count
                         && !Self::row_matches_dense_tick_filters(
@@ -454,7 +416,6 @@ impl<'w> HostChunkIter<'w> {
                     let start_row_idx = start_row.index();
 
                     let run_len = if sparse_column_mask == 0 {
-                        // All READ/WRITE/OPTIONAL data columns live in `Table`; coalesce contiguous TableRow runs!
                         let mut len = 1usize;
                         while *entity_cursor + len < arch_entities.len() {
                             let next_ent = &arch_entities[*entity_cursor + len];
@@ -480,7 +441,6 @@ impl<'w> HostChunkIter<'w> {
                         *entity_cursor += len;
                         len
                     } else {
-                        // At least one accessed column lives in `ComponentSparseSet`; yield 1-row chunk.
                         *entity_cursor += 1;
                         1usize
                     };
@@ -489,9 +449,8 @@ impl<'w> HostChunkIter<'w> {
                         continue;
                     }
 
-                    // SAFETY: Every entity in `archetype` has an allocated `TableRow` in `archetype.table_id()`,
-                    // and `start_row_idx + run_len <= table.entities().len()` was verified above.
-                    // `Entity` is `#[repr(C, align(8))]`, layout-identical to `FfiEntity(u64)`.
+                    // SAFETY: `start_row_idx + run_len <= table.entities().len()`, and `Entity`
+                    // matches the size, alignment, and `to_bits()` bit-layout of `FfiEntity`.
                     self.current_entities_ptr = unsafe {
                         table
                             .entities()
@@ -515,13 +474,11 @@ impl<'w> HostChunkIter<'w> {
             }
         }
 
-        // Exhausted
         self.clear_active_chunk();
         0
     }
 
-    /// Reset this iterator back to the first matched chunk so nested queries
-    /// can re-traverse chunks with zero allocations.
+    /// Resets this iterator back to the first matched chunk.
     #[inline]
     pub fn reset(&mut self) {
         match &mut self.backing {
@@ -562,9 +519,6 @@ impl<'w> HostChunkIter<'w> {
         {
             return true;
         }
-        // When `CHANGED(T)` / `ADDED(T)` coexists with `WRITE(T)` / `OPTIONAL_WRITE(T)` in the
-        // same query group, treat the filter column as pure tick-filter metadata so callers cannot
-        // simultaneously borrow `&T` (filter col) and `&mut T` (write col).
         if q.mode.is_tick_filter() {
             return self.query_columns.iter().any(|other| {
                 other.component_id == q.component_id
@@ -604,7 +558,7 @@ impl<'w> HostChunkIter<'w> {
 
             if let Some(col) = table.get_column(q.component_id) {
                 // SAFETY: `start_row_idx + run_len <= table_len == table.entity_count() as usize`.
-                let data_ptr = unsafe { col.get_data_unchecked(start_row).as_ptr() as *mut u8 };
+                let data_ptr = unsafe { col.get_data_unchecked(start_row).as_ptr().cast_mut() };
                 // SAFETY: `table_len` is the valid entity count of `table`.
                 let all_ticks = unsafe { col.get_changed_ticks_slice(table_len) };
                 let changed_ticks = &all_ticks[start_row_idx..start_row_idx + run_len];
@@ -614,8 +568,6 @@ impl<'w> HostChunkIter<'w> {
                     data_ptr,
                     changed_ticks,
                     summary_tick,
-                    stride: q.stride,
-                    mode: q.mode,
                 });
             } else {
                 self.active_columns[i] = None;
@@ -629,7 +581,7 @@ impl<'w> HostChunkIter<'w> {
         table: &'w Table,
         table_len: usize,
         sparse_sets: &'w SparseSets,
-        first_entity: bevy_ecs::entity::Entity,
+        first_entity: Entity,
         start_row: TableRow,
         start_row_idx: usize,
         run_len: usize,
@@ -660,13 +612,10 @@ impl<'w> HostChunkIter<'w> {
                         data_ptr: ptr.as_ptr().cast_mut(),
                         changed_ticks: core::slice::from_ref(tick_cells.changed),
                         summary_tick: tick_cells.summary_tick,
-                        stride: q.stride,
-                        mode: q.mode,
                     });
                 }
             } else if let Some(col) = table.get_column(q.component_id) {
-                // SAFETY: `start_row_idx + run_len <= table_len` was verified by caller, so
-                // `start_row` is in bounds and `[start_row_idx..start_row_idx + run_len]` is valid.
+                // SAFETY: `start_row_idx + run_len <= table_len` was verified by caller.
                 let data_ptr = unsafe { col.get_data_unchecked(start_row).as_ptr().cast_mut() };
                 // SAFETY: `table_len` is `table.entity_count() as usize`.
                 let all_ticks = unsafe { col.get_changed_ticks_slice(table_len) };
@@ -677,34 +626,29 @@ impl<'w> HostChunkIter<'w> {
                     data_ptr,
                     changed_ticks,
                     summary_tick,
-                    stride: q.stride,
-                    mode: q.mode,
                 });
             }
         }
     }
 }
 
-/// Advance `RawChunkIter` to the next chunk. Returns chunk entity count or 0 when done.
+/// Advances `RawChunkIter` to the next chunk, returning chunk entity count or 0 when done.
 ///
 /// # Safety
-/// `iter` must be a valid pointer to a `HostChunkIter` or null.
+/// `iter` must be a valid pointer to a [`HostChunkIter`] or null.
 pub unsafe extern "C" fn host_iter_next_chunk(iter: *mut RawChunkIter) -> usize {
     if iter.is_null() {
         return 0;
     }
-    // SAFETY: caller passes a valid pointer to HostChunkIter cast to RawChunkIter.
+    // SAFETY: Caller passes a valid pointer to `HostChunkIter` cast to `RawChunkIter`.
     let host_iter = unsafe { &mut *(iter.cast::<HostChunkIter<'_>>()) };
     host_iter.next_chunk()
 }
 
-/// Borrow a read-only column byte pointer from `RawChunkIter`.
-///
-/// Returns `null` when an `OPTIONAL_READ` / `OPTIONAL_WRITE` column is absent on the current
-/// archetype, or when `index` refers to a `FILTER_ONLY`, `WITHOUT`, or `RESOURCE_*` entry.
+/// Borrows a read-only column byte pointer from `RawChunkIter`.
 ///
 /// # Safety
-/// `iter` must be a valid pointer to a `HostChunkIter` or null.
+/// `iter` must be a valid pointer to a [`HostChunkIter`] or null.
 pub unsafe extern "C" fn host_iter_column_readonly(
     iter: *const RawChunkIter,
     index: usize,
@@ -712,7 +656,7 @@ pub unsafe extern "C" fn host_iter_column_readonly(
     if iter.is_null() {
         return core::ptr::null();
     }
-    // SAFETY: caller passes a valid pointer to HostChunkIter cast to RawChunkIter.
+    // SAFETY: Caller passes a valid pointer to `HostChunkIter` cast to `RawChunkIter`.
     let host_iter = unsafe { &*(iter.cast::<HostChunkIter<'_>>()) };
     if host_iter.current_entity_count == 0
         || index >= host_iter.query_columns.len()
@@ -728,19 +672,16 @@ pub unsafe extern "C" fn host_iter_column_readonly(
         return core::ptr::null();
     }
     if let Some(col) = &host_iter.active_columns[index] {
-        col.data_ptr as *const u8
+        col.data_ptr.cast_const()
     } else {
         core::ptr::null()
     }
 }
 
-/// Borrow a mutable column byte pointer from `RawChunkIter`.
-/// Automatically marks change ticks for all entities in the current chunk when present.
-/// Returns `null` when an `OPTIONAL_WRITE` column is absent on the current archetype,
-/// or if `index` was not declared with `WRITE` or `OPTIONAL_WRITE`.
+/// Borrows a mutable column byte pointer from `RawChunkIter` and marks chunk ticks changed.
 ///
 /// # Safety
-/// `iter` must be a valid pointer to a `HostChunkIter` or null.
+/// `iter` must be a valid pointer to a [`HostChunkIter`] or null.
 pub unsafe extern "C" fn host_iter_column_mutable(
     iter: *mut RawChunkIter,
     index: usize,
@@ -748,7 +689,7 @@ pub unsafe extern "C" fn host_iter_column_mutable(
     if iter.is_null() {
         return core::ptr::null_mut();
     }
-    // SAFETY: caller passes a valid pointer to HostChunkIter cast to RawChunkIter.
+    // SAFETY: Caller passes a valid pointer to `HostChunkIter` cast to `RawChunkIter`.
     let host_iter = unsafe { &mut *(iter.cast::<HostChunkIter<'_>>()) };
     if host_iter.current_entity_count == 0
         || index >= host_iter.query_columns.len()
@@ -763,7 +704,7 @@ pub unsafe extern "C" fn host_iter_column_mutable(
 
     if let Some(col) = &mut host_iter.active_columns[index] {
         for tick_cell in col.changed_ticks {
-            // SAFETY: System holds exclusive access to this component's rows as granted by Bevy scheduler.
+            // SAFETY: System holds exclusive access to this component's rows as granted by Bevy's scheduler.
             unsafe {
                 *tick_cell.get() = host_iter.this_run;
             }
@@ -777,10 +718,10 @@ pub unsafe extern "C" fn host_iter_column_mutable(
     }
 }
 
-/// Mark an individual row's component tick as changed.
+/// Marks an individual row's component tick as changed.
 ///
 /// # Safety
-/// `iter` must be a valid pointer to a `HostChunkIter` or null.
+/// `iter` must be a valid pointer to a [`HostChunkIter`] or null.
 pub unsafe extern "C" fn host_iter_mark_changed(
     iter: *mut RawChunkIter,
     index: usize,
@@ -789,7 +730,7 @@ pub unsafe extern "C" fn host_iter_mark_changed(
     if iter.is_null() {
         return FfiResult::NULL_POINTER;
     }
-    // SAFETY: caller passes a valid pointer to HostChunkIter cast to RawChunkIter.
+    // SAFETY: Caller passes a valid pointer to `HostChunkIter` cast to `RawChunkIter`.
     let host_iter = unsafe { &mut *(iter.cast::<HostChunkIter<'_>>()) };
     if index >= host_iter.query_columns.len() || index >= MAX_QUERY_COMPONENTS {
         return FfiResult::INVALID_COMPONENT;
@@ -799,11 +740,11 @@ pub unsafe extern "C" fn host_iter_mark_changed(
         return FfiResult::PERMISSION_DENIED;
     }
     if row >= host_iter.current_entity_count {
-        return FfiResult::INTERNAL_ERROR;
+        return FfiResult::OUT_OF_RANGE;
     }
 
     if let Some(col) = &mut host_iter.active_columns[index] {
-        // SAFETY: row < current_entity_count == changed_ticks.len()
+        // SAFETY: `row < current_entity_count == changed_ticks.len()`, and `WRITE` access is held.
         unsafe {
             *col.changed_ticks[row].get() = host_iter.this_run;
         }
@@ -816,15 +757,15 @@ pub unsafe extern "C" fn host_iter_mark_changed(
     }
 }
 
-/// Borrow the contiguous `FfiEntity` slice for the current chunk.
+/// Borrows the contiguous `FfiEntity` slice for the current chunk.
 ///
 /// # Safety
-/// `iter` must be a valid pointer to a `HostChunkIter` or null.
+/// `iter` must be a valid pointer to a [`HostChunkIter`] or null.
 pub unsafe extern "C" fn host_iter_entities(iter: *const RawChunkIter) -> *const FfiEntity {
     if iter.is_null() {
         return core::ptr::null();
     }
-    // SAFETY: caller passes a valid pointer to HostChunkIter cast to RawChunkIter.
+    // SAFETY: Caller passes a valid pointer to `HostChunkIter` cast to `RawChunkIter`.
     let host_iter = unsafe { &*(iter.cast::<HostChunkIter<'_>>()) };
     if host_iter.current_entity_count == 0 {
         return core::ptr::null();
@@ -832,15 +773,15 @@ pub unsafe extern "C" fn host_iter_entities(iter: *const RawChunkIter) -> *const
     host_iter.current_entities_ptr
 }
 
-/// Query the byte stride of column `index` in `RawChunkIter`.
+/// Queries the byte stride of column `index` in `RawChunkIter`.
 ///
 /// # Safety
-/// `iter` must be a valid pointer to a `HostChunkIter` or null.
+/// `iter` must be a valid pointer to a [`HostChunkIter`] or null.
 pub unsafe extern "C" fn host_iter_column_stride(iter: *const RawChunkIter, index: usize) -> usize {
     if iter.is_null() {
         return 0;
     }
-    // SAFETY: caller passes a valid pointer to HostChunkIter cast to RawChunkIter.
+    // SAFETY: Caller passes a valid pointer to `HostChunkIter` cast to `RawChunkIter`.
     let host_iter = unsafe { &*(iter.cast::<HostChunkIter<'_>>()) };
     if index >= host_iter.query_columns.len() {
         return 0;
@@ -848,27 +789,24 @@ pub unsafe extern "C" fn host_iter_column_stride(iter: *const RawChunkIter, inde
     host_iter.query_columns[index].stride
 }
 
-/// Reset a `RawChunkIter` back to its first matched chunk for nested query iteration.
+/// Resets a `RawChunkIter` back to its first matched chunk for nested query iteration.
 ///
 /// # Safety
-/// `iter` must be a valid pointer to a `HostChunkIter` or null.
+/// `iter` must be a valid pointer to a [`HostChunkIter`] or null.
 pub unsafe extern "C" fn host_iter_reset(iter: *mut RawChunkIter) -> FfiResult {
     if iter.is_null() {
         return FfiResult::NULL_POINTER;
     }
-    // SAFETY: caller passes a valid pointer to HostChunkIter cast to RawChunkIter.
+    // SAFETY: Caller passes a valid pointer to `HostChunkIter` cast to `RawChunkIter`.
     let host_iter = unsafe { &mut *(iter.cast::<HostChunkIter<'_>>()) };
     host_iter.reset();
     FfiResult::OK
 }
 
-/// Borrow a read-only pointer to singleton Bevy `Resource` `resource_name` during system execution.
-///
-/// Enforces that `resource_name` is registered as a resource (`register_mod_resource`) AND was
-/// declared on the executing system with `RESOURCE_READ` or `RESOURCE_WRITE`.
+/// Borrows a read-only pointer to singleton Bevy `Resource` `resource_name` during system execution.
 ///
 /// # Safety
-/// - `iter` must be a valid pointer to an active `HostChunkIter` or null.
+/// - `iter` must be a valid pointer to an active [`HostChunkIter`] or null.
 /// - `resource_name` must point to a valid NUL-terminated UTF-8 C string or null.
 pub unsafe extern "C" fn host_iter_resource_readonly(
     iter: *const RawChunkIter,
@@ -877,11 +815,11 @@ pub unsafe extern "C" fn host_iter_resource_readonly(
     if iter.is_null() || resource_name.is_null() {
         return core::ptr::null();
     }
-    // SAFETY: caller passes a valid NUL-terminated C string.
+    // SAFETY: Caller passes a valid NUL-terminated C string.
     let Ok(name) = (unsafe { CStr::from_ptr(resource_name) }).to_str() else {
         return core::ptr::null();
     };
-    // SAFETY: caller passes a valid pointer to `HostChunkIter` cast to `RawChunkIter`.
+    // SAFETY: Caller passes a valid pointer to `HostChunkIter` cast to `RawChunkIter`.
     let host_iter = unsafe { &*(iter.cast::<HostChunkIter<'_>>()) };
     let (Some(world), Some(registry)) = (host_iter.world, host_iter.registry) else {
         return core::ptr::null();
@@ -908,14 +846,10 @@ pub unsafe extern "C" fn host_iter_resource_readonly(
     }
 }
 
-/// Borrow an exclusive mutable pointer to singleton Bevy `Resource` `resource_name` during system execution.
-///
-/// Enforces that `resource_name` is registered as a resource (`register_mod_resource`) AND was
-/// declared strictly with `RESOURCE_WRITE` on the executing system. Automatically marks the
-/// resource's Bevy change tick to `this_run` (`Res<R>::is_changed()` becomes `true`).
+/// Borrows an exclusive mutable pointer to singleton Bevy `Resource` `resource_name` during system execution.
 ///
 /// # Safety
-/// - `iter` must be a valid pointer to an active `HostChunkIter` or null.
+/// - `iter` must be a valid pointer to an active [`HostChunkIter`] or null.
 /// - `resource_name` must point to a valid NUL-terminated UTF-8 C string or null.
 pub unsafe extern "C" fn host_iter_resource_mutable(
     iter: *mut RawChunkIter,
@@ -924,11 +858,11 @@ pub unsafe extern "C" fn host_iter_resource_mutable(
     if iter.is_null() || resource_name.is_null() {
         return core::ptr::null_mut();
     }
-    // SAFETY: caller passes a valid NUL-terminated C string.
+    // SAFETY: Caller passes a valid NUL-terminated C string.
     let Ok(name) = (unsafe { CStr::from_ptr(resource_name) }).to_str() else {
         return core::ptr::null_mut();
     };
-    // SAFETY: caller passes a valid pointer to `HostChunkIter` cast to `RawChunkIter`.
+    // SAFETY: Caller passes a valid pointer to `HostChunkIter` cast to `RawChunkIter`.
     let host_iter = unsafe { &mut *(iter.cast::<HostChunkIter<'_>>()) };
     let (Some(world), Some(registry)) = (host_iter.world, host_iter.registry) else {
         return core::ptr::null_mut();
@@ -962,4 +896,56 @@ pub unsafe extern "C" fn host_iter_resource_mutable(
         return core::ptr::null_mut();
     };
     mut_untyped.into_inner().as_ptr()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_ecs::world::World;
+
+    #[test]
+    fn regression_s10_entity_bits_layout() {
+        let mut world = World::new();
+        let mut samples = Vec::new();
+
+        // Spawn and despawn cycles to exercise both diverse indices and bumped generations.
+        for _ in 0..64 {
+            samples.push(world.spawn_empty().id());
+        }
+        for e in samples.drain(..32).collect::<Vec<_>>() {
+            world.despawn(e);
+        }
+        for _ in 0..48 {
+            samples.push(world.spawn_empty().id());
+        }
+        samples.push(Entity::PLACEHOLDER);
+
+        // Also synthesize explicit bit-patterns across boundary indices and generations.
+        for &(idx, generation_bump) in &[
+            (0u32, 1u32),
+            (1u32, 1u32),
+            (0x7FFF_FFFEu32, 1u32),
+            (42u32, 0x1234_5678u32),
+            (u32::MAX - 1, u32::MAX),
+        ] {
+            let raw_bits = ((generation_bump as u64) << 32) | (idx as u64);
+            if let Some(ent) = Entity::try_from_bits(raw_bits) {
+                samples.push(ent);
+            }
+        }
+
+        for entity in samples {
+            // SAFETY: `Entity` and `u64` (`FfiEntity`) have identical size (8) and alignment (8),
+            // asserted at compile time above; `transmute_copy` verifies bit-pattern equivalence
+            // with `Entity::to_bits()` relied upon by zero-copy `Table::entities()` slice casts.
+            let raw_mem_bits: u64 = unsafe { core::mem::transmute_copy(&entity) };
+            assert_eq!(
+                raw_mem_bits,
+                entity.to_bits(),
+                "Entity memory representation diverged from Entity::to_bits() for {entity:?}"
+            );
+            let ffi = FfiEntity::from_bits(raw_mem_bits);
+            assert_eq!(Entity::try_from_bits(ffi.to_bits()), Some(entity));
+        }
+    }
 }

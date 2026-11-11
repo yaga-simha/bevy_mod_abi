@@ -9,6 +9,9 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+test-utils = ["bevy_abi_mod_host_sys/test-utils"]
+
 [dependencies]
 bevy_abi_mod_sys = { workspace = true }
 bevy_abi_mod_host_sys = { workspace = true }
@@ -17,6 +20,7 @@ bevy_ecs = { workspace = true }
 bevy_app = { workspace = true }
 
 [dev-dependencies]
+bevy_abi_mod_host_sys = { workspace = true, features = ["test-utils"] }
 libloading = { workspace = true }
 
 [[bench]]

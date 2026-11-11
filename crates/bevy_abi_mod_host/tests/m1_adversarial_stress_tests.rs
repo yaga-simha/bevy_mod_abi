@@ -516,26 +516,26 @@ fn test_out_of_bounds_row_index_on_iter_mark_changed() {
         FfiResult::OK
     );
 
-    // Off-by-one boundary: row == current_entity_count (row 5) -> MUST return INTERNAL_ERROR
+    // Off-by-one boundary: row == current_entity_count (row 5) -> MUST return OUT_OF_RANGE
     let oob_exact = unsafe { host_iter_mark_changed(raw_iter, 0, 5) };
     assert_eq!(
         oob_exact,
-        FfiResult::INTERNAL_ERROR,
-        "row == count must return INTERNAL_ERROR"
+        FfiResult::OUT_OF_RANGE,
+        "row == count must return OUT_OF_RANGE"
     );
 
     // Extreme out-of-bounds rows
     assert_eq!(
         unsafe { host_iter_mark_changed(raw_iter, 0, 6) },
-        FfiResult::INTERNAL_ERROR
+        FfiResult::OUT_OF_RANGE
     );
     assert_eq!(
         unsafe { host_iter_mark_changed(raw_iter, 0, 1000) },
-        FfiResult::INTERNAL_ERROR
+        FfiResult::OUT_OF_RANGE
     );
     assert_eq!(
         unsafe { host_iter_mark_changed(raw_iter, 0, usize::MAX) },
-        FfiResult::INTERNAL_ERROR
+        FfiResult::OUT_OF_RANGE
     );
 
     // Invalid component index
@@ -698,10 +698,19 @@ fn test_defensive_boundary_and_null_pointer_torture() {
         FfiResult::NULL_POINTER
     );
 
-    // Entity bit pattern where try_from_bits fails (generation 0 returns None)
+    // Entity bit pattern where try_from_bits fails (generation 0) or Entity::PLACEHOLDER
     assert_eq!(
         unsafe { host_cmd_despawn(raw_queue, FfiEntity(0)) },
-        FfiResult::INTERNAL_ERROR
+        FfiResult::INVALID_ENTITY
+    );
+    assert_eq!(
+        unsafe {
+            host_cmd_despawn(
+                raw_queue,
+                FfiEntity::from_bits(bevy_ecs::entity::Entity::PLACEHOLDER.to_bits()),
+            )
+        },
+        FfiResult::INVALID_ENTITY
     );
 
     // Non-existent entity with valid bits returns OK (queued) and safely no-ops on flush
@@ -779,7 +788,7 @@ fn test_defensive_boundary_and_null_pointer_torture() {
                 core::mem::size_of::<Position>(),
             )
         },
-        FfiResult::INTERNAL_ERROR
+        FfiResult::INVALID_ENTITY
     );
 
     // Mismatched size (comp_meta.size != len)
@@ -793,7 +802,7 @@ fn test_defensive_boundary_and_null_pointer_torture() {
                 11, // expected 12
             )
         },
-        FfiResult::INTERNAL_ERROR
+        FfiResult::INVALID_ARGUMENT
     );
 
     // --- host_iter_* null safety ---
@@ -814,6 +823,7 @@ fn test_defensive_boundary_and_null_pointer_torture() {
     );
 
     let mut init_ctx = ModInitContext::new(Arc::new(registry));
+    let _active_guard = init_ctx.make_active();
     let ctx_ptr = (&mut init_ctx as *mut ModInitContext).cast::<c_void>();
 
     assert_eq!(
@@ -848,7 +858,7 @@ fn test_defensive_boundary_and_null_pointer_torture() {
     };
     assert_eq!(
         unsafe { host_register_system(ctx_ptr, &bad_desc) },
-        FfiResult::INTERNAL_ERROR
+        FfiResult::INVALID_VERSION
     );
 
     // Descriptor with query_count > 0 but queries == null

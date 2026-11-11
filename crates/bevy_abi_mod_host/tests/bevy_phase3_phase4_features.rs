@@ -185,9 +185,12 @@ fn register_inline_system(app: &mut App, desc: &SystemDescriptor) -> FfiResult {
     let registry = Arc::new(app.world().resource::<ModRegistry>().clone());
     let mut ctx = ModInitContext::new(registry);
     ctx.world = app.world_mut() as *mut bevy_ecs::world::World;
-    let ctx_ptr = (&mut ctx as *mut ModInitContext).cast::<c_void>();
-    // SAFETY: `ctx_ptr` and `desc` are valid stack pointers for the duration of registration.
-    let status = unsafe { host_register_system(ctx_ptr, desc) };
+    let status = {
+        let _guard = ctx.make_active();
+        let ctx_ptr = (&mut ctx as *mut ModInitContext).cast::<c_void>();
+        // SAFETY: `ctx_ptr` and `desc` are valid stack pointers for the duration of registration.
+        unsafe { host_register_system(ctx_ptr, desc) }
+    };
     for sys in ctx.registered_systems.drain(..) {
         app.add_systems(Update, sys);
     }
@@ -201,9 +204,12 @@ fn register_inline_conditional_system(
     let registry = Arc::new(app.world().resource::<ModRegistry>().clone());
     let mut ctx = ModInitContext::new(registry);
     ctx.world = app.world_mut() as *mut bevy_ecs::world::World;
-    let ctx_ptr = (&mut ctx as *mut ModInitContext).cast::<c_void>();
-    // SAFETY: `ctx_ptr` and `desc` are valid stack pointers for the duration of registration.
-    let status = unsafe { host_register_conditional_system(ctx_ptr, desc) };
+    let status = {
+        let _guard = ctx.make_active();
+        let ctx_ptr = (&mut ctx as *mut ModInitContext).cast::<c_void>();
+        // SAFETY: `ctx_ptr` and `desc` are valid stack pointers for the duration of registration.
+        unsafe { host_register_conditional_system(ctx_ptr, desc) }
+    };
     for sys in ctx.registered_systems.drain(..) {
         app.add_systems(Update, sys);
     }
@@ -920,18 +926,21 @@ fn test_multi_query_per_group_resource_scoping_prevents_cross_iter_aliasing() {
     let registry = Arc::new(app.world().resource::<ModRegistry>().clone());
     let mut ctx = ModInitContext::new(registry);
     ctx.world = app.world_mut() as *mut bevy_ecs::world::World;
-    let ctx_ptr = (&mut ctx as *mut ModInitContext).cast::<c_void>();
-    // SAFETY: Valid `ctx_ptr` and `mq_desc`.
-    assert_eq!(
-        unsafe { host_register_multi_query_system(ctx_ptr, &mq_desc) },
-        FfiResult::OK
-    );
+    {
+        let _guard = ctx.make_active();
+        let ctx_ptr = (&mut ctx as *mut ModInitContext).cast::<c_void>();
+        // SAFETY: Valid `ctx_ptr` and `mq_desc`.
+        assert_eq!(
+            unsafe { host_register_multi_query_system(ctx_ptr, &mq_desc) },
+            FfiResult::OK
+        );
+    }
     for sys in ctx.registered_systems.drain(..) {
         app.add_systems(Update, sys);
     }
 
     // Also verify declaring `RESOURCE_WRITE(SimConfig)` in BOTH groups of a multi-query system
-    // triggers `self_conflict` and disables the conflicting system safely!
+    // is rejected synchronously with `ACCESS_CONFLICT` (`B-04`)!
     let conflict_specs = [
         QuerySpec {
             queries: q1.as_ptr(),
@@ -952,15 +961,16 @@ fn test_multi_query_per_group_resource_scoping_prevents_cross_iter_aliasing() {
     let registry2 = Arc::new(app.world().resource::<ModRegistry>().clone());
     let mut ctx2 = ModInitContext::new(registry2);
     ctx2.world = app.world_mut() as *mut bevy_ecs::world::World;
-    let ctx2_ptr = (&mut ctx2 as *mut ModInitContext).cast::<c_void>();
-    // SAFETY: Valid `ctx2_ptr` and `conflict_desc`.
-    assert_eq!(
-        unsafe { host_register_multi_query_system(ctx2_ptr, &conflict_desc) },
-        FfiResult::OK
-    );
-    for sys in ctx2.registered_systems.drain(..) {
-        app.add_systems(Update, sys);
+    {
+        let _guard2 = ctx2.make_active();
+        let ctx2_ptr = (&mut ctx2 as *mut ModInitContext).cast::<c_void>();
+        // SAFETY: Valid `ctx2_ptr` and `conflict_desc`.
+        assert_eq!(
+            unsafe { host_register_multi_query_system(ctx2_ptr, &conflict_desc) },
+            FfiResult::ACCESS_CONFLICT
+        );
     }
+    assert!(ctx2.registered_systems.is_empty());
 
     app.update();
     assert_eq!(app.world().resource::<SimConfig>().step_count, 15);

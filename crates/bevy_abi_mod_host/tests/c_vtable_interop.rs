@@ -8,9 +8,10 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(improper_ctypes_definitions)]
 
-use bevy_abi_mod_host::ModHost;
+use bevy_abi_mod_host::{AbiModPlugin, ModAppExt};
 use bevy_abi_mod_macros::ModExposable;
 use bevy_abi_mod_sys::{ExposableComponent, FfiResult, GetProcAddressFn};
+use bevy_app::App;
 use core::ffi::{CStr, c_char, c_void};
 use libloading::{Library, Symbol};
 use std::path::PathBuf;
@@ -77,13 +78,11 @@ fn test_c99_shared_library_mutates_rust_components_via_vtable() {
         assert!(status.success(), "`make -C tests/asymmetric_c_mod` failed");
     }
 
-    // 1. Verify `ModHost::load_mod` handshake and ABI version check succeed
-    let mut host = ModHost::new();
-    // SAFETY: `dylib_path` was just compiled from `tests/asymmetric_c_mod/mod.c`.
-    unsafe {
-        host.load_mod(&dylib_path)
-            .expect("ModHost failed to load C99 mod");
-    }
+    // 1. Verify host load handshake and ABI version check succeed via exclusive `App` access
+    let mut app = App::new();
+    app.add_plugins(AbiModPlugin);
+    app.try_load_mod(&dylib_path)
+        .expect("ModAppExt::try_load_mod failed to load C99 mod");
 
     // 2. Invoke `bevy_c_mod_test_vtable_mutation` exported by the C99 shared library
     let mut column: Vec<CInteropComponent> = (0..16)
@@ -121,5 +120,5 @@ fn test_c99_shared_library_mutates_rust_components_via_vtable() {
         assert_eq!(item.label, "mutated_from_c99");
     }
 
-    drop(host);
+    drop(app);
 }

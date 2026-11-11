@@ -28,7 +28,7 @@
 //!     - Steady-State Complex Nested Multi-Archetype Query Frame Time (`ms`, `ns/pair`, slowdown `x`)
 
 use libloading::{Library, Symbol};
-use shared_scenario::bevy_abi_mod_host::{AbiModPlugin, ModAppExt, ModHost};
+use shared_scenario::bevy_abi_mod_host::{AbiModPlugin, ModAppExt};
 use shared_scenario::bevy_app::{App, Update};
 use shared_scenario::bevy_ecs::schedule::ScheduleLabel;
 use shared_scenario::{
@@ -469,20 +469,13 @@ fn measure_loading_permutations(
             register_all_scenario_components(&mut app);
             populate_scenario_world(app.world_mut(), cfg);
 
-            let registry = app
-                .world()
-                .resource::<shared_scenario::bevy_abi_mod_host::ModRegistry>()
-                .clone();
-            let registry_arc = std::sync::Arc::new(registry);
-
             let t_dl = Instant::now();
-            let (mod_id, systems) = {
-                let mut host = app.world_mut().resource_mut::<ModHost>();
-                unsafe {
-                    host.load_mod_tracked_with_registry(unique_load_copy, &registry_arc)
-                        .expect("C-ABI handshake")
-                }
-            };
+            let mod_id = app.try_load_mod(unique_load_copy).expect("C-ABI handshake");
+            app.world_mut()
+                .try_schedule_scope(Update.intern(), |world, sched| {
+                    let _ = sched.initialize(world);
+                })
+                .ok();
             let load_and_handshake_us = t_dl.elapsed().as_secs_f64() * 1_000_000.0;
 
             // Measure pure cached ABI handshake + 8 VTable lookups + Bevy 34-archetype schedule initialization
@@ -490,25 +483,12 @@ fn measure_loading_permutations(
             app_cached.add_plugins(AbiModPlugin);
             register_all_scenario_components(&mut app_cached);
             populate_scenario_world(app_cached.world_mut(), cfg);
-            let reg_cached = std::sync::Arc::new(
-                app_cached
-                    .world()
-                    .resource::<shared_scenario::bevy_abi_mod_host::ModRegistry>()
-                    .clone(),
-            );
 
             let t_in = Instant::now();
             let cached_id = {
-                let mut host_c = app_cached.world_mut().resource_mut::<ModHost>();
-                let (cid, c_systems) = unsafe {
-                    host_c
-                        .load_mod_tracked_with_registry(src_path, &reg_cached)
-                        .expect("cached C-ABI handshake")
-                };
-                drop(host_c);
-                for sys in c_systems {
-                    app_cached.add_systems(Update, sys);
-                }
+                let cid = app_cached
+                    .try_load_mod(src_path)
+                    .expect("cached C-ABI handshake");
                 app_cached
                     .world_mut()
                     .try_schedule_scope(Update.intern(), |world, sched| {
@@ -520,15 +500,6 @@ fn measure_loading_permutations(
             let pure_handshake_and_sched_us = t_in.elapsed().as_secs_f64() * 1_000_000.0;
             app_cached.unload_mod(cached_id).expect("cached unload");
             drop(app_cached);
-
-            for sys in systems {
-                app.add_systems(Update, sys);
-            }
-            app.world_mut()
-                .try_schedule_scope(Update.intern(), |world, sched| {
-                    let _ = sched.initialize(world);
-                })
-                .ok();
 
             let pure_dlopen_us = (load_and_handshake_us - pure_handshake_and_sched_us).max(1.0);
             dlopen_s.push(pure_dlopen_us);

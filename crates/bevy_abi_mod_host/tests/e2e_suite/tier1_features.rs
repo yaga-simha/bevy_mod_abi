@@ -1372,7 +1372,7 @@ fn t1_f20_01_catch_unwind_returns_panic_caught() {
     });
     assert!(status.is_err());
     let ffi_status = FfiResult::PANIC_CAUGHT;
-    assert_eq!(ffi_status, FfiResult::PanicCaught);
+    assert_eq!(ffi_status, FfiResult(3));
 }
 
 #[test]

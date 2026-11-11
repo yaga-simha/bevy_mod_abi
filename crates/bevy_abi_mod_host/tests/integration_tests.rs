@@ -10,12 +10,11 @@
 
 mod common;
 
-use bevy_abi_mod_host::{AbiModPlugin, ModAppExt, ModHost, ModRegistry};
-use bevy_abi_mod_host_sys::commands::{CommandQueueBridge, host_cmd_despawn};
-use bevy_abi_mod_host_sys::dynamic_system::{
-    DynamicCSystem, ModInitContext, host_register_component,
+use bevy_abi_mod_host::{AbiModPlugin, ModAppExt, ModRegistry};
+use bevy_abi_mod_host_sys::{
+    CommandQueueBridge, DynamicCSystem, ModInitContext, host_cmd_despawn,
+    host_cmd_insert_component, host_cmd_spawn_empty, host_register_component, load_mod_in_world,
 };
-use bevy_abi_mod_host_sys::{host_cmd_insert_component, host_cmd_spawn_empty};
 use bevy_abi_mod_sys::{
     ComponentUuid, FfiEntity, FfiResult, ModComponentDescriptor, RawChunkIter, RawCommandQueue,
 };
@@ -1282,19 +1281,11 @@ fn test_milestone_4_parallel_scheduler_concurrency() {
     app.register_mod_component::<Velocity>();
 
     // Load both mods and extract dynamic systems directly
-    let (rust_mod_id, rust_systems) = app
-        .world_mut()
-        .resource_scope::<ModHost, _>(|world, mut mod_host| unsafe {
-            mod_host.load_mod_tracked_with_world(&rust_dylib, world)
-        })
+    let (rust_mod_id, rust_systems) = load_mod_in_world(app.world_mut(), &rust_dylib)
         .expect("Failed to load asymmetric_rust_mod");
 
-    let (c_mod_id, c_systems) = app
-        .world_mut()
-        .resource_scope::<ModHost, _>(|world, mut mod_host| unsafe {
-            mod_host.load_mod_tracked_with_world(&c_dylib, world)
-        })
-        .expect("Failed to load asymmetric_c_mod");
+    let (c_mod_id, c_systems) =
+        load_mod_in_world(app.world_mut(), &c_dylib).expect("Failed to load asymmetric_c_mod");
 
     let rust_comp_id = app
         .world()

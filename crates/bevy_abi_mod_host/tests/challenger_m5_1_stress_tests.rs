@@ -25,7 +25,7 @@ mod common;
 
 use bevy_abi_mod_host::{AbiModPlugin, ModAppExt, ModRegistry};
 use bevy_abi_mod_host_sys::{
-    ComponentAccessDescOwned, DynamicCSystem, commands::CommandQueueBridge, host_cmd_despawn,
+    CommandQueueBridge, ComponentAccessDescOwned, DynamicCSystem, host_cmd_despawn,
     host_cmd_insert_component, host_cmd_spawn_empty, host_iter_column_mutable,
     host_iter_column_readonly, host_iter_entities, host_iter_mark_changed, host_iter_next_chunk,
     host_iter_reset,
@@ -591,7 +591,7 @@ unsafe extern "C" fn access_permissions_callback(
 
     // Row out of bounds
     let row_oob_mark = unsafe { host_iter_mark_changed(iter, 1, 999_999) };
-    assert_eq!(row_oob_mark, FfiResult::INTERNAL_ERROR);
+    assert_eq!(row_oob_mark, FfiResult::OUT_OF_RANGE);
 
     PERMISSIONS_VERIFIED.store(true, Ordering::SeqCst);
     FfiResult::OK
@@ -1145,14 +1145,23 @@ fn test_stress_deferred_commands_adversarial_inputs() {
                 999, // Expected 12
             )
         },
-        FfiResult::INTERNAL_ERROR
+        FfiResult::INVALID_ARGUMENT
     );
 
     // 6. Invalid entity bits on despawn:
-    // Generation 0 returns None from Entity::try_from_bits -> INTERNAL_ERROR
+    // Generation 0 and Entity::PLACEHOLDER return INVALID_ENTITY
     assert_eq!(
         unsafe { host_cmd_despawn(raw_queue, FfiEntity(0)) },
-        FfiResult::INTERNAL_ERROR
+        FfiResult::INVALID_ENTITY
+    );
+    assert_eq!(
+        unsafe {
+            host_cmd_despawn(
+                raw_queue,
+                FfiEntity::from_bits(Entity::PLACEHOLDER.to_bits()),
+            )
+        },
+        FfiResult::INVALID_ENTITY
     );
     // Non-existent entity with non-zero generation returns OK (queued safely) and safely no-ops on flush
     assert_eq!(

@@ -76,7 +76,7 @@ fn test_mod_registry_registration_and_lookup() {
     assert_eq!(pos_meta.name, "Position");
     assert_eq!(pos_meta.size, core::mem::size_of::<Position>());
     assert_eq!(pos_meta.align, core::mem::align_of::<Position>());
-    assert_eq!(pos_meta.vtable_ptr, Position::erased_vtable_ptr());
+    assert_eq!(pos_meta.vtable_ptr.as_ptr(), Position::erased_vtable_ptr());
 
     // Lookup by Name
     let pos_by_name = registry
@@ -646,15 +646,26 @@ fn test_dynamic_system_panic_and_error_containment() {
 // 10. Dynamic Component Registration C-ABI Tests
 // ============================================================================
 
+unsafe fn call_register_component_fresh(desc: &ModComponentDescriptor) -> FfiResult {
+    let mut world = World::new();
+    let reg = Arc::new(ModRegistry::new());
+    world.insert_resource((*reg).clone());
+    let active = Arc::new(core::sync::atomic::AtomicBool::new(true));
+    let mut init_ctx =
+        bevy_abi_mod_host_sys::ModInitContext::with_world(reg, active, &mut world as *mut World);
+    let _guard = init_ctx.make_active();
+    let ctx_ptr = (&mut init_ctx as *mut bevy_abi_mod_host_sys::ModInitContext).cast::<c_void>();
+    unsafe { host_register_component(ctx_ptr, desc) }
+}
+
 #[test]
 fn test_host_register_component_defensive_validation() {
-    let dummy_ctx = 0xdead_beef_usize as *mut c_void;
     let name = c"CustomRuntimeComponent".as_ptr();
     let uuid = ComponentUuid::from_name("CustomRuntimeComponent");
 
     // 1. Valid descriptor and host context
     let valid_desc = ModComponentDescriptor::new(name, uuid, 16, 8);
-    let res = unsafe { host_register_component(dummy_ctx, &valid_desc) };
+    let res = unsafe { call_register_component_fresh(&valid_desc) };
     assert_eq!(res, FfiResult::OK);
 
     // 2. Null host context
@@ -662,24 +673,33 @@ fn test_host_register_component_defensive_validation() {
     assert_eq!(res, FfiResult::NULL_POINTER);
 
     // 3. Null descriptor pointer
-    let res = unsafe { host_register_component(dummy_ctx, core::ptr::null()) };
+    let mut world = World::new();
+    let mut init_ctx = bevy_abi_mod_host_sys::ModInitContext::with_world(
+        Arc::new(ModRegistry::new()),
+        Arc::new(core::sync::atomic::AtomicBool::new(true)),
+        &mut world as *mut World,
+    );
+    let _guard = init_ctx.make_active();
+    let ctx_ptr = (&mut init_ctx as *mut bevy_abi_mod_host_sys::ModInitContext).cast::<c_void>();
+    let res = unsafe { host_register_component(ctx_ptr, core::ptr::null()) };
     assert_eq!(res, FfiResult::NULL_POINTER);
+    drop(_guard);
 
     // 4. Truncated descriptor struct_size
     let mut truncated_desc = valid_desc;
     truncated_desc.struct_size = 32;
-    let res = unsafe { host_register_component(dummy_ctx, &truncated_desc) };
+    let res = unsafe { call_register_component_fresh(&truncated_desc) };
     assert_eq!(res, FfiResult::INVALID_VERSION);
 
     // 5. Forward-compatible descriptor struct_size (>= 64)
     let mut extended_desc = valid_desc;
     extended_desc.struct_size = 128;
-    let res = unsafe { host_register_component(dummy_ctx, &extended_desc) };
+    let res = unsafe { call_register_component_fresh(&extended_desc) };
     assert_eq!(res, FfiResult::OK);
 
     // 6. Null component name
     let null_name_desc = ModComponentDescriptor::new(core::ptr::null(), uuid, 16, 8);
-    let res = unsafe { host_register_component(dummy_ctx, &null_name_desc) };
+    let res = unsafe { call_register_component_fresh(&null_name_desc) };
     assert_eq!(res, FfiResult::NULL_POINTER);
 
     // 7. Invalid UTF-8 in component name
@@ -690,36 +710,36 @@ fn test_host_register_component_defensive_validation() {
         16,
         8,
     );
-    let res = unsafe { host_register_component(dummy_ctx, &bad_utf8_desc) };
+    let res = unsafe { call_register_component_fresh(&bad_utf8_desc) };
     assert_eq!(res, FfiResult::INVALID_UTF8);
 
     // 8. Invalid zero alignment
     let mut zero_align = valid_desc;
     zero_align.align = 0;
-    let res = unsafe { host_register_component(dummy_ctx, &zero_align) };
-    assert_eq!(res, FfiResult::INTERNAL_ERROR);
+    let res = unsafe { call_register_component_fresh(&zero_align) };
+    assert_eq!(res, FfiResult::INVALID_ARGUMENT);
 
     // 9. Invalid non-power-of-two alignment
     let mut non_pot_align = valid_desc;
     non_pot_align.align = 6;
-    let res = unsafe { host_register_component(dummy_ctx, &non_pot_align) };
-    assert_eq!(res, FfiResult::INTERNAL_ERROR);
+    let res = unsafe { call_register_component_fresh(&non_pot_align) };
+    assert_eq!(res, FfiResult::INVALID_ARGUMENT);
 
     // 10. Invalid misaligned size (size % align != 0)
     let mut misaligned = valid_desc;
     misaligned.size = 15;
     misaligned.align = 8;
-    let res = unsafe { host_register_component(dummy_ctx, &misaligned) };
-    assert_eq!(res, FfiResult::INTERNAL_ERROR);
+    let res = unsafe { call_register_component_fresh(&misaligned) };
+    assert_eq!(res, FfiResult::INVALID_ARGUMENT);
 
     // 11. Valid Zero-Sized Type (ZST)
     let zst_desc = ModComponentDescriptor::new(name, uuid, 0, 1);
-    let res = unsafe { host_register_component(dummy_ctx, &zst_desc) };
+    let res = unsafe { call_register_component_fresh(&zst_desc) };
     assert_eq!(res, FfiResult::OK);
 
     // 12. Valid over-aligned ZST
     let overaligned_zst = ModComponentDescriptor::new(name, uuid, 0, 16);
-    let res = unsafe { host_register_component(dummy_ctx, &overaligned_zst) };
+    let res = unsafe { call_register_component_fresh(&overaligned_zst) };
     assert_eq!(res, FfiResult::OK);
 }
 
@@ -764,11 +784,20 @@ fn test_host_api_vtable_and_register_component_offsets() {
     );
 
     // Direct invocation via HOST_API
-    let dummy_ctx = 0xfeed_beef_usize as *mut c_void;
+    let mut world = World::new();
+    let reg = Arc::new(ModRegistry::new());
+    world.insert_resource((*reg).clone());
+    let mut init_ctx = bevy_abi_mod_host_sys::ModInitContext::with_world(
+        reg,
+        Arc::new(core::sync::atomic::AtomicBool::new(true)),
+        &mut world as *mut World,
+    );
+    let _guard = init_ctx.make_active();
+    let ctx_ptr = (&mut init_ctx as *mut bevy_abi_mod_host_sys::ModInitContext).cast::<c_void>();
     let name = c"HealthPoints".as_ptr();
     let uuid = ComponentUuid::from_name("HealthPoints");
     let desc = ModComponentDescriptor::new(name, uuid, 4, 4);
 
-    let res = unsafe { (HOST_API.register_component)(dummy_ctx, &desc) };
+    let res = unsafe { (HOST_API.register_component)(ctx_ptr, &desc) };
     assert_eq!(res, FfiResult::OK);
 }

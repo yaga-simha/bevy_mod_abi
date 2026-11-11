@@ -8,9 +8,7 @@
 #![allow(clippy::default_constructed_unit_structs, clippy::clone_on_copy)]
 
 use bevy_abi_mod_host::{AbiModPlugin, ModAppExt, ModHost, ModRegistry};
-use bevy_abi_mod_host_sys::{
-    commands::CommandQueueBridge, host_cmd_insert_component, host_cmd_spawn_empty,
-};
+use bevy_abi_mod_host_sys::{CommandQueueBridge, host_cmd_insert_component, host_cmd_spawn_empty};
 use bevy_abi_mod_macros::ModExposable;
 use bevy_abi_mod_sys::FfiResult;
 use bevy_app::App;

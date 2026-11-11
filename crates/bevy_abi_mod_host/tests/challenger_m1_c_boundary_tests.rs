@@ -244,9 +244,20 @@ unsafe extern "C" fn custom_test_drop_hook(ptr: *mut c_void) {
     }
 }
 
+unsafe fn call_register_component_fresh(desc: &ModComponentDescriptor) -> FfiResult {
+    let mut world = bevy_ecs::world::World::new();
+    let reg = Arc::new(ModRegistry::new());
+    world.insert_resource((*reg).clone());
+    let active = Arc::new(core::sync::atomic::AtomicBool::new(true));
+    let mut init_ctx =
+        bevy_abi_mod_host_sys::ModInitContext::with_world(reg, active, &mut world as *mut _);
+    let _guard = init_ctx.make_active();
+    let ctx_ptr = (&mut init_ctx as *mut bevy_abi_mod_host_sys::ModInitContext).cast::<c_void>();
+    unsafe { host_register_component(ctx_ptr, desc) }
+}
+
 #[test]
 fn test_host_register_component_extensive_stress_matrix() {
-    let dummy_ctx = 0xbeef_cafe_usize as *mut c_void;
     let name_ascii = c"StressComponent".as_ptr();
     let uuid = ComponentUuid::from_name("StressComponent");
 
@@ -260,7 +271,7 @@ fn test_host_register_component_extensive_stress_matrix() {
         assert!(desc.is_pod());
         assert!(desc.layout().is_some());
 
-        let res = unsafe { host_register_component(dummy_ctx, &desc) };
+        let res = unsafe { call_register_component_fresh(&desc) };
         assert_eq!(
             res,
             FfiResult::OK,
@@ -283,7 +294,7 @@ fn test_host_register_component_extensive_stress_matrix() {
         let desc = ModComponentDescriptor::new(name_ascii, uuid, size, align);
         assert!(desc.is_valid());
         assert_eq!(desc.validate(), FfiResult::OK);
-        let res = unsafe { host_register_component(dummy_ctx, &desc) };
+        let res = unsafe { call_register_component_fresh(&desc) };
         assert_eq!(res, FfiResult::OK);
     }
 
@@ -300,11 +311,11 @@ fn test_host_register_component_extensive_stress_matrix() {
             vtable_ptr: core::ptr::null(),
         };
         assert!(!desc.is_valid());
-        let res = unsafe { host_register_component(dummy_ctx, &desc) };
+        let res = unsafe { call_register_component_fresh(&desc) };
         assert_eq!(
             res,
-            FfiResult::INTERNAL_ERROR,
-            "Alignment {} must be rejected with INTERNAL_ERROR",
+            FfiResult::INVALID_ARGUMENT,
+            "Alignment {} must be rejected with INVALID_ARGUMENT",
             align
         );
     }
@@ -330,11 +341,11 @@ fn test_host_register_component_extensive_stress_matrix() {
             vtable_ptr: core::ptr::null(),
         };
         assert!(!desc.is_valid());
-        let res = unsafe { host_register_component(dummy_ctx, &desc) };
+        let res = unsafe { call_register_component_fresh(&desc) };
         assert_eq!(
             res,
-            FfiResult::INTERNAL_ERROR,
-            "Size {} with align {} must be rejected with INTERNAL_ERROR",
+            FfiResult::INVALID_ARGUMENT,
+            "Size {} with align {} must be rejected with INVALID_ARGUMENT",
             size,
             align
         );
@@ -345,7 +356,7 @@ fn test_host_register_component_extensive_stress_matrix() {
     for &sz in &extended_sizes {
         let mut desc = ModComponentDescriptor::new(name_ascii, uuid, 16, 8);
         desc.struct_size = sz;
-        let res = unsafe { host_register_component(dummy_ctx, &desc) };
+        let res = unsafe { call_register_component_fresh(&desc) };
         assert_eq!(res, FfiResult::OK);
     }
 
@@ -354,7 +365,7 @@ fn test_host_register_component_extensive_stress_matrix() {
     for &sz in &truncated_sizes {
         let mut desc = ModComponentDescriptor::new(name_ascii, uuid, 16, 8);
         desc.struct_size = sz;
-        let res = unsafe { host_register_component(dummy_ctx, &desc) };
+        let res = unsafe { call_register_component_fresh(&desc) };
         assert_eq!(res, FfiResult::INVALID_VERSION);
     }
 
@@ -366,7 +377,7 @@ fn test_host_register_component_extensive_stress_matrix() {
     ];
     for c_name in &utf8_names {
         let desc = ModComponentDescriptor::new(c_name.as_ptr(), uuid, 8, 8);
-        let res = unsafe { host_register_component(dummy_ctx, &desc) };
+        let res = unsafe { call_register_component_fresh(&desc) };
         assert_eq!(res, FfiResult::OK);
     }
 
@@ -376,7 +387,7 @@ fn test_host_register_component_extensive_stress_matrix() {
     assert!(!drop_desc.is_pod());
     assert!(drop_desc.drop_fn.is_some());
 
-    let res = unsafe { host_register_component(dummy_ctx, &drop_desc) };
+    let res = unsafe { call_register_component_fresh(&drop_desc) };
     assert_eq!(res, FfiResult::OK);
 
     DROP_CALL_COUNT.store(0, Ordering::SeqCst);
@@ -390,6 +401,6 @@ fn test_host_register_component_extensive_stress_matrix() {
     let dummy_vtable = 0x9999_usize as *const c_void;
     let vtable_desc = ModComponentDescriptor::new(name_ascii, uuid, 8, 8).with_vtable(dummy_vtable);
     assert_eq!(vtable_desc.vtable_ptr, dummy_vtable);
-    let res = unsafe { host_register_component(dummy_ctx, &vtable_desc) };
+    let res = unsafe { call_register_component_fresh(&vtable_desc) };
     assert_eq!(res, FfiResult::OK);
 }

@@ -99,7 +99,7 @@ unsafe extern "C" fn empty_table_stress_system(
     stats.readonly_null_after_exhaust = ro.is_null();
     stats.mutable_null_after_exhaust = rw.is_null();
     stats.entities_null_after_exhaust = ents.is_null();
-    stats.mark_err_after_exhaust = mark_res == FfiResult::INTERNAL_ERROR;
+    stats.mark_err_after_exhaust = mark_res == FfiResult::OUT_OF_RANGE;
 
     // Repeated next_chunk calls after exhaustion must stay 0
     for _ in 0..5 {
@@ -401,7 +401,7 @@ fn test_chunk_iteration_single_entity_tables() {
 
         // Row 1 mark changed must fail (chunk size is 1)
         let r1 = unsafe { host_iter_mark_changed(iter, 0, 1) };
-        stats.mark_row1_err = r1 == FfiResult::INTERNAL_ERROR;
+        stats.mark_row1_err = r1 == FfiResult::OUT_OF_RANGE;
 
         assert_eq!(unsafe { host_iter_next_chunk(iter) }, 0);
         FfiResult::OK
@@ -1254,7 +1254,7 @@ fn test_command_queue_bridge_defensive_error_handling() {
             core::mem::size_of::<Position>() - 1,
         )
     };
-    assert_eq!(r5, FfiResult::INTERNAL_ERROR);
+    assert_eq!(r5, FfiResult::INVALID_ARGUMENT);
 
     // 6. Invalid entity bits (0 returns None from Entity::try_from_bits)
     let invalid_ent = FfiEntity(0);
@@ -1269,10 +1269,10 @@ fn test_command_queue_bridge_defensive_error_handling() {
             core::mem::size_of::<Position>(),
         )
     };
-    assert_eq!(r6, FfiResult::INTERNAL_ERROR);
+    assert_eq!(r6, FfiResult::INVALID_ENTITY);
 
     let r7 = unsafe { host_cmd_despawn(raw_queue, invalid_ent) };
-    assert_eq!(r7, FfiResult::INTERNAL_ERROR);
+    assert_eq!(r7, FfiResult::INVALID_ENTITY);
 
     // 7. Non-existent entity that has valid bits: queues successfully, safely skips when applied
     let non_existent_ent = FfiEntity(Entity::from_raw_u32(999_999).unwrap().to_bits());

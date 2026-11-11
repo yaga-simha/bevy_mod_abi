@@ -12,11 +12,34 @@
 #![deny(improper_ctypes_definitions)]
 
 use bevy_abi_mod_host::ModRegistry;
-use bevy_abi_mod_host_sys::{HOST_API, host_get_proc_address, host_register_component};
-use bevy_abi_mod_sys::{ComponentUuid, FfiResult, HostApi, ModComponentDescriptor};
+use bevy_abi_mod_host_sys::{
+    HOST_API, ModInitContext, host_get_proc_address, host_register_component,
+};
+use bevy_abi_mod_sys::{
+    ComponentUuid, FfiResult, HostApi, ModComponentDescriptor, RegisterComponentFn,
+};
+use bevy_ecs::world::World;
 use core::ffi::c_void;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+unsafe fn call_register_component_with_fn(
+    reg_fn: RegisterComponentFn,
+    desc: &ModComponentDescriptor,
+) -> FfiResult {
+    let mut world = World::new();
+    let reg = Arc::new(ModRegistry::new());
+    world.insert_resource((*reg).clone());
+    let mut init_ctx =
+        ModInitContext::with_world(reg, Arc::new(AtomicBool::new(true)), &mut world as *mut _);
+    let _guard = init_ctx.make_active();
+    let ctx_ptr = (&mut init_ctx as *mut ModInitContext).cast::<c_void>();
+    unsafe { reg_fn(ctx_ptr, desc) }
+}
+
+unsafe fn call_register_component_fresh(desc: &ModComponentDescriptor) -> FfiResult {
+    unsafe { call_register_component_with_fn(host_register_component, desc) }
+}
 
 // ============================================================================
 // 1. Zero-Sized Types (ZST) Stress Tests
@@ -24,7 +47,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
 fn test_zst_descriptors_boundary() {
-    let dummy_ctx = 0x1234_5678_usize as *mut c_void;
     let name = c"ZstMarkerTag".as_ptr();
     let uuid = ComponentUuid::from_name("ZstMarkerTag");
 
@@ -46,7 +68,7 @@ fn test_zst_descriptors_boundary() {
         assert_eq!(layout.size(), 0);
         assert_eq!(layout.align(), align);
 
-        let res = unsafe { host_register_component(dummy_ctx, &desc) };
+        let res = unsafe { call_register_component_fresh(&desc) };
         assert_eq!(
             res,
             FfiResult::OK,
@@ -61,7 +83,6 @@ fn test_zst_descriptors_boundary() {
 
 #[test]
 fn test_massive_struct_descriptors() {
-    let dummy_ctx = 0x1234_5678_usize as *mut c_void;
     let name = c"MassiveComponent".as_ptr();
     let uuid = ComponentUuid::from_name("MassiveComponent");
 
@@ -74,7 +95,7 @@ fn test_massive_struct_descriptors() {
     let layout = desc_1mb.layout().expect("1MB layout must be valid");
     assert_eq!(layout.size(), size_1mb);
     assert_eq!(layout.align(), 16);
-    let res = unsafe { host_register_component(dummy_ctx, &desc_1mb) };
+    let res = unsafe { call_register_component_fresh(&desc_1mb) };
     assert_eq!(res, FfiResult::OK);
 
     // 64MB struct with 64-byte alignment
@@ -83,7 +104,7 @@ fn test_massive_struct_descriptors() {
     assert!(!desc_64mb.is_zst());
     assert!(desc_64mb.is_valid());
     assert_eq!(desc_64mb.validate(), FfiResult::OK);
-    let res = unsafe { host_register_component(dummy_ctx, &desc_64mb) };
+    let res = unsafe { call_register_component_fresh(&desc_64mb) };
     assert_eq!(res, FfiResult::OK);
 }
 
@@ -93,7 +114,6 @@ fn test_massive_struct_descriptors() {
 
 #[test]
 fn test_invalid_alignments_fuzzing() {
-    let dummy_ctx = 0x1234_5678_usize as *mut c_void;
     let name = c"InvalidAlignComp".as_ptr();
     let uuid = ComponentUuid::from_name("InvalidAlignComp");
 
@@ -102,8 +122,8 @@ fn test_invalid_alignments_fuzzing() {
     assert!(!desc_zero.is_valid());
     assert_ne!(desc_zero.validate(), FfiResult::OK);
     assert!(desc_zero.layout().is_none());
-    let res = unsafe { host_register_component(dummy_ctx, &desc_zero) };
-    assert_eq!(res, FfiResult::INTERNAL_ERROR);
+    let res = unsafe { call_register_component_fresh(&desc_zero) };
+    assert_eq!(res, FfiResult::INVALID_ARGUMENT);
 
     // Non-power-of-two alignments
     let invalid_alignments = [
@@ -126,10 +146,10 @@ fn test_invalid_alignments_fuzzing() {
             "Layout must reject non-power-of-two align {bad_align}"
         );
 
-        let res = unsafe { host_register_component(dummy_ctx, &desc) };
+        let res = unsafe { call_register_component_fresh(&desc) };
         assert_eq!(
             res,
-            FfiResult::INTERNAL_ERROR,
+            FfiResult::INVALID_ARGUMENT,
             "host_register_component must reject non-power-of-two align {bad_align}"
         );
     }
@@ -141,7 +161,6 @@ fn test_invalid_alignments_fuzzing() {
 
 #[test]
 fn test_misaligned_sizes_matrix() {
-    let dummy_ctx = 0x1234_5678_usize as *mut c_void;
     let name = c"MisalignedComp".as_ptr();
     let uuid = ComponentUuid::from_name("MisalignedComp");
 
@@ -190,10 +209,10 @@ fn test_misaligned_sizes_matrix() {
         assert_ne!(desc.validate(), FfiResult::OK);
         assert!(desc.layout().is_none());
 
-        let res = unsafe { host_register_component(dummy_ctx, &desc) };
+        let res = unsafe { call_register_component_fresh(&desc) };
         assert_eq!(
             res,
-            FfiResult::INTERNAL_ERROR,
+            FfiResult::INVALID_ARGUMENT,
             "host_register_component must reject misaligned size {size} align {align}"
         );
     }
@@ -205,7 +224,6 @@ fn test_misaligned_sizes_matrix() {
 
 #[test]
 fn test_struct_size_negotiation_boundary() {
-    let dummy_ctx = 0x1234_5678_usize as *mut c_void;
     let name = c"NegotiationComp".as_ptr();
     let uuid = ComponentUuid::from_name("NegotiationComp");
     let valid_base = ModComponentDescriptor::new(name, uuid, 16, 8);
@@ -224,7 +242,7 @@ fn test_struct_size_negotiation_boundary() {
         );
         assert!(!desc.is_valid());
 
-        let res = unsafe { host_register_component(dummy_ctx, &desc) };
+        let res = unsafe { call_register_component_fresh(&desc) };
         assert_eq!(
             res,
             FfiResult::INVALID_VERSION,
@@ -246,7 +264,7 @@ fn test_struct_size_negotiation_boundary() {
         );
         assert!(desc.is_valid());
 
-        let res = unsafe { host_register_component(dummy_ctx, &desc) };
+        let res = unsafe { call_register_component_fresh(&desc) };
         assert_eq!(
             res,
             FfiResult::OK,
@@ -282,14 +300,14 @@ fn test_null_pointers_boundary() {
     let null_name_desc = ModComponentDescriptor::new(core::ptr::null(), uuid, 8, 8);
     assert_eq!(null_name_desc.validate(), FfiResult::NULL_POINTER);
     assert!(!null_name_desc.is_valid());
-    let res = unsafe { host_register_component(dummy_ctx, &null_name_desc) };
+    let res = unsafe { call_register_component_fresh(&null_name_desc) };
     assert_eq!(res, FfiResult::NULL_POINTER);
 
     // 5. Null drop_fn and null vtable_ptr are VALID (POD component)
     assert!(valid_desc.is_pod());
     assert!(valid_desc.drop_fn.is_none());
     assert!(valid_desc.vtable_ptr.is_null());
-    let res = unsafe { host_register_component(dummy_ctx, &valid_desc) };
+    let res = unsafe { call_register_component_fresh(&valid_desc) };
     assert_eq!(res, FfiResult::OK);
 }
 
@@ -299,7 +317,6 @@ fn test_null_pointers_boundary() {
 
 #[test]
 fn test_malformed_utf8_names() {
-    let dummy_ctx = 0x1234_5678_usize as *mut c_void;
     let uuid = ComponentUuid::from_name("BadUtf8Comp");
 
     let bad_utf8_sequences: [&[u8]; 6] = [
@@ -315,7 +332,7 @@ fn test_malformed_utf8_names() {
         let desc =
             ModComponentDescriptor::new(bad_bytes.as_ptr() as *const core::ffi::c_char, uuid, 8, 8);
 
-        let res = unsafe { host_register_component(dummy_ctx, &desc) };
+        let res = unsafe { call_register_component_fresh(&desc) };
         assert_eq!(
             res,
             FfiResult::INVALID_UTF8,
@@ -363,7 +380,6 @@ fn test_host_api_layout_stability_and_byte_offsets() {
 
 #[test]
 fn test_callable_invocation_parity_matrix() {
-    let dummy_ctx = 0x9988_7766_usize as *mut c_void;
     let registry = ModRegistry::new();
     let reg_arc = Arc::new(registry);
     let _guard = reg_arc.make_current();
@@ -387,7 +403,7 @@ fn test_callable_invocation_parity_matrix() {
     let descriptors: [(&str, ModComponentDescriptor, FfiResult); 4] = [
         ("valid", valid_desc, FfiResult::OK),
         ("truncated", truncated_desc, FfiResult::INVALID_VERSION),
-        ("misaligned", misaligned_desc, FfiResult::INTERNAL_ERROR),
+        ("misaligned", misaligned_desc, FfiResult::INVALID_ARGUMENT),
         ("bad_utf8", bad_utf8_desc, FfiResult::INVALID_UTF8),
     ];
 
@@ -397,24 +413,20 @@ fn test_callable_invocation_parity_matrix() {
     let reg_sym_fn = reg_arc
         .resolve_symbol("register_component")
         .expect("symbol register_component must resolve");
-    let reg_sym_fn: bevy_abi_mod_sys::RegisterComponentFn =
-        unsafe { core::mem::transmute(reg_sym_fn) };
+    let reg_sym_fn: RegisterComponentFn = unsafe { core::mem::transmute(reg_sym_fn) };
 
     let reg_host_sym_fn = reg_arc
         .resolve_symbol("host_register_component")
         .expect("symbol host_register_component must resolve");
-    let reg_host_sym_fn: bevy_abi_mod_sys::RegisterComponentFn =
-        unsafe { core::mem::transmute(reg_host_sym_fn) };
+    let reg_host_sym_fn: RegisterComponentFn = unsafe { core::mem::transmute(reg_host_sym_fn) };
 
     let gpa_sym_ptr = unsafe { host_get_proc_address(c"register_component".as_ptr()) };
     assert!(!gpa_sym_ptr.is_null());
-    let gpa_sym_fn: bevy_abi_mod_sys::RegisterComponentFn =
-        unsafe { core::mem::transmute(gpa_sym_ptr) };
+    let gpa_sym_fn: RegisterComponentFn = unsafe { core::mem::transmute(gpa_sym_ptr) };
 
     let gpa_host_sym_ptr = unsafe { host_get_proc_address(c"host_register_component".as_ptr()) };
     assert!(!gpa_host_sym_ptr.is_null());
-    let gpa_host_sym_fn: bevy_abi_mod_sys::RegisterComponentFn =
-        unsafe { core::mem::transmute(gpa_host_sym_ptr) };
+    let gpa_host_sym_fn: RegisterComponentFn = unsafe { core::mem::transmute(gpa_host_sym_ptr) };
 
     // Verify all function pointer addresses are bitwise identical
     let target_addr = direct_fn as *const () as usize;
@@ -426,12 +438,12 @@ fn test_callable_invocation_parity_matrix() {
 
     // Execute each descriptor across all 6 invocation paths
     for (label, desc, expected_res) in descriptors {
-        let r1 = unsafe { direct_fn(dummy_ctx, &desc) };
-        let r2 = unsafe { host_api_fn(dummy_ctx, &desc) };
-        let r3 = unsafe { reg_sym_fn(dummy_ctx, &desc) };
-        let r4 = unsafe { reg_host_sym_fn(dummy_ctx, &desc) };
-        let r5 = unsafe { gpa_sym_fn(dummy_ctx, &desc) };
-        let r6 = unsafe { gpa_host_sym_fn(dummy_ctx, &desc) };
+        let r1 = unsafe { call_register_component_with_fn(direct_fn, &desc) };
+        let r2 = unsafe { call_register_component_with_fn(host_api_fn, &desc) };
+        let r3 = unsafe { call_register_component_with_fn(reg_sym_fn, &desc) };
+        let r4 = unsafe { call_register_component_with_fn(reg_host_sym_fn, &desc) };
+        let r5 = unsafe { call_register_component_with_fn(gpa_sym_fn, &desc) };
+        let r6 = unsafe { call_register_component_with_fn(gpa_host_sym_fn, &desc) };
 
         assert_eq!(r1, expected_res, "{label} via direct_fn");
         assert_eq!(r2, expected_res, "{label} via host_api_fn");
@@ -456,7 +468,6 @@ unsafe extern "C" fn test_custom_drop(ptr: *mut c_void) {
 
 #[test]
 fn test_descriptor_with_drop_and_vtable() {
-    let dummy_ctx = 0x1234_5678_usize as *mut c_void;
     let name = c"CustomDropComp".as_ptr();
     let uuid = ComponentUuid::from_name("CustomDropComp");
 
@@ -473,7 +484,7 @@ fn test_descriptor_with_drop_and_vtable() {
     );
     assert_eq!(desc.vtable_ptr, fake_vtable as *const c_void);
 
-    let res = unsafe { host_register_component(dummy_ctx, &desc) };
+    let res = unsafe { call_register_component_fresh(&desc) };
     assert_eq!(res, FfiResult::OK);
 
     // Exercise calling the drop callback safely
@@ -491,7 +502,6 @@ fn test_descriptor_with_drop_and_vtable() {
 
 #[test]
 fn test_extreme_size_and_alignment_limits() {
-    let dummy_ctx = 0x1234_5678_usize as *mut c_void;
     let name = c"ExtremeComp".as_ptr();
     let uuid = ComponentUuid::from_name("ExtremeComp");
 
@@ -503,12 +513,12 @@ fn test_extreme_size_and_alignment_limits() {
         desc_usize_max.layout().is_none(),
         "usize::MAX layout must be None"
     );
-    let res_max = unsafe { host_register_component(dummy_ctx, &desc_usize_max) };
-    println!("host_register_component(usize::MAX, 1): {:?}", res_max);
+    let res_max = unsafe { call_register_component_fresh(&desc_usize_max) };
+    assert_eq!(res_max, FfiResult::INVALID_ARGUMENT);
 
     // Alignment 1 << 63
     let layout_res = core::alloc::Layout::from_size_align(0, 1usize << 63);
-    println!("Layout for (0, 1<<63): {:?}", layout_res);
+    let _ = layout_res;
     let desc_high_align = ModComponentDescriptor::new(name, uuid, 0, 1usize << 63);
     assert!(desc_high_align.align.is_power_of_two());
 
@@ -516,6 +526,6 @@ fn test_extreme_size_and_alignment_limits() {
     let desc_max_rust_align = ModComponentDescriptor::new(name, uuid, 0, 1usize << 29);
     assert!(desc_max_rust_align.align.is_power_of_two());
     assert!(desc_max_rust_align.layout().is_some());
-    let res = unsafe { host_register_component(dummy_ctx, &desc_max_rust_align) };
+    let res = unsafe { call_register_component_fresh(&desc_max_rust_align) };
     assert_eq!(res, FfiResult::OK);
 }

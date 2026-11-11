@@ -209,7 +209,7 @@ unsafe extern "C" fn bounds_checker_callback(
 
         // Invalid row index mark changed returns error without panic
         let err = host_iter_mark_changed(iter, 0, 999);
-        assert_eq!(err, FfiResult::INTERNAL_ERROR);
+        assert_eq!(err, FfiResult::OUT_OF_RANGE);
     }
 
     BOUNDS_CALLBACK_RUNS.fetch_add(1, Ordering::SeqCst);
@@ -408,7 +408,7 @@ fn test_memory_allocator_boundary_isolation() {
     // Inspect VTable setter
     let registry = app.world().resource::<ModRegistry>();
     let tag_meta = registry.get_by_name("MetadataTag").expect("MetadataTag");
-    let tag_vt = unsafe { &*(tag_meta.vtable_ptr as *const MetadataTagVTable) };
+    let tag_vt = unsafe { &*(tag_meta.vtable_ptr.as_ptr() as *const MetadataTagVTable) };
 
     // Mutate across boundary using guest-provided buffer
     for (i, &e) in entities.iter().enumerate() {

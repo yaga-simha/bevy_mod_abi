@@ -19,18 +19,14 @@
 //! 5. Drop Trampoline Lifecycle, Unload Safety, and Slot Reuse Challenge.
 
 use bevy_abi_mod_host::plugin::AbiModPlugin;
-use bevy_abi_mod_host_sys::chunk_iter::{
-    host_iter_column_mutable, host_iter_column_readonly, host_iter_column_stride,
-    host_iter_entities, host_iter_mark_changed, host_iter_next_chunk, host_iter_reset,
-};
-use bevy_abi_mod_host_sys::commands::{
-    CommandQueueBridge, host_cmd_insert_component, host_cmd_spawn_empty,
-};
-use bevy_abi_mod_host_sys::dynamic_system::{
-    ComponentAccessDescOwned, DynamicCSystem, ModInitContext, host_register_component,
+use bevy_abi_mod_host_sys::registry::ModRegistry;
+use bevy_abi_mod_host_sys::{
+    CommandQueueBridge, ComponentAccessDescOwned, DynamicCSystem, ModInitContext,
+    host_cmd_insert_component, host_cmd_spawn_empty, host_iter_column_mutable,
+    host_iter_column_readonly, host_iter_column_stride, host_iter_entities, host_iter_mark_changed,
+    host_iter_next_chunk, host_iter_reset, host_register_component,
     reset_drop_trampolines_for_testing,
 };
-use bevy_abi_mod_host_sys::registry::ModRegistry;
 use bevy_abi_mod_sys::{
     ComponentAccessMode, ComponentUuid, FfiEntity, FfiResult, ModComponentDescriptor, RawChunkIter,
     RawCommandQueue,
@@ -1318,7 +1314,7 @@ fn test_adversarial_drop_trampoline_slot_reuse_cross_talk() {
     println!("res_b: {:?}", res_b);
     assert_eq!(
         res_b,
-        FfiResult::INTERNAL_ERROR,
+        FfiResult::CAPACITY_EXCEEDED,
         "Alien component cannot steal slot when pool is saturated"
     );
 

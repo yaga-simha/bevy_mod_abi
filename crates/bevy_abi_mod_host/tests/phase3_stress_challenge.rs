@@ -337,10 +337,8 @@ fn test_stress_asymmetric_unload_interleaving() {
         assert_eq!(pos.z, 15.0);
     }
 
-    // Phase F: Unload all via ModHost::unload_all
-    unsafe {
-        app.world_mut().resource_mut::<ModHost>().unload_all();
-    }
+    // Phase F: Unload all via ModAppExt::unload_all_mods
+    app.unload_all_mods();
     assert!(app.world().resource::<ModHost>().is_empty());
 
     for _ in 0..5 {
@@ -764,21 +762,19 @@ fn test_stress_invalid_lifecycle_operations() {
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
 
-    // 1. Unloading non-existent ModId must safely return Err(INTERNAL_ERROR) without panic
+    // 1. Unloading non-existent ModId must safely return Err(NOT_FOUND) without panic
     let err_unload = app.unload_mod(ModId(99999));
-    assert_eq!(err_unload, Err(FfiResult::INTERNAL_ERROR));
+    assert_eq!(err_unload, Err(FfiResult::NOT_FOUND));
 
     let err_unload_zero = app.unload_mod(ModId(0));
-    assert_eq!(err_unload_zero, Err(FfiResult::INTERNAL_ERROR));
+    assert_eq!(err_unload_zero, Err(FfiResult::NOT_FOUND));
 
     // 2. Loading non-existent path must return Err(INTERNAL_ERROR)
     let err_load = app.load_mod_tracked("non_existent_library_path.dylib");
     assert_eq!(err_load, Err(FfiResult::INTERNAL_ERROR));
 
-    // 3. ModHost unload_all on empty host is safe no-op
-    unsafe {
-        app.world_mut().resource_mut::<ModHost>().unload_all();
-    }
+    // 3. ModAppExt unload_all_mods on empty host is safe no-op
+    app.unload_all_mods();
     assert!(app.world().resource::<ModHost>().is_empty());
 }
 
