@@ -98,7 +98,7 @@ BEVY_ABI_MOD_EXPORT FfiResult bevy_abi_mod_init(
     void* host_context
 ) {
     if (!host_api ||
-        host_api->struct_size < (offsetof(HostApi, register_component) + sizeof(RegisterComponentFn)) ||
+        bam_host_api_raw_struct_size(host_api) < (offsetof(HostApi, register_component) + sizeof(RegisterComponentFn)) ||
         ((host_api->abi_version >> 24) & 0xFFu) != BEVY_ABI_VERSION_MAJOR ||
         ((host_api->abi_version >> 16) & 0xFFu) < BEVY_ABI_VERSION_MINOR) {
         return FFI_RESULT_INVALID_VERSION;

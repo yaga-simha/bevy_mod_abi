@@ -145,7 +145,7 @@ miri: ## Run Miri (-Zmiri-tree-borrows) on in-process ABI, macro, SDK, fuzz, and
 	@echo -e "$(GREEN)[MIRI]$(RESET) Running Miri (-Zmiri-tree-borrows) on abi_contract & guest_sdk..."
 	MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p abi_contract -p guest_sdk
 	@echo -e "$(GREEN)[MIRI]$(RESET) Running Miri (-Zmiri-tree-borrows) on mod_derive in-process suites..."
-	MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p mod_derive --lib --test validation_gate_1 --test challenger_m1_macro_tests --test compile_fail_tests
+	MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p mod_derive --lib --test validation_gate_1 --test compile_fail_tests
 	@echo -e "$(GREEN)[MIRI]$(RESET) Running Miri (-Zmiri-tree-borrows) on host_runtime non-dlopen suites..."
 	MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p host_runtime --lib --test bevy_alignment_soundness_tests --test fuzz_abi_boundaries --test differential_bevy_parity -- --skip real_dylib_loaded_mod_entity_lifecycle_events_and_strict_validation_work
 

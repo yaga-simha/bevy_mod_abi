@@ -87,7 +87,7 @@ fn validation_gate_1_vtable_layout_and_field_mutations() {
         host_private_cache: Some(String::from("kept_on_host")),
     };
 
-    let comp_ptr = &mut comp as *mut MixedComponent as *mut c_void;
+    let comp_ptr = core::ptr::addr_of_mut!(comp) as *mut c_void;
     let comp_const_ptr = comp_ptr as *const c_void;
 
     // 2. Verify primitive and u8-bool getters & setters via VTable function pointers
@@ -213,7 +213,7 @@ fn validation_gate_1_self_aliasing_string_and_vec_setters() {
         scores: vec![10, 20, 30, 40, 50],
         host_private_cache: None,
     };
-    let ptr = &mut comp as *mut MixedComponent as *mut c_void;
+    let ptr = core::ptr::addr_of_mut!(comp) as *mut c_void;
 
     // SAFETY: Passing the slice returned by `get_tag(ptr)` and a sub-slice of it directly
     // back into `set_tag(ptr, ...)` tests the B1 self-aliasing overlap guard.
@@ -328,7 +328,7 @@ fn validation_gate_1_byte_stride_array_iteration_and_symbol_resolution() {
     // Also test tuple struct `NameTag(String)`
     let mut name_tag = NameTag(String::from("hero"));
     let name_tag_vt = NameTag::vtable();
-    let nt_ptr = &mut name_tag as *mut NameTag as *mut c_void;
+    let nt_ptr = core::ptr::addr_of_mut!(name_tag) as *mut c_void;
     // SAFETY: `nt_ptr` points to a valid `NameTag`.
     unsafe {
         assert_eq!(
@@ -436,7 +436,7 @@ fn validation_gate_1_pod_vs_opaque_and_bool_soundness() {
         weights: [0.25, 0.25, 0.25, 0.25],
     };
     let xform_vt = PodEntityTransform::vtable();
-    let xform_ptr = &mut xform as *mut PodEntityTransform as *mut c_void;
+    let xform_ptr = core::ptr::addr_of_mut!(xform) as *mut c_void;
     // SAFETY: `xform_ptr` points to a valid `PodEntityTransform`, and null check is tested explicitly.
     unsafe {
         assert!((xform_vt.get_target)(core::ptr::null()).is_null());
@@ -455,7 +455,7 @@ fn validation_gate_1_pod_vs_opaque_and_bool_soundness() {
     };
     let holder_vt = OpaqueNamedHolder::vtable();
     let name_vt = NameTag::vtable();
-    let holder_ptr = &mut holder as *mut OpaqueNamedHolder as *mut c_void;
+    let holder_ptr = core::ptr::addr_of_mut!(holder) as *mut c_void;
     // SAFETY: `holder_ptr` points to a valid `OpaqueNamedHolder` and `ptr_mut_name` returns interior `&mut NameTag`.
     unsafe {
         let inner_name_ptr = (holder_vt.ptr_mut_name)(holder_ptr);

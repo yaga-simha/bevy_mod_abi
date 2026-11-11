@@ -1434,11 +1434,23 @@ fn get_example_3_dylibs() -> (PathBuf, PathBuf) {
     let c_mod_dir = root.join("examples/03_cross_language_interop/c_mod");
     let c_dylib = c_mod_dir.join(format!("{prefix}c_mod.{ext}"));
     if !c_dylib.exists() {
-        let status = Command::new("make")
-            .arg("-C")
-            .arg(&c_mod_dir)
-            .status()
-            .expect("Failed to build Example 3 C mod");
+        let status = if cfg!(target_os = "windows") {
+            Command::new("gcc")
+                .args(["-std=c99", "-Wall", "-Wextra", "-Werror", "-I"])
+                .arg(root.join("include"))
+                .args(["-O3", "-shared"])
+                .arg(c_mod_dir.join("mod.c"))
+                .arg("-o")
+                .arg(&c_dylib)
+                .status()
+                .expect("Failed to build Example 3 C mod with gcc")
+        } else {
+            Command::new("make")
+                .arg("-C")
+                .arg(&c_mod_dir)
+                .status()
+                .expect("Failed to build Example 3 C mod")
+        };
         assert!(status.success());
     }
 

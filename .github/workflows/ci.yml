@@ -115,7 +115,6 @@ jobs:
           cargo +nightly miri test -p mod_derive \
             --lib \
             --test validation_gate_1 \
-            --test challenger_m1_macro_tests \
             --test compile_fail_tests
 
       - name: Run Miri on host_runtime non-dlopen soundness, fuzz & parity suites
@@ -195,7 +194,7 @@ jobs:
           RUSTFLAGS: "-Zrandomize-layout"
         run: |
           cargo +nightly test -p abi_contract -p guest_sdk
-          cargo +nightly test -p mod_derive --lib --test validation_gate_1 --test challenger_m1_macro_tests
+          cargo +nightly test -p mod_derive --lib --test validation_gate_1
           cargo +nightly test -p host_runtime \
             --lib \
             --test integration_tests \

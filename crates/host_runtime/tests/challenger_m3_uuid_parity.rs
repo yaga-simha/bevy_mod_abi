@@ -21,7 +21,14 @@ fn compile_and_load_c_uuid_oracle() -> (Library, PathBuf) {
     fs::create_dir_all(&target_dir).expect("Failed to create target/challenger_test directory");
 
     let c_source_path = target_dir.join("c_uuid_oracle.c");
-    let dylib_path = target_dir.join("libc_uuid_oracle.dylib");
+    let dylib_name = if cfg!(target_os = "windows") {
+        "c_uuid_oracle.dll"
+    } else if cfg!(target_os = "macos") {
+        "libc_uuid_oracle.dylib"
+    } else {
+        "libc_uuid_oracle.so"
+    };
+    let dylib_path = target_dir.join(dylib_name);
 
     let c_code = r#"
 #include <stdint.h>
@@ -37,16 +44,26 @@ BEVY_ABI_MOD_EXPORT void c_uuid_from_name(const char* name, uint8_t* out_bytes) 
 
     fs::write(&c_source_path, c_code).expect("Failed to write c_uuid_oracle.c");
 
-    let status = Command::new("cc")
+    let compiler = if cfg!(target_os = "windows") {
+        "gcc"
+    } else {
+        "cc"
+    };
+    let mut cmd = Command::new(compiler);
+    cmd.args([
+        "-std=c99",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-I",
+        root.join("include").to_str().unwrap(),
+        "-shared",
+    ]);
+    if !cfg!(target_os = "windows") {
+        cmd.arg("-fPIC");
+    }
+    let status = cmd
         .args([
-            "-std=c99",
-            "-Wall",
-            "-Wextra",
-            "-Werror",
-            "-I",
-            root.join("include").to_str().unwrap(),
-            "-shared",
-            "-fPIC",
             "-O3",
             "-o",
             dylib_path.to_str().unwrap(),
@@ -55,12 +72,9 @@ BEVY_ABI_MOD_EXPORT void c_uuid_from_name(const char* name, uint8_t* out_bytes) 
         .status()
         .expect("Failed to compile c_uuid_oracle.c");
 
-    assert!(
-        status.success(),
-        "cc failed to build libc_uuid_oracle.dylib"
-    );
+    assert!(status.success(), "{compiler} failed to build {dylib_name}");
 
-    let lib = unsafe { Library::new(&dylib_path) }.expect("Failed to load libc_uuid_oracle.dylib");
+    let lib = unsafe { Library::new(&dylib_path) }.expect("Failed to load c_uuid_oracle library");
     (lib, dylib_path)
 }
 

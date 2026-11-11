@@ -1558,11 +1558,14 @@ fn differential_multi_world_parallel_thread_scope_executor_and_drop_isolation() 
     // Pollute GLOBAL_SYMBOLS before spawning concurrent Worlds to ensure Bevy worker threads
     // NEVER fall back to GLOBAL_SYMBOLS when `CURRENT_REGISTRY` is bound by `DynamicCSystem::run_unsafe`!
     let mut poison_reg = ModRegistry::new();
-    poison_reg.insert_symbol("GlobalPoisonOnlySym", 0xDEAD_BEEFusize as *const c_void);
+    poison_reg.insert_symbol(
+        "GlobalPoisonOnlySym",
+        core::ptr::without_provenance(0xDEAD_BEEF),
+    );
     for idx in 0..ACTIVE_WORLDS {
         poison_reg.insert_symbol(
             format!("WorldPrivateSym_{idx}"),
-            (0x9000 + idx) as *const c_void,
+            core::ptr::without_provenance(0x9000 + idx),
         );
     }
 
@@ -1580,10 +1583,13 @@ fn differential_multi_world_parallel_thread_scope_executor_and_drop_isolation() 
                 let expected_sym = 0x50000usize + w_idx * 0x100 + 7;
                 {
                     let mut reg = app.world_mut().resource_mut::<ModRegistry>();
-                    reg.insert_symbol("OwnScopedWorldSym", expected_sym as *const c_void);
+                    reg.insert_symbol(
+                        "OwnScopedWorldSym",
+                        core::ptr::without_provenance(expected_sym),
+                    );
                     reg.insert_symbol(
                         format!("WorldPrivateSym_{w_idx}"),
-                        expected_sym as *const c_void,
+                        core::ptr::without_provenance(expected_sym),
                     );
                 }
 

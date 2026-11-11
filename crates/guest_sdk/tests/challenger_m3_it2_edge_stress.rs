@@ -43,7 +43,7 @@ fn test_zst_slices_adversarial_matrix() {
     );
 
     // 2. ZST with alignments 4, 16, 64
-    let aligned_64 = 0x1000 as *const u8;
+    let aligned_64 = core::ptr::without_provenance::<u8>(0x1000);
     // 0x1000 is aligned to 4, 16, and 64
     assert_eq!((aligned_64 as usize) % 4, 0);
     assert_eq!((aligned_64 as usize) % 16, 0);
@@ -67,7 +67,8 @@ fn test_zst_slices_adversarial_matrix() {
         Some(50)
     );
 
-    let mut slice_mut_zst64 = ChunkSliceMut::new(aligned_64 as *mut u8, 0, 50);
+    let aligned_64_mut = core::ptr::without_provenance_mut::<u8>(0x1000);
+    let mut slice_mut_zst64 = ChunkSliceMut::new(aligned_64_mut, 0, 50);
     assert_eq!(
         slice_mut_zst64
             .as_typed_slice::<ZstAlign64>()
@@ -76,11 +77,12 @@ fn test_zst_slices_adversarial_matrix() {
     );
 
     // Unaligned pointer for ZST with align 64 (0x1001 % 64 != 0)
-    let unaligned_64 = 0x1001 as *const u8;
+    let unaligned_64 = core::ptr::without_provenance::<u8>(0x1001);
     let slice_unaligned = ChunkSlice::new(unaligned_64, 0, 50);
     assert_eq!(slice_unaligned.as_typed_slice::<ZstAlign64>(), None);
 
-    let mut slice_mut_unaligned = ChunkSliceMut::new(unaligned_64 as *mut u8, 0, 50);
+    let mut slice_mut_unaligned =
+        ChunkSliceMut::new(core::ptr::without_provenance_mut::<u8>(0x1001), 0, 50);
     assert_eq!(slice_mut_unaligned.as_typed_slice::<ZstAlign64>(), None);
 
     // 3. Stride mismatch for ZST (stride != 0 must be rejected)
@@ -88,7 +90,7 @@ fn test_zst_slices_adversarial_matrix() {
         let slice = ChunkSlice::new(aligned_64, bad_stride, 10);
         assert_eq!(slice.as_typed_slice::<ZstAlign64>(), None);
 
-        let mut slice_mut = ChunkSliceMut::new(aligned_64 as *mut u8, bad_stride, 10);
+        let mut slice_mut = ChunkSliceMut::new(aligned_64_mut, bad_stride, 10);
         assert_eq!(slice_mut.as_typed_slice::<ZstAlign64>(), None);
     }
 
@@ -102,7 +104,7 @@ fn test_zst_slices_adversarial_matrix() {
         Some(isize::MAX as usize)
     );
 
-    let mut slice_mut_at_isize = ChunkSliceMut::new(aligned_64 as *mut u8, 0, isize::MAX as usize);
+    let mut slice_mut_at_isize = ChunkSliceMut::new(aligned_64_mut, 0, isize::MAX as usize);
     assert_eq!(
         slice_mut_at_isize
             .as_typed_slice::<ZstAlign64>()
@@ -114,15 +116,14 @@ fn test_zst_slices_adversarial_matrix() {
     let slice_over_isize = ChunkSlice::new(aligned_64, 0, (isize::MAX as usize) + 1);
     assert_eq!(slice_over_isize.as_typed_slice::<ZstAlign64>(), None);
 
-    let mut slice_mut_over_isize =
-        ChunkSliceMut::new(aligned_64 as *mut u8, 0, (isize::MAX as usize) + 1);
+    let mut slice_mut_over_isize = ChunkSliceMut::new(aligned_64_mut, 0, (isize::MAX as usize) + 1);
     assert_eq!(slice_mut_over_isize.as_typed_slice::<ZstAlign64>(), None);
 
     // Count = usize::MAX: MUST be rejected (returns None)
     let slice_max = ChunkSlice::new(aligned_64, 0, usize::MAX);
     assert_eq!(slice_max.as_typed_slice::<ZstAlign64>(), None);
 
-    let mut slice_mut_max = ChunkSliceMut::new(aligned_64 as *mut u8, 0, usize::MAX);
+    let mut slice_mut_max = ChunkSliceMut::new(aligned_64_mut, 0, usize::MAX);
     assert_eq!(slice_mut_max.as_typed_slice::<ZstAlign64>(), None);
 }
 
@@ -135,7 +136,8 @@ fn test_pointer_wrapping_address_space() {
     // 1. Pointer at usize::MAX - 7 (aligned to 8 if (usize::MAX - 7) % 8 == 0)
     // In 64-bit: usize::MAX is 0xFFFF_FFFF_FFFF_FFFF (odd, % 8 == 7).
     // So (usize::MAX - 7) ends in ...FFF8, which is divisible by 8!
-    let top_aligned_8 = (usize::MAX - 7) as *const u8;
+    let top_aligned_8 = core::ptr::without_provenance::<u8>(usize::MAX - 7);
+    let top_aligned_8_mut = core::ptr::without_provenance_mut::<u8>(usize::MAX - 7);
     assert_eq!((top_aligned_8 as usize) % 8, 0);
 
     // If count = 1: total_bytes = 8.
@@ -144,14 +146,14 @@ fn test_pointer_wrapping_address_space() {
     let slice_wrap1 = ChunkSlice::new(top_aligned_8, size, 1);
     assert_eq!(slice_wrap1.as_typed_slice::<ValAlign8>(), None);
 
-    let mut slice_mut_wrap1 = ChunkSliceMut::new(top_aligned_8 as *mut u8, size, 1);
+    let mut slice_mut_wrap1 = ChunkSliceMut::new(top_aligned_8_mut, size, 1);
     assert_eq!(slice_mut_wrap1.as_typed_slice::<ValAlign8>(), None);
 
     // If count = 2: total_bytes = 16. Also wraps around address space -> None
     let slice_wrap2 = ChunkSlice::new(top_aligned_8, size, 2);
     assert_eq!(slice_wrap2.as_typed_slice::<ValAlign8>(), None);
 
-    let mut slice_mut_wrap2 = ChunkSliceMut::new(top_aligned_8 as *mut u8, size, 2);
+    let mut slice_mut_wrap2 = ChunkSliceMut::new(top_aligned_8_mut, size, 2);
     assert_eq!(slice_mut_wrap2.as_typed_slice::<ValAlign8>(), None);
 
     // 2. Wrap detection in get_ptr and get_ptr_mut
@@ -161,27 +163,25 @@ fn test_pointer_wrapping_address_space() {
     // index 1: offset = 8. (usize::MAX - 7) + 8 wraps -> must return None!
     assert_eq!(slice_ptr_wrap.get_ptr(1), None);
 
-    let mut slice_mut_ptr_wrap = ChunkSliceMut::new(top_aligned_8 as *mut u8, size, 2);
-    assert_eq!(
-        slice_mut_ptr_wrap.get_ptr_mut(0),
-        Some(top_aligned_8 as *mut u8)
-    );
+    let mut slice_mut_ptr_wrap = ChunkSliceMut::new(top_aligned_8_mut, size, 2);
+    assert_eq!(slice_mut_ptr_wrap.get_ptr_mut(0), Some(top_aligned_8_mut));
     assert_eq!(slice_mut_ptr_wrap.get_ptr_mut(1), None);
 
     // 3. Pointer at usize::MAX for u8 (align 1)
-    let top_u8 = usize::MAX as *const u8;
+    let top_u8 = core::ptr::without_provenance::<u8>(usize::MAX);
+    let top_u8_mut = core::ptr::without_provenance_mut::<u8>(usize::MAX);
     // count = 1: top_u8 + 1 wraps -> None
     let slice_u8_wrap = ChunkSlice::new(top_u8, 1, 1);
     assert_eq!(slice_u8_wrap.as_typed_slice::<u8>(), None);
 
-    let mut slice_mut_u8_wrap = ChunkSliceMut::new(top_u8 as *mut u8, 1, 1);
+    let mut slice_mut_u8_wrap = ChunkSliceMut::new(top_u8_mut, 1, 1);
     assert_eq!(slice_mut_u8_wrap.as_typed_slice::<u8>(), None);
 
     // count = 0: empty slice, should succeed regardless of pointer value
     let slice_u8_zero = ChunkSlice::new(top_u8, 1, 0);
     assert_eq!(slice_u8_zero.as_typed_slice::<u8>(), Some(&[][..]));
 
-    let mut slice_mut_u8_zero = ChunkSliceMut::new(top_u8 as *mut u8, 1, 0);
+    let mut slice_mut_u8_zero = ChunkSliceMut::new(top_u8_mut, 1, 0);
     assert_eq!(slice_mut_u8_zero.as_typed_slice::<u8>(), Some(&mut [][..]));
 }
 

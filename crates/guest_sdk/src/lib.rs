@@ -134,9 +134,14 @@ where
 // ============================================================================
 
 struct ErasedAllocation {
-    ptr: usize,
+    ptr: *mut c_void,
     drop_fn: unsafe fn(*mut c_void),
 }
+
+// SAFETY: Every allocation tracked in `ErasedAllocation` is constructed from a
+// `Send + 'static` value (`alloc_user_data`, `on_shutdown`, or system/condition closure state)
+// and is dropped at most once during rollback or `bevy_abi_mod_shutdown`.
+unsafe impl Send for ErasedAllocation {}
 
 unsafe fn drop_boxed_allocation<T>(ptr: *mut c_void) {
     if !ptr.is_null() {
@@ -165,7 +170,7 @@ fn drop_allocation_list_lifo(mut list: Vec<ErasedAllocation>) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // SAFETY: Each `ErasedAllocation` owns a unique guest-heap allocation paired with
             // its matching monomorphized `drop_fn`.
-            unsafe { (alloc.drop_fn)(alloc.ptr as *mut c_void) };
+            unsafe { (alloc.drop_fn)(alloc.ptr) };
         }));
     }
 }
@@ -2652,7 +2657,7 @@ impl<'a> GuestApp<'a> {
     pub fn alloc_user_data<T: Send + 'static>(&mut self, value: T) -> *mut T {
         let raw = Box::into_raw(Box::new(value));
         self.staged_allocations.push(ErasedAllocation {
-            ptr: raw as usize,
+            ptr: raw.cast::<c_void>(),
             drop_fn: drop_boxed_allocation::<T>,
         });
         raw
@@ -2668,7 +2673,7 @@ impl<'a> GuestApp<'a> {
             hook: Some(cleanup),
         }));
         self.staged_allocations.push(ErasedAllocation {
-            ptr: raw as usize,
+            ptr: raw.cast::<c_void>(),
             drop_fn: drop_boxed_allocation::<ShutdownHook<F>>,
         });
     }
@@ -2712,7 +2717,7 @@ impl<'a> GuestApp<'a> {
         let status = unsafe { (self.host_api.register_system)(self.host_context, &desc) };
         if status.is_ok() {
             self.staged_allocations.push(ErasedAllocation {
-                ptr: state_ptr as usize,
+                ptr: state_ptr.cast::<c_void>(),
                 drop_fn: drop_boxed_allocation::<SystemClosureState<F>>,
             });
         } else {
@@ -2779,11 +2784,11 @@ impl<'a> GuestApp<'a> {
 
         if status.is_ok() {
             self.staged_allocations.push(ErasedAllocation {
-                ptr: state_ptr as usize,
+                ptr: state_ptr.cast::<c_void>(),
                 drop_fn: drop_boxed_allocation::<SystemClosureState<F>>,
             });
             self.staged_allocations.push(ErasedAllocation {
-                ptr: cond_ptr as usize,
+                ptr: cond_ptr.cast::<c_void>(),
                 drop_fn: drop_boxed_allocation::<RunConditionClosureState<C>>,
             });
         } else {
@@ -2853,7 +2858,7 @@ impl<'a> GuestApp<'a> {
         let status = unsafe { register_mq(self.host_context, &desc) };
         if status.is_ok() {
             self.staged_allocations.push(ErasedAllocation {
-                ptr: state_ptr as usize,
+                ptr: state_ptr.cast::<c_void>(),
                 drop_fn: drop_boxed_allocation::<MultiQueryClosureState<F>>,
             });
         } else {
@@ -2939,11 +2944,11 @@ impl<'a> GuestApp<'a> {
 
         if status.is_ok() {
             self.staged_allocations.push(ErasedAllocation {
-                ptr: state_ptr as usize,
+                ptr: state_ptr.cast::<c_void>(),
                 drop_fn: drop_boxed_allocation::<MultiQueryClosureState<F>>,
             });
             self.staged_allocations.push(ErasedAllocation {
-                ptr: cond_ptr as usize,
+                ptr: cond_ptr.cast::<c_void>(),
                 drop_fn: drop_boxed_allocation::<RunConditionClosureState<C>>,
             });
         } else {
@@ -3209,7 +3214,7 @@ mod tests {
         }
 
         let mut queue = GuestCommandQueue::new(
-            0x1234 as *mut RawCommandQueue,
+            core::ptr::without_provenance_mut(0x1234),
             CommandBridgeVTable {
                 spawn_empty: None,
                 despawn: None,
@@ -3299,7 +3304,7 @@ mod tests {
             register_component: mock_register_component,
         };
 
-        let dummy_ctx = 0x1234usize as *mut c_void;
+        let dummy_ctx = core::ptr::without_provenance_mut(0x1234);
 
         // 1. POD component -> drop_fn == None
         let res = unsafe {
@@ -3405,7 +3410,7 @@ mod tests {
             remove_component: Some(mock_remove),
             insert_default: Some(mock_insert_default),
         };
-        let mut queue = GuestCommandQueue::with_ext(0x9999 as *mut RawCommandQueue, ext);
+        let mut queue = GuestCommandQueue::with_ext(core::ptr::without_provenance_mut(0x9999), ext);
         assert_eq!(
             queue.remove_guest_component::<PosData>(FfiEntity(77)),
             FfiResult::OK
@@ -3524,7 +3529,7 @@ mod tests {
             FfiResult::OK
         }
 
-        let host_api = Box::leak(Box::new(HostApi {
+        let host_api = HostApi {
             struct_size: core::mem::size_of::<HostApi>() as u32,
             abi_version: abi_contract::ABI_VERSION_PACKED,
             register_system: stub_reg_sys,
@@ -3535,7 +3540,7 @@ mod tests {
             iter_entities: stub_ents,
             iter_column_stride: stub_stride,
             register_component: stub_reg_comp,
-        }));
+        };
 
         // Reset shared value
         *SHARED_RES.lock().unwrap() = PosData { x: 10.0, y: 20.0 };
@@ -3544,8 +3549,8 @@ mod tests {
         let mut app = unsafe {
             GuestApp::from_raw(
                 mock_get_proc_address,
-                host_api as *const HostApi,
-                0x5555 as *mut c_void,
+                &host_api as *const HostApi,
+                core::ptr::without_provenance_mut(0x5555),
             )
             .expect("GuestApp::from_raw")
         };
@@ -3587,8 +3592,8 @@ mod tests {
         // SAFETY: Reconstructing `MultiQuerySystemCallback` captured by `mock_reg_multi`.
         let cb: MultiQuerySystemCallback = unsafe { core::mem::transmute(cb_ptr) };
         let raw_iters = [
-            GROUP0_SENTINEL as *mut RawChunkIter,
-            GROUP1_SENTINEL as *mut RawChunkIter,
+            core::ptr::without_provenance_mut(GROUP0_SENTINEL),
+            core::ptr::without_provenance_mut(GROUP1_SENTINEL),
         ];
         // SAFETY: Invoking registered multi-query trampoline with 2 mock iterators.
         let status = unsafe { cb(raw_iters.as_ptr(), 2, core::ptr::null_mut(), ud_ptr) };

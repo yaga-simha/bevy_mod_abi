@@ -513,9 +513,10 @@ fn test_rejects_overlapping_host_byte_ranges_even_with_distinct_indices() {
 fn test_entities_slice_defensive_bounds_and_empty_chunks() {
     let api = mock_host_api();
     let valid_entities = [FfiEntity(7), FfiEntity(8)];
-    let unaligned_buf = [0u8; 32];
-    let unaligned_entities_ptr = unsafe { unaligned_buf.as_ptr().add(1) } as *const FfiEntity;
-    let wrapping_entities_ptr = (usize::MAX - 3) as *const FfiEntity;
+    let unaligned_buf = [0u64; 4];
+    let unaligned_entities_ptr =
+        unsafe { (unaligned_buf.as_ptr() as *const u8).add(1) } as *const FfiEntity;
+    let wrapping_entities_ptr = core::ptr::without_provenance::<FfiEntity>(usize::MAX - 3);
 
     let mut state = MockIterState {
         chunks: vec![
@@ -729,7 +730,7 @@ fn test_guest_app_zero_leak_shutdown_and_lifo_drop_order() {
         run_guest_app_init(
             mock_get_proc_address,
             &api,
-            &mut world as *mut MockHostWorld as *mut c_void,
+            core::ptr::addr_of_mut!(world) as *mut c_void,
             move |app| {
                 let raw_ctx = app.alloc_user_data(DropTracker::new(
                     "alloc_user_data_1",
@@ -853,8 +854,8 @@ fn test_guest_app_zero_leak_shutdown_and_lifo_drop_order() {
     let (_name, single_cb, single_ud) = world.registered_single[0].clone();
     let single_res = unsafe {
         single_cb(
-            &mut single_iter_state as *mut MockIterState as *mut RawChunkIter,
-            &mut world as *mut MockHostWorld as *mut RawCommandQueue,
+            core::ptr::addr_of_mut!(single_iter_state) as *mut RawChunkIter,
+            core::ptr::addr_of_mut!(world) as *mut RawCommandQueue,
             single_ud,
         )
     };
@@ -893,8 +894,8 @@ fn test_guest_app_zero_leak_shutdown_and_lifo_drop_order() {
         reset_calls: 0,
     };
     let mut raw_iters = [
-        &mut q0_state as *mut MockIterState as *mut RawChunkIter,
-        &mut q1_state as *mut MockIterState as *mut RawChunkIter,
+        core::ptr::addr_of_mut!(q0_state) as *mut RawChunkIter,
+        core::ptr::addr_of_mut!(q1_state) as *mut RawChunkIter,
     ];
 
     let (_mq_name, mq_cb, mq_ud, mq_count) = world.registered_multi[0].clone();
@@ -902,7 +903,7 @@ fn test_guest_app_zero_leak_shutdown_and_lifo_drop_order() {
         mq_cb(
             raw_iters.as_mut_ptr(),
             mq_count,
-            &mut world as *mut MockHostWorld as *mut RawCommandQueue,
+            core::ptr::addr_of_mut!(world) as *mut RawCommandQueue,
             mq_ud,
         )
     };
@@ -954,7 +955,7 @@ fn test_guest_app_rollback_on_failed_or_panicking_init_leaves_zero_leaks() {
             run_guest_app_init(
                 mock_get_proc_address,
                 &api,
-                &mut world as *mut MockHostWorld as *mut c_void,
+                core::ptr::addr_of_mut!(world) as *mut c_void,
                 move |app| {
                     let _ = app.alloc_user_data(DropTracker::new(
                         "staged_ctx",
@@ -998,7 +999,7 @@ fn test_guest_app_rollback_on_failed_or_panicking_init_leaves_zero_leaks() {
             run_guest_app_init(
                 mock_get_proc_address,
                 &api,
-                &mut world as *mut MockHostWorld as *mut c_void,
+                core::ptr::addr_of_mut!(world) as *mut c_void,
                 move |app| {
                     let _ = app.alloc_user_data(DropTracker::new(
                         "panic_staged_ctx",
@@ -1025,16 +1026,22 @@ fn test_reentrant_closure_invocation_returns_access_conflict() {
         .unwrap_or_else(|p| p.into_inner());
     cleanup_registered_guest_state();
 
+    #[derive(Clone, Copy)]
+    struct SendWorldPtr(*const MockHostWorld);
+    // SAFETY: Used strictly on the current test thread during synchronous reentrant callback test.
+    unsafe impl Send for SendWorldPtr {}
+
     let mut api = mock_host_api();
     api.register_system = world_register_system;
     let mut world = MockHostWorld::new();
-    let world_ptr = &mut world as *mut MockHostWorld;
+    let world_ptr = core::ptr::addr_of_mut!(world);
 
-    let world_addr = world_ptr as usize;
+    let send_ptr = SendWorldPtr(world_ptr);
     let setup = move |app: &mut GuestApp<'_>| {
         app.add_system(c"reentrant_probe", &[], move |_ctx| {
             // Attempt illegal re-entrant invocation of the same system closure while locked
-            let w = unsafe { &*(world_addr as *const MockHostWorld) };
+            let sp = send_ptr;
+            let w = unsafe { &*sp.0 };
             let (_name, cb, ud) = &w.registered_single[0];
             let nested = unsafe { (*cb)(core::ptr::null_mut(), core::ptr::null_mut(), *ud) };
             assert_eq!(nested, FfiResult::ACCESS_CONFLICT);
@@ -1058,6 +1065,7 @@ fn test_reentrant_closure_invocation_returns_access_conflict() {
 // ============================================================================
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn test_asymmetric_c99_and_rust_mods_compile_cleanly() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let repo_root = manifest_dir
@@ -1066,12 +1074,27 @@ fn test_asymmetric_c99_and_rust_mods_compile_cleanly() {
         .expect("workspace root exists");
 
     let c_mod_dir = repo_root.join("tests").join("asymmetric_c_mod");
-    let make_status = Command::new("make")
-        .arg("-C")
-        .arg(&c_mod_dir)
-        .status()
-        .expect("failed to invoke make for asymmetric_c_mod");
-    assert!(make_status.success(), "asymmetric_c_mod C99 build failed");
+    let c_status = if cfg!(target_os = "windows") {
+        let target_dir = repo_root.join("target");
+        let _ = std::fs::create_dir_all(&target_dir);
+        let out_dll = target_dir.join("asymmetric_c_mod_compile_check.dll");
+        Command::new("gcc")
+            .args(["-std=c99", "-Wall", "-Wextra", "-Werror", "-I"])
+            .arg(repo_root.join("include"))
+            .args(["-O3", "-shared"])
+            .arg(c_mod_dir.join("mod.c"))
+            .arg("-o")
+            .arg(&out_dll)
+            .status()
+            .expect("failed to invoke gcc for asymmetric_c_mod")
+    } else {
+        Command::new("make")
+            .arg("-C")
+            .arg(&c_mod_dir)
+            .status()
+            .expect("failed to invoke make for asymmetric_c_mod")
+    };
+    assert!(c_status.success(), "asymmetric_c_mod C99 build failed");
 
     let rust_mod_manifest = repo_root
         .join("tests")

@@ -86,8 +86,12 @@ struct DropRegistryState {
     slots: Vec<DropSlotMeta>,
     /// Retains retired `DropSlotSnapshot` allocations across rare hot-reloads or test resets so
     /// lock-free readers on `DROP_SLOT_SNAPSHOTS` never dereference freed memory.
-    retired: Vec<usize>,
+    retired: Vec<*mut DropSlotSnapshot>,
 }
+
+// SAFETY: `DropRegistryState` owns the retired `DropSlotSnapshot` allocations (which contain
+// `ComponentDropFn` and `Arc<AtomicBool>`, both `Send + Sync`) and is synchronized via `Mutex`.
+unsafe impl Send for DropRegistryState {}
 
 static DROP_REGISTRY: LazyLock<Mutex<DropRegistryState>> = LazyLock::new(|| {
     Mutex::new(DropRegistryState {
@@ -215,7 +219,7 @@ fn allocate_drop_trampoline(
         }));
         let old_snap = DROP_SLOT_SNAPSHOTS[slot_idx].swap(new_snap, Ordering::AcqRel);
         if !old_snap.is_null() {
-            reg.retired.push(old_snap as usize);
+            reg.retired.push(old_snap);
         }
         return Some(drop_trampoline_fn_for_slot(slot_idx));
     }
@@ -232,7 +236,7 @@ fn allocate_drop_trampoline(
     }));
     let old_snap = DROP_SLOT_SNAPSHOTS[slot_idx].swap(new_snap, Ordering::AcqRel);
     if !old_snap.is_null() {
-        reg.retired.push(old_snap as usize);
+        reg.retired.push(old_snap);
     }
     reg.slots.push(DropSlotMeta {
         world_id,
@@ -255,7 +259,7 @@ pub fn reset_drop_trampolines_for_testing() {
     for slot in DROP_SLOT_SNAPSHOTS.iter().take(used) {
         let old = slot.swap(core::ptr::null_mut(), Ordering::AcqRel);
         if !old.is_null() {
-            reg.retired.push(old as usize);
+            reg.retired.push(old);
         }
     }
     reg.slots.clear();

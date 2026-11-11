@@ -99,7 +99,7 @@ fn test_insert_null_queue_returns_null_pointer() {
 fn test_insert_missing_vtable_function_returns_null_pointer() {
     let mut ctx = TestContext::default();
     let mut queue = GuestCommandQueue::new(
-        &mut ctx as *mut TestContext as *mut RawCommandQueue,
+        core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
         CommandBridgeVTable {
             spawn_empty: None,
             despawn: None,
@@ -120,7 +120,7 @@ fn test_insert_missing_vtable_function_returns_null_pointer() {
 fn test_insert_error_propagation() {
     let mut ctx = TestContext::default();
     let mut queue = GuestCommandQueue::new(
-        &mut ctx as *mut TestContext as *mut RawCommandQueue,
+        core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
         CommandBridgeVTable {
             spawn_empty: None,
             despawn: None,
@@ -141,7 +141,7 @@ fn test_insert_error_propagation() {
 fn test_insert_value_and_slice_valid_data() {
     let mut ctx = TestContext::default();
     let mut queue = GuestCommandQueue::new(
-        &mut ctx as *mut TestContext as *mut RawCommandQueue,
+        core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
         CommandBridgeVTable {
             spawn_empty: None,
             despawn: None,
@@ -188,7 +188,7 @@ fn test_insert_value_and_slice_valid_data() {
 fn test_data_content_fidelity() {
     let mut ctx = TestContext::default();
     let mut queue = GuestCommandQueue::new(
-        &mut ctx as *mut TestContext as *mut RawCommandQueue,
+        core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
         CommandBridgeVTable {
             spawn_empty: None,
             despawn: None,
@@ -216,7 +216,7 @@ fn test_data_content_fidelity() {
 fn test_insert_zero_sized_types_and_empty_slices() {
     let mut ctx = TestContext::default();
     let mut queue = GuestCommandQueue::new(
-        &mut ctx as *mut TestContext as *mut RawCommandQueue,
+        core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
         CommandBridgeVTable {
             spawn_empty: None,
             despawn: None,
@@ -253,7 +253,7 @@ fn test_insert_zero_sized_types_and_empty_slices() {
 fn test_insert_overaligned_type() {
     let mut ctx = TestContext::default();
     let mut queue = GuestCommandQueue::new(
-        &mut ctx as *mut TestContext as *mut RawCommandQueue,
+        core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
         CommandBridgeVTable {
             spawn_empty: None,
             despawn: None,
@@ -275,7 +275,7 @@ fn test_insert_overaligned_type() {
 fn test_insert_large_slice_scale() {
     let mut ctx = TestContext::default();
     let mut queue = GuestCommandQueue::new(
-        &mut ctx as *mut TestContext as *mut RawCommandQueue,
+        core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
         CommandBridgeVTable {
             spawn_empty: None,
             despawn: None,
@@ -294,7 +294,7 @@ fn test_insert_large_slice_scale() {
 fn test_multiple_sequential_insertions_stress() {
     let mut ctx = TestContext::default();
     let mut queue = GuestCommandQueue::new(
-        &mut ctx as *mut TestContext as *mut RawCommandQueue,
+        core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
         CommandBridgeVTable {
             spawn_empty: None,
             despawn: None,
@@ -302,7 +302,7 @@ fn test_multiple_sequential_insertions_stress() {
         },
     );
 
-    let iterations = 5000;
+    let iterations = if cfg!(miri) { 100 } else { 5000 };
 
     for i in 0..iterations {
         let entity = FfiEntity(i as u64);
@@ -319,7 +319,7 @@ fn test_multiple_sequential_insertions_stress() {
 fn test_edge_case_component_names() {
     let mut ctx = TestContext::default();
     let mut queue = GuestCommandQueue::new(
-        &mut ctx as *mut TestContext as *mut RawCommandQueue,
+        core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
         CommandBridgeVTable {
             spawn_empty: None,
             despawn: None,

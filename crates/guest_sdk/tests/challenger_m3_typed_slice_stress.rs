@@ -169,7 +169,8 @@ fn test_as_typed_slice_null_with_nonzero_count() {
 #[test]
 fn test_as_typed_slice_zst_safety() {
     // Zero-Sized Types: size == 0, align == 1
-    let zst_ptr = 0x1000 as *const u8;
+    let zst_ptr = core::ptr::without_provenance::<u8>(0x1000);
+    let zst_ptr_mut = core::ptr::without_provenance_mut::<u8>(0x1000);
     let slice_zst = ChunkSlice::new(zst_ptr, 0, 100);
     let typed = slice_zst.as_typed_slice::<()>();
     assert!(typed.is_some());
@@ -191,14 +192,13 @@ fn test_as_typed_slice_zst_safety() {
     let massive_zst = ChunkSlice::new(zst_ptr, 0, usize::MAX);
     assert_eq!(massive_zst.as_typed_slice::<()>(), None);
 
-    let mut massive_mut_zst = ChunkSliceMut::new(zst_ptr as *mut u8, 0, usize::MAX);
+    let mut massive_mut_zst = ChunkSliceMut::new(zst_ptr_mut, 0, usize::MAX);
     assert_eq!(massive_mut_zst.as_typed_slice::<()>(), None);
 
     let over_isize_zst = ChunkSlice::new(zst_ptr, 0, (isize::MAX as usize) + 1);
     assert_eq!(over_isize_zst.as_typed_slice::<()>(), None);
 
-    let mut over_isize_mut_zst =
-        ChunkSliceMut::new(zst_ptr as *mut u8, 0, (isize::MAX as usize) + 1);
+    let mut over_isize_mut_zst = ChunkSliceMut::new(zst_ptr_mut, 0, (isize::MAX as usize) + 1);
     assert_eq!(over_isize_mut_zst.as_typed_slice::<()>(), None);
 }
 
@@ -225,7 +225,7 @@ fn test_as_typed_slice_massive_count() {
     assert_eq!(slice_over_mut.as_typed_slice::<u32>(), None);
 
     // 4. Address wrapping: pointer near the end of address space
-    let high_ptr = (usize::MAX - 2) as *mut u8;
+    let high_ptr = core::ptr::without_provenance_mut::<u8>(usize::MAX - 2);
     let slice_wrap = ChunkSlice::new(high_ptr, 1, 4);
     assert_eq!(slice_wrap.as_typed_slice::<u8>(), None);
 

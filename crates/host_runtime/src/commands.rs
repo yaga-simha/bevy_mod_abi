@@ -41,7 +41,7 @@ use std::alloc::Layout;
 /// Host-allocated temporary buffer aligned to the component's required memory alignment.
 /// Automatically deallocates the aligned host memory when dropped.
 struct AlignedBuffer {
-    ptr: usize,
+    ptr: *mut u8,
     layout: Layout,
 }
 
@@ -51,10 +51,10 @@ unsafe impl Sync for AlignedBuffer {}
 
 impl Drop for AlignedBuffer {
     fn drop(&mut self) {
-        if self.layout.size() > 0 && self.ptr != 0 {
+        if self.layout.size() > 0 && !self.ptr.is_null() {
             // SAFETY: Memory was allocated with this exact layout via std::alloc::alloc.
             unsafe {
-                std::alloc::dealloc(self.ptr as *mut u8, self.layout);
+                std::alloc::dealloc(self.ptr, self.layout);
             }
         }
     }
@@ -237,21 +237,24 @@ pub unsafe extern "C" fn host_cmd_insert_component(
             core::ptr::copy_nonoverlapping(data, host_ptr, len);
         }
         AlignedBuffer {
-            ptr: host_ptr as usize,
+            ptr: host_ptr,
             layout,
         }
     } else {
         let Ok(layout) = Layout::from_size_align(0, align) else {
             return FfiResult::INTERNAL_ERROR;
         };
-        AlignedBuffer { ptr: align, layout }
+        AlignedBuffer {
+            ptr: core::ptr::without_provenance_mut(align),
+            layout,
+        }
     };
 
     bridge.queue.push(move |world: &mut World| {
         let _keep_alive = &buf;
         if let Ok(mut entity_mut) = world.get_entity_mut(bevy_entity) {
             let non_null = if buf.layout.size() > 0 {
-                core::ptr::NonNull::new(buf.ptr as *mut u8)
+                core::ptr::NonNull::new(buf.ptr)
             } else {
                 // D10 fix: construct a non-null dangling pointer aligned to `buf.layout.align()`
                 // rather than `NonNull::<u8>::dangling()` (which only guarantees align 1).

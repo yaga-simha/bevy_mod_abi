@@ -376,21 +376,27 @@ static void test_newer_mod_on_legacy_host(void) {
     legacy_host.iter_entities = mock_iter_entities_dummy;
     legacy_host.iter_column_stride = mock_iter_stride_dummy;
 
-    /* Newer mod expects HostApi (72 bytes) */
+    /* Newer mod expects HostApi (72 bytes): inspect header via raw_struct_size without
+     * forming a 72-byte HostApi lvalue over the 64-byte legacy allocation. */
     const HostApi* modern_view = (const HostApi*)(const void*)&legacy_host;
+    uint32_t raw_size = bam_host_api_raw_struct_size(modern_view);
+    assert(raw_size == sizeof(LegacyHostApi));
 
     /* Newer mod checks whether register_component is available */
-    FfiBool has_register_component = (modern_view->struct_size >= (offsetof(HostApi, register_component) + sizeof(RegisterComponentFn))) ? FFI_BOOL_TRUE : FFI_BOOL_FALSE;
+    FfiBool has_register_component = (raw_size >= (offsetof(HostApi, register_component) + sizeof(RegisterComponentFn))) ? FFI_BOOL_TRUE : FFI_BOOL_FALSE;
     assert(!has_register_component);
 
     /* Also verify strict sizeof check */
-    FfiBool meets_full_size = (modern_view->struct_size >= sizeof(HostApi)) ? FFI_BOOL_TRUE : FFI_BOOL_FALSE;
+    FfiBool meets_full_size = (raw_size >= sizeof(HostApi)) ? FFI_BOOL_TRUE : FFI_BOOL_FALSE;
     assert(!meets_full_size);
 
-    /* Older functionality remains callable without touching offset 64 */
-    assert(modern_view->struct_size >= sizeof(LegacyHostApi));
-    assert(modern_view->register_system == mock_register_system_dummy);
-    assert(modern_view->iter_column_stride(NULL, 0) == 16);
+    /* Materialize bounded local HostApi copy; trailing fields past 64 bytes stay NULL */
+    HostApi bounded_api;
+    bam_host_api_copy_bounded(modern_view, &bounded_api);
+    assert(bounded_api.struct_size >= sizeof(LegacyHostApi));
+    assert(bounded_api.register_component == NULL);
+    assert(bounded_api.register_system == mock_register_system_dummy);
+    assert(bounded_api.iter_column_stride(NULL, 0) == 16);
 
     printf("  -> OK (boundary check correctly prevents reading or calling past 64-byte boundary)\n");
 }

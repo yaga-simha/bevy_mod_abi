@@ -904,7 +904,7 @@ unsafe extern "C" fn probe_proc_address_in_executor(
     // SAFETY: Valid NUL-terminated C string literal.
     let foreign_sym = unsafe { host_get_proc_address(c"OnlyInOtherWorldSymbol".as_ptr()) };
     let own_sym = unsafe { host_get_proc_address(c"OwnWorldSymbol".as_ptr()) };
-    let passed = foreign_sym.is_null() && own_sym == (0x1234usize as *const c_void);
+    let passed = foreign_sym.is_null() && own_sym == core::ptr::without_provenance(0x1234);
     // SAFETY: `user_data` points to an `AtomicBool`.
     unsafe { (*(user_data as *const AtomicBool)).store(passed, Ordering::SeqCst) };
     FfiResult::OK
@@ -914,13 +914,16 @@ unsafe extern "C" fn probe_proc_address_in_executor(
 fn runtime_get_proc_address_on_executor_is_isolated_to_current_world_registry() {
     // Pollute GLOBAL_SYMBOLS via an unrelated ModRegistry
     let mut other_reg = ModRegistry::new();
-    other_reg.insert_symbol("OnlyInOtherWorldSymbol", 0x9999usize as *const c_void);
+    other_reg.insert_symbol(
+        "OnlyInOtherWorldSymbol",
+        core::ptr::without_provenance(0x9999),
+    );
 
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
     app.world_mut()
         .resource_mut::<ModRegistry>()
-        .insert_symbol("OwnWorldSymbol", 0x1234usize as *const c_void);
+        .insert_symbol("OwnWorldSymbol", core::ptr::without_provenance(0x1234));
 
     let ok_flag = Arc::new(AtomicBool::new(false));
     let reg = Arc::new(app.world().resource::<ModRegistry>().clone());
@@ -1036,13 +1039,18 @@ fn mod_schedule_startup_error_policy_report_to_bevy_and_fault_events_work() {
 
 #[test]
 fn hot_reload_1000_cycles_remove_systems_in_set_keeps_schedule_graph_constant() {
+    #[cfg(not(miri))]
+    const CYCLES: u32 = 1000;
+    #[cfg(miri)]
+    const CYCLES: u32 = 10;
+
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
     let reg = Arc::new(app.world().resource::<ModRegistry>().clone());
     let run_counter = Arc::new(AtomicUsize::new(0));
 
     // Measure baseline schedule size after 1 loaded & unloaded mod
-    for cycle in 1..=1000u32 {
+    for cycle in 1..=CYCLES {
         let mod_id = ModId(cycle);
         let sys = DynamicCSystem::new(
             format!("hot_sys_{cycle}"),
@@ -1070,19 +1078,19 @@ fn hot_reload_1000_cycles_remove_systems_in_set_keeps_schedule_graph_constant() 
             });
     }
 
-    assert_eq!(run_counter.load(Ordering::SeqCst), 1000);
+    assert_eq!(run_counter.load(Ordering::SeqCst), CYCLES as usize);
 
-    // Run one tick so Bevy rebuilds the dirty schedule graph after the 1000th removal.
+    // Run one tick so Bevy rebuilds the dirty schedule graph after the final removal.
     app.update();
-    assert_eq!(run_counter.load(Ordering::SeqCst), 1000);
+    assert_eq!(run_counter.load(Ordering::SeqCst), CYCLES as usize);
 
-    // After 1,000 add + run + remove cycles, zero guest systems remain in Update!
+    // After all add + run + remove cycles, zero guest systems remain in Update!
     let schedules = app.world().resource::<Schedules>();
     let update_sched = schedules.get(Update).unwrap();
     assert_eq!(
         update_sched.systems_len(),
         0,
-        "1,000 hot-reload cycles must leave 0 dead guest systems in Bevy's Update schedule!"
+        "{CYCLES} hot-reload cycles must leave 0 dead guest systems in Bevy's Update schedule!"
     );
 }
 
@@ -1114,11 +1122,18 @@ fn semver_abi_compatibility_and_typed_mod_load_error_work() {
         pack_ver(1, 0, 0)
     ));
 
-    let mut app = App::new();
-    app.add_plugins(AbiModPlugin);
-    let err = app
-        .try_load_mod("/nonexistent/path/to/missing_mod.dylib")
-        .expect_err("Missing dylib must return ModLoadError::DlOpen");
+    #[cfg(not(miri))]
+    let err = {
+        let mut app = App::new();
+        app.add_plugins(AbiModPlugin);
+        app.try_load_mod("/nonexistent/path/to/missing_mod.dylib")
+            .expect_err("Missing dylib must return ModLoadError::DlOpen")
+    };
+    #[cfg(miri)]
+    let err = ModLoadError::DlOpen {
+        path: std::path::PathBuf::from("/nonexistent/path/to/missing_mod.dylib"),
+        message: String::from("dlopen unavailable under Miri isolation"),
+    };
     assert!(matches!(err, ModLoadError::DlOpen { .. }));
     assert_eq!(FfiResult::from(err.clone()), FfiResult::INTERNAL_ERROR);
     assert!(err.to_string().contains("missing_mod.dylib"));

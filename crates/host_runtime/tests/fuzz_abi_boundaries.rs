@@ -167,7 +167,7 @@ fn make_sized_descriptor_buffer<T: Copy>(
 fn fuzz_host_register_system_family_adversarial_inputs() {
     let registry = Arc::new(ModRegistry::new());
     let mut init_ctx = ModInitContext::new(Arc::clone(&registry));
-    let ctx_ptr = (&mut init_ctx as *mut ModInitContext).cast::<c_void>();
+    let ctx_ptr = core::ptr::addr_of_mut!(init_ctx).cast::<c_void>();
 
     // Exhaustive `struct_size` sweep 0..128 + u32::MAX (both aligned and 1-byte misaligned!)
     let valid_base = SystemDescriptor::new(
@@ -477,7 +477,7 @@ fn fuzz_host_register_system_family_adversarial_inputs() {
 fn fuzz_host_register_multi_query_system_adversarial_inputs() {
     let registry = Arc::new(ModRegistry::new());
     let mut init_ctx = ModInitContext::new(Arc::clone(&registry));
-    let ctx_ptr = (&mut init_ctx as *mut ModInitContext).cast::<c_void>();
+    let ctx_ptr = core::ptr::addr_of_mut!(init_ctx).cast::<c_void>();
 
     let valid_q = ComponentAccessDesc::read(c"Position".as_ptr());
     let valid_spec = QuerySpec {

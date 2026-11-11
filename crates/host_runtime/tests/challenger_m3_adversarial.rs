@@ -68,11 +68,23 @@ fn get_workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+fn dylib_prefix_and_ext() -> (&'static str, &'static str) {
+    if cfg!(target_os = "windows") {
+        ("", "dll")
+    } else if cfg!(target_os = "macos") {
+        ("lib", "dylib")
+    } else {
+        ("lib", "so")
+    }
+}
+
 fn get_example_1_dylib() -> PathBuf {
     let root = get_workspace_root();
+    let (prefix, ext) = dylib_prefix_and_ext();
     let manifest = root.join("examples/01_minimal_handshake/guest_mod/Cargo.toml");
     let dylib = root
-        .join("examples/01_minimal_handshake/guest_mod/target/release/libminimal_guest_mod.dylib");
+        .join("examples/01_minimal_handshake/guest_mod/target/release")
+        .join(format!("{prefix}minimal_guest_mod.{ext}"));
     if !dylib.exists() {
         let status = Command::new("cargo")
             .args(["build", "--manifest-path"])
@@ -87,10 +99,11 @@ fn get_example_1_dylib() -> PathBuf {
 
 fn get_example_2_dylib() -> PathBuf {
     let root = get_workspace_root();
+    let (prefix, ext) = dylib_prefix_and_ext();
     let manifest = root.join("examples/02_multi_system_pipeline/guest_mod/Cargo.toml");
-    let dylib = root.join(
-        "examples/02_multi_system_pipeline/guest_mod/target/release/libexample_02_guest_mod.dylib",
-    );
+    let dylib = root
+        .join("examples/02_multi_system_pipeline/guest_mod/target/release")
+        .join(format!("{prefix}example_02_guest_mod.{ext}"));
     if !dylib.exists() {
         let status = Command::new("cargo")
             .args(["build", "--manifest-path"])
@@ -105,20 +118,34 @@ fn get_example_2_dylib() -> PathBuf {
 
 fn get_example_3_dylibs() -> (PathBuf, PathBuf) {
     let root = get_workspace_root();
+    let (prefix, ext) = dylib_prefix_and_ext();
     let c_mod_dir = root.join("examples/03_cross_language_interop/c_mod");
-    let c_dylib = c_mod_dir.join("libc_mod.dylib");
+    let c_dylib = c_mod_dir.join(format!("{prefix}c_mod.{ext}"));
     if !c_dylib.exists() {
-        let status = Command::new("make")
-            .arg("-C")
-            .arg(&c_mod_dir)
-            .status()
-            .expect("Failed to build Example 3 C mod");
+        let status = if cfg!(target_os = "windows") {
+            Command::new("gcc")
+                .args(["-std=c99", "-Wall", "-Wextra", "-Werror", "-I"])
+                .arg(root.join("include"))
+                .args(["-O3", "-shared"])
+                .arg(c_mod_dir.join("mod.c"))
+                .arg("-o")
+                .arg(&c_dylib)
+                .status()
+                .expect("Failed to build Example 3 C mod with gcc")
+        } else {
+            Command::new("make")
+                .arg("-C")
+                .arg(&c_mod_dir)
+                .status()
+                .expect("Failed to build Example 3 C mod")
+        };
         assert!(status.success());
     }
 
     let rust_manifest = root.join("examples/03_cross_language_interop/rust_mod/Cargo.toml");
-    let rust_dylib =
-        root.join("examples/03_cross_language_interop/rust_mod/target/release/librust_mod.dylib");
+    let rust_dylib = root
+        .join("examples/03_cross_language_interop/rust_mod/target/release")
+        .join(format!("{prefix}rust_mod.{ext}"));
     if !rust_dylib.exists() {
         let status = Command::new("cargo")
             .args(["build", "--manifest-path"])

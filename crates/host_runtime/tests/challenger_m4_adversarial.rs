@@ -620,7 +620,11 @@ fn test_m4_shadow_copy_isolation_and_drop_cleanup() {
     let temp_dir = std::env::temp_dir().join(format!("test_m4_shadow_{}", std::process::id()));
     fs::create_dir_all(&temp_dir).expect("create shadow dir");
 
-    let shadow_path = temp_dir.join("mod_gravity_shadow.dylib");
+    let ext = original
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("dylib");
+    let shadow_path = temp_dir.join(format!("mod_gravity_shadow.{ext}"));
     fs::copy(&original, &shadow_path).expect("copy shadow");
     assert!(shadow_path.exists());
 

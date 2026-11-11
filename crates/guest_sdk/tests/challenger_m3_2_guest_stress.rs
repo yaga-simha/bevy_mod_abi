@@ -129,7 +129,7 @@ fn test_register_runtime_component_pod_vs_non_pod() {
     let mut ctx = MockHostContext {
         captured_desc: None,
     };
-    let ctx_ptr = &mut ctx as *mut MockHostContext as *mut c_void;
+    let ctx_ptr = core::ptr::addr_of_mut!(ctx) as *mut c_void;
 
     // 1. POD component registration: drop_fn MUST be None!
     let res = unsafe { register_runtime_component::<PodComponent>(&api, ctx_ptr, c"PodComponent") };
@@ -187,7 +187,7 @@ fn test_generic_drop_trampoline_panic_containment() {
     let mut ctx = MockHostContext {
         captured_desc: None,
     };
-    let ctx_ptr = &mut ctx as *mut MockHostContext as *mut c_void;
+    let ctx_ptr = core::ptr::addr_of_mut!(ctx) as *mut c_void;
 
     let res = unsafe {
         register_runtime_component::<PanickingDropComponent>(&api, ctx_ptr, c"PanickingDrop")
@@ -324,7 +324,7 @@ fn test_guest_command_queue_insert_runtime_component_contract() {
     };
 
     let mut queue = GuestCommandQueue::new(
-        &mut q_ctx as *mut QueueContext as *mut RawCommandQueue,
+        core::ptr::addr_of_mut!(q_ctx) as *mut RawCommandQueue,
         vtable,
     );
 
@@ -336,6 +336,7 @@ fn test_guest_command_queue_insert_runtime_component_contract() {
     assert_eq!(q_ctx.last_name, "PodComponent");
     assert_eq!(q_ctx.last_bytes.len(), 8);
 
-    let read_comp = unsafe { *(q_ctx.last_bytes.as_ptr() as *const PodComponent) };
+    let read_comp =
+        unsafe { core::ptr::read_unaligned(q_ctx.last_bytes.as_ptr() as *const PodComponent) };
     assert_eq!(read_comp, comp);
 }

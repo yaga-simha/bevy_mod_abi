@@ -387,6 +387,42 @@ typedef struct HostApi {
     RegisterComponentFn register_component;
 } HostApi;
 
+/* Safely reads the 4-byte `struct_size` header at offset 0 of a potentially older/smaller
+ * `HostApi` buffer without dereferencing `sizeof(HostApi)` bytes (preventing C99 strict-aliasing
+ * and UBSan `-fsanitize=object-size` violations on legacy buffers). */
+static inline BEVY_ABI_UNUSED uint32_t bam_host_api_raw_struct_size(const HostApi* api) {
+    if (!api) {
+        return 0u;
+    }
+    return *(const uint32_t*)(const void*)api;
+}
+
+/* Copies at most `min(src->struct_size, sizeof(HostApi))` bytes from `src` into `dst` and
+ * zero-fills any trailing fields not provided by an older host. */
+static inline BEVY_ABI_UNUSED void bam_host_api_copy_bounded(const HostApi* src, HostApi* dst) {
+    unsigned char* dst_bytes;
+    const unsigned char* src_bytes;
+    size_t raw_size;
+    size_t copy_len;
+    size_t i;
+    if (!dst) {
+        return;
+    }
+    dst_bytes = (unsigned char*)(void*)dst;
+    for (i = 0; i < sizeof(HostApi); ++i) {
+        dst_bytes[i] = 0u;
+    }
+    if (!src) {
+        return;
+    }
+    raw_size = (size_t)bam_host_api_raw_struct_size(src);
+    copy_len = raw_size < sizeof(HostApi) ? raw_size : sizeof(HostApi);
+    src_bytes = (const unsigned char*)(const void*)src;
+    for (i = 0; i < copy_len; ++i) {
+        dst_bytes[i] = src_bytes[i];
+    }
+}
+
 /* Static ABI layout assertions for 64-bit architectures */
 #if defined(__LP64__) || defined(_WIN64) || (defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 8)
 BEVY_ABI_STATIC_ASSERT(sizeof(ModComponentDescriptor) == 64, "ModComponentDescriptor 64-bit size must be 64");

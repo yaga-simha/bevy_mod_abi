@@ -2264,14 +2264,15 @@ mod tests {
 
         // 10. with_drop and with_vtable
         unsafe extern "C" fn dummy_drop(_ptr: *mut core::ffi::c_void) {}
-        let with_drop = valid_desc.with_drop(dummy_drop);
+        let drop_fn: ComponentDropFn = dummy_drop;
+        let with_drop = valid_desc.with_drop(drop_fn);
         assert!(!with_drop.is_pod());
         assert_eq!(
             with_drop.drop_fn.map(|f| f as *const () as usize),
-            Some(dummy_drop as *const () as usize)
+            Some(drop_fn as *const () as usize)
         );
 
-        let vtable_dummy = 0x1234usize as *const core::ffi::c_void;
+        let vtable_dummy = core::ptr::without_provenance::<core::ffi::c_void>(0x1234);
         let with_vtable = valid_desc.with_vtable(vtable_dummy);
         assert_eq!(with_vtable.vtable_ptr, vtable_dummy);
     }
@@ -2393,7 +2394,7 @@ mod tests {
             core::ptr::null(),
             0,
             dummy_sys,
-            0xBEEFusize as *mut c_void,
+            core::ptr::without_provenance_mut(0xBEEF),
         );
         assert_eq!(v1_desc.validate(), FfiResult::OK);
 
@@ -2649,7 +2650,7 @@ mod tests {
         assert!(from_v2.run_if_user_data.is_null());
 
         // v3 (104B) round-trip
-        let tag = 0x1234usize as *mut c_void;
+        let tag = core::ptr::without_provenance_mut(0x1234);
         let v3 = v2.with_run_if(dummy_cond, tag);
         // SAFETY: `v3` is valid and readable for `v3.sched.base.struct_size` bytes.
         let from_v3 = unsafe {
