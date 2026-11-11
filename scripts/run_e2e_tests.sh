@@ -1,69 +1,21 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# bevy_abi_mod: Comprehensive E2E & Multi-Language Test Runner
+# bevy_abi_mod: End-to-End Verification Runner (delegates to `cargo xtask`)
 # ==============================================================================
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-echo "======================================================================"
-echo " Starting bevy_abi_mod Comprehensive Verification Pipeline"
-echo " Working directory: $ROOT_DIR"
-echo " Timestamp: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-echo "======================================================================"
+echo "==> Running full workspace CI checks, fixtures, C99 tests, and test suites..."
+cargo xtask ci
 
-echo ""
-echo "[1/9] Pre-building asymmetric guest mods (C99 & Rust cdylib)..."
-make -C tests/asymmetric_c_mod
-cargo build --manifest-path tests/asymmetric_rust_mod/Cargo.toml --release
+echo "==> Running permutation benchmark verification..."
+cargo xtask bench --permutation
 
-echo ""
-echo "[2/9] Checking workspace static typing and target compliance (0 warnings/errors required)..."
-cargo check --workspace --all-targets
-
-echo ""
-echo "[3/9] Running default workspace unit & integration tests..."
-cargo test -- --test-threads=1
-
-echo ""
-echo "[4/9] Running comprehensive 4-tier E2E test suite (275 tests)..."
-cargo test -p bevy_abi_mod_host --test e2e_suite
-
-echo ""
-echo "[5/9] Running Validation Gate 2 integration test (10k entities, Changed<Position>, CommandQueueBridge)..."
-cargo test -p bevy_abi_mod_host --test validation_gate_2
-
-echo ""
-echo "[6/9] Running Milestone 3 Bevy Runtime Testbed (integration_tests)..."
-cargo test -p bevy_abi_mod_host --test integration_tests -- --test-threads=1
-
-echo ""
-echo "[7/9] Running Milestone 4 & Full Permutation Benchmarking Suite (Debug + Release x Native + Rust dylib + C-ABI Rust/C99)..."
-cargo test -p bevy_abi_mod_host --test benchmarks -- --nocapture
-cargo run --release -p permutation_bench
 if [ ! -f "target/benchmark_results.json" ]; then
-    echo "ERROR: target/benchmark_results.json was not generated!" >&2
+    echo "ERROR: target/benchmark_results.json was not generated" >&2
     exit 1
 fi
-echo "Verified: target/benchmark_results.json exists."
 
-echo ""
-echo "[8/9] Running Milestone 5 Safety Test Suite (alignment, bounds, borrow rules, isolation)..."
-cargo test -p bevy_abi_mod_host --test safety_tests -- --test-threads=1
-
-echo ""
-echo "[9/9] Running Milestone 5 Lifecycle Test Suite (50-cycle reload, post-unload immunity)..."
-cargo test -p bevy_abi_mod_host --test lifecycle_tests -- --test-threads=1
-
-echo ""
-echo "======================================================================"
-echo " ALL TEST SUITES & MILESTONES COMPLETED SUCCESSFULLY!"
-echo "   - Milestone 1: Host Runtime & Engine Bridge PASSED"
-echo "   - Milestone 2: Asymmetric Native Guest Mods PASSED"
-echo "   - Milestone 3: Bevy Runtime Testbed PASSED"
-echo "   - Milestone 4: Performance Benchmarking Suite PASSED (JSON report verified)"
-echo "   - Milestone 5: Safety & 50-Cycle Lifecycle Suites PASSED"
-echo "   - Validation Gates 1, 2, 3: PASSED"
-echo "   - Total Passing Tests: 340+ tests PASSED (0 failures, 0 warnings)"
-echo "======================================================================"
+echo "==> E2E verification completed."

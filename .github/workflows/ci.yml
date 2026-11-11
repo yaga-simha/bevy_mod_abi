@@ -31,37 +31,8 @@ jobs:
       - name: Cache Cargo registry & build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Build asymmetric C99 guest mod (Unix)
-        if: runner.os != 'Windows'
-        run: make -C tests/asymmetric_c_mod
-
-      - name: Build asymmetric C99 guest mod (Windows MinGW C99)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          gcc -std=c99 -Wall -Wextra -Werror -Iinclude -O3 -shared \
-            tests/asymmetric_c_mod/mod.c \
-            -o tests/asymmetric_c_mod/asymmetric_c_mod.dll
-
-      - name: Build asymmetric Rust guest mod (independent Cargo.lock)
-        run: cargo build --manifest-path tests/asymmetric_rust_mod/Cargo.toml --release
-
-      - name: Verify zero Bevy dependencies in ABI & guest crates
-        run: |
-          if cargo tree -p bevy_abi_mod_sys -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest | grep -v bevy_abi_mod | grep -i bevy; then
-            echo "ERROR: Bevy dependency leaked into ABI or guest crates!" >&2
-            exit 1
-          fi
-
-      - name: Check formatting (Linux)
-        if: runner.os == 'Linux'
-        run: cargo fmt --all -- --check
-
-      - name: Run Clippy across workspace
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Run default workspace unit, behavioral, fuzz, parity, compile-fail & doc tests
-        run: cargo test -- --test-threads=1
+      - name: Run cargo xtask ci
+        run: cargo xtask ci
 
   # ============================================================================
   # 2. Strict ISO C99 & C++17 Header Verification (-Wall -Wextra -Werror)
@@ -77,12 +48,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build C99 mods & run standalone C99 ABI harness
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Validate C99 header, standalone harness & C99 fixture mods
+        env:
+          CC: ${{ matrix.cc }}
         run: |
-          make test-c99 CC=${{ matrix.cc }}
-          make -C benches/c_abi_c99_mod clean && make -C benches/c_abi_c99_mod CC=${{ matrix.cc }}
-          make -C examples/03_cross_language_interop/c_mod clean && make -C examples/03_cross_language_interop/c_mod CC=${{ matrix.cc }}
-          make -C examples/05_cute_3d_winit/mods/mod_cuddle_c99 clean && make -C examples/05_cute_3d_winit/mods/mod_cuddle_c99 CC=${{ matrix.cc }}
+          cargo xtask header --test-c99
+          cargo xtask fixtures --all
 
       - name: Verify C++17 header compatibility
         if: matrix.cc == 'clang'
@@ -114,25 +91,8 @@ jobs:
         with:
           key: miri-tree-borrows
 
-      - name: Run Miri on bevy_abi_mod_sys, bevy_abi_mod_guest_sys & bevy_abi_mod_guest
-        run: cargo +nightly miri test -p bevy_abi_mod_sys -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest
-
-      - name: Run Miri on bevy_abi_mod_macros in-process VTable & aliasing suites
-        run: |
-          cargo +nightly miri test -p bevy_abi_mod_macros \
-            --lib \
-            --test validation_gate_1 \
-            --test compile_fail_tests
-
-      - name: Run Miri on bevy_abi_mod_host_sys & bevy_abi_mod_host non-dlopen soundness, fuzz & parity suites
-        run: |
-          cargo +nightly miri test -p bevy_abi_mod_host_sys --lib
-          cargo +nightly miri test -p bevy_abi_mod_host \
-            --lib \
-            --test bevy_alignment_soundness_tests \
-            --test fuzz_abi_boundaries \
-            --test differential_bevy_parity \
-            -- --skip real_dylib_loaded_mod_entity_lifecycle_events_and_strict_validation_work
+      - name: Run Miri via cargo xtask
+        run: cargo xtask miri --all
 
   # ============================================================================
   # 4. ASan & UBSan Sanitizer Verification on C99 ABI & Guest Mod
@@ -166,13 +126,15 @@ jobs:
         env:
           UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
         run: |
+          cargo xtask fixtures
           clang -std=c99 -Wall -Wextra -Werror -O1 -g -fno-omit-frame-pointer \
             -fsanitize=undefined -fno-sanitize-recover=all \
             -Iinclude -shared -fPIC \
             tests/asymmetric_c_mod/mod.c \
             -o tests/asymmetric_c_mod/libasymmetric_c_mod.so
-          cargo build --manifest-path tests/asymmetric_rust_mod/Cargo.toml --release
-          cargo test -p bevy_abi_mod_host --test integration_tests --test c_vtable_interop -- --test-threads=1
+          cp tests/asymmetric_c_mod/libasymmetric_c_mod.so target/fixtures/libasymmetric_c_mod.so
+          BAM_FIXTURE_DIR="${{ github.workspace }}/target/fixtures" \
+            cargo test -p bevy_abi_mod_host -- --test-threads=1
 
   # ============================================================================
   # 5. Randomized Rust Layout Check (-Zrandomize-layout)
@@ -192,22 +154,15 @@ jobs:
         with:
           key: randomize-layout
 
-      - name: Build asymmetric C99 & Rust guest mods with default layout
-        run: |
-          make -C tests/asymmetric_c_mod
-          cargo +nightly build --manifest-path tests/asymmetric_rust_mod/Cargo.toml --release
+      - name: Build asymmetric C99 & Rust guest fixtures with default layout
+        run: cargo +nightly xtask fixtures
 
       - name: Run host & ABI suites under -Zrandomize-layout
         env:
           RUSTFLAGS: "-Zrandomize-layout"
+          BAM_FIXTURE_DIR: "${{ github.workspace }}/target/fixtures"
         run: |
           cargo +nightly test -p bevy_abi_mod_sys -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest
           cargo +nightly test -p bevy_abi_mod_macros --lib --test validation_gate_1
           cargo +nightly test -p bevy_abi_mod_host_sys --lib -- --test-threads=1
-          cargo +nightly test -p bevy_abi_mod_host \
-            --lib \
-            --test integration_tests \
-            --test bevy_alignment_soundness_tests \
-            --test fuzz_abi_boundaries \
-            --test differential_bevy_parity \
-            -- --test-threads=1
+          cargo +nightly test -p bevy_abi_mod_host -- --test-threads=1

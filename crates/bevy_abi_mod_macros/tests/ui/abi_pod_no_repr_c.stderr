@@ -1,0 +1,5 @@
+error: `#[derive(AbiPod)]` requires `#[repr(C)]` or `#[repr(transparent)]` to guarantee deterministic cross-language memory layout
+ --> tests/ui/abi_pod_no_repr_c.rs:4:12
+  |
+4 | pub struct MissingReprC {
+  |            ^^^^^^^^^^^^

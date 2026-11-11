@@ -1,0 +1,5 @@
+error: `#[derive(AbiPod)]` cannot be applied to `#[repr(packed)]` structs because unaligned field references are undefined behavior
+ --> tests/ui/abi_pod_repr_c_packed.rs:5:12
+  |
+5 | pub struct PackedStruct {
+  |            ^^^^^^^^^^^^

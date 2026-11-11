@@ -412,16 +412,33 @@ static void test_entity_null_semver_and_scheduled_descriptors(void) {
     assert(bam_entity_is_null(1ULL) == FFI_BOOL_FALSE);
     assert(bam_entity_is_null(UINT64_MAX) == FFI_BOOL_FALSE);
 
-    /* 2. SemVer compatibility helper */
+    /* 2. SemVer compatibility helper (Cargo 0.x exact-minor vs 1.x additive-minor rules) */
+    uint32_t v0_0_9 = bevy_abi_pack_version(0, 0, 9);
     uint32_t v0_1_0 = bevy_abi_pack_version(0, 1, 0);
     uint32_t v0_1_5 = bevy_abi_pack_version(0, 1, 5);
     uint32_t v0_2_0 = bevy_abi_pack_version(0, 2, 0);
     uint32_t v1_0_0 = bevy_abi_pack_version(1, 0, 0);
+    uint32_t v1_1_0 = bevy_abi_pack_version(1, 1, 0);
+    uint32_t v1_2_0 = bevy_abi_pack_version(1, 2, 0);
     assert(v0_1_0 == BEVY_ABI_VERSION_PACKED);
     assert(bevy_abi_version_is_compatible(v0_1_0, v0_1_5) == FFI_BOOL_TRUE);
-    assert(bevy_abi_version_is_compatible(v0_2_0, v0_1_0) == FFI_BOOL_TRUE);
+    assert(bevy_abi_version_is_compatible(v0_1_5, v0_1_0) == FFI_BOOL_TRUE);
+    assert(bevy_abi_version_is_compatible(v0_2_0, v0_1_0) == FFI_BOOL_FALSE);
     assert(bevy_abi_version_is_compatible(v0_1_0, v0_2_0) == FFI_BOOL_FALSE);
+    assert(bevy_abi_version_is_compatible(v0_1_0, v0_0_9) == FFI_BOOL_FALSE);
+    assert(bevy_abi_version_is_compatible(v1_2_0, v1_1_0) == FFI_BOOL_TRUE);
+    assert(bevy_abi_version_is_compatible(v1_1_0, v1_2_0) == FFI_BOOL_FALSE);
     assert(bevy_abi_version_is_compatible(v1_0_0, v0_1_0) == FFI_BOOL_FALSE);
+
+    /* Verify extended FfiResult taxonomy constants */
+    assert(FFI_RESULT_INVALID_ARGUMENT == 8u);
+    assert(FFI_RESULT_OUT_OF_RANGE == 9u);
+    assert(FFI_RESULT_NOT_FOUND == 10u);
+    assert(FFI_RESULT_INVALID_STATE == 11u);
+    assert(FFI_RESULT_INVALID_ENTITY == 12u);
+    assert(FFI_RESULT_CAPACITY_EXCEEDED == 13u);
+    assert(FFI_RESULT_UNSUPPORTED == 14u);
+    assert(FFI_RESULT_INTERNAL_ERROR == 99u);
 
     /* 3. ScheduleLabelId constants & ScheduledSystemDescriptor layout */
     assert(SCHEDULE_LABEL_UPDATE == 0u);

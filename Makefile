@@ -1,223 +1,125 @@
 # ==============================================================================
-# bevy_abi_mod: Root Makefile
-# Unified Developer Experience for Building, Testing, Benchmarking & Verifying
+# bevy_abi_mod: Thin Wrapper Makefile Delegating to `cargo xtask`
 # ==============================================================================
 
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
-# Colors for terminal output
 BOLD  := \033[1m
-GREEN := \033[32m
 CYAN  := \033[36m
 RESET := \033[0m
 
 .PHONY: help
 help: ## Display this help message
-	@echo -e "$(BOLD)bevy_abi_mod Development Commands$(RESET)"
+	@echo -e "$(BOLD)bevy_abi_mod Development Commands (via cargo xtask)$(RESET)"
 	@echo ""
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  $(CYAN)%-18s$(RESET) %s\n", $$1, $$2}'
 	@echo ""
 
-.PHONY: build
-build: build-mods build-bench-mods ## Build the entire workspace and all asymmetric guest mods
-	@echo -e "$(GREEN)[BUILD]$(RESET) Compiling workspace..."
-	cargo build --workspace
+.PHONY: ci
+ci: ## Run full CI pipeline via cargo xtask
+	cargo xtask ci
 
-.PHONY: build-mods
-build-mods: ## Build test asymmetric C99 (.so/.dylib) and Rust (.cdylib) guest mods
-	@echo -e "$(GREEN)[BUILD-MODS]$(RESET) Compiling asymmetric C99 guest mod..."
-	$(MAKE) -C tests/asymmetric_c_mod
-	@echo -e "$(GREEN)[BUILD-MODS]$(RESET) Compiling asymmetric Rust guest mod (independent Cargo lockfile)..."
-	cargo build --manifest-path tests/asymmetric_rust_mod/Cargo.toml --release
+.PHONY: fixtures build-mods
+fixtures: ## Build core asymmetric Rust & C99 guest mod fixtures into target/fixtures/
+	cargo xtask fixtures
+
+build-mods: fixtures ## Alias for fixtures
 
 .PHONY: build-bench-mods
-build-bench-mods: ## Build benchmark guest mods (C99 debug/release & Rust cdylib debug/release)
-	@echo -e "$(GREEN)[BUILD-BENCH-MODS]$(RESET) Compiling benchmark C99 mods (-O0 debug & -O3 release)..."
-	$(MAKE) -C benches/c_abi_c99_mod
-	@echo -e "$(GREEN)[BUILD-BENCH-MODS]$(RESET) Compiling benchmark C-ABI Rust mod (debug & release)..."
-	cargo build --manifest-path benches/c_abi_rust_mod/Cargo.toml
-	cargo build --manifest-path benches/c_abi_rust_mod/Cargo.toml --release
+build-bench-mods: ## Build benchmark guest mod fixtures
+	cargo xtask fixtures --benches
 
-.PHONY: build-game-mods
-build-game-mods: ## Build the 3 distinct guest mods for Example 4 (Gravity, Rainbow, Vortex)
-	@echo -e "$(GREEN)[BUILD-GAME-MODS]$(RESET) Compiling Gravity guest mod..."
-	cargo build --manifest-path examples/04_visual_game/mods/mod_gravity/Cargo.toml --release
-	@echo -e "$(GREEN)[BUILD-GAME-MODS]$(RESET) Compiling Rainbow guest mod..."
-	cargo build --manifest-path examples/04_visual_game/mods/mod_rainbow/Cargo.toml --release
-	@echo -e "$(GREEN)[BUILD-GAME-MODS]$(RESET) Compiling Vortex guest mod..."
-	cargo build --manifest-path examples/04_visual_game/mods/mod_vortex/Cargo.toml --release
+.PHONY: build-example-mods build-game-mods build-3d-mods
+build-example-mods: ## Build guest mod fixtures for all progression examples
+	cargo xtask fixtures --examples
 
-.PHONY: build-3d-mods
-build-3d-mods: ## Build the 3 cute 3D guest mods for Example 5 (Rust Boing, Rust Carousel, C99 Cuddle)
-	@echo -e "$(GREEN)[BUILD-3D-MODS]$(RESET) Compiling Jelly Boing Rust guest mod..."
-	cargo build --manifest-path examples/05_cute_3d_winit/mods/mod_boing/Cargo.toml --release
-	@echo -e "$(GREEN)[BUILD-3D-MODS]$(RESET) Compiling Pastel Carousel Rust guest mod..."
-	cargo build --manifest-path examples/05_cute_3d_winit/mods/mod_carousel/Cargo.toml --release
-	@echo -e "$(GREEN)[BUILD-3D-MODS]$(RESET) Compiling Cozy Cuddle C99 guest mod..."
-	$(MAKE) -C examples/05_cute_3d_winit/mods/mod_cuddle_c99
+build-game-mods: build-example-mods ## Alias for build-example-mods
+build-3d-mods: build-example-mods ## Alias for build-example-mods
 
-.PHONY: build-example-mods
-build-example-mods: build-game-mods build-3d-mods ## Build guest mods for all progression examples (Stages 1-5)
-	@echo -e "$(GREEN)[BUILD-EXAMPLE-MODS]$(RESET) Compiling Example 1 guest mod..."
-	cargo build --manifest-path examples/01_minimal_handshake/guest_mod/Cargo.toml --release
-	@echo -e "$(GREEN)[BUILD-EXAMPLE-MODS]$(RESET) Compiling Example 2 guest mod..."
-	cargo build --manifest-path examples/02_multi_system_pipeline/guest_mod/Cargo.toml --release
-	@echo -e "$(GREEN)[BUILD-EXAMPLE-MODS]$(RESET) Compiling Example 3 C99 guest mod..."
-	$(MAKE) -C examples/03_cross_language_interop/c_mod
-	@echo -e "$(GREEN)[BUILD-EXAMPLE-MODS]$(RESET) Compiling Example 3 Rust guest mod..."
-	cargo build --manifest-path examples/03_cross_language_interop/rust_mod/Cargo.toml --release
+.PHONY: build
+build: ## Build all guest fixtures and workspace crates
+	cargo xtask fixtures --all
+	cargo build --workspace
 
-.PHONY: example-1
-example-1: ## Run Stage 1 Minimal Handshake PoC (<100 LOC)
-	@echo -e "$(GREEN)[EXAMPLE 1]$(RESET) Building and running Stage 1 Minimal Handshake..."
-	cargo build --manifest-path examples/01_minimal_handshake/guest_mod/Cargo.toml --release
-	cargo run --manifest-path examples/01_minimal_handshake/Cargo.toml
+.PHONY: header
+header: ## Validate include/bevy_abi_mod.h as strict ISO C99
+	cargo xtask header
 
-.PHONY: example-2
-example-2: ## Run Stage 2 Multi-System Pipeline (Queries, Filters, Commands, Ticks)
-	@echo -e "$(GREEN)[EXAMPLE 2]$(RESET) Building and running Stage 2 Multi-System Pipeline..."
-	cargo build --manifest-path examples/02_multi_system_pipeline/guest_mod/Cargo.toml --release
-	cargo run --manifest-path examples/02_multi_system_pipeline/Cargo.toml
-
-.PHONY: example-3
-example-3: ## Run Stage 3 Cross-Language C99 + Rust Interoperability
-	@echo -e "$(GREEN)[EXAMPLE 3]$(RESET) Building and running Stage 3 Cross-Language Interop..."
-	$(MAKE) -C examples/03_cross_language_interop/c_mod
-	cargo build --manifest-path examples/03_cross_language_interop/rust_mod/Cargo.toml --release
-	cargo run --manifest-path examples/03_cross_language_interop/Cargo.toml
-
-.PHONY: example-4 game
-example-4: build-game-mods ## Run Stage 4 2D Visual Game with Runtime Mod Reloading
-	@echo -e "$(GREEN)[EXAMPLE 4]$(RESET) Launching Stage 4 Visual Kinetic Arena Game..."
-	cargo run --manifest-path examples/04_visual_game/Cargo.toml
-
-game: example-4 ## Alias for example-4
-
-.PHONY: example-4-test
-example-4-test: build-game-mods ## Run Stage 4 Visual Game in automated headless test mode
-	@echo -e "$(GREEN)[EXAMPLE 4 TEST]$(RESET) Running Stage 4 in headless verification mode..."
-	cargo run --manifest-path examples/04_visual_game/Cargo.toml -- --test-mode --ticks 30
-
-.PHONY: example-5 game-3d
-example-5: build-3d-mods ## Run Stage 5 Cute 3D Slime Meadow (winit + wgpu) with Runtime Mod Reloading
-	@echo -e "$(GREEN)[EXAMPLE 5]$(RESET) Launching Stage 5 Cute 3D Slime Meadow (winit + wgpu) in Release Mode..."
-	cargo run --manifest-path examples/05_cute_3d_winit/Cargo.toml --release
-
-game-3d: example-5 ## Alias for example-5
-
-.PHONY: example-5-test
-example-5-test: build-3d-mods ## Run Stage 5 Cute 3D Slime Meadow in automated headless test mode
-	@echo -e "$(GREEN)[EXAMPLE 5 TEST]$(RESET) Running Stage 5 in headless 3D verification mode..."
-	cargo run --manifest-path examples/05_cute_3d_winit/Cargo.toml --release -- --test-mode --ticks 45
-
-.PHONY: examples
-examples: example-1 example-2 example-3 example-4-test example-5-test ## Run all progression examples sequentially (Stages 1-5)
-
+.PHONY: test-c99
+test-c99: ## Compile & run strict ISO C99 header and standalone ABI harness
+	cargo xtask header --test-c99
 
 .PHONY: check
 check: ## Run static type checks across all workspace targets
-	@echo -e "$(GREEN)[CHECK]$(RESET) Running cargo check on all targets..."
 	cargo check --workspace --all-targets
 
 .PHONY: test
-test: build-mods ## Run unit and integration tests across default workspace members
-	@echo -e "$(GREEN)[TEST]$(RESET) Running workspace tests..."
-	cargo test -- --test-threads=1
+test: fixtures ## Run unit and integration tests across default workspace members
+	BAM_FIXTURE_DIR="$(CURDIR)/target/fixtures" cargo test -- --test-threads=1
 
 .PHONY: test-e2e
-test-e2e: ## Execute comprehensive 9-stage end-to-end verification pipeline
-	@echo -e "$(GREEN)[TEST-E2E]$(RESET) Running full E2E verification pipeline..."
+test-e2e: ## Run end-to-end verification pipeline
 	bash scripts/run_e2e_tests.sh
 
-.PHONY: test-c99
-test-c99: ## Compile & run strict C99 header and ABI layout verification (-std=c99 -Wall -Wextra -Werror)
-	@echo -e "$(GREEN)[TEST-C99]$(RESET) Compiling asymmetric C99 mod (-std=c99 -Wall -Wextra -Werror)..."
-	$(MAKE) -C tests/asymmetric_c_mod clean
-	$(MAKE) -C tests/asymmetric_c_mod
-	@echo -e "$(GREEN)[TEST-C99]$(RESET) Compiling and running standalone_c_test.c..."
-	@mkdir -p target
-	$(CC) -std=c99 -Wall -Wextra -Werror -Iinclude tests/standalone_c_test.c -o target/standalone_c_test
-	./target/standalone_c_test
-
 .PHONY: miri
-miri: ## Run Miri (-Zmiri-tree-borrows) on in-process ABI, macro, SDK, fuzz, and parity suites
-	@echo -e "$(GREEN)[MIRI]$(RESET) Running Miri (-Zmiri-tree-borrows) on bevy_abi_mod_sys, bevy_abi_mod_guest_sys & bevy_abi_mod_guest..."
-	MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p bevy_abi_mod_sys -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest
-	@echo -e "$(GREEN)[MIRI]$(RESET) Running Miri (-Zmiri-tree-borrows) on bevy_abi_mod_macros in-process suites..."
-	MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p bevy_abi_mod_macros --lib --test validation_gate_1 --test compile_fail_tests
-	@echo -e "$(GREEN)[MIRI]$(RESET) Running Miri (-Zmiri-tree-borrows) on bevy_abi_mod_host_sys & bevy_abi_mod_host non-dlopen suites..."
-	MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p bevy_abi_mod_host_sys --lib
-	MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p bevy_abi_mod_host --lib --test bevy_alignment_soundness_tests --test fuzz_abi_boundaries --test differential_bevy_parity -- --skip real_dylib_loaded_mod_entity_lifecycle_events_and_strict_validation_work
+miri: ## Run Miri (-Zmiri-tree-borrows) via cargo xtask
+	cargo xtask miri --all
 
 .PHONY: bench
-bench: build-mods build-bench-mods ## Run full cross-architecture & debug/release permutation benchmark matrix
-	@echo -e "$(GREEN)[BENCH]$(RESET) Running complete permutation benchmark suite (Debug + Release x Native + Rust dylib + C-ABI Rust/C99)..."
-	cargo run --release -p permutation_bench
-	@if [ -f "target/benchmark_results.json" ]; then \
-		echo -e "$(GREEN)[BENCH]$(RESET) Successfully generated target/benchmark_results.json"; \
-	fi
+bench: ## Run full cross-language permutation benchmark matrix
+	cargo xtask bench --permutation
 
 .PHONY: bench-quick
-bench-quick: build-mods ## Run Milestone 4 bevy_abi_mod_host benchmark test (1k, 10k, 100k entities)
-	@echo -e "$(GREEN)[BENCH-QUICK]$(RESET) Running Milestone 4 bevy_abi_mod_host benchmark test..."
-	cargo test -p bevy_abi_mod_host --release --test benchmarks -- --nocapture
+bench-quick: ## Run Criterion / host chunk throughput benchmark
+	cargo xtask bench
 
 .PHONY: fmt
 fmt: ## Auto-format all Rust code across the workspace
-	@echo -e "$(GREEN)[FMT]$(RESET) Formatting Rust code..."
 	cargo fmt --all
 
 .PHONY: fmt-check
 fmt-check: ## Check code formatting without applying changes
-	@echo -e "$(GREEN)[FMT-CHECK]$(RESET) Checking code formatting..."
 	cargo fmt --all -- --check
 
 .PHONY: clippy
 clippy: ## Run Clippy linter with strict warning checks
-	@echo -e "$(GREEN)[CLIPPY]$(RESET) Running clippy..."
 	cargo clippy --workspace --all-targets -- -D warnings
 
-.PHONY: clean
-clean: clean-mods ## Clean all cargo targets and build artifacts
-	@echo -e "$(GREEN)[CLEAN]$(RESET) Cleaning workspace target..."
+.PHONY: example-1 example-2 example-3 example-4 game example-4-test example-5 game-3d example-5-test examples
+example-1: build-example-mods ## Run Stage 1 Minimal Handshake
+	cargo run --manifest-path examples/01_minimal_handshake/Cargo.toml
+
+example-2: build-example-mods ## Run Stage 2 Multi-System Pipeline
+	cargo run --manifest-path examples/02_multi_system_pipeline/Cargo.toml
+
+example-3: build-example-mods ## Run Stage 3 Cross-Language C99 + Rust Interop
+	cargo run --manifest-path examples/03_cross_language_interop/Cargo.toml
+
+example-4: build-example-mods ## Run Stage 4 2D Visual Game
+	cargo run --manifest-path examples/04_visual_game/Cargo.toml
+
+game: example-4 ## Alias for example-4
+
+example-4-test: build-example-mods ## Run Stage 4 Visual Game in headless test mode
+	cargo run --manifest-path examples/04_visual_game/Cargo.toml -- --test-mode --ticks 30
+
+example-5: build-example-mods ## Run Stage 5 Cute 3D Slime Meadow (winit + wgpu)
+	cargo run --manifest-path examples/05_cute_3d_winit/Cargo.toml --release
+
+game-3d: example-5 ## Alias for example-5
+
+example-5-test: build-example-mods ## Run Stage 5 Cute 3D Slime Meadow in headless test mode
+	cargo run --manifest-path examples/05_cute_3d_winit/Cargo.toml --release -- --test-mode --ticks 45
+
+examples: example-1 example-2 example-3 example-4-test example-5-test ## Run progression examples sequentially
+
+.PHONY: clean clean-mods
+clean: clean-mods ## Clean workspace target and guest mod artifacts
 	cargo clean
 
-.PHONY: clean-mods
 clean-mods: ## Clean guest mod build artifacts
-	@echo -e "$(GREEN)[CLEAN-MODS]$(RESET) Cleaning C mods..."
 	$(MAKE) -C tests/asymmetric_c_mod clean
 	$(MAKE) -C benches/c_abi_c99_mod clean
-	@if [ -f "examples/03_cross_language_interop/c_mod/Makefile" ]; then \
-		$(MAKE) -C examples/03_cross_language_interop/c_mod clean; \
-	fi
-	@echo -e "$(GREEN)[CLEAN-MODS]$(RESET) Cleaning Rust mods..."
 	cargo clean --manifest-path tests/asymmetric_rust_mod/Cargo.toml
 	cargo clean --manifest-path benches/c_abi_rust_mod/Cargo.toml
-	@if [ -f "examples/01_minimal_handshake/guest_mod/Cargo.toml" ]; then \
-		cargo clean --manifest-path examples/01_minimal_handshake/guest_mod/Cargo.toml; \
-	fi
-	@if [ -f "examples/02_multi_system_pipeline/guest_mod/Cargo.toml" ]; then \
-		cargo clean --manifest-path examples/02_multi_system_pipeline/guest_mod/Cargo.toml; \
-	fi
-	@if [ -f "examples/03_cross_language_interop/rust_mod/Cargo.toml" ]; then \
-		cargo clean --manifest-path examples/03_cross_language_interop/rust_mod/Cargo.toml; \
-	fi
-	@if [ -f "examples/04_visual_game/mods/mod_gravity/Cargo.toml" ]; then \
-		cargo clean --manifest-path examples/04_visual_game/mods/mod_gravity/Cargo.toml; \
-	fi
-	@if [ -f "examples/04_visual_game/mods/mod_rainbow/Cargo.toml" ]; then \
-		cargo clean --manifest-path examples/04_visual_game/mods/mod_rainbow/Cargo.toml; \
-	fi
-	@if [ -f "examples/04_visual_game/mods/mod_vortex/Cargo.toml" ]; then \
-		cargo clean --manifest-path examples/04_visual_game/mods/mod_vortex/Cargo.toml; \
-	fi
-	@if [ -f "examples/05_cute_3d_winit/mods/mod_boing/Cargo.toml" ]; then \
-		cargo clean --manifest-path examples/05_cute_3d_winit/mods/mod_boing/Cargo.toml; \
-	fi
-	@if [ -f "examples/05_cute_3d_winit/mods/mod_carousel/Cargo.toml" ]; then \
-		cargo clean --manifest-path examples/05_cute_3d_winit/mods/mod_carousel/Cargo.toml; \
-	fi
-	@if [ -f "examples/05_cute_3d_winit/mods/mod_cuddle_c99/Makefile" ]; then \
-		$(MAKE) -C examples/05_cute_3d_winit/mods/mod_cuddle_c99 clean; \
-	fi

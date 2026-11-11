@@ -85,13 +85,22 @@ static inline BEVY_ABI_UNUSED uint32_t bevy_abi_version_patch(uint32_t packed) {
 }
 
 static inline BEVY_ABI_UNUSED FfiBool bevy_abi_version_is_compatible(uint32_t host_packed, uint32_t guest_packed) {
-    return (bevy_abi_version_major(host_packed) == bevy_abi_version_major(guest_packed) &&
-            bevy_abi_version_minor(guest_packed) <= bevy_abi_version_minor(host_packed))
-        ? FFI_BOOL_TRUE
-        : FFI_BOOL_FALSE;
+    uint32_t host_major = bevy_abi_version_major(host_packed);
+    uint32_t guest_major = bevy_abi_version_major(guest_packed);
+    uint32_t host_minor;
+    uint32_t guest_minor;
+    if (host_major != guest_major) {
+        return FFI_BOOL_FALSE;
+    }
+    host_minor = bevy_abi_version_minor(host_packed);
+    guest_minor = bevy_abi_version_minor(guest_packed);
+    if (host_major == 0u) {
+        return (host_minor == guest_minor) ? FFI_BOOL_TRUE : FFI_BOOL_FALSE;
+    }
+    return (guest_minor <= host_minor) ? FFI_BOOL_TRUE : FFI_BOOL_FALSE;
 }
 
-/* Status codes (matches `abi_contract::FfiResult`) */
+/* Status codes (matches `bevy_abi_mod_sys::FfiResult`) */
 typedef uint32_t FfiResult;
 #define FFI_RESULT_OK                 0u
 #define FFI_RESULT_INVALID_COMPONENT  1u
@@ -101,6 +110,13 @@ typedef uint32_t FfiResult;
 #define FFI_RESULT_INVALID_UTF8       5u
 #define FFI_RESULT_PERMISSION_DENIED  6u
 #define FFI_RESULT_INVALID_VERSION    7u
+#define FFI_RESULT_INVALID_ARGUMENT   8u
+#define FFI_RESULT_OUT_OF_RANGE       9u
+#define FFI_RESULT_NOT_FOUND          10u
+#define FFI_RESULT_INVALID_STATE      11u
+#define FFI_RESULT_INVALID_ENTITY     12u
+#define FFI_RESULT_CAPACITY_EXCEEDED  13u
+#define FFI_RESULT_UNSUPPORTED        14u
 #define FFI_RESULT_INTERNAL_ERROR     99u
 
 /* Opaque 64-bit entity identifier (`abi_contract::FfiEntity`).
