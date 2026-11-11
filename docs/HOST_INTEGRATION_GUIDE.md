@@ -128,12 +128,12 @@ In your Bevy game project's `Cargo.toml`:
 
 ```toml
 [dependencies]
-bevy = "0.15" # or bevy_app, bevy_ecs (v0.20+)
+bevy = "0.20" # or bevy_app, bevy_ecs (v0.20+)
 host_runtime = { path = "path/to/bevy_abi_mod/crates/host_runtime" }
 mod_derive = { path = "path/to/bevy_abi_mod/crates/mod_derive" }
 ```
 
-### 2.2 Adding `AbiModPlugin`
+### 2.2 Adding `AbiModPlugin` & Configuring `ModErrorPolicy`
 Initialize the modding subsystem in your Bevy `App` by adding `AbiModPlugin`:
 
 ```rust
@@ -144,44 +144,51 @@ fn main() {
     let mut app = App::new();
     app.add_plugins(DefaultPlugins);
 
-    // Add the ABI modding plugin
-    app.add_plugins(AbiModPlugin::default()); // or app.add_plugins(AbiModPlugin);
+    // Add the ABI modding plugin (default policy: ModErrorPolicy::Quarantine;
+    // also supports ModErrorPolicy::Log and ModErrorPolicy::ReportToBevy)
+    app.add_plugins(AbiModPlugin::with_error_policy(ModErrorPolicy::Quarantine));
 }
 ```
 
 When added, `AbiModPlugin`:
-1. Ensures `ModRegistry` and `ModHost` are inserted into the ECS world resources if not already present.
+1. Ensures `ModRegistry` and `ModHost` are inserted into the ECS world resources and registers `ModLoaded`, `ModUnloaded`, and `ModSystemFaulted` messages/events.
 2. Registers built-in engine bridge function symbols:
-   - `cmd_spawn_empty`: Immediate entity ID allocation with deferred spawn.
-   - `cmd_despawn`: Deferred entity despawning.
-   - `cmd_insert_component`: Deferred raw-byte component insertion.
-   - `iter_reset`: O(1) query cursor rewinding for nested iteration.
-   - `register_multi_query_system`: Multi-query dynamic system registration.
+   - `cmd_spawn_empty`: Immediate entity ID allocation (`FfiEntity::NULL = 0` on error) with deferred spawn.
+   - `cmd_despawn`: Deferred recursive entity despawning.
+   - `cmd_insert_component`: Deferred raw-byte component insertion (`IS_RAW_INSERTABLE` enforced).
+   - `iter_reset`: $O(1)$ query cursor rewinding for nested iteration.
+   - `register_scheduled_system`: Single-query registration targeting `Startup`/`PreUpdate`/`Update`/`PostUpdate`/`FixedUpdate`/`Last` with `.after()`/`.before()` ordering.
+   - `register_multi_query_system`: Multi-query dynamic system registration (up to 8 queries).
+   - `register_component`: Runtime dynamic component registration (`ModComponentDescriptor`).
 
-### 2.3 Registering Exposable Host Components
-Host components intended for mod reading or writing must be registered with the Bevy `App`:
+### 2.3 Registering Exposable Host Components (`Table` & `SparseSet`)
+Host components intended for mod reading or writing (using either default `StorageType::Table` or `#[component(storage = "SparseSet")]`) must be registered with the Bevy `App`:
 
 ```rust
-// Registers ECS component, assigns ComponentId, and records VTable
+// Registers ECS component (Table or SparseSet), assigns ComponentId, and records VTable
 app.register_mod_component::<Position>();
 app.register_mod_component::<Velocity>();
+
+// Force VTable-only opaque exposure (forbids raw byte cmd_insert_component even on Copy structs):
+// app.register_mod_component_opaque::<AuthState>();
 
 // If you have a nested struct or shared data type (not an ECS component):
 app.register_mod_type::<Vec3f>();
 ```
 
 Under the hood, `register_mod_component::<T>()`:
-1. Calls `app.world_mut().register_component::<T>()` to obtain Bevy's runtime `ComponentId`.
-2. Registers `T` in `ModRegistry`, recording its 128-bit `ComponentUuid`, byte size, byte alignment, and static VTable pointer.
+1. Calls `app.world_mut().register_component::<T>()` to obtain Bevy's runtime `ComponentId` and `StorageType`.
+2. Registers `T` in `ModRegistry`, recording its 128-bit `ComponentUuid`, byte size, byte alignment, `T::IS_RAW_INSERTABLE`, and static VTable pointer.
 3. Exposes the VTable symbol `"<ComponentName>_vtable"` to the handshake symbol resolver `host_get_proc_address`.
 
-### 2.4 Structuring Host Components with `#[derive(ModExposable)]`
-Components stay standard Rust structs (no `#[repr(C)]` required on the struct itself) while deriving `ModExposable`:
+### 2.4 Structuring Host Components with `#[derive(ModExposable)]` & `#[derive(AbiPod)]`
+Components can either use `#[repr(C)]` + `Copy` (implementing both `AbiPod` for zero-copy typed guest slices and `ModExposable` for VTables) or stay standard `#[repr(Rust)]` structs with `String`/`Vec`/`bool` fields (implementing `ExposableComponent` VTables without `AbiPod`):
 
 ```rust
 use bevy_ecs::component::Component;
 use host_runtime::ModExposable;
 
+#[repr(C)]
 #[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
 #[mod_component(name = "game::Position", prefix = "Pos")]
 pub struct Position {
@@ -191,32 +198,33 @@ pub struct Position {
 }
 ```
 
-The `#[derive(ModExposable)]` procedural macro generates:
-- An associated `#[repr(C)] pub struct <Struct>VTable` with static function pointers.
-- Safe `unsafe extern "C"` getter and setter implementations.
-- An associated static instance `VTABLE` referenced by `ModRegistry`.
-- An associated deterministic `UUID: ComponentUuid`.
+Supported container attributes on `#[mod_component(...)]`:
+- `name = "..."`, `prefix = "..."`, `export_symbols`
+- `no_pod`: Suppresses automatic `AbiPod` implementation even on a `#[repr(C)] + Copy` struct.
+- `opaque`: Marks `IS_POD = false` and `IS_RAW_INSERTABLE = false`, allowing nested `ExposableComponent` fields via pointer accessors while forbidding raw-byte overwrites.
 
-#### 2.4.1 Primitive Fields
-Standard primitives (`f32`, `f64`, `i8`..`i64`, `u8`..`u64`, `usize`, `isize`, `bool`) generate direct getter/setter pairs:
+#### 2.4.1 Primitive & Boolean (`FfiBool`) Fields
+Numeric primitives (`f32`, `f64`, `i8`..`i128`, `u8`..`u128`, `usize`, `isize`, `FfiEntity`) generate direct getter/setter pairs:
 - `<Struct>_get_<field>(ptr: *const c_void) -> <Type>`
 - `<Struct>_set_<field>(ptr: *mut c_void, val: <Type>)`
 
-#### 2.4.2 Nested Compound Structs & Interior Pointers
-For compound types that implement `FfiLayout` (which must be `#[repr(C)]`), tag the field with `#[mod_field(nested)]`:
+Boolean (`bool`) fields automatically bridge over the C-ABI as `FfiBool` (`u8`: `0` = false, non-zero = true) so foreign byte values `2..=255` can never construct an invalid Rust `bool`:
+- `<Struct>_get_<field>(ptr: *const c_void) -> u8`
+- `<Struct>_set_<field>(ptr: *mut c_void, val: u8)`
+
+#### 2.4.2 Nested Compound Structs & Interior Pointers (`#[derive(AbiPod)]`)
+For compound sub-structs, derive `AbiPod` (which enforces `#[repr(C)]` / `#[repr(transparent)]`, non-packed layout, `Copy`, and `!needs_drop` at compile time) and tag the field with `#[mod_field(nested)]`:
 
 ```rust
-use abi_contract::FfiLayout;
+use mod_derive::AbiPod;
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, AbiPod)]
 pub struct Vec3f {
     pub x: f32,
     pub y: f32,
     pub z: f32,
 }
-// SAFETY: Vec3f is #[repr(C)] containing only primitive f32 fields.
-unsafe impl FfiLayout for Vec3f {}
 
 #[derive(Component, ModExposable)]
 pub struct Transform {
@@ -228,12 +236,12 @@ This generates interior pointer accessors:
 - `<Struct>_ptr_<field>(ptr: *const c_void) -> *const c_void`
 - `<Struct>_ptr_mut_<field>(ptr: *mut c_void) -> *mut c_void`
 
-#### 2.4.3 Heap-Allocated Fields (`String` and `Vec<T>`)
-Heap collections owned by the host allocator must **never** be passed as raw owned types to guest allocators!
+#### 2.4.3 Heap-Allocated Fields (`String` and `Vec<T: AbiPod>`)
+Heap collections owned by the host allocator must **never** be passed as raw owned types to guest allocators (and automatically set `IS_POD = false` and `IS_RAW_INSERTABLE = false`):
 - **For `String` (`#[mod_field(string)]`):**
-  - Getter returns borrowed `StrView { ptr: *const u8, len: usize }`.
+  - Getter returns borrowed `FfiSlice<u8>` (`StrView { ptr: *const u8, len: usize }`).
   - Setter takes `(*const u8, usize)`, validates UTF-8, and mutates the host `String` using the host allocator.
-- **For `Vec<T: FfiLayout + Copy>` (`#[mod_field(vec)]`):**
+- **For `Vec<T: AbiPod>` (`#[mod_field(vec)]`):**
   - Getter returns borrowed `FfiSlice<T> { ptr: *const T, len: usize }`.
   - Setter takes `(*const T, usize)` and copies elements using the host allocator.
 
@@ -346,106 +354,71 @@ When Bevy runs `apply_deferred`, all queued operations are flushed safely into t
 
 ## 4. Mod Lifecycle Management at Runtime
 
-### 4.1 Dynamic Library Loading (`load_mod_tracked`)
+### 4.1 Dynamic Library Loading (`try_load_mod` & `ModLoadError`)
 Host games load dynamic mods using the `ModAppExt` trait on `App`:
 
 ```rust
-let mod_id: ModId = app.load_mod_tracked("mods/kinematics.dylib")
+// Returns Result<ModId, ModLoadError> with structured diagnostics
+let mod_id: ModId = app.try_load_mod("mods/kinematics.dylib")
     .expect("Failed to load mod");
+
+// Or validate component names + borrow conflicts strictly before schedule insertion:
+// let mod_id = app.try_load_mod_strict("mods/kinematics.dylib")?;
+// Or route default systems into a specific Bevy schedule (Startup / FixedUpdate / PostUpdate):
+// let mod_id = app.try_load_mod_into_schedule("mods/init_mod.dylib", ModSchedule::Startup)?;
 ```
 
-The 6-Step Loading Sequence:
-1. **Dynamic Loading:** `libloading::Library::new(path)` loads the shared library (`dlopen` / `LoadLibrary`).
-2. **ABI Version Check:** Calls `bevy_abi_mod_abi_version() -> u32` if exported, confirming version compatibility with `ABI_VERSION_PACKED`.
-3. **Symbol Handshake:** Resolves mandatory entry point `bevy_abi_mod_init` and optional `bevy_abi_mod_shutdown`.
-4. **Context & Guard Creation:** Instantiates `is_active = Arc::new(AtomicBool::new(true))` and temporary `ModInitContext`.
-5. **Initialization Hook:** Invokes `bevy_abi_mod_init(host_get_proc_address, &HOST_API, &mut init_ctx)`. The mod registers its systems.
-6. **Schedule Injection:** Registered `DynamicCSystem` instances are injected directly into Bevy's `Update` schedule.
+The Loading Sequence:
+1. **Dynamic Loading & Per-Inode Locking:** `libloading::Library::new(path)` loads the shared library under a per-inode `SharedLibState` reference-counted lock.
+2. **SemVer ABI Version Check:** Calls `bevy_abi_mod_abi_version() -> u32` if exported, verifying `is_abi_version_compatible(ABI_VERSION_PACKED, guest_version)`.
+3. **Symbol Handshake:** Resolves mandatory `bevy_abi_mod_init` and optional `bevy_abi_mod_shutdown`.
+4. **Context & Guard Creation:** Instantiates `is_active = Arc::new(AtomicBool::new(true))` and `ModInitContext`.
+5. **Initialization Hook:** Invokes `bevy_abi_mod_init(host_get_proc_address, &HOST_API, &mut init_ctx)`.
+6. **Schedule Injection, `ModSystemSet` & ECS Events:** Injects registered `DynamicCSystem` instances into their target schedules tagged with `ModSystemSet::All`, `ModSystemSet::Mod(mod_id)`, and `ModNamedSystemSet(name)`, spawns a queryable `LoadedModInfo` entity, and emits `ModLoaded`.
 
-### 4.2 Mod Identification & Tracking (`ModId` and `LoadedMod`)
-- `ModId(pub u32)`: A unique identifier assigned to each loaded library instance.
-- `ModHost`: ECS resource storing active mod records:
-  ```rust
-  pub struct LoadedMod {
-      pub id: ModId,
-      pub name: String,
-      pub library: Library,
-      pub shutdown_fn: Option<ModShutdownFn>,
-      pub is_active: Arc<AtomicBool>,
-  }
-  ```
+### 4.2 Mod Identification, ECS Entities & Lifecycle Events
+- `ModId(pub u32)`: Unique identifier assigned to each loaded mod instance.
+- `LoadedModInfo`: ECS `Component` spawned for each active mod so Bevy UI/systems can query `Query<&LoadedModInfo>` directly.
+- `ModLoaded`, `ModUnloaded`, and `ModSystemFaulted`: Bevy `Event` + `Message` types emitted for observers (`app.add_observer(...)`) and `MessageReader<...>`.
 
-### 4.3 Safe Unloading & The Atomic Tombstone Pattern
-#### The Unloading Hazard in Bevy ECS
-In Bevy ECS, schedule system graphs cannot be arbitrarily rebuilt or excised at runtime while the app is running. Dropping `libloading::Library` issues an OS-level `dlclose()`, which unmaps the `.text` code pages of the shared library from virtual memory.
+### 4.3 Safe Unloading: Atomic Tombstones + `ModSystemSet` Schedule Excision
+Dropping `libloading::Library` issues an OS-level `dlclose()`, unmapping the shared library's `.text` segment. `bevy_abi_mod` combines two complementary mechanisms on `app.try_unload_mod(mod_id)`:
+1. **Schedule Graph Excision (`remove_systems_in_set`):** Removes all systems belonging to `ModSystemSet::Mod(mod_id)` from tracked Bevy schedules (`ScheduleCleanupPolicy::RemoveSystemsOnly`), preventing schedule node accumulation across thousands of hot-reload cycles.
+2. **Atomic Tombstone & Drop-Trampoline Deactivation:** Stores `is_active.store(false, Ordering::Release)` and updates the per-`(WorldId, ComponentUuid)` atomic drop-trampoline pool (`MAX_DROP_TRAMPOLINES = 1024`), guaranteeing that any surviving system reference or unmapped foreign `ComponentDropFn` becomes an immediate safe no-op.
 
-If Bevy's schedule were to execute leftover systems after an unload, the instruction pointer would jump into unmapped virtual memory, causing an immediate, fatal `SIGSEGV` or access violation!
-
-#### The Atomic Tombstone Solution
-`bevy_abi_mod` prevents this using the **Atomic Tombstone Pattern**:
-1. Every `DynamicCSystem` holds a cloned `Arc<AtomicBool>` reference to `is_active`.
-2. When `app.unload_mod(mod_id)` is called, the host performs `is_active.store(false, Ordering::Release)`.
-3. At the very start of `DynamicCSystem::run_unsafe`:
-   ```rust
-   if !self.enabled || self.self_conflict || !self.is_active.load(Ordering::Acquire) {
-       return Ok(());
-   }
-   ```
-4. On all subsequent frame ticks, the system checks the atomic flag and bails instantly with `Ok(())`. Foreign code is never called again, completely neutralizing the unmapped memory hazard!
-
-### 4.4 The 4-Phase Shutdown Sequence
-`ModHost::unload_mod` executes in 4 strict phases:
-- **Phase 1: Tombstone Store:** `is_active.store(false, Ordering::Release)` immediately deactivates all systems registered by this mod.
-- **Phase 2: Guest Teardown Hook:** Calls `shutdown_fn(null_mut())` **while the library memory is still validly mapped**. The guest can flush buffers, close open files/sockets, and deallocate its own heap state.
-- **Phase 3: Dynamic Unmapping:** Dropping `loaded.library` issues the OS `dlclose()`.
-- **Phase 4: LIFO Reverse-Order Teardown:** When `ModHost::unload_all()` is called at game exit, mods are unloaded in reverse load order (Last-In, First-Out), ensuring dependent mods are dismantled before their prerequisites.
+### 4.4 The Shutdown Sequence
+`ModHost::try_unload_mod` (and `unload_all` in LIFO reverse load order) executes in strict order:
+- **Phase 1: Tombstone & Drop-Slot Deactivation:** `is_active.store(false, Ordering::Release)` and per-`(WorldId, ComponentUuid)` drop-trampoline snapshot update.
+- **Phase 2: Schedule Excision & ECS Cleanup:** Excises `ModSystemSet::Mod(mod_id)` from schedules, despawns `LoadedModInfo`, and emits `ModUnloaded`.
+- **Phase 3: Guest Teardown Hook:** When the per-inode `SharedLibState` active count transitions `1 -> 0`, calls `bevy_abi_mod_shutdown` **while `.text` is still mapped** so guest closures and heap allocations are freed cleanly.
+- **Phase 4: Dynamic Unmapping:** Drops `libloading::Library` (`dlclose` / `FreeLibrary`).
 
 ### 4.5 Hot-Reloading Patterns Without OS File Locking
-#### The OS File Locking Obstacle
-On Windows, the OS places an exclusive lock on loaded `.dll` files, preventing compilers from rebuilding them. On macOS/Linux, overwriting a currently loaded `.so` or `.dylib` in-place causes code corruption or `ETXTBSY`.
-
-#### The Shadow-Copy Hot-Reloading Pattern
-To support seamless runtime hot-reloading:
-1. Detect file modifications in the mod directory (via file watcher or timestamp polling).
-2. Copy the newly compiled `.dylib` / `.dll` to a versioned shadow path in a temporary directory (e.g. `.cache/mods/kinematics_v2.dylib`).
-3. Unload the previous mod instance: `app.unload_mod(current_mod_id)`.
-4. Load the shadow-copied instance: `app.load_mod_tracked(shadow_path)`.
-5. Store the new `ModId`.
-
-This pattern allows mod developers to rebuild their code without closing the running game.
+To support seamless runtime hot-reloading without Windows `.dll` locks or Unix `ETXTBSY`:
+1. Copy the newly compiled `.dylib` / `.so` / `.dll` to a versioned shadow path (e.g. `.cache/mods/kinematics_v2.dylib`).
+2. Unload the previous instance: `app.try_unload_mod(current_mod_id)?`.
+3. Load the shadow-copied instance: `app.try_load_mod(shadow_path)?`.
 
 ---
 
-## 5. Fault Tolerance & Panic Containment
+## 5. Fault Tolerance, `ModErrorPolicy` & Panic Containment
 
 ### 5.1 Cross-Runtime Unwinding Panic Hazards
-Rust dynamic libraries compiled as standalone `.cdylib` link their own copy of the Rust standard library and their own panic runtime. If a guest Rust mod panics and unwinds across `extern "C"` into the host, the Rust runtime treats this as an unhandled foreign exception. Standard `catch_unwind` on the host side cannot catch foreign unwinding exceptions, causing the OS to terminate the game process (`fatal runtime error: failed to initiate panic`).
+Standalone `.cdylib` mods link an isolated Rust `std` runtime; unwinding across `extern "C"` into the host is undefined behavior.
 
 ### 5.2 Two-Tier Panic Containment & `FfiResult::PANIC_CAUGHT`
-To guarantee game stability, `bevy_abi_mod` employs two-tier panic containment:
-- **Tier 1 (Guest-Side Containment):** In `guest_sdk`, macros `export_mod!` and `wrap_system_callback!` wrap all mod callbacks inside `std::panic::catch_unwind` within the guest's own standard library. Caught panics are translated into the integer status code `FfiResult::PANIC_CAUGHT`.
-- **Tier 2 (Host-Side Defense):** In `DynamicCSystem::run_unsafe`, foreign callbacks are also wrapped in `catch_unwind` as defense-in-depth against in-process mod callbacks.
+- **Tier 1 (Guest-Side Containment):** `guest_sdk` (`export_mod!`, `GuestApp::add_system`, `wrap_system_callback!`) wraps guest callbacks in `std::panic::catch_unwind` inside the guest runtime and returns `FfiResult::PANIC_CAUGHT`.
+- **Tier 2 (Host-Side Defense):** `DynamicCSystem::run_unsafe` also guards callbacks with `catch_unwind`.
 
-### 5.3 Automatic System Disabling & World Protection
-When `DynamicCSystem` executes a callback and receives `status == FfiResult::PANIC_CAUGHT` or an error status:
-```rust
-match res {
-    Ok(status) => {
-        if status == FfiResult::PANIC_CAUGHT || status.is_err() {
-            self.enabled = false; // Permanently quarantine faulty system
-        }
-    }
-    Err(_) => {
-        self.enabled = false;
-    }
-}
-```
-The host disables the faulted system for the remainder of the session. The host Bevy engine, UI, rendering, and all other healthy mod systems continue running at full frame rate without crashing or halting the game loop.
+### 5.3 Configurable `ModErrorPolicy` & `ModSystemFaulted`
+When a system returns an error `FfiResult` or `PANIC_CAUGHT`, `DynamicCSystem` emits a `ModSystemFaulted` event/message and applies the configured `ModErrorPolicy`:
+- **`ModErrorPolicy::Quarantine` (default):** Logs the fault and sets `self.enabled = false` so healthy host and mod systems continue uninterrupted.
+- **`ModErrorPolicy::Log`:** Logs the fault and emits `ModSystemFaulted` without disabling future runs.
+- **`ModErrorPolicy::ReportToBevy`:** Propagates `Err(BevyError)` into Bevy's native schedule error handler.
 
 ### 5.4 Memory & Allocator Boundary Isolation (The Owner-Frees Rule)
-- **The Golden Rule:** Memory allocated by the host must be freed by the host. Memory allocated by the guest must be freed by the guest.
-- Never pass Rust `Box`, `Vec`, or `String` across the C-ABI boundary.
-- When guest code queues component insertions via `cmd_insert_component`, the host copies the incoming bytes into a host-allocated `Vec<u8>`. The guest buffer can be freed immediately or the guest mod unloaded; the host retains its own safe copy.
+- **The Golden Rule:** Memory allocated by the host is freed by the host; memory allocated by the guest is freed by the guest.
+- `cmd_insert_component` copies bytes into a host-owned aligned buffer and rejects non-raw-insertable (`String`, `Vec`, `bool`, `opaque`) host components with `FfiResult::PERMISSION_DENIED`.
 
 ---
 
@@ -523,23 +496,21 @@ fn main() {
 ```
 
 ### 6.2 Example 2: Advanced Host Component Design & Change Detection
-Illustrating primitives, host strings with self-aliasing safety, nested sub-structs, and skipped fields:
+Illustrating primitives, host strings with self-aliasing safety, nested `AbiPod` sub-structs, and skipped fields:
 
 ```rust
 use bevy_app::App;
 use bevy_ecs::component::Component;
 use host_runtime::prelude::*;
-use abi_contract::FfiLayout;
+use mod_derive::AbiPod;
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, AbiPod)]
 pub struct Vec3f {
     pub x: f32,
     pub y: f32,
     pub z: f32,
 }
-// SAFETY: Vec3f is #[repr(C)] containing exclusively primitive f32 fields.
-unsafe impl FfiLayout for Vec3f {}
 
 #[derive(Component, Debug, Clone, PartialEq, ModExposable)]
 #[mod_component(name = "game::Character")]
@@ -650,14 +621,16 @@ pub fn inspect_minions(query: Query<(Entity, &MinionTag, &Position)>) {
 
 | Trait / Type | Location | Method / Item | Description |
 |---|---|---|---|
-| **`AbiModPlugin`** | `host_runtime::plugin` | `AbiModPlugin::default()` | Initializes ECS mod subsystem and registers bridge symbols. |
-| **`ModAppExt`** | `host_runtime::plugin` | `app.register_mod_component::<T>()` | Registers component, assigns `ComponentId`, exposes VTable. |
-| **`ModAppExt`** | `host_runtime::plugin` | `app.register_mod_type::<T>()` | Registers helper type VTable without assigning ECS `ComponentId`. |
-| **`ModAppExt`** | `host_runtime::plugin` | `app.load_mod(path)` | Fluent dynamic mod loading. |
-| **`ModAppExt`** | `host_runtime::plugin` | `app.load_mod_tracked(path)` | Returns `Result<ModId, ModError>` for lifecycle tracking. |
-| **`ModAppExt`** | `host_runtime::plugin` | `app.unload_mod(mod_id)` | Triggers 4-phase shutdown with atomic tombstone safety. |
-| **`ModHost`** | `host_runtime::host` | `host.loaded_count()` | Returns count of currently active mods. |
-| **`ModHost`** | `host_runtime::host` | `host.is_mod_active(mod_id)` | Checks if a mod is loaded and active. |
-| **`ModRegistry`** | `host_runtime::registry` | `registry.get_component_id_by_name(name)` | Translates C string name to Bevy `ComponentId`. |
-| **`ModRegistry`** | `host_runtime::registry` | `registry.get_symbol(name)` | Resolves static VTable and bridge symbol pointers. |
-| **`ModExposable`** | `mod_derive` | `#[derive(ModExposable)]` | Generates `#[repr(C)]` VTable with self-aliasing safety. |
+| **`AbiModPlugin`** | `host_runtime` | `AbiModPlugin::with_error_policy(...)` | Initializes ECS mod subsystem with `ModErrorPolicy`. |
+| **`ModErrorPolicy`** | `host_runtime` | `Quarantine` / `Log` / `ReportToBevy` | Controls runtime fault handling for dynamic mod systems. |
+| **`ModLoadError`** | `host_runtime` | Structured load/unload error enum | Typed diagnostics (`DlOpen`, `IncompatibleAbiVersion`, `InitFailed`, etc.). |
+| **`ModAppExt`** | `host_runtime` | `app.register_mod_component::<T>()` | Registers `Table` or `SparseSet` component, assigns `ComponentId`, exposes VTable. |
+| **`ModAppExt`** | `host_runtime` | `app.register_mod_component_opaque::<T>()` | Registers component for VTable access while forbidding raw-byte insertion. |
+| **`ModAppExt`** | `host_runtime` | `app.register_mod_type::<T>()` | Registers helper type VTable without assigning ECS `ComponentId`. |
+| **`ModAppExt`** | `host_runtime` | `app.try_load_mod(path)` | Loads mod returning `Result<ModId, ModLoadError>`. |
+| **`ModAppExt`** | `host_runtime` | `app.try_load_mod_strict(path)` | Pre-validates component names and borrow conflicts before inserting into schedule. |
+| **`ModAppExt`** | `host_runtime` | `app.try_load_mod_into_schedule(path, sched)` | Loads mod routing default systems into `ModSchedule` (`Startup`, `FixedUpdate`, etc.). |
+| **`ModAppExt`** | `host_runtime` | `app.try_unload_mod(mod_id)` | Excises `ModSystemSet::Mod(mod_id)`, flips tombstones, runs shutdown, and `dlclose`s. |
+| **`ModSystemSet`** | `host_runtime` | `ModSystemSet::{All, Mod(ModId)}` | Bevy `SystemSet`s for ordering against or excising mod systems. |
+| **`ModLoaded` / `ModUnloaded` / `ModSystemFaulted`** | `host_runtime` | ECS `Event` + `Message` | Lifecycle and fault telemetry observable via observers or `MessageReader`. |
+| **`ModExposable` / `AbiPod`** | `mod_derive` | `#[derive(ModExposable, AbiPod)]` | Generates `#[repr(C)]` VTables and compile-time verified POD layout markers. |

@@ -91,26 +91,30 @@ In Rust game development with Bevy Engine (v0.20+), dynamically loading external
 ```text
 bevy_abi_mod/
 ├── Cargo.toml                  # Workspace definition
+├── Makefile                    # Unified build, test, C99, Clippy, Miri & benchmark targets
+├── .github/workflows/ci.yml    # Cross-OS matrix, strict C99, Miri, ASan/UBSan & -Zrandomize-layout CI
 ├── spec.md                     # Deep technical specification
-├── gemini.md                   # Agent workflow guidelines & instructions
+├── GEMINI.md                   # Agent workflow guidelines & architectural invariants
 ├── include/
-│   └── bevy_abi_mod.h          # C99 header matching `abi_contract` (cbindgen-compatible)
+│   └── bevy_abi_mod.h          # C99 header matching `abi_contract` (static layout assertions)
 ├── crates/
 │   ├── abi_contract/           # Zero-dependency `#![no_std]` C-ABI types & function pointer signatures
 │   │   ├── Cargo.toml
 │   │   └── src/lib.rs
-│   ├── mod_derive/             # Proc-macro crate (`#[derive(ModExposable)]`)
+│   ├── mod_derive/             # Proc-macro crate (`#[derive(ModExposable, AbiPod)]`)
 │   │   ├── Cargo.toml
 │   │   ├── src/lib.rs
-│   │   └── tests/validation_gate_1.rs
-│   ├── host_runtime/           # Bevy host plugin, dynamic system adapter, ChunkIterator, CommandQueueBridge, loader
+│   │   └── tests/              # VTable/aliasing (`validation_gate_1.rs`) & real `rustc` (`compile_fail_tests.rs`)
+│   ├── host_runtime/           # Bevy host plugin, DynamicCSystem, HostChunkIter, CommandQueueBridge, ModHost
 │   │   ├── Cargo.toml
-│   │   └── src/lib.rs
-│   └── guest_sdk/              # Safe idiomatic Rust wrappers for mod developers
+│   │   ├── src/lib.rs
+│   │   └── tests/              # Soundness, differential Bevy parity, C-ABI fuzzing, E2E & lifecycle suites
+│   └── guest_sdk/              # Safe idiomatic Rust wrappers (`GuestApp`, `Chunk` split borrows)
 │       ├── Cargo.toml
 │       └── src/lib.rs
 └── tests/
-    ├── asymmetric_rust_mod/    # Standalone Cargo project (committed independent Cargo.lock) compiled to .cdylib
+    ├── standalone_c_test.c     # Standalone ISO C99 ABI layout & SemVer harness
+    ├── asymmetric_rust_mod/    # Standalone Cargo project (independent Cargo.lock) compiled to .cdylib
     │   ├── Cargo.toml
     │   ├── Cargo.lock
     │   └── src/lib.rs
@@ -177,30 +181,33 @@ For any Bevy `#[derive(Component, ModExposable)]` struct (standard `#[repr(Rust)
 ### 4.3. `crates/host_runtime` (Dynamic System Trait, Runtime Components & Parallel Execution)
 - Depends on `bevy_ecs` / `bevy_app` (or `bevy`), `libloading`, and `abi_contract`.
 - Implements:
-  - `AbiModPlugin` & `ModHost`: Manages library loading, static `HostApi` handshake, process-wide per-inode reference-counted lifecycle locking (`SharedLibState`), and deterministic `bevy_abi_mod_shutdown` invocation on final unload before `dlclose`.
-  - `ModRegistry`: Stores both compile-time `ModExposable` and runtime-registered components (`ComponentId`, `ComponentUuid`, name, size, alignment, VTable pointer, symbol resolver) and services `host_get_proc_address` with strict thread-local per-`World` symbol isolation (`CURRENT_REGISTRY`).
-  - `host_register_component`: Validates layout invariants (non-empty UTF-8 name, power-of-two alignment, size a multiple of alignment and within `isize::MAX`), constructs a raw `ComponentDescriptor::new_with_layout` (`StorageType::Table`), registers or rebinds the `ComponentId` in Bevy's `World`, and wires optional foreign `ComponentDropFn` callbacks through a 64-slot static trampoline pool (`DROP_TRAMPOLINE_SLOTS`) guarded by active mod tombstone flags (`Vec<Arc<AtomicBool>>`).
+  - `AbiModPlugin`, `ModHost`, `ModErrorPolicy` (`Quarantine`, `Log`, `ReportToBevy`), and `ModLoadError`: Manages library loading (`try_load_mod`, `try_load_mod_strict`, `try_load_mod_into_schedule`, `try_unload_mod`), SemVer `HostApi` handshake, first-class ECS representation (`LoadedModInfo` entity components), lifecycle events/messages (`ModLoaded`, `ModUnloaded`, `ModSystemFaulted`), process-wide per-inode reference-counted lifecycle locking (`SharedLibState`), and deterministic `bevy_abi_mod_shutdown` invocation on final unload before `dlclose`.
+  - `ModRegistry`: Stores compile-time `ModExposable` (`IS_POD`, `IS_RAW_INSERTABLE`, plus `register_mod_component_opaque`) and runtime-registered components (`ComponentId`, `StorageType`, `ComponentUuid`, name, size, alignment, VTable pointer, symbol resolver) and services `host_get_proc_address` with strict thread-local per-`World` symbol isolation (`CURRENT_REGISTRY`, bound on worker threads via `ModRegistry::make_current()`).
+  - `host_register_component`: Validates layout invariants (non-empty UTF-8 name, power-of-two alignment, size a multiple of alignment and within `isize::MAX`), constructs a raw `ComponentDescriptor::new_with_layout` (`StorageType::Table`, configuring `ComponentCloneBehavior::Ignore` whenever `drop_fn.is_some()` so `EntityCloner` never bitwise-copies foreign-owned resources), registers or rebinds the `ComponentId` in Bevy's `World`, and wires optional foreign `ComponentDropFn` callbacks through a 1,024-slot lock-free per-`(WorldId, ComponentUuid)` atomic snapshot pool (`MAX_DROP_TRAMPOLINES = 1024`).
   - `DynamicCSystem` (`impl bevy_ecs::system::System<In = (), Out = ()>`):
-    - `System::initialize(&mut self, world: &mut World)`: resolves `ComponentId` for each requested static or runtime component and populates `FilteredAccessSet<ComponentId>` (`add_component_read` / `add_component_write`).
-    - Archetype & Table Caching: tracks `ArchetypeGeneration` to incrementally update matched `TableId`s and `Access` without per-frame heap allocations (compatible with Bevy 0.16–0.20+ where `update_archetype_component_access` was unified into system execution/access updates).
-    - `System::run_unsafe(&mut self, _input: (), world: UnsafeWorldCell)`: constructs `RawChunkIter` backed by `world`, the cached `TableId` list, and `world.change_tick()`; invokes the mod callback; isolates faults (`FfiResult::PANIC_CAUGHT` or caught unwind) by disabling the offending system.
-    - `System::apply_deferred(&mut self, world: &mut World)`: flushes the internal `CommandQueue` (`CommandQueueBridge`).
+    - `System::initialize(&mut self, world: &mut World)`: resolves `ComponentId` and `StorageType` for each requested static or runtime component and constructs native Bevy `QueryBuilder` / `QueryState` instances, extracting `FilteredAccess<ComponentId>` into `FilteredAccessSet` and validating intra- and inter-query self-conflicts (`MAX_QUERY_COMPONENTS = 32`, `MAX_SYSTEM_QUERIES = 8`).
+    - Archetype & Storage-Aware Traversal (`HostChunkIter`): tracks `ArchetypeGeneration` to incrementally update matched dense `TableId`s (`HostChunkIter::new` fast path) or archetype-filtered chunks (`HostChunkIter::new_archetypal` whenever any data or filter clause references a `StorageType::SparseSet` component) with zero per-frame heap allocations in steady state.
+    - Schedule Sets & Ordering: tags mod systems with `ModSystemSet::All`, `ModSystemSet::Mod(ModId)`, and `ModNamedSystemSet(name)`, supporting `ModSchedule` (`Startup`, `PreUpdate`, `Update`, `PostUpdate`, `FixedUpdate`, `Last`) and `ScheduledSystemDescriptor` (`after`/`before` ordering).
+    - `System::run_unsafe(&mut self, _input: (), world: UnsafeWorldCell)`: binds `CURRENT_REGISTRY` on the active worker thread, advances `world.increment_change_tick()`, constructs stack-allocated `HostChunkIter` and `CommandQueueBridge` handles, invokes the mod callback, and handles `FfiResult` errors or caught unwinds according to `ModErrorPolicy` (emitting `ModSystemFaulted`).
+    - `System::apply_deferred(&mut self, world: &mut World)`: flushes the internal `CommandQueue` (`CommandQueueBridge`, rejecting `FfiEntity::NULL`, `Entity::PLACEHOLDER`, and raw byte insertions on `!is_raw_insertable` components with `PERMISSION_DENIED`).
 
 ### 4.4. `crates/guest_sdk` (Ergonomic Mod Author SDK)
 - Lightweight, Bevy-independent Rust wrapper over `abi_contract`.
 - Provides:
-  - `export_mod!(init_fn, shutdown_fn)` macro with guest-side `catch_unwind` boundaries.
-  - `register_runtime_component::<T>(host_api, host_context, c"Name")` with automatic layout extraction, deterministic `ComponentUuid::from_name`, and `core::mem::needs_drop::<T>()` drop-hook generation.
-  - `GuestChunkIter`, `ChunkSlice::as_typed_slice::<T>()`, and `ChunkSliceMut::as_typed_slice::<T>()` with alignment, stride, and overflow verification for zero-copy SoA slice access.
-  - `GuestCommandQueue::insert_runtime_component` for allocator-isolated deferred insertions.
+  - `GuestPlugin` trait, `GuestApp` transactional initialization builder (committing closures, `alloc_user_data`, and `on_shutdown` hooks on `FfiResult::OK` or rolling back on failure), `SystemContext`, and `MultiQueryContext`.
+  - `export_mod!(setup_fn)`, `export_mod!(plugin: MyMod)`, and `export_mod!(init_fn, shutdown_fn)` macros with guest-side `catch_guest_panic` boundaries and automatic LIFO `cleanup_registered_guest_state()` teardown during `bevy_abi_mod_shutdown`.
+  - `GuestComponent` trait and `register_runtime_component::<T>(host_api, host_context, c"Name")` with automatic layout extraction, deterministic `ComponentUuid::from_name`, and `core::mem::needs_drop::<T>()` drop-hook generation.
+  - `GuestChunkIter` and scoped `Chunk` (`next_chunk_view()`) split-borrow views (`column::<T>`, `column_mut::<T>`, `read_write::<R, W>`, `entities_and_read_write::<R, W>`, `write_2::<A, B>`, `columns_mut`, `split_slices`) plus `ChunkSlice::as_typed_slice::<T>()` and `ChunkSliceMut::as_typed_slice::<T>()` verifying alignment, byte stride, index disjointness, and physical byte-range non-overlap.
+  - `GuestCommandQueue` (`spawn_empty`, `despawn`, `insert_component`, `insert_runtime_component`, `insert_value`) for allocator-isolated deferred structural mutations.
 
-### 4.5. Hot-Unloading, Tombstone Guards & Concurrency Safety
+### 4.5. Hot-Unloading, Schedule Excision, Tombstone Guards & Concurrency Safety
 - Tracks loaded mods by `ModId` and coordinates OS shared-library images across concurrent `World`s via per-inode `SharedLibState` locks and active reference counts.
-- Associates all systems and foreign drop trampolines registered by a mod instance with an `is_active: Arc<AtomicBool>` tombstone guard.
+- Associates all systems and foreign drop trampolines registered by a mod instance with an `is_active: Arc<AtomicBool>` tombstone guard and `ModSystemSet::Mod(mod_id)`.
 - When unloading or hot-reloading a shared library:
-  1. Sets `is_active` to `false` (`Ordering::Release`), turning the mod's scheduled systems and drop hooks into safe no-ops without dangling jumps into unmapped `.text` pages, while preserving component data in Bevy's archetype tables for seamless hot-reload rebinding.
-  2. Decrements the shared-library `active_count` under the per-image mutex and invokes `bevy_abi_mod_shutdown` only when the last active instance unloads (`1 -> 0`).
-  3. Drops the `libloading::Library` handle under the per-image mutex.
+  1. Sets `is_active` to `false` (`Ordering::Release`) and updates per-`(WorldId, ComponentUuid)` drop-trampoline snapshots, turning the mod's systems and unmapped foreign drop hooks into safe no-ops without dangling jumps into unmapped `.text` pages, while preserving component data in Bevy's archetype tables for seamless hot-reload rebinding.
+  2. Excises the mod's system nodes from Bevy schedules via `Schedule::remove_systems_in_set(ModSystemSet::Mod(mod_id), world, ScheduleCleanupPolicy::RemoveSystemsOnly)`, keeping schedule graph node counts bounded across thousands of hot-reload cycles.
+  3. Despawns the `LoadedModInfo` entity, emits `ModUnloaded`, decrements the shared-library `active_count` under the per-image mutex, and invokes `bevy_abi_mod_shutdown` only when the last active instance unloads (`1 -> 0`).
+  4. Drops the `libloading::Library` handle under the per-image mutex.
 
 ---
 
@@ -208,21 +215,24 @@ For any Bevy `#[derive(Component, ModExposable)]` struct (standard `#[repr(Rust)
 - **Strict `unsafe` Hygiene:** `#![deny(unsafe_op_in_unsafe_fn)]` and `#![deny(improper_ctypes_definitions)]` across all crates, and inside generated macro code. Every `unsafe { ... }` block has a `// SAFETY:` justification.
 - **Zero-Allocation Hot Path:** `DynamicCSystem::run_unsafe` and `iter_next_chunk` perform zero heap allocations during steady-state frame execution.
 - **No Shared Allocator Assumptions:** Host frees host memory; guest frees guest memory.
-- **Defensive Boundary Validation:** Null pointer checks, alignment debug assertions, self-aliasing overlap guards, UTF-8 validation on string setters, and read/write permission checks on column accessors.
+- **Defensive Boundary Validation:** Extensible `struct_size` checks (`ExtensibleStruct` / `read_descriptor`), `FfiBool` (`u8`) boolean representation, `FfiEntity::NULL` (`0`) validation, `IS_RAW_INSERTABLE` guards, self-aliasing overlap checks, UTF-8 validation on string setters, and read/write permission checks on column accessors.
 
 ---
 
 ## 6. Phased Implementation & Validation Gates
 
 - **Phase 1: ABI Contract & Proc-Macro (`abi_contract` + `mod_derive`)**
-  - Implement C-ABI types, `#[derive(ModExposable)]`, and `include/bevy_abi_mod.h`.
-  - **Validation Gate 1:** Unit, aliasing, compile-fail, and C-interop tests verifying VTable layout, `size_of` stride, primitive/nested/String/Vec mutations, and defensive error handling without UB.
+  - Implement C-ABI types, `#[derive(ModExposable, AbiPod)]`, and `include/bevy_abi_mod.h`.
+  - **Validation Gate 1:** Unit, aliasing, real `rustc` compile-fail (`compile_fail_tests.rs`), and C-interop tests verifying VTable layout, `size_of` stride, `AbiPod` / `FfiLayout` trait separation, primitive/bool/nested/String/Vec mutations, and defensive error handling without UB.
 - **Phase 2: Host Runtime, Chunk Iterator & Change Detection (`host_runtime`)**
-  - Implement `ModRegistry`, `RawChunkIter`, `RawCommandQueue`, and `DynamicCSystem`.
+  - Implement `ModRegistry`, `RawChunkIter` (`Table` + `SparseSet` archetype traversal), `RawCommandQueue`, and `DynamicCSystem`.
   - **Validation Gate 2:** Host integration test with 10,000 entities possessing `Position`, `Velocity`, and `NameTag(String)` verifying byte-stride updates, native `Changed<Position>` detection, and deferred command flushing.
 - **Phase 3: Asymmetric `.dll` / `.so` / `.dylib` Compilation, Fault Isolation & Hot-Unload**
   - Build `tests/asymmetric_rust_mod` and `tests/asymmetric_c_mod`.
-  - **Validation Gate 3:** Load both shared libraries into a headless Bevy App, run 100 multi-threaded ticks, verify fault isolation when a mod system panics, and hot-unload both libraries cleanly followed by 10 additional schedule ticks.
+  - **Validation Gate 3:** Load both shared libraries into a headless Bevy App, run 100 multi-threaded ticks, verify fault isolation when a mod system panics, and hot-unload both libraries cleanly followed by schedule excision and post-unload ticks.
 - **Phase 4: Runtime Mod Component Registration & Parallel Throughput Validation**
   - Expose runtime component descriptors (`ModComponentDescriptor`) across Rust (`guest_sdk`) and pure C99 (`include/bevy_abi_mod.h`) shared libraries without host compile-time knowledge.
-  - **Validation Gate 4:** End-to-end multi-language integration tests, parallel `FilteredAccessSet` concurrency verification, deferred command burst & allocator-poisoning isolation tests, hot-unload/reload `ComponentId` rebinding & drop-trampoline safety tests, and 1k–100k entity benchmarks comparing runtime-registered components against static `ModExposable` components and native Bevy components.
+  - **Validation Gate 4:** End-to-end multi-language integration tests, parallel `FilteredAccessSet` concurrency verification, deferred command burst & allocator-poisoning isolation tests, hot-unload/reload `ComponentId` rebinding & drop-trampoline safety tests, and 1k–100k entity benchmarks.
+- **Phase 5 & 6: Bevy ECS Soundness Remediation, Differential Parity, C-ABI Fuzzing & CI Gates**
+  - Align dynamic systems with Bevy 0.20+ `QueryBuilder`/`QueryState`, `SparseSet` filters/columns, `world.increment_change_tick()`, `ComponentCloneBehavior::Ignore`, `ModSystemSet` schedule excision, `ScheduledSystemDescriptor`, `ModErrorPolicy`, and `GuestApp` + `Chunk` split borrows.
+  - **Validation Gate 5:** Soundness regression suite (`bevy_alignment_soundness_tests.rs`), deterministic native-vs-dynamic differential Bevy parity harness (`differential_bevy_parity.rs`), adversarial C-ABI boundary fuzzer (`fuzz_abi_boundaries.rs`), standalone C99 layout/SemVer suite (`standalone_c_test.c`), and automated CI gates (Linux/macOS/Windows matrix, strict C99, Miri `-Zmiri-tree-borrows`, ASan/UBSan, and `-Zrandomize-layout`).
