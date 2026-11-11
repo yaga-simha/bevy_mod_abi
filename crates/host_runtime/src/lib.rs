@@ -63,18 +63,21 @@ pub use mod_derive::ModExposable;
 pub use chunk_iter::{
     host_iter_column_mutable, host_iter_column_readonly, host_iter_column_stride,
     host_iter_entities, host_iter_mark_changed, host_iter_next_chunk, host_iter_reset,
-    HostChunkIter, QueryColumnDesc, MAX_QUERY_COMPONENTS,
+    host_iter_resource_mutable, host_iter_resource_readonly, HostChunkIter, QueryColumnDesc,
+    MAX_QUERY_COMPONENTS,
 };
 pub use commands::{
-    host_cmd_despawn, host_cmd_insert_component, host_cmd_spawn_empty, CmdDespawnFn,
-    CmdInsertComponentFn, CmdSpawnEmptyFn, CommandQueueBridge,
+    host_cmd_despawn, host_cmd_insert_component, host_cmd_insert_default,
+    host_cmd_remove_component, host_cmd_spawn_empty, CmdDespawnFn, CmdInsertComponentFn,
+    CmdInsertDefaultFn, CmdRemoveComponentFn, CmdSpawnEmptyFn, CommandQueueBridge,
 };
 pub use dynamic_system::{
-    host_register_component, host_register_multi_query_system, host_register_scheduled_system,
-    host_register_system, host_register_system_in_schedule, reset_drop_trampolines_for_testing,
-    ComponentAccessDescOwned, DynamicCSystem, ModErrorPolicy, ModErrorPolicyConfig, ModInitContext,
-    ModSchedule, ModSystemError, ModSystemFaulted, ModSystemSet, MAX_DROP_TRAMPOLINES,
-    MAX_SYSTEM_QUERIES,
+    host_register_component, host_register_conditional_multi_query_system,
+    host_register_conditional_system, host_register_multi_query_system,
+    host_register_scheduled_system, host_register_system, host_register_system_in_schedule,
+    reset_drop_trampolines_for_testing, ComponentAccessDescOwned, DynamicCSystem, ModErrorPolicy,
+    ModErrorPolicyConfig, ModInitContext, ModSchedule, ModSystemError, ModSystemFaulted,
+    ModSystemSet, MAX_DROP_TRAMPOLINES, MAX_SYSTEM_QUERIES,
 };
 pub use host::{is_abi_version_compatible, LoadedMod, ModHost, ModId, ModLoadError};
 pub use plugin::{
@@ -82,8 +85,8 @@ pub use plugin::{
     ModUnloaded,
 };
 pub use registry::{
-    host_get_proc_address, CurrentRegistryGuard, InsertRawFn, ModRegistry, RegisteredComponent,
-    CURRENT_REGISTRY, GLOBAL_SYMBOLS,
+    host_get_proc_address, ComponentCollisionError, CurrentRegistryGuard, InsertDefaultFn,
+    InsertRawFn, ModRegistry, RegisteredComponent, CURRENT_REGISTRY, GLOBAL_SYMBOLS,
 };
 
 /// Convenient prelude module for Bevy games hosting native C-ABI mods.
@@ -96,11 +99,12 @@ pub mod prelude {
         AbiModPlugin, ConfiguredAbiModPlugin, LoadedModInfo, ModAppExt, ModLoaded,
         ModNamedSystemSet, ModUnloaded,
     };
-    pub use crate::registry::ModRegistry;
+    pub use crate::registry::{ComponentCollisionError, ModRegistry};
     pub use crate::ModExposable;
     pub use abi_contract::{
-        ComponentAccessDesc, ComponentAccessMode, ComponentUuid, ExposableComponent, FfiEntity,
-        FfiResult, FfiSlice, ScheduleLabelId, ScheduledMultiQuerySystemDescriptor,
-        ScheduledSystemDescriptor, StrView,
+        ComponentAccessDesc, ComponentAccessMode, ComponentUuid,
+        ConditionalMultiQuerySystemDescriptor, ConditionalSystemDescriptor, ExposableComponent,
+        FfiEntity, FfiResult, FfiSlice, RunConditionCallback, ScheduleLabelId,
+        ScheduledMultiQuerySystemDescriptor, ScheduledSystemDescriptor, StrView,
     };
 }

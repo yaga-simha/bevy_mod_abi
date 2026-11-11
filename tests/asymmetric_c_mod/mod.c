@@ -74,16 +74,16 @@ typedef struct CInteropComponentVTable {
     void (*set_label)(void* ptr, const uint8_t* utf8_ptr, size_t len);
 } CInteropComponentVTable;
 
-/* Deferred command bridge function pointer signatures */
-typedef FfiEntity (*CmdSpawnEmptyFn)(RawCommandQueue* queue);
-typedef FfiResult (*CmdDespawnFn)(RawCommandQueue* queue, FfiEntity entity);
-typedef FfiResult (*CmdInsertComponentFn)(
-    RawCommandQueue* queue,
-    FfiEntity entity,
-    const char* component_name,
-    const uint8_t* data,
-    size_t len
-);
+/* Phase 4 POD resource layout mirrored in C99 */
+typedef struct Phase4CRes {
+    float scale;
+    uint32_t matched_rows;
+    uint32_t optional_vel_hits;
+    uint64_t spawned_default_entity;
+} Phase4CRes;
+
+BEVY_ABI_STATIC_ASSERT(sizeof(Phase4CRes) == 24, "Phase4CRes size must be 24");
+BEVY_ABI_STATIC_ASSERT(BEVY_ABI_ALIGNOF(Phase4CRes) == 8, "Phase4CRes align must be 8");
 
 /* ============================================================================
  * Dynamic Component Definitions (Milestone 3)
@@ -112,8 +112,14 @@ static atomic_uintptr_t g_c_tag_vtable = 0;
 static atomic_uintptr_t g_cmd_spawn_empty = 0;
 static atomic_uintptr_t g_cmd_despawn = 0;
 static atomic_uintptr_t g_cmd_insert_component = 0;
+static atomic_uintptr_t g_cmd_remove_component = 0;
+static atomic_uintptr_t g_cmd_insert_default = 0;
+static atomic_uintptr_t g_res_readonly = 0;
+static atomic_uintptr_t g_res_mutable = 0;
+static atomic_uintptr_t g_c_phase4_tf_vtable = 0;
 
 static atomic_bool g_c_mod_shutdown_called = false;
+static atomic_uint g_c_phase4_run_enabled = FFI_BOOL_TRUE;
 
 /* ============================================================================
  * Scenario Systems
@@ -373,6 +379,86 @@ static FfiResult c_custom_data_system(
     return FFI_RESULT_OK;
 }
 
+/*
+ * Scenario 6 (Phase 3 + Phase 4): Optional Columns, Changed/Added Row Filters,
+ * ECS Resources, Run Conditions (`run_if`), `cmd_remove_component`, & `cmd_insert_default`.
+ */
+static FfiBool c_phase4_run_if(void* user_data) {
+    (void)user_data;
+    return (FfiBool)atomic_load(&g_c_phase4_run_enabled);
+}
+
+static FfiResult c_phase4_ecs_system(
+    RawChunkIter* iter,
+    RawCommandQueue* commands,
+    void* user_data
+) {
+    (void)user_data;
+    const HostApi* host_api = (const HostApi*)atomic_load(&g_c_host_api);
+    const PositionVTable* pos_vt = (const PositionVTable*)atomic_load(&g_c_phase4_tf_vtable);
+    const VelocityVTable* vel_vt = (const VelocityVTable*)atomic_load(&g_c_vel_vtable);
+    IterResourceMutableFn res_mut_fn = (IterResourceMutableFn)atomic_load(&g_res_mutable);
+    CmdSpawnEmptyFn spawn_fn = (CmdSpawnEmptyFn)atomic_load(&g_cmd_spawn_empty);
+    CmdRemoveComponentFn remove_fn = (CmdRemoveComponentFn)atomic_load(&g_cmd_remove_component);
+    CmdInsertDefaultFn default_fn = (CmdInsertDefaultFn)atomic_load(&g_cmd_insert_default);
+
+    if (!host_api || !pos_vt || !res_mut_fn) {
+        return FFI_RESULT_INTERNAL_ERROR;
+    }
+
+    Phase4CRes* res = (Phase4CRes*)res_mut_fn(iter, "Phase4CRes");
+    if (!res) {
+        return FFI_RESULT_INVALID_COMPONENT;
+    }
+
+    if (res->spawned_default_entity == 0 && commands && spawn_fn && default_fn) {
+        FfiEntity ent = spawn_fn(commands);
+        if (ent != BAM_ENTITY_NULL) {
+            FfiResult def_status = default_fn(commands, ent, "NameTag");
+            if (def_status == FFI_RESULT_OK) {
+                res->spawned_default_entity = ent;
+            }
+        }
+    }
+
+    while (1) {
+        size_t count = host_api->iter_next_chunk(iter);
+        if (count == 0) {
+            break;
+        }
+
+        uint8_t* pos_base = host_api->iter_column_mutable(iter, 0);
+        size_t pos_stride = host_api->iter_column_stride(iter, 0);
+        const uint8_t* opt_vel_base = host_api->iter_column_readonly(iter, 1);
+        size_t vel_stride = host_api->iter_column_stride(iter, 1);
+        const FfiEntity* entities = host_api->iter_entities(iter);
+
+        if (!pos_base) {
+            return FFI_RESULT_NULL_POINTER;
+        }
+
+        for (size_t i = 0; i < count; ++i) {
+            void* p_ptr = (void*)(pos_base + (i * pos_stride));
+            float py = pos_vt->get_y(p_ptr);
+            if (opt_vel_base != NULL && vel_vt != NULL) {
+                const void* v_ptr = (const void*)(opt_vel_base + (i * vel_stride));
+                float vy = vel_vt->get_y(v_ptr);
+                pos_vt->set_y(p_ptr, py + (vy * res->scale));
+                res->optional_vel_hits += 1u;
+            } else {
+                pos_vt->set_y(p_ptr, py + (1.0f * res->scale));
+            }
+            res->matched_rows += 1u;
+
+            if (commands && entities && remove_fn) {
+                remove_fn(commands, entities[i], "Phase4CRemovable");
+            }
+        }
+    }
+
+    return FFI_RESULT_OK;
+}
+
 /* ============================================================================
  * Exported Mod Entry Points & Lifecycle
  * ============================================================================ */
@@ -383,6 +469,10 @@ BEVY_ABI_MOD_EXPORT uint32_t bevy_abi_mod_abi_version(void) {
 
 BEVY_ABI_MOD_EXPORT bool asymmetric_c_mod_was_shutdown(void) {
     return atomic_load(&g_c_mod_shutdown_called);
+}
+
+BEVY_ABI_MOD_EXPORT void asymmetric_c_mod_set_phase4_enabled(FfiBool enabled) {
+    atomic_store(&g_c_phase4_run_enabled, (unsigned int)enabled);
 }
 
 BEVY_ABI_MOD_EXPORT FfiResult bevy_abi_mod_init(
@@ -445,6 +535,31 @@ BEVY_ABI_MOD_EXPORT FfiResult bevy_abi_mod_init(
     if (!local_insert) {
         local_insert = (CmdInsertComponentFn)get_proc_address("host_cmd_insert_component");
     }
+    CmdRemoveComponentFn local_remove =
+        (CmdRemoveComponentFn)get_proc_address("cmd_remove_component");
+    if (!local_remove) {
+        local_remove = (CmdRemoveComponentFn)get_proc_address("host_cmd_remove_component");
+    }
+    CmdInsertDefaultFn local_insert_default =
+        (CmdInsertDefaultFn)get_proc_address("cmd_insert_default");
+    if (!local_insert_default) {
+        local_insert_default = (CmdInsertDefaultFn)get_proc_address("host_cmd_insert_default");
+    }
+    IterResourceReadonlyFn local_res_ro =
+        (IterResourceReadonlyFn)get_proc_address("res_readonly");
+    if (!local_res_ro) {
+        local_res_ro = (IterResourceReadonlyFn)get_proc_address("iter_resource_readonly");
+    }
+    IterResourceMutableFn local_res_mut =
+        (IterResourceMutableFn)get_proc_address("res_mutable");
+    if (!local_res_mut) {
+        local_res_mut = (IterResourceMutableFn)get_proc_address("iter_resource_mutable");
+    }
+    RegisterConditionalSystemFn local_reg_cond =
+        (RegisterConditionalSystemFn)get_proc_address("register_conditional_system");
+    const void* local_phase4_c_res_vt = get_proc_address("Phase4CRes_vtable");
+    const PositionVTable* local_phase4_tf_vt =
+        (const PositionVTable*)get_proc_address("Phase4CTransform_vtable");
 
     if (local_pos_vt) {
         atomic_store(&g_c_pos_vtable, (uintptr_t)local_pos_vt);
@@ -466,6 +581,21 @@ BEVY_ABI_MOD_EXPORT FfiResult bevy_abi_mod_init(
     }
     if (local_insert) {
         atomic_store(&g_cmd_insert_component, (uintptr_t)local_insert);
+    }
+    if (local_remove) {
+        atomic_store(&g_cmd_remove_component, (uintptr_t)local_remove);
+    }
+    if (local_insert_default) {
+        atomic_store(&g_cmd_insert_default, (uintptr_t)local_insert_default);
+    }
+    if (local_res_ro) {
+        atomic_store(&g_res_readonly, (uintptr_t)local_res_ro);
+    }
+    if (local_res_mut) {
+        atomic_store(&g_res_mutable, (uintptr_t)local_res_mut);
+    }
+    if (local_phase4_tf_vt) {
+        atomic_store(&g_c_phase4_tf_vtable, (uintptr_t)local_phase4_tf_vt);
     }
 
     if (!host_context || !host_api->register_system) {
@@ -586,12 +716,42 @@ BEVY_ABI_MOD_EXPORT FfiResult bevy_abi_mod_init(
         }
     }
 
+    // 6. Register Phase 3/4 Conditional System if `Phase4CRes_vtable` is exposed in this World
+    if (local_phase4_c_res_vt && local_phase4_tf_vt) {
+        ComponentAccessDesc p4_queries[5];
+        p4_queries[0] = bam_access_desc("Phase4CTransform", COMPONENT_ACCESS_WRITE);
+        p4_queries[1] = bam_access_desc("Velocity", COMPONENT_ACCESS_OPTIONAL_READ);
+        p4_queries[2] = bam_access_desc("Phase4CSensor", COMPONENT_ACCESS_CHANGED);
+        p4_queries[3] = bam_access_desc("Phase4CFreshTag", COMPONENT_ACCESS_ADDED);
+        p4_queries[4] = bam_access_desc("Phase4CRes", COMPONENT_ACCESS_RESOURCE_WRITE);
+
+        ConditionalSystemDescriptor cond_desc;
+        memset(&cond_desc, 0, sizeof(cond_desc));
+        cond_desc.sched.base.struct_size = (uint32_t)sizeof(ConditionalSystemDescriptor);
+        cond_desc.sched.base.name = "c_phase4_ecs_system";
+        cond_desc.sched.base.queries = p4_queries;
+        cond_desc.sched.base.query_count = 5;
+        cond_desc.sched.base.callback = c_phase4_ecs_system;
+        cond_desc.sched.base.user_data = NULL;
+        cond_desc.sched.schedule = SCHEDULE_LABEL_UPDATE;
+        cond_desc.run_if = c_phase4_run_if;
+        cond_desc.run_if_user_data = NULL;
+
+        FfiResult p4_res = local_reg_cond
+            ? local_reg_cond(host_context, &cond_desc)
+            : host_api->register_system(host_context, &cond_desc.sched.base);
+        if (p4_res != FFI_RESULT_OK) {
+            return p4_res;
+        }
+    }
+
     return FFI_RESULT_OK;
 }
 
 BEVY_ABI_MOD_EXPORT FfiResult bevy_abi_mod_shutdown(void* host_context) {
     (void)host_context;
     atomic_store(&g_c_mod_shutdown_called, true);
+    atomic_store(&g_c_phase4_run_enabled, FFI_BOOL_TRUE);
     atomic_store(&g_c_host_api, 0);
     atomic_store(&g_c_pos_vtable, 0);
     atomic_store(&g_c_vel_vtable, 0);
@@ -600,6 +760,11 @@ BEVY_ABI_MOD_EXPORT FfiResult bevy_abi_mod_shutdown(void* host_context) {
     atomic_store(&g_cmd_spawn_empty, 0);
     atomic_store(&g_cmd_despawn, 0);
     atomic_store(&g_cmd_insert_component, 0);
+    atomic_store(&g_cmd_remove_component, 0);
+    atomic_store(&g_cmd_insert_default, 0);
+    atomic_store(&g_res_readonly, 0);
+    atomic_store(&g_res_mutable, 0);
+    atomic_store(&g_c_phase4_tf_vtable, 0);
     return FFI_RESULT_OK;
 }
 

@@ -37,14 +37,14 @@ use crate::commands::CommandQueueBridge;
 use crate::host::ModId;
 use crate::registry::{ModRegistry, RegisteredComponent};
 use abi_contract::{
-    read_descriptor, ComponentAccessMode, ComponentDropFn, DynamicSystemCallback, FfiResult,
-    MultiQuerySystemCallback, MultiQuerySystemDescriptor, RawChunkIter, RawCommandQueue,
-    ScheduleLabelId, ScheduledMultiQuerySystemDescriptor, ScheduledSystemDescriptor,
-    SystemDescriptor,
+    ffi_bool_to_rust, read_descriptor, ComponentAccessMode, ComponentDropFn,
+    ConditionalMultiQuerySystemDescriptor, ConditionalSystemDescriptor, DynamicSystemCallback,
+    FfiResult, MultiQuerySystemCallback, MultiQuerySystemDescriptor, RawChunkIter, RawCommandQueue,
+    RunConditionCallback, ScheduleLabelId, ScheduledSystemDescriptor, SystemDescriptor,
 };
 use bevy_ecs::archetype::{ArchetypeGeneration, ArchetypeId};
 use bevy_ecs::change_detection::{CheckChangeTicks, Tick};
-use bevy_ecs::component::{ComponentCloneBehavior, ComponentDescriptor, StorageType};
+use bevy_ecs::component::{ComponentCloneBehavior, ComponentDescriptor, ComponentId, StorageType};
 use bevy_ecs::event::Event;
 use bevy_ecs::message::{Message, Messages};
 use bevy_ecs::prelude::Resource;
@@ -460,6 +460,7 @@ enum SystemCallbackKind {
 pub struct DynamicCSystem {
     name: String,
     query_groups: Vec<CachedQueryGroup>,
+    declared_resources: Vec<(ComponentId, bool)>,
 
     access: SystemAccess,
     self_conflict: bool,
@@ -469,6 +470,7 @@ pub struct DynamicCSystem {
 
     callback: SystemCallbackKind,
     user_data: *mut c_void,
+    run_if: Option<(RunConditionCallback, *mut c_void)>,
 
     mod_id: Option<ModId>,
     schedule: ModSchedule,
@@ -500,6 +502,7 @@ impl DynamicCSystem {
         Self {
             name,
             query_groups: vec![CachedQueryGroup::new(query_descs)],
+            declared_resources: Vec::new(),
             access: SystemAccess::None,
             self_conflict: false,
             missing_components: Vec::new(),
@@ -507,6 +510,7 @@ impl DynamicCSystem {
             this_run: Tick::new(0),
             callback: SystemCallbackKind::Single(callback),
             user_data,
+            run_if: None,
             mod_id: None,
             schedule: ModSchedule::Update,
             after_systems: Vec::new(),
@@ -532,6 +536,7 @@ impl DynamicCSystem {
         Self {
             name,
             query_groups,
+            declared_resources: Vec::new(),
             access: SystemAccess::None,
             self_conflict: false,
             missing_components: Vec::new(),
@@ -539,6 +544,7 @@ impl DynamicCSystem {
             this_run: Tick::new(0),
             callback: SystemCallbackKind::Multi(callback),
             user_data,
+            run_if: None,
             mod_id: None,
             schedule: ModSchedule::Update,
             after_systems: Vec::new(),
@@ -682,6 +688,59 @@ impl DynamicCSystem {
         self.is_active = is_active;
         self
     }
+
+    /// Configures an optional C-ABI run condition callback evaluated before each system run.
+    pub fn set_run_if(&mut self, run_if: Option<(RunConditionCallback, *mut c_void)>) {
+        self.run_if = run_if;
+    }
+
+    /// Fluent builder method to attach an optional C-ABI run condition callback.
+    pub fn with_run_if(mut self, run_if: Option<(RunConditionCallback, *mut c_void)>) -> Self {
+        self.run_if = run_if;
+        self
+    }
+
+    /// Returns the configured run condition callback and context pointer, if any.
+    pub fn run_if(&self) -> Option<(RunConditionCallback, *mut c_void)> {
+        self.run_if
+    }
+
+    fn record_fault_and_apply_policy(
+        &mut self,
+        status: FfiResult,
+        panicked: bool,
+    ) -> Result<(), RunSystemError> {
+        self.enabled = false;
+        let fault_event = ModSystemFaulted {
+            mod_id: self.mod_id,
+            system_name: self.name.clone(),
+            status,
+            panicked,
+        };
+        self.command_queue.push(move |world: &mut World| {
+            if let Some(mut msgs) = world.get_resource_mut::<Messages<ModSystemFaulted>>() {
+                msgs.write(fault_event.clone());
+            }
+            world.trigger(fault_event);
+        });
+
+        match self.error_policy {
+            ModErrorPolicy::Quarantine => Ok(()),
+            ModErrorPolicy::Log => {
+                eprintln!(
+                    "[bevy_abi_mod] guest system '{}' (mod_id={:?}) faulted: status={:?}, panicked={}",
+                    self.name, self.mod_id, status, panicked
+                );
+                Ok(())
+            }
+            ModErrorPolicy::ReportToBevy => Err(RunSystemError::from(ModSystemError {
+                mod_id: self.mod_id,
+                system_name: self.name.clone(),
+                status,
+                panicked,
+            })),
+        }
+    }
 }
 
 impl System for DynamicCSystem {
@@ -710,6 +769,7 @@ impl System for DynamicCSystem {
         self.last_run = Tick::new(world.change_tick().get().wrapping_sub(Tick::MAX.get()));
         self.self_conflict = false;
         self.missing_components.clear();
+        self.declared_resources.clear();
 
         if !self.error_policy_explicit {
             if let Some(cfg) = world.get_resource::<ModErrorPolicyConfig>() {
@@ -723,6 +783,9 @@ impl System for DynamicCSystem {
         }
 
         let mut access_set = FilteredAccessSet::new();
+        let mut system_res_reads = std::collections::HashSet::new();
+        let mut system_res_writes = std::collections::HashSet::new();
+        let mut system_res_order: Vec<ComponentId> = Vec::new();
 
         for group in &mut self.query_groups {
             group.columns.clear();
@@ -738,6 +801,7 @@ impl System for DynamicCSystem {
 
             let mut read_components = std::collections::HashSet::new();
             let mut write_components = std::collections::HashSet::new();
+            let mut has_entity_terms = false;
             let mut resolved = Vec::with_capacity(group.descs.len());
 
             for (col_idx, desc) in group.descs.iter().enumerate() {
@@ -754,11 +818,19 @@ impl System for DynamicCSystem {
                     return self.access.clone();
                 };
 
+                // Enforce strict Resource vs entity Component separation
+                if desc.mode.is_resource() != reg.is_resource {
+                    self.enabled = false;
+                    self.access = SystemAccess::None;
+                    return self.access.clone();
+                }
+
                 let comp_id = reg.component_id;
                 let stride = reg.size;
 
                 match desc.mode {
-                    ComponentAccessMode::READ => {
+                    ComponentAccessMode::READ | ComponentAccessMode::OPTIONAL_READ => {
+                        has_entity_terms = true;
                         if write_components.contains(&comp_id) {
                             self.self_conflict = true;
                             self.enabled = false;
@@ -767,7 +839,8 @@ impl System for DynamicCSystem {
                         }
                         read_components.insert(comp_id);
                     }
-                    ComponentAccessMode::WRITE => {
+                    ComponentAccessMode::WRITE | ComponentAccessMode::OPTIONAL_WRITE => {
+                        has_entity_terms = true;
                         if read_components.contains(&comp_id) || write_components.contains(&comp_id)
                         {
                             self.self_conflict = true;
@@ -777,7 +850,35 @@ impl System for DynamicCSystem {
                         }
                         write_components.insert(comp_id);
                     }
-                    ComponentAccessMode::FILTER_ONLY | ComponentAccessMode::WITHOUT => {}
+                    ComponentAccessMode::FILTER_ONLY
+                    | ComponentAccessMode::WITHOUT
+                    | ComponentAccessMode::CHANGED
+                    | ComponentAccessMode::ADDED => {
+                        has_entity_terms = true;
+                    }
+                    ComponentAccessMode::RESOURCE_READ => {
+                        if system_res_writes.contains(&comp_id) {
+                            self.self_conflict = true;
+                            self.enabled = false;
+                            self.access = SystemAccess::None;
+                            return self.access.clone();
+                        }
+                        if system_res_reads.insert(comp_id) {
+                            system_res_order.push(comp_id);
+                        }
+                    }
+                    ComponentAccessMode::RESOURCE_WRITE => {
+                        if system_res_reads.contains(&comp_id)
+                            || system_res_writes.contains(&comp_id)
+                        {
+                            self.self_conflict = true;
+                            self.enabled = false;
+                            self.access = SystemAccess::None;
+                            return self.access.clone();
+                        }
+                        system_res_writes.insert(comp_id);
+                        system_res_order.push(comp_id);
+                    }
                     _ => {
                         self.enabled = false;
                         self.access = SystemAccess::None;
@@ -785,14 +886,22 @@ impl System for DynamicCSystem {
                     }
                 }
 
-                let is_sparse_storage = world
-                    .components()
-                    .get_info(comp_id)
-                    .is_none_or(|info| info.storage_type() == StorageType::SparseSet);
+                let is_sparse_storage = !desc.mode.is_resource()
+                    && world
+                        .components()
+                        .get_info(comp_id)
+                        .is_none_or(|info| info.storage_type() == StorageType::SparseSet);
 
                 if is_sparse_storage
-                    && (desc.mode == ComponentAccessMode::READ
-                        || desc.mode == ComponentAccessMode::WRITE)
+                    && matches!(
+                        desc.mode,
+                        ComponentAccessMode::READ
+                            | ComponentAccessMode::WRITE
+                            | ComponentAccessMode::OPTIONAL_READ
+                            | ComponentAccessMode::OPTIONAL_WRITE
+                            | ComponentAccessMode::CHANGED
+                            | ComponentAccessMode::ADDED
+                    )
                 {
                     group.sparse_column_mask |= 1u32 << col_idx;
                 }
@@ -800,23 +909,7 @@ impl System for DynamicCSystem {
                 resolved.push((comp_id, desc.mode, stride));
             }
 
-            let mut builder = QueryBuilder::<()>::new(world);
             for &(comp_id, mode, stride) in &resolved {
-                match mode {
-                    ComponentAccessMode::READ => {
-                        builder.ref_id(comp_id);
-                    }
-                    ComponentAccessMode::WRITE => {
-                        builder.mut_id(comp_id);
-                    }
-                    ComponentAccessMode::FILTER_ONLY => {
-                        builder.with_id(comp_id);
-                    }
-                    ComponentAccessMode::WITHOUT => {
-                        builder.without_id(comp_id);
-                    }
-                    _ => {}
-                }
                 group.columns.push(QueryColumnDesc {
                     component_id: comp_id,
                     mode,
@@ -824,31 +917,95 @@ impl System for DynamicCSystem {
                 });
             }
 
-            let state = builder.build();
-            let is_comp_dense = |id| {
-                world
-                    .components()
-                    .get_info(id)
-                    .is_some_and(|info| info.storage_type() == StorageType::Table)
-            };
-            group.is_dense = group.sparse_column_mask == 0
-                && state.component_access().with_filters().all(is_comp_dense)
-                && state
-                    .component_access()
-                    .without_filters()
-                    .all(is_comp_dense);
+            if group.descs.is_empty() || has_entity_terms {
+                let mut builder = QueryBuilder::<()>::new(world);
+                for &(comp_id, mode, _stride) in &resolved {
+                    match mode {
+                        ComponentAccessMode::READ => {
+                            builder.ref_id(comp_id);
+                        }
+                        ComponentAccessMode::WRITE => {
+                            builder.mut_id(comp_id);
+                        }
+                        ComponentAccessMode::OPTIONAL_READ => {
+                            builder.optional(|b| {
+                                b.ref_id(comp_id);
+                            });
+                        }
+                        ComponentAccessMode::OPTIONAL_WRITE => {
+                            builder.optional(|b| {
+                                b.mut_id(comp_id);
+                            });
+                        }
+                        ComponentAccessMode::FILTER_ONLY => {
+                            builder.with_id(comp_id);
+                        }
+                        ComponentAccessMode::WITHOUT => {
+                            builder.without_id(comp_id);
+                        }
+                        ComponentAccessMode::CHANGED | ComponentAccessMode::ADDED => {
+                            if write_components.contains(&comp_id) {
+                                // `mut_id` already registered write access; add `With<T>` so
+                                // `(OptionalWrite(T), Changed(T))` still requires `T`'s presence!
+                                builder.with_id(comp_id);
+                            } else {
+                                builder.ref_id(comp_id);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
 
-            let filtered_access = state.component_access().clone();
-            group.query_state = Some(state);
+                let state = builder.build();
+                let is_comp_dense = |id| {
+                    world
+                        .components()
+                        .get_info(id)
+                        .is_some_and(|info| info.storage_type() == StorageType::Table)
+                };
+                group.is_dense = group.sparse_column_mask == 0
+                    && state.component_access().with_filters().all(is_comp_dense)
+                    && state
+                        .component_access()
+                        .without_filters()
+                        .all(is_comp_dense);
 
+                let filtered_access = state.component_access().clone();
+                group.query_state = Some(state);
+
+                let mut candidate_set = FilteredAccessSet::new();
+                candidate_set.add(filtered_access.clone());
+                if !access_set.is_compatible(&candidate_set) {
+                    self.self_conflict = true;
+                    self.enabled = false;
+                }
+
+                access_set.add(filtered_access);
+            } else {
+                // Pure resource-only system group (`[RESOURCE_READ/RESOURCE_WRITE]` with no entity columns)
+                group.is_dense = true;
+                group.query_state = None;
+            }
+        }
+
+        for res_id in system_res_order {
+            let writable = system_res_writes.contains(&res_id);
             let mut candidate_set = FilteredAccessSet::new();
-            candidate_set.add(filtered_access.clone());
+            if writable {
+                candidate_set.add_resource_write(res_id);
+            } else {
+                candidate_set.add_resource_read(res_id);
+            }
             if !access_set.is_compatible(&candidate_set) {
                 self.self_conflict = true;
                 self.enabled = false;
             }
-
-            access_set.add(filtered_access);
+            if writable {
+                access_set.add_resource_write(res_id);
+            } else {
+                access_set.add_resource_read(res_id);
+            }
+            self.declared_resources.push((res_id, writable));
         }
 
         if self.self_conflict || !self.enabled {
@@ -876,13 +1033,33 @@ impl System for DynamicCSystem {
             return Ok(());
         }
 
+        // Bind this World's ModRegistry on the executing worker thread so any runtime
+        // `get_proc_address` call inside `run_if` or the guest callback resolves strictly against this World.
+        let _reg_guard = self.registry.make_current();
+
+        // Evaluate optional guest `run_if` BEFORE advancing `last_run` so `Changed<T>` / `Added<T>`
+        // ticks accumulated during skipped frames remain observable when `run_if` later returns true!
+        if let Some((cond_fn, cond_ud)) = self.run_if {
+            let cond_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                // SAFETY: `cond_fn` is a foreign C-ABI predicate supplied by an active loaded mod.
+                cond_fn(cond_ud)
+            }));
+            match cond_res {
+                Ok(flag) => {
+                    if !ffi_bool_to_rust(flag) {
+                        return Ok(());
+                    }
+                }
+                Err(_) => {
+                    return self.record_fault_and_apply_policy(FfiResult::PANIC_CAUGHT, true);
+                }
+            }
+        }
+
         // Match Bevy's FunctionSystem::run_unsafe change tick progression
         let change_tick = world.increment_change_tick();
         self.this_run = change_tick;
-
-        // Bind this World's ModRegistry on the executing worker thread so any runtime
-        // `get_proc_address` call inside the guest resolves strictly against this World.
-        let _reg_guard = self.registry.make_current();
+        let last_run = self.last_run;
 
         // Incremental archetype update: zero heap allocations in steady-state
         for group in &mut self.query_groups {
@@ -900,6 +1077,8 @@ impl System for DynamicCSystem {
         );
         let commands_ptr = (&mut bridge as *mut CommandQueueBridge<'_>).cast::<RawCommandQueue>();
         let user_data = self.user_data;
+        let registry_ref: &ModRegistry = &self.registry;
+        let declared_resources: &[(ComponentId, bool)] = &self.declared_resources;
 
         let res = match self.callback {
             SystemCallbackKind::Single(callback) => {
@@ -921,7 +1100,9 @@ impl System for DynamicCSystem {
                         group.sparse_column_mask,
                         change_tick,
                     )
-                };
+                }
+                .with_last_run(last_run)
+                .with_resources(world, registry_ref, declared_resources);
                 let iter_ptr = (&mut host_iter as *mut HostChunkIter<'_>).cast::<RawChunkIter>();
                 // SAFETY: Calling foreign C-ABI callback with valid stack-allocated iterator and command bridge.
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
@@ -950,7 +1131,9 @@ impl System for DynamicCSystem {
                             group.sparse_column_mask,
                             change_tick,
                         )
-                    };
+                    }
+                    .with_last_run(last_run)
+                    .with_resources(world, registry_ref, declared_resources);
                     host_iters[i] = Some(iter);
                 }
 
@@ -984,38 +1167,7 @@ impl System for DynamicCSystem {
         };
 
         if let Some((status, panicked)) = fault {
-            self.enabled = false;
-            let fault_event = ModSystemFaulted {
-                mod_id: self.mod_id,
-                system_name: self.name.clone(),
-                status,
-                panicked,
-            };
-            self.command_queue.push(move |world: &mut World| {
-                if let Some(mut msgs) = world.get_resource_mut::<Messages<ModSystemFaulted>>() {
-                    msgs.write(fault_event.clone());
-                }
-                world.trigger(fault_event);
-            });
-
-            match self.error_policy {
-                ModErrorPolicy::Quarantine => return Ok(()),
-                ModErrorPolicy::Log => {
-                    eprintln!(
-                        "[bevy_abi_mod] guest system '{}' (mod_id={:?}) faulted: status={:?}, panicked={}",
-                        self.name, self.mod_id, status, panicked
-                    );
-                    return Ok(());
-                }
-                ModErrorPolicy::ReportToBevy => {
-                    return Err(RunSystemError::from(ModSystemError {
-                        mod_id: self.mod_id,
-                        system_name: self.name.clone(),
-                        status,
-                        panicked,
-                    }));
-                }
-            }
+            return self.record_fault_and_apply_policy(status, panicked);
         }
 
         Ok(())
@@ -1169,14 +1321,17 @@ unsafe fn register_system_from_extensible_ptr(
         return FfiResult::NULL_POINTER;
     }
 
-    // SAFETY: Reads `struct_size` and copies at most `min(struct_size, size_of::<ScheduledSystemDescriptor>())`
+    // SAFETY: Reads `struct_size` and copies at most `min(struct_size, size_of::<ConditionalSystemDescriptor>())`
     // bytes into a zero-filled `MaybeUninit`, validating non-null `callback` BEFORE `assume_init()`
-    // to eliminate truncated-provenance and null-`fn`-niche UB!
-    let sched_desc = match unsafe { read_descriptor::<ScheduledSystemDescriptor>(descriptor_ptr) } {
+    // to eliminate truncated-provenance and null-`fn`-niche UB! Older v1 (48B) and v2 (88B) descriptors
+    // zero-fill `run_if = None` and `run_if_user_data = null_mut()`.
+    let cond_desc = match unsafe { read_descriptor::<ConditionalSystemDescriptor>(descriptor_ptr) }
+    {
         Ok(d) => d,
         Err(FfiResult::INVALID_VERSION) => return truncated_err,
         Err(err) => return err,
     };
+    let sched_desc = cond_desc.sched;
 
     let schedule = match schedule_override {
         Some(s) => s,
@@ -1202,6 +1357,9 @@ unsafe fn register_system_from_extensible_ptr(
     };
 
     let desc = sched_desc.base;
+    let run_if = cond_desc
+        .run_if
+        .map(|cb| (cb, cond_desc.run_if_user_data));
 
     // D8 fix: never silently truncate query columns beyond MAX_QUERY_COMPONENTS!
     if desc.query_count > MAX_QUERY_COMPONENTS {
@@ -1254,6 +1412,7 @@ unsafe fn register_system_from_extensible_ptr(
     )
     .with_schedule(schedule)
     .with_ordering(after, before)
+    .with_run_if(run_if)
     .with_is_active(Arc::clone(&init_ctx.is_active));
     init_ctx.registered_systems.push(system);
 
@@ -1261,17 +1420,17 @@ unsafe fn register_system_from_extensible_ptr(
 }
 
 /// C-ABI implementation of `register_system` (defaults to [`ModSchedule::Update`] for v1
-/// [`SystemDescriptor`]s, and transparently honors `schedule` / `after` / `before` when passed
-/// an extended [`ScheduledSystemDescriptor`] via [`ScheduledSystemDescriptor::as_base_ptr`]).
+/// [`SystemDescriptor`]s, and transparently honors `schedule`, `after`/`before`, and `run_if`
+/// when passed an extended v2/v3 descriptor via `as_base_ptr`).
 ///
 /// # Safety
 /// `host_context` must point to a valid [`ModInitContext`]. `descriptor` must point to a valid
-/// [`SystemDescriptor`] or [`ScheduledSystemDescriptor`].
+/// [`SystemDescriptor`], [`ScheduledSystemDescriptor`], or [`ConditionalSystemDescriptor`].
 pub unsafe extern "C" fn host_register_system(
     host_context: *mut c_void,
     descriptor: *const SystemDescriptor,
 ) -> FfiResult {
-    // SAFETY: Delegating through `read_descriptor::<ScheduledSystemDescriptor>`.
+    // SAFETY: Delegating through `read_descriptor::<ConditionalSystemDescriptor>`.
     unsafe {
         register_system_from_extensible_ptr(
             host_context,
@@ -1286,12 +1445,32 @@ pub unsafe extern "C" fn host_register_system(
 ///
 /// # Safety
 /// `host_context` must point to a valid [`ModInitContext`]. `descriptor` must point to a valid
-/// [`ScheduledSystemDescriptor`].
+/// [`ScheduledSystemDescriptor`] or [`ConditionalSystemDescriptor`].
 pub unsafe extern "C" fn host_register_scheduled_system(
     host_context: *mut c_void,
     descriptor: *const ScheduledSystemDescriptor,
 ) -> FfiResult {
-    // SAFETY: Delegating through `read_descriptor::<ScheduledSystemDescriptor>`.
+    // SAFETY: Delegating through `read_descriptor::<ConditionalSystemDescriptor>`.
+    unsafe {
+        register_system_from_extensible_ptr(
+            host_context,
+            descriptor.cast::<c_void>(),
+            None,
+            FfiResult::INVALID_VERSION,
+        )
+    }
+}
+
+/// C-ABI symbol `register_conditional_system` matching [`abi_contract::RegisterConditionalSystemFn`].
+///
+/// # Safety
+/// `host_context` must point to a valid [`ModInitContext`]. `descriptor` must point to a valid
+/// [`ConditionalSystemDescriptor`].
+pub unsafe extern "C" fn host_register_conditional_system(
+    host_context: *mut c_void,
+    descriptor: *const ConditionalSystemDescriptor,
+) -> FfiResult {
+    // SAFETY: Delegating through `read_descriptor::<ConditionalSystemDescriptor>`.
     unsafe {
         register_system_from_extensible_ptr(
             host_context,
@@ -1315,7 +1494,7 @@ pub unsafe extern "C" fn host_register_system_in_schedule(
     let Some(schedule) = ModSchedule::from_raw(schedule_raw) else {
         return FfiResult::INTERNAL_ERROR;
     };
-    // SAFETY: Delegating through `read_descriptor::<ScheduledSystemDescriptor>`.
+    // SAFETY: Delegating through `read_descriptor::<ConditionalSystemDescriptor>`.
     unsafe {
         register_system_from_extensible_ptr(
             host_context,
@@ -1326,36 +1505,31 @@ pub unsafe extern "C" fn host_register_system_in_schedule(
     }
 }
 
-/// C-ABI implementation of `register_multi_query_system` for nested / multi-query ECS systems.
-/// Transparently supports both v1 [`MultiQuerySystemDescriptor`] and extended
-/// [`ScheduledMultiQuerySystemDescriptor`] via `struct_size` negotiation.
-///
-/// # Safety
-/// `host_context` must point to a valid [`ModInitContext`]. `descriptor` must point to a valid
-/// [`MultiQuerySystemDescriptor`] or [`ScheduledMultiQuerySystemDescriptor`].
-pub unsafe extern "C" fn host_register_multi_query_system(
+unsafe fn register_multi_query_from_extensible_ptr(
     host_context: *mut c_void,
-    descriptor: *const MultiQuerySystemDescriptor,
+    descriptor_ptr: *const c_void,
+    truncated_err: FfiResult,
 ) -> FfiResult {
-    if host_context.is_null() || descriptor.is_null() {
+    if host_context.is_null() || descriptor_ptr.is_null() {
         return FfiResult::NULL_POINTER;
     }
 
-    // SAFETY: Safely copies `min(struct_size, size_of::<ScheduledMultiQuerySystemDescriptor>())`
+    // SAFETY: Safely copies `min(struct_size, size_of::<ConditionalMultiQuerySystemDescriptor>())`
     // and checks `callback != 0` before `assume_init()` (no provenance or `fn`-niche UB).
-    let sched_desc = match unsafe {
-        read_descriptor::<ScheduledMultiQuerySystemDescriptor>(descriptor.cast::<c_void>())
+    let cond_desc = match unsafe {
+        read_descriptor::<ConditionalMultiQuerySystemDescriptor>(descriptor_ptr)
     } {
         Ok(d) => d,
-        Err(FfiResult::INVALID_VERSION) => return FfiResult::INTERNAL_ERROR,
+        Err(FfiResult::INVALID_VERSION) => return truncated_err,
         Err(err) => return err,
     };
+    let sched_desc = cond_desc.sched;
 
     let Some(schedule) = ModSchedule::from_label_id(sched_desc.schedule) else {
         return FfiResult::INVALID_VERSION;
     };
 
-    // SAFETY: Zero-filled for v1 descriptors or caller-supplied pointer array for v2 descriptors.
+    // SAFETY: Zero-filled for v1 descriptors or caller-supplied pointer array for v2/v3 descriptors.
     let after = match unsafe { parse_cstr_name_array(sched_desc.after, sched_desc.after_count) } {
         Ok(v) => v,
         Err(err) => return err,
@@ -1368,6 +1542,10 @@ pub unsafe extern "C" fn host_register_multi_query_system(
     };
 
     let desc = sched_desc.base;
+    let run_if = cond_desc
+        .run_if
+        .map(|cb| (cb, cond_desc.run_if_user_data));
+
     if desc.query_spec_count == 0 || desc.query_spec_count > MAX_SYSTEM_QUERIES {
         return FfiResult::INTERNAL_ERROR;
     }
@@ -1434,10 +1612,52 @@ pub unsafe extern "C" fn host_register_multi_query_system(
     )
     .with_schedule(schedule)
     .with_ordering(after, before)
+    .with_run_if(run_if)
     .with_is_active(Arc::clone(&init_ctx.is_active));
     init_ctx.registered_systems.push(system);
 
     FfiResult::OK
+}
+
+/// C-ABI implementation of `register_multi_query_system` for nested / multi-query ECS systems.
+/// Transparently supports v1 [`MultiQuerySystemDescriptor`], v2 [`abi_contract::ScheduledMultiQuerySystemDescriptor`],
+/// and v3 [`ConditionalMultiQuerySystemDescriptor`] via `struct_size` negotiation.
+///
+/// # Safety
+/// `host_context` must point to a valid [`ModInitContext`]. `descriptor` must point to a valid
+/// multi-query system descriptor.
+pub unsafe extern "C" fn host_register_multi_query_system(
+    host_context: *mut c_void,
+    descriptor: *const MultiQuerySystemDescriptor,
+) -> FfiResult {
+    // SAFETY: Delegating through `read_descriptor::<ConditionalMultiQuerySystemDescriptor>`.
+    unsafe {
+        register_multi_query_from_extensible_ptr(
+            host_context,
+            descriptor.cast::<c_void>(),
+            FfiResult::INTERNAL_ERROR,
+        )
+    }
+}
+
+/// C-ABI symbol `register_conditional_multi_query_system` matching
+/// [`abi_contract::RegisterConditionalMultiQuerySystemFn`].
+///
+/// # Safety
+/// `host_context` must point to a valid [`ModInitContext`]. `descriptor` must point to a valid
+/// [`ConditionalMultiQuerySystemDescriptor`].
+pub unsafe extern "C" fn host_register_conditional_multi_query_system(
+    host_context: *mut c_void,
+    descriptor: *const ConditionalMultiQuerySystemDescriptor,
+) -> FfiResult {
+    // SAFETY: Delegating through `read_descriptor::<ConditionalMultiQuerySystemDescriptor>`.
+    unsafe {
+        register_multi_query_from_extensible_ptr(
+            host_context,
+            descriptor.cast::<c_void>(),
+            FfiResult::INVALID_VERSION,
+        )
+    }
 }
 
 /// C-ABI implementation of `register_component` for registering dynamic runtime components.
@@ -1496,44 +1716,73 @@ pub unsafe extern "C" fn host_register_component(
         let world = unsafe { &mut *init_ctx.world };
         let world_id = world.id();
 
+        // Guard against UUID collision (distinct name claiming an already-registered ComponentUuid)
+        // or layout/kind mismatch BEFORE mutating World or drop trampolines!
+        if init_ctx
+            .registry
+            .check_registration_collision(name_str, desc.uuid, desc.size, desc.align, false, None)
+            .is_err()
+        {
+            return FfiResult::INVALID_COMPONENT;
+        }
+        if let Some(world_reg) = world.get_resource::<ModRegistry>() {
+            if world_reg
+                .check_registration_collision(
+                    name_str, desc.uuid, desc.size, desc.align, false, None,
+                )
+                .is_err()
+            {
+                return FfiResult::INVALID_COMPONENT;
+            }
+        }
+
         // Check if component already exists with identical layout (idempotent registration / reload)
         if let Some(existing) = world
             .get_resource::<ModRegistry>()
             .and_then(|r| r.get_by_name(name_str))
+            .cloned()
         {
             if existing.size == desc.size
                 && existing.align == desc.align
                 && existing.uuid == desc.uuid
+                && !existing.is_resource
             {
-                // Update drop trampoline slot for the reloaded mod instance in THIS World
-                if let Some(drop_fn) = desc.drop_fn {
-                    match allocate_drop_trampoline(
-                        world_id,
-                        desc.uuid,
-                        drop_fn,
-                        Arc::clone(&init_ctx.is_active),
-                    ) {
-                        Some(_) => {}
-                        None => return FfiResult::INTERNAL_ERROR,
+                if existing.is_dynamic {
+                    // Update drop trampoline slot for the reloaded mod instance in THIS World
+                    if let Some(drop_fn) = desc.drop_fn {
+                        match allocate_drop_trampoline(
+                            world_id,
+                            desc.uuid,
+                            drop_fn,
+                            Arc::clone(&init_ctx.is_active),
+                        ) {
+                            Some(_) => {}
+                            None => return FfiResult::INTERNAL_ERROR,
+                        }
                     }
+                    if !init_ctx
+                        .registered_components
+                        .iter()
+                        .any(|c| c.component_id == existing.component_id)
+                    {
+                        init_ctx.registered_components.push(existing.clone());
+                    }
+                    let mut reg_clone = (*init_ctx.registry).clone();
+                    if reg_clone
+                        .try_register_dynamic_component(
+                            existing.component_id,
+                            &desc,
+                            name_str.to_string(),
+                        )
+                        .is_err()
+                    {
+                        return FfiResult::INVALID_COMPONENT;
+                    }
+                    init_ctx.registry = Arc::new(reg_clone);
+                    crate::registry::CURRENT_REGISTRY.with(|cell| {
+                        *cell.borrow_mut() = Some(Arc::clone(&init_ctx.registry));
+                    });
                 }
-                if !init_ctx
-                    .registered_components
-                    .iter()
-                    .any(|c| c.component_id == existing.component_id)
-                {
-                    init_ctx.registered_components.push(existing.clone());
-                }
-                let mut reg_clone = (*init_ctx.registry).clone();
-                reg_clone.register_dynamic_component(
-                    existing.component_id,
-                    &desc,
-                    name_str.to_string(),
-                );
-                init_ctx.registry = Arc::new(reg_clone);
-                crate::registry::CURRENT_REGISTRY.with(|cell| {
-                    *cell.borrow_mut() = Some(Arc::clone(&init_ctx.registry));
-                });
                 return FfiResult::OK;
             } else {
                 return FfiResult::INVALID_COMPONENT;
@@ -1577,14 +1826,24 @@ pub unsafe extern "C" fn host_register_component(
         let comp_id = world.register_component_with_descriptor(bevy_desc);
 
         if let Some(mut registry) = world.get_resource_mut::<ModRegistry>() {
-            registry.register_dynamic_component(comp_id, &desc, name_str.to_string());
+            if registry
+                .try_register_dynamic_component(comp_id, &desc, name_str.to_string())
+                .is_err()
+            {
+                return FfiResult::INVALID_COMPONENT;
+            }
             if let Some(reg_comp) = registry.get_by_id(comp_id) {
                 init_ctx.registered_components.push(reg_comp.clone());
             }
         }
 
         let mut reg_clone = (*init_ctx.registry).clone();
-        reg_clone.register_dynamic_component(comp_id, &desc, name_str.to_string());
+        if reg_clone
+            .try_register_dynamic_component(comp_id, &desc, name_str.to_string())
+            .is_err()
+        {
+            return FfiResult::INVALID_COMPONENT;
+        }
         init_ctx.registry = Arc::new(reg_clone);
         crate::registry::CURRENT_REGISTRY.with(|cell| {
             *cell.borrow_mut() = Some(Arc::clone(&init_ctx.registry));

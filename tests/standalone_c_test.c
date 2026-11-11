@@ -442,6 +442,55 @@ static void test_entity_null_semver_and_scheduled_descriptors(void) {
     printf("  -> OK (BAM_ENTITY_NULL=0, SemVer matrix, FfiBool & ScheduledSystemDescriptor verified)\n");
 }
 
+static FfiBool mock_run_condition(void* user_data) {
+    return user_data != NULL ? FFI_BOOL_TRUE : FFI_BOOL_FALSE;
+}
+
+/* Test Suite 7: Phase 3 & Phase 4 Access Modes, Resource/Command Typedefs & Conditional Descriptors */
+static void test_phase3_phase4_abi_extensions(void) {
+    printf("[7/7] Testing Phase 3/4 access modes, command/resource fn typedefs & ConditionalSystemDescriptor...\n");
+
+    assert(COMPONENT_ACCESS_READ == 0u);
+    assert(COMPONENT_ACCESS_WRITE == 1u);
+    assert(COMPONENT_ACCESS_FILTER_ONLY == 2u);
+    assert(COMPONENT_ACCESS_WITHOUT == 3u);
+    assert(COMPONENT_ACCESS_OPTIONAL_READ == 4u);
+    assert(COMPONENT_ACCESS_OPTIONAL_WRITE == 5u);
+    assert(COMPONENT_ACCESS_CHANGED == 6u);
+    assert(COMPONENT_ACCESS_ADDED == 7u);
+    assert(COMPONENT_ACCESS_RESOURCE_READ == 8u);
+    assert(COMPONENT_ACCESS_RESOURCE_WRITE == 9u);
+
+    ComponentAccessDesc opt_ro = bam_access_desc("Velocity", COMPONENT_ACCESS_OPTIONAL_READ);
+    ComponentAccessDesc chg = bam_access_desc("Position", COMPONENT_ACCESS_CHANGED);
+    ComponentAccessDesc res_rw = bam_access_desc("ScoreBoard", COMPONENT_ACCESS_RESOURCE_WRITE);
+    assert(opt_ro.mode == COMPONENT_ACCESS_OPTIONAL_READ);
+    assert(chg.mode == COMPONENT_ACCESS_CHANGED);
+    assert(res_rw.mode == COMPONENT_ACCESS_RESOURCE_WRITE);
+
+    int flag = 1;
+    ConditionalSystemDescriptor cond_desc;
+    memset(&cond_desc, 0, sizeof(cond_desc));
+    cond_desc.sched.base.struct_size = (uint32_t)sizeof(ConditionalSystemDescriptor);
+    cond_desc.sched.base.name = "conditional_sys";
+    cond_desc.sched.schedule = BAM_SCHEDULE_UPDATE;
+    cond_desc.run_if = mock_run_condition;
+    cond_desc.run_if_user_data = &flag;
+
+    assert(((const SystemDescriptor*)&cond_desc)->struct_size == sizeof(ConditionalSystemDescriptor));
+    assert(cond_desc.run_if(cond_desc.run_if_user_data) == FFI_BOOL_TRUE);
+    assert(cond_desc.run_if(NULL) == FFI_BOOL_FALSE);
+
+    /* Verify function pointer typedef usability */
+    IterResourceReadonlyFn fn_res_ro = NULL;
+    IterResourceMutableFn fn_res_mut = NULL;
+    CmdRemoveComponentFn fn_cmd_rm = NULL;
+    CmdInsertDefaultFn fn_cmd_def = NULL;
+    assert(fn_res_ro == NULL && fn_res_mut == NULL && fn_cmd_rm == NULL && fn_cmd_def == NULL);
+
+    printf("  -> OK (Phase 3/4 constants, typedefs & ConditionalSystemDescriptor verified)\n");
+}
+
 /* ============================================================================
  * Main Entry Point
  * ============================================================================ */
@@ -453,6 +502,7 @@ int main(void) {
     test_legacy_mod_on_newer_host();
     test_newer_mod_on_legacy_host();
     test_entity_null_semver_and_scheduled_descriptors();
+    test_phase3_phase4_abi_extensions();
     printf("=== All C Header & ABI Compatibility Tests Passed! ===\n");
     return 0;
 }

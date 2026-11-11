@@ -73,14 +73,21 @@ use core::ffi::{c_char, c_void, CStr};
 use std::sync::Mutex;
 
 pub use abi_contract::{
+    ffi_bool_to_rust, rust_bool_to_ffi, CmdInsertDefaultFn, CmdRemoveComponentFn,
     ComponentAccessDesc, ComponentAccessMode, ComponentDropFn, ComponentUuid,
-    DynamicComponentDescriptor, DynamicSystemCallback, ExposableComponent, FfiEntity, FfiLayout,
-    FfiResult, FfiSlice, GetProcAddressFn, HostApi, IterColumnMutableFn, IterColumnReadonlyFn,
-    IterColumnStrideFn, IterEntitiesFn, IterMarkChangedFn, IterNextChunkFn, IterResetFn,
-    ModAbiVersionFn, ModComponentDescriptor, ModInitFn, ModShutdownFn, MultiQuerySystemCallback,
-    MultiQuerySystemDescriptor, QuerySpec, RawChunkIter, RawCommandQueue, RegisterComponentFn,
-    RegisterMultiQuerySystemFn, RegisterSystemFn, StrView, SymbolEntry, SystemDescriptor,
-    ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PACKED, ABI_VERSION_PATCH,
+    ConditionalMultiQuerySystemDescriptor, ConditionalSystemDescriptor,
+    DynamicComponentDescriptor, DynamicSystemCallback, ExposableComponent, ExtensibleStruct,
+    FfiBool, FfiEntity, FfiLayout, FfiResult, FfiSlice, GetProcAddressFn, HostApi,
+    IterColumnMutableFn, IterColumnReadonlyFn, IterColumnStrideFn, IterEntitiesFn,
+    IterMarkChangedFn, IterNextChunkFn, IterResetFn, IterResourceMutableFn,
+    IterResourceReadonlyFn, ModAbiVersionFn, ModComponentDescriptor, ModInitFn, ModShutdownFn,
+    MultiQuerySystemCallback, MultiQuerySystemDescriptor, MultiQuerySystemDescriptorV2,
+    MultiQuerySystemDescriptorV3, QuerySpec, RawChunkIter, RawCommandQueue, RegisterComponentFn,
+    RegisterConditionalMultiQuerySystemFn, RegisterConditionalSystemFn,
+    RegisterMultiQuerySystemFn, RegisterSystemFn, RunConditionCallback, ScheduleLabelId,
+    ScheduledMultiQuerySystemDescriptor, ScheduledSystemDescriptor, StrView, SymbolEntry,
+    SystemDescriptor, SystemDescriptorV2, SystemDescriptorV3, ABI_VERSION_MAJOR, ABI_VERSION_MINOR,
+    ABI_VERSION_PACKED, ABI_VERSION_PATCH, FFI_BOOL_FALSE, FFI_BOOL_TRUE,
 };
 
 /// Maximum number of simultaneous queries supported per [`MultiQueryContext`] without heap allocation.
@@ -357,8 +364,29 @@ macro_rules! wrap_multi_query_callback {
     };
 }
 
+/// Macro to wrap a guest Rust run-condition function (`unsafe fn(*mut c_void) -> bool`) into a
+/// C-ABI [`RunConditionCallback`] (`unsafe extern "C" fn(*mut c_void) -> FfiBool`) that catches
+/// guest panics and returns [`FFI_BOOL_FALSE`] (`0`) instead of unwinding across `extern "C"`.
+#[macro_export]
+macro_rules! wrap_run_condition {
+    ($vis:vis fn $wrapper_name:ident calls $inner_fn:path) => {
+        $vis unsafe extern "C" fn $wrapper_name(
+            user_data: *mut ::core::ffi::c_void,
+        ) -> $crate::FfiBool {
+            match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                // SAFETY: Forwarding `user_data` received from the host executor.
+                let should_run: bool = unsafe { $inner_fn(user_data) };
+                $crate::rust_bool_to_ffi(should_run)
+            })) {
+                Ok(flag) => flag,
+                Err(_) => $crate::FFI_BOOL_FALSE,
+            }
+        }
+    };
+}
+
 // ============================================================================
-// Deferred Command Queue Bridge
+// Deferred Command Queue & Resource Bridge VTables
 // ============================================================================
 
 /// C-ABI function pointer type for deferred empty entity creation.
@@ -434,6 +462,100 @@ impl CommandBridgeVTable {
     }
 }
 
+/// Extended cached function pointers for host command queue operations, including Phase 3/4
+/// `cmd_remove_component` and `cmd_insert_default` while preserving literal compatibility for
+/// [`CommandBridgeVTable`].
+#[derive(Clone, Copy, Default, Debug)]
+pub struct CommandBridgeVTableExt {
+    /// Core v1 command pointers (`spawn_empty`, `despawn`, `insert_component`).
+    pub base: CommandBridgeVTable,
+    /// Function pointer for `cmd_remove_component`.
+    pub remove_component: Option<CmdRemoveComponentFn>,
+    /// Function pointer for `cmd_insert_default`.
+    pub insert_default: Option<CmdInsertDefaultFn>,
+}
+
+impl CommandBridgeVTableExt {
+    /// Resolves all command bridge functions (including `cmd_remove_component` and `cmd_insert_default`)
+    /// from the host's symbol provider.
+    pub fn resolve(get_proc_address: GetProcAddressFn) -> Self {
+        let base = CommandBridgeVTable::resolve(get_proc_address);
+        let mut remove_ptr = unsafe { get_proc_address(c"cmd_remove_component".as_ptr()) };
+        if remove_ptr.is_null() {
+            remove_ptr = unsafe { get_proc_address(c"host_cmd_remove_component".as_ptr()) };
+        }
+        let mut default_ptr = unsafe { get_proc_address(c"cmd_insert_default".as_ptr()) };
+        if default_ptr.is_null() {
+            default_ptr = unsafe { get_proc_address(c"host_cmd_insert_default".as_ptr()) };
+        }
+
+        Self {
+            base,
+            remove_component: if !remove_ptr.is_null() {
+                // SAFETY: Symbol `"cmd_remove_component"` resolved from host matches `CmdRemoveComponentFn`.
+                Some(unsafe {
+                    core::mem::transmute::<*const c_void, CmdRemoveComponentFn>(remove_ptr)
+                })
+            } else {
+                None
+            },
+            insert_default: if !default_ptr.is_null() {
+                // SAFETY: Symbol `"cmd_insert_default"` resolved from host matches `CmdInsertDefaultFn`.
+                Some(unsafe {
+                    core::mem::transmute::<*const c_void, CmdInsertDefaultFn>(default_ptr)
+                })
+            } else {
+                None
+            },
+        }
+    }
+}
+
+/// Cached function pointers for host ECS resource read/write operations (`Res<R>` / `ResMut<R>`).
+#[derive(Clone, Copy, Default, Debug)]
+pub struct ResourceBridgeVTable {
+    /// Function pointer for `res_readonly` (`iter_resource_readonly`).
+    pub res_readonly: Option<IterResourceReadonlyFn>,
+    /// Function pointer for `res_mutable` (`iter_resource_mutable`).
+    pub res_mutable: Option<IterResourceMutableFn>,
+}
+
+impl ResourceBridgeVTable {
+    /// Resolves resource access functions (`res_readonly`, `res_mutable`) from `get_proc_address`.
+    pub fn resolve(get_proc_address: GetProcAddressFn) -> Self {
+        let mut ro_ptr = unsafe { get_proc_address(c"res_readonly".as_ptr()) };
+        if ro_ptr.is_null() {
+            ro_ptr = unsafe { get_proc_address(c"iter_resource_readonly".as_ptr()) };
+        }
+        if ro_ptr.is_null() {
+            ro_ptr = unsafe { get_proc_address(c"host_iter_resource_readonly".as_ptr()) };
+        }
+
+        let mut rw_ptr = unsafe { get_proc_address(c"res_mutable".as_ptr()) };
+        if rw_ptr.is_null() {
+            rw_ptr = unsafe { get_proc_address(c"iter_resource_mutable".as_ptr()) };
+        }
+        if rw_ptr.is_null() {
+            rw_ptr = unsafe { get_proc_address(c"host_iter_resource_mutable".as_ptr()) };
+        }
+
+        Self {
+            res_readonly: if !ro_ptr.is_null() {
+                // SAFETY: Symbol `"res_readonly"` resolved from host matches `IterResourceReadonlyFn`.
+                Some(unsafe { core::mem::transmute::<*const c_void, IterResourceReadonlyFn>(ro_ptr) })
+            } else {
+                None
+            },
+            res_mutable: if !rw_ptr.is_null() {
+                // SAFETY: Symbol `"res_mutable"` resolved from host matches `IterResourceMutableFn`.
+                Some(unsafe { core::mem::transmute::<*const c_void, IterResourceMutableFn>(rw_ptr) })
+            } else {
+                None
+            },
+        }
+    }
+}
+
 /// Resolves the `iter_reset` host function pointer via `get_proc_address`, if supported by the host.
 #[inline]
 pub fn resolve_iter_reset(get_proc_address: GetProcAddressFn) -> Option<IterResetFn> {
@@ -466,6 +588,43 @@ pub fn resolve_register_multi_query(
     }
 }
 
+/// Resolves `register_conditional_system` via `get_proc_address`, if supported by the host.
+#[inline]
+pub fn resolve_register_conditional_system(
+    get_proc_address: GetProcAddressFn,
+) -> Option<RegisterConditionalSystemFn> {
+    let mut ptr = unsafe { get_proc_address(c"register_conditional_system".as_ptr()) };
+    if ptr.is_null() {
+        ptr = unsafe { get_proc_address(c"host_register_conditional_system".as_ptr()) };
+    }
+    if ptr.is_null() {
+        None
+    } else {
+        // SAFETY: Symbol `"register_conditional_system"` resolved from host matches `RegisterConditionalSystemFn`.
+        Some(unsafe { core::mem::transmute::<*const c_void, RegisterConditionalSystemFn>(ptr) })
+    }
+}
+
+/// Resolves `register_conditional_multi_query_system` via `get_proc_address`, if supported by the host.
+#[inline]
+pub fn resolve_register_conditional_multi_query(
+    get_proc_address: GetProcAddressFn,
+) -> Option<RegisterConditionalMultiQuerySystemFn> {
+    let mut ptr = unsafe { get_proc_address(c"register_conditional_multi_query_system".as_ptr()) };
+    if ptr.is_null() {
+        ptr =
+            unsafe { get_proc_address(c"host_register_conditional_multi_query_system".as_ptr()) };
+    }
+    if ptr.is_null() {
+        None
+    } else {
+        // SAFETY: Symbol `"register_conditional_multi_query_system"` matches `RegisterConditionalMultiQuerySystemFn`.
+        Some(unsafe {
+            core::mem::transmute::<*const c_void, RegisterConditionalMultiQuerySystemFn>(ptr)
+        })
+    }
+}
+
 /// Wrapper around the host's deferred command queue handle ([`RawCommandQueue`]).
 ///
 /// Prefer obtaining a `GuestCommandQueue` safely through [`SystemContext::commands`] or
@@ -484,6 +643,8 @@ pub fn resolve_register_multi_query(
 pub struct GuestCommandQueue<'a> {
     raw: *mut RawCommandQueue,
     vtable: CommandBridgeVTable,
+    remove_component: Option<CmdRemoveComponentFn>,
+    insert_default: Option<CmdInsertDefaultFn>,
     _marker: core::marker::PhantomData<&'a mut ()>,
 }
 
@@ -499,8 +660,37 @@ impl<'a> GuestCommandQueue<'a> {
         Self {
             raw,
             vtable,
+            remove_component: None,
+            insert_default: None,
             _marker: core::marker::PhantomData,
         }
+    }
+
+    /// Creates a new guest command queue wrapper from an opaque handle and extended command VTable
+    /// (including `cmd_remove_component` and `cmd_insert_default`).
+    #[inline]
+    pub fn with_ext(raw: *mut RawCommandQueue, ext: CommandBridgeVTableExt) -> Self {
+        Self {
+            raw,
+            vtable: ext.base,
+            remove_component: ext.remove_component,
+            insert_default: ext.insert_default,
+            _marker: core::marker::PhantomData,
+        }
+    }
+
+    /// Attaches an optional `cmd_remove_component` function pointer to this queue wrapper.
+    #[inline]
+    pub fn with_remove_component(mut self, remove_fn: Option<CmdRemoveComponentFn>) -> Self {
+        self.remove_component = remove_fn;
+        self
+    }
+
+    /// Attaches an optional `cmd_insert_default` function pointer to this queue wrapper.
+    #[inline]
+    pub fn with_insert_default(mut self, insert_default_fn: Option<CmdInsertDefaultFn>) -> Self {
+        self.insert_default = insert_default_fn;
+        self
     }
 
     /// Returns `true` if the underlying `RawCommandQueue` pointer is null.
@@ -618,6 +808,79 @@ impl<'a> GuestCommandQueue<'a> {
     ) -> FfiResult {
         self.insert_value(entity, name, value)
     }
+
+    /// Enqueues the deferred removal of a component by raw C string name from `entity`.
+    ///
+    /// # Safety
+    /// `component_name` must point to a valid, nul-terminated UTF-8 C string.
+    #[inline]
+    pub unsafe fn remove_component_raw(
+        &mut self,
+        entity: FfiEntity,
+        component_name: *const c_char,
+    ) -> FfiResult {
+        if self.raw.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if let Some(f) = self.remove_component {
+            // SAFETY: `self.raw` is non-null and `component_name` satisfies caller contract.
+            unsafe { f(self.raw, entity, component_name) }
+        } else {
+            FfiResult::NULL_POINTER
+        }
+    }
+
+    /// Safely enqueues the deferred removal of `component_name` from `entity` (`Commands::entity(e).remove::<T>()`).
+    #[inline]
+    pub fn remove_component(&mut self, entity: FfiEntity, component_name: &CStr) -> FfiResult {
+        // SAFETY: `CStr` guarantees a valid nul-terminated C string pointer.
+        unsafe { self.remove_component_raw(entity, component_name.as_ptr()) }
+    }
+
+    /// Safely enqueues the deferred removal of a typed [`GuestComponent`] from `entity`.
+    #[inline]
+    pub fn remove_guest_component<T: GuestComponent>(&mut self, entity: FfiEntity) -> FfiResult {
+        self.remove_component(entity, T::NAME)
+    }
+
+    /// Enqueues the deferred insertion of a host-constructed `T::default()` component onto `entity`
+    /// by raw C string name.
+    ///
+    /// # Safety
+    /// `component_name` must point to a valid, nul-terminated UTF-8 C string.
+    #[inline]
+    pub unsafe fn insert_default_raw(
+        &mut self,
+        entity: FfiEntity,
+        component_name: *const c_char,
+    ) -> FfiResult {
+        if self.raw.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if let Some(f) = self.insert_default {
+            // SAFETY: `self.raw` is non-null and `component_name` satisfies caller contract.
+            unsafe { f(self.raw, entity, component_name) }
+        } else {
+            FfiResult::NULL_POINTER
+        }
+    }
+
+    /// Safely enqueues the deferred insertion of a host-constructed `T::default()` component onto `entity`.
+    ///
+    /// Enables guest mods to attach even opaque, non-POD host components (such as `String`-bearing
+    /// components registered via `register_mod_component_with_default::<T>()`) with zero allocator crossover,
+    /// and subsequently mutate them via VTable setters!
+    #[inline]
+    pub fn insert_default(&mut self, entity: FfiEntity, component_name: &CStr) -> FfiResult {
+        // SAFETY: `CStr` guarantees a valid nul-terminated C string pointer.
+        unsafe { self.insert_default_raw(entity, component_name.as_ptr()) }
+    }
+
+    /// Safely enqueues the deferred default insertion of a typed [`GuestComponent`] onto `entity`.
+    #[inline]
+    pub fn insert_guest_default<T: GuestComponent>(&mut self, entity: FfiEntity) -> FfiResult {
+        self.insert_default(entity, T::NAME)
+    }
 }
 
 // ============================================================================
@@ -666,6 +929,7 @@ pub struct GuestChunkIter<'a> {
     raw: *mut RawChunkIter,
     api: &'a HostApi,
     reset_fn: Option<IterResetFn>,
+    res_vtable: ResourceBridgeVTable,
 }
 
 impl<'a> GuestChunkIter<'a> {
@@ -681,19 +945,47 @@ impl<'a> GuestChunkIter<'a> {
             raw,
             api,
             reset_fn: None,
+            res_vtable: ResourceBridgeVTable::default(),
         }
     }
 
     /// Creates a new guest chunk iterator wrapper with a pre-resolved [`IterResetFn`] for nested loops.
     #[inline]
     pub fn with_reset(raw: *mut RawChunkIter, api: &'a HostApi, reset_fn: Option<IterResetFn>) -> Self {
-        Self { raw, api, reset_fn }
+        Self {
+            raw,
+            api,
+            reset_fn,
+            res_vtable: ResourceBridgeVTable::default(),
+        }
+    }
+
+    /// Creates a new guest chunk iterator wrapper with both [`IterResetFn`] and [`ResourceBridgeVTable`].
+    #[inline]
+    pub fn with_bridges(
+        raw: *mut RawChunkIter,
+        api: &'a HostApi,
+        reset_fn: Option<IterResetFn>,
+        res_vtable: ResourceBridgeVTable,
+    ) -> Self {
+        Self {
+            raw,
+            api,
+            reset_fn,
+            res_vtable,
+        }
     }
 
     /// Attaches a resolved [`IterResetFn`] to enable [`GuestChunkIter::reset`].
     #[inline]
     pub fn set_reset_fn(&mut self, reset_fn: Option<IterResetFn>) {
         self.reset_fn = reset_fn;
+    }
+
+    /// Attaches a resolved [`ResourceBridgeVTable`] to enable [`GuestChunkIter::resource`] / [`GuestChunkIter::resource_mut`].
+    #[inline]
+    pub fn set_resource_vtable(&mut self, res_vtable: ResourceBridgeVTable) {
+        self.res_vtable = res_vtable;
     }
 
     /// Rewinds the chunk iterator cursor back to the first matched chunk so inner queries
@@ -986,6 +1278,195 @@ impl<'a> GuestChunkIter<'a> {
         let b_typed = rw_b.into_typed_slice::<W2>()?;
         Some((a_typed, b_typed))
     }
+
+    /// Obtains an optional read-only column pointer (`Option<&T>`) for the current chunk.
+    ///
+    /// Returns `Some(ptr)` when the optional column is present on the current archetype,
+    /// or `None` when absent.
+    #[inline]
+    pub fn optional_column_ptr(&self, index: usize) -> Option<*const u8> {
+        let ptr = self.column_readonly(index);
+        if ptr.is_null() {
+            None
+        } else {
+            Some(ptr)
+        }
+    }
+
+    /// Obtains an optional mutable column pointer (`Option<&mut T>`) for the current chunk.
+    ///
+    /// Marks the column's change ticks and returns `Some(ptr)` when present on the current
+    /// archetype, or returns `None` without modifying ticks when absent.
+    #[inline]
+    pub fn optional_column_mut_ptr(&mut self, index: usize) -> Option<*mut u8> {
+        let ptr = self.column_mutable(index);
+        if ptr.is_null() {
+            None
+        } else {
+            Some(ptr)
+        }
+    }
+
+    /// Returns `Some(ChunkSlice)` when an `OPTIONAL_READ` column is present on the current chunk,
+    /// or `None` when absent.
+    #[inline]
+    pub fn optional_readonly_slice(&self, index: usize, count: usize) -> Option<ChunkSlice<'_>> {
+        let ptr = self.optional_column_ptr(index)?;
+        let stride = self.column_stride(index);
+        Some(ChunkSlice::new(ptr, stride, count))
+    }
+
+    /// Returns `Some(ChunkSliceMut)` when an `OPTIONAL_WRITE` column is present on the current chunk,
+    /// or `None` when absent.
+    #[inline]
+    pub fn optional_mutable_slice(
+        &mut self,
+        index: usize,
+        count: usize,
+    ) -> Option<ChunkSliceMut<'_>> {
+        let ptr = self.optional_column_mut_ptr(index)?;
+        let stride = self.column_stride(index);
+        Some(ChunkSliceMut::new(ptr, stride, count))
+    }
+
+    /// Simultaneously borrows an optional read-only column (`Option<&[OptR]>`) and a required
+    /// disjoint mutable column (`&mut [W]`), verifying index disjointness and non-overlapping memory.
+    ///
+    /// Returns `None` if `opt_read_col == write_col`, if the required mutable column is null/invalid,
+    /// or if a present optional column has mismatched stride/alignment or overlaps the mutable column.
+    pub fn optional_read_write<OptR: Copy, W: Copy>(
+        &mut self,
+        opt_read_col: usize,
+        write_col: usize,
+        count: usize,
+    ) -> Option<(Option<&[OptR]>, &mut [W])> {
+        if opt_read_col == write_col {
+            return None;
+        }
+        if self.raw.is_null() && count > 0 {
+            return None;
+        }
+
+        let opt_ptr = self.column_readonly(opt_read_col);
+        let opt_stride = self.column_stride(opt_read_col);
+
+        let w_ptr = self.column_mutable(write_col);
+        let w_stride = self.column_stride(write_col);
+        if count > 0 && w_ptr.is_null() {
+            return None;
+        }
+        let w_bytes = count.checked_mul(w_stride)?;
+        if w_bytes > (isize::MAX as usize)
+            || (count > 0 && (w_ptr as usize).checked_add(w_bytes).is_none())
+        {
+            return None;
+        }
+
+        let opt_slice = if opt_ptr.is_null() {
+            None
+        } else {
+            let opt_bytes = count.checked_mul(opt_stride)?;
+            if opt_bytes > (isize::MAX as usize)
+                || (count > 0 && (opt_ptr as usize).checked_add(opt_bytes).is_none())
+            {
+                return None;
+            }
+            if count > 0 && byte_ranges_overlap(w_ptr as usize, w_bytes, opt_ptr as usize, opt_bytes)
+            {
+                return None;
+            }
+            let raw_ro = ChunkSlice::new(opt_ptr, opt_stride, count);
+            Some(raw_ro.as_typed_slice::<OptR>()?)
+        };
+
+        let raw_rw = ChunkSliceMut::new(w_ptr, w_stride, count);
+        let w_typed = raw_rw.into_typed_slice::<W>()?;
+        Some((opt_slice, w_typed))
+    }
+
+    /// Obtains a read-only byte pointer to an exposed Bevy `Resource` (`Res<R>`).
+    ///
+    /// Returns `null` if the resource was not declared (`RESOURCE_READ` / `RESOURCE_WRITE`),
+    /// is not currently inserted in the Bevy `World`, or resource bridge symbols are unavailable.
+    #[inline]
+    pub fn resource_ptr(&self, resource_name: &CStr) -> *const u8 {
+        if self.raw.is_null() {
+            return core::ptr::null();
+        }
+        let Some(f) = self.res_vtable.res_readonly else {
+            return core::ptr::null();
+        };
+        // SAFETY: `self.raw` is non-null and `resource_name` is a valid nul-terminated `CStr`.
+        unsafe { f(self.raw, resource_name.as_ptr()) }
+    }
+
+    /// Obtains a mutable byte pointer to an exposed Bevy `Resource` (`ResMut<R>`), marking its
+    /// Bevy change tick as modified on this system run.
+    ///
+    /// Returns `null` if the resource was not declared with `RESOURCE_WRITE`, is not currently
+    /// inserted in the Bevy `World`, or resource bridge symbols are unavailable.
+    #[inline]
+    pub fn resource_mut_ptr(&mut self, resource_name: &CStr) -> *mut u8 {
+        if self.raw.is_null() {
+            return core::ptr::null_mut();
+        }
+        let Some(f) = self.res_vtable.res_mutable else {
+            return core::ptr::null_mut();
+        };
+        // SAFETY: `self.raw` is exclusively borrowed via `&mut self` and `resource_name` is a valid `CStr`.
+        unsafe { f(self.raw, resource_name.as_ptr()) }
+    }
+
+    /// Safely borrows a typed `#[repr(C)]` POD Bevy `Resource` (`Res<R>`) for reading.
+    #[inline]
+    pub fn resource<R: Copy>(&self, resource_name: &CStr) -> Option<&R> {
+        let ptr = self.resource_ptr(resource_name);
+        if ptr.is_null() {
+            return None;
+        }
+        if core::mem::size_of::<R>() == 0 {
+            // SAFETY: ZST requires no backing bytes; lifetime is tied to `&self`.
+            return Some(unsafe { &*core::ptr::NonNull::<R>::dangling().as_ptr() });
+        }
+        if !(ptr as usize).is_multiple_of(core::mem::align_of::<R>()) {
+            return None;
+        }
+        // SAFETY: `ptr` is non-null, aligned for `R`, backed by host resource storage declared
+        // in `FilteredAccessSet`, and tied to `&self` so it cannot alias a mutable borrow.
+        Some(unsafe { &*(ptr as *const R) })
+    }
+
+    /// Safely borrows a typed `#[repr(C)]` POD Bevy `Resource` (`ResMut<R>`) mutably, marking its
+    /// change tick as modified.
+    #[inline]
+    pub fn resource_mut<R: Copy>(&mut self, resource_name: &CStr) -> Option<&mut R> {
+        let ptr = self.resource_mut_ptr(resource_name);
+        if ptr.is_null() {
+            return None;
+        }
+        if core::mem::size_of::<R>() == 0 {
+            // SAFETY: ZST requires no backing bytes; exclusive borrow tied to `&mut self`.
+            return Some(unsafe { &mut *core::ptr::NonNull::<R>::dangling().as_ptr() });
+        }
+        if !(ptr as usize).is_multiple_of(core::mem::align_of::<R>()) {
+            return None;
+        }
+        // SAFETY: `ptr` is non-null, aligned for `R`, exclusively borrowed by this system via
+        // `RESOURCE_WRITE` in `FilteredAccessSet`, and tied to `&mut self` preventing aliasing.
+        Some(unsafe { &mut *(ptr as *mut R) })
+    }
+
+    /// Safely borrows a typed [`GuestComponent`] resource (`Res<R>`) using `R::NAME`.
+    #[inline]
+    pub fn guest_resource<R: GuestComponent>(&self) -> Option<&R> {
+        self.resource::<R>(R::NAME)
+    }
+
+    /// Safely borrows a typed [`GuestComponent`] resource (`ResMut<R>`) mutably using `R::NAME`.
+    #[inline]
+    pub fn guest_resource_mut<R: GuestComponent>(&mut self) -> Option<&mut R> {
+        self.resource_mut::<R>(R::NAME)
+    }
 }
 
 /// Scoped handle to a single non-empty chunk yielded by [`GuestChunkIter::next_chunk_view`].
@@ -1123,6 +1604,63 @@ impl<'iter, 'api> Chunk<'iter, 'api> {
     #[inline]
     pub fn mark_changed(&mut self, index: usize, row: usize) -> FfiResult {
         self.iter.mark_changed(index, row)
+    }
+
+    /// Returns `Some(ptr)` when an `OPTIONAL_READ` column is present on this chunk's archetype,
+    /// or `None` when absent.
+    #[inline]
+    pub fn optional_column_ptr(&self, index: usize) -> Option<*const u8> {
+        self.iter.optional_column_ptr(index)
+    }
+
+    /// Returns `Some(ptr)` and marks ticks when an `OPTIONAL_WRITE` column is present on this
+    /// chunk's archetype, or `None` when absent.
+    #[inline]
+    pub fn optional_column_mut_ptr(&mut self, index: usize) -> Option<*mut u8> {
+        self.iter.optional_column_mut_ptr(index)
+    }
+
+    /// Returns `Some(&[T])` when an `OPTIONAL_READ` POD column is present on this chunk,
+    /// or `None` when absent.
+    #[inline]
+    pub fn optional_column<T: Copy>(&self, index: usize) -> Option<&[T]> {
+        self.iter
+            .optional_readonly_slice(index, self.count)?
+            .as_typed_slice::<T>()
+    }
+
+    /// Returns `Some(&mut [T])` and marks ticks when an `OPTIONAL_WRITE` POD column is present on
+    /// this chunk, or `None` when absent.
+    #[inline]
+    pub fn optional_column_mut<T: Copy>(&mut self, index: usize) -> Option<&mut [T]> {
+        self.iter
+            .optional_mutable_slice(index, self.count)?
+            .into_typed_slice::<T>()
+    }
+
+    /// Simultaneously borrows an optional read-only column (`Option<&[OptR]>`) and a required
+    /// disjoint mutable column (`&mut [W]`) for this chunk.
+    #[inline]
+    pub fn optional_read_write<OptR: Copy, W: Copy>(
+        &mut self,
+        opt_read_col: usize,
+        write_col: usize,
+    ) -> Option<(Option<&[OptR]>, &mut [W])> {
+        let count = self.count;
+        self.iter
+            .optional_read_write::<OptR, W>(opt_read_col, write_col, count)
+    }
+
+    /// Reads an exposed Bevy `Resource` (`Res<R>`) while inspecting this chunk.
+    #[inline]
+    pub fn resource<R: Copy>(&self, resource_name: &CStr) -> Option<&R> {
+        self.iter.resource::<R>(resource_name)
+    }
+
+    /// Obtains a read-only byte pointer to an exposed Bevy `Resource` while inspecting this chunk.
+    #[inline]
+    pub fn resource_ptr(&self, resource_name: &CStr) -> *const u8 {
+        self.iter.resource_ptr(resource_name)
     }
 }
 
@@ -1412,6 +1950,42 @@ pub unsafe trait GuestComponent: Copy + 'static {
     fn without_desc() -> ComponentAccessDesc {
         ComponentAccessDesc::without(Self::NAME.as_ptr())
     }
+
+    /// Builds an optional read-only (`Option<&T>`) query access descriptor for this component.
+    #[inline]
+    fn optional_read_desc() -> ComponentAccessDesc {
+        ComponentAccessDesc::optional_read(Self::NAME.as_ptr())
+    }
+
+    /// Builds an optional mutable (`Option<&mut T>`) query access descriptor for this component.
+    #[inline]
+    fn optional_write_desc() -> ComponentAccessDesc {
+        ComponentAccessDesc::optional_write(Self::NAME.as_ptr())
+    }
+
+    /// Builds a row-level change filter (`Changed<T>`) query access descriptor for this component.
+    #[inline]
+    fn changed_desc() -> ComponentAccessDesc {
+        ComponentAccessDesc::changed(Self::NAME.as_ptr())
+    }
+
+    /// Builds a row-level addition filter (`Added<T>`) query access descriptor for this component.
+    #[inline]
+    fn added_desc() -> ComponentAccessDesc {
+        ComponentAccessDesc::added(Self::NAME.as_ptr())
+    }
+
+    /// Builds a read-only resource (`Res<T>`) access descriptor for this type.
+    #[inline]
+    fn resource_read_desc() -> ComponentAccessDesc {
+        ComponentAccessDesc::resource_read(Self::NAME.as_ptr())
+    }
+
+    /// Builds a mutable resource (`ResMut<T>`) access descriptor for this type.
+    #[inline]
+    fn resource_write_desc() -> ComponentAccessDesc {
+        ComponentAccessDesc::resource_write(Self::NAME.as_ptr())
+    }
 }
 
 /// Helper trampoline for invoking `drop_in_place` on non-POD dynamic components.
@@ -1540,6 +2114,42 @@ impl<'a> SystemContext<'a> {
     pub fn host_api(&self) -> &'a HostApi {
         self.host_api
     }
+
+    /// Obtains a read-only byte pointer to an exposed Bevy `Resource` (`Res<R>`).
+    #[inline]
+    pub fn resource_ptr(&self, resource_name: &CStr) -> *const u8 {
+        self.iter.resource_ptr(resource_name)
+    }
+
+    /// Obtains a mutable byte pointer to an exposed Bevy `Resource` (`ResMut<R>`), marking its change tick.
+    #[inline]
+    pub fn resource_mut_ptr(&mut self, resource_name: &CStr) -> *mut u8 {
+        self.iter.resource_mut_ptr(resource_name)
+    }
+
+    /// Safely borrows a typed `#[repr(C)]` POD Bevy `Resource` (`Res<R>`).
+    #[inline]
+    pub fn resource<R: Copy>(&self, resource_name: &CStr) -> Option<&R> {
+        self.iter.resource::<R>(resource_name)
+    }
+
+    /// Safely borrows a typed `#[repr(C)]` POD Bevy `Resource` (`ResMut<R>`) mutably, marking its change tick.
+    #[inline]
+    pub fn resource_mut<R: Copy>(&mut self, resource_name: &CStr) -> Option<&mut R> {
+        self.iter.resource_mut::<R>(resource_name)
+    }
+
+    /// Safely borrows a typed [`GuestComponent`] resource (`Res<R>`).
+    #[inline]
+    pub fn guest_resource<R: GuestComponent>(&self) -> Option<&R> {
+        self.iter.guest_resource::<R>()
+    }
+
+    /// Safely borrows a typed [`GuestComponent`] resource (`ResMut<R>`) mutably.
+    #[inline]
+    pub fn guest_resource_mut<R: GuestComponent>(&mut self) -> Option<&mut R> {
+        self.iter.guest_resource_mut::<R>()
+    }
 }
 
 /// Execution context passed to multi-query systems registered via [`GuestApp::add_multi_query_system`].
@@ -1626,11 +2236,30 @@ impl<'a> MultiQueryContext<'a> {
     pub fn host_api(&self) -> &'a HostApi {
         self.host_api
     }
+
+    /// Safely borrows a typed `#[repr(C)]` POD Bevy `Resource` (`Res<R>`) via the primary query context.
+    #[inline]
+    pub fn resource<R: Copy>(&self, resource_name: &CStr) -> Option<&R> {
+        if self.iter_count == 0 {
+            return None;
+        }
+        self.iters[0].as_ref()?.resource::<R>(resource_name)
+    }
+
+    /// Safely borrows a typed `#[repr(C)]` POD Bevy `Resource` (`ResMut<R>`) mutably via the primary query context.
+    #[inline]
+    pub fn resource_mut<R: Copy>(&mut self, resource_name: &CStr) -> Option<&mut R> {
+        if self.iter_count == 0 {
+            return None;
+        }
+        self.iters[0].as_mut()?.resource_mut::<R>(resource_name)
+    }
 }
 
 struct SystemClosureState<F> {
     host_api: *const HostApi,
-    cmd_vtable: CommandBridgeVTable,
+    cmd_vtable_ext: CommandBridgeVTableExt,
+    res_vtable: ResourceBridgeVTable,
     iter_reset: Option<IterResetFn>,
     callback: Mutex<F>,
 }
@@ -1662,8 +2291,8 @@ where
         // for the duration of the system callback.
         let api = unsafe { &*state.host_api };
         let mut ctx = SystemContext {
-            iter: GuestChunkIter::with_reset(iter, api, state.iter_reset),
-            commands: GuestCommandQueue::new(commands, state.cmd_vtable),
+            iter: GuestChunkIter::with_bridges(iter, api, state.iter_reset, state.res_vtable),
+            commands: GuestCommandQueue::with_ext(commands, state.cmd_vtable_ext),
             host_api: api,
         };
         (*cb_guard)(&mut ctx)
@@ -1672,7 +2301,8 @@ where
 
 struct MultiQueryClosureState<F> {
     host_api: *const HostApi,
-    cmd_vtable: CommandBridgeVTable,
+    cmd_vtable_ext: CommandBridgeVTableExt,
+    res_vtable: ResourceBridgeVTable,
     iter_reset: Option<IterResetFn>,
     callback: Mutex<F>,
 }
@@ -1712,17 +2342,46 @@ where
         for (slot, item) in iter_array.iter_mut().enumerate().take(iter_count) {
             // SAFETY: `iters` is non-null and holds `iter_count` pointers per `MultiQuerySystemCallback` contract.
             let raw_iter = unsafe { *iters.add(slot) };
-            *item = Some(GuestChunkIter::with_reset(raw_iter, api, state.iter_reset));
+            *item = Some(GuestChunkIter::with_bridges(
+                raw_iter,
+                api,
+                state.iter_reset,
+                state.res_vtable,
+            ));
         }
 
         let mut ctx = MultiQueryContext {
             iters: iter_array,
             iter_count,
-            commands: GuestCommandQueue::new(commands, state.cmd_vtable),
+            commands: GuestCommandQueue::with_ext(commands, state.cmd_vtable_ext),
             host_api: api,
         };
         (*cb_guard)(&mut ctx)
     })
+}
+
+struct RunConditionClosureState<C> {
+    predicate: Mutex<C>,
+}
+
+unsafe extern "C" fn c_run_condition_closure_trampoline<C>(user_data: *mut c_void) -> FfiBool
+where
+    C: FnMut() -> bool + Send + 'static,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if user_data.is_null() {
+            return FFI_BOOL_FALSE;
+        }
+        // SAFETY: `user_data` points to an initialized `RunConditionClosureState<C>` owned by `GUEST_ALLOCATIONS`.
+        let state = unsafe { &*(user_data as *const RunConditionClosureState<C>) };
+        let Ok(mut guard) = state.predicate.try_lock() else {
+            return FFI_BOOL_FALSE;
+        };
+        rust_bool_to_ffi((*guard)())
+    })) {
+        Ok(flag) => flag,
+        Err(_) => FFI_BOOL_FALSE,
+    }
 }
 
 /// High-level mod initialization builder eliminating raw FFI globals and `user_data` memory leaks.
@@ -1737,9 +2396,12 @@ pub struct GuestApp<'a> {
     get_proc_address: GetProcAddressFn,
     host_api: &'a HostApi,
     host_context: *mut c_void,
-    cmd_vtable: CommandBridgeVTable,
+    cmd_vtable_ext: CommandBridgeVTableExt,
+    res_vtable: ResourceBridgeVTable,
     iter_reset: Option<IterResetFn>,
     register_multi_query: Option<RegisterMultiQuerySystemFn>,
+    register_conditional_system: Option<RegisterConditionalSystemFn>,
+    register_conditional_multi_query: Option<RegisterConditionalMultiQuerySystemFn>,
     staged_allocations: Vec<ErasedAllocation>,
 }
 
@@ -1777,17 +2439,24 @@ impl<'a> GuestApp<'a> {
             return Err(FfiResult::INVALID_VERSION);
         }
 
-        let cmd_vtable = CommandBridgeVTable::resolve(get_proc_address);
+        let cmd_vtable_ext = CommandBridgeVTableExt::resolve(get_proc_address);
+        let res_vtable = ResourceBridgeVTable::resolve(get_proc_address);
         let iter_reset = resolve_iter_reset(get_proc_address);
         let register_multi_query = resolve_register_multi_query(get_proc_address);
+        let register_conditional_system = resolve_register_conditional_system(get_proc_address);
+        let register_conditional_multi_query =
+            resolve_register_conditional_multi_query(get_proc_address);
 
         Ok(Self {
             get_proc_address,
             host_api: api_ref,
             host_context,
-            cmd_vtable,
+            cmd_vtable_ext,
+            res_vtable,
             iter_reset,
             register_multi_query,
+            register_conditional_system,
+            register_conditional_multi_query,
             staged_allocations: Vec::new(),
         })
     }
@@ -1813,7 +2482,19 @@ impl<'a> GuestApp<'a> {
     /// Returns the pre-resolved [`CommandBridgeVTable`] for this world.
     #[inline]
     pub fn command_vtable(&self) -> CommandBridgeVTable {
-        self.cmd_vtable
+        self.cmd_vtable_ext.base
+    }
+
+    /// Returns the pre-resolved [`CommandBridgeVTableExt`] (including `remove_component` & `insert_default`).
+    #[inline]
+    pub fn command_vtable_ext(&self) -> CommandBridgeVTableExt {
+        self.cmd_vtable_ext
+    }
+
+    /// Returns the pre-resolved [`ResourceBridgeVTable`] (`res_readonly`, `res_mutable`) for this world.
+    #[inline]
+    pub fn resource_vtable(&self) -> ResourceBridgeVTable {
+        self.res_vtable
     }
 
     /// Resolves a raw symbol pointer by nul-terminated name via `get_proc_address`.
@@ -1894,7 +2575,8 @@ impl<'a> GuestApp<'a> {
     {
         let state = Box::new(SystemClosureState {
             host_api: self.host_api as *const HostApi,
-            cmd_vtable: self.cmd_vtable,
+            cmd_vtable_ext: self.cmd_vtable_ext,
+            res_vtable: self.res_vtable,
             iter_reset: self.iter_reset,
             callback: Mutex::new(system),
         });
@@ -1923,6 +2605,77 @@ impl<'a> GuestApp<'a> {
         } else {
             // Host rejected registration and did not retain `user_data`; free immediately.
             // SAFETY: `state_ptr` was just allocated via `Box::into_raw` above and was not retained.
+            drop(unsafe { Box::from_raw(state_ptr) });
+        }
+        status
+    }
+
+    /// Registers a panic-safe, leak-free Rust system closure gated by a `run_if` predicate closure.
+    ///
+    /// When `run_if()` returns `false`, the host skips invoking `system` for that frame without
+    /// advancing the system's `last_run` tick (matching native Bevy `.run_if(...)` change-detection semantics).
+    pub fn add_system_if<F, C>(
+        &mut self,
+        name: &CStr,
+        queries: &[ComponentAccessDesc],
+        run_if: C,
+        system: F,
+    ) -> FfiResult
+    where
+        C: FnMut() -> bool + Send + 'static,
+        F: FnMut(&mut SystemContext<'_>) -> FfiResult + Send + 'static,
+    {
+        let state = Box::new(SystemClosureState {
+            host_api: self.host_api as *const HostApi,
+            cmd_vtable_ext: self.cmd_vtable_ext,
+            res_vtable: self.res_vtable,
+            iter_reset: self.iter_reset,
+            callback: Mutex::new(system),
+        });
+        let state_ptr = Box::into_raw(state);
+
+        let cond_state = Box::new(RunConditionClosureState {
+            predicate: Mutex::new(run_if),
+        });
+        let cond_ptr = Box::into_raw(cond_state);
+
+        let base = SystemDescriptor::new(
+            name.as_ptr(),
+            if queries.is_empty() {
+                core::ptr::null()
+            } else {
+                queries.as_ptr()
+            },
+            queries.len(),
+            c_system_closure_trampoline::<F>,
+            state_ptr as *mut c_void,
+        );
+        let desc = base.with_run_if(
+            c_run_condition_closure_trampoline::<C>,
+            cond_ptr as *mut c_void,
+        );
+
+        let status = if let Some(reg_cond) = self.register_conditional_system {
+            // SAFETY: `self.host_context` and `desc` are valid for the duration of `reg_cond`.
+            unsafe { reg_cond(self.host_context, &desc) }
+        } else {
+            // Fallback to `HostApi::register_system`, which inspects `struct_size` for v3 fields!
+            // SAFETY: `ConditionalSystemDescriptor` starts with the exact `SystemDescriptor` prefix.
+            unsafe { (self.host_api.register_system)(self.host_context, desc.as_base_ptr()) }
+        };
+
+        if status.is_ok() {
+            self.staged_allocations.push(ErasedAllocation {
+                ptr: state_ptr as usize,
+                drop_fn: drop_boxed_allocation::<SystemClosureState<F>>,
+            });
+            self.staged_allocations.push(ErasedAllocation {
+                ptr: cond_ptr as usize,
+                drop_fn: drop_boxed_allocation::<RunConditionClosureState<C>>,
+            });
+        } else {
+            // SAFETY: Neither `state_ptr` nor `cond_ptr` was retained by the host on registration error.
+            drop(unsafe { Box::from_raw(cond_ptr) });
             drop(unsafe { Box::from_raw(state_ptr) });
         }
         status
@@ -1963,7 +2716,8 @@ impl<'a> GuestApp<'a> {
 
         let state = Box::new(MultiQueryClosureState {
             host_api: self.host_api as *const HostApi,
-            cmd_vtable: self.cmd_vtable,
+            cmd_vtable_ext: self.cmd_vtable_ext,
+            res_vtable: self.res_vtable,
             iter_reset: self.iter_reset,
             callback: Mutex::new(system),
         });
@@ -1991,6 +2745,97 @@ impl<'a> GuestApp<'a> {
             });
         } else {
             // SAFETY: `state_ptr` was just allocated above and was not retained by the host.
+            drop(unsafe { Box::from_raw(state_ptr) });
+        }
+        status
+    }
+
+    /// Registers a multi-query Rust system closure gated by a `run_if` predicate closure.
+    pub fn add_multi_query_system_if<F, C>(
+        &mut self,
+        name: &CStr,
+        query_groups: &[&[ComponentAccessDesc]],
+        run_if: C,
+        system: F,
+    ) -> FfiResult
+    where
+        C: FnMut() -> bool + Send + 'static,
+        F: FnMut(&mut MultiQueryContext<'_>) -> FfiResult + Send + 'static,
+    {
+        if query_groups.len() > MAX_GUEST_MULTI_QUERIES {
+            return FfiResult::INVALID_COMPONENT;
+        }
+        if self.register_conditional_multi_query.is_none() && self.register_multi_query.is_none() {
+            return FfiResult::NULL_POINTER;
+        }
+
+        let mut raw_specs = [QuerySpec {
+            queries: core::ptr::null(),
+            query_count: 0,
+        }; MAX_GUEST_MULTI_QUERIES];
+        for (slot, group) in raw_specs.iter_mut().zip(query_groups.iter()) {
+            *slot = QuerySpec {
+                queries: if group.is_empty() {
+                    core::ptr::null()
+                } else {
+                    group.as_ptr()
+                },
+                query_count: group.len(),
+            };
+        }
+
+        let state = Box::new(MultiQueryClosureState {
+            host_api: self.host_api as *const HostApi,
+            cmd_vtable_ext: self.cmd_vtable_ext,
+            res_vtable: self.res_vtable,
+            iter_reset: self.iter_reset,
+            callback: Mutex::new(system),
+        });
+        let state_ptr = Box::into_raw(state);
+
+        let cond_state = Box::new(RunConditionClosureState {
+            predicate: Mutex::new(run_if),
+        });
+        let cond_ptr = Box::into_raw(cond_state);
+
+        let base = MultiQuerySystemDescriptor::new(
+            name.as_ptr(),
+            if query_groups.is_empty() {
+                core::ptr::null()
+            } else {
+                raw_specs.as_ptr()
+            },
+            query_groups.len(),
+            c_multi_query_closure_trampoline::<F>,
+            state_ptr as *mut c_void,
+        );
+        let desc = base.with_run_if(
+            c_run_condition_closure_trampoline::<C>,
+            cond_ptr as *mut c_void,
+        );
+
+        let status = if let Some(reg_cond_mq) = self.register_conditional_multi_query {
+            // SAFETY: `self.host_context` and `desc` remain valid for the duration of `reg_cond_mq`.
+            unsafe { reg_cond_mq(self.host_context, &desc) }
+        } else if let Some(reg_mq) = self.register_multi_query {
+            // SAFETY: `ConditionalMultiQuerySystemDescriptor` starts with `MultiQuerySystemDescriptor`.
+            unsafe { reg_mq(self.host_context, desc.as_base_ptr()) }
+        } else {
+            FfiResult::NULL_POINTER
+        };
+
+        if status.is_ok() {
+            self.staged_allocations.push(ErasedAllocation {
+                ptr: state_ptr as usize,
+                drop_fn: drop_boxed_allocation::<MultiQueryClosureState<F>>,
+            });
+            self.staged_allocations.push(ErasedAllocation {
+                ptr: cond_ptr as usize,
+                drop_fn: drop_boxed_allocation::<RunConditionClosureState<C>>,
+            });
+        } else {
+            // SAFETY: Neither `state_ptr` nor `cond_ptr` was retained by the host on registration error.
+            drop(unsafe { Box::from_raw(cond_ptr) });
             drop(unsafe { Box::from_raw(state_ptr) });
         }
         status
@@ -2051,19 +2896,26 @@ where
 pub mod prelude {
     pub use crate::{
         catch_guest_panic, cleanup_registered_guest_state, export_mod, register_runtime_component,
-        resolve_iter_reset, resolve_register_multi_query, run_guest_app_init,
-        wrap_multi_query_callback, wrap_system_callback, Chunk, ChunkSlice, ChunkSliceMut,
-        CommandBridgeVTable, GuestApp, GuestChunkIter, GuestCommandQueue, GuestComponent,
-        GuestPlugin, MultiQueryContext, SystemContext, MAX_GUEST_MULTI_QUERIES,
+        resolve_iter_reset, resolve_register_conditional_multi_query,
+        resolve_register_conditional_system, resolve_register_multi_query, run_guest_app_init,
+        wrap_multi_query_callback, wrap_run_condition, wrap_system_callback, Chunk, ChunkSlice,
+        ChunkSliceMut, CommandBridgeVTable, CommandBridgeVTableExt, GuestApp, GuestChunkIter,
+        GuestCommandQueue, GuestComponent, GuestPlugin, MultiQueryContext, ResourceBridgeVTable,
+        SystemContext, MAX_GUEST_MULTI_QUERIES,
     };
     pub use abi_contract::{
+        ffi_bool_to_rust, rust_bool_to_ffi, CmdInsertDefaultFn, CmdRemoveComponentFn,
         ComponentAccessDesc, ComponentAccessMode, ComponentDropFn, ComponentUuid,
-        DynamicComponentDescriptor, DynamicSystemCallback, ExposableComponent, FfiEntity,
-        FfiResult, FfiSlice, GetProcAddressFn, HostApi, IterResetFn, ModComponentDescriptor,
+        ConditionalMultiQuerySystemDescriptor, ConditionalSystemDescriptor,
+        DynamicComponentDescriptor, DynamicSystemCallback, ExposableComponent, ExtensibleStruct,
+        FfiBool, FfiEntity, FfiResult, FfiSlice, GetProcAddressFn, HostApi, IterResetFn,
+        IterResourceMutableFn, IterResourceReadonlyFn, ModComponentDescriptor,
         MultiQuerySystemCallback, MultiQuerySystemDescriptor, QuerySpec, RawChunkIter,
-        RawCommandQueue, RegisterComponentFn, RegisterMultiQuerySystemFn, RegisterSystemFn,
+        RawCommandQueue, RegisterComponentFn, RegisterConditionalMultiQuerySystemFn,
+        RegisterConditionalSystemFn, RegisterMultiQuerySystemFn, RegisterSystemFn,
+        RunConditionCallback, ScheduledMultiQuerySystemDescriptor, ScheduledSystemDescriptor,
         StrView, SymbolEntry, SystemDescriptor, ABI_VERSION_MAJOR, ABI_VERSION_MINOR,
-        ABI_VERSION_PACKED, ABI_VERSION_PATCH,
+        ABI_VERSION_PACKED, ABI_VERSION_PATCH, FFI_BOOL_FALSE, FFI_BOOL_TRUE,
     };
 }
 
@@ -2390,5 +3242,80 @@ mod tests {
             },
             FfiResult::NULL_POINTER
         );
+    }
+
+    unsafe impl GuestComponent for PosData {
+        const NAME: &'static CStr = c"PosData";
+    }
+
+    #[test]
+    fn test_phase3_phase4_guest_component_descriptors_and_commands() {
+        assert_eq!(
+            PosData::optional_read_desc().mode,
+            ComponentAccessMode::OPTIONAL_READ
+        );
+        assert_eq!(
+            PosData::optional_write_desc().mode,
+            ComponentAccessMode::OPTIONAL_WRITE
+        );
+        assert_eq!(PosData::changed_desc().mode, ComponentAccessMode::CHANGED);
+        assert_eq!(PosData::added_desc().mode, ComponentAccessMode::ADDED);
+        assert_eq!(
+            PosData::resource_read_desc().mode,
+            ComponentAccessMode::RESOURCE_READ
+        );
+        assert_eq!(
+            PosData::resource_write_desc().mode,
+            ComponentAccessMode::RESOURCE_WRITE
+        );
+
+        static REMOVED_ENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static DEFAULT_ENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+        unsafe extern "C" fn mock_remove(
+            _q: *mut RawCommandQueue,
+            entity: FfiEntity,
+            _name: *const c_char,
+        ) -> FfiResult {
+            REMOVED_ENT.store(entity.0, std::sync::atomic::Ordering::SeqCst);
+            FfiResult::OK
+        }
+
+        unsafe extern "C" fn mock_insert_default(
+            _q: *mut RawCommandQueue,
+            entity: FfiEntity,
+            _name: *const c_char,
+        ) -> FfiResult {
+            DEFAULT_ENT.store(entity.0, std::sync::atomic::Ordering::SeqCst);
+            FfiResult::OK
+        }
+
+        let ext = CommandBridgeVTableExt {
+            base: CommandBridgeVTable::default(),
+            remove_component: Some(mock_remove),
+            insert_default: Some(mock_insert_default),
+        };
+        let mut queue = GuestCommandQueue::with_ext(0x9999 as *mut RawCommandQueue, ext);
+        assert_eq!(queue.remove_guest_component::<PosData>(FfiEntity(77)), FfiResult::OK);
+        assert_eq!(REMOVED_ENT.load(std::sync::atomic::Ordering::SeqCst), 77);
+        assert_eq!(queue.insert_guest_default::<PosData>(FfiEntity(88)), FfiResult::OK);
+        assert_eq!(DEFAULT_ENT.load(std::sync::atomic::Ordering::SeqCst), 88);
+    }
+
+    unsafe fn panicking_cond(_ud: *mut c_void) -> bool {
+        panic!("cond panic");
+    }
+    unsafe fn true_cond(_ud: *mut c_void) -> bool {
+        true
+    }
+    wrap_run_condition!(fn c_panicking_cond calls panicking_cond);
+    wrap_run_condition!(fn c_true_cond calls true_cond);
+
+    #[test]
+    fn test_wrap_run_condition_panic_containment() {
+        // SAFETY: Passing null opaque pointer to test run conditions that do not dereference it.
+        assert_eq!(unsafe { c_panicking_cond(core::ptr::null_mut()) }, FFI_BOOL_FALSE);
+        // SAFETY: Passing null opaque pointer to test run condition.
+        assert_eq!(unsafe { c_true_cond(core::ptr::null_mut()) }, FFI_BOOL_TRUE);
     }
 }

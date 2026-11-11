@@ -44,6 +44,9 @@ use std::sync::{Arc, LazyLock, RwLock};
 /// Function signature for monomorphized raw component byte insertion into a Bevy [`World`].
 pub type InsertRawFn = unsafe fn(world: &mut World, entity: Entity, data: &[u8]);
 
+/// Function signature for monomorphized `Default` component insertion into a Bevy [`World`].
+pub type InsertDefaultFn = fn(world: &mut World, entity: Entity);
+
 /// Monomorphized typed component insertion function using unaligned memory reading.
 ///
 /// # Safety
@@ -65,6 +68,60 @@ unsafe fn insert_raw_impl<T: Component + ExposableComponent>(
     }
 }
 
+/// Monomorphized host-side `T::default()` component constructor and inserter.
+///
+/// Allocates any heap fields (`String`, `Vec`, etc.) strictly on the host allocator (Rule 2).
+fn insert_default_impl<T: Component + Default>(world: &mut World, entity: Entity) {
+    if let Ok(mut e) = world.get_entity_mut(entity) {
+        e.insert(T::default());
+    }
+}
+
+/// Error returned when a component or resource registration collides with an existing entry's
+/// 128-bit [`ComponentUuid`], canonical name, `(size, align)` layout, or component/resource kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComponentCollisionError {
+    /// Two distinct canonical names map to the same 128-bit [`ComponentUuid`].
+    UuidCollision {
+        /// Existing registered name bound to `uuid`.
+        existing_name: String,
+        /// Conflicting new name attempting to register under `uuid`.
+        new_name: String,
+        /// Colliding 128-bit UUID.
+        uuid: ComponentUuid,
+    },
+    /// Re-registration of an existing canonical name with mismatched metadata.
+    MetadataMismatch {
+        /// Canonical component or resource name.
+        name: String,
+        /// Human-readable description of the mismatched metadata.
+        reason: String,
+    },
+}
+
+impl core::fmt::Display for ComponentCollisionError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::UuidCollision {
+                existing_name,
+                new_name,
+                uuid,
+            } => write!(
+                f,
+                "ComponentUuid collision ({:?}): '{}' collides with already-registered '{}'",
+                uuid.bytes, new_name, existing_name
+            ),
+            Self::MetadataMismatch { name, reason } => write!(
+                f,
+                "component/resource '{}' re-registered with conflicting metadata: {}",
+                name, reason
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ComponentCollisionError {}
+
 /// Newtype wrapper over `*const c_void` providing thread-safety guarantees for static symbol pointers.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SymbolAddress(pub *const c_void);
@@ -73,28 +130,32 @@ pub struct SymbolAddress(pub *const c_void);
 unsafe impl Send for SymbolAddress {}
 unsafe impl Sync for SymbolAddress {}
 
-/// Catalog record stored for each component registered with [`ModRegistry`].
+/// Catalog record stored for each component or resource registered with [`ModRegistry`].
 #[derive(Clone)]
 pub struct RegisteredComponent {
-    /// Canonical component name (e.g. `"Position"`).
+    /// Canonical component or resource name (e.g. `"Position"` or `"WindConfig"`).
     pub name: String,
     /// Deterministic 128-bit compile-time UUID.
     pub uuid: ComponentUuid,
     /// Runtime Bevy [`ComponentId`].
     pub component_id: ComponentId,
-    /// Byte size of the component type.
+    /// Byte size of the type.
     pub size: usize,
-    /// Memory alignment of the component type.
+    /// Memory alignment of the type.
     pub align: usize,
     /// Pointer to the static C-ABI VTable.
     pub vtable_ptr: *const c_void,
-    /// Function pointer for deferred raw byte deserialization and insertion (`None` for dynamic
-    /// or non-Pod/heap-owning static components).
+    /// Function pointer for deferred raw byte deserialization and insertion (`None` for dynamic,
+    /// resource, or non-Pod/heap-owning static components).
     pub insert_raw_fn: Option<InsertRawFn>,
+    /// Optional host-side `T::default()` constructor for deferred `cmd_insert_default`.
+    pub insert_default_fn: Option<InsertDefaultFn>,
     /// Optional foreign lifecycle drop callback.
     pub drop_fn: Option<unsafe extern "C" fn(ptr: *mut c_void)>,
     /// Indicates whether this component was registered dynamically at runtime.
     pub is_dynamic: bool,
+    /// Indicates whether this entry represents a singleton Bevy `Resource` rather than an entity `Component`.
+    pub is_resource: bool,
 }
 
 // SAFETY: All fields (pointers to static VTables and function pointers) are Send and Sync.
@@ -177,6 +238,22 @@ impl ModRegistry {
             crate::commands::host_cmd_insert_component as *const c_void,
         );
         reg.insert_symbol(
+            "cmd_remove_component",
+            crate::commands::host_cmd_remove_component as *const c_void,
+        );
+        reg.insert_symbol(
+            "host_cmd_remove_component",
+            crate::commands::host_cmd_remove_component as *const c_void,
+        );
+        reg.insert_symbol(
+            "cmd_insert_default",
+            crate::commands::host_cmd_insert_default as *const c_void,
+        );
+        reg.insert_symbol(
+            "host_cmd_insert_default",
+            crate::commands::host_cmd_insert_default as *const c_void,
+        );
+        reg.insert_symbol(
             "iter_reset",
             crate::chunk_iter::host_iter_reset as *const c_void,
         );
@@ -185,12 +262,52 @@ impl ModRegistry {
             crate::chunk_iter::host_iter_reset as *const c_void,
         );
         reg.insert_symbol(
+            "res_readonly",
+            crate::chunk_iter::host_iter_resource_readonly as *const c_void,
+        );
+        reg.insert_symbol(
+            "host_res_readonly",
+            crate::chunk_iter::host_iter_resource_readonly as *const c_void,
+        );
+        reg.insert_symbol(
+            "iter_resource_readonly",
+            crate::chunk_iter::host_iter_resource_readonly as *const c_void,
+        );
+        reg.insert_symbol(
+            "host_iter_resource_readonly",
+            crate::chunk_iter::host_iter_resource_readonly as *const c_void,
+        );
+        reg.insert_symbol(
+            "res_mutable",
+            crate::chunk_iter::host_iter_resource_mutable as *const c_void,
+        );
+        reg.insert_symbol(
+            "host_res_mutable",
+            crate::chunk_iter::host_iter_resource_mutable as *const c_void,
+        );
+        reg.insert_symbol(
+            "iter_resource_mutable",
+            crate::chunk_iter::host_iter_resource_mutable as *const c_void,
+        );
+        reg.insert_symbol(
+            "host_iter_resource_mutable",
+            crate::chunk_iter::host_iter_resource_mutable as *const c_void,
+        );
+        reg.insert_symbol(
             "register_multi_query_system",
             crate::dynamic_system::host_register_multi_query_system as *const c_void,
         );
         reg.insert_symbol(
             "host_register_multi_query_system",
             crate::dynamic_system::host_register_multi_query_system as *const c_void,
+        );
+        reg.insert_symbol(
+            "register_conditional_multi_query_system",
+            crate::dynamic_system::host_register_conditional_multi_query_system as *const c_void,
+        );
+        reg.insert_symbol(
+            "host_register_conditional_multi_query_system",
+            crate::dynamic_system::host_register_conditional_multi_query_system as *const c_void,
         );
         reg.insert_symbol(
             "register_system_in_schedule",
@@ -209,6 +326,14 @@ impl ModRegistry {
             crate::dynamic_system::host_register_scheduled_system as *const c_void,
         );
         reg.insert_symbol(
+            "register_conditional_system",
+            crate::dynamic_system::host_register_conditional_system as *const c_void,
+        );
+        reg.insert_symbol(
+            "host_register_conditional_system",
+            crate::dynamic_system::host_register_conditional_system as *const c_void,
+        );
+        reg.insert_symbol(
             "register_component",
             crate::dynamic_system::host_register_component as *const c_void,
         );
@@ -225,14 +350,113 @@ impl ModRegistry {
         CurrentRegistryGuard { prev }
     }
 
+    /// Validates that registering `(name, uuid, size, align, is_resource, comp_id)` does not
+    /// collide with an incompatible existing component or resource entry.
+    pub fn check_registration_collision(
+        &self,
+        name: &str,
+        uuid: ComponentUuid,
+        size: usize,
+        align: usize,
+        is_resource: bool,
+        expected_comp_id: Option<ComponentId>,
+    ) -> Result<(), ComponentCollisionError> {
+        if let Some(existing_by_uuid) = self.get_by_uuid(&uuid) {
+            if existing_by_uuid.name != name {
+                return Err(ComponentCollisionError::UuidCollision {
+                    existing_name: existing_by_uuid.name.clone(),
+                    new_name: name.to_string(),
+                    uuid,
+                });
+            }
+        }
+
+        if let Some(existing) = self.get_by_name(name) {
+            if existing.uuid != uuid {
+                return Err(ComponentCollisionError::MetadataMismatch {
+                    name: name.to_string(),
+                    reason: format!(
+                        "UUID mismatch (existing={:?}, new={:?})",
+                        existing.uuid.bytes, uuid.bytes
+                    ),
+                });
+            }
+            if existing.size != size || existing.align != align {
+                return Err(ComponentCollisionError::MetadataMismatch {
+                    name: name.to_string(),
+                    reason: format!(
+                        "layout mismatch (existing=({}, {}), new=({}, {}))",
+                        existing.size, existing.align, size, align
+                    ),
+                });
+            }
+            if existing.is_resource != is_resource {
+                return Err(ComponentCollisionError::MetadataMismatch {
+                    name: name.to_string(),
+                    reason: format!(
+                        "kind mismatch (existing is_resource={}, new is_resource={})",
+                        existing.is_resource, is_resource
+                    ),
+                });
+            }
+            if let Some(comp_id) = expected_comp_id {
+                if existing.component_id != comp_id {
+                    return Err(ComponentCollisionError::MetadataMismatch {
+                        name: name.to_string(),
+                        reason: format!(
+                            "ComponentId mismatch (existing={:?}, new={:?})",
+                            existing.component_id, comp_id
+                        ),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Register an exposable component type with its Bevy [`ComponentId`].
     ///
-    /// Automatically disables raw byte insertion (`insert_raw_fn = None`) unless
-    /// `T::IS_RAW_INSERTABLE && !core::mem::needs_drop::<T>()`, preventing foreign bytes from
-    /// forging host `String`/`Vec` pointers or invalid `bool` bit patterns (D3/D6 soundness protection).
+    /// Panics with a diagnostic message if another distinct component/resource collides on
+    /// `ComponentUuid` or re-registers the same name with conflicting metadata.
     pub fn register_component<T: Component + ExposableComponent>(&mut self, comp_id: ComponentId) {
+        if let Err(err) = self.try_register_component::<T>(comp_id) {
+            panic!("ModRegistry::register_component failed: {err}");
+        }
+    }
+
+    /// Fallible variant of [`ModRegistry::register_component`].
+    pub fn try_register_component<T: Component + ExposableComponent>(
+        &mut self,
+        comp_id: ComponentId,
+    ) -> Result<(), ComponentCollisionError> {
         let allow_raw_insert = T::IS_RAW_INSERTABLE && !core::mem::needs_drop::<T>();
-        self.register_component_with_raw_policy::<T>(comp_id, allow_raw_insert);
+        self.try_register_entry::<T>(comp_id, allow_raw_insert, None, false)
+    }
+
+    /// Register an exposable component type along with its host-side [`Default`] constructor
+    /// so guest mods may invoke `cmd_insert_default` (including on non-POD `String`/`Vec` types).
+    pub fn register_component_with_default<T: Component + ExposableComponent + Default>(
+        &mut self,
+        comp_id: ComponentId,
+    ) {
+        if let Err(err) = self.try_register_component_with_default::<T>(comp_id) {
+            panic!("ModRegistry::register_component_with_default failed: {err}");
+        }
+    }
+
+    /// Fallible variant of [`ModRegistry::register_component_with_default`].
+    pub fn try_register_component_with_default<T: Component + ExposableComponent + Default>(
+        &mut self,
+        comp_id: ComponentId,
+    ) -> Result<(), ComponentCollisionError> {
+        let allow_raw_insert = T::IS_RAW_INSERTABLE && !core::mem::needs_drop::<T>();
+        self.try_register_entry::<T>(
+            comp_id,
+            allow_raw_insert,
+            Some(insert_default_impl::<T>),
+            false,
+        )
     }
 
     /// Register an exposable component type as VTable-only (disallowing raw byte insertion
@@ -241,23 +465,87 @@ impl ModRegistry {
         &mut self,
         comp_id: ComponentId,
     ) {
-        self.register_component_with_raw_policy::<T>(comp_id, false);
+        if let Err(err) = self.try_register_component_opaque::<T>(comp_id) {
+            panic!("ModRegistry::register_component_opaque failed: {err}");
+        }
     }
 
-    fn register_component_with_raw_policy<T: Component + ExposableComponent>(
+    /// Fallible variant of [`ModRegistry::register_component_opaque`].
+    pub fn try_register_component_opaque<T: Component + ExposableComponent>(
+        &mut self,
+        comp_id: ComponentId,
+    ) -> Result<(), ComponentCollisionError> {
+        self.try_register_entry::<T>(comp_id, false, None, false)
+    }
+
+    /// Register an exposable VTable-only component type along with its host-side [`Default`] constructor.
+    pub fn register_component_opaque_with_default<T: Component + ExposableComponent + Default>(
+        &mut self,
+        comp_id: ComponentId,
+    ) {
+        if let Err(err) = self.try_register_component_opaque_with_default::<T>(comp_id) {
+            panic!("ModRegistry::register_component_opaque_with_default failed: {err}");
+        }
+    }
+
+    /// Fallible variant of [`ModRegistry::register_component_opaque_with_default`].
+    pub fn try_register_component_opaque_with_default<
+        T: Component + ExposableComponent + Default,
+    >(
+        &mut self,
+        comp_id: ComponentId,
+    ) -> Result<(), ComponentCollisionError> {
+        self.try_register_entry::<T>(comp_id, false, Some(insert_default_impl::<T>), false)
+    }
+
+    /// Register a Bevy singleton [`Resource`] type with its [`ComponentId`] so guest mods can
+    /// declare `RESOURCE_READ` / `RESOURCE_WRITE` and borrow it via `res_readonly` / `res_mutable`.
+    pub fn register_resource<R: Resource + ExposableComponent>(&mut self, comp_id: ComponentId) {
+        if let Err(err) = self.try_register_resource::<R>(comp_id) {
+            panic!("ModRegistry::register_resource failed: {err}");
+        }
+    }
+
+    /// Fallible variant of [`ModRegistry::register_resource`].
+    pub fn try_register_resource<R: Resource + ExposableComponent>(
+        &mut self,
+        comp_id: ComponentId,
+    ) -> Result<(), ComponentCollisionError> {
+        self.try_register_entry::<R>(comp_id, false, None, true)
+    }
+
+    fn try_register_entry<T: Component + ExposableComponent>(
         &mut self,
         comp_id: ComponentId,
         allow_raw_insert: bool,
-    ) {
+        insert_default_fn: Option<InsertDefaultFn>,
+        is_resource: bool,
+    ) -> Result<(), ComponentCollisionError> {
         let name = T::COMPONENT_NAME.to_string();
         let uuid = T::UUID;
+        self.check_registration_collision(
+            &name,
+            uuid,
+            T::size(),
+            T::align(),
+            is_resource,
+            Some(comp_id),
+        )?;
+
         let vtable_ptr = T::erased_vtable_ptr();
         let insert_raw_fn: Option<InsertRawFn> =
-            if allow_raw_insert && !core::mem::needs_drop::<T>() {
+            if !is_resource && allow_raw_insert && !core::mem::needs_drop::<T>() {
                 Some(insert_raw_impl::<T>)
             } else {
                 None
             };
+
+        // Preserve any previously registered `insert_default_fn` on idempotent re-registration
+        let merged_default_fn = insert_default_fn.or_else(|| {
+            self.components_by_id
+                .get(&comp_id)
+                .and_then(|prev| prev.insert_default_fn)
+        });
 
         let reg = RegisteredComponent {
             name: name.clone(),
@@ -267,8 +555,10 @@ impl ModRegistry {
             align: T::align(),
             vtable_ptr,
             insert_raw_fn,
+            insert_default_fn: merged_default_fn,
             drop_fn: None,
             is_dynamic: false,
+            is_resource,
         };
 
         self.components_by_id.insert(comp_id, reg);
@@ -291,16 +581,41 @@ impl ModRegistry {
                 global.insert(sym.name.to_string(), SymbolAddress(sym.ptr));
             }
         }
+
+        Ok(())
     }
 
     /// Register a dynamic component descriptor declared at runtime by a guest mod.
+    ///
+    /// Panics if the descriptor collides with an incompatible existing component/UUID.
     pub fn register_dynamic_component(
         &mut self,
         comp_id: ComponentId,
         desc: &abi_contract::ModComponentDescriptor,
         name: String,
     ) {
+        if let Err(err) = self.try_register_dynamic_component(comp_id, desc, name) {
+            panic!("ModRegistry::register_dynamic_component failed: {err}");
+        }
+    }
+
+    /// Fallible variant of [`ModRegistry::register_dynamic_component`].
+    pub fn try_register_dynamic_component(
+        &mut self,
+        comp_id: ComponentId,
+        desc: &abi_contract::ModComponentDescriptor,
+        name: String,
+    ) -> Result<(), ComponentCollisionError> {
         let uuid = desc.uuid;
+        self.check_registration_collision(
+            &name,
+            uuid,
+            desc.size,
+            desc.align,
+            false,
+            Some(comp_id),
+        )?;
+
         let vtable_ptr = desc.vtable_ptr;
         let reg = RegisteredComponent {
             name: name.clone(),
@@ -310,8 +625,10 @@ impl ModRegistry {
             align: desc.align,
             vtable_ptr,
             insert_raw_fn: None,
+            insert_default_fn: None,
             drop_fn: desc.drop_fn,
             is_dynamic: true,
+            is_resource: false,
         };
 
         self.components_by_id.insert(comp_id, reg);
@@ -327,6 +644,8 @@ impl ModRegistry {
                 global.insert(format!("{name}_vtable"), sym_addr);
             }
         }
+
+        Ok(())
     }
 
     /// Register a non-component `ModExposable` helper/nested struct type (e.g. `Vec3f`)

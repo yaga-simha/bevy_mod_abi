@@ -26,7 +26,7 @@ use crate::dynamic_system::{
     ModSystemSet,
 };
 use crate::host::{ModHost, ModId, ModLoadError};
-use crate::registry::ModRegistry;
+use crate::registry::{ComponentCollisionError, ModRegistry};
 use abi_contract::{ExposableComponent, FfiResult};
 use bevy_app::{App, FixedUpdate, Last, Plugin, PostUpdate, PreUpdate, Startup, Update};
 use bevy_ecs::component::Component;
@@ -34,6 +34,7 @@ use bevy_ecs::entity::Entity;
 use bevy_ecs::event::Event;
 use bevy_ecs::message::{Message, Messages};
 use bevy_ecs::name::Name;
+use bevy_ecs::prelude::Resource;
 use bevy_ecs::schedule::{
     IntoScheduleConfigs, InternedScheduleLabel, ScheduleCleanupPolicy, ScheduleLabel, Schedules,
     SystemSet,
@@ -246,9 +247,34 @@ pub trait ModAppExt {
     /// Register an exposable component type with Bevy ECS and the native mod registry.
     fn register_mod_component<T: Component + ExposableComponent>(&mut self) -> &mut Self;
 
+    /// Fallible variant of [`ModAppExt::register_mod_component`] returning [`ComponentCollisionError`].
+    fn try_register_mod_component<T: Component + ExposableComponent>(
+        &mut self,
+    ) -> Result<&mut Self, ComponentCollisionError>;
+
+    /// Register an exposable component type along with its host-side [`Default`] constructor
+    /// so guest mods may invoke `cmd_insert_default` (including on opaque non-POD `String`/`Vec` types).
+    fn register_mod_component_with_default<T: Component + ExposableComponent + Default>(
+        &mut self,
+    ) -> &mut Self;
+
     /// Register an exposable component type as VTable-only (disallowing raw byte insertion via
     /// `cmd_insert_component`, e.g. for types containing `bool` or domain invariants).
     fn register_mod_component_opaque<T: Component + ExposableComponent>(&mut self) -> &mut Self;
+
+    /// Register an exposable VTable-only component type along with its host-side [`Default`] constructor.
+    fn register_mod_component_opaque_with_default<T: Component + ExposableComponent + Default>(
+        &mut self,
+    ) -> &mut Self;
+
+    /// Register a singleton Bevy [`Resource`] type with the native mod registry so guest mods can
+    /// declare `RESOURCE_READ` / `RESOURCE_WRITE` and access it via `res_readonly` / `res_mutable`.
+    fn register_mod_resource<R: Resource + ExposableComponent>(&mut self) -> &mut Self;
+
+    /// Fallible variant of [`ModAppExt::register_mod_resource`] returning [`ComponentCollisionError`].
+    fn try_register_mod_resource<R: Resource + ExposableComponent>(
+        &mut self,
+    ) -> Result<&mut Self, ComponentCollisionError>;
 
     /// Register a nested/compound `ModExposable` helper type (without requiring `Component`)
     /// so its VTable and field accessors are exposed via `GetProcAddressFn`.
@@ -307,6 +333,34 @@ impl ModAppExt for App {
         self
     }
 
+    fn try_register_mod_component<T: Component + ExposableComponent>(
+        &mut self,
+    ) -> Result<&mut Self, ComponentCollisionError> {
+        let comp_id = self.world_mut().register_component::<T>();
+        if let Some(mut registry) = self.world_mut().get_resource_mut::<ModRegistry>() {
+            registry.try_register_component::<T>(comp_id)?;
+        } else {
+            let mut registry = ModRegistry::new();
+            registry.try_register_component::<T>(comp_id)?;
+            self.insert_resource(registry);
+        }
+        Ok(self)
+    }
+
+    fn register_mod_component_with_default<T: Component + ExposableComponent + Default>(
+        &mut self,
+    ) -> &mut Self {
+        let comp_id = self.world_mut().register_component::<T>();
+        if let Some(mut registry) = self.world_mut().get_resource_mut::<ModRegistry>() {
+            registry.register_component_with_default::<T>(comp_id);
+        } else {
+            let mut registry = ModRegistry::new();
+            registry.register_component_with_default::<T>(comp_id);
+            self.insert_resource(registry);
+        }
+        self
+    }
+
     fn register_mod_component_opaque<T: Component + ExposableComponent>(&mut self) -> &mut Self {
         let comp_id = self.world_mut().register_component::<T>();
         if let Some(mut registry) = self.world_mut().get_resource_mut::<ModRegistry>() {
@@ -317,6 +371,46 @@ impl ModAppExt for App {
             self.insert_resource(registry);
         }
         self
+    }
+
+    fn register_mod_component_opaque_with_default<T: Component + ExposableComponent + Default>(
+        &mut self,
+    ) -> &mut Self {
+        let comp_id = self.world_mut().register_component::<T>();
+        if let Some(mut registry) = self.world_mut().get_resource_mut::<ModRegistry>() {
+            registry.register_component_opaque_with_default::<T>(comp_id);
+        } else {
+            let mut registry = ModRegistry::new();
+            registry.register_component_opaque_with_default::<T>(comp_id);
+            self.insert_resource(registry);
+        }
+        self
+    }
+
+    fn register_mod_resource<R: Resource + ExposableComponent>(&mut self) -> &mut Self {
+        let comp_id = self.world_mut().register_component::<R>();
+        if let Some(mut registry) = self.world_mut().get_resource_mut::<ModRegistry>() {
+            registry.register_resource::<R>(comp_id);
+        } else {
+            let mut registry = ModRegistry::new();
+            registry.register_resource::<R>(comp_id);
+            self.insert_resource(registry);
+        }
+        self
+    }
+
+    fn try_register_mod_resource<R: Resource + ExposableComponent>(
+        &mut self,
+    ) -> Result<&mut Self, ComponentCollisionError> {
+        let comp_id = self.world_mut().register_component::<R>();
+        if let Some(mut registry) = self.world_mut().get_resource_mut::<ModRegistry>() {
+            registry.try_register_resource::<R>(comp_id)?;
+        } else {
+            let mut registry = ModRegistry::new();
+            registry.try_register_resource::<R>(comp_id)?;
+            self.insert_resource(registry);
+        }
+        Ok(self)
     }
 
     fn register_mod_type<T: ExposableComponent>(&mut self) -> &mut Self {

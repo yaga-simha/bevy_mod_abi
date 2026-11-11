@@ -28,6 +28,7 @@
 //!      aligned host-owned buffer (or constructs a properly aligned dangling pointer for ZSTs)
 //!      before transferring ownership into Bevy via [`OwningPtr`].
 
+pub use abi_contract::{CmdInsertDefaultFn, CmdRemoveComponentFn};
 use crate::registry::ModRegistry;
 use abi_contract::{FfiEntity, FfiResult, RawCommandQueue};
 use bevy_ecs::entity::{Entity, EntityAllocator};
@@ -176,6 +177,9 @@ pub unsafe extern "C" fn host_cmd_insert_component(
     let Some(comp_meta) = bridge.registry.get_by_name(name) else {
         return FfiResult::INVALID_COMPONENT;
     };
+    if comp_meta.is_resource {
+        return FfiResult::INVALID_COMPONENT;
+    }
 
     // Static components that are non-Pod / heap-owning (`insert_raw_fn == None`) must NEVER
     // accept raw foreign byte buffers or fall through to `insert_by_id` (D3 soundness guard).
@@ -271,6 +275,111 @@ pub unsafe extern "C" fn host_cmd_insert_component(
         }
         // buf is explicitly owned by the closure and dropped here after insertion.
         drop(buf);
+    });
+
+    FfiResult::OK
+}
+
+/// Queues deferred removal of component `component_name` from `entity`.
+///
+/// Works for both statically registered host components and dynamically registered guest components.
+/// Rejects resources, unregistered components, [`FfiEntity::NULL`], invalid bit patterns, and `Entity::PLACEHOLDER`.
+///
+/// # Safety
+/// - `queue` must be a valid pointer to a [`CommandQueueBridge`] or null.
+/// - `component_name` must point to a valid NUL-terminated UTF-8 C string or null.
+pub unsafe extern "C" fn host_cmd_remove_component(
+    queue: *mut RawCommandQueue,
+    entity: FfiEntity,
+    component_name: *const c_char,
+) -> FfiResult {
+    if queue.is_null() || component_name.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+
+    // SAFETY: caller guarantees `component_name` is a valid NUL-terminated C string.
+    let Ok(name) = (unsafe { CStr::from_ptr(component_name) }).to_str() else {
+        return FfiResult::INVALID_UTF8;
+    };
+
+    // SAFETY: caller passes a valid pointer to `CommandQueueBridge` cast to `RawCommandQueue`.
+    let bridge = unsafe { &mut *(queue as *mut CommandQueueBridge<'_>) };
+    let Some(comp_meta) = bridge.registry.get_by_name(name) else {
+        return FfiResult::INVALID_COMPONENT;
+    };
+    if comp_meta.is_resource {
+        return FfiResult::INVALID_COMPONENT;
+    }
+
+    if entity.is_null() {
+        return FfiResult::INTERNAL_ERROR;
+    }
+    let Some(bevy_entity) = Entity::try_from_bits(entity.to_bits()) else {
+        return FfiResult::INTERNAL_ERROR;
+    };
+    if bevy_entity == Entity::PLACEHOLDER {
+        return FfiResult::INTERNAL_ERROR;
+    }
+
+    let comp_id = comp_meta.component_id;
+    bridge.queue.push(move |world: &mut World| {
+        if let Ok(mut entity_mut) = world.get_entity_mut(bevy_entity) {
+            entity_mut.remove_by_id(comp_id);
+        }
+    });
+
+    FfiResult::OK
+}
+
+/// Queues deferred insertion of host-constructed `T::default()` for `component_name` onto `entity`.
+///
+/// Enables guest mods to spawn or attach opaque non-POD host components (such as `String`- or
+/// `Vec`-bearing components registered via `register_mod_component_with_default`) without raw
+/// byte deserialization or allocator crossover, and subsequently mutate fields via VTable setters.
+///
+/// Returns [`FfiResult::PERMISSION_DENIED`] if the component was not registered with a `Default` constructor.
+///
+/// # Safety
+/// - `queue` must be a valid pointer to a [`CommandQueueBridge`] or null.
+/// - `component_name` must point to a valid NUL-terminated UTF-8 C string or null.
+pub unsafe extern "C" fn host_cmd_insert_default(
+    queue: *mut RawCommandQueue,
+    entity: FfiEntity,
+    component_name: *const c_char,
+) -> FfiResult {
+    if queue.is_null() || component_name.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+
+    // SAFETY: caller guarantees `component_name` is a valid NUL-terminated C string.
+    let Ok(name) = (unsafe { CStr::from_ptr(component_name) }).to_str() else {
+        return FfiResult::INVALID_UTF8;
+    };
+
+    // SAFETY: caller passes a valid pointer to `CommandQueueBridge` cast to `RawCommandQueue`.
+    let bridge = unsafe { &mut *(queue as *mut CommandQueueBridge<'_>) };
+    let Some(comp_meta) = bridge.registry.get_by_name(name) else {
+        return FfiResult::INVALID_COMPONENT;
+    };
+    if comp_meta.is_resource {
+        return FfiResult::INVALID_COMPONENT;
+    }
+    let Some(insert_default_fn) = comp_meta.insert_default_fn else {
+        return FfiResult::PERMISSION_DENIED;
+    };
+
+    if entity.is_null() {
+        return FfiResult::INTERNAL_ERROR;
+    }
+    let Some(bevy_entity) = Entity::try_from_bits(entity.to_bits()) else {
+        return FfiResult::INTERNAL_ERROR;
+    };
+    if bevy_entity == Entity::PLACEHOLDER {
+        return FfiResult::INTERNAL_ERROR;
+    }
+
+    bridge.queue.push(move |world: &mut World| {
+        insert_default_fn(world, bevy_entity);
     });
 
     FfiResult::OK

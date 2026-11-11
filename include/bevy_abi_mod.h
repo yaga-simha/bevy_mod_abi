@@ -156,10 +156,16 @@ static inline BEVY_ABI_UNUSED ComponentUuid bevy_abi_uuid_from_name(const char* 
 
 /* Component access mode (`abi_contract::ComponentAccessMode`) */
 typedef uint32_t ComponentAccessMode;
-#define COMPONENT_ACCESS_READ        0u
-#define COMPONENT_ACCESS_WRITE       1u
-#define COMPONENT_ACCESS_FILTER_ONLY 2u
-#define COMPONENT_ACCESS_WITHOUT     3u
+#define COMPONENT_ACCESS_READ           0u
+#define COMPONENT_ACCESS_WRITE          1u
+#define COMPONENT_ACCESS_FILTER_ONLY    2u
+#define COMPONENT_ACCESS_WITHOUT        3u
+#define COMPONENT_ACCESS_OPTIONAL_READ  4u
+#define COMPONENT_ACCESS_OPTIONAL_WRITE 5u
+#define COMPONENT_ACCESS_CHANGED        6u
+#define COMPONENT_ACCESS_ADDED          7u
+#define COMPONENT_ACCESS_RESOURCE_READ  8u
+#define COMPONENT_ACCESS_RESOURCE_WRITE 9u
 
 /* Component access descriptor (`abi_contract::ComponentAccessDesc`) */
 typedef struct ComponentAccessDesc {
@@ -167,11 +173,21 @@ typedef struct ComponentAccessDesc {
     ComponentAccessMode mode;
 } ComponentAccessDesc;
 
+static inline BEVY_ABI_UNUSED ComponentAccessDesc bam_access_desc(
+    const char* name,
+    ComponentAccessMode mode
+) {
+    ComponentAccessDesc d;
+    d.name = name;
+    d.mode = mode;
+    return d;
+}
+
 /* Opaque handles for chunk iteration and deferred commands */
 typedef struct RawChunkIter RawChunkIter;
 typedef struct RawCommandQueue RawCommandQueue;
 
-/* Host chunk iteration function pointer types */
+/* Host chunk iteration & resource accessor function pointer types */
 typedef size_t (*IterNextChunkFn)(RawChunkIter* iter);
 typedef const uint8_t* (*IterColumnReadonlyFn)(const RawChunkIter* iter, size_t index);
 typedef uint8_t* (*IterColumnMutableFn)(RawChunkIter* iter, size_t index);
@@ -179,6 +195,32 @@ typedef FfiResult (*IterMarkChangedFn)(RawChunkIter* iter, size_t index, size_t 
 typedef const FfiEntity* (*IterEntitiesFn)(const RawChunkIter* iter);
 typedef size_t (*IterColumnStrideFn)(const RawChunkIter* iter, size_t index);
 typedef FfiResult (*IterResetFn)(RawChunkIter* iter);
+typedef const uint8_t* (*IterResourceReadonlyFn)(const RawChunkIter* iter, const char* resource_name);
+typedef uint8_t* (*IterResourceMutableFn)(RawChunkIter* iter, const char* resource_name);
+
+/* Deferred command queue bridge function pointer types (resolvable via `GetProcAddressFn`) */
+typedef FfiEntity (*CmdSpawnEmptyFn)(RawCommandQueue* queue);
+typedef FfiResult (*CmdDespawnFn)(RawCommandQueue* queue, FfiEntity entity);
+typedef FfiResult (*CmdInsertComponentFn)(
+    RawCommandQueue* queue,
+    FfiEntity entity,
+    const char* component_name,
+    const uint8_t* data_ptr,
+    size_t data_size
+);
+typedef FfiResult (*CmdRemoveComponentFn)(
+    RawCommandQueue* queue,
+    FfiEntity entity,
+    const char* component_name
+);
+typedef FfiResult (*CmdInsertDefaultFn)(
+    RawCommandQueue* queue,
+    FfiEntity entity,
+    const char* component_name
+);
+
+/* Optional guest run-condition predicate (`abi_contract::RunConditionCallback`) */
+typedef FfiBool (*RunConditionCallback)(void* user_data);
 
 /* Dynamic system callback (`abi_contract::DynamicSystemCallback`) */
 typedef FfiResult (*DynamicSystemCallback)(
@@ -238,9 +280,23 @@ typedef struct ScheduledMultiQuerySystemDescriptor {
 
 typedef ScheduledMultiQuerySystemDescriptor MultiQuerySystemDescriptorV2;
 
+/* Extended v3 multi-query descriptor adding `run_if` (`abi_contract::ConditionalMultiQuerySystemDescriptor`) */
+typedef struct ConditionalMultiQuerySystemDescriptor {
+    ScheduledMultiQuerySystemDescriptor sched;
+    RunConditionCallback run_if;
+    void* run_if_user_data;
+} ConditionalMultiQuerySystemDescriptor;
+
+typedef ConditionalMultiQuerySystemDescriptor MultiQuerySystemDescriptorV3;
+
 typedef FfiResult (*RegisterMultiQuerySystemFn)(
     void* host_context,
     const MultiQuerySystemDescriptor* descriptor
+);
+
+typedef FfiResult (*RegisterConditionalMultiQuerySystemFn)(
+    void* host_context,
+    const ConditionalMultiQuerySystemDescriptor* descriptor
 );
 
 /* System registration descriptor (`abi_contract::SystemDescriptor`) */
@@ -266,7 +322,16 @@ typedef struct ScheduledSystemDescriptor {
 
 typedef ScheduledSystemDescriptor SystemDescriptorV2;
 
-/* System registration function signatures (`abi_contract::RegisterSystemFn` / `RegisterScheduledSystemFn`) */
+/* Extended v3 system descriptor adding `run_if` (`abi_contract::ConditionalSystemDescriptor`) */
+typedef struct ConditionalSystemDescriptor {
+    ScheduledSystemDescriptor sched;
+    RunConditionCallback run_if;
+    void* run_if_user_data;
+} ConditionalSystemDescriptor;
+
+typedef ConditionalSystemDescriptor SystemDescriptorV3;
+
+/* System registration function signatures (`abi_contract::RegisterSystemFn` / `RegisterScheduledSystemFn` / `RegisterConditionalSystemFn`) */
 typedef FfiResult (*RegisterSystemFn)(
     void* host_context,
     const SystemDescriptor* descriptor
@@ -275,6 +340,11 @@ typedef FfiResult (*RegisterSystemFn)(
 typedef FfiResult (*RegisterScheduledSystemFn)(
     void* host_context,
     const ScheduledSystemDescriptor* descriptor
+);
+
+typedef FfiResult (*RegisterConditionalSystemFn)(
+    void* host_context,
+    const ConditionalSystemDescriptor* descriptor
 );
 
 /* Symbol resolver function pointer (`abi_contract::GetProcAddressFn`) */
@@ -353,6 +423,11 @@ BEVY_ABI_STATIC_ASSERT(offsetof(ScheduledSystemDescriptor, after_count) == 64, "
 BEVY_ABI_STATIC_ASSERT(offsetof(ScheduledSystemDescriptor, before) == 72, "offset of before must be 72");
 BEVY_ABI_STATIC_ASSERT(offsetof(ScheduledSystemDescriptor, before_count) == 80, "offset of before_count must be 80");
 BEVY_ABI_STATIC_ASSERT(sizeof(ScheduledMultiQuerySystemDescriptor) == 88, "ScheduledMultiQuerySystemDescriptor 64-bit size must be 88");
+BEVY_ABI_STATIC_ASSERT(sizeof(ConditionalSystemDescriptor) == 104, "ConditionalSystemDescriptor 64-bit size must be 104");
+BEVY_ABI_STATIC_ASSERT(offsetof(ConditionalSystemDescriptor, sched) == 0, "offset of sched must be 0");
+BEVY_ABI_STATIC_ASSERT(offsetof(ConditionalSystemDescriptor, run_if) == 88, "offset of run_if must be 88");
+BEVY_ABI_STATIC_ASSERT(offsetof(ConditionalSystemDescriptor, run_if_user_data) == 96, "offset of run_if_user_data must be 96");
+BEVY_ABI_STATIC_ASSERT(sizeof(ConditionalMultiQuerySystemDescriptor) == 104, "ConditionalMultiQuerySystemDescriptor 64-bit size must be 104");
 
 /* Static ABI layout assertions for 32-bit architectures */
 #elif defined(__ILP32__) || (defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 4)
@@ -390,6 +465,10 @@ BEVY_ABI_STATIC_ASSERT(offsetof(ScheduledSystemDescriptor, after_count) == 36, "
 BEVY_ABI_STATIC_ASSERT(offsetof(ScheduledSystemDescriptor, before) == 40, "offset of before must be 40");
 BEVY_ABI_STATIC_ASSERT(offsetof(ScheduledSystemDescriptor, before_count) == 44, "offset of before_count must be 44");
 BEVY_ABI_STATIC_ASSERT(sizeof(ScheduledMultiQuerySystemDescriptor) == 48, "ScheduledMultiQuerySystemDescriptor 32-bit size must be 48");
+BEVY_ABI_STATIC_ASSERT(sizeof(ConditionalSystemDescriptor) == 56, "ConditionalSystemDescriptor 32-bit size must be 56");
+BEVY_ABI_STATIC_ASSERT(offsetof(ConditionalSystemDescriptor, run_if) == 48, "offset of run_if must be 48");
+BEVY_ABI_STATIC_ASSERT(offsetof(ConditionalSystemDescriptor, run_if_user_data) == 52, "offset of run_if_user_data must be 52");
+BEVY_ABI_STATIC_ASSERT(sizeof(ConditionalMultiQuerySystemDescriptor) == 56, "ConditionalMultiQuerySystemDescriptor 32-bit size must be 56");
 #endif
 
 /* Mod lifecycle entry points */

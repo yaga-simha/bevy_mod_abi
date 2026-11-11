@@ -72,6 +72,23 @@ pub const FFI_BOOL_FALSE: FfiBool = 0;
 /// Canonical `true` value for [`FfiBool`].
 pub const FFI_BOOL_TRUE: FfiBool = 1;
 
+/// Converts an [`FfiBool`] byte (`0` = `false`, any non-zero byte = `true`) into a Rust `bool`
+/// without undefined behavior on non-canonical foreign truthy values (`2..=255`).
+#[inline]
+pub const fn ffi_bool_to_rust(flag: FfiBool) -> bool {
+    flag != FFI_BOOL_FALSE
+}
+
+/// Converts a Rust `bool` into a canonical [`FfiBool`] (`0` or `1`).
+#[inline]
+pub const fn rust_bool_to_ffi(val: bool) -> FfiBool {
+    if val {
+        FFI_BOOL_TRUE
+    } else {
+        FFI_BOOL_FALSE
+    }
+}
+
 /// Major version of the ABI contract. Incremented for breaking ABI layout or signature changes.
 pub const ABI_VERSION_MAJOR: u32 = 0;
 /// Minor version of the ABI contract. Incremented for backward-compatible symbol or capability additions.
@@ -466,6 +483,22 @@ impl ComponentAccessMode {
     pub const FILTER_ONLY: Self = Self(2);
     /// Archetype absence filter (`Without<T>`). Proves query disjointness for scheduler concurrency.
     pub const WITHOUT: Self = Self(3);
+    /// Optional read-only column access (`Option<&T>`). Matches archetypes with or without `T`;
+    /// `iter_column_readonly` returns non-null when present or `null` when absent.
+    pub const OPTIONAL_READ: Self = Self(4);
+    /// Optional exclusive write access (`Option<&mut T>`). Matches archetypes with or without `T`;
+    /// `iter_column_mutable` returns non-null and marks ticks when present or `null` when absent.
+    pub const OPTIONAL_WRITE: Self = Self(5);
+    /// Row-level change-tick filter (`Changed<T>`) with read-only column access.
+    /// Yields contiguous runs of entities whose `T` change tick is newer than the system's `last_run`.
+    pub const CHANGED: Self = Self(6);
+    /// Row-level added-tick filter (`Added<T>`) with read-only column access.
+    /// Yields contiguous runs of entities whose `T` added tick is newer than the system's `last_run`.
+    pub const ADDED: Self = Self(7);
+    /// Shared read-only access to a Bevy singleton `Resource` (`Res<R>`).
+    pub const RESOURCE_READ: Self = Self(8);
+    /// Exclusive mutable access to a Bevy singleton `Resource` (`ResMut<R>`).
+    pub const RESOURCE_WRITE: Self = Self(9);
 
     /// Alias for [`Self::READ`].
     pub const Read: Self = Self::READ;
@@ -475,17 +508,31 @@ impl ComponentAccessMode {
     pub const FilterOnly: Self = Self::FILTER_ONLY;
     /// Alias for [`Self::WITHOUT`].
     pub const Without: Self = Self::WITHOUT;
+    /// Alias for [`Self::OPTIONAL_READ`].
+    pub const OptionalRead: Self = Self::OPTIONAL_READ;
+    /// Alias for [`Self::OPTIONAL_WRITE`].
+    pub const OptionalWrite: Self = Self::OPTIONAL_WRITE;
+    /// Alias for [`Self::CHANGED`].
+    pub const Changed: Self = Self::CHANGED;
+    /// Alias for [`Self::ADDED`].
+    pub const Added: Self = Self::ADDED;
+    /// Alias for [`Self::RESOURCE_READ`].
+    pub const ResourceRead: Self = Self::RESOURCE_READ;
+    /// Alias for [`Self::RESOURCE_WRITE`].
+    pub const ResourceWrite: Self = Self::RESOURCE_WRITE;
 
-    /// Returns `true` if this mode is one of the recognized variants (0..=3).
+    /// Returns `true` if this mode is one of the recognized variants (`0..=9`).
     #[inline]
     pub const fn is_valid(self) -> bool {
-        self.0 <= Self::WITHOUT.0
+        self.0 <= Self::RESOURCE_WRITE.0
     }
 
-    /// Returns `true` if this access mode requires exclusive mutable access.
+    /// Returns `true` if this access mode requires exclusive mutable access (`WRITE`, `OPTIONAL_WRITE`, or `RESOURCE_WRITE`).
     #[inline]
     pub const fn is_mutable(self) -> bool {
         self.0 == Self::WRITE.0
+            || self.0 == Self::OPTIONAL_WRITE.0
+            || self.0 == Self::RESOURCE_WRITE.0
     }
 
     /// Returns `true` if this access mode is an archetype presence filter (`With<T>`).
@@ -499,15 +546,33 @@ impl ComponentAccessMode {
     pub const fn is_without(self) -> bool {
         self.0 == Self::WITHOUT.0
     }
+
+    /// Returns `true` if this access mode is optional (`Option<&T>` or `Option<&mut T>`).
+    #[inline]
+    pub const fn is_optional(self) -> bool {
+        self.0 == Self::OPTIONAL_READ.0 || self.0 == Self::OPTIONAL_WRITE.0
+    }
+
+    /// Returns `true` if this access mode filters rows by component ticks (`Changed<T>` or `Added<T>`).
+    #[inline]
+    pub const fn is_tick_filter(self) -> bool {
+        self.0 == Self::CHANGED.0 || self.0 == Self::ADDED.0
+    }
+
+    /// Returns `true` if this access mode targets a singleton Bevy `Resource` (`Res<R>` or `ResMut<R>`).
+    #[inline]
+    pub const fn is_resource(self) -> bool {
+        self.0 == Self::RESOURCE_READ.0 || self.0 == Self::RESOURCE_WRITE.0
+    }
 }
 
 /// Component access descriptor passed in `SystemDescriptor::queries`.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ComponentAccessDesc {
-    /// Null-terminated UTF-8 C string identifying the registered component name.
+    /// Null-terminated UTF-8 C string identifying the registered component or resource name.
     pub name: *const c_char,
-    /// Access mode (`ComponentAccessMode::READ`, `WRITE`, `FILTER_ONLY`, or `WITHOUT`).
+    /// Access mode (`READ`, `WRITE`, `FILTER_ONLY`, `WITHOUT`, `OPTIONAL_*`, `CHANGED`, `ADDED`, `RESOURCE_*`).
     pub mode: ComponentAccessMode,
 }
 
@@ -545,6 +610,60 @@ impl ComponentAccessDesc {
         Self {
             name,
             mode: ComponentAccessMode::WITHOUT,
+        }
+    }
+
+    /// Creates an optional read-only (`Option<&T>`) access descriptor.
+    #[inline]
+    pub const fn optional_read(name: *const c_char) -> Self {
+        Self {
+            name,
+            mode: ComponentAccessMode::OPTIONAL_READ,
+        }
+    }
+
+    /// Creates an optional mutable (`Option<&mut T>`) access descriptor.
+    #[inline]
+    pub const fn optional_write(name: *const c_char) -> Self {
+        Self {
+            name,
+            mode: ComponentAccessMode::OPTIONAL_WRITE,
+        }
+    }
+
+    /// Creates a per-row change-tick filter (`Changed<T>`) descriptor.
+    #[inline]
+    pub const fn changed(name: *const c_char) -> Self {
+        Self {
+            name,
+            mode: ComponentAccessMode::CHANGED,
+        }
+    }
+
+    /// Creates a per-row added-tick filter (`Added<T>`) descriptor.
+    #[inline]
+    pub const fn added(name: *const c_char) -> Self {
+        Self {
+            name,
+            mode: ComponentAccessMode::ADDED,
+        }
+    }
+
+    /// Creates a shared resource read (`Res<R>`) descriptor.
+    #[inline]
+    pub const fn resource_read(name: *const c_char) -> Self {
+        Self {
+            name,
+            mode: ComponentAccessMode::RESOURCE_READ,
+        }
+    }
+
+    /// Creates an exclusive resource write (`ResMut<R>`) descriptor.
+    #[inline]
+    pub const fn resource_write(name: *const c_char) -> Self {
+        Self {
+            name,
+            mode: ComponentAccessMode::RESOURCE_WRITE,
         }
     }
 }
@@ -625,6 +744,69 @@ pub type IterColumnStrideFn =
 /// # Safety
 /// `iter` must be a valid pointer to a [`RawChunkIter`].
 pub type IterResetFn = unsafe extern "C" fn(iter: *mut RawChunkIter) -> FfiResult;
+
+/// Obtains a read-only byte pointer to singleton Bevy `Resource` `resource_name` during system execution.
+///
+/// Returns `null` if `iter` or `resource_name` is null, if the resource was not declared with
+/// [`ComponentAccessMode::RESOURCE_READ`] or [`ComponentAccessMode::RESOURCE_WRITE`] on this system,
+/// or if the resource is not currently inserted in the `World`.
+///
+/// # Safety
+/// - `iter` must be a valid pointer to an active [`RawChunkIter`] passed to the system callback.
+/// - `resource_name` must point to a valid NUL-terminated UTF-8 C string.
+pub type IterResourceReadonlyFn =
+    unsafe extern "C" fn(iter: *const RawChunkIter, resource_name: *const c_char) -> *const u8;
+
+/// Obtains an exclusive mutable byte pointer to singleton Bevy `Resource` `resource_name` during system execution.
+///
+/// Marks the resource's Bevy change tick as changed (`Res<R>::is_changed()` becomes `true`).
+/// Returns `null` if `iter` or `resource_name` is null, if the resource was not declared strictly with
+/// [`ComponentAccessMode::RESOURCE_WRITE`] on this system, or if the resource is not present in the `World`.
+///
+/// # Safety
+/// - `iter` must be a valid pointer to an active [`RawChunkIter`] passed to the system callback.
+/// - `resource_name` must point to a valid NUL-terminated UTF-8 C string.
+/// - Caller must not create aliasing references to the same resource simultaneously.
+pub type IterResourceMutableFn =
+    unsafe extern "C" fn(iter: *mut RawChunkIter, resource_name: *const c_char) -> *mut u8;
+
+/// Queues deferred removal of component `component_name` from `entity`.
+///
+/// # Safety
+/// - `queue` must be a valid pointer to an active [`RawCommandQueue`] during system execution.
+/// - `component_name` must point to a valid NUL-terminated UTF-8 C string.
+pub type CmdRemoveComponentFn = unsafe extern "C" fn(
+    queue: *mut RawCommandQueue,
+    entity: FfiEntity,
+    component_name: *const c_char,
+) -> FfiResult;
+
+/// Queues deferred insertion of host-constructed `T::default()` for component `component_name` on `entity`.
+///
+/// Enables guest mods to attach opaque non-POD host components (such as `String`- or `Vec`-bearing
+/// components registered via `register_mod_component_with_default`) without allocator crossover,
+/// and subsequently mutate their fields via VTable setters on the next frame.
+///
+/// Returns [`FfiResult::PERMISSION_DENIED`] if the component was not registered with a `Default` constructor.
+///
+/// # Safety
+/// - `queue` must be a valid pointer to an active [`RawCommandQueue`] during system execution.
+/// - `component_name` must point to a valid NUL-terminated UTF-8 C string.
+pub type CmdInsertDefaultFn = unsafe extern "C" fn(
+    queue: *mut RawCommandQueue,
+    entity: FfiEntity,
+    component_name: *const c_char,
+) -> FfiResult;
+
+/// Optional guest run-condition predicate evaluated before a dynamic system executes.
+///
+/// Returns [`FFI_BOOL_FALSE`] (`0`) to skip system execution for the current tick (preserving
+/// `last_run` so `Changed<T>` and `Added<T>` ticks accumulated while skipped are still observed
+/// when the condition later returns non-zero), or any non-zero [`FfiBool`] value to execute.
+///
+/// # Safety
+/// - Must contain any internal panics; unwinding across the `extern "C"` boundary is undefined behavior.
+pub type RunConditionCallback = unsafe extern "C" fn(user_data: *mut c_void) -> FfiBool;
 
 /// Dynamic system callback invoked by the host during schedule execution.
 ///
@@ -844,6 +1026,20 @@ impl MultiQuerySystemDescriptor {
         ScheduledMultiQuerySystemDescriptor::from_base(self, schedule)
     }
 
+    /// Promotes this descriptor into a [`ConditionalMultiQuerySystemDescriptor`] with a `run_if` predicate.
+    #[inline]
+    pub const fn with_run_if(
+        self,
+        run_if: RunConditionCallback,
+        run_if_user_data: *mut c_void,
+    ) -> ConditionalMultiQuerySystemDescriptor {
+        ConditionalMultiQuerySystemDescriptor::from_scheduled(
+            ScheduledMultiQuerySystemDescriptor::from_base(self, ScheduleLabelId::UPDATE),
+            Some(run_if),
+            run_if_user_data,
+        )
+    }
+
     /// Validates `struct_size` and mandatory pointer invariants.
     #[inline]
     pub fn validate(&self) -> FfiResult {
@@ -942,6 +1138,16 @@ impl ScheduledMultiQuerySystemDescriptor {
         self
     }
 
+    /// Promotes this scheduled descriptor into a [`ConditionalMultiQuerySystemDescriptor`] with a `run_if` predicate.
+    #[inline]
+    pub const fn with_run_if(
+        self,
+        run_if: RunConditionCallback,
+        run_if_user_data: *mut c_void,
+    ) -> ConditionalMultiQuerySystemDescriptor {
+        ConditionalMultiQuerySystemDescriptor::from_scheduled(self, Some(run_if), run_if_user_data)
+    }
+
     /// Returns a base-compatible pointer suitable for passing to [`RegisterMultiQuerySystemFn`].
     #[inline]
     pub const fn as_base_ptr(&self) -> *const MultiQuerySystemDescriptor {
@@ -984,6 +1190,74 @@ unsafe impl ExtensibleStruct for ScheduledMultiQuerySystemDescriptor {
     }
 }
 
+/// Extended v3 multi-query system descriptor adding an optional `run_if` condition callback.
+///
+/// Layout-prefixed by [`ScheduledMultiQuerySystemDescriptor`] at offset `0` (`104` bytes on 64-bit,
+/// `56` bytes on 32-bit). Older v1 (`48`B) and v2 (`88`B) descriptors zero-extend cleanly into
+/// `ConditionalMultiQuerySystemDescriptor` (`run_if = None`, `run_if_user_data = null`).
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ConditionalMultiQuerySystemDescriptor {
+    /// Scheduled v2 multi-query system descriptor prefix (`sched.base.struct_size` = `size_of::<Self>() as u32`).
+    pub sched: ScheduledMultiQuerySystemDescriptor,
+    /// Optional run-condition predicate (`None` / `NULL` means execute unconditionally).
+    pub run_if: Option<RunConditionCallback>,
+    /// Opaque guest-owned context pointer forwarded to `run_if`.
+    pub run_if_user_data: *mut c_void,
+}
+
+/// Alias for [`ConditionalMultiQuerySystemDescriptor`].
+pub type MultiQuerySystemDescriptorV3 = ConditionalMultiQuerySystemDescriptor;
+
+impl ConditionalMultiQuerySystemDescriptor {
+    /// Minimum valid descriptor size (`MultiQuerySystemDescriptor::MIN_V1_SIZE` for backward compatibility).
+    pub const MIN_V1_SIZE: usize = MultiQuerySystemDescriptor::MIN_V1_SIZE;
+
+    /// Wraps a [`ScheduledMultiQuerySystemDescriptor`] with an optional `run_if` predicate.
+    #[inline]
+    pub const fn from_scheduled(
+        mut sched: ScheduledMultiQuerySystemDescriptor,
+        run_if: Option<RunConditionCallback>,
+        run_if_user_data: *mut c_void,
+    ) -> Self {
+        sched.base.struct_size = core::mem::size_of::<Self>() as u32;
+        Self {
+            sched,
+            run_if,
+            run_if_user_data,
+        }
+    }
+
+    /// Returns a base-compatible pointer suitable for passing to [`RegisterMultiQuerySystemFn`].
+    #[inline]
+    pub const fn as_base_ptr(&self) -> *const MultiQuerySystemDescriptor {
+        &self.sched.base
+    }
+
+    /// Validates base, schedule, and ordering invariants.
+    #[inline]
+    pub fn validate(&self) -> FfiResult {
+        self.sched.validate()
+    }
+}
+
+// SAFETY: `ConditionalMultiQuerySystemDescriptor` starts with `sched: ScheduledMultiQuerySystemDescriptor`
+// (`struct_size` at offset 0), all fields after `MIN_V1_SIZE` (`schedule`, `flags`, `after*`, `before*`,
+// `run_if: Option<...>`, `run_if_user_data`) are valid when zero-filled, and `validate_raw_slot` checks `callback != 0`.
+unsafe impl ExtensibleStruct for ConditionalMultiQuerySystemDescriptor {
+    const MIN_V1_SIZE: usize = Self::MIN_V1_SIZE;
+
+    #[inline]
+    unsafe fn validate_raw_slot(slot_ptr: *const Self) -> FfiResult {
+        // SAFETY: `sched.base` is at byte offset 0 of `Self`.
+        unsafe {
+            MultiQuerySystemDescriptor::validate_raw_slot(
+                slot_ptr as *const MultiQuerySystemDescriptor,
+            )
+        }
+    }
+}
+
 /// Multi-query system registration function signature resolvable via `GetProcAddressFn`.
 ///
 /// # Safety
@@ -991,6 +1265,15 @@ unsafe impl ExtensibleStruct for ScheduledMultiQuerySystemDescriptor {
 pub type RegisterMultiQuerySystemFn = unsafe extern "C" fn(
     host_context: *mut c_void,
     descriptor: *const MultiQuerySystemDescriptor,
+) -> FfiResult;
+
+/// Explicit conditional multi-query system registration function signature resolvable via `GetProcAddressFn`.
+///
+/// # Safety
+/// `host_context` must point to host initialization context; `descriptor` must point to a valid descriptor.
+pub type RegisterConditionalMultiQuerySystemFn = unsafe extern "C" fn(
+    host_context: *mut c_void,
+    descriptor: *const ConditionalMultiQuerySystemDescriptor,
 ) -> FfiResult;
 
 /// Descriptor used by mods to register a `DynamicCSystem` with the host.
@@ -1038,6 +1321,20 @@ impl SystemDescriptor {
     #[inline]
     pub const fn with_schedule(self, schedule: ScheduleLabelId) -> ScheduledSystemDescriptor {
         ScheduledSystemDescriptor::from_base(self, schedule)
+    }
+
+    /// Promotes this descriptor into a [`ConditionalSystemDescriptor`] with a `run_if` predicate.
+    #[inline]
+    pub const fn with_run_if(
+        self,
+        run_if: RunConditionCallback,
+        run_if_user_data: *mut c_void,
+    ) -> ConditionalSystemDescriptor {
+        ConditionalSystemDescriptor::from_scheduled(
+            ScheduledSystemDescriptor::from_base(self, ScheduleLabelId::UPDATE),
+            Some(run_if),
+            run_if_user_data,
+        )
     }
 
     /// Validates `struct_size` and mandatory pointer invariants.
@@ -1136,6 +1433,16 @@ impl ScheduledSystemDescriptor {
         self
     }
 
+    /// Promotes this scheduled descriptor into a [`ConditionalSystemDescriptor`] with a `run_if` predicate.
+    #[inline]
+    pub const fn with_run_if(
+        self,
+        run_if: RunConditionCallback,
+        run_if_user_data: *mut c_void,
+    ) -> ConditionalSystemDescriptor {
+        ConditionalSystemDescriptor::from_scheduled(self, Some(run_if), run_if_user_data)
+    }
+
     /// Returns a base-compatible pointer suitable for passing to [`RegisterSystemFn`].
     #[inline]
     pub const fn as_base_ptr(&self) -> *const SystemDescriptor {
@@ -1174,6 +1481,79 @@ unsafe impl ExtensibleStruct for ScheduledSystemDescriptor {
     }
 }
 
+/// Extended v3 system registration descriptor adding an optional `run_if` condition callback.
+///
+/// Layout-prefixed by [`ScheduledSystemDescriptor`] at offset `0` (`104` bytes on 64-bit,
+/// `56` bytes on 32-bit). When an older v1 [`SystemDescriptor`] (`48`B) or v2
+/// [`ScheduledSystemDescriptor`] (`88`B) is read via `read_descriptor::<ConditionalSystemDescriptor>`,
+/// trailing fields are zero-filled (`run_if = None`, `run_if_user_data = null`).
+/// Newer guests can pass [`Self::as_base_ptr`] directly to `HostApi::register_system`,
+/// [`Self::as_scheduled_ptr`] to `register_scheduled_system`, or `&self` to `register_conditional_system`.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ConditionalSystemDescriptor {
+    /// Scheduled v2 system descriptor prefix (`sched.base.struct_size` = `size_of::<Self>() as u32`).
+    pub sched: ScheduledSystemDescriptor,
+    /// Optional run-condition predicate (`None` / `NULL` means execute unconditionally).
+    pub run_if: Option<RunConditionCallback>,
+    /// Opaque guest-owned context pointer forwarded to `run_if`.
+    pub run_if_user_data: *mut c_void,
+}
+
+/// Alias for [`ConditionalSystemDescriptor`].
+pub type SystemDescriptorV3 = ConditionalSystemDescriptor;
+
+impl ConditionalSystemDescriptor {
+    /// Minimum valid descriptor size (`SystemDescriptor::MIN_V1_SIZE` for backward compatibility).
+    pub const MIN_V1_SIZE: usize = SystemDescriptor::MIN_V1_SIZE;
+
+    /// Wraps a [`ScheduledSystemDescriptor`] with an optional `run_if` predicate.
+    #[inline]
+    pub const fn from_scheduled(
+        mut sched: ScheduledSystemDescriptor,
+        run_if: Option<RunConditionCallback>,
+        run_if_user_data: *mut c_void,
+    ) -> Self {
+        sched.base.struct_size = core::mem::size_of::<Self>() as u32;
+        Self {
+            sched,
+            run_if,
+            run_if_user_data,
+        }
+    }
+
+    /// Returns a base-compatible pointer suitable for passing to [`RegisterSystemFn`].
+    #[inline]
+    pub const fn as_base_ptr(&self) -> *const SystemDescriptor {
+        &self.sched.base
+    }
+
+    /// Returns a v2-compatible pointer suitable for passing to [`RegisterScheduledSystemFn`].
+    #[inline]
+    pub const fn as_scheduled_ptr(&self) -> *const ScheduledSystemDescriptor {
+        &self.sched
+    }
+
+    /// Validates base, schedule, and ordering invariants.
+    #[inline]
+    pub fn validate(&self) -> FfiResult {
+        self.sched.validate()
+    }
+}
+
+// SAFETY: `ConditionalSystemDescriptor` starts with `sched: ScheduledSystemDescriptor`
+// (`struct_size` at offset 0), all fields after `MIN_V1_SIZE` (`schedule`, `flags`, `after*`, `before*`,
+// `run_if: Option<...>`, `run_if_user_data`) are valid when zero-filled, and `validate_raw_slot` checks `callback != 0`.
+unsafe impl ExtensibleStruct for ConditionalSystemDescriptor {
+    const MIN_V1_SIZE: usize = Self::MIN_V1_SIZE;
+
+    #[inline]
+    unsafe fn validate_raw_slot(slot_ptr: *const Self) -> FfiResult {
+        // SAFETY: `sched.base` is at byte offset 0 of `Self`.
+        unsafe { SystemDescriptor::validate_raw_slot(slot_ptr as *const SystemDescriptor) }
+    }
+}
+
 /// System registration function signature exposed in [`HostApi`].
 ///
 /// # Safety
@@ -1190,6 +1570,15 @@ pub type RegisterSystemFn = unsafe extern "C" fn(
 pub type RegisterScheduledSystemFn = unsafe extern "C" fn(
     host_context: *mut c_void,
     descriptor: *const ScheduledSystemDescriptor,
+) -> FfiResult;
+
+/// Explicit conditional system registration function signature resolvable via `GetProcAddressFn`.
+///
+/// # Safety
+/// `host_context` must point to host initialization context; `descriptor` must point to a valid descriptor.
+pub type RegisterConditionalSystemFn = unsafe extern "C" fn(
+    host_context: *mut c_void,
+    descriptor: *const ConditionalSystemDescriptor,
 ) -> FfiResult;
 
 /// Symbol-resolver function pointer passed to the guest mod entry point (Godot GDExtension style).
@@ -2140,5 +2529,130 @@ mod tests {
         assert_pod::<FfiEntity>();
         assert_pod::<[f32; 4]>();
         assert_pod::<[[u32; 4]; 4]>();
+    }
+
+    #[test]
+    fn test_phase3_phase4_access_modes_and_conditional_descriptors() {
+        // Verify all 10 valid modes (0..=9) and helper predicates
+        let all_modes = [
+            ComponentAccessMode::READ,
+            ComponentAccessMode::WRITE,
+            ComponentAccessMode::FILTER_ONLY,
+            ComponentAccessMode::WITHOUT,
+            ComponentAccessMode::OPTIONAL_READ,
+            ComponentAccessMode::OPTIONAL_WRITE,
+            ComponentAccessMode::CHANGED,
+            ComponentAccessMode::ADDED,
+            ComponentAccessMode::RESOURCE_READ,
+            ComponentAccessMode::RESOURCE_WRITE,
+        ];
+        for (idx, mode) in all_modes.iter().copied().enumerate() {
+            assert_eq!(mode.0, idx as u32);
+            assert!(mode.is_valid());
+        }
+        assert!(!ComponentAccessMode(10).is_valid());
+        assert!(!ComponentAccessMode(u32::MAX).is_valid());
+
+        assert!(ComponentAccessMode::OPTIONAL_READ.is_optional());
+        assert!(ComponentAccessMode::OPTIONAL_WRITE.is_optional());
+        assert!(!ComponentAccessMode::READ.is_optional());
+
+        assert!(ComponentAccessMode::WRITE.is_mutable());
+        assert!(ComponentAccessMode::OPTIONAL_WRITE.is_mutable());
+        assert!(ComponentAccessMode::RESOURCE_WRITE.is_mutable());
+        assert!(!ComponentAccessMode::OPTIONAL_READ.is_mutable());
+        assert!(!ComponentAccessMode::CHANGED.is_mutable());
+        assert!(!ComponentAccessMode::ADDED.is_mutable());
+        assert!(!ComponentAccessMode::RESOURCE_READ.is_mutable());
+
+        assert!(ComponentAccessMode::CHANGED.is_tick_filter());
+        assert!(ComponentAccessMode::ADDED.is_tick_filter());
+        assert!(!ComponentAccessMode::FILTER_ONLY.is_tick_filter());
+
+        assert!(ComponentAccessMode::RESOURCE_READ.is_resource());
+        assert!(ComponentAccessMode::RESOURCE_WRITE.is_resource());
+        assert!(!ComponentAccessMode::READ.is_resource());
+
+        assert_eq!(
+            ComponentAccessDesc::optional_read(c"A".as_ptr()).mode,
+            ComponentAccessMode::OPTIONAL_READ
+        );
+        assert_eq!(
+            ComponentAccessDesc::optional_write(c"A".as_ptr()).mode,
+            ComponentAccessMode::OPTIONAL_WRITE
+        );
+        assert_eq!(
+            ComponentAccessDesc::changed(c"A".as_ptr()).mode,
+            ComponentAccessMode::CHANGED
+        );
+        assert_eq!(
+            ComponentAccessDesc::added(c"A".as_ptr()).mode,
+            ComponentAccessMode::ADDED
+        );
+        assert_eq!(
+            ComponentAccessDesc::resource_read(c"R".as_ptr()).mode,
+            ComponentAccessMode::RESOURCE_READ
+        );
+        assert_eq!(
+            ComponentAccessDesc::resource_write(c"R".as_ptr()).mode,
+            ComponentAccessMode::RESOURCE_WRITE
+        );
+
+        unsafe extern "C" fn dummy_sys(
+            _iter: *mut RawChunkIter,
+            _cmds: *mut RawCommandQueue,
+            _ud: *mut c_void,
+        ) -> FfiResult {
+            FfiResult::OK
+        }
+        unsafe extern "C" fn dummy_cond(_ud: *mut c_void) -> FfiBool {
+            FFI_BOOL_TRUE
+        }
+
+        if core::mem::size_of::<usize>() == 8 {
+            assert_eq!(core::mem::size_of::<SystemDescriptor>(), 48);
+            assert_eq!(core::mem::size_of::<ScheduledSystemDescriptor>(), 88);
+            assert_eq!(core::mem::size_of::<ConditionalSystemDescriptor>(), 104);
+            assert_eq!(
+                core::mem::size_of::<ConditionalMultiQuerySystemDescriptor>(),
+                104
+            );
+            assert_eq!(core::mem::size_of::<HostApi>(), 72);
+        }
+
+        // v1 (48B) -> v3 (104B) zero-extension
+        let v1 = SystemDescriptor::new(c"sys".as_ptr(), core::ptr::null(), 0, dummy_sys, core::ptr::null_mut());
+        // SAFETY: `v1` is valid and readable for `v1.struct_size` bytes.
+        let from_v1 = unsafe {
+            read_descriptor::<ConditionalSystemDescriptor>(&v1 as *const _ as *const c_void)
+        }
+        .unwrap();
+        assert_eq!(from_v1.sched.schedule, ScheduleLabelId::UPDATE);
+        assert!(from_v1.run_if.is_none());
+        assert!(from_v1.run_if_user_data.is_null());
+
+        // v2 (88B) -> v3 (104B) zero-extension
+        let v2 = v1.with_schedule(ScheduleLabelId::FIXED_UPDATE);
+        // SAFETY: `v2` is valid and readable for `v2.base.struct_size` bytes.
+        let from_v2 = unsafe {
+            read_descriptor::<ConditionalSystemDescriptor>(&v2 as *const _ as *const c_void)
+        }
+        .unwrap();
+        assert_eq!(from_v2.sched.schedule, ScheduleLabelId::FIXED_UPDATE);
+        assert!(from_v2.run_if.is_none());
+        assert!(from_v2.run_if_user_data.is_null());
+
+        // v3 (104B) round-trip
+        let tag = 0x1234usize as *mut c_void;
+        let v3 = v2.with_run_if(dummy_cond, tag);
+        // SAFETY: `v3` is valid and readable for `v3.sched.base.struct_size` bytes.
+        let from_v3 = unsafe {
+            read_descriptor::<ConditionalSystemDescriptor>(&v3 as *const _ as *const c_void)
+        }
+        .unwrap();
+        assert_eq!(from_v3.sched.schedule, ScheduleLabelId::FIXED_UPDATE);
+        assert!(from_v3.run_if.is_some());
+        assert_eq!(from_v3.run_if_user_data, tag);
+        assert_eq!(from_v3.validate(), FfiResult::OK);
     }
 }

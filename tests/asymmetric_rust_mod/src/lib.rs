@@ -5,9 +5,11 @@ use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::Mutex;
 use guest_sdk::{
-    export_mod, register_runtime_component, wrap_system_callback, CommandBridgeVTable,
-    ComponentAccessDesc, ComponentAccessMode, FfiResult, GetProcAddressFn, GuestChunkIter,
-    GuestCommandQueue, HostApi, RawChunkIter, RawCommandQueue, StrView, SystemDescriptor,
+    export_mod, ffi_bool_to_rust, register_runtime_component, resolve_register_conditional_system,
+    wrap_run_condition, wrap_system_callback, CommandBridgeVTable, CommandBridgeVTableExt,
+    ComponentAccessDesc, ComponentAccessMode, FfiBool, FfiResult, GetProcAddressFn,
+    GuestChunkIter, GuestCommandQueue, HostApi, RawChunkIter, RawCommandQueue,
+    ResourceBridgeVTable, StrView, SystemDescriptor,
 };
 
 // ============================================================================
@@ -71,6 +73,23 @@ pub struct RustModCustomData {
     pub shield: u32,
 }
 
+/// Phase 3 + Phase 4 POD resource layout mirrored in the Rust guest mod.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Phase4RustRes {
+    pub scale: f32,
+    pub matched_rows: u32,
+    pub optional_vel_hits: u32,
+    pub spawned_default_entity: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Phase4BridgeState {
+    pos_vt: *const PositionVTable,
+    cmd_ext: CommandBridgeVTableExt,
+    res_vt: ResourceBridgeVTable,
+}
+
 // ============================================================================
 // 2. Mod Static State
 // ============================================================================
@@ -82,9 +101,11 @@ static HEALTH_VTABLE: AtomicPtr<CombatHealthVTable> = AtomicPtr::new(core::ptr::
 static TAG_VTABLE: AtomicPtr<MetadataTagVTable> = AtomicPtr::new(core::ptr::null_mut());
 
 static ALLOCATED_CMD_VTABLES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static ALLOCATED_PHASE4_BRIDGES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 static PANIC_TRIGGER: AtomicBool = AtomicBool::new(false);
 static SHUTDOWN_CALLED: AtomicBool = AtomicBool::new(false);
+static PHASE4_RUST_RUN_ENABLED: AtomicBool = AtomicBool::new(true);
 
 // Test harness controls
 
@@ -116,6 +137,15 @@ pub unsafe extern "C" fn asymmetric_rust_mod_reset_panic() {
 #[no_mangle]
 pub unsafe extern "C" fn asymmetric_rust_mod_was_shutdown() -> bool {
     SHUTDOWN_CALLED.load(Ordering::SeqCst)
+}
+
+/// Toggles the Phase 4 conditional system `run_if` predicate in `asymmetric_rust_mod`.
+///
+/// # Safety
+/// Callers must ensure the dynamic library remains loaded in memory during the call.
+#[no_mangle]
+pub unsafe extern "C" fn asymmetric_rust_mod_set_phase4_enabled(enabled: FfiBool) {
+    PHASE4_RUST_RUN_ENABLED.store(ffi_bool_to_rust(enabled), Ordering::SeqCst);
 }
 
 // ============================================================================
@@ -417,6 +447,104 @@ wrap_system_callback!(fn c_rust_command calls rust_command_system);
 wrap_system_callback!(fn c_rust_panicking calls rust_panicking_system);
 wrap_system_callback!(fn c_rust_custom_system calls rust_custom_system);
 
+unsafe fn rust_phase4_run_if(_user_data: *mut c_void) -> bool {
+    PHASE4_RUST_RUN_ENABLED.load(Ordering::SeqCst)
+}
+
+// --- Scenario 8 (Phase 3 + Phase 4): Optional Columns, Changed/Added Row Filters, Resources, & Commands ---
+unsafe fn rust_phase4_ecs_system(
+    iter: *mut RawChunkIter,
+    commands: *mut RawCommandQueue,
+    user_data: *mut c_void,
+) -> FfiResult {
+    if iter.is_null() || user_data.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    let host_api_ptr = HOST_API_PTR.load(Ordering::Acquire);
+    let vel_vt_ptr = VEL_VTABLE.load(Ordering::Acquire);
+    if host_api_ptr.is_null() {
+        return FfiResult::INTERNAL_ERROR;
+    }
+
+    // SAFETY: Validated non-null static/allocated pointers for the duration of the callback.
+    let api = unsafe { &*host_api_ptr };
+    let bridges = unsafe { *(user_data as *const Phase4BridgeState) };
+    if bridges.pos_vt.is_null() {
+        return FfiResult::INTERNAL_ERROR;
+    }
+    let pos_vt = unsafe { &*bridges.pos_vt };
+
+    let mut chunk_iter = GuestChunkIter::with_bridges(iter, api, None, bridges.res_vt);
+    let mut cmd_queue = GuestCommandQueue::with_ext(commands, bridges.cmd_ext);
+
+    let (scale, need_spawn_default) = {
+        let Some(res) = chunk_iter.resource::<Phase4RustRes>(c"Phase4RustRes") else {
+            return FfiResult::INVALID_COMPONENT;
+        };
+        (res.scale, res.spawned_default_entity == 0)
+    };
+
+    if need_spawn_default && !cmd_queue.is_null() {
+        let spawned = cmd_queue.spawn_empty();
+        if spawned.0 != 0 && cmd_queue.insert_default(spawned, c"NameTag").is_ok() {
+            if let Some(res_mut) = chunk_iter.resource_mut::<Phase4RustRes>(c"Phase4RustRes") {
+                res_mut.spawned_default_entity = spawned.0;
+            }
+        }
+    }
+
+    let mut matched_delta = 0u32;
+    let mut opt_vel_delta = 0u32;
+
+    while let Some(mut chunk) = chunk_iter.next_chunk_view() {
+        let count = chunk.len();
+        let entities_copy: Vec<_> = chunk.entities().to_vec();
+        let opt_vel_ptr = chunk.optional_column_ptr(1);
+        let vel_stride = if opt_vel_ptr.is_some() {
+            chunk.readonly_slice(1).stride()
+        } else {
+            0
+        };
+        let mut pos_slice = chunk.mutable_slice(0);
+        for i in 0..count {
+            let Some(p_raw) = pos_slice.get_ptr_mut(i) else {
+                return FfiResult::NULL_POINTER;
+            };
+            let p_ptr = p_raw as *mut c_void;
+            let px = unsafe { (pos_vt.get_x)(p_ptr) };
+            if let Some(v_base) = opt_vel_ptr {
+                if !vel_vt_ptr.is_null() {
+                    let vel_vt = unsafe { &*vel_vt_ptr };
+                    let v_ptr = unsafe { v_base.add(i * vel_stride) } as *const c_void;
+                    let vx = unsafe { (vel_vt.get_x)(v_ptr) };
+                    unsafe { (pos_vt.set_x)(p_ptr, px + vx * scale) };
+                    opt_vel_delta += 1;
+                }
+            } else {
+                unsafe { (pos_vt.set_x)(p_ptr, px + 1.0 * scale) };
+            }
+            matched_delta += 1;
+
+            if i < entities_copy.len() && !cmd_queue.is_null() {
+                let _ = cmd_queue.remove_component(entities_copy[i], c"Phase4Removable");
+            }
+        }
+    }
+
+    if matched_delta > 0 || opt_vel_delta > 0 {
+        let Some(res_mut) = chunk_iter.resource_mut::<Phase4RustRes>(c"Phase4RustRes") else {
+            return FfiResult::INVALID_COMPONENT;
+        };
+        res_mut.matched_rows += matched_delta;
+        res_mut.optional_vel_hits += opt_vel_delta;
+    }
+
+    FfiResult::OK
+}
+
+wrap_run_condition!(fn c_rust_phase4_run_if calls rust_phase4_run_if);
+wrap_system_callback!(fn c_rust_phase4_ecs_system calls rust_phase4_ecs_system);
+
 // ============================================================================
 // 4. Mod Lifecycle (Scenario 6)
 // ============================================================================
@@ -586,6 +714,45 @@ fn mod_init(
         return custom_status;
     }
 
+    // Register System 7 (Phase 3 + Phase 4): Optional + Changed + Added + Resource + run_if
+    let phase4_res_sym = unsafe { (get_proc_address)(c"Phase4RustRes_vtable".as_ptr()) };
+    let phase4_tf_sym = unsafe { (get_proc_address)(c"Phase4Transform_vtable".as_ptr()) };
+    if !phase4_res_sym.is_null() && !phase4_tf_sym.is_null() {
+        let bridges_ptr = Box::into_raw(Box::new(Phase4BridgeState {
+            pos_vt: phase4_tf_sym as *const PositionVTable,
+            cmd_ext: CommandBridgeVTableExt::resolve(get_proc_address),
+            res_vt: ResourceBridgeVTable::resolve(get_proc_address),
+        }));
+        if let Ok(mut list) = ALLOCATED_PHASE4_BRIDGES.lock() {
+            list.push(bridges_ptr as usize);
+        }
+
+        let p4_queries = [
+            ComponentAccessDesc::write(c"Phase4Transform".as_ptr()),
+            ComponentAccessDesc::optional_read(c"Velocity".as_ptr()),
+            ComponentAccessDesc::changed(c"Phase4Sensor".as_ptr()),
+            ComponentAccessDesc::added(c"Phase4FreshTag".as_ptr()),
+            ComponentAccessDesc::resource_write(c"Phase4RustRes".as_ptr()),
+        ];
+        let base_desc = SystemDescriptor::new(
+            c"rust_phase4_ecs_system".as_ptr(),
+            p4_queries.as_ptr(),
+            p4_queries.len(),
+            c_rust_phase4_ecs_system,
+            bridges_ptr as *mut c_void,
+        );
+        let cond_desc = base_desc.with_run_if(c_rust_phase4_run_if, core::ptr::null_mut());
+        let p4_status = if let Some(reg_cond) = resolve_register_conditional_system(get_proc_address)
+        {
+            unsafe { reg_cond(host_context, &cond_desc) }
+        } else {
+            unsafe { (api.register_system)(host_context, cond_desc.as_base_ptr()) }
+        };
+        if p4_status.is_err() {
+            return p4_status;
+        }
+    }
+
     // Register System 5: Panicking
     let panic_desc = SystemDescriptor {
         struct_size: core::mem::size_of::<SystemDescriptor>() as u32,
@@ -601,10 +768,20 @@ fn mod_init(
 fn mod_shutdown(_host_context: *mut c_void) -> FfiResult {
     SHUTDOWN_CALLED.store(true, Ordering::SeqCst);
     PANIC_TRIGGER.store(false, Ordering::SeqCst);
+    PHASE4_RUST_RUN_ENABLED.store(true, Ordering::SeqCst);
 
     if let Ok(mut list) = ALLOCATED_CMD_VTABLES.lock() {
         for ptr_usize in list.drain(..) {
             let ptr = ptr_usize as *mut CommandBridgeVTable;
+            if !ptr.is_null() {
+                // SAFETY: Allocated via Box::into_raw in mod_init; systems are deactivated prior to mod_shutdown.
+                drop(unsafe { Box::from_raw(ptr) });
+            }
+        }
+    }
+    if let Ok(mut list) = ALLOCATED_PHASE4_BRIDGES.lock() {
+        for ptr_usize in list.drain(..) {
+            let ptr = ptr_usize as *mut Phase4BridgeState;
             if !ptr.is_null() {
                 // SAFETY: Allocated via Box::into_raw in mod_init; systems are deactivated prior to mod_shutdown.
                 drop(unsafe { Box::from_raw(ptr) });
