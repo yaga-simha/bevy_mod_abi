@@ -138,7 +138,7 @@ GameScore* score     = (GameScore*)api->res_mut_ptr(iter, 3);
    - `res_ptr(iter, term_index)` returns `*const u8` if `term_index < term_count` and `mode` is `RESOURCE_READ` or `RESOURCE_WRITE` (and the resource exists in the `World`); otherwise returns `core::ptr::null()`.
    - `res_mut_ptr(iter, term_index)` returns `*mut u8` **only** if `mode == RESOURCE_WRITE`, marking the resource's Bevy change tick (`Tick`) on first mutable fetch in that run; calling `res_mut_ptr` on a `RESOURCE_READ` or entity column term returns `core::ptr::null()`.
 4. **Resource-Only Queries:** If **every** term in `BamQueryDesc` has `mode` in `{RESOURCE_READ, RESOURCE_WRITE}`, `HostIter` represents a singleton resource bundle: `res_ptr` / `res_mut_ptr` are immediately valid upon `sys_query(sys_ctx, query_idx, &mut iter)` without calling `iter_next_chunk` (`iter_next_chunk` returns `FfiBool::FALSE`).
-5. **Type-Confusion Introspection (`C-13`):** `iter_column_info(iter, term_index, &mut info)` works uniformly for both entity component terms and resource terms (setting `BAM_STORAGE_FLAG_RESOURCE` in `info.storage_flags`), allowing `bevy_abi_mod_guest` to assert `info.uuid == R::UUID` before casting `*const u8` to `&R` (`S-01`).
+5. **Type-Confusion Introspection (`C-13`, `S-03`):** `iter_column_info(iter, term_index, &mut info)` works uniformly for both entity component terms and resource terms (setting `BAM_STORAGE_FLAG_RESOURCE` in `info.storage_flags`), allowing `bevy_abi_mod_guest` to assert `info.uuid == R::UUID` (`R: AbiPod + GuestComponent`) before casting `*const u8` to `&R`.
 
 ---
 

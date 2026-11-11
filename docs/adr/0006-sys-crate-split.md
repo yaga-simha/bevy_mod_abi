@@ -13,9 +13,9 @@ In v0.1, the workspace consisted of four crates (`abi_contract`, `mod_derive`, `
 
 1. **Unbounded `unsafe` audit surface:** `host_runtime` mixed raw `UnsafeWorldCell` pointer arithmetic, `OwningPtr` construction, `libloading` `dlsym` casts, and `extern "C"` callbacks in the same crate as high-level Bevy `Plugin`, `App` extensions, and `SystemSet` types. Similarly, `guest_sdk` mixed `extern "C"` trampolines and `slice::from_raw_parts_mut` inside high-level user iterator types (`Chunk`, `SystemContext`). Neither public crate could enforce `#![forbid(unsafe_code)]`.
 2. **Soundness gaps in safe guest APIs (`S-01`, `S-02`, `S-03`):**
-   - `Chunk::components::<u64>(col)` in safe Rust trusted `size` and `align` without verifying component `ComponentUuid` (`S-01`, `C-13`), enabling safe-Rust type confusion (`f64` -> `NonZeroU64` / pointer-like bit patterns).
-   - `Chunk::components_mut::<T>(0)` took `&self` instead of tracking per-column dynamic borrows, allowing safe guest code to obtain two simultaneous `&mut [T]` slices to the same column (`S-02` — immediate aliasing UB!).
-   - Safe `MultiQueryContext` / `GuestChunkIter::reset` allowed re-entering or advancing an iterator while a `ChunkSlice` from the previous chunk was still alive (`S-03`).
+   - **Safe constructors over raw pointers (`S-01`):** Public `pub fn` constructors (`GuestChunkIter::new` / `with_reset` / `with_bridges`, `GuestCommandQueue::new` / `with_ext`, `ChunkSlice::new`, `ChunkSliceMut::new`) stored caller-supplied raw pointers in safe Rust that subsequent safe methods dereferenced (`ChunkSlice::new(0x1234 as _, 4, 1).as_typed_slice::<u32>()` -> immediate UB in 100% safe Rust).
+   - **Caller-supplied `count` on safe iterator slice methods (`S-02`):** Safe `GuestChunkIter` methods (`entities_slice(count)`, `readonly_slice(index, count)`, `mutable_slice(index, count)`, `split_slices(.., count)`, `columns_mut`, `read_write`, `write_2`, `optional_*`) trusted an unvalidated caller-provided `count`, allowing safe code to materialize out-of-bounds slices (`1 << 20` elements over a 3-entity chunk).
+   - **`T: Copy` bounds instead of `T: AbiPod` (`S-03`):** Typed views (`ChunkSlice::as_typed_slice`, `ChunkSliceMut::as_typed_slice` / `into_typed_slice`, `Chunk::column`, `read_write`), `resource<R>`, and `insert_slice` / `insert_value` / `insert_runtime_component` bounded `T: Copy` rather than `T: AbiPod`, allowing `bool`, `char`, `NonZeroU32`, `&'static T`, and fieldless enums to be constructed from arbitrary host bytes in safe Rust.
 3. **Leaked FFI internals in public rustdoc (`H-05`, `G-04`):** `host_runtime` publicly exported `host_*` C functions, `HostChunkIter`, `CURRENT_REGISTRY`, and `GLOBAL_SYMBOLS`, while `guest_sdk` duplicated raw command `extern "C" fn` typedefs instead of sharing them from the ABI crate (`G-04`).
 
 ---
@@ -68,7 +68,7 @@ flowchart TD
 
 | Crate | `#![no_std]` | `#![forbid(unsafe_code)]` | `bevy*` Allowed? | Allowed Dependencies & Core Responsibility |
 |---|---|---|---|---|
-| **`bevy_abi_mod_sys`** | **Yes** | No (`unsafe trait`, `FfiSlice::as_slice`, `read_extensible_struct`) | **NEVER** | **Zero external dependencies.** Pure `#[repr(C)]` ABI v0.2 types (`BamManifest`, `BamHostApi`, `BamSystemDesc`, `BamQueryDesc`, `BamTermDesc`, `ComponentDesc`, `BamColumnInfo`, `VTableHeader`), `FfiResult`, `FfiBool`, `FfiEntity`, `BamComponent`, `ComponentUuid`, `ExtensibleStruct`, and `unsafe` traits `AbiPod` + `RawInsertable`. |
+| **`bevy_abi_mod_sys`** | **Yes** | No (`unsafe trait`, `FfiSlice::as_slice`, `read_extensible_struct`) | **NEVER** | **Zero external dependencies.** Pure `#[repr(C)]` ABI v0.2 types (`BamManifest`, `BamHostApi`, `BamSystemDesc`, `BamQueryDesc`, `BamTermDesc`, `ComponentDesc`, `BamColumnInfo`, `VTableHeader`), `FfiResult`, `FfiBool`, `FfiEntity`, `BamComponent`, `ComponentUuid`, `ExtensibleStruct`, safe metadata trait `ModComponent`, and `unsafe` traits `AbiPod` + `RawInsertable`. |
 | **`bevy_abi_mod_macros`** | N/A (`proc-macro`) | Yes (proc-macro host code uses zero `unsafe`) | **NEVER** | `syn`, `quote`, `proc-macro2`, `proc-macro-crate`. Implements `#[derive(ModComponent)]` (host component VTable + raw ops codegen) and `#[derive(AbiPod)]` (shared by both host and guest via zero-Bevy dependency!). |
 | **`bevy_abi_mod_host_sys`** | No (`std`) | No (100% of host `unsafe` lives here; `#![deny(unsafe_op_in_unsafe_fn)]`) | **Yes** (`bevy_ecs`, `bevy_app`) | `bevy_ecs`, `bevy_app`, `libloading`, `arc-swap`, `tracing`, `bevy_abi_mod_sys`. Implements `HOST_API` (`extern "C"` functions), `HostIter` (`UnsafeWorldCell` dense/sparse chunk iteration), `HostCommands` (`CommandArena`, `OwningPtr`), `GuestSystem` (`System` impl, `FilteredAccessSet`), `DROP_SLOTS` (`ADR 0001`), `ModRegistry` (`ADR 0003`), and `ModHost` (`ADR 0005`). Exposes **safe** soundness-encapsulated functions to `bevy_abi_mod_host`. |
 | **`bevy_abi_mod_host`** | No (`std`) | **YES (`#![forbid(unsafe_code)]`)** | **Yes** (`bevy_ecs`, `bevy_app`) | `bevy_app`, `bevy_ecs`, `bevy_abi_mod_host_sys`, `bevy_abi_mod_sys`, `bevy_abi_mod_macros`. Public Bevy plugin (`AbiModPlugin`, `ConfiguredAbiModPlugin`), `ModAppExt`, `ModWorldExt`, `ModCommandsExt`, lifecycle `Message`s (`ModLoaded`, `ModUnloaded`, `ModSystemFaulted`), `ModNamedSystemSet`, `ModSystemSet`, `LoadOptions`, `ModErrorPolicy`, and `prelude`. |
@@ -80,25 +80,40 @@ flowchart TD
 
 ### 2.3 Key Boundary Design Patterns
 
-#### 1. Safe Registration Bridge Between `bevy_abi_mod_host` and `bevy_abi_mod_host_sys`
-Because `bevy_abi_mod_host` enforces `#![forbid(unsafe_code)]`, it cannot write `unsafe { ... }` blocks when registering host components or unloading mods. Instead, `bevy_abi_mod_host_sys` exposes safe entry points whose soundness preconditions are discharged by Rust's type system:
+#### 1. `ModComponent` Placement in `bevy_abi_mod_sys` & Safe Host Registration Bridge (`N-02`, `B-01`)
+`ModComponent` (replacing `ExposableComponent`) lives in **`bevy_abi_mod_sys`** with `: Sized + 'static` — **not** in `bevy_abi_mod_host_sys` and **without** `bevy_ecs::component::Component`, `RawInsertable`, or `Default` supertraits:
+- Components containing `String`, `Vec<T>`, `bool`, `#[mod_field(skip)]`, or `#[mod_component(opaque)]` are **not** `RawInsertable` (`IS_ABI_POD = false`, `IS_RAW_INSERTABLE = false`), yet must still expose VTable accessors via `#[derive(ModComponent)]`.
+- `Default` is strictly optional (`ComponentOptions::with_default()` in `B-01`).
+- Nested non-ECS sub-structs and `bevy_abi_mod_macros` remain 100% Bevy-free.
+
+Because `bevy_abi_mod_host` enforces `#![forbid(unsafe_code)]`, `bevy_abi_mod_host_sys` exposes safe registration and lifecycle functions whose soundness preconditions are discharged by trait bounds only on the specific capability being enabled:
 
 ```rust
-// In `bevy_abi_mod_host_sys`:
-/// Implemented by `#[derive(ModComponent)]` (generated code lives in the user's crate or
-/// invokes `bevy_abi_mod_host_sys::ComponentRegistration::for_pod::<Self>()`).
-pub trait ModComponent: bevy_ecs::component::Component + RawInsertable + Default {
+// In `bevy_abi_mod_sys` (zero Bevy dependencies):
+pub trait ModComponent: Sized + 'static {
     const CANONICAL_NAME: &'static str;
+    const COMPONENT_CSTR: &'static core::ffi::CStr;
     const UUID: ComponentUuid;
-    fn vtable_ptr() -> Option<(&'static str, *const core::ffi::c_void)>;
+    const IS_ABI_POD: bool = false;
+    const IS_RAW_INSERTABLE: bool = false;
+    type VTable: Copy + 'static;
+    fn vtable() -> &'static Self::VTable;
+    fn symbols() -> &'static [SymbolEntry];
 }
 
-pub fn register_host_component<T: ModComponent>(world: &mut bevy_ecs::world::World);
-pub fn register_host_resource<R: bevy_ecs::resource::Resource + RawInsertable>(
+// In `bevy_abi_mod_host_sys` (bounds `Component + ModComponent`; `RawInsertable` / `Default`
+// are required ONLY on the opt-in `ComponentOptions` capability builders per `B-01`):
+pub struct ComponentOptions<T> { /* ... */ }
+impl<T: bevy_ecs::component::Component + ModComponent> ComponentOptions<T> {
+    pub const fn new() -> Self { /* VTable / opaque / marker registration */ }
+    pub fn with_raw_insert(self) -> Self where T: RawInsertable { /* enables cmd_insert / cmd_spawn */ }
+    pub fn with_default(self) -> Self where T: Default { /* enables cmd_insert_default */ }
+}
+
+pub fn register_host_component<T: bevy_ecs::component::Component + ModComponent>(
     world: &mut bevy_ecs::world::World,
-    canonical_name: &'static str,
-    uuid: ComponentUuid,
-);
+    options: ComponentOptions<T>,
+) -> Result<BamComponent, ModLoadError>;
 pub fn load_mod_into_world(
     world: &mut bevy_ecs::world::World,
     path: &std::path::Path,
@@ -112,15 +127,17 @@ pub fn unload_mod_from_world(
 
 `bevy_abi_mod_host`'s `ModAppExt`, `ModWorldExt`, and `ModCommandsExt` call these functions in 100% safe Rust.
 
-#### 2. Closing the Safe-Rust Soundness Loops in `bevy_abi_mod_guest_sys` (`S-01`, `S-02`, `S-03`)
-To enforce `#![forbid(unsafe_code)]` on `bevy_abi_mod_guest` truthfully (not merely hiding unsound casts inside `bevy_abi_mod_guest_sys`!), `bevy_abi_mod_guest_sys` enforces three runtime + lifetime invariants before returning any safe reference:
+#### 2. Closing the Safe-Rust Soundness Loops Across `bevy_abi_mod_guest_sys` & `bevy_abi_mod_guest` (`S-01`, `S-02`, `S-03`, `C-13`)
+To enforce `#![forbid(unsafe_code)]` on `bevy_abi_mod_guest` truthfully (not merely moving unsound functions into `bevy_abi_mod_guest_sys`), the guest boundary enforces:
 
-1. **UUID & Layout Verification (`S-01`, `C-13`):**
-   `ValidatedQueryIter` queries `iter_column_info(iter, term_idx, &mut info)` once when the query starts (cached across chunks for the run) and verifies `info.uuid == T::UUID && info.size == size_of::<T>() && info.align == align_of::<T>()` where `T: AbiPod + GuestComponent`. Mismatches return `None` / `Err(FfiResult::TYPE_MISMATCH)` before `slice::from_raw_parts` is ever called.
-2. **Per-Column Dynamic Borrow Tracking (`S-02`):**
-   `RawChunkHandle<'iter>` maintains a stack `[ColumnBorrowState; MAX_TERMS_PER_QUERY]` (`Unused | Shared(u16) | Exclusive`, analogous to `RefCell` flags over `0..32` terms). Requesting `column_mut::<T>(0)` twice on the same `Chunk` panics deterministically (caught by `catch_guest_result` -> `FfiResult::PANIC_CAUGHT`) or returns `Err(BorrowError)` on `try_column_mut`, preventing `&mut [T]` aliasing UB in safe Rust!
-3. **Lifetime-Bound Chunk Exclusivity (`S-03`):**
-   `ChunkIter::next_chunk(&mut self) -> Option<Chunk<'_>>` and `ChunkIter::reset(&mut self)` take **`&mut self`**, and `SystemContext::query(&mut self, idx)` borrows the query slot exclusively (or tracks active borrows via `Cell` flags across distinct query indices `q0 != q1`), making it a compile-time borrow-checker error in safe Rust to hold a `ChunkSlice<'chunk, T>` across `next_chunk()` or `reset()`.
+1. **Raw Pointer Constructors Restricted to `unsafe` / `-sys` (`S-01`):**
+   Every constructor over raw FFI pointers (`ChunkIter`, `GuestCommands`, `ChunkSlice`, `ChunkSliceMut`) is `pub unsafe fn` (with `# Safety` invariants) inside `bevy_abi_mod_guest_sys` (or `pub(crate)` internal). `SystemContext` and `MultiQueryContext` constructed by the `bevy_abi_mod_guest_sys` system trampoline are the **only** safe entry points in `bevy_abi_mod_guest` (`grep "pub fn .*\*(const|mut)" crates/bevy_abi_mod_guest/src` returns empty).
+2. **Iterator-Tracked `current_len` Replacing Caller `count` (`S-02`):**
+   `ChunkIter` tracks `current_len: usize` internally — populated from `iter_next_chunk` and reset to `0` on `reset()` and exhaustion. Every `count` parameter is removed from safe slice/column methods (any explicit-count raw escape hatch lives in `bevy_abi_mod_guest_sys` as `pub unsafe fn *_unchecked`).
+3. **Strict `T: AbiPod` Bounds (`S-03`):**
+   Every typed column slice (`ChunkSlice::as_typed_slice`, `ChunkSliceMut::as_typed_slice` / `into_typed_slice`, `Chunk::column`, `read_write`), `resource<R>`, and raw command insertion method (`insert_slice`, `insert_value`, `insert_runtime_component`) replaces `T: Copy` with `T: AbiPod`. `GuestComponent` requires `: AbiPod`, and `bevy_abi_mod_guest`'s optional `derive` feature re-exports `bevy_abi_mod_macros::AbiPod` so `chunk.column::<bool>(0)` fails at compile time.
+4. **Runtime UUID Introspection (`C-13`) & Aliasing Guards:**
+   In Wave 2/3, `iter_column_info(iter, term_idx, &mut info)` (`C-13`) additionally checks `info.uuid == T::UUID && info.size == size_of::<T>() && info.align == align_of::<T>()` when `T: GuestComponent` (returning `None` on component type confusion), while `&mut self` chunk progression and disjoint column borrow checks prevent aliasing `&mut [T]` slices.
 
 #### 3. Explicit Native DLL Trust Model (`D-02`)
 `#![forbid(unsafe_code)]` in `bevy_abi_mod_host` and `bevy_abi_mod_guest` guarantees:

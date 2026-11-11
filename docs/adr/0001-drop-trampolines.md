@@ -142,8 +142,14 @@ unsafe fn drop_trampoline<const SLOT: usize>(owning_ptr: OwningPtr<'_>) {
     //    `World` is already mid-drop (`SLOT_CLOSING`).
     let prev = DROP_META[SLOT].live_values.fetch_sub(1, Ordering::AcqRel);
     debug_assert!(prev >= 1, "live_values underflow on drop slot {SLOT}");
-    if prev == 1 && DROP_META[SLOT].state.load(Ordering::Acquire) == SLOT_CLOSING {
-        reclaim_closed_slot(SLOT);
+    if prev == 1 {
+        // Pair `SeqCst` fence on the final element drop (zero `SeqCst` cost when `prev > 1`)
+        // with `SeqCst` store + load in `WorldDropSlotGuard::drop` to prevent Dekker
+        // store-buffering reordering under weak memory models (`T-07` loom check).
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if DROP_META[SLOT].state.load(Ordering::SeqCst) == SLOT_CLOSING {
+            reclaim_closed_slot(SLOT);
+        }
     }
 }
 ```
@@ -172,8 +178,8 @@ To eliminate this race unconditionally, slot reclamation uses a **two-condition 
 3. **World Teardown (`WorldDropSlotGuard::drop`):**
    For each `slot` owned by the `World`:
    - Disarms all `is_active` flags (`Ordering::Release`) and calls `DROP_SLOTS[slot].store(None)` so remaining `tables[M]` drops become safe no-ops rather than calling into `dlclose`d code (`ModHost` also disarms before dropping `Library`).
-   - Sets `DROP_META[slot].state.store(SLOT_CLOSING, Ordering::Release)`.
-   - Reads `DROP_META[slot].live_values.load(Ordering::Acquire)` (paired with `SeqCst` / `AcqRel` fence):
+   - Sets `DROP_META[slot].state.store(SLOT_CLOSING, Ordering::SeqCst)` (cold teardown path).
+   - Reads `DROP_META[slot].live_values.load(Ordering::SeqCst)` (paired with `drop_trampoline::<SLOT>`'s `prev == 1` `fence(Ordering::SeqCst)` + `state.load(Ordering::SeqCst)` so Dekker store-buffering reordering is impossible under `T-07` `loom`):
      - If `live_values == 0`, no `tables[M]` holds any instance for `slot`, so `reclaim_closed_slot(slot)` transitions `SLOT_CLOSING -> SLOT_FREE` and pushes `slot` back to `DropSlotFreeList` immediately.
      - If `live_values > 0`, `WorldDropSlotGuard::drop` leaves `slot` in `SLOT_CLOSING`. Seconds or nanoseconds later within the same `World::drop`, `Storages` drops `tables[M]`, invoking `drop_trampoline::<SLOT>` for the remaining instances; the final decrement (`prev == 1`) observes `SLOT_CLOSING` and calls `reclaim_closed_slot(slot)`.
 
