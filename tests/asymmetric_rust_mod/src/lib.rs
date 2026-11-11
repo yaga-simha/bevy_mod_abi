@@ -4,9 +4,10 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use guest_sdk::{
-    export_mod, wrap_system_callback, CommandBridgeVTable, ComponentAccessDesc,
-    ComponentAccessMode, FfiEntity, FfiResult, GetProcAddressFn, GuestCommandQueue,
-    HostApi, RawChunkIter, RawCommandQueue, StrView, SystemDescriptor,
+    export_mod, register_runtime_component, wrap_system_callback, CommandBridgeVTable,
+    ComponentAccessDesc, ComponentAccessMode, FfiEntity, FfiResult, GetProcAddressFn,
+    GuestChunkIter, GuestCommandQueue, HostApi, RawChunkIter, RawCommandQueue, StrView,
+    SystemDescriptor,
 };
 
 // ============================================================================
@@ -53,6 +54,21 @@ pub struct MetadataTagVTable {
     pub align: usize,
     pub get_label: unsafe extern "C" fn(*const c_void) -> StrView,
     pub set_label: unsafe extern "C" fn(*mut c_void, *const u8, usize),
+}
+
+// ============================================================================
+// 1b. Dynamic Runtime Component Definitions (Milestone 3)
+// ============================================================================
+
+/// Milestone 3: Dynamic runtime component defined purely by the guest mod.
+///
+/// This component is not known to the host application at compile time.
+/// It is registered dynamically with Bevy ECS during `mod_init` via `register_runtime_component`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RustModCustomData {
+    pub power: f32,
+    pub shield: u32,
 }
 
 // ============================================================================
@@ -331,6 +347,20 @@ unsafe fn rust_command_system(
         return insert_res;
     }
 
+    // Insert dynamic runtime component via typed helper (Milestone 3)
+    let custom_data = RustModCustomData {
+        power: 42.0,
+        shield: 100,
+    };
+    let insert_custom_res = cmd_queue.insert_runtime_component(
+        new_entity,
+        c"RustModCustomData",
+        &custom_data,
+    );
+    if insert_custom_res.is_err() {
+        return insert_custom_res;
+    }
+
     let despawn_res = cmd_queue.despawn(new_entity);
     if despawn_res.is_err() {
         return despawn_res;
@@ -351,11 +381,58 @@ unsafe fn rust_panicking_system(
     FfiResult::OK
 }
 
+// --- Scenario 7: Dynamic Runtime Component Mutation System (Milestone 3) ---
+unsafe fn rust_custom_system(
+    iter: *mut RawChunkIter,
+    _commands: *mut RawCommandQueue,
+    _user_data: *mut c_void,
+) -> FfiResult {
+    if iter.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    let host_api_ptr = HOST_API_PTR.load(Ordering::Acquire);
+    if host_api_ptr.is_null() {
+        return FfiResult::INTERNAL_ERROR;
+    }
+
+    let api = unsafe { &*host_api_ptr };
+    let mut chunk_iter = GuestChunkIter::new(iter, api);
+
+    loop {
+        let count = chunk_iter.next_chunk();
+        if count == 0 {
+            break;
+        }
+
+        {
+            let mut slice = chunk_iter.mutable_slice(0, count);
+            let Some(items) = slice.as_typed_slice::<RustModCustomData>() else {
+                return FfiResult::INTERNAL_ERROR;
+            };
+
+            for item in items.iter_mut() {
+                item.power += 10.0;
+                item.shield += 1;
+            }
+        }
+
+        for i in 0..count {
+            let mark_res = chunk_iter.mark_changed(0, i);
+            if mark_res.is_err() {
+                return mark_res;
+            }
+        }
+    }
+
+    FfiResult::OK
+}
+
 wrap_system_callback!(fn c_rust_kinematics calls rust_kinematics_system);
 wrap_system_callback!(fn c_rust_combat calls rust_combat_system);
 wrap_system_callback!(fn c_rust_metadata calls rust_metadata_system);
 wrap_system_callback!(fn c_rust_command calls rust_command_system);
 wrap_system_callback!(fn c_rust_panicking calls rust_panicking_system);
+wrap_system_callback!(fn c_rust_custom_system calls rust_custom_system);
 
 // ============================================================================
 // 4. Mod Lifecycle (Scenario 6)
@@ -373,6 +450,18 @@ fn mod_init(
         return FfiResult::NULL_POINTER;
     }
     HOST_API_PTR.store(host_api as *mut HostApi, Ordering::Release);
+
+    // Register Dynamic Component (Milestone 3)
+    let reg_res = unsafe {
+        register_runtime_component::<RustModCustomData>(
+            host_api,
+            host_context,
+            c"RustModCustomData",
+        )
+    };
+    if reg_res.is_err() {
+        return reg_res;
+    }
 
     // Resolve VTables with fallback naming support
     let pos_sym = unsafe { (get_proc_address)(c"Position_vtable".as_ptr()) };
@@ -494,6 +583,24 @@ fn mod_init(
         user_data: core::ptr::null_mut(),
     };
     let _ = unsafe { (api.register_system)(host_context, &spawner_desc) };
+
+    // Register System 6: Dynamic Custom Data Mutation (Milestone 3)
+    let custom_queries = [ComponentAccessDesc {
+        name: c"RustModCustomData".as_ptr(),
+        mode: ComponentAccessMode::WRITE,
+    }];
+    let custom_desc = SystemDescriptor {
+        struct_size: core::mem::size_of::<SystemDescriptor>() as u32,
+        name: c"rust_custom_system".as_ptr(),
+        queries: custom_queries.as_ptr(),
+        query_count: custom_queries.len(),
+        callback: c_rust_custom_system,
+        user_data: core::ptr::null_mut(),
+    };
+    let custom_status = unsafe { (api.register_system)(host_context, &custom_desc) };
+    if custom_status.is_err() {
+        return custom_status;
+    }
 
     // Register System 5: Panicking
     let panic_desc = SystemDescriptor {

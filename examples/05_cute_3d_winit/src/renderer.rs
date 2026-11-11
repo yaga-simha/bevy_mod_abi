@@ -11,7 +11,7 @@ use crate::components::{ColorRgba, CuteSpirit, Position, Scale3D};
 use crate::mod_manager::{ActiveMod, ModStatusResource};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-const MAX_INSTANCES: usize = 8192;
+const MAX_INSTANCES: usize = 16384;
 const MAX_UI_VERTICES: usize = 32768;
 
 #[repr(C)]
@@ -1088,8 +1088,8 @@ fn build_hud_overlay(
     // Top-left pastel card background
     let card_x = 18.0 * ui_scale;
     let card_y = 16.0 * ui_scale;
-    let card_w = 510.0 * ui_scale;
-    let card_h = 92.0 * ui_scale;
+    let card_w = 540.0 * ui_scale;
+    let card_h = 118.0 * ui_scale;
 
     let accent = status.active_mod.accent_rgb();
     push_rect(
@@ -1122,7 +1122,8 @@ fn build_hud_overlay(
         fps
     );
     let line2 = "[1] BOING (RUST)  [2] CAROUSEL (RUST)  [3] CUDDLE (C99)";
-    let line3 = format!(
+    let line3 = "[+] SPAWN (+8)    [-] REMOVE (-8)   [JELLY BOUNCE ON]";
+    let line4 = format!(
         "[R] HOT-RELOAD (#{})  [U] UNLOAD  [SPACE] PAUSE  [DRAG] ORBIT",
         status.reload_count
     );
@@ -1142,7 +1143,7 @@ fn build_hud_overlay(
         screen_w,
         screen_h,
         card_x + 14.0 * ui_scale,
-        card_y + 40.0 * ui_scale,
+        card_y + 38.0 * ui_scale,
         px,
         line2,
         [0.98, 0.96, 1.0, 0.96],
@@ -1152,9 +1153,19 @@ fn build_hud_overlay(
         screen_w,
         screen_h,
         card_x + 14.0 * ui_scale,
-        card_y + 66.0 * ui_scale,
+        card_y + 64.0 * ui_scale,
         px,
-        &line3,
+        line3,
+        [0.72, 0.95, 0.82, 0.96],
+    );
+    draw_text(
+        &mut v,
+        screen_w,
+        screen_h,
+        card_x + 14.0 * ui_scale,
+        card_y + 90.0 * ui_scale,
+        px,
+        &line4,
         [0.80, 0.88, 0.98, 0.92],
     );
 
@@ -1357,6 +1368,12 @@ fn glyph_5x7(c: char) -> [u8; 7] {
         ],
         '-' => [
             0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000,
+        ],
+        '+' => [
+            0b00000, 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0b00000,
+        ],
+        '=' => [
+            0b00000, 0b11111, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000,
         ],
         '[' => [
             0b01110, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01110,

@@ -16,6 +16,16 @@ Instead of a terminal TUI, 32 kawaii pastel bunny-slimes (complete with floppy e
 
 ---
 
+## Pairwise Jelly Collisions & Elastic Bouncing
+
+All bunny-slimes possess physical pairwise collision detection and lively jelly bounce responses:
+- **Elastic Momentum Reflection**: When two slimes bump into each other, they bounce apart with high jelly restitution ($e = 0.88$) plus a playful impulse pop.
+- **Vertical Startle Boing & Squash**: Collisions trigger an upward vertical hop (`+1.2` velocity) and non-uniform volume-preserving squash deformation.
+- **Emotional Reaction**: Upon bonking into a fellow slime, both slimes instantly blush bright rosy pink (`blush = 1.0`) and flap their floppy bunny ears!
+- **High-Capacity Instanced Rendering**: The instanced GPU pipeline comfortably supports scaling from small parties up to 1,000+ colliding slimes in real-time.
+
+---
+
 ## The 3 Cute Dynamic 3D Mods
 
 | Key | Mod | Language | Mutated Components | Cute 3D Behavior |
@@ -35,6 +45,8 @@ Instead of a terminal TUI, 32 kawaii pastel bunny-slimes (complete with floppy e
 | `1` | Load **Jelly Boing Hop** (`mod_boing`, Rust) |
 | `2` | Load **Pastel Carousel Waltz** (`mod_carousel`, Rust) |
 | `3` | Load **Cozy Cuddle Huddle** (`mod_cuddle_c99`, Pure C99) |
+| `+` / `=` / `B` | **Spawn More Slimes** (+8 bunny-slimes into the meadow) |
+| `-` | **Remove Slimes** (-8 bunny-slimes, down to 1 minimum) |
 | `R` | **Hot-Reload** active mod from disk (recompile while window is open!) |
 | `U` / `0` | **Unload** active mod (return to peaceful Meadow Stroll) |
 | `Space` | **Pause / Resume** simulation |

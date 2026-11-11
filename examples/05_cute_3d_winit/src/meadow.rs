@@ -24,7 +24,12 @@ const PASTEL_PALETTE: [ColorRgba; 6] = [
 
 /// Spawns cute slime spirits across the floating 3D meadow island.
 pub fn spawn_slimes(mut commands: Commands, count: usize) {
-    let mut seed = 0xC0FF_EE42_u32;
+    spawn_slimes_batch(&mut commands, count, 0xC0FF_EE42_u32);
+}
+
+/// Spawns a batch of cute slime spirits with a specified pseudorandom seed.
+pub fn spawn_slimes_batch(commands: &mut Commands, count: usize, seed_start: u32) {
+    let mut seed = seed_start;
     let mut next_f32 = || {
         seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
         (seed >> 8) as f32 / 16777216.0
@@ -41,7 +46,7 @@ pub fn spawn_slimes(mut commands: Commands, count: usize) {
         let vz = (next_f32() - 0.5) * 2.2;
         let yaw = vx.atan2(vz);
 
-        let base_color = PASTEL_PALETTE[i % PASTEL_PALETTE.len()];
+        let base_color = PASTEL_PALETTE[(i + (seed_start as usize)) % PASTEL_PALETTE.len()];
         let phase_offset = next_f32() * core::f32::consts::TAU;
 
         commands.spawn((
@@ -155,6 +160,118 @@ pub fn host_meadow_post_physics(
             let target_ear = 0.10 * (t * 3.4 + home.phase_offset).sin();
             spirit.ear_wiggle += (target_ear - spirit.ear_wiggle) * 0.15;
             spirit.blush += (0.42 - spirit.blush) * 0.10;
+        }
+    }
+
+    // Slime-to-slime pairwise collisions and bouncy elastic jelly reaction
+    let mut combinations = query.iter_combinations_mut();
+    while let Some([mut a, mut b]) = combinations.fetch_next() {
+        let (pos_a, vel_a, scale_a, spirit_a, _) = &mut a;
+        let (pos_b, vel_b, scale_b, spirit_b, _) = &mut b;
+
+        let dx = pos_a.x - pos_b.x;
+        let dz = pos_a.z - pos_b.z;
+        let dist_sq = dx * dx + dz * dz;
+
+        // Collision radius takes into account horizontal squash-stretch
+        let r_a = 0.46 * scale_a.x.max(0.6);
+        let r_b = 0.46 * scale_b.x.max(0.6);
+        let min_dist = r_a + r_b;
+        let min_dist_sq = min_dist * min_dist;
+
+        // Vertical overlap check (slimes can leap over each other if dy is high)
+        let dy = (pos_a.y - pos_b.y).abs();
+        let max_dy = 0.70 * (scale_a.y + scale_b.y);
+
+        if dist_sq < min_dist_sq && dy < max_dy {
+            let dist = dist_sq.sqrt();
+            let (nx, nz) = if dist > 0.0001 {
+                (dx / dist, dz / dist)
+            } else {
+                (1.0, 0.0)
+            };
+
+            // 1. Positional soft separation so slimes don't overlap/clip
+            let overlap = min_dist - dist;
+            let sep = overlap * 0.52;
+            pos_a.x += nx * sep;
+            pos_a.z += nz * sep;
+            pos_b.x -= nx * sep;
+            pos_b.z -= nz * sep;
+
+            // 2. Elastic jelly bounce & momentum exchange
+            let rel_vx = vel_a.x - vel_b.x;
+            let rel_vz = vel_a.z - vel_b.z;
+            let vn = rel_vx * nx + rel_vz * nz;
+
+            if vn < 0.0 {
+                // Moving toward each other: bounce apart!
+                let restitution = 0.88;
+                let pop_boost = 0.75; // cute boing impulse
+                let impulse = -(1.0 + restitution) * vn + pop_boost;
+
+                vel_a.x += nx * impulse * 0.5;
+                vel_a.z += nz * impulse * 0.5;
+                vel_b.x -= nx * impulse * 0.5;
+                vel_b.z -= nz * impulse * 0.5;
+            } else {
+                // Already parting: subtle repulsive nudge
+                vel_a.x += nx * 0.20;
+                vel_a.z += nz * 0.20;
+                vel_b.x -= nx * 0.20;
+                vel_b.z -= nz * 0.20;
+            }
+
+            // 3. Cute vertical boing hop & squish reaction
+            if pos_a.y < 0.25 && vel_a.y < 0.8 {
+                vel_a.y = (vel_a.y + 1.2).min(3.5);
+            }
+            if pos_b.y < 0.25 && vel_b.y < 0.8 {
+                vel_b.y = (vel_b.y + 1.2).min(3.5);
+            }
+
+            // Impact jelly squish
+            scale_a.y = (scale_a.y * 0.88).clamp(0.68, 1.35);
+            scale_b.y = (scale_b.y * 0.88).clamp(0.68, 1.35);
+
+            // 4. Emotional reaction: bright rosy cheeks & startled ear wobble!
+            spirit_a.blush = 1.0;
+            spirit_b.blush = 1.0;
+            spirit_a.ear_wiggle = (spirit_a.ear_wiggle + 0.35).clamp(-0.6, 0.6);
+            spirit_b.ear_wiggle = (spirit_b.ear_wiggle - 0.35).clamp(-0.6, 0.6);
+
+            // Keep slimes within the meadow island after collision separation
+            clamp_island_bounds(pos_a, vel_a);
+            clamp_island_bounds(pos_b, vel_b);
+        }
+    }
+}
+
+#[inline]
+fn clamp_island_bounds(pos: &mut Position, vel: &mut Velocity) {
+    let r_out = (pos.x * pos.x + pos.z * pos.z).sqrt();
+    if r_out > MEADOW_RADIUS {
+        let nx = pos.x / r_out;
+        let nz = pos.z / r_out;
+        pos.x = nx * MEADOW_RADIUS;
+        pos.z = nz * MEADOW_RADIUS;
+        let dot = vel.x * nx + vel.z * nz;
+        if dot > 0.0 {
+            vel.x -= 1.8 * dot * nx;
+            vel.z -= 1.8 * dot * nz;
+        }
+    }
+    let r_in_sq = pos.x * pos.x + pos.z * pos.z;
+    if r_in_sq < 1.35 * 1.35 && r_in_sq > 0.0001 {
+        let r = r_in_sq.sqrt();
+        let nx = pos.x / r;
+        let nz = pos.z / r;
+        pos.x = nx * 1.35;
+        pos.z = nz * 1.35;
+        let dot = vel.x * nx + vel.z * nz;
+        if dot < 0.0 {
+            vel.x -= 1.8 * dot * nx;
+            vel.z -= 1.8 * dot * nz;
         }
     }
 }

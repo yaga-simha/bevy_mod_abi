@@ -3,7 +3,7 @@
 
 mod common;
 
-use abi_contract::{RawChunkIter, RawCommandQueue};
+use abi_contract::{ComponentUuid, RawChunkIter, RawCommandQueue};
 use bevy_app::{App, Update};
 use bevy_ecs::entity::Entity;
 use bevy_ecs::prelude::{ResMut, Resource};
@@ -407,6 +407,257 @@ fn test_change_detection_position_and_combat_health() {
     app.unload_mod(c_id).unwrap();
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct RustModCustomData {
+    pub power: f32,
+    pub shield: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct CModCustomData {
+    pub mana: f32,
+    pub level: i32,
+}
+
+/// Scenario 6: Milestone 3 Multi-Language Dynamic Component Lifecycle & Concurrency Test.
+///
+/// Verifies:
+/// 1. Host loads both `asymmetric_rust_mod` and `asymmetric_c_mod`.
+/// 2. Host verifies both `RustModCustomData` and `CModCustomData` are dynamically registered in `ModRegistry`.
+/// 3. Host spawns entities possessing dynamic components (RustModCustomData, CModCustomData, and both on a shared entity).
+/// 4. `app.update()` runs:
+///    - Rust system mutates `power += 10.0`, `shield += 1` on matching entities.
+///    - C99 system mutates `mana += 5.0f`, `level += 1` on matching entities.
+///    - Single entity with both components receives mutations from both foreign systems in the same tick.
+/// 5. Change detection: entity component change ticks reflect the mutation tick.
+/// 6. Mod unloading: unloading mods cleanly deactivates foreign systems, leaves component table data intact,
+///    prevents further mutations on subsequent ticks, and despawning post-unload produces zero segfaults.
+#[test]
+fn test_milestone_3_dynamic_components_multilanguage() {
+    let (rust_dylib, c_dylib) = ensure_guest_mods_built();
+    reset_rust_mod_panic(&rust_dylib);
+
+    let mut app = App::new();
+    app.add_plugins(AbiModPlugin);
+
+    // 1. Load both mods
+    let rust_mod_id = app
+        .load_mod_tracked(&rust_dylib)
+        .expect("Failed to load asymmetric_rust_mod");
+    let c_mod_id = app
+        .load_mod_tracked(&c_dylib)
+        .expect("Failed to load asymmetric_c_mod");
+
+    // 2. Verify ModRegistry dynamic component metadata
+    let (rust_comp_id, c_comp_id) = {
+        let registry = app.world().resource::<ModRegistry>();
+
+        let rust_meta = registry
+            .get_by_name("RustModCustomData")
+            .expect("RustModCustomData must be registered in ModRegistry");
+        assert_eq!(rust_meta.size, 8);
+        assert_eq!(rust_meta.align, 4);
+        assert_eq!(rust_meta.uuid, ComponentUuid::from_name("RustModCustomData"));
+        assert!(rust_meta.is_dynamic);
+
+        let c_meta = registry
+            .get_by_name("CModCustomData")
+            .expect("CModCustomData must be registered in ModRegistry");
+        assert_eq!(c_meta.size, 8);
+        assert_eq!(c_meta.align, 4);
+        assert_eq!(c_meta.uuid, ComponentUuid::from_name("CModCustomData"));
+        assert!(c_meta.is_dynamic);
+
+        (rust_meta.component_id, c_meta.component_id)
+    };
+
+    // 3. Spawn entities with dynamic components
+    // Entity 1: Rust dynamic component only
+    let e_rust = {
+        let e = app.world_mut().spawn_empty().id();
+        let init_data = RustModCustomData {
+            power: 100.0,
+            shield: 50,
+        };
+        let mut entity_mut = app.world_mut().entity_mut(e);
+        bevy_ptr::OwningPtr::make(init_data, |ptr| {
+            entity_mut.insert_by_id(rust_comp_id, ptr);
+        });
+        e
+    };
+
+    // Entity 2: C dynamic component only
+    let e_c = {
+        let e = app.world_mut().spawn_empty().id();
+        let init_data = CModCustomData {
+            mana: 25.0,
+            level: 3,
+        };
+        let mut entity_mut = app.world_mut().entity_mut(e);
+        bevy_ptr::OwningPtr::make(init_data, |ptr| {
+            entity_mut.insert_by_id(c_comp_id, ptr);
+        });
+        e
+    };
+
+    // Entity 3: BOTH dynamic components on a shared entity (multi-language heterogeneous archetype)
+    let e_both = {
+        let e = app.world_mut().spawn_empty().id();
+        let init_rust = RustModCustomData {
+            power: 200.0,
+            shield: 10,
+        };
+        let init_c = CModCustomData {
+            mana: 50.0,
+            level: 7,
+        };
+        let mut entity_mut = app.world_mut().entity_mut(e);
+        bevy_ptr::OwningPtr::make(init_rust, |ptr| {
+            entity_mut.insert_by_id(rust_comp_id, ptr);
+        });
+        bevy_ptr::OwningPtr::make(init_c, |ptr| {
+            entity_mut.insert_by_id(c_comp_id, ptr);
+        });
+        e
+    };
+
+    // Record initial change ticks prior to system execution
+    let initial_rust_tick = app.world().entity(e_rust).get_change_ticks_by_id(rust_comp_id).unwrap().changed;
+    let initial_c_tick = app.world().entity(e_c).get_change_ticks_by_id(c_comp_id).unwrap().changed;
+    let initial_both_rust_tick = app.world().entity(e_both).get_change_ticks_by_id(rust_comp_id).unwrap().changed;
+    let initial_both_c_tick = app.world().entity(e_both).get_change_ticks_by_id(c_comp_id).unwrap().changed;
+
+    // 4. Execute 1 tick of the Bevy schedule
+    app.update();
+
+    let frame1_tick = app.world().change_tick();
+
+    // Verify mutations on Entity 1 (RustModCustomData: power +10.0, shield +1)
+    {
+        let entity_ref = app.world().entity(e_rust);
+        let ptr = entity_ref.get_by_id(rust_comp_id).expect("e_rust must have RustModCustomData");
+        let data = unsafe { *(ptr.as_ptr() as *const RustModCustomData) };
+        assert_eq!(
+            data,
+            RustModCustomData {
+                power: 110.0,
+                shield: 51,
+            },
+            "Rust mod must increment power by 10.0 and shield by 1"
+        );
+        let ticks = entity_ref.get_change_ticks_by_id(rust_comp_id).unwrap();
+        assert_eq!(ticks.changed, frame1_tick, "Rust dynamic component must be marked changed in frame 1");
+        assert!(ticks.changed > initial_rust_tick);
+    }
+
+    // Verify mutations on Entity 2 (CModCustomData: mana +5.0f, level +1)
+    {
+        let entity_ref = app.world().entity(e_c);
+        let ptr = entity_ref.get_by_id(c_comp_id).expect("e_c must have CModCustomData");
+        let data = unsafe { *(ptr.as_ptr() as *const CModCustomData) };
+        assert_eq!(
+            data,
+            CModCustomData {
+                mana: 30.0,
+                level: 4,
+            },
+            "C99 mod must increment mana by 5.0 and level by 1"
+        );
+        let ticks = entity_ref.get_change_ticks_by_id(c_comp_id).unwrap();
+        assert_eq!(ticks.changed, frame1_tick, "C99 dynamic component must be marked changed in frame 1");
+        assert!(ticks.changed > initial_c_tick);
+    }
+
+    // Verify mutations on Entity 3 (Shared archetype mutated by BOTH Rust and C99 systems)
+    {
+        let entity_ref = app.world().entity(e_both);
+
+        let ptr_rust = entity_ref.get_by_id(rust_comp_id).expect("e_both must have RustModCustomData");
+        let data_rust = unsafe { *(ptr_rust.as_ptr() as *const RustModCustomData) };
+        assert_eq!(
+            data_rust,
+            RustModCustomData {
+                power: 210.0,
+                shield: 11,
+            },
+            "Shared entity Rust component must be mutated by Rust mod"
+        );
+
+        let ptr_c = entity_ref.get_by_id(c_comp_id).expect("e_both must have CModCustomData");
+        let data_c = unsafe { *(ptr_c.as_ptr() as *const CModCustomData) };
+        assert_eq!(
+            data_c,
+            CModCustomData {
+                mana: 55.0,
+                level: 8,
+            },
+            "Shared entity C component must be mutated by C99 mod"
+        );
+
+        let ticks_rust = entity_ref.get_change_ticks_by_id(rust_comp_id).unwrap();
+        let ticks_c = entity_ref.get_change_ticks_by_id(c_comp_id).unwrap();
+        assert_eq!(ticks_rust.changed, frame1_tick);
+        assert_eq!(ticks_c.changed, frame1_tick);
+        assert!(ticks_rust.changed > initial_both_rust_tick);
+        assert!(ticks_c.changed > initial_both_c_tick);
+    }
+
+    // Execute 4 more ticks: total 5 ticks
+    for _ in 0..4 {
+        app.update();
+    }
+
+    // Verify values after 5 ticks total
+    // Rust: +10.0 power per tick * 5 = +50.0; +1 shield * 5 = +5
+    // C: +5.0 mana per tick * 5 = +25.0; +1 level * 5 = +5
+    {
+        let entity_ref = app.world().entity(e_rust);
+        let data = unsafe { *(entity_ref.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData) };
+        assert_eq!(data, RustModCustomData { power: 150.0, shield: 55 });
+
+        let entity_ref = app.world().entity(e_c);
+        let data = unsafe { *(entity_ref.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData) };
+        assert_eq!(data, CModCustomData { mana: 50.0, level: 8 });
+
+        let entity_ref = app.world().entity(e_both);
+        let data_r = unsafe { *(entity_ref.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData) };
+        let data_c = unsafe { *(entity_ref.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData) };
+        assert_eq!(data_r, RustModCustomData { power: 250.0, shield: 15 });
+        assert_eq!(data_c, CModCustomData { mana: 75.0, level: 12 });
+    }
+
+    // 5. Mod unloading & lifecycle safety
+    app.unload_mod(rust_mod_id).expect("Rust mod must unload cleanly");
+    app.unload_mod(c_mod_id).expect("C mod must unload cleanly");
+
+    // Post-unload ticks: components remain intact, values frozen (no further system execution)
+    app.update();
+    app.update();
+
+    {
+        let entity_ref = app.world().entity(e_rust);
+        let data = unsafe { *(entity_ref.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData) };
+        assert_eq!(data, RustModCustomData { power: 150.0, shield: 55 }, "Values must remain frozen after mod unload");
+
+        let entity_ref = app.world().entity(e_c);
+        let data = unsafe { *(entity_ref.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData) };
+        assert_eq!(data, CModCustomData { mana: 50.0, level: 8 }, "Values must remain frozen after mod unload");
+
+        let entity_ref = app.world().entity(e_both);
+        let data_r = unsafe { *(entity_ref.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData) };
+        let data_c = unsafe { *(entity_ref.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData) };
+        assert_eq!(data_r, RustModCustomData { power: 250.0, shield: 15 });
+        assert_eq!(data_c, CModCustomData { mana: 75.0, level: 12 });
+    }
+
+    // Despawn all entities post-unload without panics or crashes
+    app.world_mut().despawn(e_rust);
+    app.world_mut().despawn(e_c);
+    app.world_mut().despawn(e_both);
+}
+
 /// Scenario 4: Dynamic Metadata String (`StrView`) Inspection and Mutation.
 /// Validates string reads/writes across C-ABI without allocator boundary violations.
 #[test]
@@ -569,4 +820,255 @@ fn test_deferred_commands_spawn_insert_despawn_flush() {
     );
 
     app.unload_mod(c_id).unwrap();
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct RustModCustomData {
+    pub power: f32,
+    pub shield: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct CModCustomData {
+    pub mana: f32,
+    pub level: i32,
+}
+
+/// Scenario 6: Milestone 3 Multi-Language Dynamic Component Lifecycle & Concurrency Test.
+///
+/// Verifies:
+/// 1. Host loads both `asymmetric_rust_mod` and `asymmetric_c_mod`.
+/// 2. Host verifies both `RustModCustomData` and `CModCustomData` are dynamically registered in `ModRegistry`.
+/// 3. Host spawns entities possessing dynamic components (RustModCustomData, CModCustomData, and both on a shared entity).
+/// 4. `app.update()` runs:
+///    - Rust system mutates `power += 10.0`, `shield += 1` on matching entities.
+///    - C99 system mutates `mana += 5.0f`, `level += 1` on matching entities.
+///    - Single entity with both components receives mutations from both foreign systems in the same tick.
+/// 5. Change detection: entity component change ticks reflect the mutation tick.
+/// 6. Mod unloading: unloading mods cleanly deactivates foreign systems, leaves component table data intact,
+///    prevents further mutations on subsequent ticks, and despawning post-unload produces zero segfaults.
+#[test]
+fn test_milestone_3_dynamic_components_multilanguage() {
+    let (rust_dylib, c_dylib) = ensure_guest_mods_built();
+    reset_rust_mod_panic(&rust_dylib);
+
+    let mut app = App::new();
+    app.add_plugins(AbiModPlugin);
+
+    // 1. Load both mods
+    let rust_mod_id = app
+        .load_mod_tracked(&rust_dylib)
+        .expect("Failed to load asymmetric_rust_mod");
+    let c_mod_id = app
+        .load_mod_tracked(&c_dylib)
+        .expect("Failed to load asymmetric_c_mod");
+
+    // 2. Verify ModRegistry dynamic component metadata
+    let (rust_comp_id, c_comp_id) = {
+        let registry = app.world().resource::<ModRegistry>();
+
+        let rust_meta = registry
+            .get_by_name("RustModCustomData")
+            .expect("RustModCustomData must be registered in ModRegistry");
+        assert_eq!(rust_meta.size, 8);
+        assert_eq!(rust_meta.align, 4);
+        assert_eq!(rust_meta.uuid, ComponentUuid::from_name("RustModCustomData"));
+        assert!(rust_meta.is_dynamic);
+
+        let c_meta = registry
+            .get_by_name("CModCustomData")
+            .expect("CModCustomData must be registered in ModRegistry");
+        assert_eq!(c_meta.size, 8);
+        assert_eq!(c_meta.align, 4);
+        assert_eq!(c_meta.uuid, ComponentUuid::from_name("CModCustomData"));
+        assert!(c_meta.is_dynamic);
+
+        (rust_meta.component_id, c_meta.component_id)
+    };
+
+    // 3. Spawn entities with dynamic components
+    // Entity 1: Rust dynamic component only
+    let e_rust = {
+        let e = app.world_mut().spawn_empty().id();
+        let init_data = RustModCustomData {
+            power: 100.0,
+            shield: 50,
+        };
+        let mut entity_mut = app.world_mut().entity_mut(e);
+        bevy_ptr::OwningPtr::make(init_data, |ptr| {
+            entity_mut.insert_by_id(rust_comp_id, ptr);
+        });
+        e
+    };
+
+    // Entity 2: C dynamic component only
+    let e_c = {
+        let e = app.world_mut().spawn_empty().id();
+        let init_data = CModCustomData {
+            mana: 25.0,
+            level: 3,
+        };
+        let mut entity_mut = app.world_mut().entity_mut(e);
+        bevy_ptr::OwningPtr::make(init_data, |ptr| {
+            entity_mut.insert_by_id(c_comp_id, ptr);
+        });
+        e
+    };
+
+    // Entity 3: BOTH dynamic components on a shared entity (multi-language heterogeneous archetype)
+    let e_both = {
+        let e = app.world_mut().spawn_empty().id();
+        let init_rust = RustModCustomData {
+            power: 200.0,
+            shield: 10,
+        };
+        let init_c = CModCustomData {
+            mana: 50.0,
+            level: 7,
+        };
+        let mut entity_mut = app.world_mut().entity_mut(e);
+        bevy_ptr::OwningPtr::make(init_rust, |ptr| {
+            entity_mut.insert_by_id(rust_comp_id, ptr);
+        });
+        bevy_ptr::OwningPtr::make(init_c, |ptr| {
+            entity_mut.insert_by_id(c_comp_id, ptr);
+        });
+        e
+    };
+
+    // Record initial change ticks prior to system execution
+    let initial_rust_tick = app.world().entity(e_rust).get_change_ticks_by_id(rust_comp_id).unwrap().changed;
+    let initial_c_tick = app.world().entity(e_c).get_change_ticks_by_id(c_comp_id).unwrap().changed;
+    let initial_both_rust_tick = app.world().entity(e_both).get_change_ticks_by_id(rust_comp_id).unwrap().changed;
+    let initial_both_c_tick = app.world().entity(e_both).get_change_ticks_by_id(c_comp_id).unwrap().changed;
+
+    // 4. Execute 1 tick of the Bevy schedule
+    app.update();
+
+    let frame1_tick = app.world().change_tick();
+
+    // Verify mutations on Entity 1 (RustModCustomData: power +10.0, shield +1)
+    {
+        let entity_ref = app.world().entity(e_rust);
+        let ptr = entity_ref.get_by_id(rust_comp_id).expect("e_rust must have RustModCustomData");
+        let data = unsafe { *(ptr.as_ptr() as *const RustModCustomData) };
+        assert_eq!(
+            data,
+            RustModCustomData {
+                power: 110.0,
+                shield: 51,
+            },
+            "Rust mod must increment power by 10.0 and shield by 1"
+        );
+        let ticks = entity_ref.get_change_ticks_by_id(rust_comp_id).unwrap();
+        assert_eq!(ticks.changed, frame1_tick, "Rust dynamic component must be marked changed in frame 1");
+        assert!(ticks.changed > initial_rust_tick);
+    }
+
+    // Verify mutations on Entity 2 (CModCustomData: mana +5.0f, level +1)
+    {
+        let entity_ref = app.world().entity(e_c);
+        let ptr = entity_ref.get_by_id(c_comp_id).expect("e_c must have CModCustomData");
+        let data = unsafe { *(ptr.as_ptr() as *const CModCustomData) };
+        assert_eq!(
+            data,
+            CModCustomData {
+                mana: 30.0,
+                level: 4,
+            },
+            "C99 mod must increment mana by 5.0 and level by 1"
+        );
+        let ticks = entity_ref.get_change_ticks_by_id(c_comp_id).unwrap();
+        assert_eq!(ticks.changed, frame1_tick, "C99 dynamic component must be marked changed in frame 1");
+        assert!(ticks.changed > initial_c_tick);
+    }
+
+    // Verify mutations on Entity 3 (Shared archetype mutated by BOTH Rust and C99 systems)
+    {
+        let entity_ref = app.world().entity(e_both);
+
+        let ptr_rust = entity_ref.get_by_id(rust_comp_id).expect("e_both must have RustModCustomData");
+        let data_rust = unsafe { *(ptr_rust.as_ptr() as *const RustModCustomData) };
+        assert_eq!(
+            data_rust,
+            RustModCustomData {
+                power: 210.0,
+                shield: 11,
+            },
+            "Shared entity Rust component must be mutated by Rust mod"
+        );
+
+        let ptr_c = entity_ref.get_by_id(c_comp_id).expect("e_both must have CModCustomData");
+        let data_c = unsafe { *(ptr_c.as_ptr() as *const CModCustomData) };
+        assert_eq!(
+            data_c,
+            CModCustomData {
+                mana: 55.0,
+                level: 8,
+            },
+            "Shared entity C component must be mutated by C99 mod"
+        );
+
+        let ticks_rust = entity_ref.get_change_ticks_by_id(rust_comp_id).unwrap();
+        let ticks_c = entity_ref.get_change_ticks_by_id(c_comp_id).unwrap();
+        assert_eq!(ticks_rust.changed, frame1_tick);
+        assert_eq!(ticks_c.changed, frame1_tick);
+        assert!(ticks_rust.changed > initial_both_rust_tick);
+        assert!(ticks_c.changed > initial_both_c_tick);
+    }
+
+    // Execute 4 more ticks: total 5 ticks
+    for _ in 0..4 {
+        app.update();
+    }
+
+    // Verify values after 5 ticks total
+    // Rust: +10.0 power per tick * 5 = +50.0; +1 shield * 5 = +5
+    // C: +5.0 mana per tick * 5 = +25.0; +1 level * 5 = +5
+    {
+        let entity_ref = app.world().entity(e_rust);
+        let data = unsafe { *(entity_ref.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData) };
+        assert_eq!(data, RustModCustomData { power: 150.0, shield: 55 });
+
+        let entity_ref = app.world().entity(e_c);
+        let data = unsafe { *(entity_ref.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData) };
+        assert_eq!(data, CModCustomData { mana: 50.0, level: 8 });
+
+        let entity_ref = app.world().entity(e_both);
+        let data_r = unsafe { *(entity_ref.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData) };
+        let data_c = unsafe { *(entity_ref.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData) };
+        assert_eq!(data_r, RustModCustomData { power: 250.0, shield: 15 });
+        assert_eq!(data_c, CModCustomData { mana: 75.0, level: 12 });
+    }
+
+    // 5. Mod unloading & lifecycle safety
+    app.unload_mod(rust_mod_id).expect("Rust mod must unload cleanly");
+    app.unload_mod(c_mod_id).expect("C mod must unload cleanly");
+
+    // Post-unload ticks: components remain intact, values frozen (no further system execution)
+    app.update();
+    app.update();
+
+    {
+        let entity_ref = app.world().entity(e_rust);
+        let data = unsafe { *(entity_ref.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData) };
+        assert_eq!(data, RustModCustomData { power: 150.0, shield: 55 }, "Values must remain frozen after mod unload");
+
+        let entity_ref = app.world().entity(e_c);
+        let data = unsafe { *(entity_ref.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData) };
+        assert_eq!(data, CModCustomData { mana: 50.0, level: 8 }, "Values must remain frozen after mod unload");
+
+        let entity_ref = app.world().entity(e_both);
+        let data_r = unsafe { *(entity_ref.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData) };
+        let data_c = unsafe { *(entity_ref.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData) };
+        assert_eq!(data_r, RustModCustomData { power: 250.0, shield: 15 });
+        assert_eq!(data_c, CModCustomData { mana: 75.0, level: 12 });
+    }
+
+    // Despawn all entities post-unload without panics or crashes
+    app.world_mut().despawn(e_rust);
+    app.world_mut().despawn(e_c);
+    app.world_mut().despawn(e_both);
 }

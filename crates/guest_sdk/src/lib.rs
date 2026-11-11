@@ -855,14 +855,13 @@ mod tests {
 
     #[test]
     fn test_chunk_slice_as_typed_slice() {
-        let data = [
-            PosData { x: 1.0, y: 2.0 },
-            PosData { x: 3.0, y: 4.0 },
-        ];
+        let data = [PosData { x: 1.0, y: 2.0 }, PosData { x: 3.0, y: 4.0 }];
         let stride = core::mem::size_of::<PosData>();
         let slice = ChunkSlice::new(data.as_ptr() as *const u8, stride, 2);
 
-        let typed = slice.as_typed_slice::<PosData>().expect("valid typed slice");
+        let typed = slice
+            .as_typed_slice::<PosData>()
+            .expect("valid typed slice");
         assert_eq!(typed.len(), 2);
         assert_eq!(typed[0], PosData { x: 1.0, y: 2.0 });
         assert_eq!(typed[1], PosData { x: 3.0, y: 4.0 });
@@ -887,15 +886,14 @@ mod tests {
 
     #[test]
     fn test_chunk_slice_mut_as_typed_slice() {
-        let mut data = [
-            PosData { x: 1.0, y: 2.0 },
-            PosData { x: 3.0, y: 4.0 },
-        ];
+        let mut data = [PosData { x: 1.0, y: 2.0 }, PosData { x: 3.0, y: 4.0 }];
         let stride = core::mem::size_of::<PosData>();
         let mut slice_mut = ChunkSliceMut::new(data.as_mut_ptr() as *mut u8, stride, 2);
 
         {
-            let typed_mut = slice_mut.as_typed_slice::<PosData>().expect("valid typed slice mut");
+            let typed_mut = slice_mut
+                .as_typed_slice::<PosData>()
+                .expect("valid typed slice mut");
             typed_mut[0].x = 10.0;
             typed_mut[1].y = 40.0;
         }
@@ -951,9 +949,12 @@ mod tests {
     fn test_register_runtime_component_mock() {
         use std::sync::Mutex;
         static CAPTURED_NAME: Mutex<Option<std::string::String>> = Mutex::new(None);
-        static CAPTURED_SIZE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        static CAPTURED_ALIGN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        static CAPTURED_DROP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        static CAPTURED_SIZE: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        static CAPTURED_ALIGN: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        static CAPTURED_DROP: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
 
         unsafe extern "C" fn mock_register_component(
             _ctx: *mut core::ffi::c_void,
@@ -961,8 +962,12 @@ mod tests {
         ) -> FfiResult {
             assert!(!desc.is_null());
             let d = unsafe { &*desc };
-            *CAPTURED_NAME.lock().unwrap() =
-                Some(unsafe { core::ffi::CStr::from_ptr(d.name) }.to_str().unwrap().to_string());
+            *CAPTURED_NAME.lock().unwrap() = Some(
+                unsafe { core::ffi::CStr::from_ptr(d.name) }
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+            );
             CAPTURED_SIZE.store(d.size, std::sync::atomic::Ordering::SeqCst);
             CAPTURED_ALIGN.store(d.align, std::sync::atomic::Ordering::SeqCst);
             CAPTURED_DROP.store(d.drop_fn.is_some(), std::sync::atomic::Ordering::SeqCst);
@@ -986,41 +991,59 @@ mod tests {
 
         // 1. POD component -> drop_fn == None
         let res = unsafe {
-            register_runtime_component::<PosData>(
-                &dummy_host_api,
-                dummy_ctx,
-                c"PosData",
-            )
+            register_runtime_component::<PosData>(&dummy_host_api, dummy_ctx, c"PosData")
         };
         assert_eq!(res, FfiResult::OK);
         assert_eq!(CAPTURED_NAME.lock().unwrap().as_deref(), Some("PosData"));
-        assert_eq!(CAPTURED_SIZE.load(std::sync::atomic::Ordering::SeqCst), core::mem::size_of::<PosData>());
-        assert_eq!(CAPTURED_ALIGN.load(std::sync::atomic::Ordering::SeqCst), core::mem::align_of::<PosData>());
-        assert_eq!(CAPTURED_DROP.load(std::sync::atomic::Ordering::SeqCst), false);
+        assert_eq!(
+            CAPTURED_SIZE.load(std::sync::atomic::Ordering::SeqCst),
+            core::mem::size_of::<PosData>()
+        );
+        assert_eq!(
+            CAPTURED_ALIGN.load(std::sync::atomic::Ordering::SeqCst),
+            core::mem::align_of::<PosData>()
+        );
+        assert_eq!(
+            CAPTURED_DROP.load(std::sync::atomic::Ordering::SeqCst),
+            false
+        );
 
         // 2. Non-POD component -> drop_fn != None
         #[allow(dead_code)]
         struct HasDrop(std::string::String);
         let res_drop = unsafe {
-            register_runtime_component::<HasDrop>(
-                &dummy_host_api,
-                dummy_ctx,
-                c"HasDrop",
-            )
+            register_runtime_component::<HasDrop>(&dummy_host_api, dummy_ctx, c"HasDrop")
         };
         assert_eq!(res_drop, FfiResult::OK);
         assert_eq!(CAPTURED_NAME.lock().unwrap().as_deref(), Some("HasDrop"));
-        assert_eq!(CAPTURED_SIZE.load(std::sync::atomic::Ordering::SeqCst), core::mem::size_of::<HasDrop>());
-        assert_eq!(CAPTURED_ALIGN.load(std::sync::atomic::Ordering::SeqCst), core::mem::align_of::<HasDrop>());
-        assert_eq!(CAPTURED_DROP.load(std::sync::atomic::Ordering::SeqCst), true);
+        assert_eq!(
+            CAPTURED_SIZE.load(std::sync::atomic::Ordering::SeqCst),
+            core::mem::size_of::<HasDrop>()
+        );
+        assert_eq!(
+            CAPTURED_ALIGN.load(std::sync::atomic::Ordering::SeqCst),
+            core::mem::align_of::<HasDrop>()
+        );
+        assert_eq!(
+            CAPTURED_DROP.load(std::sync::atomic::Ordering::SeqCst),
+            true
+        );
 
         // 3. Null pointer checks
         assert_eq!(
-            unsafe { register_runtime_component::<PosData>(core::ptr::null(), dummy_ctx, c"PosData") },
+            unsafe {
+                register_runtime_component::<PosData>(core::ptr::null(), dummy_ctx, c"PosData")
+            },
             FfiResult::NULL_POINTER
         );
         assert_eq!(
-            unsafe { register_runtime_component::<PosData>(&dummy_host_api, core::ptr::null_mut(), c"PosData") },
+            unsafe {
+                register_runtime_component::<PosData>(
+                    &dummy_host_api,
+                    core::ptr::null_mut(),
+                    c"PosData",
+                )
+            },
             FfiResult::NULL_POINTER
         );
     }

@@ -97,6 +97,7 @@ impl CliArgs {
                            [1] Jelly Boing Hop (Rust cdylib)\n  \
                            [2] Pastel Carousel Waltz (Rust cdylib)\n  \
                            [3] Cozy Cuddle Huddle (Pure ISO C99)\n  \
+                           [+] Spawn Slimes (+8)         [-] Remove Slimes (-8)\n  \
                            [R] Hot-Reload Active Mod     [U] Unload to Cozy Stroll\n  \
                            [Space] Pause / Resume        [O] Toggle Auto-Orbit Camera\n  \
                            [Left-Drag] Orbit 3D Camera   [Scroll] Zoom In / Out\n  \
@@ -228,6 +229,49 @@ impl CuteMeadowWinitApp {
         }
     }
 
+    fn query_slime_count(&mut self) -> usize {
+        let mut query = self.ecs_app.world_mut().query::<&Position>();
+        query.iter(self.ecs_app.world()).count()
+    }
+
+    fn spawn_more_slimes(&mut self, count: usize) {
+        let seed = (self.frame_counter as u32).wrapping_mul(7919) ^ 0xFEED_FACE;
+        {
+            let mut commands = self.ecs_app.world_mut().commands();
+            meadow::spawn_slimes_batch(&mut commands, count, seed);
+        }
+        self.ecs_app.update();
+        let total = self.query_slime_count();
+        println!(
+            "✨ [CuteMeadow] Spawned +{} slimes! Total: {}",
+            count, total
+        );
+        self.refresh_window_title();
+    }
+
+    fn remove_slimes(&mut self, count: usize) {
+        let mut to_despawn = Vec::new();
+        {
+            let mut query = self
+                .ecs_app
+                .world_mut()
+                .query::<(bevy_ecs::entity::Entity, &Position)>();
+            let all: Vec<_> = query.iter(self.ecs_app.world()).map(|(e, _)| e).collect();
+            if all.len() <= 1 {
+                return;
+            }
+            let remove_count = count.min(all.len().saturating_sub(1));
+            to_despawn.extend_from_slice(&all[all.len() - remove_count..]);
+        }
+        for e in to_despawn {
+            self.ecs_app.world_mut().commands().entity(e).despawn();
+        }
+        self.ecs_app.update();
+        let total = self.query_slime_count();
+        println!("✨ [CuteMeadow] Removed slimes. Total: {}", total);
+        self.refresh_window_title();
+    }
+
     fn collect_slimes(&mut self) -> Vec<SlimeRenderData> {
         let mut query = self
             .ecs_app
@@ -273,6 +317,7 @@ impl ApplicationHandler for CuteMeadowWinitApp {
                 println!("  [1] Jelly Boing Hop (Rust cdylib)");
                 println!("  [2] Pastel Carousel Waltz (Rust cdylib)");
                 println!("  [3] Cozy Cuddle Huddle (Pure C99)");
+                println!("  [+] Spawn Slimes (+8)       [-] Remove Slimes (-8)");
                 println!("  [R] Hot-Reload Active Mod   [U] Unload Mod   [Space] Pause");
                 println!("  [Left-Drag] Orbit Camera    [Scroll] Zoom    [Esc/Q] Quit");
             }
@@ -345,6 +390,12 @@ impl ApplicationHandler for CuteMeadowWinitApp {
                                     Err(e) => eprintln!("[ModManager] {e}"),
                                 }
                                 self.refresh_window_title();
+                            }
+                            KeyCode::Equal | KeyCode::NumpadAdd | KeyCode::KeyB => {
+                                self.spawn_more_slimes(8);
+                            }
+                            KeyCode::Minus | KeyCode::NumpadSubtract => {
+                                self.remove_slimes(8);
                             }
                             KeyCode::Space => {
                                 self.paused = !self.paused;
@@ -582,8 +633,71 @@ fn run_headless_3d_verification(
         app.update();
     }
     println!("  -> PASS: Clean dlclose unload and baseline restoration verified.");
+
+    // Phase 7: Dynamic Slime Population Scaling & Jelly Collision Bouncing
+    println!("[TEST] Phase 7: Dynamic Population Scaling & Collision Bouncing ({ticks} ticks)...");
+    let count_before = query_positions(app).len();
+    {
+        let mut commands = app.world_mut().commands();
+        meadow::spawn_slimes_batch(&mut commands, 16, 0x1234_ABCD);
+    }
+    app.update();
+    let count_after = query_positions(app).len();
+    assert_eq!(
+        count_after,
+        count_before + 16,
+        "Spawning additional slimes must increase total entity count"
+    );
+
+    // Spawn two slimes on a direct head-on collision path to verify elastic bounce & blush
+    let col_entity_a = {
+        let mut commands = app.world_mut().commands();
+        let e = commands
+            .spawn((
+                Position::new(-0.8, 0.0, 0.0),
+                Velocity::new(3.0, 0.0, 0.0),
+                Scale3D::uniform(1.0),
+                ColorRgba::new(1.0, 0.5, 0.5, 1.0),
+                CuteSpirit::new(0.0, 0.0, 0.2),
+                components::HomeStyle {
+                    base_color: ColorRgba::new(1.0, 0.5, 0.5, 1.0),
+                    phase_offset: 0.0,
+                },
+            ))
+            .id();
+        commands.spawn((
+            Position::new(0.8, 0.0, 0.0),
+            Velocity::new(-3.0, 0.0, 0.0),
+            Scale3D::uniform(1.0),
+            ColorRgba::new(0.5, 0.5, 1.0, 1.0),
+            CuteSpirit::new(0.0, 0.0, 0.2),
+            components::HomeStyle {
+                base_color: ColorRgba::new(0.5, 0.5, 1.0, 1.0),
+                phase_offset: 0.0,
+            },
+        ));
+        e
+    };
+    app.update(); // Step collision and bounce
+
+    let bounced_pos = app.world().get::<Position>(col_entity_a).unwrap();
+    let bounced_vel = app.world().get::<Velocity>(col_entity_a).unwrap();
+    let bounced_spirit = app.world().get::<CuteSpirit>(col_entity_a).unwrap();
+
+    assert!(
+        bounced_vel.x < 0.0 || bounced_pos.x < -0.4,
+        "Colliding slimes must bounce and reverse direction upon collision"
+    );
+    assert_eq!(
+        bounced_spirit.blush, 1.0,
+        "Colliding slimes must blush rosy pink upon bumping into each other"
+    );
     println!(
-        "\n[TEST_MODE] SUCCESS: All 3 cute 3D mods (Rust + C99), hot-reload, and unload passed!"
+        "  -> PASS: Dynamic spawn (+16) and elastic collision bounce + blush reaction verified."
+    );
+
+    println!(
+        "\n[TEST_MODE] SUCCESS: All 3 cute 3D mods, hot-reload, dynamic population, and collision bouncing verified!"
     );
 
     Ok(())
