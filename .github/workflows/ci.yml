@@ -1,0 +1,205 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ============================================================================
+  # 1. Cross-Platform Workspace & Asymmetric Mod Matrix (Linux / macOS / Windows)
+  # ============================================================================
+  test-matrix:
+    name: Test Matrix (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build asymmetric C99 guest mod (Unix)
+        if: runner.os != 'Windows'
+        run: make -C tests/asymmetric_c_mod
+
+      - name: Build asymmetric C99 guest mod (Windows MinGW C99)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          gcc -std=c99 -Wall -Wextra -Werror -Iinclude -O3 -shared \
+            tests/asymmetric_c_mod/mod.c \
+            -o tests/asymmetric_c_mod/asymmetric_c_mod.dll
+
+      - name: Build asymmetric Rust guest mod (independent Cargo.lock)
+        run: cargo build --manifest-path tests/asymmetric_rust_mod/Cargo.toml --release
+
+      - name: Check formatting (Linux)
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy across workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run full workspace unit, behavioral, fuzz, parity, compile-fail & doc tests
+        run: cargo test --workspace -- --test-threads=1
+
+  # ============================================================================
+  # 2. Strict ISO C99 & C++17 Header Verification (-Wall -Wextra -Werror)
+  # ============================================================================
+  c99-strict:
+    name: Strict C99 (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build C99 mods & run standalone C99 ABI harness
+        run: |
+          make test-c99 CC=${{ matrix.cc }}
+          make -C benches/c_abi_c99_mod clean && make -C benches/c_abi_c99_mod CC=${{ matrix.cc }}
+          make -C examples/03_cross_language_interop/c_mod clean && make -C examples/03_cross_language_interop/c_mod CC=${{ matrix.cc }}
+          make -C examples/05_cute_3d_winit/mods/mod_cuddle_c99 clean && make -C examples/05_cute_3d_winit/mods/mod_cuddle_c99 CC=${{ matrix.cc }}
+
+      - name: Verify C++17 header compatibility
+        if: matrix.cc == 'clang'
+        run: |
+          clang++ -std=c++17 -Wall -Wextra -Werror -fsyntax-only -x c++ include/bevy_abi_mod.h
+
+  # ============================================================================
+  # 3. Miri Soundness & Tree Borrows Verification
+  # ============================================================================
+  miri:
+    name: Miri (-Zmiri-tree-borrows)
+    runs-on: ubuntu-latest
+    env:
+      MIRIFLAGS: "-Zmiri-tree-borrows"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install nightly Rust with Miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - name: Setup Miri sysroot
+        run: cargo +nightly miri setup
+
+      - name: Cache Cargo & Miri artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: miri-tree-borrows
+
+      - name: Run Miri on abi_contract & guest_sdk
+        run: cargo +nightly miri test -p abi_contract -p guest_sdk
+
+      - name: Run Miri on mod_derive in-process VTable & aliasing suites
+        run: |
+          cargo +nightly miri test -p mod_derive \
+            --lib \
+            --test validation_gate_1 \
+            --test challenger_m1_macro_tests \
+            --test compile_fail_tests
+
+      - name: Run Miri on host_runtime non-dlopen soundness, fuzz & parity suites
+        run: |
+          cargo +nightly miri test -p host_runtime \
+            --lib \
+            --test bevy_alignment_soundness_tests \
+            --test fuzz_abi_boundaries \
+            --test differential_bevy_parity \
+            -- --skip real_dylib_loaded_mod_entity_lifecycle_events_and_strict_validation_work
+
+  # ============================================================================
+  # 4. ASan & UBSan Sanitizer Verification on C99 ABI & Guest Mod
+  # ============================================================================
+  sanitizers:
+    name: ASan / UBSan C99 Verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run standalone_c_test under AddressSanitizer + UndefinedBehaviorSanitizer
+        env:
+          ASAN_OPTIONS: "detect_leaks=1:strict_string_checks=1:halt_on_error=1"
+          UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+        run: |
+          mkdir -p target
+          clang -std=c99 -Wall -Wextra -Werror -O1 -g -fno-omit-frame-pointer \
+            -fsanitize=address,undefined -fno-sanitize-recover=all \
+            -Iinclude tests/standalone_c_test.c \
+            -o target/standalone_c_test_san
+          ./target/standalone_c_test_san
+
+      - name: Build UBSan-instrumented C99 guest mod & run host integration suites
+        env:
+          UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+        run: |
+          clang -std=c99 -Wall -Wextra -Werror -O1 -g -fno-omit-frame-pointer \
+            -fsanitize=undefined -fno-sanitize-recover=all \
+            -Iinclude -shared -fPIC \
+            tests/asymmetric_c_mod/mod.c \
+            -o tests/asymmetric_c_mod/libasymmetric_c_mod.so
+          cargo build --manifest-path tests/asymmetric_rust_mod/Cargo.toml --release
+          cargo test -p host_runtime --test integration_tests --test c_vtable_interop -- --test-threads=1
+
+  # ============================================================================
+  # 5. Randomized Rust Layout Check (-Zrandomize-layout)
+  # ============================================================================
+  randomize-layout:
+    name: Randomized Rust Layout (-Zrandomize-layout)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install nightly Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: randomize-layout
+
+      - name: Build asymmetric C99 & Rust guest mods with default layout
+        run: |
+          make -C tests/asymmetric_c_mod
+          cargo +nightly build --manifest-path tests/asymmetric_rust_mod/Cargo.toml --release
+
+      - name: Run host & ABI suites under -Zrandomize-layout
+        env:
+          RUSTFLAGS: "-Zrandomize-layout"
+        run: |
+          cargo +nightly test -p abi_contract -p guest_sdk
+          cargo +nightly test -p mod_derive --lib --test validation_gate_1 --test challenger_m1_macro_tests
+          cargo +nightly test -p host_runtime \
+            --lib \
+            --test integration_tests \
+            --test bevy_alignment_soundness_tests \
+            --test fuzz_abi_boundaries \
+            --test differential_bevy_parity \
+            -- --test-threads=1

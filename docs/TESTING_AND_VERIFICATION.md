@@ -1,149 +1,124 @@
 # Testing & Verification Framework: `bevy_abi_mod`
 
-This document details the multi-tiered testing methodology, safety audits, and automated verification pipelines of **`bevy_abi_mod`**.
+This document details the behavioral test organization, differential Bevy parity suites, adversarial C-ABI boundary fuzzing, compile-fail harnesses, sanitizer/Miri gates, and automated CI pipelines of **`bevy_abi_mod`**.
 
 ---
 
-## 1. Test Architecture Overview
+## 1. Test Architecture & Organization Map
 
-`bevy_abi_mod` employs a rigorous, layered testing methodology ensuring ABI soundness, concurrency safety, zero allocator leakage, and high throughput.
+`bevy_abi_mod` organizes tests by **architectural invariant and behavior** rather than historical milestones, ensuring ABI soundness, Bevy ECS scheduler/storage parity, zero allocator crossover, and high throughput.
 
+```text
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                       Continuous Integration (.github/workflows/ci.yml)          │
+│  • OS Matrix (Linux/macOS/Windows)   • Strict ISO C99 (-Wall -Wextra -Werror)    │
+│  • Miri (-Zmiri-tree-borrows)        • ASan / UBSan C99   • -Zrandomize-layout   │
+└────────────────────────────────────────┬─────────────────────────────────────────┘
+                                         │
+       ┌─────────────────────────────────┼─────────────────────────────────┐
+       ▼                                 ▼                                 ▼
+┌────────────────────────────┐  ┌────────────────────────────┐  ┌────────────────────────────┐
+│ Behavioral & Parity Suites │  │ Boundary Fuzz & Compile    │  │ Live Asymmetric Mods &     │
+│ - differential_bevy_parity │  │ - fuzz_abi_boundaries      │  │ Lifecycle / E2E Suites     │
+│ - bevy_alignment_soundness │  │ - compile_fail_tests       │  │ - asymmetric_c_mod (.so)   │
+│ - validation_gate_1 / _2   │  │ - standalone_c_test.c      │  │ - asymmetric_rust_mod      │
+└────────────────────────────┘  └────────────────────────────┘  └────────────────────────────┘
 ```
-┌────────────────────────────────────────────────────────────────────────┐
-│                   Layer 4: Verification Pipeline                       │
-│      scripts/run_e2e_tests.sh (9 Automated Sequential Stages)          │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │
-    ┌───────────────────────────────┼───────────────────────────────┐
-    ▼                               ▼                               ▼
-┌────────────────────────┐  ┌────────────────────────┐  ┌────────────────────────┐
-│  Multi-Language Mods   │  │  Safety & Lifecycle    │  │  Performance Bench     │
-│  - C99 shared library  │  │  - 50-cycle hot-reload │  │  - 1k, 10k, 100k scale │
-│  - Rust cdylib mod     │  │  - Borrow conflict det │  │  - Archetype splitting │
-│  - Dual concurrent run │  │  - Memory alignment    │  │  - JSON reports export │
-└────────────────────────┘  └────────────────────────┘  └────────────────────────┘
-                                    │
-    ┌───────────────────────────────┴───────────────────────────────┐
-    ▼                                                               ▼
-┌──────────────────────────────────────────┐  ┌──────────────────────────────────┐
-│  Tiered E2E Suite (275 Tests)            │  │  Validation Gates 1, 2, 3        │
-│  - Tier 1: Core Features                 │  │  - Gate 1: Proc-macro VTables    │
-│  - Tier 2: Boundary Safety               │  │  - Gate 2: 10k Host Runtime      │
-│  - Tier 3: Pairwise Matrix Combinations  │  │  - Gate 3: Live Bevy Integration │
-│  - Tier 4: Real-world Game Scenarios     │  └──────────────────────────────────┘
-└──────────────────────────────────────────┘
-```
+
+### Complete Test Suite Directory & Responsibility Matrix
+
+| Crate / Location | Test Target | Primary Behavioral Responsibility | Miri-Compatible |
+|---|---|---|---|
+| `crates/abi_contract` | `--lib` & doc-tests | `#[repr(C)]` struct sizes/offsets, `ExtensibleStruct` / `read_descriptor` truncation & zeroed-fn checks, `FfiBool`, `FfiEntity::NULL`, SemVer `abi_version_is_compatible`. | Yes |
+| `crates/mod_derive` | `validation_gate_1.rs`<br>`challenger_m1_macro_tests.rs` | Generated `#[repr(C)]` VTables, `FfiBool` (`u8`) accessors, self-aliasing `String`/`Vec<T>` overlap safety, `IS_POD` / `IS_RAW_INSERTABLE` derivation. | Yes |
+| `crates/mod_derive` | **`compile_fail_tests.rs`** | Real `rustc` subprocess compile-fail suite verifying `#[derive(AbiPod)]` rejects missing `#[repr(C)]`, `packed`, `bool`, `String`, `Vec<u8>`, enums, generics, and `Drop`, and `ModExposable` with `String`/`bool` fails `: AbiPod` / `: FfiLayout` bounds. | Guarded (`#[cfg_attr(miri, ignore)]`) |
+| `crates/guest_sdk` | `--lib` & doc-tests | `GuestApp` transactional rollback & LIFO `cleanup_registered_guest_state`, `Chunk` split-borrow non-overlap (`read_write`, `columns_mut`, `write_2`), `catch_guest_panic`. | Yes |
+| `crates/host_runtime` | **`differential_bevy_parity.rs`** | Deterministic PRNG differential oracle comparing native Bevy `Query` + `Commands` vs. `DynamicCSystem` across `Table` + `SparseSet` schemas, ZSTs, over-aligned types, multi-frame `Changed<T>`, `World::check_change_ticks()` `u32::MAX` wraparound, `ChildOf` recursive despawn, `EntityCloner` (`ComponentCloneBehavior::Ignore`), and multi-`World` `std::thread::scope` executor + drop-trampoline isolation. | Yes (scaled iterations) |
+| `crates/host_runtime` | **`fuzz_abi_boundaries.rs`** | Deterministic SplitMix64 adversarial fuzzer hammering all 16 `host_*` `extern "C"` entry points across thousands of malformed inputs: `struct_size` sweeps `0..128` (aligned & misaligned), null pointers, non-UTF8 C strings, non-power-of-two alignments, `usize::MAX` overflow sizes, invalid `ComponentAccessMode`/`ScheduleLabelId`, `query_count > 32`, `query_spec_count > 8`, forged/null/placeholder `FfiEntity`, and raw-insert permission denials. | Yes (scaled iterations) |
+| `crates/host_runtime` | `bevy_alignment_soundness_tests.rs` | Targeted soundness regressions (`D1`–`D10`): shared-table `SparseSet` filters/columns, `world.increment_change_tick()`, `ModSystemSet` 1,000-cycle `remove_systems_in_set`, `ScheduledSystemDescriptor` ordering, `ModErrorPolicy`, partial multi-mod unload drop safety. | Yes (except 1 `dlopen` test) |
+| `crates/host_runtime` | `integration_tests.rs`, `lifecycle_tests.rs`, `safety_tests.rs`, `e2e_suite.rs` | Live `.dylib`/`.so`/`.dll` loading of `tests/asymmetric_c_mod` and `tests/asymmetric_rust_mod`, 50-cycle hot-reload stress, 275-case 4-tier E2E matrix. | Host native (`dlopen`) |
+| `tests/` | `standalone_c_test.c` | Pure ISO C99 compile-time `BEVY_ABI_STATIC_ASSERT` layout checks, legacy 64-byte vs. 72-byte `HostApi` forward/backward compatibility, `BAM_ENTITY_NULL`, SemVer helpers, and `ScheduledSystemDescriptor`. | Native C99 + ASan/UBSan |
 
 ---
 
-## 2. The 9-Stage Verification Pipeline
+## 2. Deep Dive: Differential, Fuzz & Compile-Fail Suites
 
-The complete verification pipeline is executed with `make test-e2e` or `bash scripts/run_e2e_tests.sh`:
+### 2.1 Differential Native-vs-Dynamic Bevy Parity (`differential_bevy_parity.rs`)
+Rather than asserting hand-picked point values alone, `differential_bevy_parity.rs` treats **Bevy ECS itself as the ground-truth specification**:
+1. **Access-Compatibility Matrix Parity**: Generates random single-query and multi-query schemas mixing `StorageType::Table`, `StorageType::SparseSet`, ZSTs (`size == 0`), and over-aligned (`align(16)`, `align(32)`) components across `READ`, `WRITE`, `FILTER_ONLY`, and `WITHOUT`. Verifies 100% agreement between `DynamicCSystem::initialize` and native Bevy `QueryBuilder` on both intra-system self-conflicts and pairwise `FilteredAccessSet::is_compatible` / `ScheduleBuildSettings { ambiguity_detection: LogLevel::Error }` matrices.
+2. **Side-by-Side World Execution & Tick Wraparound**: Seeds identical `World A` (native Bevy `Query` + `Commands`) and `World B` (`DynamicCSystem` single + multi-query + `host_iter_reset` + `host_cmd_*`), asserting identical entity sets, component values, and `Changed<T>` observations across multi-frame schedules, `CHECK_TICK_THRESHOLD` (`World::check_change_ticks()`) clamping scans, and `u32::MAX -> 0` tick wraparound boundaries.
+3. **Hierarchy & `EntityCloner` Drop Safety**: Verifies 5-node `ChildOf` tree recursive despawn parity (`Commands::despawn` vs. `host_cmd_despawn`) with exact foreign `ComponentDropFn` counts, plus `clone_and_spawn()` cloning static/dynamic POD components while ignoring foreign-droppable dynamic components (`ComponentCloneBehavior::Ignore`, zero double-free).
+4. **Multi-World Parallel `std::thread::scope` Isolation**: Runs concurrent `World`s on Bevy's multi-threaded executor, verifying worker-thread `host_get_proc_address` symbol isolation (`CURRENT_REGISTRY`) and independent per-`(WorldId, ComponentUuid)` drop-trampoline counts.
+
+### 2.2 Adversarial C-ABI Boundary Fuzzing (`fuzz_abi_boundaries.rs`)
+Deterministically fuzzes all 16 `host_*` `extern "C"` functions (`host_register_system`, `host_register_scheduled_system`, `host_register_system_in_schedule`, `host_register_multi_query_system`, `host_register_component`, `host_iter_*`, `host_cmd_*`, `host_get_proc_address`):
+- Exhaustively sweeps `struct_size` across `0..128` and `u32::MAX` inside exact-length heap allocations (both aligned and 1-byte misaligned) so reading even 1 byte past `struct_size` or assuming pointer alignment is caught immediately by Miri/ASan.
+- Injects zeroed function-pointer slots (`Option<extern "C" fn>` niche check before `assume_init`), invalid UTF-8 C strings, non-power-of-two alignments, `size % align != 0`, `usize::MAX` overflow sizes, `query_count > 32`, `query_spec_count > 8`, invalid `ComponentAccessMode(4..=u32::MAX)` and `ScheduleLabelId(6..=u32::MAX)`, forged/null/placeholder `FfiEntity` bits, and raw-byte insertions onto `String`/`bool`/`opaque` components—asserting zero panics, zero UB, and clean `FfiResult` error codes.
+
+### 2.3 Real `rustc` Compile-Fail Suite (`compile_fail_tests.rs`)
+Invokes `rustc --edition=2021 --crate-type=lib --emit=metadata` against the compiled `abi_contract` and `mod_derive` artifacts to verify both procedural macro diagnostics and Rust type-system rejections:
+- `#[derive(AbiPod)]` rejects structs missing `#[repr(C)]`, `#[repr(C, packed)]`, `bool` fields, `String` fields, `Vec<u8>` fields, enums, generic structs, direct `Drop` impls, and transitive `Drop` fields.
+- `#[derive(ModExposable)]` structs containing `String`, `bool`, `#[repr(Rust)]` layout, or `#[mod_component(no_pod)]` do **not** implement `AbiPod` (and cannot be nested inside `Vec<BadElem>` in another `ModExposable` component).
+
+---
+
+## 3. Developer Verification Commands & CI Gates
+
+### 3.1 Local `Makefile` Verification Targets
+```bash
+# Run full workspace unit, parity, fuzz, compile-fail, integration & doc tests
+make test
+
+# Compile C99 mod & run standalone_c_test.c with -std=c99 -Wall -Wextra -Werror
+make test-c99
+
+# Run strict Clippy linter (-D warnings) across all workspace targets
+make clippy
+
+# Run Miri (-Zmiri-tree-borrows) across abi_contract, mod_derive, guest_sdk & host_runtime
+make miri
+
+# Execute the 9-stage E2E pipeline (builds mods, runs unit/E2E/gate/safety/lifecycle suites)
+make test-e2e
+```
+
+### 3.2 Continuous Integration Workflow (`.github/workflows/ci.yml`)
+Every push and pull request runs five automated jobs:
+1. **`test-matrix` (`ubuntu-latest`, `macos-latest`, `windows-latest`)**: Builds both asymmetric C99 and Rust guest mods, checks `rustfmt` and `clippy -D warnings`, and runs `cargo test --workspace -- --test-threads=1`.
+2. **`c99-strict` (`gcc` & `clang`)**: Compiles all C99 guest/benchmark/example mods and executes `standalone_c_test.c` under `-std=c99 -Wall -Wextra -Werror`, plus verifies C++17 header compatibility (`-std=c++17 -Wall -Wextra -Werror`).
+3. **`miri`**: Executes `cargo +nightly miri test` with `MIRIFLAGS="-Zmiri-tree-borrows"` across `abi_contract`, `guest_sdk`, `mod_derive`, and `host_runtime` non-`dlopen` soundness, fuzz, and differential parity suites.
+4. **`sanitizers`**: Runs `standalone_c_test.c` under AddressSanitizer + UndefinedBehaviorSanitizer (`-fsanitize=address,undefined -fno-sanitize-recover=all`) and executes host C-mod integration tests against a UBSan-instrumented `libasymmetric_c_mod.so`.
+5. **`randomize-layout`**: Compiles the guest `.cdylib` with default layout and runs the host workspace under `RUSTFLAGS="-Zrandomize-layout"`, empirically proving zero reliance on unstable `#[repr(Rust)]` struct field ordering across the ABI.
+
+---
+
+## 4. The 9-Stage E2E Verification Pipeline (`scripts/run_e2e_tests.sh`)
+
+Executed with `make test-e2e` or `bash scripts/run_e2e_tests.sh`:
 
 | Stage | Target / Test | Objective | Success Metric |
 |---|---|---|---|
 | **[1/9]** | `make -C tests/asymmetric_c_mod`<br>`cargo build --manifest-path tests/asymmetric_rust_mod/Cargo.toml --release` | Compile independent guest shared libraries (`.so`/`.dylib`/`.dll` and `.cdylib`). | Zero compilation errors. |
 | **[2/9]** | `cargo check --workspace --all-targets` | Static typing and API boundary compliance across all crates. | 0 warnings, 0 errors. |
-| **[3/9]** | `cargo test --workspace -- --test-threads=1` | Unit tests for `abi_contract`, `mod_derive`, `host_runtime`, and `guest_sdk`. | All unit tests pass. |
-| **[4/9]** | `cargo test --test e2e_suite` | 275 tests across 4 comprehensive tiers. | 275/275 passed. |
+| **[3/9]** | `cargo test --workspace -- --test-threads=1` | Unit, parity, fuzz, compile-fail, and doc tests across all crates. | All tests pass. |
+| **[4/9]** | `cargo test --test e2e_suite` | 275 tests across 4 comprehensive tiers (Core, Boundary, Pairwise Matrix, Game Scenarios). | 275/275 passed. |
 | **[5/9]** | `cargo test --test validation_gate_2` | 10,000 entities chunk iteration, `Changed<Position>`, deferred command bridge. | Gate 2 passed. |
-| **[6/9]** | `cargo test --test integration_tests` | Validation Gate 3: Multi-archetype Bevy App with live C99 and Rust mods. | Gate 3 passed. |
+| **[6/9]** | `cargo test --test integration_tests` | Multi-archetype Bevy App with live C99 and Rust mods. | Gate 3 passed. |
 | **[7/9]** | `cargo test --test benchmarks -- --nocapture` | High-scale throughput benchmarks (1k, 10k, 100k entities) with JSON report. | `target/benchmark_results.json` generated. |
-| **[8/9]** | `cargo test --test safety_tests` | Alignment (1B..64B), pointer bounds, borrow conflicts, memory isolation. | All safety checks pass. |
+| **[8/9]** | `cargo test --test safety_tests` | Alignment (`1B..64B`), pointer bounds, borrow conflicts, memory isolation. | All safety checks pass. |
 | **[9/9]** | `cargo test --test lifecycle_tests` | 50 continuous hot-reload cycles and post-unload immunity. | 0 memory corruption, clean teardown. |
-
----
-
-## 3. Four-Tier E2E Test Suite (`tests/e2e_suite.rs`)
-
-The E2E suite contains **275 discrete tests** organized into four structured tiers:
-
-### Tier 1: Isolated Feature Tests (35 Tests)
-- **T1_F01**: Component UUID lookup and VTable symbol resolution.
-- **T1_F02**: Dynamic system descriptors and callback invocations.
-- **T1_F03**: Table chunk traversal, entity slices, column strides.
-- **T1_F04**: Command queue bridge (`spawn_empty`, `despawn`, `insert_bytes`).
-- **T1_F05**: Lifecycle management and library unmapping.
-- **T1_F06**: Change detection tick propagation.
-- **T1_F07**: Foreign panic containment and status conversion.
-
-### Tier 2: Boundary Safety & Stress (35 Tests)
-- Null pointer handling across all host FFI functions.
-- Empty worlds, empty tables, and single-entity tables.
-- Out-of-bounds column indices and invalid access modes.
-- Mutating read-only columns rejected with `PERMISSION_DENIED`.
-- Rapid command bursts (10,000 commands/sec).
-
-### Tier 3: Pairwise Combinatorial Matrix (105 Tests)
-- All combinations of:
-  - System counts: 1, 2, 4, 8 systems.
-  - Access modes: READ, WRITE, FILTER_ONLY, READ+WRITE.
-  - Archetype distribution: 1, 4, 16 archetypes.
-  - Entity scales: 0, 10, 100, 1,000, 10,000 entities.
-
-### Tier 4: Real-World Game Scenarios (100 Tests)
-- 3D Kinematics and physics integration.
-- Combat damage, status effect decay, and death despawns.
-- Inventory item attachments and metadata inspection.
-- Simultaneous execution of asymmetric C99 and Rust mods modifying common entities.
-
----
-
-## 4. Safety & Adversarial Suites
-
-### 4.1 Borrow Conflict Detection (`safety_tests.rs`)
-Bevy's ECS requires that two systems mutating the same component cannot run in parallel.
-The safety suite validates that:
-- Registering two systems with `WRITE` access to `Position` triggers Bevy's conflict detection.
-- Systems with disjoint access (`SystemA: WRITE Position`, `SystemB: WRITE Velocity`) execute in parallel without conflict.
-
-### 4.2 Heterogeneous Memory Alignment (`safety_tests.rs`)
-Validates that pointer arithmetic respects alignment for structures ranging from 1-byte tags (`u8`) to 64-byte SIMD vectors (`align_of = 64`), preventing misaligned CPU faults.
-
-### 4.3 50-Cycle Hot-Reloading Stress (`lifecycle_tests.rs`)
-Loads and unloads guest shared libraries in a continuous 50-cycle loop:
-- Validates that `dlclose` unmaps library text and data segments cleanly.
-- Asserts that host ECS tables and native systems continue uninterrupted after mod unloading without segmentation faults or memory corruption.
 
 ---
 
 ## 5. Performance Benchmarks & Methodology
 
-Performance is quantitatively verified across varying entity counts, archetype fragmentation distributions, and multi-architecture FFI access patterns.
-
-### 5.1 Invocation Commands
 ```bash
 # Run full cross-architecture & debug/release permutation benchmark matrix:
 make bench
 
 # Run Milestone 4 single-query linear throughput test (1k, 10k, 100k entities):
 make bench-quick
-
-# Inspect complete structured JSON results:
-cat target/benchmark_results.json
 ```
 
-### 5.2 Benchmarking Methodology & Parameter Spaces
-The benchmarking suite evaluates performance across five primary independent variables:
-1. **Execution Architecture**: Pure Native Bevy (inlined monomorphized), Coupled Rust `dylib` (shared unstable ABI), C-ABI Rust `cdylib` (`guest_sdk`), C-ABI C99 (`bevy_abi_mod.h`), and Dual Concurrent C99 + Rust.
-2. **FFI Access Pattern & Call Granularity**:
-   - `Pre-Cached SoA`: Gathers fragmented inner tables into an L1-resident array once per frame ($O(E)$ prep).
-   - `ChunkOptimized`: Direct chunk slice pointer iteration with $O(U+E)$ VTable boundary crossings.
-   - `Direct Idiomatic Nested Query`: Standard Bevy query loop re-walking 6 fragmented tables per outer entity.
-   - `EntityNestedVTable`: $O(U \times E)$ indirect VTable calls inside the inner nested loop + `iter_reset`.
-   - `NaiveChattyFfi`: $O(U \times E)$ VTable reads/writes + per-pair `iter_mark_changed` invocations.
-3. **Host Build Target**: `Release` (`opt-level=3`) vs. `Debug` (`opt-level=0`, unoptimized Bevy scheduler).
-4. **Guest Mod Build Target**: `Release` / `-O3` (production mod) vs. `Debug` / `-O0` (development mod with debug symbols).
-5. **Simulation Topology & Scale**:
-   - 34 total archetypes (16 active unit tables × 6 active emitter tables + 12 excluded decoy/frozen tables).
-   - Standard Scale: 1,024 units × 48 emitters = 49,152 pair evaluations/frame.
-   - Heavy Scale: 3,072 units × 96 emitters = 294,912 pair evaluations/frame.
-
-### 5.3 Benchmark Metrics Baseline & Results Summary
-- **Single-Query Linear Scale (`benchmarks.rs`)**:
-  - **100,000 Entities Throughput**: ~**20.3M+ entities/sec** in debug host, >**100M+ entities/sec** in release host.
-  - **Archetype Fragmentation**: Traversal remains consistent across 1-way, 4-way, and 16-way fragmented archetypes.
-- **Full Multi-Architecture × `Debug`/`Release` Nested Query Matrix ([`docs/BENCHMARKS.md`](BENCHMARKS.md))**:
-  - Proves **True Native Parity (`1.00x`–`1.15x`)**: Chunk-Optimized C-ABI (`0.186 ms` C99 / `0.215 ms` Rust) matches Pure Native Bevy (`0.186 ms` SoA / `0.218 ms` nested) within margin of error, without compiler lock-in.
-  - Maps the full **`1.00x` -> `66.47x` performance degradation ladder**, proving that chatty per-pair FFI dispatches and unoptimized debug hosts consume up to `74.3%` of the 60 FPS frame budget.
-  - Demonstrates the **Decoupled Cross-Profile Advantage**: a `Debug` Bevy Host running a `Release` C-ABI mod runs in `0.39 ms` (**`2.10x`**), which is **`20x` faster** than unoptimized Pure Native Bevy in Debug (`8.26 ms`).
+- **Single-Query Linear Scale (`benchmarks.rs`)**: ~**20.3M+ entities/sec** in debug host, >**100M+ entities/sec** in release host across 1-way, 4-way, and 16-way fragmented archetypes.
+- **Full Multi-Architecture × `Debug`/`Release` Nested Query Matrix ([`docs/BENCHMARKS.md`](BENCHMARKS.md))**: Demonstrates **`1.00x`–`1.15x` native parity** for Chunk-Optimized C99 (`0.186 ms`) and Rust `cdylib` (`0.215 ms`) vs. Pure Native Bevy (`0.186 ms` SoA / `0.218 ms` nested) without compiler lock-in.

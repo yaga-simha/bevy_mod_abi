@@ -130,6 +130,25 @@ test-e2e: ## Execute comprehensive 9-stage end-to-end verification pipeline
 	@echo -e "$(GREEN)[TEST-E2E]$(RESET) Running full E2E verification pipeline..."
 	bash scripts/run_e2e_tests.sh
 
+.PHONY: test-c99
+test-c99: ## Compile & run strict C99 header and ABI layout verification (-std=c99 -Wall -Wextra -Werror)
+	@echo -e "$(GREEN)[TEST-C99]$(RESET) Compiling asymmetric C99 mod (-std=c99 -Wall -Wextra -Werror)..."
+	$(MAKE) -C tests/asymmetric_c_mod clean
+	$(MAKE) -C tests/asymmetric_c_mod
+	@echo -e "$(GREEN)[TEST-C99]$(RESET) Compiling and running standalone_c_test.c..."
+	@mkdir -p target
+	$(CC) -std=c99 -Wall -Wextra -Werror -Iinclude tests/standalone_c_test.c -o target/standalone_c_test
+	./target/standalone_c_test
+
+.PHONY: miri
+miri: ## Run Miri (-Zmiri-tree-borrows) on in-process ABI, macro, SDK, fuzz, and parity suites
+	@echo -e "$(GREEN)[MIRI]$(RESET) Running Miri (-Zmiri-tree-borrows) on abi_contract & guest_sdk..."
+	MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p abi_contract -p guest_sdk
+	@echo -e "$(GREEN)[MIRI]$(RESET) Running Miri (-Zmiri-tree-borrows) on mod_derive in-process suites..."
+	MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p mod_derive --lib --test validation_gate_1 --test challenger_m1_macro_tests --test compile_fail_tests
+	@echo -e "$(GREEN)[MIRI]$(RESET) Running Miri (-Zmiri-tree-borrows) on host_runtime non-dlopen suites..."
+	MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p host_runtime --lib --test bevy_alignment_soundness_tests --test fuzz_abi_boundaries --test differential_bevy_parity -- --skip real_dylib_loaded_mod_entity_lifecycle_events_and_strict_validation_work
+
 .PHONY: bench
 bench: build-mods build-bench-mods ## Run full cross-architecture & debug/release permutation benchmark matrix
 	@echo -e "$(GREEN)[BENCH]$(RESET) Running complete permutation benchmark suite (Debug + Release x Native + Rust dylib + C-ABI Rust/C99)..."

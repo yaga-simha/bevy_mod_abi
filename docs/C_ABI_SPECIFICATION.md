@@ -85,23 +85,28 @@ In modern game engines built with Rust, dynamic plugin loading has historically 
 
 ## 2. Header & Type Definitions (`include/bevy_abi_mod.h`)
 
-The canonical header file is located at `include/bevy_abi_mod.h`. It is completely standalone and depends only on `<stdint.h>`, `<stddef.h>`, and `<stdbool.h>`.
+The canonical header file is located at `include/bevy_abi_mod.h`. It is completely standalone and depends **only** on `<stdint.h>` and `<stddef.h>` (`<stdbool.h>` is intentionally omitted; all C-ABI boolean values use `FfiBool` / `uint8_t` with `FFI_BOOL_FALSE = 0u` and `FFI_BOOL_TRUE = 1u` so non-canonical byte patterns `2..=255` can never trigger Rust `bool` UB).
 
 ### 2.1 Memory Layout & Struct Offsets (64-Bit Platforms)
-All types have guaranteed `sizeof`, `alignof`, and `offsetof` across standard 64-bit systems (System V AMD64 ABI on Linux/macOS and Microsoft x64 ABI on Windows):
+All types have guaranteed `sizeof`, `alignof`, and `offsetof` across standard 64-bit systems (System V AMD64 ABI on Linux/macOS and Microsoft x64 ABI on Windows), verified at compile time by `BEVY_ABI_STATIC_ASSERT` in `include/bevy_abi_mod.h` (including 32-bit `ILP32` assertions):
 
 | # | Type | `sizeof` | `alignof` | Field Name | Field Type | Field `offsetof` | Field `sizeof` | Notes / Padding |
 |---|---|---|---|---|---|---|---|---|
-| 1 | **`FfiResult`** | **4** | **4** | `(value)` | `uint32_t` | `0` | `4` | `#[repr(transparent)]` status code. |
-| 2 | **`FfiEntity`** | **8** | **8** | `(value)` | `uint64_t` | `0` | `8` | Opaque 64-bit entity handle (`Entity::to_bits()`). |
-| 3 | **`FfiByteSlice`** | **16** | **8** | `ptr`<br>`len` | `const uint8_t*`<br>`size_t` | `0`<br>`8` | `8`<br>`8` | Borrowed byte/string slice (`StrView`). |
-| 4 | **`ComponentUuid`** | **16** | **1** | `bytes[16]` | `uint8_t[16]` | `0` | `16` | Deterministic 128-bit 2-lane FNV-1a hash. |
-| 5 | **`ComponentAccessMode`** | **4** | **4** | `(value)` | `uint32_t` | `0` | `4` | `READ=0`, `WRITE=1`, `FILTER_ONLY=2`, `WITHOUT=3`. |
-| 6 | **`ComponentAccessDesc`** | **16** | **8** | `name`<br>`mode`<br>*(padding)* | `const char*`<br>`ComponentAccessMode`<br>`-` | `0`<br>`8`<br>`12` | `8`<br>`4`<br>`4` | 4 bytes tail padding to satisfy 8-byte pointer alignment. |
-| 7 | **`QuerySpec`** | **16** | **8** | `queries`<br>`query_count` | `const ComponentAccessDesc*`<br>`size_t` | `0`<br>`8` | `8`<br>`8` | Array of component descriptors for multi-query systems. |
-| 8 | **`MultiQuerySystemDescriptor`** | **48** | **8** | `struct_size`<br>*(padding)*<br>`name`<br>`query_specs`<br>`query_spec_count`<br>`callback`<br>`user_data` | `uint32_t`<br>`-`<br>`const char*`<br>`const QuerySpec*`<br>`size_t`<br>`MultiQuerySystemCallback`<br>`void*` | `0`<br>`4`<br>`8`<br>`16`<br>`24`<br>`32`<br>`40` | `4`<br>`4`<br>`8`<br>`8`<br>`8`<br>`8`<br>`8` | 4 bytes internal padding at offset 4 to align `name` pointer. |
-| 9 | **`SystemDescriptor`** | **48** | **8** | `struct_size`<br>*(padding)*<br>`name`<br>`queries`<br>`query_count`<br>`callback`<br>`user_data` | `uint32_t`<br>`-`<br>`const char*`<br>`const ComponentAccessDesc*`<br>`size_t`<br>`DynamicSystemCallback`<br>`void*` | `0`<br>`4`<br>`8`<br>`16`<br>`24`<br>`32`<br>`40` | `4`<br>`4`<br>`8`<br>`8`<br>`8`<br>`8`<br>`8` | 4 bytes internal padding at offset 4 to align `name` pointer. |
-| 10 | **`HostApi`** | **64** | **8** | `struct_size`<br>`abi_version`<br>`register_system`<br>`iter_next_chunk`<br>`iter_column_readonly`<br>`iter_column_mutable`<br>`iter_mark_changed`<br>`iter_entities`<br>`iter_column_stride` | `uint32_t`<br>`uint32_t`<br>`RegisterSystemFn`<br>`IterNextChunkFn`<br>`IterColumnReadonlyFn`<br>`IterColumnMutableFn`<br>`IterMarkChangedFn`<br>`IterEntitiesFn`<br>`IterColumnStrideFn` | `0`<br>`4`<br>`8`<br>`16`<br>`24`<br>`32`<br>`40`<br>`48`<br>`56` | `4`<br>`4`<br>`8`<br>`8`<br>`8`<br>`8`<br>`8`<br>`8`<br>`8` | `struct_size` + `abi_version` = 8 bytes; exactly aligns function pointers. |
+| 1 | **`FfiBool`** | **1** | **1** | `(value)` | `uint8_t` | `0` | `1` | `0` = false, non-zero = true (`FFI_BOOL_FALSE` / `FFI_BOOL_TRUE`). |
+| 2 | **`FfiResult`** | **4** | **4** | `(value)` | `uint32_t` | `0` | `4` | `#[repr(transparent)]` status code. |
+| 3 | **`FfiEntity`** | **8** | **8** | `(value)` | `uint64_t` | `0` | `8` | Opaque 64-bit entity handle; `BAM_ENTITY_NULL = 0ULL` is the sole invalid sentinel. |
+| 4 | **`FfiByteSlice`** | **16** | **8** | `ptr`<br>`len` | `const uint8_t*`<br>`size_t` | `0`<br>`8` | `8`<br>`8` | Borrowed byte/string slice (`StrView`). |
+| 5 | **`ComponentUuid`** | **16** | **1** | `bytes[16]` | `uint8_t[16]` | `0` | `16` | Deterministic 128-bit 2-lane FNV-1a hash. |
+| 6 | **`ComponentAccessMode`** | **4** | **4** | `(value)` | `uint32_t` | `0` | `4` | `READ=0`, `WRITE=1`, `FILTER_ONLY=2`, `WITHOUT=3`. |
+| 7 | **`ScheduleLabelId`** | **4** | **4** | `(value)` | `uint32_t` | `0` | `4` | `UPDATE=0`, `STARTUP=1`, `PRE_UPDATE=2`, `POST_UPDATE=3`, `FIXED_UPDATE=4`, `LAST=5`. |
+| 8 | **`ComponentAccessDesc`** | **16** | **8** | `name`<br>`mode`<br>*(padding)* | `const char*`<br>`ComponentAccessMode`<br>`-` | `0`<br>`8`<br>`12` | `8`<br>`4`<br>`4` | 4 bytes tail padding to satisfy 8-byte pointer alignment. |
+| 9 | **`QuerySpec`** | **16** | **8** | `queries`<br>`query_count` | `const ComponentAccessDesc*`<br>`size_t` | `0`<br>`8` | `8`<br>`8` | Array of component descriptors (`query_count <= 32`). |
+| 10 | **`SystemDescriptor`** | **48** | **8** | `struct_size`<br>*(padding)*<br>`name`<br>`queries`<br>`query_count`<br>`callback`<br>`user_data` | `uint32_t`<br>`-`<br>`const char*`<br>`const ComponentAccessDesc*`<br>`size_t`<br>`DynamicSystemCallback`<br>`void*` | `0`<br>`4`<br>`8`<br>`16`<br>`24`<br>`32`<br>`40` | `4`<br>`4`<br>`8`<br>`8`<br>`8`<br>`8`<br>`8` | v1 single-query descriptor (`query_count <= 32`). |
+| 11 | **`ScheduledSystemDescriptor`** | **88** | **8** | `base`<br>`schedule`<br>`flags`<br>`after`<br>`after_count`<br>`before`<br>`before_count` | `SystemDescriptor`<br>`ScheduleLabelId`<br>`uint32_t`<br>`const char* const*`<br>`size_t`<br>`const char* const*`<br>`size_t` | `0`<br>`48`<br>`52`<br>`56`<br>`64`<br>`72`<br>`80` | `48`<br>`4`<br>`4`<br>`8`<br>`8`<br>`8`<br>`8` | Alias `SystemDescriptorV2`; layout-prefixed by `SystemDescriptor` at offset `0`. |
+| 12 | **`MultiQuerySystemDescriptor`** | **48** | **8** | `struct_size`<br>*(padding)*<br>`name`<br>`query_specs`<br>`query_spec_count`<br>`callback`<br>`user_data` | `uint32_t`<br>`-`<br>`const char*`<br>`const QuerySpec*`<br>`size_t`<br>`MultiQuerySystemCallback`<br>`void*` | `0`<br>`4`<br>`8`<br>`16`<br>`24`<br>`32`<br>`40` | `4`<br>`4`<br>`8`<br>`8`<br>`8`<br>`8`<br>`8` | v1 multi-query descriptor (`1 <= query_spec_count <= 8`). |
+| 13 | **`ScheduledMultiQuerySystemDescriptor`** | **88** | **8** | `base`<br>`schedule`<br>`flags`<br>`after`<br>`after_count`<br>`before`<br>`before_count` | `MultiQuerySystemDescriptor`<br>`ScheduleLabelId`<br>`uint32_t`<br>`const char* const*`<br>`size_t`<br>`const char* const*`<br>`size_t` | `0`<br>`48`<br>`52`<br>`56`<br>`64`<br>`72`<br>`80` | `48`<br>`4`<br>`4`<br>`8`<br>`8`<br>`8`<br>`8` | Alias `MultiQuerySystemDescriptorV2`; layout-prefixed by `MultiQuerySystemDescriptor`. |
+| 14 | **`ModComponentDescriptor`** | **64** | **8** | `struct_size`<br>*(padding)*<br>`name`<br>`uuid`<br>`size`<br>`align`<br>`drop_fn`<br>`vtable_ptr` | `uint32_t`<br>`-`<br>`const char*`<br>`ComponentUuid`<br>`size_t`<br>`size_t`<br>`ComponentDropFn`<br>`const void*` | `0`<br>`4`<br>`8`<br>`16`<br>`32`<br>`40`<br>`48`<br>`56` | `4`<br>`4`<br>`8`<br>`16`<br>`8`<br>`8`<br>`8`<br>`8` | Alias `DynamicComponentDescriptor`; runtime component registration. |
+| 15 | **`HostApi`** | **72** | **8** | `struct_size`<br>`abi_version`<br>`register_system`<br>`iter_next_chunk`<br>`iter_column_readonly`<br>`iter_column_mutable`<br>`iter_mark_changed`<br>`iter_entities`<br>`iter_column_stride`<br>`register_component` | `uint32_t`<br>`uint32_t`<br>`RegisterSystemFn`<br>`IterNextChunkFn`<br>`IterColumnReadonlyFn`<br>`IterColumnMutableFn`<br>`IterMarkChangedFn`<br>`IterEntitiesFn`<br>`IterColumnStrideFn`<br>`RegisterComponentFn` | `0`<br>`4`<br>`8`<br>`16`<br>`24`<br>`32`<br>`40`<br>`48`<br>`56`<br>`64` | `4`<br>`4`<br>`8`<br>`8`<br>`8`<br>`8`<br>`8`<br>`8`<br>`8`<br>`8` | Backward-compatible with 64-byte legacy mods via `struct_size >= 64`. |
 
 ### 2.2 Calling Conventions & Pointer Rules
 1. **Calling Convention:** All dynamic entry points and function pointer callbacks strictly adhere to standard C calling conventions (`cdecl` on x86, standard register conventions on x86_64 and AArch64).
@@ -192,7 +197,7 @@ The dynamic library exports three core lifecycle entry points:
         ▼                                                ▼
 ```
 
-### 3.3 VTable Resolution via `GetProcAddressFn`
+### 3.3 VTable & Extension Resolution via `GetProcAddressFn`
 The guest retrieves pointers by passing string names to `get_proc_address`:
 - **Component VTables:** `"<ComponentName>_vtable"` (e.g., `"Position_vtable"`, `"Velocity_vtable"`). Returns `const <Component>VTable*`.
 - **Deferred Command Bridge:**
@@ -201,8 +206,12 @@ The guest retrieves pointers by passing string names to `get_proc_address`:
   - `"cmd_insert_component"`: `CmdInsertComponentFn`
 - **Iteration Controls:**
   - `"iter_reset"`: `IterResetFn`
-- **Advanced Registration:**
+- **Advanced System & Component Registration:**
+  - `"register_scheduled_system"`: `RegisterScheduledSystemFn`
   - `"register_multi_query_system"`: `RegisterMultiQuerySystemFn`
+  - `"register_component"`: `RegisterComponentFn` (also directly on `HostApi::register_component`)
+
+SemVer handshake compatibility is checked via `bevy_abi_version_is_compatible(host_api->abi_version, BEVY_ABI_VERSION_PACKED)` (`major ==` and `guest_minor <= host_minor`), while extensible descriptors (`SystemDescriptor`, `ScheduledSystemDescriptor`, `MultiQuerySystemDescriptor`, `ScheduledMultiQuerySystemDescriptor`, `ModComponentDescriptor`) enforce `struct_size >= MIN_V1_SIZE` and zero-fill trailing fields when older minor-version descriptors are passed.
 
 ---
 
@@ -333,6 +342,33 @@ IterResetFn iter_reset = (IterResetFn)get_proc_address("iter_reset");
 iter_reset(iters[1]); // Rewinds inner query iterator
 ```
 
+Bounds enforced on all descriptors:
+- `query_count <= 32` (`MAX_QUERY_COMPONENTS`); exceeding `32` returns `FFI_RESULT_INVALID_COMPONENT` (never silently truncating filter/access clauses).
+- `1 <= query_spec_count <= 8` (`MAX_SYSTEM_QUERIES`); `0` or `> 8` returns `FFI_RESULT_INVALID_COMPONENT`.
+
+### 4.6 Scheduled System Registration & Explicit Ordering (`ScheduledSystemDescriptor`)
+To target non-default Bevy schedules (`BAM_SCHEDULE_STARTUP`, `BAM_SCHEDULE_PRE_UPDATE`, `BAM_SCHEDULE_UPDATE`, `BAM_SCHEDULE_POST_UPDATE`, `BAM_SCHEDULE_FIXED_UPDATE`, `BAM_SCHEDULE_LAST`) or declare explicit `.after(...)` / `.before(...)` ordering against named mod systems, populate `ScheduledSystemDescriptor` (`SystemDescriptorV2`) or `ScheduledMultiQuerySystemDescriptor` (`MultiQuerySystemDescriptorV2`):
+```c
+const char* after_names[] = { "input_gather_system" };
+ScheduledSystemDescriptor sdesc;
+memset(&sdesc, 0, sizeof(sdesc));
+sdesc.base.struct_size = (uint32_t)sizeof(ScheduledSystemDescriptor);
+sdesc.base.name = "physics_step_system";
+sdesc.base.queries = queries;
+sdesc.base.query_count = 2;
+sdesc.base.callback = c_kinematics_system;
+sdesc.schedule = BAM_SCHEDULE_FIXED_UPDATE;
+sdesc.after = after_names;
+sdesc.after_count = 1;
+
+RegisterScheduledSystemFn reg_sched =
+    (RegisterScheduledSystemFn)get_proc_address("register_scheduled_system");
+FfiResult res = reg_sched
+    ? reg_sched(host_context, &sdesc)
+    : host_api->register_system(host_context, &sdesc.base);
+```
+Because `ScheduledSystemDescriptor` embeds `SystemDescriptor` at offset `0` with `base.struct_size == sizeof(ScheduledSystemDescriptor)`, both `register_scheduled_system(ctx, &sdesc)` and `host_api->register_system(ctx, &sdesc.base)` decode the schedule and ordering extensions seamlessly.
+
 ---
 
 ## 5. Deferred Command Queue APIs & Allocator Isolation
@@ -342,20 +378,20 @@ Bevy ECS organizes entities in densely packed archetype tables. Structural mutat
 
 Therefore, dynamic systems receive a `RawCommandQueue*` handle. Structural mutations are buffered during system execution and applied at Bevy's schedule synchronization boundary.
 
-### 5.2 Immediate Entity ID Generation
+### 5.2 Immediate Entity ID Generation & `BAM_ENTITY_NULL`
 Mods frequently need to spawn an entity and immediately attach components to it within the same frame. When a mod calls `cmd_spawn_empty(commands)`, the host invokes Bevy's atomic `EntityAllocator`:
-- A valid, unique 64-bit `FfiEntity` ID is allocated immediately and returned to the guest.
-- A deferred command `world.spawn_empty_at(entity)` is queued.
-- The guest can immediately pass the returned `FfiEntity` to `cmd_insert_component`!
+- A valid, unique 64-bit `FfiEntity` ID is allocated immediately and returned to the guest (or `BAM_ENTITY_NULL` / `0ULL` if `commands` is null).
+- Note that in Bevy 0.20+, `BAM_ENTITY_NULL` (`0ULL`, tested via `bam_entity_is_null(entity)`) is the **sole invalid entity sentinel** (`Entity::try_from_bits(0) == None`, whereas `UINT64_MAX` is a valid entity bit pattern). Passing `BAM_ENTITY_NULL` or `Entity::PLACEHOLDER` (`0x1`) to `cmd_despawn` or `cmd_insert_component` returns `FFI_RESULT_INVALID_COMPONENT`.
+- A deferred command `world.spawn_empty_at(entity)` is queued, so the guest can immediately pass the returned `FfiEntity` to `cmd_insert_component`!
 
-### 5.3 Strict Memory Allocator Isolation
+### 5.3 Strict Memory Allocator Isolation & Raw-Insertability Guards
 Rule 2 of the ABI contract mandates: **Memory allocated by the guest must be freed by the guest; memory allocated by the host must be freed by the host.**
 
 When a guest calls `cmd_insert_component`:
-1. The guest passes a pointer to its own stack or heap memory: `data` with length `len`.
-2. The host immediately allocates a host-owned buffer (`Vec<u8>`) and **copies** the guest bytes.
-3. The guest may immediately free, reuse, or overwrite its buffer upon function return.
-4. When Bevy applies deferred commands, the component is unmarshaled from host memory. Unloading the guest `.so`/`.dll` can never cause a dangling pointer on the host.
+1. The host verifies that the target component allows raw-byte insertion (`IS_RAW_INSERTABLE == true` on static POD `ModExposable` components or runtime-registered `ModComponentDescriptor` types). Attempting to overwrite heap-owning (`String`, `Vec<T>`), `bool`-bearing, or `#[mod_component(opaque)]` host components via raw bytes is rejected with `FFI_RESULT_PERMISSION_DENIED`.
+2. The guest passes a pointer to its own stack or heap memory: `data` with exact byte length `len == sizeof(Component)`.
+3. The host immediately allocates a host-owned aligned buffer and **copies** the guest bytes.
+4. The guest may immediately free, reuse, or overwrite its buffer upon function return; unloading the guest `.so`/`.dll` can never cause a dangling pointer on the host.
 
 ### 5.4 Command Function Signatures
 Resolved via `get_proc_address`:
@@ -440,7 +476,6 @@ This reference mod demonstrates complete C99 compatibility, registering a 3D kin
 
 #include "bevy_abi_mod.h"
 #include <string.h>
-#include <stdbool.h>
 
 /* Component VTable Mirrors */
 typedef struct PositionVTable {
@@ -549,7 +584,7 @@ BEVY_ABI_MOD_EXPORT FfiResult bevy_abi_mod_init(
     if (!host_api || host_api->struct_size < sizeof(HostApi)) {
         return FFI_RESULT_INVALID_VERSION;
     }
-    if (host_api->abi_version != BEVY_ABI_VERSION_PACKED) {
+    if (!bevy_abi_version_is_compatible(host_api->abi_version, BEVY_ABI_VERSION_PACKED)) {
         return FFI_RESULT_INVALID_VERSION;
     }
     if (!get_proc_address) {
@@ -921,6 +956,7 @@ pub const HostApi = extern struct {
     iter_mark_changed: IterMarkChangedFn,
     iter_entities: IterEntitiesFn,
     iter_column_stride: IterColumnStrideFn,
+    register_component: ?*const anyopaque,
 };
 
 // VTable Definitions

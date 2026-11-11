@@ -111,11 +111,11 @@ Standard Rust does not provide a stable ABI. Dynamically linking Rust plugins vi
 
 | Layer / Crate | Type | Responsibilities & Constraints |
 |---|---|---|
-| **`abi_contract`** | Core Contract | `#![no_std]`, `#[repr(C)]`, zero external dependencies. Defines `HostApi`, `SystemDescriptor`, `RawChunkIter`, `FfiEntity`, `FfiResult`, and status codes. |
-| **`mod_derive`** | Procedural Macro | Generates `#[repr(C)]` VTables and C-ABI accessors for Bevy components (`#[derive(Component, ModExposable)]`). Enforces self-aliasing safety in mutators. |
-| **`host_runtime`** | Host Engine Bridge | Bevy plugin (`AbiModPlugin`), component registry (`ModRegistry`), dynamic system adapter (`DynamicCSystem`), table chunk iterator (`HostChunkIter`), and lifecycle manager (`ModHost`). |
-| **`guest_sdk`** | Mod Author SDK | Lightweight, Bevy-independent Rust wrapper. Encapsulates `catch_guest_panic`, `export_mod!`, `wrap_system_callback!`, bounds-checked `ChunkSlice`, and safe command queues. |
-| **`include/bevy_abi_mod.h`** | Canonical C Header | Complete C99/C++ header defining all types and function pointers matching `abi_contract` byte-for-byte. |
+| **`abi_contract`** | Core Contract | `#![no_std]`, `#[repr(C)]`, zero external dependencies. Defines `HostApi`, `SystemDescriptor`, `ScheduledSystemDescriptor`, `ModComponentDescriptor`, `RawChunkIter`, `FfiBool` (`u8`), `FfiEntity` (`NULL = 0`), `FfiResult`, `AbiPod`, `FfiLayout`, and `ExposableComponent`. |
+| **`mod_derive`** | Procedural Macro | Generates `#[repr(C)]` VTables and C-ABI accessors (`#[derive(ModExposable)]`, emitting `u8` for `bool`) and compile-time verified POD layout markers (`#[derive(AbiPod)]`). Enforces self-aliasing safety in mutators and computes `IS_POD` / `IS_RAW_INSERTABLE`. |
+| **`host_runtime`** | Host Engine Bridge | Bevy plugin (`AbiModPlugin`, `ModErrorPolicy`), component registry (`ModRegistry` with per-`World` thread-local `CURRENT_REGISTRY`), dynamic system adapter (`DynamicCSystem` backed by `QueryState`), dense + `SparseSet` chunk iterator (`HostChunkIter`), and lifecycle manager (`ModHost`, `ModLoadError`, `ModSystemSet`). |
+| **`guest_sdk`** | Mod Author SDK | Lightweight, Bevy-independent Rust wrapper. Provides `GuestApp`, `GuestPlugin`, `SystemContext`, `MultiQueryContext`, `catch_guest_panic`, `export_mod!`, `Chunk` split-borrow views (`next_chunk_view`, `read_write`, `columns_mut`), and safe command queues. |
+| **`include/bevy_abi_mod.h`** | Canonical C Header | Standalone ISO C99/C++ header (`<stdint.h>`, `<stddef.h>`, no `<stdbool.h>`) defining all types, SemVer helpers, and static layout assertions matching `abi_contract` byte-for-byte. |
 
 ---
 
@@ -342,9 +342,25 @@ $\therefore$ Dropping the library handle does not produce dangling execution or 
 
 ---
 
-## 5. Contiguous Archetype Table Chunk Traversal
+### 4.4 Proof D: POD Layout Separation, Bit Validity & Clone Drop Safety
+**Theorem**: *Foreign bit patterns crossing the C-ABI can never materialize an invalid Rust bit pattern (`bool` $\notin \{0,1\}$, invalid enum discriminant, or overwritten `String`/`Vec` pointers), nor can entity cloning duplicate ownership of foreign-allocated resources.*
 
-Bevy ECS organizes entities with identical component sets into contiguous **Archetypes** and **Tables** (Structure-of-Arrays).
+**Proof**:
+1. **Primitive Newtypes & `FfiBool`**:
+   - Status codes (`FfiResult(pub u32)`), access modes (`ComponentAccessMode(pub u32)`), and schedule selectors (`ScheduleLabelId(pub u32)`) are `#[repr(transparent)]` integer newtypes rather than Rust `enum`s.
+   - Boolean values across FFI use `FfiBool = u8` (`0` = false, non-zero = true); `<stdbool.h>` is intentionally omitted from `include/bevy_abi_mod.h`, and `#[derive(ModExposable)]` emits `extern "C" fn(...) -> u8` / `fn(..., u8)` accessors for `bool` fields.
+   - Invalid entity handles use `FfiEntity::NULL = FfiEntity(0)` (`Entity::try_from_bits(0) == None` in Bevy 0.20+, whereas `u64::MAX` is a valid entity and `Entity::PLACEHOLDER` is rejected on mutation).
+2. **Three-Trait Separation (`AbiPod` $\subset$ `FfiLayout` $\subset$ `ExposableComponent`)**:
+   - `AbiPod` requires `#[repr(C)]` / `#[repr(transparent)]`, non-packed layout, `Copy`, `!needs_drop::<Self>()`, and universal bit validity on every field (excluding `bool`, `String`, `Vec<T>`, and `#[repr(Rust)]` structs). `guest_sdk` restricts typed zero-copy column slices (`Chunk::read_write`, `as_typed_slice`) to `AbiPod` types (`#[derive(AbiPod)]`).
+   - `FfiLayout` marks types safe for interior pointers and raw-byte insertion (`IS_RAW_INSERTABLE = true`). `ExposableComponent` is decoupled from `FfiLayout`; calling `host_cmd_insert_component` on any component with `IS_RAW_INSERTABLE == false` (containing `String`, `Vec<T>`, `bool`, `#[mod_field(skip)]`, or `#[mod_component(opaque)]`) immediately returns `FfiResult::PERMISSION_DENIED`.
+3. **Clone Safety on Foreign-Droppable Dynamic Components**:
+   - Runtime components registered via `host_register_component` with `drop_fn.is_some()` set Bevy's `ComponentCloneBehavior::Ignore` on their `ComponentDescriptor`. Consequently, `EntityCloner` (`clone_and_spawn`) never performs a bitwise shallow copy of foreign heap pointers, eliminating double-free UB. $\blacksquare$
+
+---
+
+## 5. Contiguous Archetype `Table` & `SparseSet` Chunk Traversal
+
+Bevy ECS supports two component storage backends: dense Structure-of-Arrays **`Table`** columns (`StorageType::Table`) and per-component **`SparseSet`** maps (`StorageType::SparseSet`). Importantly, adding or removing a `SparseSet` component moves an entity to a new **Archetype** while leaving it in the **same dense `Table`**.
 
 ```text
 Archetype Table (e.g. Entities with [Position, Velocity, Health])
@@ -359,22 +375,17 @@ Archetype Table (e.g. Entities with [Position, Velocity, Health])
 └─────────────┴────────────────────────────────────────────────────────┘
 ```
 
-### 5.1 Zero-Allocation Traversal Mechanics
-During system execution:
-1. `HostChunkIter` queries Bevy's `world.storages().tables`.
-2. It fetches the column pointer for each requested component using `table.get_column(component_id).data()`.
-3. It hands the guest:
-   - `count`: Number of entities in the current table chunk.
-   - Column base pointers via `iter_column_readonly(iter, col_idx)` and `iter_column_mutable(iter, col_idx)`.
-   - Byte strides via `iter_column_stride(iter, col_idx)`.
-   - Entity IDs via `iter_entities(iter)`.
-4. The guest system iterates through the chunk with simple pointer arithmetic:
-   $$\text{element\_ptr}(i) = \text{base\_ptr} + (i \times \text{stride})$$
-
-This achieves native hardware speed with full CPU cache prefetching, matching native Rust iteration performance (~20M entities/sec).
+### 5.1 Dual-Path Traversal Mechanics (`HostChunkIter`)
+During `DynamicCSystem::initialize`, each query group builds a native Bevy `QueryState` via `QueryBuilder` and checks whether any data or filter (`FILTER_ONLY` / `WITHOUT`) clause references a `StorageType::SparseSet` component:
+1. **Dense `Table` Fast Path (`HostChunkIter::new`)**:
+   - Used whenever all data and filter components use `StorageType::Table`.
+   - Iterates matched `TableId`s directly, handing the guest zero-copy contiguous column pointers (`table.get_column(component_id)`), byte strides, and `[FfiEntity; count]` slices at ~20M+ entities/sec.
+2. **Archetype-Aware `SparseSet` Path (`HostChunkIter::new_archetypal`)**:
+   - Activated automatically whenever any queried or filtered component uses `StorageType::SparseSet`.
+   - Iterates per matched `Archetype` (never leaking shared-table entities excluded by `With<Sparse>` or `Without<Sparse>`), gathering archetype-local rows for both `Table` and `SparseSet` columns and propagating `Changed<T>` ticks back to the underlying `Table` row or `ComponentSparseSet` entry.
 
 ### 5.2 Steady-State Generation Caching
-To eliminate table matching overhead on every frame, `DynamicCSystem` caches matched table IDs in `CachedQueryGroup`. On every run, it inspects `world.archetypes().generation()`. If unchanged, the cached table slice is reused directly without any allocations.
+To eliminate archetype matching overhead on every frame, `DynamicCSystem` caches matched `TableId`s and `ArchetypeId`s in `CachedQueryGroup` via `QueryState::update_archetypes`. On every run, if `world.archetypes().generation()` is unchanged, cached slices are reused with zero steady-state heap allocations.
 
 ---
 
@@ -454,59 +465,46 @@ In `DynamicCSystem::run_unsafe`:
 
 ## 7. Parallel Scheduling & Borrow Checking
 
-### 7.1 Dynamic `FilteredAccessSet`
-When a mod registers a system, it supplies an array of `ComponentAccessDesc`:
+### 7.1 Dynamic `QueryBuilder` & `FilteredAccessSet`
+When a mod registers a system, it supplies up to `MAX_QUERY_COMPONENTS = 32` `ComponentAccessDesc` entries per query (and up to `MAX_SYSTEM_QUERIES = 8` queries per system):
 ```rust
-ComponentAccessDesc {
-    name: b"Position\0".as_ptr() as *const c_char,
-    mode: ComponentAccessMode::WRITE,
-}
+ComponentAccessDesc::write(c"Position".as_ptr())
 ```
 During `System::initialize`:
-1. `DynamicCSystem` resolves each component name to its runtime `ComponentId` via `ModRegistry`.
-2. It populates Bevy's internal `FilteredAccessSet<ComponentId>`:
-   - `add_component_read(component_id)` for `READ`.
-   - `add_component_write(component_id)` for `WRITE`.
-   - `and_with(component_id)` for `FILTER_ONLY`.
-   - `and_without(component_id)` for `WITHOUT`.
-3. Bevy's multi-threaded scheduler inspects this access set.
+1. `DynamicCSystem` resolves each component name to its runtime `(ComponentId, StorageType)` via `ModRegistry`.
+2. It constructs a native Bevy `QueryBuilder` (`ref_id`, `mut_id`, `with_id`, `without_id`) and extracts `QueryState::component_access()` directly into Bevy's `FilteredAccessSet<ComponentId>`, guaranteeing 100% access-compatibility parity with native Bevy `Query` systems.
+3. On multi-threaded executor worker threads, `DynamicCSystem::run_unsafe` binds `ModRegistry::make_current()` to thread-local `CURRENT_REGISTRY` so runtime `host_get_proc_address` calls remain isolated per `World`.
 
-### 7.2 Concurrency & Disjoint Execution
+### 7.2 Concurrency, System Sets & Ordering
 - Systems accessing disjoint components or performing concurrent reads execute in parallel across CPU worker threads.
-- Conflicting systems are safely serialized by Bevy's scheduler without user intervention or lock overhead.
+- Every mod system is tagged with `ModSystemSet::All`, `ModSystemSet::Mod(ModId)`, and `ModNamedSystemSet(name)`, allowing both host schedules and `ScheduledSystemDescriptor` (`after` / `before` across `Startup`, `PreUpdate`, `Update`, `PostUpdate`, `FixedUpdate`, and `Last`) to order mod systems deterministically.
 
 ---
 
-## 8. Change Detection Integration (`AtomicTick`)
+## 8. Change Detection Integration (`world.increment_change_tick()`)
 
-Bevy features a sophisticated change-detection mechanism (`Changed<T>` query filter) driven by world ticks.
-
-In `bevy_abi_mod`:
-- When a guest system requests mutable column access via `iter_column_mutable`, or explicitly invokes `iter_mark_changed(iter, col, row)`:
-- `HostChunkIter` locates the component's `AtomicTick` storage in the table column.
-- It writes the current `world.change_tick()` to the tick cell.
-- Subsequent native or mod systems filtering by `Changed<Position>` instantly detect that the entity was mutated by the mod.
+Bevy's `Changed<T>` query filter compares component `Tick`s against each system's `last_run` tick:
+- At the start of every execution, `DynamicCSystem::run_unsafe` advances `let this_run = world.increment_change_tick();` and updates `self.last_run` at completion, maintaining exact tick parity with native Bevy systems across multi-frame schedules and `World::check_change_ticks()` `u32::MAX` wraparound clamping.
+- Requesting mutable column access via `iter_column_mutable` marks chunk ticks (`Table` or `ComponentSparseSet`), while `iter_mark_changed(iter, col, row)` flags individual rows.
 
 ---
 
-## 9. Fault Isolation & Two-Tier Panic Containment
+## 9. Fault Isolation, `ModErrorPolicy` & Two-Tier Panic Containment
 
-Cross-library panics between distinct Rust runtimes or C shared libraries pose a major safety risk:
-- Catching an unwinding panic from a separate `.cdylib` in the host's `catch_unwind` is classified as catching a foreign exception, which can abort the entire process.
-- To prevent this, `bevy_abi_mod` enforces **Two-Tier Panic Containment**:
-  1. **Tier 1 (Guest-Side Containment):** `guest_sdk` uses `catch_guest_panic` to intercept panics inside the guest's own standard library runtime, converting them to `FfiResult::PANIC_CAUGHT`.
-  2. **Tier 2 (Host-Side Defense):** The host wraps callback execution in `catch_unwind`.
-  3. **Fault Quarantining:** Upon receiving `PANIC_CAUGHT` or an unhandled error:
-     - The host logs the faulted system name.
-     - The host marks `self.enabled = false`.
-     - The host continues running Bevy's game loop without interrupting other systems or crashing the game.
+Cross-library panics between distinct Rust runtimes or C shared libraries are contained via **Two-Tier Panic Containment** and configurable **`ModErrorPolicy`**:
+1. **Tier 1 (Guest-Side Containment):** `guest_sdk` (`catch_guest_panic`, `export_mod!`, `GuestApp::add_system`) catches panics inside the guest's own `std` runtime and returns `FfiResult::PANIC_CAUGHT`.
+2. **Tier 2 (Host-Side Defense):** `DynamicCSystem::run_unsafe` also wraps callback execution in `catch_unwind`.
+3. **Configurable `ModErrorPolicy` & `ModSystemFaulted` Events:**
+   - `ModErrorPolicy::Quarantine` (default): logs the fault, sets `self.enabled = false` to quarantine the faulty system, and queues a `ModSystemFaulted` ECS event/message.
+   - `ModErrorPolicy::Log`: logs and emits `ModSystemFaulted` while allowing subsequent ticks to retry.
+   - `ModErrorPolicy::ReportToBevy`: returns `Err(BevyError)` directly into Bevy's schedule error handler alongside `ModSystemFaulted`.
 
 ---
 
-## 10. Deterministic Lifecycle & Hot-Reloading
+## 10. Deterministic Lifecycle, Schedule Excision & Drop-Trampoline Isolation
 
-Hot-unloading native code requires deterministic teardown:
-1. **Atomic Tombstone Flag:** `is_active.store(false, Ordering::Release)` immediately deactivates all registered systems.
-2. **Shutdown Hook:** The host calls the mod's optional `bevy_abi_mod_shutdown()` entry point while `.text` is still mapped, allowing the mod to release guest-allocated resources.
-3. **Handle Drop:** The `libloading::Library` handle is dropped, executing OS-level library unmapping (`dlclose` on Unix, `FreeLibrary` on Windows).
-4. **Post-Unload Immunity:** The surviving Bevy schedule continues executing leftover dynamic systems as no-ops without dangling pointer dereferences.
+Hot-unloading native code (`ModHost::try_unload_mod`) executes a deterministic teardown pipeline:
+1. **Atomic Tombstone & Drop-Trampoline Deactivation:** Flips `is_active.store(false, Ordering::Release)` and updates the 1,024-slot lock-free per-`(WorldId, ComponentUuid)` atomic drop-trampoline pool (`MAX_DROP_TRAMPOLINES = 1024`), ensuring unmapped foreign `ComponentDropFn` pointers are never invoked even during partial multi-mod unloads or `World::drop`.
+2. **Schedule Graph Excision:** Calls `Schedule::remove_systems_in_set(ModSystemSet::Mod(mod_id), world, ScheduleCleanupPolicy::RemoveSystemsOnly)` across tracked schedules so schedule node counts stay constant across thousands of hot-reload cycles.
+3. **ECS Metadata & Shutdown Hook:** Despawns the `LoadedModInfo` entity, emits `ModUnloaded`, and—when the per-inode `SharedLibState` reference count reaches `0`—invokes `bevy_abi_mod_shutdown()` while `.text` is still mapped (triggering `guest_sdk`'s LIFO `cleanup_registered_guest_state()`).
+4. **OS Library Unmap:** Drops `libloading::Library` (`dlclose` / `FreeLibrary`) under the per-inode lock.
