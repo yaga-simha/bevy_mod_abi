@@ -4,6 +4,7 @@ use bevy_ecs::component::Component;
 use host_runtime::ModExposable;
 
 #[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+#[repr(C)]
 pub struct Position {
     pub x: f32,
     pub y: f32,
@@ -11,6 +12,7 @@ pub struct Position {
 }
 
 #[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+#[repr(C)]
 pub struct Velocity {
     pub x: f32,
     pub y: f32,
@@ -18,17 +20,20 @@ pub struct Velocity {
 }
 
 #[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+#[repr(C)]
 pub struct Health {
     pub current: f32,
     pub max: f32,
 }
 
 #[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+#[repr(C)]
 pub struct PlayerTag {
     pub id: u32,
 }
 
 #[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+#[repr(C)]
 pub struct DroneTag {
     pub squad: u32,
 }

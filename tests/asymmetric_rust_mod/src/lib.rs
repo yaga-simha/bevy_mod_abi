@@ -6,9 +6,8 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::Mutex;
 use guest_sdk::{
     export_mod, register_runtime_component, wrap_system_callback, CommandBridgeVTable,
-    ComponentAccessDesc, ComponentAccessMode, FfiEntity, FfiResult, GetProcAddressFn,
-    GuestChunkIter, GuestCommandQueue, HostApi, RawChunkIter, RawCommandQueue, StrView,
-    SystemDescriptor,
+    ComponentAccessDesc, ComponentAccessMode, FfiResult, GetProcAddressFn, GuestChunkIter,
+    GuestCommandQueue, HostApi, RawChunkIter, RawCommandQueue, StrView, SystemDescriptor,
 };
 
 // ============================================================================
@@ -310,7 +309,7 @@ unsafe fn rust_command_system(
 
     // 1. Spawn a new entity
     let new_entity = cmd_queue.spawn_empty();
-    if new_entity.0 == 0 || new_entity == FfiEntity::PLACEHOLDER {
+    if new_entity.0 == 0 {
         return FfiResult::INTERNAL_ERROR;
     }
 
