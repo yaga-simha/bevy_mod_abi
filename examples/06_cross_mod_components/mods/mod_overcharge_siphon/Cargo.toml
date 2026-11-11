@@ -1,0 +1,14 @@
+[package]
+name = "mod_overcharge_siphon"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+guest_sdk = { path = "../../../../crates/guest_sdk" }
+abi_contract = { path = "../../../../crates/abi_contract" }
