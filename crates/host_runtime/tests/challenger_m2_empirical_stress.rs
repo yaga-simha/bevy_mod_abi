@@ -1,4 +1,5 @@
 #![deny(unsafe_op_in_unsafe_fn)]
+#![deny(improper_ctypes_definitions)]
 
 //! # Milestone 2 Empirical Adversarial Stress Suite
 //!
@@ -175,8 +176,8 @@ fn test_adversarial_alignment_and_pointer_arithmetic_matrix() {
 
     // Verify all components in Bevy World are strictly aligned and equal to inserted data
     let reg = world.resource::<ModRegistry>();
-    for i in 0..ENTITY_COUNT {
-        let bevy_e = Entity::from_bits(entities[i].0);
+    for (i, ffi_e) in entities.iter().enumerate().take(ENTITY_COUNT) {
+        let bevy_e = Entity::from_bits(ffi_e.0);
         let e_ref = world.entity(bevy_e);
 
         macro_rules! check_val {
@@ -243,11 +244,8 @@ unsafe extern "C" fn dynamic_chunk_pointer_arithmetic_verifier(
     _commands: *mut RawCommandQueue,
     _user_data: *mut c_void,
 ) -> FfiResult {
-    loop {
-        let count = unsafe { host_iter_next_chunk(iter) };
-        if count == 0 {
-            break;
-        }
+    let count = unsafe { host_iter_next_chunk(iter) };
+    if count > 0 {
 
         // Columns: 0: CompAlign1, 1: CompAlign16, 2: CompAlign64
         let p1 = unsafe { host_iter_column_mutable(iter, 0) };
@@ -303,9 +301,6 @@ unsafe extern "C" fn dynamic_chunk_pointer_arithmetic_verifier(
 
         let re_p1 = unsafe { host_iter_column_readonly(iter, 0) };
         assert_eq!(re_p1, p1 as *const u8);
-
-        // Break after the verified reset pass to avoid infinite loop
-        break;
     }
 
     FfiResult::OK
@@ -1260,9 +1255,9 @@ fn test_adversarial_drop_trampoline_slot_reuse_cross_talk() {
     }
     command_queue.apply(&mut world);
 
-    // Fill remaining slots up to 64
+    // Fill remaining slots up to MAX_DROP_TRAMPOLINES
     let mut dummy_names = Vec::new();
-    for i in 0..63 {
+    for i in 0..(host_runtime::MAX_DROP_TRAMPOLINES - 1) {
         let name_str = format!("DummyDropSlotComp_{}\0", i);
         dummy_names.push(name_str);
     }

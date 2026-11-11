@@ -18,12 +18,15 @@
 //!      components or reference relationships within the same frame.
 //!    - `bridge.allocator.alloc()` generates a valid 64-bit [`Entity`] ID synchronously from
 //!      Bevy's thread-safe atomic entity allocator, while queueing `world.spawn_empty_at(entity)` deferred.
-//! 3. **Strict Allocator Isolation (Rule 2)**:
+//! 3. **Strict Allocator & Layout Isolation (Rule 2 + Pod Safety)**:
 //!    - Guest mods and the host game may use entirely different memory allocators.
 //!    - Memory allocated by guest must never be freed by host, and vice versa.
-//!    - In [`host_cmd_insert_component`], the host copies the guest's component byte buffer
-//!      into a host-owned `Vec<u8>` via `core::slice::from_raw_parts(data, len).to_vec()`.
-//!    - When the command queue is flushed, the host safely inserts the component from host memory.
+//!    - Static host components that manage heap allocations (e.g. `String`, `Vec`) or non-Pod
+//!      invariants forbid raw byte insertion (`FfiResult::PERMISSION_DENIED`) so guest bytes
+//!      can never forge host heap pointers or cause double-frees.
+//!    - For dynamic components, [`host_cmd_insert_component`] copies foreign bytes into an
+//!      aligned host-owned buffer (or constructs a properly aligned dangling pointer for ZSTs)
+//!      before transferring ownership into Bevy via [`OwningPtr`].
 
 use crate::registry::ModRegistry;
 use abi_contract::{FfiEntity, FfiResult, RawCommandQueue};
@@ -31,6 +34,7 @@ use bevy_ecs::entity::{Entity, EntityAllocator};
 use bevy_ecs::ptr::OwningPtr;
 use bevy_ecs::world::{CommandQueue, World};
 use core::ffi::{c_char, CStr};
+use core::num::NonZeroUsize;
 use std::alloc::Layout;
 
 /// Host-allocated temporary buffer aligned to the component's required memory alignment.
@@ -97,6 +101,7 @@ pub type CmdInsertComponentFn = unsafe extern "C" fn(
 ) -> FfiResult;
 
 /// Spawns an empty entity deferred on the Bevy world and returns its 64-bit ID immediately.
+/// Returns `FfiEntity(0)` (null sentinel) if `queue` is null.
 ///
 /// # Safety
 /// `queue` must be a valid pointer to a [`CommandQueueBridge`] or null.
@@ -114,6 +119,7 @@ pub unsafe extern "C" fn host_cmd_spawn_empty(queue: *mut RawCommandQueue) -> Ff
 }
 
 /// Queues deferred despawning of an entity.
+/// Rejects null sentinels (`FfiEntity(0)`), invalid bit patterns, and `Entity::PLACEHOLDER`.
 ///
 /// # Safety
 /// `queue` must be a valid pointer to a [`CommandQueueBridge`] or null.
@@ -124,9 +130,15 @@ pub unsafe extern "C" fn host_cmd_despawn(
     if queue.is_null() {
         return FfiResult::NULL_POINTER;
     }
+    if entity.to_bits() == 0 {
+        return FfiResult::INTERNAL_ERROR;
+    }
     let Some(bevy_entity) = Entity::try_from_bits(entity.to_bits()) else {
         return FfiResult::INTERNAL_ERROR;
     };
+    if bevy_entity == Entity::PLACEHOLDER {
+        return FfiResult::INTERNAL_ERROR;
+    }
 
     // SAFETY: caller passes a valid pointer to CommandQueueBridge cast to RawCommandQueue.
     let bridge = unsafe { &mut *(queue as *mut CommandQueueBridge<'_>) };
@@ -159,17 +171,30 @@ pub unsafe extern "C" fn host_cmd_insert_component(
         return FfiResult::INVALID_UTF8;
     };
 
-    let Some(bevy_entity) = Entity::try_from_bits(entity.to_bits()) else {
-        return FfiResult::INTERNAL_ERROR;
-    };
-
     // SAFETY: caller passes a valid pointer to CommandQueueBridge cast to RawCommandQueue.
     let bridge = unsafe { &mut *(queue as *mut CommandQueueBridge<'_>) };
     let Some(comp_meta) = bridge.registry.get_by_name(name) else {
         return FfiResult::INVALID_COMPONENT;
     };
 
+    // Static components that are non-Pod / heap-owning (`insert_raw_fn == None`) must NEVER
+    // accept raw foreign byte buffers or fall through to `insert_by_id` (D3 soundness guard).
+    if !comp_meta.is_dynamic && comp_meta.insert_raw_fn.is_none() {
+        return FfiResult::PERMISSION_DENIED;
+    }
+
     if comp_meta.size != len {
+        return FfiResult::INTERNAL_ERROR;
+    }
+
+    // Reject null sentinel (0), invalid entity bits, and Bevy's Entity::PLACEHOLDER (D9 guard).
+    if entity.to_bits() == 0 {
+        return FfiResult::INTERNAL_ERROR;
+    }
+    let Some(bevy_entity) = Entity::try_from_bits(entity.to_bits()) else {
+        return FfiResult::INTERNAL_ERROR;
+    };
+    if bevy_entity == Entity::PLACEHOLDER {
         return FfiResult::INTERNAL_ERROR;
     }
 
@@ -188,12 +213,14 @@ pub unsafe extern "C" fn host_cmd_insert_component(
             });
             return FfiResult::OK;
         }
+        return FfiResult::PERMISSION_DENIED;
     }
 
     // Dynamic component deferred insertion via insert_by_id and host-aligned buffer
     let comp_id = comp_meta.component_id;
+    let align = comp_meta.align.max(1);
     let buf = if len > 0 {
-        let Ok(layout) = Layout::from_size_align(comp_meta.size, comp_meta.align) else {
+        let Ok(layout) = Layout::from_size_align(comp_meta.size, align) else {
             return FfiResult::INTERNAL_ERROR;
         };
         // SAFETY: Allocating host memory matching component's layout (Rule 2: strict allocator isolation).
@@ -210,11 +237,11 @@ pub unsafe extern "C" fn host_cmd_insert_component(
             layout,
         }
     } else {
-        let Ok(layout) = Layout::from_size_align(0, comp_meta.align.max(1)) else {
+        let Ok(layout) = Layout::from_size_align(0, align) else {
             return FfiResult::INTERNAL_ERROR;
         };
         AlignedBuffer {
-            ptr: core::ptr::NonNull::<u8>::dangling().as_ptr() as usize,
+            ptr: align,
             layout,
         }
     };
@@ -225,10 +252,18 @@ pub unsafe extern "C" fn host_cmd_insert_component(
             let non_null = if buf.layout.size() > 0 {
                 core::ptr::NonNull::new(buf.ptr as *mut u8)
             } else {
-                Some(core::ptr::NonNull::dangling())
+                // D10 fix: construct a non-null dangling pointer aligned to `buf.layout.align()`
+                // rather than `NonNull::<u8>::dangling()` (which only guarantees align 1).
+                NonZeroUsize::new(buf.layout.align())
+                    .map(core::ptr::NonNull::<u8>::without_provenance)
             };
             if let Some(non_null) = non_null {
+                // SAFETY: `non_null` is non-null, properly aligned for `comp_id`'s layout, and
+                // points to initialized host memory (or a valid aligned ZST address). Ownership of
+                // the component bytes transfers to Bevy; `AlignedBuffer::drop` only frees the raw
+                // backing allocation without running any Rust destructor.
                 let owning_ptr = unsafe { OwningPtr::new(non_null) };
+                // SAFETY: `comp_id` was registered in this World with the exact layout of `buf`.
                 unsafe {
                     entity_mut.insert_by_id(comp_id, owning_ptr);
                 }

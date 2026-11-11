@@ -828,7 +828,10 @@ fn test_milestone_3_dynamic_components_multilanguage() {
 
         let ticks_rust = entity_ref.get_change_ticks_by_id(rust_comp_id).unwrap();
         let ticks_c = entity_ref.get_change_ticks_by_id(c_comp_id).unwrap();
-        assert_eq!(ticks_rust.changed, ticks_c.changed);
+        assert_ne!(
+            ticks_rust.changed, ticks_c.changed,
+            "Distinct dynamic systems must each advance Bevy's change tick"
+        );
         assert_ne!(ticks_rust.changed, initial_both_rust_tick);
         assert_ne!(ticks_c.changed, initial_both_c_tick);
         assert!(ticks_rust.is_changed(initial_both_rust_tick, frame1_tick));
@@ -1158,7 +1161,7 @@ fn test_milestone_4_high_throughput_archetype_permutations() {
             *(ent.get_by_id(rust_comp_id).unwrap().as_ptr() as *const RustModCustomData)
         };
         assert_eq!(data.power, 100.0 + (i as f32) + (SIM_TICKS as f32 * 10.0));
-        assert_eq!(data.shield, 10 + ((i % 50) as u32) + (SIM_TICKS as u32 * 1));
+        assert_eq!(data.shield, 10 + ((i % 50) as u32) + (SIM_TICKS as u32));
         assert!(ent.get_by_id(c_comp_id).is_err());
         assert!(ent.get_by_id(pos_comp_id).is_err());
 
@@ -1173,7 +1176,7 @@ fn test_milestone_4_high_throughput_archetype_permutations() {
             *(ent.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData)
         };
         assert_eq!(data.mana, 50.0 + (i as f32) + (SIM_TICKS as f32 * 5.0));
-        assert_eq!(data.level, 1 + ((i % 20) as i32) + (SIM_TICKS as i32 * 1));
+        assert_eq!(data.level, 1 + ((i % 20) as i32) + (SIM_TICKS as i32));
         assert!(ent.get_by_id(rust_comp_id).is_err());
         assert!(ent.get_by_id(pos_comp_id).is_err());
 
@@ -1191,9 +1194,9 @@ fn test_milestone_4_high_throughput_archetype_permutations() {
             *(ent.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData)
         };
         assert_eq!(data_r.power, 200.0 + (i as f32) + (SIM_TICKS as f32 * 10.0));
-        assert_eq!(data_r.shield, 20 + ((i % 50) as u32) + (SIM_TICKS as u32 * 1));
+        assert_eq!(data_r.shield, 20 + ((i % 50) as u32) + (SIM_TICKS as u32));
         assert_eq!(data_c.mana, 100.0 + (i as f32) + (SIM_TICKS as f32 * 5.0));
-        assert_eq!(data_c.level, 5 + ((i % 20) as i32) + (SIM_TICKS as i32 * 1));
+        assert_eq!(data_c.level, 5 + ((i % 20) as i32) + (SIM_TICKS as i32));
         assert!(ent.get_by_id(pos_comp_id).is_err());
     }
 
@@ -1212,9 +1215,9 @@ fn test_milestone_4_high_throughput_archetype_permutations() {
             *(ent.get_by_id(c_comp_id).unwrap().as_ptr() as *const CModCustomData)
         };
         assert_eq!(data_r.power, 300.0 + (i as f32) + (SIM_TICKS as f32 * 10.0));
-        assert_eq!(data_r.shield, 30 + ((i % 50) as u32) + (SIM_TICKS as u32 * 1));
+        assert_eq!(data_r.shield, 30 + ((i % 50) as u32) + (SIM_TICKS as u32));
         assert_eq!(data_c.mana, 150.0 + (i as f32) + (SIM_TICKS as f32 * 5.0));
-        assert_eq!(data_c.level, 10 + ((i % 20) as i32) + (SIM_TICKS as i32 * 1));
+        assert_eq!(data_c.level, 10 + ((i % 20) as i32) + (SIM_TICKS as i32));
     }
 
     // 8. Unload both mods cleanly
@@ -1383,12 +1386,12 @@ fn test_milestone_4_parallel_scheduler_concurrency() {
         let r_ptr = entity_ref.get_by_id(rust_comp_id).unwrap();
         let r_val = unsafe { *(r_ptr.as_ptr() as *const RustModCustomData) };
         assert_eq!(r_val.power, (i as f32) * 2.0 + (TICKS as f32 * 10.0));
-        assert_eq!(r_val.shield, 100 + ((i % 1000) as u32) + (TICKS as u32 * 1));
+        assert_eq!(r_val.shield, 100 + ((i % 1000) as u32) + (TICKS as u32));
 
         let c_ptr = entity_ref.get_by_id(c_comp_id).unwrap();
         let c_val = unsafe { *(c_ptr.as_ptr() as *const CModCustomData) };
         assert_eq!(c_val.mana, (i as f32) * 0.5 + (TICKS as f32 * 5.0));
-        assert_eq!(c_val.level, 10 + ((i % 50) as i32) + (TICKS as i32 * 1));
+        assert_eq!(c_val.level, 10 + ((i % 50) as i32) + (TICKS as i32));
     }
 
     // Clean teardown

@@ -6,152 +6,346 @@
 //! This module adapts foreign C-ABI function callbacks into native Bevy ECS [`System`]s.
 //!
 //! ## Core Architectural Invariants
-//! 1. **Dynamic `FilteredAccessSet` Borrow Checking**:
-//!    - During [`DynamicCSystem::initialize`], foreign query descriptors ([`ComponentAccessDescOwned`])
-//!      are parsed into Bevy's native [`FilteredAccess<ComponentId>`].
-//!    - Access modes ([`ComponentAccessMode::READ`], [`ComponentAccessMode::WRITE`],
-//!      [`ComponentAccessMode::FILTER_ONLY`], [`ComponentAccessMode::WITHOUT`]) are recorded.
-//!    - An access set is returned to Bevy via [`SystemAccess::Shared`].
-//!    - Bevy's scheduler uses this access set to guarantee data race freedom: systems accessing
-//!      disjoint components run concurrently in parallel, while conflicting systems are serialized.
+//! 1. **Idiomatic `QueryBuilder` / `QueryState` & `FilteredAccessSet` Borrow Checking**:
+//!    - During [`DynamicCSystem::initialize`], each foreign query group is constructed via Bevy's
+//!      native [`QueryBuilder`] (`ref_id`, `mut_id`, `with_id`, `without_id`) into a [`QueryState`],
+//!      automatically inheriting [`DefaultQueryFilters`](bevy_ecs::query::DefaultQueryFilters) and
+//!      exact dense vs. sparse storage classification.
+//!    - When all accessed and filtered components use [`StorageType::Table`], dense table iteration
+//!      is used. When any accessed or filtered component uses [`StorageType::SparseSet`], archetype-aware
+//!      iteration (`HostChunkIter::new_archetypal`) visits only matching archetypes and supports both
+//!      `Table` and `SparseSet` data columns without data races or null columns.
 //! 2. **Intra-System Conflict Detection**:
 //!    - If a single system specifies mutually conflicting queries (e.g. Query 0 writes Component A
 //!      and Query 1 reads or writes Component A), `access_set.is_compatible(&candidate_set)` returns `false`.
 //!    - The system detects this self-conflict, flags `self_conflict = true; self.enabled = false;`,
 //!      and safely disables itself without causing undefined behavior.
-//! 3. **Steady-State Zero Allocation via `ArchetypeGeneration`**:
-//!    - Archetypes are scanned and cached in [`CachedQueryGroup`].
-//!    - In steady state, `world.archetypes().generation()` matches the cached generation,
-//!      so archetype scanning is bypassed and zero heap allocations occur per tick.
-//! 4. **Panic Containment & Fault Isolation**:
-//!    - The foreign callback invocation is wrapped in [`std::panic::catch_unwind`].
-//!    - If a guest mod panics or returns an error status ([`FfiResult::PANIC_CAUGHT`] or `is_err()`),
-//!      the system sets `self.enabled = false` and quarantines itself.
-//!    - The host Bevy engine and all other healthy systems continue running uninterrupted.
-//! 5. **Atomic Tombstone Guard**:
-//!    - Checks `self.is_active.load(Ordering::Acquire)` before every execution.
-//!    - When a mod is unloaded, this flag becomes `false`, immediately rendering the system an inert no-op.
+//! 3. **Incremental `ArchetypeGeneration` Caching**:
+//!    - Only newly created archetypes (`&archetypes[old_gen..]`) are scanned when
+//!      `world.archetypes().generation()` advances, achieving zero heap allocations in steady state.
+//! 4. **Change Tick Advancement & Thread-Local Registry Isolation**:
+//!    - Matches Bevy's `FunctionSystem`: advances `world.increment_change_tick()` on every run so
+//!      downstream `Changed<T>` queries observe exact per-system tick boundaries.
+//!    - Binds [`ModRegistry::make_current`] on the worker thread inside `run_unsafe` so multi-threaded
+//!      executor worker threads resolve symbols strictly against that `World`'s registry.
+//! 5. **Lock-Free Per-World Drop Trampolines**:
+//!    - Supports up to [`MAX_DROP_TRAMPOLINES`] distinct `(WorldId, ComponentUuid)` dynamic drop
+//!      registrations with lock-free atomic reads on the drop hot path and full multi-World isolation.
 
-use crate::chunk_iter::{HostChunkIter, QueryColumnDesc};
+use crate::chunk_iter::{HostChunkIter, QueryColumnDesc, MAX_QUERY_COMPONENTS};
 use crate::commands::CommandQueueBridge;
+use crate::host::ModId;
 use crate::registry::{ModRegistry, RegisteredComponent};
 use abi_contract::{
     ComponentAccessMode, DynamicSystemCallback, FfiResult, MultiQuerySystemCallback,
     MultiQuerySystemDescriptor, RawChunkIter, RawCommandQueue, SystemDescriptor,
 };
-use bevy_ecs::archetype::ArchetypeGeneration;
+use bevy_ecs::archetype::{ArchetypeGeneration, ArchetypeId};
 use bevy_ecs::change_detection::{CheckChangeTicks, Tick};
 use bevy_ecs::component::{ComponentCloneBehavior, ComponentDescriptor, StorageType};
+use bevy_ecs::event::Event;
+use bevy_ecs::message::{Message, Messages};
+use bevy_ecs::prelude::Resource;
 use bevy_ecs::ptr::OwningPtr;
-use bevy_ecs::query::{FilteredAccess, FilteredAccessSet};
+use bevy_ecs::query::{FilteredAccessSet, QueryBuilder, QueryState};
+use bevy_ecs::schedule::{InternedSystemSet, SystemSet};
 use bevy_ecs::storage::TableId;
 use bevy_ecs::system::{RunSystemError, System, SystemAccess, SystemIn, SystemStateFlags};
 use bevy_ecs::utils::DebugName;
 use bevy_ecs::world::unsafe_world_cell::UnsafeWorldCell;
-use bevy_ecs::world::{CommandQueue, DeferredWorld, World};
+use bevy_ecs::world::{CommandQueue, DeferredWorld, World, WorldId};
 use core::ffi::{c_void, CStr};
-use core::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use core::fmt;
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 /// Maximum number of concurrent/nested queries supported per multi-query dynamic system.
 pub const MAX_SYSTEM_QUERIES: usize = 8;
 
-struct DropTrampolineSlot {
-    uuid: abi_contract::ComponentUuid,
+/// Maximum number of distinct `(WorldId, ComponentUuid)` foreign drop trampolines supported per process.
+pub const MAX_DROP_TRAMPOLINES: usize = 1024;
+
+struct DropSlotSnapshot {
     drop_fn: unsafe extern "C" fn(ptr: *mut c_void),
-    active_guards: Vec<Arc<AtomicBool>>,
+    active_guards: Box<[Arc<AtomicBool>]>,
 }
 
-static DROP_TRAMPOLINE_SLOTS: [Mutex<Option<DropTrampolineSlot>>; 64] = {
-    const INIT: Mutex<Option<DropTrampolineSlot>> = Mutex::new(None);
-    [INIT; 64]
-};
+static DROP_SLOT_SNAPSHOTS: [AtomicPtr<DropSlotSnapshot>; MAX_DROP_TRAMPOLINES] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_DROP_TRAMPOLINES];
 
-macro_rules! make_trampolines {
-    ($($name:ident => $i:expr),* $(,)?) => {
-        $(
-            unsafe fn $name(ptr: OwningPtr<'_>) {
-                if let Ok(guard) = DROP_TRAMPOLINE_SLOTS[$i].lock() {
-                    if let Some(slot) = guard.as_ref() {
-                        if slot.active_guards.iter().any(|g| g.load(Ordering::Acquire)) {
-                            let raw = ptr.as_ptr() as *mut c_void;
-                            // SAFETY: foreign drop function called on valid instance while at least
-                            // one loaded mod instance providing this UUID remains active and mapped.
-                            unsafe { (slot.drop_fn)(raw) };
-                        }
-                    }
-                }
-            }
-        )*
+struct DropSlotMeta {
+    world_id: WorldId,
+    uuid: abi_contract::ComponentUuid,
+    guards: Vec<Arc<AtomicBool>>,
+}
 
-        static DROP_TRAMPOLINE_FNS: [for<'a> unsafe fn(OwningPtr<'a>); 64] = [
-            $($name),*
-        ];
+struct DropRegistryState {
+    slots: Vec<DropSlotMeta>,
+    /// Retains retired `DropSlotSnapshot` allocations across rare hot-reloads or test resets so
+    /// lock-free readers on `DROP_SLOT_SNAPSHOTS` never dereference freed memory.
+    retired: Vec<usize>,
+}
+
+static DROP_REGISTRY: LazyLock<Mutex<DropRegistryState>> = LazyLock::new(|| {
+    Mutex::new(DropRegistryState {
+        slots: Vec::new(),
+        retired: Vec::new(),
+    })
+});
+
+unsafe fn drop_trampoline<const SLOT: usize>(ptr: OwningPtr<'_>) {
+    let snap_ptr = DROP_SLOT_SNAPSHOTS[SLOT].load(Ordering::Acquire);
+    if !snap_ptr.is_null() {
+        // SAFETY: `snap_ptr` points to a valid `DropSlotSnapshot` whose lifetime is retained
+        // for the lifetime of the process (or in `DROP_REGISTRY.retired` across updates).
+        let snap = unsafe { &*snap_ptr };
+        if snap.active_guards.iter().any(|g| g.load(Ordering::Acquire)) {
+            let raw = ptr.as_ptr() as *mut c_void;
+            // SAFETY: Foreign drop function invoked on valid component instance while at least
+            // one loaded mod instance providing this `(WorldId, ComponentUuid)` remains mapped.
+            unsafe { (snap.drop_fn)(raw) };
+        }
+    }
+}
+
+macro_rules! tramp_16 {
+    ($b:expr) => {
+        [
+            drop_trampoline::<{ $b }>,
+            drop_trampoline::<{ $b + 1 }>,
+            drop_trampoline::<{ $b + 2 }>,
+            drop_trampoline::<{ $b + 3 }>,
+            drop_trampoline::<{ $b + 4 }>,
+            drop_trampoline::<{ $b + 5 }>,
+            drop_trampoline::<{ $b + 6 }>,
+            drop_trampoline::<{ $b + 7 }>,
+            drop_trampoline::<{ $b + 8 }>,
+            drop_trampoline::<{ $b + 9 }>,
+            drop_trampoline::<{ $b + 10 }>,
+            drop_trampoline::<{ $b + 11 }>,
+            drop_trampoline::<{ $b + 12 }>,
+            drop_trampoline::<{ $b + 13 }>,
+            drop_trampoline::<{ $b + 14 }>,
+            drop_trampoline::<{ $b + 15 }>,
+        ]
     };
 }
 
-make_trampolines!(
-    t0 => 0, t1 => 1, t2 => 2, t3 => 3, t4 => 4, t5 => 5, t6 => 6, t7 => 7,
-    t8 => 8, t9 => 9, t10 => 10, t11 => 11, t12 => 12, t13 => 13, t14 => 14, t15 => 15,
-    t16 => 16, t17 => 17, t18 => 18, t19 => 19, t20 => 20, t21 => 21, t22 => 22, t23 => 23,
-    t24 => 24, t25 => 25, t26 => 26, t27 => 27, t28 => 28, t29 => 29, t30 => 30, t31 => 31,
-    t32 => 32, t33 => 33, t34 => 34, t35 => 35, t36 => 36, t37 => 37, t38 => 38, t39 => 39,
-    t40 => 40, t41 => 41, t42 => 42, t43 => 43, t44 => 44, t45 => 45, t46 => 46, t47 => 47,
-    t48 => 48, t49 => 49, t50 => 50, t51 => 51, t52 => 52, t53 => 53, t54 => 54, t55 => 55,
-    t56 => 56, t57 => 57, t58 => 58, t59 => 59, t60 => 60, t61 => 61, t62 => 62, t63 => 63,
-);
+macro_rules! tramp_256 {
+    ($b:expr) => {
+        [
+            tramp_16!($b),
+            tramp_16!($b + 16),
+            tramp_16!($b + 32),
+            tramp_16!($b + 48),
+            tramp_16!($b + 64),
+            tramp_16!($b + 80),
+            tramp_16!($b + 96),
+            tramp_16!($b + 112),
+            tramp_16!($b + 128),
+            tramp_16!($b + 144),
+            tramp_16!($b + 160),
+            tramp_16!($b + 176),
+            tramp_16!($b + 192),
+            tramp_16!($b + 208),
+            tramp_16!($b + 224),
+            tramp_16!($b + 240),
+        ]
+    };
+}
+
+type DropTrampolineFn = for<'a> unsafe fn(OwningPtr<'a>);
+type DropTrampolineBlock = [[DropTrampolineFn; 16]; 16];
+
+static DROP_TRAMPOLINE_BLOCKS: [DropTrampolineBlock; 4] = [
+    tramp_256!(0),
+    tramp_256!(256),
+    tramp_256!(512),
+    tramp_256!(768),
+];
+
+#[inline]
+fn drop_trampoline_fn_for_slot(slot: usize) -> DropTrampolineFn {
+    let b256 = slot / 256;
+    let rem = slot % 256;
+    let b16 = rem / 16;
+    let idx = rem % 16;
+    DROP_TRAMPOLINE_BLOCKS[b256][b16][idx]
+}
 
 fn allocate_drop_trampoline(
+    world_id: WorldId,
     uuid: abi_contract::ComponentUuid,
     drop_fn: unsafe extern "C" fn(ptr: *mut c_void),
     is_active: Arc<AtomicBool>,
 ) -> Option<for<'a> unsafe fn(OwningPtr<'a>)> {
-    // 1. Safe reuse: Check if a slot is already assigned to this exact ComponentUuid (e.g. reload or multi-World load)
-    for i in 0..64 {
-        if let Ok(mut guard) = DROP_TRAMPOLINE_SLOTS[i].lock() {
-            if let Some(slot) = guard.as_mut() {
-                if slot.uuid == uuid {
-                    slot.drop_fn = drop_fn;
-                    slot.active_guards.retain(|g| g.load(Ordering::Acquire));
-                    if !slot.active_guards.iter().any(|g| Arc::ptr_eq(g, &is_active)) {
-                        slot.active_guards.push(is_active);
-                    }
-                    return Some(DROP_TRAMPOLINE_FNS[i]);
-                }
-            }
+    let mut reg = DROP_REGISTRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    // 1. Same-(WorldId, ComponentUuid) hot-reload rebinding: isolated per World so concurrent
+    //    Worlds registering the same ComponentUuid never overwrite each other's drop_fn!
+    if let Some((slot_idx, meta)) = reg
+        .slots
+        .iter_mut()
+        .enumerate()
+        .find(|(_, m)| m.world_id == world_id && m.uuid == uuid)
+    {
+        meta.guards.retain(|g| g.load(Ordering::Acquire));
+        if !meta.guards.iter().any(|g| Arc::ptr_eq(g, &is_active)) {
+            meta.guards.push(is_active);
         }
+        let new_snap = Box::into_raw(Box::new(DropSlotSnapshot {
+            drop_fn,
+            active_guards: meta.guards.clone().into_boxed_slice(),
+        }));
+        let old_snap = DROP_SLOT_SNAPSHOTS[slot_idx].swap(new_snap, Ordering::AcqRel);
+        if !old_snap.is_null() {
+            reg.retired.push(old_snap as usize);
+        }
+        return Some(drop_trampoline_fn_for_slot(slot_idx));
     }
 
-    // 2. Allocate an unassigned slot (None)
-    for i in 0..64 {
-        if let Ok(mut guard) = DROP_TRAMPOLINE_SLOTS[i].lock() {
-            if guard.is_none() {
-                *guard = Some(DropTrampolineSlot {
-                    uuid,
-                    drop_fn,
-                    active_guards: vec![is_active],
-                });
-                return Some(DROP_TRAMPOLINE_FNS[i]);
-            }
-        }
+    // 2. Allocate a fresh slot for this (WorldId, ComponentUuid)
+    let slot_idx = reg.slots.len();
+    if slot_idx >= MAX_DROP_TRAMPOLINES {
+        return None;
     }
 
-    // 3. Pool is exhausted by distinct ComponentUuids.
-    // NEVER reuse an inactive slot belonging to a different ComponentUuid.
-    None
+    let guards = vec![is_active];
+    let new_snap = Box::into_raw(Box::new(DropSlotSnapshot {
+        drop_fn,
+        active_guards: guards.clone().into_boxed_slice(),
+    }));
+    let old_snap = DROP_SLOT_SNAPSHOTS[slot_idx].swap(new_snap, Ordering::AcqRel);
+    if !old_snap.is_null() {
+        reg.retired.push(old_snap as usize);
+    }
+    reg.slots.push(DropSlotMeta {
+        world_id,
+        uuid,
+        guards,
+    });
+    Some(drop_trampoline_fn_for_slot(slot_idx))
 }
 
-/// Resets all drop trampoline slots to `None`.
+/// Resets all drop trampoline slots to unassigned.
 ///
 /// # Safety / Warning
-/// This function is intended strictly for resetting global trampoline state between integration tests.
+/// Intended strictly for resetting global trampoline state between isolated integration tests.
 #[doc(hidden)]
 pub fn reset_drop_trampolines_for_testing() {
-    for i in 0..64 {
-        if let Ok(mut guard) = DROP_TRAMPOLINE_SLOTS[i].lock() {
-            *guard = None;
+    let mut reg = DROP_REGISTRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let used = reg.slots.len();
+    for slot in DROP_SLOT_SNAPSHOTS.iter().take(used) {
+        let old = slot.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        if !old.is_null() {
+            reg.retired.push(old as usize);
         }
     }
+    reg.slots.clear();
+}
+
+/// Bevy [`SystemSet`] labels automatically attached to dynamic guest systems.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ModSystemSet {
+    /// Contains all dynamic guest systems across all loaded mods.
+    All,
+    /// Contains all dynamic guest systems belonging to a specific [`ModId`].
+    Mod(ModId),
+}
+
+/// Target Bevy schedule for a dynamic guest system (matches `ScheduleLabelId` discriminant values).
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ModSchedule {
+    /// Main per-frame `Update` schedule (`0`).
+    #[default]
+    Update = 0,
+    /// One-time `Startup` schedule (`1`).
+    Startup = 1,
+    /// `PreUpdate` schedule (`2`).
+    PreUpdate = 2,
+    /// `PostUpdate` schedule (`3`).
+    PostUpdate = 3,
+    /// Fixed-timestep `FixedUpdate` schedule (`4`).
+    FixedUpdate = 4,
+    /// End-of-frame `Last` schedule (`5`).
+    Last = 5,
+}
+
+impl ModSchedule {
+    /// Converts a raw `u32` discriminant (`ScheduleLabelId`) into [`ModSchedule`].
+    #[inline]
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Update),
+            1 => Some(Self::Startup),
+            2 => Some(Self::PreUpdate),
+            3 => Some(Self::PostUpdate),
+            4 => Some(Self::FixedUpdate),
+            5 => Some(Self::Last),
+            _ => None,
+        }
+    }
+}
+
+/// Error-handling policy governing how [`DynamicCSystem`] responds when a guest callback
+/// returns an error [`FfiResult`] or unwinds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ModErrorPolicy {
+    /// Quarantines the faulting guest system (`enabled = false`) and returns `Ok(())` (default).
+    #[default]
+    Quarantine,
+    /// Quarantines the faulting guest system, logs diagnostic details to stderr, and returns `Ok(())`.
+    Log,
+    /// Quarantines the faulting guest system and propagates [`ModSystemError`] via
+    /// `Err(RunSystemError::Failed(...))` to Bevy's error handler.
+    ReportToBevy,
+}
+
+/// World resource configuring the default [`ModErrorPolicy`] for dynamic guest systems.
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ModErrorPolicyConfig(pub ModErrorPolicy);
+
+/// Typed error reported to Bevy when [`ModErrorPolicy::ReportToBevy`] is active and a guest system faults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModSystemError {
+    /// Optional [`ModId`] owning the faulting system.
+    pub mod_id: Option<ModId>,
+    /// Registered name of the faulting guest system.
+    pub system_name: String,
+    /// Error status returned by the callback (or `FfiResult::PANIC_CAUGHT` on unwind).
+    pub status: FfiResult,
+    /// Whether an unwind was caught at the callback boundary.
+    pub panicked: bool,
+}
+
+impl fmt::Display for ModSystemError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "guest mod system '{}' (mod_id={:?}) faulted with {:?} (panicked={})",
+            self.system_name, self.mod_id, self.status, self.panicked
+        )
+    }
+}
+
+impl std::error::Error for ModSystemError {}
+
+/// Bevy [`Event`] and buffered [`Message`] emitted whenever a guest system faults and is quarantined.
+#[derive(Event, Message, Debug, Clone, PartialEq, Eq)]
+pub struct ModSystemFaulted {
+    /// [`ModId`] owning the faulting system, if tracked.
+    pub mod_id: Option<ModId>,
+    /// Name of the faulting guest system.
+    pub system_name: String,
+    /// Fault [`FfiResult`] status code.
+    pub status: FfiResult,
+    /// `true` if a panic/unwind was caught.
+    pub panicked: bool,
 }
 
 /// Owned representation of component access mode and component name for a dynamic query clause.
@@ -163,12 +357,16 @@ pub struct ComponentAccessDescOwned {
     pub mode: ComponentAccessMode,
 }
 
-#[derive(Clone, Debug)]
 struct CachedQueryGroup {
     descs: Vec<ComponentAccessDescOwned>,
     columns: Vec<QueryColumnDesc>,
+    query_state: Option<QueryState<(), ()>>,
+    is_dense: bool,
+    sparse_column_mask: u32,
+    archetype_generation: ArchetypeGeneration,
     matched_tables: Vec<TableId>,
     matched_table_bits: Vec<bool>,
+    matched_archetypes: Vec<ArchetypeId>,
 }
 
 impl CachedQueryGroup {
@@ -176,8 +374,53 @@ impl CachedQueryGroup {
         Self {
             descs,
             columns: Vec::new(),
+            query_state: None,
+            is_dense: true,
+            sparse_column_mask: 0,
+            archetype_generation: ArchetypeGeneration::initial(),
             matched_tables: Vec::new(),
             matched_table_bits: Vec::new(),
+            matched_archetypes: Vec::new(),
+        }
+    }
+
+    fn reset_cache(&mut self) {
+        self.archetype_generation = ArchetypeGeneration::initial();
+        self.matched_tables.clear();
+        self.matched_table_bits.clear();
+        self.matched_archetypes.clear();
+    }
+
+    fn update_archetypes(&mut self, world: UnsafeWorldCell<'_>) {
+        let archetypes = world.archetypes();
+        let new_gen = archetypes.generation();
+        if self.archetype_generation == new_gen {
+            return;
+        }
+        let old_gen = core::mem::replace(&mut self.archetype_generation, new_gen);
+
+        let Some(ref mut state) = self.query_state else {
+            return;
+        };
+        state.update_archetypes_unsafe_world_cell(world);
+
+        // Incremental scan: inspect ONLY newly created archetypes in `old_gen..new_gen`!
+        for archetype in &archetypes[old_gen..] {
+            if state.matches_component_set(&|id| archetype.contains(id)) {
+                if self.is_dense {
+                    let table_id = archetype.table_id();
+                    let idx = table_id.as_usize();
+                    if idx >= self.matched_table_bits.len() {
+                        self.matched_table_bits.resize(idx + 1, false);
+                    }
+                    if !self.matched_table_bits[idx] {
+                        self.matched_table_bits[idx] = true;
+                        self.matched_tables.push(table_id);
+                    }
+                } else {
+                    self.matched_archetypes.push(archetype.id());
+                }
+            }
         }
     }
 }
@@ -193,14 +436,19 @@ pub struct DynamicCSystem {
     name: String,
     query_groups: Vec<CachedQueryGroup>,
 
-    archetype_generation: ArchetypeGeneration,
     access: SystemAccess,
     self_conflict: bool,
+    missing_components: Vec<String>,
     last_run: Tick,
     this_run: Tick,
 
     callback: SystemCallbackKind,
     user_data: *mut c_void,
+
+    mod_id: Option<ModId>,
+    schedule: ModSchedule,
+    error_policy: ModErrorPolicy,
+    error_policy_explicit: bool,
 
     enabled: bool,
     is_active: Arc<AtomicBool>,
@@ -225,13 +473,17 @@ impl DynamicCSystem {
         Self {
             name,
             query_groups: vec![CachedQueryGroup::new(query_descs)],
-            archetype_generation: ArchetypeGeneration::initial(),
             access: SystemAccess::None,
             self_conflict: false,
+            missing_components: Vec::new(),
             last_run: Tick::new(0),
             this_run: Tick::new(0),
             callback: SystemCallbackKind::Single(callback),
             user_data,
+            mod_id: None,
+            schedule: ModSchedule::Update,
+            error_policy: ModErrorPolicy::Quarantine,
+            error_policy_explicit: false,
             enabled: true,
             is_active: Arc::new(AtomicBool::new(true)),
             command_queue: CommandQueue::default(),
@@ -251,18 +503,27 @@ impl DynamicCSystem {
         Self {
             name,
             query_groups,
-            archetype_generation: ArchetypeGeneration::initial(),
             access: SystemAccess::None,
             self_conflict: false,
+            missing_components: Vec::new(),
             last_run: Tick::new(0),
             this_run: Tick::new(0),
             callback: SystemCallbackKind::Multi(callback),
             user_data,
+            mod_id: None,
+            schedule: ModSchedule::Update,
+            error_policy: ModErrorPolicy::Quarantine,
+            error_policy_explicit: false,
             enabled: true,
             is_active: Arc::new(AtomicBool::new(true)),
             command_queue: CommandQueue::default(),
             registry,
         }
+    }
+
+    /// Returns the guest system's registered name.
+    pub fn system_name(&self) -> &str {
+        &self.name
     }
 
     /// Returns `true` if the system is currently enabled to execute.
@@ -285,6 +546,79 @@ impl DynamicCSystem {
         self.self_conflict
     }
 
+    /// Returns any component names that failed to resolve during `initialize` or validation.
+    pub fn missing_components(&self) -> &[String] {
+        &self.missing_components
+    }
+
+    /// Validates that all queried component names exist in the given [`ModRegistry`].
+    /// Returns `Err(missing_component_names)` if one or more components are unregistered.
+    pub fn validate_against_registry(&self, registry: &ModRegistry) -> Result<(), Vec<String>> {
+        let mut missing = Vec::new();
+        for group in &self.query_groups {
+            for desc in &group.descs {
+                if registry.get_by_name(&desc.name).is_none() && !missing.contains(&desc.name) {
+                    missing.push(desc.name.clone());
+                }
+            }
+        }
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(missing)
+        }
+    }
+
+    /// Returns the [`ModId`] associated with this system, if any.
+    pub fn mod_id(&self) -> Option<ModId> {
+        self.mod_id
+    }
+
+    /// Associates this system with a [`ModId`] so it joins [`ModSystemSet::Mod`].
+    pub fn set_mod_id(&mut self, mod_id: ModId) {
+        self.mod_id = Some(mod_id);
+    }
+
+    /// Builder helper to associate this system with a [`ModId`].
+    pub fn with_mod_id(mut self, mod_id: ModId) -> Self {
+        self.mod_id = Some(mod_id);
+        self
+    }
+
+    /// Returns the target [`ModSchedule`] requested for this system.
+    pub fn schedule(&self) -> ModSchedule {
+        self.schedule
+    }
+
+    /// Sets the target [`ModSchedule`] for this system.
+    pub fn set_schedule(&mut self, schedule: ModSchedule) {
+        self.schedule = schedule;
+    }
+
+    /// Builder helper to set the target [`ModSchedule`] for this system.
+    pub fn with_schedule(mut self, schedule: ModSchedule) -> Self {
+        self.schedule = schedule;
+        self
+    }
+
+    /// Returns the [`ModErrorPolicy`] governing faults in this system.
+    pub fn error_policy(&self) -> ModErrorPolicy {
+        self.error_policy
+    }
+
+    /// Overrides the [`ModErrorPolicy`] for this system.
+    pub fn set_error_policy(&mut self, policy: ModErrorPolicy) {
+        self.error_policy = policy;
+        self.error_policy_explicit = true;
+    }
+
+    /// Builder helper to override the [`ModErrorPolicy`] for this system.
+    pub fn with_error_policy(mut self, policy: ModErrorPolicy) -> Self {
+        self.error_policy = policy;
+        self.error_policy_explicit = true;
+        self
+    }
+
     /// Obtains a clone of the atomic tombstone flag.
     pub fn is_active(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.is_active)
@@ -300,37 +634,6 @@ impl DynamicCSystem {
         self.is_active = is_active;
         self
     }
-
-    fn update_archetypes(&mut self, world: UnsafeWorldCell, current_gen: ArchetypeGeneration) {
-        self.archetype_generation = current_gen;
-        let archetypes = world.archetypes();
-
-        for group in &mut self.query_groups {
-            group.matched_tables.clear();
-            group.matched_table_bits.clear();
-
-            for archetype in archetypes.iter() {
-                let matches = group.columns.iter().all(|col| {
-                    if col.mode == ComponentAccessMode::WITHOUT {
-                        !archetype.contains(col.component_id)
-                    } else {
-                        archetype.contains(col.component_id)
-                    }
-                });
-                if matches {
-                    let table_id = archetype.table_id();
-                    let idx = table_id.as_usize();
-                    if idx >= group.matched_table_bits.len() {
-                        group.matched_table_bits.resize(idx + 1, false);
-                    }
-                    if !group.matched_table_bits[idx] {
-                        group.matched_table_bits[idx] = true;
-                        group.matched_tables.push(table_id);
-                    }
-                }
-            }
-        }
-    }
 }
 
 impl System for DynamicCSystem {
@@ -345,10 +648,26 @@ impl System for DynamicCSystem {
         SystemStateFlags::DEFERRED
     }
 
+    fn default_system_sets(&self) -> Vec<InternedSystemSet> {
+        let mut sets = vec![SystemSet::intern(&ModSystemSet::All)];
+        if let Some(id) = self.mod_id {
+            sets.push(SystemSet::intern(&ModSystemSet::Mod(id)));
+        }
+        sets
+    }
+
     fn initialize(&mut self, world: &mut World) -> SystemAccess {
+        // Match Bevy's FunctionSystem::initialize tick semantics (`change_tick.relative_to(Tick::MAX)`)
         self.this_run = world.change_tick();
-        self.last_run = self.this_run;
+        self.last_run = Tick::new(world.change_tick().get().wrapping_sub(Tick::MAX.get()));
         self.self_conflict = false;
+        self.missing_components.clear();
+
+        if !self.error_policy_explicit {
+            if let Some(cfg) = world.get_resource::<ModErrorPolicyConfig>() {
+                self.error_policy = cfg.0;
+            }
+        }
 
         // Synchronize with world's ModRegistry to ensure dynamically registered components are available
         if let Some(world_reg) = world.get_resource::<ModRegistry>() {
@@ -359,13 +678,29 @@ impl System for DynamicCSystem {
 
         for group in &mut self.query_groups {
             group.columns.clear();
-            let mut filtered_access = FilteredAccess::default();
+            group.query_state = None;
+            group.sparse_column_mask = 0;
+            group.reset_cache();
+
+            if group.descs.len() > MAX_QUERY_COMPONENTS {
+                self.enabled = false;
+                self.access = SystemAccess::None;
+                return self.access.clone();
+            }
+
             let mut read_components = std::collections::HashSet::new();
             let mut write_components = std::collections::HashSet::new();
+            let mut resolved = Vec::with_capacity(group.descs.len());
 
-            for desc in &group.descs {
+            for (col_idx, desc) in group.descs.iter().enumerate() {
+                if !desc.mode.is_valid() {
+                    self.enabled = false;
+                    self.access = SystemAccess::None;
+                    return self.access.clone();
+                }
+
                 let Some(reg) = self.registry.get_by_name(&desc.name) else {
-                    // Missing component: disable system and return SystemAccess::None
+                    self.missing_components.push(desc.name.clone());
                     self.enabled = false;
                     self.access = SystemAccess::None;
                     return self.access.clone();
@@ -376,7 +711,6 @@ impl System for DynamicCSystem {
 
                 match desc.mode {
                     ComponentAccessMode::READ => {
-                        // Intra-query conflict check: cannot READ if component is already declared for WRITE
                         if write_components.contains(&comp_id) {
                             self.self_conflict = true;
                             self.enabled = false;
@@ -384,10 +718,8 @@ impl System for DynamicCSystem {
                             return self.access.clone();
                         }
                         read_components.insert(comp_id);
-                        filtered_access.add_read(comp_id);
                     }
                     ComponentAccessMode::WRITE => {
-                        // Intra-query conflict check: cannot WRITE if component is already declared for READ or WRITE
                         if read_components.contains(&comp_id) || write_components.contains(&comp_id)
                         {
                             self.self_conflict = true;
@@ -396,23 +728,70 @@ impl System for DynamicCSystem {
                             return self.access.clone();
                         }
                         write_components.insert(comp_id);
-                        filtered_access.add_write(comp_id);
+                    }
+                    ComponentAccessMode::FILTER_ONLY | ComponentAccessMode::WITHOUT => {}
+                    _ => {
+                        self.enabled = false;
+                        self.access = SystemAccess::None;
+                        return self.access.clone();
+                    }
+                }
+
+                let is_sparse_storage = world
+                    .components()
+                    .get_info(comp_id)
+                    .is_none_or(|info| info.storage_type() == StorageType::SparseSet);
+
+                if is_sparse_storage
+                    && (desc.mode == ComponentAccessMode::READ
+                        || desc.mode == ComponentAccessMode::WRITE)
+                {
+                    group.sparse_column_mask |= 1u32 << col_idx;
+                }
+
+                resolved.push((comp_id, desc.mode, stride));
+            }
+
+            let mut builder = QueryBuilder::<()>::new(world);
+            for &(comp_id, mode, stride) in &resolved {
+                match mode {
+                    ComponentAccessMode::READ => {
+                        builder.ref_id(comp_id);
+                    }
+                    ComponentAccessMode::WRITE => {
+                        builder.mut_id(comp_id);
                     }
                     ComponentAccessMode::FILTER_ONLY => {
-                        filtered_access.and_with(comp_id);
+                        builder.with_id(comp_id);
                     }
                     ComponentAccessMode::WITHOUT => {
-                        filtered_access.and_without(comp_id);
+                        builder.without_id(comp_id);
                     }
                     _ => {}
                 }
-
                 group.columns.push(QueryColumnDesc {
                     component_id: comp_id,
-                    mode: desc.mode,
+                    mode,
                     stride,
                 });
             }
+
+            let state = builder.build();
+            let is_comp_dense = |id| {
+                world
+                    .components()
+                    .get_info(id)
+                    .is_some_and(|info| info.storage_type() == StorageType::Table)
+            };
+            group.is_dense = group.sparse_column_mask == 0
+                && state.component_access().with_filters().all(is_comp_dense)
+                && state
+                    .component_access()
+                    .without_filters()
+                    .all(is_comp_dense);
+
+            let filtered_access = state.component_access().clone();
+            group.query_state = Some(state);
 
             let mut candidate_set = FilteredAccessSet::new();
             candidate_set.add(filtered_access.clone());
@@ -431,10 +810,11 @@ impl System for DynamicCSystem {
 
         self.access = SystemAccess::Shared(access_set);
 
-        // Scan initial archetypes
+        // Scan initial archetypes incrementally from ArchetypeGeneration::initial()
         let cell = world.as_unsafe_world_cell();
-        let current_gen = cell.archetypes().generation();
-        self.update_archetypes(cell, current_gen);
+        for group in &mut self.query_groups {
+            group.update_archetypes(cell);
+        }
 
         self.access.clone()
     }
@@ -448,18 +828,22 @@ impl System for DynamicCSystem {
             return Ok(());
         }
 
-        // Advance change detection ticks
-        self.last_run = self.this_run;
-        self.this_run = world.change_tick();
+        // Match Bevy's FunctionSystem::run_unsafe change tick progression
+        let change_tick = world.increment_change_tick();
+        self.this_run = change_tick;
 
-        // Archetype caching: zero heap allocations in steady-state
-        let current_gen = world.archetypes().generation();
-        if self.archetype_generation != current_gen {
-            self.update_archetypes(world, current_gen);
+        // Bind this World's ModRegistry on the executing worker thread so any runtime
+        // `get_proc_address` call inside the guest resolves strictly against this World.
+        let _reg_guard = self.registry.make_current();
+
+        // Incremental archetype update: zero heap allocations in steady-state
+        for group in &mut self.query_groups {
+            group.update_archetypes(world);
         }
 
         // SAFETY: Scheduler verified access via FilteredAccessSet; no intra-system conflict exists.
         let storages = unsafe { world.storages() };
+        let archetypes = world.archetypes();
 
         let mut bridge = CommandQueueBridge::new(
             &mut self.command_queue,
@@ -472,12 +856,24 @@ impl System for DynamicCSystem {
         let res = match self.callback {
             SystemCallbackKind::Single(callback) => {
                 let group = &self.query_groups[0];
-                let mut host_iter = HostChunkIter::new(
-                    &storages.tables,
-                    &group.matched_tables,
-                    &group.columns,
-                    self.this_run,
-                );
+                let mut host_iter = if group.is_dense {
+                    HostChunkIter::new(
+                        &storages.tables,
+                        &group.matched_tables,
+                        &group.columns,
+                        change_tick,
+                    )
+                } else {
+                    HostChunkIter::new_archetypal(
+                        &storages.tables,
+                        archetypes,
+                        &storages.sparse_sets,
+                        &group.matched_archetypes,
+                        &group.columns,
+                        group.sparse_column_mask,
+                        change_tick,
+                    )
+                };
                 let iter_ptr = (&mut host_iter as *mut HostChunkIter<'_>).cast::<RawChunkIter>();
                 // SAFETY: Calling foreign C-ABI callback with valid stack-allocated iterator and command bridge.
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
@@ -489,12 +885,25 @@ impl System for DynamicCSystem {
                 let mut host_iters: [Option<HostChunkIter<'_>>; MAX_SYSTEM_QUERIES] =
                     [const { None }; MAX_SYSTEM_QUERIES];
                 for (i, group) in self.query_groups.iter().take(count).enumerate() {
-                    host_iters[i] = Some(HostChunkIter::new(
-                        &storages.tables,
-                        &group.matched_tables,
-                        &group.columns,
-                        self.this_run,
-                    ));
+                    let iter = if group.is_dense {
+                        HostChunkIter::new(
+                            &storages.tables,
+                            &group.matched_tables,
+                            &group.columns,
+                            change_tick,
+                        )
+                    } else {
+                        HostChunkIter::new_archetypal(
+                            &storages.tables,
+                            archetypes,
+                            &storages.sparse_sets,
+                            &group.matched_archetypes,
+                            &group.columns,
+                            group.sparse_column_mask,
+                            change_tick,
+                        )
+                    };
+                    host_iters[i] = Some(iter);
                 }
 
                 let mut raw_ptrs: [*mut RawChunkIter; MAX_SYSTEM_QUERIES] =
@@ -513,14 +922,51 @@ impl System for DynamicCSystem {
             }
         };
 
-        match res {
+        self.last_run = change_tick;
+
+        let fault = match res {
             Ok(status) => {
                 if status == FfiResult::PANIC_CAUGHT || status.is_err() {
-                    self.enabled = false;
+                    Some((status, status == FfiResult::PANIC_CAUGHT))
+                } else {
+                    None
                 }
             }
-            Err(_) => {
-                self.enabled = false;
+            Err(_) => Some((FfiResult::PANIC_CAUGHT, true)),
+        };
+
+        if let Some((status, panicked)) = fault {
+            self.enabled = false;
+            let fault_event = ModSystemFaulted {
+                mod_id: self.mod_id,
+                system_name: self.name.clone(),
+                status,
+                panicked,
+            };
+            self.command_queue.push(move |world: &mut World| {
+                if let Some(mut msgs) = world.get_resource_mut::<Messages<ModSystemFaulted>>() {
+                    msgs.write(fault_event.clone());
+                }
+                world.trigger(fault_event);
+            });
+
+            match self.error_policy {
+                ModErrorPolicy::Quarantine => return Ok(()),
+                ModErrorPolicy::Log => {
+                    eprintln!(
+                        "[bevy_abi_mod] guest system '{}' (mod_id={:?}) faulted: status={:?}, panicked={}",
+                        self.name, self.mod_id, status, panicked
+                    );
+                    return Ok(());
+                }
+                ModErrorPolicy::ReportToBevy => {
+                    return Err(RunSystemError::from(ModSystemError {
+                        mod_id: self.mod_id,
+                        system_name: self.name.clone(),
+                        status,
+                        panicked,
+                    }));
+                }
             }
         }
 
@@ -529,6 +975,16 @@ impl System for DynamicCSystem {
 
     fn apply_deferred(&mut self, world: &mut World) {
         self.command_queue.apply(world);
+    }
+
+    fn run(
+        &mut self,
+        input: SystemIn<'_, Self>,
+        world: &mut World,
+    ) -> Result<Self::Out, RunSystemError> {
+        let res = self.run_without_applying_deferred(input, world);
+        self.apply_deferred(world);
+        res
     }
 
     fn queue_deferred(&mut self, mut world: DeferredWorld) {
@@ -629,13 +1085,10 @@ pub fn set_active_init_context(ctx: *mut ModInitContext) -> ActiveInitContextGua
     ActiveInitContextGuard { prev }
 }
 
-/// C-ABI implementation of `register_system`.
-///
-/// # Safety
-/// `host_context` must point to a valid [`ModInitContext`]. `descriptor` must point to a valid [`SystemDescriptor`].
-pub unsafe extern "C" fn host_register_system(
+unsafe fn register_system_with_schedule_impl(
     host_context: *mut c_void,
     descriptor: *const SystemDescriptor,
+    schedule: ModSchedule,
 ) -> FfiResult {
     if host_context.is_null() || descriptor.is_null() {
         return FfiResult::NULL_POINTER;
@@ -645,6 +1098,11 @@ pub unsafe extern "C" fn host_register_system(
     let desc = unsafe { &*descriptor };
     if (desc.struct_size as usize) < core::mem::size_of::<SystemDescriptor>() {
         return FfiResult::INTERNAL_ERROR;
+    }
+
+    // D8 fix: never silently truncate query columns beyond MAX_QUERY_COMPONENTS!
+    if desc.query_count > MAX_QUERY_COMPONENTS {
+        return FfiResult::INVALID_COMPONENT;
     }
 
     let sys_name = if !desc.name.is_null() {
@@ -668,6 +1126,9 @@ pub unsafe extern "C" fn host_register_system(
             if q.name.is_null() {
                 return FfiResult::NULL_POINTER;
             }
+            if !q.mode.is_valid() {
+                return FfiResult::INVALID_COMPONENT;
+            }
             // SAFETY: q.name is a NUL-terminated C string.
             let Ok(q_name) = (unsafe { CStr::from_ptr(q.name) }).to_str() else {
                 return FfiResult::INVALID_UTF8;
@@ -688,10 +1149,40 @@ pub unsafe extern "C" fn host_register_system(
         desc.user_data,
         Arc::clone(&init_ctx.registry),
     )
+    .with_schedule(schedule)
     .with_is_active(Arc::clone(&init_ctx.is_active));
     init_ctx.registered_systems.push(system);
 
     FfiResult::OK
+}
+
+/// C-ABI implementation of `register_system` (defaults to [`ModSchedule::Update`]).
+///
+/// # Safety
+/// `host_context` must point to a valid [`ModInitContext`]. `descriptor` must point to a valid [`SystemDescriptor`].
+pub unsafe extern "C" fn host_register_system(
+    host_context: *mut c_void,
+    descriptor: *const SystemDescriptor,
+) -> FfiResult {
+    // SAFETY: Delegating with identical safety invariants.
+    unsafe { register_system_with_schedule_impl(host_context, descriptor, ModSchedule::Update) }
+}
+
+/// C-ABI symbol `register_system_in_schedule` allowing a guest mod to target a specific
+/// [`ModSchedule`] (`0 = Update`, `1 = Startup`, `2 = PreUpdate`, `3 = PostUpdate`, `4 = FixedUpdate`, `5 = Last`).
+///
+/// # Safety
+/// `host_context` must point to a valid [`ModInitContext`]. `descriptor` must point to a valid [`SystemDescriptor`].
+pub unsafe extern "C" fn host_register_system_in_schedule(
+    host_context: *mut c_void,
+    descriptor: *const SystemDescriptor,
+    schedule_raw: u32,
+) -> FfiResult {
+    let Some(schedule) = ModSchedule::from_raw(schedule_raw) else {
+        return FfiResult::INTERNAL_ERROR;
+    };
+    // SAFETY: Delegating with identical safety invariants.
+    unsafe { register_system_with_schedule_impl(host_context, descriptor, schedule) }
 }
 
 /// C-ABI implementation of `register_multi_query_system` for nested / multi-query ECS systems.
@@ -734,6 +1225,10 @@ pub unsafe extern "C" fn host_register_multi_query_system(
     let mut parsed_specs = Vec::with_capacity(desc.query_spec_count);
 
     for spec in specs_slice {
+        // D8 fix: reject > MAX_QUERY_COMPONENTS instead of silently truncating columns!
+        if spec.query_count > MAX_QUERY_COMPONENTS {
+            return FfiResult::INVALID_COMPONENT;
+        }
         let mut query_descs = Vec::with_capacity(spec.query_count);
         if spec.query_count > 0 {
             if spec.queries.is_null() {
@@ -745,6 +1240,9 @@ pub unsafe extern "C" fn host_register_multi_query_system(
             for q in queries_slice {
                 if q.name.is_null() {
                     return FfiResult::NULL_POINTER;
+                }
+                if !q.mode.is_valid() {
+                    return FfiResult::INVALID_COMPONENT;
                 }
                 // SAFETY: q.name is a NUL-terminated C string.
                 let Ok(q_name) = (unsafe { CStr::from_ptr(q.name) }).to_str() else {
@@ -825,6 +1323,7 @@ pub unsafe extern "C" fn host_register_component(
         }
         // SAFETY: init_ctx.world was created from a valid &mut World.
         let world = unsafe { &mut *init_ctx.world };
+        let world_id = world.id();
 
         // Check if component already exists with identical layout (idempotent registration / reload)
         if let Some(existing) = world
@@ -835,9 +1334,10 @@ pub unsafe extern "C" fn host_register_component(
                 && existing.align == desc.align
                 && existing.uuid == desc.uuid
             {
-                // Update drop trampoline slot for the reloaded mod instance
+                // Update drop trampoline slot for the reloaded mod instance in THIS World
                 if let Some(drop_fn) = desc.drop_fn {
                     match allocate_drop_trampoline(
+                        world_id,
                         desc.uuid,
                         drop_fn,
                         Arc::clone(&init_ctx.is_active),
@@ -870,12 +1370,24 @@ pub unsafe extern "C" fn host_register_component(
         }
 
         let drop_trampoline = if let Some(drop_fn) = desc.drop_fn {
-            match allocate_drop_trampoline(desc.uuid, drop_fn, Arc::clone(&init_ctx.is_active)) {
+            match allocate_drop_trampoline(
+                world_id,
+                desc.uuid,
+                drop_fn,
+                Arc::clone(&init_ctx.is_active),
+            ) {
                 Some(t) => Some(t),
                 None => return FfiResult::INTERNAL_ERROR,
             }
         } else {
             None
+        };
+
+        // D7 fix: never allow Bevy's EntityCloner to bit-copy foreign-drop-managed components!
+        let clone_behavior = if desc.drop_fn.is_some() {
+            ComponentCloneBehavior::Ignore
+        } else {
+            ComponentCloneBehavior::Default
         };
 
         // SAFETY: layout verified above; drop_trampoline satisfies OwningPtr signature; Table storage used.
@@ -887,7 +1399,7 @@ pub unsafe extern "C" fn host_register_component(
                 drop_trampoline,
                 true,
                 true,
-                ComponentCloneBehavior::Default,
+                clone_behavior,
                 None,
             )
         };

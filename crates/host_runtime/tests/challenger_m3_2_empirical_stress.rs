@@ -1,4 +1,5 @@
 #![deny(unsafe_op_in_unsafe_fn)]
+#![deny(improper_ctypes_definitions)]
 
 //! # Milestone 3 Empirical Challenger Stress Suite
 //!
@@ -163,10 +164,10 @@ fn test_pod_components_consume_zero_drop_trampoline_slots() {
         );
     }
 
-    // 4. Now, verify all 64 slots in the drop trampoline pool remain completely available!
-    // Register exactly 64 Non-POD components with non-null drop_fn.
+    // 4. Now, verify all MAX_DROP_TRAMPOLINES slots in the drop trampoline pool remain completely available!
+    // Register exactly MAX_DROP_TRAMPOLINES Non-POD components with non-null drop_fn.
     let mut non_pod_names = Vec::new();
-    for i in 0..64 {
+    for i in 0..host_runtime::MAX_DROP_TRAMPOLINES {
         let name = format!("NonPodComp_{i}\0");
         non_pod_names.push(name);
     }
@@ -185,7 +186,7 @@ fn test_pod_components_consume_zero_drop_trampoline_slots() {
         assert_eq!(
             res,
             FfiResult::OK,
-            "Non-POD slot {i} of 64 must succeed because POD components consumed 0 slots"
+            "Non-POD slot {i} of MAX_DROP_TRAMPOLINES must succeed because POD components consumed 0 slots"
         );
     }
 
@@ -335,9 +336,9 @@ fn test_non_pod_slot_reuse_on_mod_reload() {
     };
     assert_eq!(res, FfiResult::OK);
 
-    // Fill 63 more slots (total 64 slots full)
+    // Fill remaining slots (total MAX_DROP_TRAMPOLINES slots full)
     let mut names = Vec::new();
-    for i in 1..64 {
+    for i in 1..host_runtime::MAX_DROP_TRAMPOLINES {
         names.push(format!("SlotComp_{i}\0"));
     }
     for (i, name) in names.iter().enumerate() {
@@ -648,7 +649,7 @@ fn test_cmd_insert_boundary_sizes_and_alignments() {
     assert!(entity_ref.contains_id(zst_id));
     assert!(entity_ref.contains_id(large_id));
 
-    let table_large_ptr = entity_ref.get_by_id(large_id).unwrap().as_ptr() as *const u8;
+    let table_large_ptr = entity_ref.get_by_id(large_id).unwrap().as_ptr();
     let table_large_slice = unsafe { core::slice::from_raw_parts(table_large_ptr, LARGE_SIZE) };
     assert_eq!(table_large_slice[0], 0x11);
     assert_eq!(table_large_slice[LARGE_SIZE - 1], 0x99);

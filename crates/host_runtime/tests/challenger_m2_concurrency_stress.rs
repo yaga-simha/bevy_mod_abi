@@ -747,9 +747,9 @@ fn test_challenge_drop_trampoline_saturation_and_reclamation() {
     );
     let _guard_1 = init_ctx_1.make_active();
 
-    // Register 64 non-POD components (filling the 64-slot pool)
+    // Register MAX_DROP_TRAMPOLINES non-POD components (filling the drop trampoline pool)
     let mut names = Vec::new();
-    for i in 0..64 {
+    for i in 0..host_runtime::MAX_DROP_TRAMPOLINES {
         let name_str = format!("DroppableComp_{i}\0");
         names.push(name_str);
     }
@@ -769,9 +769,9 @@ fn test_challenge_drop_trampoline_saturation_and_reclamation() {
         );
     }
 
-    // 65th registration with foreign drop MUST fail with INTERNAL_ERROR (pool exhausted)
-    let extra_name = c"DroppableComp_64";
-    let extra_uuid = ComponentUuid::from_name("DroppableComp_64");
+    // Overflow registration with foreign drop MUST fail with INTERNAL_ERROR (pool exhausted)
+    let extra_name = c"DroppableComp_Overflow";
+    let extra_uuid = ComponentUuid::from_name("DroppableComp_Overflow");
     let extra_desc = ModComponentDescriptor::new(extra_name.as_ptr(), extra_uuid, 8, 4)
         .with_drop(generic_drop_hook);
 
