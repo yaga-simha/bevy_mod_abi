@@ -1,8 +1,12 @@
 //! 3D Pastel Slime Meadow simulation environment, entity spawning, and baseline host physics.
 
 use crate::components::{ColorRgba, CuteSpirit, HomeStyle, Position, Scale3D, Velocity};
+use avian3d::prelude::{Collider, CollidingEntities, Friction, LockedAxes, Restitution, RigidBody};
+use avian3d::prelude::{LinearVelocity as AvianVel, Position as AvianPos};
 use bevy_ecs::prelude::Resource;
 use bevy_ecs::system::{Commands, Query, Res, ResMut};
+use bevy_math::Vec3;
+use bevy_transform::components::Transform;
 
 pub const MEADOW_RADIUS: f32 = 8.4;
 pub const DT: f32 = 1.0 / 60.0;
@@ -22,9 +26,64 @@ const PASTEL_PALETTE: [ColorRgba; 6] = [
     ColorRgba::new(0.83, 0.71, 1.00, 1.0), // Taro lavender
 ];
 
+/// Spawns static colliders for the floating meadow island and giant plush mushroom.
+pub fn spawn_meadow_colliders(mut commands: Commands) {
+    // 1. Centerpiece giant plush mushroom trunk collider
+    commands.spawn((
+        RigidBody::Static,
+        Collider::cylinder(1.35, 3.0),
+        Restitution::new(0.85),
+        Friction::new(0.25),
+        AvianPos::from_xyz(0.0, 1.0, 0.0),
+        Transform::from_xyz(0.0, 1.0, 0.0),
+    ));
+
+    // 2. Island grass foundation floor collider
+    commands.spawn((
+        RigidBody::Static,
+        Collider::cylinder(MEADOW_RADIUS + 0.5, 1.0),
+        Restitution::new(0.70),
+        Friction::new(0.30),
+        AvianPos::from_xyz(0.0, -0.5, 0.0),
+        Transform::from_xyz(0.0, -0.5, 0.0),
+    ));
+}
+
 /// Spawns cute slime spirits across the floating 3D meadow island.
 pub fn spawn_slimes(mut commands: Commands, count: usize) {
     spawn_slimes_batch(&mut commands, count, 0xC0FF_EE42_u32);
+}
+
+/// Spawns a single cute bunny-slime with complete C-ABI and Avian 3D physics components.
+pub fn spawn_single_slime(
+    commands: &mut Commands,
+    pos: Position,
+    vel: Velocity,
+    scale: Scale3D,
+    color: ColorRgba,
+    spirit: CuteSpirit,
+    home: HomeStyle,
+) -> bevy_ecs::entity::Entity {
+    commands
+        .spawn((
+            pos,
+            vel,
+            scale,
+            color,
+            spirit,
+            home,
+            // Avian 3D ECS Physics with simpler Capsule collider
+            RigidBody::Dynamic,
+            Collider::capsule(0.42, 0.36),
+            CollidingEntities::default(),
+            Restitution::new(0.88),
+            Friction::new(0.20),
+            LockedAxes::ROTATION_LOCKED,
+            AvianPos::from_xyz(pos.x, pos.y, pos.z),
+            AvianVel(Vec3::new(vel.x, vel.y, vel.z)),
+            Transform::from_xyz(pos.x, pos.y, pos.z),
+        ))
+        .id()
 }
 
 /// Spawns a batch of cute slime spirits with a specified pseudorandom seed.
@@ -49,7 +108,8 @@ pub fn spawn_slimes_batch(commands: &mut Commands, count: usize, seed_start: u32
         let base_color = PASTEL_PALETTE[(i + (seed_start as usize)) % PASTEL_PALETTE.len()];
         let phase_offset = next_f32() * core::f32::consts::TAU;
 
-        commands.spawn((
+        spawn_single_slime(
+            commands,
             Position::new(x, 0.0, z),
             Velocity::new(vx, 0.0, vz),
             Scale3D::uniform(1.0),
@@ -59,84 +119,70 @@ pub fn spawn_slimes_batch(commands: &mut Commands, count: usize, seed_start: u32
                 base_color,
                 phase_offset,
             },
-        ));
+        );
     }
 }
 
-/// Host physics & cozy idle animation executed during `PostUpdate`.
-///
-/// Guest mods execute during `Update` (mutating velocity, hop height, squash/stretch,
-/// pastel colors, ear flop, and blush), while `PostUpdate` integrates horizontal motion,
-/// keeps slimes safely inside the meadow island, and gently settles baseline idle breathing
-/// when no mod is loaded.
+type SlimeQueryItem<'a> = (
+    &'a mut Position,
+    &'a mut Velocity,
+    &'a mut Scale3D,
+    &'a mut CuteSpirit,
+    &'a HomeStyle,
+    &'a mut AvianPos,
+    &'a mut AvianVel,
+    &'a CollidingEntities,
+);
+
+/// Host physics, Avian collider synchronization, and cozy idle animation executed during `PostUpdate`.
+#[allow(clippy::type_complexity)]
 pub fn host_meadow_post_physics(
     mut clock: ResMut<MeadowClock>,
     has_active_mod: Option<Res<crate::mod_manager::ModStatusResource>>,
-    mut query: Query<(
-        &mut Position,
-        &mut Velocity,
-        &mut Scale3D,
-        &mut CuteSpirit,
-        &HomeStyle,
-    )>,
+    mut query: Query<SlimeQueryItem>,
 ) {
     clock.tick = clock.tick.wrapping_add(1);
     let t = (clock.tick as f32) * DT;
-    let baseline_idle = has_active_mod
+    let has_mod = has_active_mod
         .as_ref()
-        .map(|s| s.active_mod == crate::mod_manager::ActiveMod::None)
-        .unwrap_or(true);
+        .map(|s| s.active_mod != crate::mod_manager::ActiveMod::None)
+        .unwrap_or(false);
 
-    for (mut pos, mut vel, mut scale, mut spirit, home) in query.iter_mut() {
-        pos.x += vel.x * DT;
-        pos.z += vel.z * DT;
+    for (mut pos, mut vel, mut scale, mut spirit, home, mut avian_pos, mut avian_vel, colliding) in
+        query.iter_mut()
+    {
+        if has_mod {
+            // Mod updated C-ABI components during Update; sync to Avian physics
+            avian_pos.0 = Vec3::new(pos.x, pos.y, pos.z);
+            avian_vel.0 = Vec3::new(vel.x, vel.y, vel.z);
+        } else {
+            // Baseline stroll: integrate horizontal motion and idle wandering
+            pos.x += vel.x * DT;
+            pos.z += vel.z * DT;
+            avian_pos.0.x = pos.x;
+            avian_pos.0.z = pos.z;
 
-        // Keep away from the central giant plush mushroom trunk (radius < 1.35)
-        let r_sq = pos.x * pos.x + pos.z * pos.z;
-        if r_sq < 1.35 * 1.35 && r_sq > 0.0001 {
-            let r = r_sq.sqrt();
-            let nx = pos.x / r;
-            let nz = pos.z / r;
-            pos.x = nx * 1.35;
-            pos.z = nz * 1.35;
-            let dot = vel.x * nx + vel.z * nz;
-            if dot < 0.0 {
-                vel.x -= 1.8 * dot * nx;
-                vel.z -= 1.8 * dot * nz;
-            }
-        }
-
-        // Soft circular fence reflection at the edge of the floating island
-        let r_out = (pos.x * pos.x + pos.z * pos.z).sqrt();
-        if r_out > MEADOW_RADIUS {
-            let nx = pos.x / r_out;
-            let nz = pos.z / r_out;
-            pos.x = nx * MEADOW_RADIUS;
-            pos.z = nz * MEADOW_RADIUS;
-            let dot = vel.x * nx + vel.z * nz;
-            if dot > 0.0 {
-                vel.x -= 1.9 * dot * nx;
-                vel.z -= 1.9 * dot * nz;
-            }
-        }
-
-        if baseline_idle {
-            // Cozy baseline stroll: gentle ground glide + soft jelly breathing
             pos.y *= 0.85;
             if pos.y < 0.005 {
                 pos.y = 0.0;
             }
             vel.y = 0.0;
+            avian_pos.0.y = pos.y;
+            avian_vel.0.y = 0.0;
 
-            // Keep a gentle wandering breeze speed so slimes don't stall
+            // Gentle wandering breeze speed so slimes don't stall
             let speed = (vel.x * vel.x + vel.z * vel.z).sqrt();
             if speed < 0.65 {
                 let angle = home.phase_offset + t * 0.4;
                 vel.x += angle.cos() * 0.04;
                 vel.z += angle.sin() * 0.04;
+                avian_vel.0.x = vel.x;
+                avian_vel.0.z = vel.z;
             } else if speed > 2.2 {
                 vel.x *= 0.97;
                 vel.z *= 0.97;
+                avian_vel.0.x = vel.x;
+                avian_vel.0.z = vel.z;
             }
 
             let breath = 1.0 + 0.06 * (t * 2.8 + home.phase_offset).sin();
@@ -147,7 +193,6 @@ pub fn host_meadow_post_physics(
 
             if speed > 0.05 {
                 let target_yaw = vel.x.atan2(vel.z);
-                // Shortest-angle turn
                 let mut diff = target_yaw - spirit.yaw;
                 while diff > core::f32::consts::PI {
                     diff -= core::f32::consts::TAU;
@@ -161,13 +206,59 @@ pub fn host_meadow_post_physics(
             spirit.ear_wiggle += (target_ear - spirit.ear_wiggle) * 0.15;
             spirit.blush += (0.42 - spirit.blush) * 0.10;
         }
+
+        // Keep away from the central giant plush mushroom trunk (radius < 1.35)
+        let r_sq = pos.x * pos.x + pos.z * pos.z;
+        if r_sq < 1.35 * 1.35 && r_sq > 0.0001 {
+            let r = r_sq.sqrt();
+            let nx = pos.x / r;
+            let nz = pos.z / r;
+            pos.x = nx * 1.35;
+            pos.z = nz * 1.35;
+            avian_pos.0.x = pos.x;
+            avian_pos.0.z = pos.z;
+            let dot = vel.x * nx + vel.z * nz;
+            if dot < 0.0 {
+                vel.x -= 1.8 * dot * nx;
+                vel.z -= 1.8 * dot * nz;
+                avian_vel.0.x = vel.x;
+                avian_vel.0.z = vel.z;
+            }
+        }
+
+        // Soft circular fence reflection at the edge of the floating island
+        let r_out = (pos.x * pos.x + pos.z * pos.z).sqrt();
+        if r_out > MEADOW_RADIUS {
+            let nx = pos.x / r_out;
+            let nz = pos.z / r_out;
+            pos.x = nx * MEADOW_RADIUS;
+            pos.z = nz * MEADOW_RADIUS;
+            avian_pos.0.x = pos.x;
+            avian_pos.0.z = pos.z;
+            let dot = vel.x * nx + vel.z * nz;
+            if dot > 0.0 {
+                vel.x -= 1.9 * dot * nx;
+                vel.z -= 1.9 * dot * nz;
+                avian_vel.0.x = vel.x;
+                avian_vel.0.z = vel.z;
+            }
+        }
+
+        // Avian contact manifold collision reaction
+        if !colliding.is_empty() {
+            spirit.blush = 1.0;
+            spirit.ear_wiggle = (spirit.ear_wiggle + 0.35).clamp(-0.6, 0.6);
+            scale.y = (scale.y * 0.88).clamp(0.68, 1.35);
+            scale.x = 1.0 / scale.y.sqrt();
+            scale.z = scale.x;
+        }
     }
 
     // Slime-to-slime pairwise collisions and bouncy elastic jelly reaction
     let mut combinations = query.iter_combinations_mut();
     while let Some([mut a, mut b]) = combinations.fetch_next() {
-        let (pos_a, vel_a, scale_a, spirit_a, _) = &mut a;
-        let (pos_b, vel_b, scale_b, spirit_b, _) = &mut b;
+        let (pos_a, vel_a, scale_a, spirit_a, _, avian_pos_a, avian_vel_a, _) = &mut a;
+        let (pos_b, vel_b, scale_b, spirit_b, _, avian_pos_b, avian_vel_b, _) = &mut b;
 
         let dx = pos_a.x - pos_b.x;
         let dz = pos_a.z - pos_b.z;
@@ -198,6 +289,10 @@ pub fn host_meadow_post_physics(
             pos_a.z += nz * sep;
             pos_b.x -= nx * sep;
             pos_b.z -= nz * sep;
+            avian_pos_a.0.x = pos_a.x;
+            avian_pos_a.0.z = pos_a.z;
+            avian_pos_b.0.x = pos_b.x;
+            avian_pos_b.0.z = pos_b.z;
 
             // 2. Elastic jelly bounce & momentum exchange
             let rel_vx = vel_a.x - vel_b.x;
@@ -221,13 +316,19 @@ pub fn host_meadow_post_physics(
                 vel_b.x -= nx * 0.20;
                 vel_b.z -= nz * 0.20;
             }
+            avian_vel_a.0.x = vel_a.x;
+            avian_vel_a.0.z = vel_a.z;
+            avian_vel_b.0.x = vel_b.x;
+            avian_vel_b.0.z = vel_b.z;
 
             // 3. Cute vertical boing hop & squish reaction
             if pos_a.y < 0.25 && vel_a.y < 0.8 {
                 vel_a.y = (vel_a.y + 1.2).min(3.5);
+                avian_vel_a.0.y = vel_a.y;
             }
             if pos_b.y < 0.25 && vel_b.y < 0.8 {
                 vel_b.y = (vel_b.y + 1.2).min(3.5);
+                avian_vel_b.0.y = vel_b.y;
             }
 
             // Impact jelly squish
@@ -243,6 +344,10 @@ pub fn host_meadow_post_physics(
             // Keep slimes within the meadow island after collision separation
             clamp_island_bounds(pos_a, vel_a);
             clamp_island_bounds(pos_b, vel_b);
+            avian_pos_a.0.x = pos_a.x;
+            avian_pos_a.0.z = pos_a.z;
+            avian_pos_b.0.x = pos_b.x;
+            avian_pos_b.0.z = pos_b.z;
         }
     }
 }

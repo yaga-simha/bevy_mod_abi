@@ -16,6 +16,16 @@ Instead of a terminal TUI, 32 kawaii pastel bunny-slimes (complete with floppy e
 
 ---
 
+## Avian 3D Physics Engine & Capsule Colliders
+
+The simulation leverages **Avian 3D (`avian3d` v0.8.0)**, Bevy's premier ECS-native physics engine:
+- **Simpler Capsule Mesh & Colliders**: Each bunny-slime is simulated using an optimal, watertight **Capsule collider** (`Collider::capsule(0.42, 0.36)`) paired with a lightweight, seamless procedural capsule mesh (`build_capsule(0.48, 0.28, 22, 7)`). This provides far superior contact stability, eliminates edge-catching artifacts common with spherical colliders, and reduces vertex overhead.
+- **Island Environment Colliders**: Static cylinder colliders protect the central giant plush mushroom trunk (`Collider::cylinder(1.35, 3.0)`) and the floating island grass bed foundation (`Collider::cylinder(MEADOW_RADIUS + 0.5, 1.0)`).
+- **Avian Contact Manifold Tracking**: Active contact states are tracked via `CollidingEntities`. Slimes react to both world obstacles and peer bunny-slimes with restitution ($e = 0.88$), friction ($0.20$), locked rotation axes, and collision impulse pops.
+- **C-ABI Sync Bridge**: The host runtime bidirectionally synchronizes the `Position` and `Velocity` C-ABI components with Avian's `Position` and `LinearVelocity` ECS components, allowing both Rust and pure C99 mods to influence physical trajectories.
+
+---
+
 ## Pairwise Jelly Collisions & Elastic Bouncing
 
 All bunny-slimes possess physical pairwise collision detection and lively jelly bounce responses:

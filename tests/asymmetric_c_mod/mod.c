@@ -521,26 +521,24 @@ BEVY_ABI_MOD_EXPORT FfiResult bevy_abi_mod_init(
         desc.vtable_ptr = NULL;
 
         FfiResult reg_comp_res = host_api->register_component(host_context, &desc);
-        if (reg_comp_res != FFI_RESULT_OK) {
-            return reg_comp_res;
-        }
+        if (reg_comp_res == FFI_RESULT_OK) {
+            static ComponentAccessDesc custom_queries[1];
+            custom_queries[0].name = "CModCustomData";
+            custom_queries[0].mode = COMPONENT_ACCESS_WRITE;
 
-        static ComponentAccessDesc custom_queries[1];
-        custom_queries[0].name = "CModCustomData";
-        custom_queries[0].mode = COMPONENT_ACCESS_WRITE;
+            SystemDescriptor sys_desc;
+            memset(&sys_desc, 0, sizeof(sys_desc));
+            sys_desc.struct_size = (uint32_t)sizeof(SystemDescriptor);
+            sys_desc.name = "c_custom_data_system";
+            sys_desc.queries = custom_queries;
+            sys_desc.query_count = 1;
+            sys_desc.callback = c_custom_data_system;
+            sys_desc.user_data = NULL;
 
-        SystemDescriptor sys_desc;
-        memset(&sys_desc, 0, sizeof(sys_desc));
-        sys_desc.struct_size = (uint32_t)sizeof(SystemDescriptor);
-        sys_desc.name = "c_custom_data_system";
-        sys_desc.queries = custom_queries;
-        sys_desc.query_count = 1;
-        sys_desc.callback = c_custom_data_system;
-        sys_desc.user_data = NULL;
-
-        FfiResult reg_sys_res = host_api->register_system(host_context, &sys_desc);
-        if (reg_sys_res != FFI_RESULT_OK) {
-            return reg_sys_res;
+            FfiResult reg_sys_res = host_api->register_system(host_context, &sys_desc);
+            if (reg_sys_res != FFI_RESULT_OK) {
+                return reg_sys_res;
+            }
         }
     }
 

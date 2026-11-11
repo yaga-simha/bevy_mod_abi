@@ -466,17 +466,17 @@ impl CuteRenderer {
             cache: None,
         });
 
-        let (sphere_verts, sphere_indices) = build_uv_sphere(26, 18);
-        let sphere_index_count = sphere_indices.len() as u32;
+        let (capsule_verts, capsule_indices) = build_capsule(0.48, 0.28, 22, 7);
+        let sphere_index_count = capsule_indices.len() as u32;
 
         let vertex_buffer_sphere = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("SphereVertices"),
-            contents: bytemuck::cast_slice(&sphere_verts),
+            label: Some("CapsuleVertices"),
+            contents: bytemuck::cast_slice(&capsule_verts),
             usage: wgpu::BufferUsages::VERTEX,
         });
         let index_buffer_sphere = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("SphereIndices"),
-            contents: bytemuck::cast_slice(&sphere_indices),
+            label: Some("CapsuleIndices"),
+            contents: bytemuck::cast_slice(&capsule_indices),
             usage: wgpu::BufferUsages::INDEX,
         });
 
@@ -1023,42 +1023,115 @@ fn append_fluffy_clouds(out: &mut Vec<ModelInstance>, time_secs: f32) {
     }
 }
 
-fn build_uv_sphere(sectors: u16, stacks: u16) -> (Vec<MeshVertex>, Vec<u16>) {
+/// Builds a simpler, optimal Capsule mesh (cylinder body + dual hemispherical caps)
+/// that perfectly matches the physics collision shape.
+fn build_capsule(
+    radius: f32,
+    half_height: f32,
+    sectors: u16,
+    cap_rings: u16,
+) -> (Vec<MeshVertex>, Vec<u16>) {
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
 
-    for i in 0..=stacks {
-        let v = i as f32 / stacks as f32;
-        let phi = core::f32::consts::PI * v;
+    // 1. Top cap pole
+    vertices.push(MeshVertex {
+        position: [0.0, half_height + radius, 0.0],
+        normal: [0.0, 1.0, 0.0],
+    });
+
+    // 2. Top hemisphere rings (excluding pole, down to cylinder top)
+    for i in 1..=cap_rings {
+        let phi = (core::f32::consts::FRAC_PI_2 * (i as f32)) / (cap_rings as f32);
         let sin_phi = phi.sin();
         let cos_phi = phi.cos();
+        let y = half_height + radius * cos_phi;
+        let r = radius * sin_phi;
 
         for j in 0..=sectors {
             let u = j as f32 / sectors as f32;
             let theta = core::f32::consts::TAU * u;
-            let x = sin_phi * theta.cos();
-            let y = cos_phi;
-            let z = sin_phi * theta.sin();
+            let x = r * theta.cos();
+            let z = r * theta.sin();
+            let nx = sin_phi * theta.cos();
+            let ny = cos_phi;
+            let nz = sin_phi * theta.sin();
 
             vertices.push(MeshVertex {
                 position: [x, y, z],
-                normal: [x, y, z],
+                normal: [nx, ny, nz],
             });
         }
     }
 
-    let ring = sectors + 1;
-    for i in 0..stacks {
-        for j in 0..sectors {
-            let k1 = i * ring + j;
-            let k2 = k1 + ring;
-            if i != 0 {
-                indices.extend_from_slice(&[k1, k2, k1 + 1]);
-            }
-            if i != stacks - 1 {
-                indices.extend_from_slice(&[k1 + 1, k2, k2 + 1]);
-            }
+    // 3. Bottom hemisphere rings (from cylinder bottom down to near pole)
+    for i in 0..cap_rings {
+        let phi = core::f32::consts::FRAC_PI_2
+            + (core::f32::consts::FRAC_PI_2 * (i as f32)) / (cap_rings as f32);
+        let sin_phi = phi.sin();
+        let cos_phi = phi.cos();
+        let y = -half_height + radius * cos_phi;
+        let r = radius * sin_phi;
+
+        for j in 0..=sectors {
+            let u = j as f32 / sectors as f32;
+            let theta = core::f32::consts::TAU * u;
+            let x = r * theta.cos();
+            let z = r * theta.sin();
+            let nx = sin_phi * theta.cos();
+            let ny = cos_phi;
+            let nz = sin_phi * theta.sin();
+
+            vertices.push(MeshVertex {
+                position: [x, y, z],
+                normal: [nx, ny, nz],
+            });
         }
+    }
+
+    // 4. Bottom cap pole
+    let bottom_pole_idx = vertices.len() as u16;
+    vertices.push(MeshVertex {
+        position: [0.0, -half_height - radius, 0.0],
+        normal: [0.0, -1.0, 0.0],
+    });
+
+    let ring_stride = sectors + 1;
+
+    // Top pole fan
+    for j in 0..sectors {
+        indices.push(0);
+        indices.push(1 + j + 1);
+        indices.push(1 + j);
+    }
+
+    // Body and cap quads
+    let total_rings = 2 * cap_rings;
+    for ring in 0..(total_rings - 1) {
+        let r1 = 1 + ring * ring_stride;
+        let r2 = r1 + ring_stride;
+        for j in 0..sectors {
+            let a = r1 + j;
+            let b = r2 + j;
+            let c = r2 + j + 1;
+            let d = r1 + j + 1;
+
+            indices.push(a);
+            indices.push(b);
+            indices.push(d);
+
+            indices.push(d);
+            indices.push(b);
+            indices.push(c);
+        }
+    }
+
+    // Bottom pole fan
+    let last_ring_start = 1 + (total_rings - 1) * ring_stride;
+    for j in 0..sectors {
+        indices.push(last_ring_start + j);
+        indices.push(last_ring_start + j + 1);
+        indices.push(bottom_pole_idx);
     }
 
     (vertices, indices)

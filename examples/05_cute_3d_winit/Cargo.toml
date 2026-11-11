@@ -7,6 +7,9 @@ publish = false
 [dependencies]
 bevy_app = { version = "0.20.1", default-features = false, features = ["std"] }
 bevy_ecs = { version = "0.20.1", default-features = false, features = ["std", "async_executor"] }
+bevy_math = "0.20.1"
+bevy_time = "0.20.1"
+bevy_transform = "0.20.1"
 host_runtime = { path = "../../crates/host_runtime" }
 abi_contract = { path = "../../crates/abi_contract" }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
@@ -14,3 +17,4 @@ wgpu = "29.0.4"
 glam = "0.33"
 bytemuck = { version = "1.25", features = ["derive"] }
 futures-executor = "0.3.34"
+avian3d = { version = "0.8.0", default-features = false, features = ["3d", "parry-f32"] }

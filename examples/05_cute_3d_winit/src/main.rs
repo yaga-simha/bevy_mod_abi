@@ -125,6 +125,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. Initialize Bevy ECS App with AbiModPlugin and 3D ModExposable components
     let mut app = App::new();
+    app.add_plugins(bevy_app::TaskPoolPlugin::default());
+    app.add_plugins(bevy_time::TimePlugin);
+    app.add_plugins(bevy_transform::TransformPlugin);
+    app.add_plugins(avian3d::prelude::PhysicsPlugins::default());
     app.add_plugins(AbiModPlugin);
     app.init_resource::<MeadowClock>();
     app.register_mod_component::<Position>();
@@ -134,7 +138,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.register_mod_component::<CuteSpirit>();
     app.add_systems(PostUpdate, host_meadow_post_physics);
 
-    // 2. Spawn cute pastel bunny-slimes onto the floating 3D meadow
+    // Finalize plugins (initializes Avian collision tree diagnostics & resources)
+    app.finish();
+    app.cleanup();
+
+    // 2. Spawn static colliders and cute pastel bunny-slimes onto the floating 3D meadow
+    meadow::spawn_meadow_colliders(app.world_mut().commands());
     spawn_slimes(app.world_mut().commands(), args.slime_count);
     app.update();
 
@@ -652,21 +661,21 @@ fn run_headless_3d_verification(
     // Spawn two slimes on a direct head-on collision path to verify elastic bounce & blush
     let col_entity_a = {
         let mut commands = app.world_mut().commands();
-        let e = commands
-            .spawn((
-                Position::new(-0.8, 0.0, 0.0),
-                Velocity::new(3.0, 0.0, 0.0),
-                Scale3D::uniform(1.0),
-                ColorRgba::new(1.0, 0.5, 0.5, 1.0),
-                CuteSpirit::new(0.0, 0.0, 0.2),
-                components::HomeStyle {
-                    base_color: ColorRgba::new(1.0, 0.5, 0.5, 1.0),
-                    phase_offset: 0.0,
-                },
-            ))
-            .id();
-        commands.spawn((
-            Position::new(0.8, 0.0, 0.0),
+        let e = meadow::spawn_single_slime(
+            &mut commands,
+            Position::new(-0.4, 0.0, 0.0),
+            Velocity::new(3.0, 0.0, 0.0),
+            Scale3D::uniform(1.0),
+            ColorRgba::new(1.0, 0.5, 0.5, 1.0),
+            CuteSpirit::new(0.0, 0.0, 0.2),
+            components::HomeStyle {
+                base_color: ColorRgba::new(1.0, 0.5, 0.5, 1.0),
+                phase_offset: 0.0,
+            },
+        );
+        meadow::spawn_single_slime(
+            &mut commands,
+            Position::new(0.4, 0.0, 0.0),
             Velocity::new(-3.0, 0.0, 0.0),
             Scale3D::uniform(1.0),
             ColorRgba::new(0.5, 0.5, 1.0, 1.0),
@@ -675,7 +684,7 @@ fn run_headless_3d_verification(
                 base_color: ColorRgba::new(0.5, 0.5, 1.0, 1.0),
                 phase_offset: 0.0,
             },
-        ));
+        );
         e
     };
     app.update(); // Step collision and bounce
