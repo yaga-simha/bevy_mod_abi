@@ -5,8 +5,8 @@ mod common;
 
 use abi_contract::{
     ComponentAccessDesc, ComponentUuid, ConditionalSystemDescriptor, ExposableComponent, FfiBool,
-    FfiEntity, FfiResult, ModComponentDescriptor, RawChunkIter, RawCommandQueue, StrView,
-    SystemDescriptor, FFI_BOOL_FALSE, FFI_BOOL_TRUE,
+    FfiEntity, FfiResult, ModComponentDescriptor, MultiQuerySystemDescriptor, QuerySpec,
+    RawChunkIter, RawCommandQueue, StrView, SystemDescriptor, FFI_BOOL_FALSE, FFI_BOOL_TRUE,
 };
 use bevy_app::{App, Update};
 use bevy_ecs::component::Component;
@@ -23,8 +23,8 @@ use host_runtime::{
     host_cmd_spawn_empty, host_get_proc_address, host_iter_column_mutable,
     host_iter_column_readonly, host_iter_entities, host_iter_next_chunk,
     host_iter_resource_mutable, host_iter_resource_readonly, host_register_component,
-    host_register_conditional_system, host_register_system, AbiModPlugin,
-    ComponentCollisionError, ModAppExt, ModInitContext, ModRegistry,
+    host_register_conditional_system, host_register_multi_query_system, host_register_system,
+    AbiModPlugin, ComponentCollisionError, ModAppExt, ModInitContext, ModRegistry,
 };
 use libloading::{Library, Symbol};
 use mod_derive::ModExposable;
@@ -834,6 +834,120 @@ fn test_ecs_resource_write_conflicts_with_native_bevy_res_under_strict_ambiguity
     });
 
     app.update();
+}
+
+#[test]
+fn test_multi_query_per_group_resource_scoping_prevents_cross_iter_aliasing() {
+    let mut app = App::new();
+    app.add_plugins(AbiModPlugin);
+    app.register_mod_component::<Pos3>();
+    app.register_mod_resource::<SimConfig>();
+    app.insert_resource(SimConfig {
+        dt: 0.25,
+        step_count: 10,
+        banner_len_observed: 0,
+    });
+    app.world_mut().spawn(Pos3 {
+        x: 4.0,
+        y: 0.0,
+        z: 0.0,
+    });
+
+    unsafe extern "C" fn mq_scoped_res_sys(
+        iters: *const *mut RawChunkIter,
+        iter_count: usize,
+        _commands: *mut RawCommandQueue,
+        _user_data: *mut c_void,
+    ) -> FfiResult {
+        assert_eq!(iter_count, 2);
+        // SAFETY: `iters` contains 2 valid `HostChunkIter` handles.
+        let iter0 = unsafe { *iters.add(0) };
+        let iter1 = unsafe { *iters.add(1) };
+
+        // `SimConfig` was declared ONLY in query group 1 (`iter1`), NOT in query group 0 (`iter0`)!
+        // Attempting to read or mutably borrow `SimConfig` through `iter0` MUST return null!
+        // SAFETY: Valid `iter0`.
+        assert!(unsafe { host_iter_resource_readonly(iter0, c"SimConfig".as_ptr()) }.is_null());
+        assert!(unsafe { host_iter_resource_mutable(iter0, c"SimConfig".as_ptr()) }.is_null());
+
+        // Borrowing `SimConfig` through `iter1` (where `RESOURCE_WRITE` was declared) MUST succeed!
+        // SAFETY: Valid `iter1` with `RESOURCE_WRITE` on `SimConfig`.
+        let cfg_ptr =
+            unsafe { host_iter_resource_mutable(iter1, c"SimConfig".as_ptr()) } as *mut SimConfig;
+        assert!(!cfg_ptr.is_null());
+        unsafe {
+            (*cfg_ptr).step_count += 5;
+        }
+        FfiResult::OK
+    }
+
+    let q0 = [ComponentAccessDesc::read(c"Pos3".as_ptr())];
+    let q1 = [ComponentAccessDesc::resource_write(c"SimConfig".as_ptr())];
+    let specs = [
+        QuerySpec {
+            queries: q0.as_ptr(),
+            query_count: q0.len(),
+        },
+        QuerySpec {
+            queries: q1.as_ptr(),
+            query_count: q1.len(),
+        },
+    ];
+    let mq_desc = MultiQuerySystemDescriptor::new(
+        c"mq_scoped_res_sys".as_ptr(),
+        specs.as_ptr(),
+        specs.len(),
+        mq_scoped_res_sys,
+        core::ptr::null_mut(),
+    );
+
+    let registry = Arc::new(app.world().resource::<ModRegistry>().clone());
+    let mut ctx = ModInitContext::new(registry);
+    ctx.world = app.world_mut() as *mut bevy_ecs::world::World;
+    let ctx_ptr = (&mut ctx as *mut ModInitContext).cast::<c_void>();
+    // SAFETY: Valid `ctx_ptr` and `mq_desc`.
+    assert_eq!(
+        unsafe { host_register_multi_query_system(ctx_ptr, &mq_desc) },
+        FfiResult::OK
+    );
+    for sys in ctx.registered_systems.drain(..) {
+        app.add_systems(Update, sys);
+    }
+
+    // Also verify declaring `RESOURCE_WRITE(SimConfig)` in BOTH groups of a multi-query system
+    // triggers `self_conflict` and disables the conflicting system safely!
+    let conflict_specs = [
+        QuerySpec {
+            queries: q1.as_ptr(),
+            query_count: q1.len(),
+        },
+        QuerySpec {
+            queries: q1.as_ptr(),
+            query_count: q1.len(),
+        },
+    ];
+    let conflict_desc = MultiQuerySystemDescriptor::new(
+        c"mq_dup_res_write_conflict".as_ptr(),
+        conflict_specs.as_ptr(),
+        conflict_specs.len(),
+        mq_scoped_res_sys,
+        core::ptr::null_mut(),
+    );
+    let registry2 = Arc::new(app.world().resource::<ModRegistry>().clone());
+    let mut ctx2 = ModInitContext::new(registry2);
+    ctx2.world = app.world_mut() as *mut bevy_ecs::world::World;
+    let ctx2_ptr = (&mut ctx2 as *mut ModInitContext).cast::<c_void>();
+    // SAFETY: Valid `ctx2_ptr` and `conflict_desc`.
+    assert_eq!(
+        unsafe { host_register_multi_query_system(ctx2_ptr, &conflict_desc) },
+        FfiResult::OK
+    );
+    for sys in ctx2.registered_systems.drain(..) {
+        app.add_systems(Update, sys);
+    }
+
+    app.update();
+    assert_eq!(app.world().resource::<SimConfig>().step_count, 15);
 }
 
 // ============================================================================

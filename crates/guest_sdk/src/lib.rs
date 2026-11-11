@@ -930,6 +930,7 @@ pub struct GuestChunkIter<'a> {
     api: &'a HostApi,
     reset_fn: Option<IterResetFn>,
     res_vtable: ResourceBridgeVTable,
+    allow_resource_access: bool,
 }
 
 impl<'a> GuestChunkIter<'a> {
@@ -946,6 +947,7 @@ impl<'a> GuestChunkIter<'a> {
             api,
             reset_fn: None,
             res_vtable: ResourceBridgeVTable::default(),
+            allow_resource_access: true,
         }
     }
 
@@ -957,6 +959,7 @@ impl<'a> GuestChunkIter<'a> {
             api,
             reset_fn,
             res_vtable: ResourceBridgeVTable::default(),
+            allow_resource_access: true,
         }
     }
 
@@ -973,6 +976,28 @@ impl<'a> GuestChunkIter<'a> {
             api,
             reset_fn,
             res_vtable,
+            allow_resource_access: true,
+        }
+    }
+
+    /// Internal constructor for per-query iterators stored inside [`MultiQueryContext`].
+    ///
+    /// Disables direct resource borrowing on the per-query handle (`allow_resource_access = false`)
+    /// so [`MultiQueryContext::iters_2_mut`] can never produce aliasing `&mut R` or `&R` + `&mut R`
+    /// references in safe Rust; multi-query resource borrows are routed exclusively through
+    /// [`MultiQueryContext::resource`] / [`MultiQueryContext::resource_mut`].
+    #[inline]
+    fn for_multi_query(
+        raw: *mut RawChunkIter,
+        api: &'a HostApi,
+        reset_fn: Option<IterResetFn>,
+    ) -> Self {
+        Self {
+            raw,
+            api,
+            reset_fn,
+            res_vtable: ResourceBridgeVTable::default(),
+            allow_resource_access: false,
         }
     }
 
@@ -1387,10 +1412,11 @@ impl<'a> GuestChunkIter<'a> {
     /// Obtains a read-only byte pointer to an exposed Bevy `Resource` (`Res<R>`).
     ///
     /// Returns `null` if the resource was not declared (`RESOURCE_READ` / `RESOURCE_WRITE`),
-    /// is not currently inserted in the Bevy `World`, or resource bridge symbols are unavailable.
+    /// is not currently inserted in the Bevy `World`, resource bridge symbols are unavailable,
+    /// or this iterator belongs to a [`MultiQueryContext`] (use [`MultiQueryContext::resource`] instead).
     #[inline]
     pub fn resource_ptr(&self, resource_name: &CStr) -> *const u8 {
-        if self.raw.is_null() {
+        if !self.allow_resource_access || self.raw.is_null() {
             return core::ptr::null();
         }
         let Some(f) = self.res_vtable.res_readonly else {
@@ -1404,10 +1430,11 @@ impl<'a> GuestChunkIter<'a> {
     /// Bevy change tick as modified on this system run.
     ///
     /// Returns `null` if the resource was not declared with `RESOURCE_WRITE`, is not currently
-    /// inserted in the Bevy `World`, or resource bridge symbols are unavailable.
+    /// inserted in the Bevy `World`, resource bridge symbols are unavailable, or this iterator
+    /// belongs to a [`MultiQueryContext`] (use [`MultiQueryContext::resource_mut`] instead).
     #[inline]
     pub fn resource_mut_ptr(&mut self, resource_name: &CStr) -> *mut u8 {
-        if self.raw.is_null() {
+        if !self.allow_resource_access || self.raw.is_null() {
             return core::ptr::null_mut();
         }
         let Some(f) = self.res_vtable.res_mutable else {
@@ -2161,6 +2188,7 @@ pub struct MultiQueryContext<'a> {
     iter_count: usize,
     commands: GuestCommandQueue<'a>,
     host_api: &'a HostApi,
+    res_vtable: ResourceBridgeVTable,
 }
 
 impl<'a> MultiQueryContext<'a> {
@@ -2237,22 +2265,96 @@ impl<'a> MultiQueryContext<'a> {
         self.host_api
     }
 
-    /// Safely borrows a typed `#[repr(C)]` POD Bevy `Resource` (`Res<R>`) via the primary query context.
+    /// Obtains a read-only byte pointer to an exposed Bevy `Resource` (`Res<R>`) declared in any
+    /// query spec of this multi-query system.
     #[inline]
-    pub fn resource<R: Copy>(&self, resource_name: &CStr) -> Option<&R> {
-        if self.iter_count == 0 {
-            return None;
+    pub fn resource_ptr(&self, resource_name: &CStr) -> *const u8 {
+        let Some(f) = self.res_vtable.res_readonly else {
+            return core::ptr::null();
+        };
+        for slot in self.iters.iter().take(self.iter_count).flatten() {
+            if !slot.raw.is_null() {
+                // SAFETY: `slot.raw` is a valid `RawChunkIter` for this callback invocation and
+                // `resource_name` is a valid nul-terminated `CStr`.
+                let ptr = unsafe { f(slot.raw, resource_name.as_ptr()) };
+                if !ptr.is_null() {
+                    return ptr;
+                }
+            }
         }
-        self.iters[0].as_ref()?.resource::<R>(resource_name)
+        core::ptr::null()
     }
 
-    /// Safely borrows a typed `#[repr(C)]` POD Bevy `Resource` (`ResMut<R>`) mutably via the primary query context.
+    /// Obtains a mutable byte pointer to an exposed Bevy `Resource` (`ResMut<R>`) declared with
+    /// `RESOURCE_WRITE` in any query spec of this multi-query system, marking its change tick.
     #[inline]
-    pub fn resource_mut<R: Copy>(&mut self, resource_name: &CStr) -> Option<&mut R> {
-        if self.iter_count == 0 {
+    pub fn resource_mut_ptr(&mut self, resource_name: &CStr) -> *mut u8 {
+        let Some(f) = self.res_vtable.res_mutable else {
+            return core::ptr::null_mut();
+        };
+        for slot in self.iters.iter_mut().take(self.iter_count).flatten() {
+            if !slot.raw.is_null() {
+                // SAFETY: `self` is exclusively borrowed via `&mut self` (preventing aliasing across
+                // query iterators), `slot.raw` is non-null, and `resource_name` is a valid `CStr`.
+                let ptr = unsafe { f(slot.raw, resource_name.as_ptr()) };
+                if !ptr.is_null() {
+                    return ptr;
+                }
+            }
+        }
+        core::ptr::null_mut()
+    }
+
+    /// Safely borrows a typed `#[repr(C)]` POD Bevy `Resource` (`Res<R>`) across any query spec
+    /// of this multi-query system, tying the reference lifetime strictly to `&self`.
+    #[inline]
+    pub fn resource<R: Copy>(&self, resource_name: &CStr) -> Option<&R> {
+        let ptr = self.resource_ptr(resource_name);
+        if ptr.is_null() {
             return None;
         }
-        self.iters[0].as_mut()?.resource_mut::<R>(resource_name)
+        if core::mem::size_of::<R>() == 0 {
+            // SAFETY: ZST requires no backing bytes; lifetime is tied to `&self`.
+            return Some(unsafe { &*core::ptr::NonNull::<R>::dangling().as_ptr() });
+        }
+        if !(ptr as usize).is_multiple_of(core::mem::align_of::<R>()) {
+            return None;
+        }
+        // SAFETY: `ptr` is non-null, aligned for `R`, backed by host resource storage declared
+        // in `FilteredAccessSet`, and tied to `&self` so it cannot alias `&mut self`.
+        Some(unsafe { &*(ptr as *const R) })
+    }
+
+    /// Safely borrows a typed `#[repr(C)]` POD Bevy `Resource` (`ResMut<R>`) mutably across any
+    /// query spec of this multi-query system, tying the exclusive borrow strictly to `&mut self`.
+    #[inline]
+    pub fn resource_mut<R: Copy>(&mut self, resource_name: &CStr) -> Option<&mut R> {
+        let ptr = self.resource_mut_ptr(resource_name);
+        if ptr.is_null() {
+            return None;
+        }
+        if core::mem::size_of::<R>() == 0 {
+            // SAFETY: ZST requires no backing bytes; exclusive borrow tied to `&mut self`.
+            return Some(unsafe { &mut *core::ptr::NonNull::<R>::dangling().as_ptr() });
+        }
+        if !(ptr as usize).is_multiple_of(core::mem::align_of::<R>()) {
+            return None;
+        }
+        // SAFETY: `ptr` is non-null, aligned for `R`, exclusively borrowed via `RESOURCE_WRITE`
+        // in `FilteredAccessSet`, and tied to `&mut self` preventing aliasing across iterators.
+        Some(unsafe { &mut *(ptr as *mut R) })
+    }
+
+    /// Safely borrows a typed [`GuestComponent`] resource (`Res<R>`) using `R::NAME`.
+    #[inline]
+    pub fn guest_resource<R: GuestComponent>(&self) -> Option<&R> {
+        self.resource::<R>(R::NAME)
+    }
+
+    /// Safely borrows a typed [`GuestComponent`] resource (`ResMut<R>`) mutably using `R::NAME`.
+    #[inline]
+    pub fn guest_resource_mut<R: GuestComponent>(&mut self) -> Option<&mut R> {
+        self.resource_mut::<R>(R::NAME)
     }
 }
 
@@ -2342,11 +2444,10 @@ where
         for (slot, item) in iter_array.iter_mut().enumerate().take(iter_count) {
             // SAFETY: `iters` is non-null and holds `iter_count` pointers per `MultiQuerySystemCallback` contract.
             let raw_iter = unsafe { *iters.add(slot) };
-            *item = Some(GuestChunkIter::with_bridges(
+            *item = Some(GuestChunkIter::for_multi_query(
                 raw_iter,
                 api,
                 state.iter_reset,
-                state.res_vtable,
             ));
         }
 
@@ -2355,6 +2456,7 @@ where
             iter_count,
             commands: GuestCommandQueue::with_ext(commands, state.cmd_vtable_ext),
             host_api: api,
+            res_vtable: state.res_vtable,
         };
         (*cb_guard)(&mut ctx)
     })
@@ -3317,5 +3419,168 @@ mod tests {
         assert_eq!(unsafe { c_panicking_cond(core::ptr::null_mut()) }, FFI_BOOL_FALSE);
         // SAFETY: Passing null opaque pointer to test run condition.
         assert_eq!(unsafe { c_true_cond(core::ptr::null_mut()) }, FFI_BOOL_TRUE);
+    }
+
+    #[test]
+    fn test_multi_query_context_blocks_iter_resource_aliasing_and_resolves_group1_resource() {
+        use core::sync::atomic::{AtomicPtr, Ordering};
+
+        static SHARED_RES: Mutex<PosData> = Mutex::new(PosData { x: 10.0, y: 20.0 });
+        static CAPTURED_CB: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
+        static CAPTURED_UD: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
+
+        const GROUP0_SENTINEL: usize = 0xA000;
+        const GROUP1_SENTINEL: usize = 0xB000;
+
+        unsafe extern "C" fn mock_res_readonly(
+            iter: *const RawChunkIter,
+            _name: *const c_char,
+        ) -> *const u8 {
+            // Simulate resource declared ONLY in group 1 (`GROUP1_SENTINEL`)
+            if iter as usize == GROUP1_SENTINEL {
+                let guard = SHARED_RES.lock().unwrap();
+                (&*guard as *const PosData).cast::<u8>()
+            } else {
+                core::ptr::null()
+            }
+        }
+
+        unsafe extern "C" fn mock_res_mutable(
+            iter: *mut RawChunkIter,
+            _name: *const c_char,
+        ) -> *mut u8 {
+            if iter as usize == GROUP1_SENTINEL {
+                let mut guard = SHARED_RES.lock().unwrap();
+                (&mut *guard as *mut PosData).cast::<u8>()
+            } else {
+                core::ptr::null_mut()
+            }
+        }
+
+        unsafe extern "C" fn mock_reg_multi(
+            _ctx: *mut c_void,
+            desc: *const MultiQuerySystemDescriptor,
+        ) -> FfiResult {
+            // SAFETY: Valid descriptor passed by `GuestApp::add_multi_query_system`.
+            let d = unsafe { &*desc };
+            CAPTURED_CB.store(d.callback as *mut c_void, Ordering::SeqCst);
+            CAPTURED_UD.store(d.user_data, Ordering::SeqCst);
+            FfiResult::OK
+        }
+
+        unsafe extern "C" fn mock_get_proc_address(symbol_name: *const c_char) -> *const c_void {
+            // SAFETY: Valid C string passed by `GuestApp::new`.
+            let name = unsafe { CStr::from_ptr(symbol_name) }.to_str().unwrap();
+            match name {
+                "register_multi_query_system" => mock_reg_multi as *const c_void,
+                "res_readonly" => mock_res_readonly as *const c_void,
+                "res_mutable" => mock_res_mutable as *const c_void,
+                _ => core::ptr::null(),
+            }
+        }
+
+        unsafe extern "C" fn stub_reg_sys(
+            _: *mut c_void,
+            _: *const SystemDescriptor,
+        ) -> FfiResult {
+            FfiResult::OK
+        }
+        unsafe extern "C" fn stub_next(_: *mut RawChunkIter) -> usize {
+            0
+        }
+        unsafe extern "C" fn stub_ro(_: *const RawChunkIter, _: usize) -> *const u8 {
+            core::ptr::null()
+        }
+        unsafe extern "C" fn stub_rw(_: *mut RawChunkIter, _: usize) -> *mut u8 {
+            core::ptr::null_mut()
+        }
+        unsafe extern "C" fn stub_mark(_: *mut RawChunkIter, _: usize, _: usize) -> FfiResult {
+            FfiResult::OK
+        }
+        unsafe extern "C" fn stub_ents(_: *const RawChunkIter) -> *const FfiEntity {
+            core::ptr::null()
+        }
+        unsafe extern "C" fn stub_stride(_: *const RawChunkIter, _: usize) -> usize {
+            0
+        }
+        unsafe extern "C" fn stub_reg_comp(
+            _: *mut c_void,
+            _: *const ModComponentDescriptor,
+        ) -> FfiResult {
+            FfiResult::OK
+        }
+
+        let host_api = Box::leak(Box::new(HostApi {
+            struct_size: core::mem::size_of::<HostApi>() as u32,
+            abi_version: abi_contract::ABI_VERSION_PACKED,
+            register_system: stub_reg_sys,
+            iter_next_chunk: stub_next,
+            iter_column_readonly: stub_ro,
+            iter_column_mutable: stub_rw,
+            iter_mark_changed: stub_mark,
+            iter_entities: stub_ents,
+            iter_column_stride: stub_stride,
+            register_component: stub_reg_comp,
+        }));
+
+        // Reset shared value
+        *SHARED_RES.lock().unwrap() = PosData { x: 10.0, y: 20.0 };
+
+        // SAFETY: Valid `host_api` and `mock_get_proc_address` for test setup.
+        let mut app = unsafe {
+            GuestApp::from_raw(
+                mock_get_proc_address,
+                host_api as *const HostApi,
+                0x5555 as *mut c_void,
+            )
+            .expect("GuestApp::from_raw")
+        };
+        let captured_res_vt = app.resource_vtable();
+
+        let q0_terms = [PosData::read_desc()];
+        let q1_terms = [PosData::resource_write_desc()];
+        let groups: [&[ComponentAccessDesc]; 2] = [&q0_terms, &q1_terms];
+
+        assert_eq!(
+            app.add_multi_query_system(c"mq_res_safety", &groups, move |ctx| {
+                // 1. Even if safe Rust splits `(q0, q1)` via `iters_2_mut` AND attempts to
+                //    re-attach `captured_res_vt`, per-query resource access MUST return `None`!
+                {
+                    let (q0, q1) = ctx.iters_2_mut(0, 1).unwrap();
+                    q0.set_resource_vtable(captured_res_vt);
+                    q1.set_resource_vtable(captured_res_vt);
+                    assert!(q0.resource::<PosData>(c"PosData").is_none());
+                    assert!(q1.resource::<PosData>(c"PosData").is_none());
+                    assert!(q0.resource_mut::<PosData>(c"PosData").is_none());
+                    assert!(q1.resource_mut::<PosData>(c"PosData").is_none());
+                }
+
+                // 2. `ctx.guest_resource` & `ctx.guest_resource_mut` resolve group 1's resource
+                //    with lifetimes strictly tied to `&ctx` / `&mut ctx`!
+                assert_eq!(ctx.guest_resource::<PosData>().unwrap().x, 10.0);
+                let res_mut = ctx.guest_resource_mut::<PosData>().unwrap();
+                res_mut.x += 5.0;
+                res_mut.y += 7.0;
+                FfiResult::OK
+            }),
+            FfiResult::OK
+        );
+        app.commit();
+
+        let cb_ptr = CAPTURED_CB.load(Ordering::SeqCst);
+        let ud_ptr = CAPTURED_UD.load(Ordering::SeqCst);
+        assert!(!cb_ptr.is_null());
+        // SAFETY: Reconstructing `MultiQuerySystemCallback` captured by `mock_reg_multi`.
+        let cb: MultiQuerySystemCallback = unsafe { core::mem::transmute(cb_ptr) };
+        let raw_iters = [
+            GROUP0_SENTINEL as *mut RawChunkIter,
+            GROUP1_SENTINEL as *mut RawChunkIter,
+        ];
+        // SAFETY: Invoking registered multi-query trampoline with 2 mock iterators.
+        let status = unsafe { cb(raw_iters.as_ptr(), 2, core::ptr::null_mut(), ud_ptr) };
+        assert_eq!(status, FfiResult::OK);
+        assert_eq!(*SHARED_RES.lock().unwrap(), PosData { x: 15.0, y: 27.0 });
+
+        cleanup_registered_guest_state();
     }
 }

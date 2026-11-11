@@ -385,6 +385,7 @@ pub struct ComponentAccessDescOwned {
 struct CachedQueryGroup {
     descs: Vec<ComponentAccessDescOwned>,
     columns: Vec<QueryColumnDesc>,
+    declared_resources: Vec<(ComponentId, bool)>,
     query_state: Option<QueryState<(), ()>>,
     is_dense: bool,
     sparse_column_mask: u32,
@@ -399,6 +400,7 @@ impl CachedQueryGroup {
         Self {
             descs,
             columns: Vec::new(),
+            declared_resources: Vec::new(),
             query_state: None,
             is_dense: true,
             sparse_column_mask: 0,
@@ -460,7 +462,6 @@ enum SystemCallbackKind {
 pub struct DynamicCSystem {
     name: String,
     query_groups: Vec<CachedQueryGroup>,
-    declared_resources: Vec<(ComponentId, bool)>,
 
     access: SystemAccess,
     self_conflict: bool,
@@ -502,7 +503,6 @@ impl DynamicCSystem {
         Self {
             name,
             query_groups: vec![CachedQueryGroup::new(query_descs)],
-            declared_resources: Vec::new(),
             access: SystemAccess::None,
             self_conflict: false,
             missing_components: Vec::new(),
@@ -536,7 +536,6 @@ impl DynamicCSystem {
         Self {
             name,
             query_groups,
-            declared_resources: Vec::new(),
             access: SystemAccess::None,
             self_conflict: false,
             missing_components: Vec::new(),
@@ -769,7 +768,6 @@ impl System for DynamicCSystem {
         self.last_run = Tick::new(world.change_tick().get().wrapping_sub(Tick::MAX.get()));
         self.self_conflict = false;
         self.missing_components.clear();
-        self.declared_resources.clear();
 
         if !self.error_policy_explicit {
             if let Some(cfg) = world.get_resource::<ModErrorPolicyConfig>() {
@@ -789,6 +787,7 @@ impl System for DynamicCSystem {
 
         for group in &mut self.query_groups {
             group.columns.clear();
+            group.declared_resources.clear();
             group.query_state = None;
             group.sparse_column_mask = 0;
             group.reset_cache();
@@ -866,6 +865,9 @@ impl System for DynamicCSystem {
                         if system_res_reads.insert(comp_id) {
                             system_res_order.push(comp_id);
                         }
+                        if !group.declared_resources.iter().any(|&(cid, _)| cid == comp_id) {
+                            group.declared_resources.push((comp_id, false));
+                        }
                     }
                     ComponentAccessMode::RESOURCE_WRITE => {
                         if system_res_reads.contains(&comp_id)
@@ -878,6 +880,7 @@ impl System for DynamicCSystem {
                         }
                         system_res_writes.insert(comp_id);
                         system_res_order.push(comp_id);
+                        group.declared_resources.push((comp_id, true));
                     }
                     _ => {
                         self.enabled = false;
@@ -1005,7 +1008,6 @@ impl System for DynamicCSystem {
             } else {
                 access_set.add_resource_read(res_id);
             }
-            self.declared_resources.push((res_id, writable));
         }
 
         if self.self_conflict || !self.enabled {
@@ -1078,7 +1080,6 @@ impl System for DynamicCSystem {
         let commands_ptr = (&mut bridge as *mut CommandQueueBridge<'_>).cast::<RawCommandQueue>();
         let user_data = self.user_data;
         let registry_ref: &ModRegistry = &self.registry;
-        let declared_resources: &[(ComponentId, bool)] = &self.declared_resources;
 
         let res = match self.callback {
             SystemCallbackKind::Single(callback) => {
@@ -1102,7 +1103,7 @@ impl System for DynamicCSystem {
                     )
                 }
                 .with_last_run(last_run)
-                .with_resources(world, registry_ref, declared_resources);
+                .with_resources(world, registry_ref, &group.declared_resources);
                 let iter_ptr = (&mut host_iter as *mut HostChunkIter<'_>).cast::<RawChunkIter>();
                 // SAFETY: Calling foreign C-ABI callback with valid stack-allocated iterator and command bridge.
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
@@ -1133,7 +1134,7 @@ impl System for DynamicCSystem {
                         )
                     }
                     .with_last_run(last_run)
-                    .with_resources(world, registry_ref, declared_resources);
+                    .with_resources(world, registry_ref, &group.declared_resources);
                     host_iters[i] = Some(iter);
                 }
 
