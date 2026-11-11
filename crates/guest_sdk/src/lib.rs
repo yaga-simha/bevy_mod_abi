@@ -1196,9 +1196,7 @@ impl<'a> ChunkSlice<'a> {
             if offset > (isize::MAX as usize) {
                 return None;
             }
-            if (self.ptr as usize).checked_add(offset).is_none() {
-                return None;
-            }
+            (self.ptr as usize).checked_add(offset)?;
             // SAFETY: Bounds checked, index is strictly less than count, offset fits within isize::MAX without wrapping.
             unsafe { Some(self.ptr.add(offset)) }
         } else {
@@ -1236,9 +1234,7 @@ impl<'a> ChunkSlice<'a> {
             Some(bytes) if bytes <= (isize::MAX as usize) => bytes,
             _ => return None,
         };
-        if (self.ptr as usize).checked_add(total_bytes).is_none() {
-            return None;
-        }
+        (self.ptr as usize).checked_add(total_bytes)?;
         // SAFETY:
         // - self.ptr is non-null and aligned for T.
         // - self.stride == size_of::<T>(), guaranteeing elements are contiguous in table storage.
@@ -1315,9 +1311,7 @@ impl<'a> ChunkSliceMut<'a> {
             if offset > (isize::MAX as usize) {
                 return None;
             }
-            if (self.ptr as usize).checked_add(offset).is_none() {
-                return None;
-            }
+            (self.ptr as usize).checked_add(offset)?;
             // SAFETY: Bounds checked, index is strictly less than count, offset fits within isize::MAX without wrapping.
             unsafe { Some(self.ptr.add(offset)) }
         } else {
@@ -1343,9 +1337,7 @@ impl<'a> ChunkSliceMut<'a> {
             Some(bytes) if bytes <= (isize::MAX as usize) => bytes,
             _ => return None,
         };
-        if (self.ptr as usize).checked_add(total_bytes).is_none() {
-            return None;
-        }
+        (self.ptr as usize).checked_add(total_bytes)?;
         Some((self.ptr as *mut T, self.count))
     }
 
@@ -1674,7 +1666,7 @@ where
             commands: GuestCommandQueue::new(commands, state.cmd_vtable),
             host_api: api,
         };
-        (&mut *cb_guard)(&mut ctx)
+        (*cb_guard)(&mut ctx)
     })
 }
 
@@ -1729,7 +1721,7 @@ where
             commands: GuestCommandQueue::new(commands, state.cmd_vtable),
             host_api: api,
         };
-        (&mut *cb_guard)(&mut ctx)
+        (*cb_guard)(&mut ctx)
     })
 }
 
@@ -2295,16 +2287,53 @@ mod tests {
             FfiResult::OK
         }
 
+        unsafe extern "C" fn stub_register_system(
+            _: *mut c_void,
+            _: *const abi_contract::SystemDescriptor,
+        ) -> FfiResult {
+            FfiResult::OK
+        }
+        unsafe extern "C" fn stub_iter_next_chunk(_: *mut RawChunkIter) -> usize {
+            0
+        }
+        unsafe extern "C" fn stub_iter_column_readonly(
+            _: *const RawChunkIter,
+            _: usize,
+        ) -> *const u8 {
+            core::ptr::null()
+        }
+        unsafe extern "C" fn stub_iter_column_mutable(
+            _: *mut RawChunkIter,
+            _: usize,
+        ) -> *mut u8 {
+            core::ptr::null_mut()
+        }
+        unsafe extern "C" fn stub_iter_mark_changed(
+            _: *mut RawChunkIter,
+            _: usize,
+            _: usize,
+        ) -> FfiResult {
+            FfiResult::OK
+        }
+        unsafe extern "C" fn stub_iter_entities(
+            _: *const RawChunkIter,
+        ) -> *const abi_contract::FfiEntity {
+            core::ptr::null()
+        }
+        unsafe extern "C" fn stub_iter_column_stride(_: *const RawChunkIter, _: usize) -> usize {
+            0
+        }
+
         let dummy_host_api = HostApi {
             struct_size: core::mem::size_of::<HostApi>() as u32,
             abi_version: abi_contract::ABI_VERSION_PACKED,
-            register_system: unsafe { core::mem::transmute(1usize) },
-            iter_next_chunk: unsafe { core::mem::transmute(1usize) },
-            iter_column_readonly: unsafe { core::mem::transmute(1usize) },
-            iter_column_mutable: unsafe { core::mem::transmute(1usize) },
-            iter_mark_changed: unsafe { core::mem::transmute(1usize) },
-            iter_entities: unsafe { core::mem::transmute(1usize) },
-            iter_column_stride: unsafe { core::mem::transmute(1usize) },
+            register_system: stub_register_system,
+            iter_next_chunk: stub_iter_next_chunk,
+            iter_column_readonly: stub_iter_column_readonly,
+            iter_column_mutable: stub_iter_column_mutable,
+            iter_mark_changed: stub_iter_mark_changed,
+            iter_entities: stub_iter_entities,
+            iter_column_stride: stub_iter_column_stride,
             register_component: mock_register_component,
         };
 

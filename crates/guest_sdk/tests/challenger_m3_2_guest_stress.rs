@@ -68,16 +68,56 @@ unsafe extern "C" fn mock_register_component(
 }
 
 fn create_mock_host_api(reg_fn: RegisterComponentFn) -> HostApi {
+    unsafe extern "C" fn stub_register_system(
+        _: *mut c_void,
+        _: *const abi_contract::SystemDescriptor,
+    ) -> FfiResult {
+        FfiResult::OK
+    }
+    unsafe extern "C" fn stub_iter_next_chunk(_: *mut abi_contract::RawChunkIter) -> usize {
+        0
+    }
+    unsafe extern "C" fn stub_iter_column_readonly(
+        _: *const abi_contract::RawChunkIter,
+        _: usize,
+    ) -> *const u8 {
+        core::ptr::null()
+    }
+    unsafe extern "C" fn stub_iter_column_mutable(
+        _: *mut abi_contract::RawChunkIter,
+        _: usize,
+    ) -> *mut u8 {
+        core::ptr::null_mut()
+    }
+    unsafe extern "C" fn stub_iter_mark_changed(
+        _: *mut abi_contract::RawChunkIter,
+        _: usize,
+        _: usize,
+    ) -> FfiResult {
+        FfiResult::OK
+    }
+    unsafe extern "C" fn stub_iter_entities(
+        _: *const abi_contract::RawChunkIter,
+    ) -> *const FfiEntity {
+        core::ptr::null()
+    }
+    unsafe extern "C" fn stub_iter_column_stride(
+        _: *const abi_contract::RawChunkIter,
+        _: usize,
+    ) -> usize {
+        0
+    }
+
     HostApi {
         struct_size: core::mem::size_of::<HostApi>() as u32,
         abi_version: abi_contract::ABI_VERSION_PACKED,
-        register_system: unsafe { core::mem::transmute(1usize) },
-        iter_next_chunk: unsafe { core::mem::transmute(1usize) },
-        iter_column_readonly: unsafe { core::mem::transmute(1usize) },
-        iter_column_mutable: unsafe { core::mem::transmute(1usize) },
-        iter_mark_changed: unsafe { core::mem::transmute(1usize) },
-        iter_entities: unsafe { core::mem::transmute(1usize) },
-        iter_column_stride: unsafe { core::mem::transmute(1usize) },
+        register_system: stub_register_system,
+        iter_next_chunk: stub_iter_next_chunk,
+        iter_column_readonly: stub_iter_column_readonly,
+        iter_column_mutable: stub_iter_column_mutable,
+        iter_mark_changed: stub_iter_mark_changed,
+        iter_entities: stub_iter_entities,
+        iter_column_stride: stub_iter_column_stride,
         register_component: reg_fn,
     }
 }
@@ -288,7 +328,7 @@ fn test_guest_command_queue_insert_runtime_component_contract() {
         vtable,
     );
 
-    let comp = PodComponent { x: 3.14, y: 42 };
+    let comp = PodComponent { x: 2.5, y: 42 };
     let res = queue.insert_runtime_component(FfiEntity(123), c"PodComponent", &comp);
     assert_eq!(res, FfiResult::OK);
 

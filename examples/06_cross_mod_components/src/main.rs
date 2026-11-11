@@ -88,7 +88,7 @@ fn main() {
 
     // 2. Initialize Bevy App with AbiModPlugin
     let mut app = App::new();
-    app.add_plugins(AbiModPlugin::default());
+    app.add_plugins(AbiModPlugin);
     app.register_mod_component::<FleetSector>();
 
     // Spawn a base host entity (e.g. flagship headquarters)

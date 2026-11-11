@@ -28,10 +28,10 @@ struct ValAlign8 {
 fn test_zst_slices_adversarial_matrix() {
     // 1. ZST with align 1
     // Valid aligned pointer (0x1 is aligned to 1)
-    let slice_zst1 = ChunkSlice::new(0x1 as *const u8, 0, 100);
+    let slice_zst1 = ChunkSlice::new(core::ptr::dangling::<u8>(), 0, 100);
     assert_eq!(slice_zst1.as_typed_slice::<ZstAlign1>().map(|s| s.len()), Some(100));
 
-    let mut slice_mut_zst1 = ChunkSliceMut::new(0x1 as *mut u8, 0, 100);
+    let mut slice_mut_zst1 = ChunkSliceMut::new(core::ptr::dangling_mut::<u8>(), 0, 100);
     assert_eq!(slice_mut_zst1.as_typed_slice::<ZstAlign1>().map(|s| s.len()), Some(100));
 
     // 2. ZST with alignments 4, 16, 64

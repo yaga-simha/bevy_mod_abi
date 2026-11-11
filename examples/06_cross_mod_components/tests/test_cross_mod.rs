@@ -65,7 +65,7 @@ fn test_cross_mod_component_query_and_access() {
     let (mod_a_dylib, mod_b_dylib) = get_dylib_paths();
 
     let mut app = App::new();
-    app.add_plugins(AbiModPlugin::default());
+    app.add_plugins(AbiModPlugin);
 
     // Phase 1: Load Mod A (Introducer / Spawner)
     let mod_a_id = app

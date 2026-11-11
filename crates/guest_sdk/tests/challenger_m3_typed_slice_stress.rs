@@ -41,7 +41,7 @@ fn test_as_typed_slice_alignment_matrix() {
 
         // Align2
         let slice2 = ChunkSlice::new(test_ptr, 2, 1);
-        if addr % 2 == 0 {
+        if addr.is_multiple_of(2) {
             assert!(slice2.as_typed_slice::<Align2>().is_some());
         } else {
             assert!(slice2.as_typed_slice::<Align2>().is_none());
@@ -49,7 +49,7 @@ fn test_as_typed_slice_alignment_matrix() {
 
         // Align4
         let slice4 = ChunkSlice::new(test_ptr, 4, 1);
-        if addr % 4 == 0 {
+        if addr.is_multiple_of(4) {
             assert!(slice4.as_typed_slice::<Align4>().is_some());
         } else {
             assert!(slice4.as_typed_slice::<Align4>().is_none());
@@ -57,7 +57,7 @@ fn test_as_typed_slice_alignment_matrix() {
 
         // Align8
         let slice8 = ChunkSlice::new(test_ptr, 8, 1);
-        if addr % 8 == 0 {
+        if addr.is_multiple_of(8) {
             assert!(slice8.as_typed_slice::<Align8>().is_some());
         } else {
             assert!(slice8.as_typed_slice::<Align8>().is_none());
@@ -65,7 +65,7 @@ fn test_as_typed_slice_alignment_matrix() {
 
         // Align16
         let slice16 = ChunkSlice::new(test_ptr, 16, 1);
-        if addr % 16 == 0 {
+        if addr.is_multiple_of(16) {
             assert!(slice16.as_typed_slice::<Align16>().is_some());
         } else {
             assert!(slice16.as_typed_slice::<Align16>().is_none());
@@ -85,7 +85,7 @@ fn test_as_typed_slice_mut_alignment_matrix() {
         let addr = test_ptr as usize;
 
         let mut slice4 = ChunkSliceMut::new(test_ptr, 4, 1);
-        if addr % 4 == 0 {
+        if addr.is_multiple_of(4) {
             let res = slice4.as_typed_slice::<Align4>();
             assert!(res.is_some());
         } else {
@@ -138,11 +138,11 @@ fn test_as_typed_slice_zero_count_edge_cases() {
     assert_eq!(typed_mut_null, Some(&mut [][..]));
 
     // 2. count == 0, ptr == unaligned dangling (0x1), valid stride
-    let slice_unaligned = ChunkSlice::new(0x1 as *const u8, size, 0);
+    let slice_unaligned = ChunkSlice::new(core::ptr::dangling::<u8>(), size, 0);
     let typed_unaligned = slice_unaligned.as_typed_slice::<u32>();
     assert_eq!(typed_unaligned, Some(&[][..]));
 
-    let mut slice_mut_unaligned = ChunkSliceMut::new(0x1 as *mut u8, size, 0);
+    let mut slice_mut_unaligned = ChunkSliceMut::new(core::ptr::dangling_mut::<u8>(), size, 0);
     let typed_mut_unaligned = slice_mut_unaligned.as_typed_slice::<u32>();
     assert_eq!(typed_mut_unaligned, Some(&mut [][..]));
 
