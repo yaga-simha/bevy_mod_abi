@@ -37,7 +37,8 @@ pub use component::{
 pub use host::{CUSTOM_SYMBOL_PREFIX, Host, ValidatedLoadCtx};
 pub use instance::{GuestInstance, init_guest_instance, shutdown_guest_instance};
 pub use iter::{
-    SparseRows, SparseRowsIter, SparseRowsMut, ValidatedIter, ValidatedSlice, ValidatedSliceMut,
+    SparseRows, SparseRowsIter, SparseRowsMut, UuidFilter, ValidatedIter, ValidatedSlice,
+    ValidatedSliceMut,
 };
 pub use panic::{catch_guest_bool, catch_guest_result, catch_guest_unit};
 pub use trampoline::{

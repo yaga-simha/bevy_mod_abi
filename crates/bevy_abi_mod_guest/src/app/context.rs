@@ -8,7 +8,11 @@ use bevy_abi_mod_sys::{
     MAX_QUERIES_PER_SYSTEM,
 };
 
-use crate::{commands::GuestCommands, component::GuestComponent, iter::ChunkIter};
+use crate::{
+    commands::GuestCommands,
+    component::{GuestComponent, resolve_guest_component},
+    iter::ChunkIter,
+};
 
 /// Safe context passed to `.run_if(...)` condition closures.
 ///
@@ -51,6 +55,12 @@ impl<'a> RunConditionContext<'a> {
         uuid: Option<ComponentUuid>,
     ) -> Result<BamComponent, FfiResult> {
         resolve_component(self.host, name, uuid)
+    }
+
+    /// Resolves `T: GuestComponent` (including manifest-qualified `C-10` names) on this world.
+    #[inline]
+    pub fn resolve_guest_component<T: GuestComponent>(&self) -> Result<BamComponent, FfiResult> {
+        resolve_guest_component::<T>(self.host, self.host.manifest_name())
     }
 
     /// Resolves a custom `"bam.v0.<name>"` host symbol pointer.

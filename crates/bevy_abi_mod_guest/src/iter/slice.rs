@@ -3,7 +3,7 @@
 use bevy_abi_mod_guest_sys::{ValidatedSlice, ValidatedSliceMut};
 use bevy_abi_mod_sys::{AbiPod, ComponentUuid};
 
-use crate::component::GuestComponent;
+use crate::component::{GuestComponent, guest_uuid_filter};
 
 /// Safe read-only view over a dense archetype column for the current chunk.
 ///
@@ -82,10 +82,12 @@ impl<'a> ChunkSlice<'a> {
         self.inner.as_typed_slice::<T>()
     }
 
-    /// Casts this column view to `&[T]` (`T: GuestComponent`), validating `T::UUID`, size, and alignment.
+    /// Casts this column view to `&[T]` (`T: GuestComponent`), validating `T`'s UUID (including
+    /// manifest-qualified `C-10` names), size, and alignment.
     #[inline]
     pub fn as_component_slice<T: GuestComponent>(&self) -> Option<&'a [T]> {
-        self.inner.as_typed_slice_checked::<T>(Some(T::UUID))
+        let filter = guest_uuid_filter::<T>(self.inner.manifest_name());
+        self.inner.as_typed_slice_checked::<T>(Some(filter))
     }
 }
 
@@ -175,11 +177,12 @@ impl<'a> ChunkSliceMut<'a> {
         self.inner.as_typed_slice::<T>()
     }
 
-    /// Borrows this column view immutably as `&[T]` (`T: GuestComponent`), validating `T::UUID`,
+    /// Borrows this column view immutably as `&[T]` (`T: GuestComponent`), validating `T`'s UUID,
     /// size, and alignment.
     #[inline]
     pub fn as_component_slice<T: GuestComponent>(&self) -> Option<&[T]> {
-        self.inner.as_typed_slice_checked::<T>(Some(T::UUID))
+        let filter = guest_uuid_filter::<T>(self.inner.manifest_name());
+        self.inner.as_typed_slice_checked::<T>(Some(filter))
     }
 
     /// Borrows this column view mutably as `&mut [T]` (`T: AbiPod`), tied to `&mut self`.
@@ -188,11 +191,12 @@ impl<'a> ChunkSliceMut<'a> {
         self.inner.as_typed_slice_mut::<T>()
     }
 
-    /// Borrows this column view mutably as `&mut [T]` (`T: GuestComponent`), validating `T::UUID`,
+    /// Borrows this column view mutably as `&mut [T]` (`T: GuestComponent`), validating `T`'s UUID,
     /// size, and alignment.
     #[inline]
     pub fn as_component_slice_mut<T: GuestComponent>(&mut self) -> Option<&mut [T]> {
-        self.inner.as_typed_slice_mut_checked::<T>(Some(T::UUID))
+        let filter = guest_uuid_filter::<T>(self.inner.manifest_name());
+        self.inner.as_typed_slice_mut_checked::<T>(Some(filter))
     }
 }
 

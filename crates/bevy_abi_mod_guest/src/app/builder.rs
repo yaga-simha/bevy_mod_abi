@@ -459,10 +459,9 @@ impl<'b, 'a> SystemBuilder<'b, 'a> {
             return self;
         }
         let host = *self.app.host();
-        let manifest_name = self.app.manifest_name().to_owned();
         let qb = QueryBuilder {
             host: &host,
-            manifest_name: &manifest_name,
+            manifest_name: host.manifest_name(),
             terms: Vec::new(),
             first_error: None,
         };

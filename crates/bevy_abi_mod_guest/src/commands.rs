@@ -5,7 +5,7 @@ use core::ffi::CStr;
 use bevy_abi_mod_guest_sys::{Host, SpawnEntry, ValidatedCommands, resolve_component};
 use bevy_abi_mod_sys::{AbiPod, BamCommands, BamComponent, ComponentUuid, FfiEntity, FfiResult};
 
-use crate::component::GuestComponent;
+use crate::component::{GuestComponent, resolve_guest_component};
 
 /// Safe deferred command buffer bound to an active system execution context.
 ///
@@ -113,7 +113,8 @@ impl<'a> GuestCommands<'a> {
         self.inner.remove(entity, component)
     }
 
-    /// Convenience helper resolving `(T::NAME, T::UUID)` and inserting `value` (`T: GuestComponent`).
+    /// Convenience helper resolving `T: GuestComponent` (including manifest-qualified `C-10` names)
+    /// and inserting `value`.
     ///
     /// Prefer pre-resolving [`BamComponent`] handles at mod init for hot per-frame loops.
     #[inline]
@@ -122,25 +123,30 @@ impl<'a> GuestCommands<'a> {
         entity: FfiEntity,
         value: &T,
     ) -> FfiResult {
-        match resolve_component(self.inner.host(), Some(T::NAME), Some(T::UUID)) {
+        let host = self.inner.host();
+        match resolve_guest_component::<T>(host, host.manifest_name()) {
             Ok(comp) => self.inner.insert(entity, comp, value),
             Err(err) => err,
         }
     }
 
-    /// Convenience helper resolving `(T::NAME, T::UUID)` and inserting `T::default()` on the host.
+    /// Convenience helper resolving `T: GuestComponent` (including manifest-qualified `C-10` names)
+    /// and inserting `T::default()` on the host.
     #[inline]
     pub fn insert_component_default<T: GuestComponent>(&mut self, entity: FfiEntity) -> FfiResult {
-        match resolve_component(self.inner.host(), Some(T::NAME), Some(T::UUID)) {
+        let host = self.inner.host();
+        match resolve_guest_component::<T>(host, host.manifest_name()) {
             Ok(comp) => self.inner.insert_default(entity, comp),
             Err(err) => err,
         }
     }
 
-    /// Convenience helper resolving `(T::NAME, T::UUID)` and removing `T` from `entity`.
+    /// Convenience helper resolving `T: GuestComponent` (including manifest-qualified `C-10` names)
+    /// and removing `T` from `entity`.
     #[inline]
     pub fn remove_component<T: GuestComponent>(&mut self, entity: FfiEntity) -> FfiResult {
-        match resolve_component(self.inner.host(), Some(T::NAME), Some(T::UUID)) {
+        let host = self.inner.host();
+        match resolve_guest_component::<T>(host, host.manifest_name()) {
             Ok(comp) => self.inner.remove(entity, comp),
             Err(err) => err,
         }

@@ -35,6 +35,44 @@ unsafe fn drop_boxed<T>(ptr: *mut c_void) {
     drop(unsafe { Box::from_raw(ptr.cast::<T>()) });
 }
 
+struct OwnedManifestBytes {
+    ptr: *mut u8,
+    len: usize,
+}
+
+// SAFETY: `OwnedManifestBytes` uniquely owns a heap-allocated immutable UTF-8 `[u8]` buffer (when
+// `len > 0`) created via `Box::into_raw` and freed exclusively in `OwnedManifestBytes::drop`.
+unsafe impl Send for OwnedManifestBytes {}
+
+impl OwnedManifestBytes {
+    fn new(name: String) -> Self {
+        let len = name.len();
+        if len == 0 {
+            Self {
+                ptr: core::ptr::NonNull::<u8>::dangling().as_ptr(),
+                len: 0,
+            }
+        } else {
+            let boxed: Box<[u8]> = name.into_bytes().into_boxed_slice();
+            Self {
+                ptr: Box::into_raw(boxed).cast::<u8>(),
+                len,
+            }
+        }
+    }
+}
+
+impl Drop for OwnedManifestBytes {
+    fn drop(&mut self) {
+        if self.len > 0 {
+            // SAFETY: `self.ptr` was allocated via `Box::into_raw` of a `Box<[u8]>` of length
+            // `self.len` in `OwnedManifestBytes::new` and all `Host` copies inside `GuestInstance`
+            // closures/hooks have already finished dropping before this field drops.
+            drop(unsafe { Box::from_raw(core::ptr::slice_from_raw_parts_mut(self.ptr, self.len)) });
+        }
+    }
+}
+
 /// Heap-allocated per-World guest mod instance returned via `*instance_out` from
 /// `bevy_abi_mod_init` and reclaimed in `bevy_abi_mod_shutdown`.
 ///
@@ -43,19 +81,27 @@ unsafe fn drop_boxed<T>(ptr: *mut c_void) {
 /// Bevy `World`s simultaneously shares zero mutable global state.
 pub struct GuestInstance {
     host: Host,
-    manifest_name: String,
     allocations: Vec<ErasedAllocation>,
     shutdown_hooks: Vec<Box<dyn FnOnce() + Send + 'static>>,
+    // Declared last so field drop runs strictly after `GuestInstance::drop` tears down every
+    // closure/hook holding a copy of `host`.
+    _manifest_bytes: OwnedManifestBytes,
 }
 
 impl GuestInstance {
     /// Creates an empty [`GuestInstance`] bound to `host` and `manifest_name`.
     pub fn new(host: Host, manifest_name: impl Into<String>) -> Self {
+        let manifest_bytes = OwnedManifestBytes::new(manifest_name.into());
+        // SAFETY: When `manifest_bytes.len > 0`, `manifest_bytes.ptr` points to immutable, valid
+        // UTF-8 heap bytes that remain pinned at stable provenance until `_manifest_bytes` drops
+        // after all `shutdown_hooks` and `allocations`.
+        let host =
+            unsafe { host.with_manifest_name(manifest_bytes.ptr.cast_const(), manifest_bytes.len) };
         Self {
             host,
-            manifest_name: manifest_name.into(),
             allocations: Vec::new(),
             shutdown_hooks: Vec::new(),
+            _manifest_bytes: manifest_bytes,
         }
     }
 
@@ -68,7 +114,7 @@ impl GuestInstance {
     /// Returns the canonical mod name declared in [`BamManifest::name`].
     #[inline]
     pub fn manifest_name(&self) -> &str {
-        &self.manifest_name
+        self.host.manifest_name()
     }
 
     /// Transfers ownership of `boxed` into this instance, returning a stable raw pointer valid

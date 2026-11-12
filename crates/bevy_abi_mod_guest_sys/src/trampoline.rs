@@ -10,7 +10,7 @@ use std::ffi::CString;
 
 use bevy_abi_mod_sys::{
     AbiPod, BAM_SYSTEM_KNOWN_FLAGS, BamCommands, BamIter, BamLoadCtx, BamQueryDesc, BamRunIfFn,
-    BamSystemCtx, BamSystemDesc, BamSystemFn, BamTermDesc, ComponentUuid, FfiBool, FfiResult,
+    BamSystemCtx, BamSystemDesc, BamSystemFn, BamTermDesc, FfiBool, FfiResult,
     MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ScheduleId,
 };
 
@@ -18,7 +18,7 @@ use crate::{
     commands::ValidatedCommands,
     host::Host,
     instance::GuestInstance,
-    iter::ValidatedIter,
+    iter::{UuidFilter, ValidatedIter},
     panic::{catch_guest_bool, catch_guest_result},
 };
 
@@ -324,7 +324,7 @@ impl<'a> ValidatedSystemInvocation<'a> {
     pub fn resource_checked<R: AbiPod>(
         &mut self,
         decl_index: usize,
-        expected_uuid: Option<ComponentUuid>,
+        expected_uuid: Option<UuidFilter>,
     ) -> Option<&R> {
         let q_idx = self.resource_query_index.unwrap_or(0);
         if q_idx >= self.total_query_count {
@@ -342,7 +342,7 @@ impl<'a> ValidatedSystemInvocation<'a> {
     pub fn resource_mut_checked<R: AbiPod>(
         &mut self,
         decl_index: usize,
-        expected_uuid: Option<ComponentUuid>,
+        expected_uuid: Option<UuidFilter>,
     ) -> Option<&mut R> {
         let q_idx = self.resource_query_index.unwrap_or(0);
         if q_idx >= self.total_query_count {

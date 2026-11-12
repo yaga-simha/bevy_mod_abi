@@ -9,10 +9,53 @@ use bevy_abi_mod_sys::{
 
 use crate::host::Host;
 
+/// Expected [`ComponentUuid`] predicate for `C-13` typed column and resource introspection.
+///
+/// Supports either a single exact UUID or a primary manifest-qualified UUID with an unqualified
+/// fallback (matching `C-10` auto-namespaced `GuestComponent` resolution).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UuidFilter {
+    primary: ComponentUuid,
+    fallback: Option<ComponentUuid>,
+}
+
+impl UuidFilter {
+    /// Matches only `uuid`.
+    #[inline]
+    pub const fn exact(uuid: ComponentUuid) -> Self {
+        Self {
+            primary: uuid,
+            fallback: None,
+        }
+    }
+
+    /// Matches either `primary` (e.g. `"<manifest>::<Name>"`) or `fallback` (e.g. `"<Name>"`).
+    #[inline]
+    pub const fn with_fallback(primary: ComponentUuid, fallback: ComponentUuid) -> Self {
+        Self {
+            primary,
+            fallback: Some(fallback),
+        }
+    }
+
+    /// Returns `true` if `actual` matches `primary` or `fallback`.
+    #[inline]
+    pub fn matches(self, actual: ComponentUuid) -> bool {
+        actual == self.primary || self.fallback.is_some_and(|fb| actual == fb)
+    }
+}
+
+impl From<ComponentUuid> for UuidFilter {
+    #[inline]
+    fn from(uuid: ComponentUuid) -> Self {
+        Self::exact(uuid)
+    }
+}
+
 #[inline]
 fn validate_dense_read_info<T: AbiPod>(
     info: &BamColumnInfo,
-    expected_uuid: Option<ComponentUuid>,
+    expected_uuid: Option<UuidFilter>,
 ) -> bool {
     if !info.mode.has_entity_column_data() || info.is_resource() || info.is_sparse_set() {
         return false;
@@ -20,8 +63,8 @@ fn validate_dense_read_info<T: AbiPod>(
     if info.size != core::mem::size_of::<T>() || info.align != core::mem::align_of::<T>() {
         return false;
     }
-    if let Some(uuid) = expected_uuid
-        && info.uuid != uuid
+    if let Some(filter) = expected_uuid
+        && !filter.matches(info.uuid)
     {
         return false;
     }
@@ -31,7 +74,7 @@ fn validate_dense_read_info<T: AbiPod>(
 #[inline]
 fn validate_dense_write_info<T: AbiPod>(
     info: &BamColumnInfo,
-    expected_uuid: Option<ComponentUuid>,
+    expected_uuid: Option<UuidFilter>,
 ) -> bool {
     if !info.mode.is_mutable()
         || !info.mode.has_entity_column_data()
@@ -44,8 +87,8 @@ fn validate_dense_write_info<T: AbiPod>(
     if info.size != core::mem::size_of::<T>() || info.align != core::mem::align_of::<T>() {
         return false;
     }
-    if let Some(uuid) = expected_uuid
-        && info.uuid != uuid
+    if let Some(filter) = expected_uuid
+        && !filter.matches(info.uuid)
     {
         return false;
     }
@@ -55,7 +98,7 @@ fn validate_dense_write_info<T: AbiPod>(
 #[inline]
 fn validate_rows_read_info<T: AbiPod>(
     info: &BamColumnInfo,
-    expected_uuid: Option<ComponentUuid>,
+    expected_uuid: Option<UuidFilter>,
 ) -> bool {
     if !info.mode.has_entity_column_data() || info.is_resource() {
         return false;
@@ -63,8 +106,8 @@ fn validate_rows_read_info<T: AbiPod>(
     if info.size != core::mem::size_of::<T>() || info.align != core::mem::align_of::<T>() {
         return false;
     }
-    if let Some(uuid) = expected_uuid
-        && info.uuid != uuid
+    if let Some(filter) = expected_uuid
+        && !filter.matches(info.uuid)
     {
         return false;
     }
@@ -74,7 +117,7 @@ fn validate_rows_read_info<T: AbiPod>(
 #[inline]
 fn validate_rows_write_info<T: AbiPod>(
     info: &BamColumnInfo,
-    expected_uuid: Option<ComponentUuid>,
+    expected_uuid: Option<UuidFilter>,
 ) -> bool {
     if !info.mode.is_mutable()
         || !info.mode.has_entity_column_data()
@@ -86,8 +129,8 @@ fn validate_rows_write_info<T: AbiPod>(
     if info.size != core::mem::size_of::<T>() || info.align != core::mem::align_of::<T>() {
         return false;
     }
-    if let Some(uuid) = expected_uuid
-        && info.uuid != uuid
+    if let Some(filter) = expected_uuid
+        && !filter.matches(info.uuid)
     {
         return false;
     }
@@ -97,7 +140,7 @@ fn validate_rows_write_info<T: AbiPod>(
 #[inline]
 fn validate_resource_read_info<R: AbiPod>(
     info: &BamColumnInfo,
-    expected_uuid: Option<ComponentUuid>,
+    expected_uuid: Option<UuidFilter>,
 ) -> bool {
     if !info.mode.is_resource() {
         return false;
@@ -105,8 +148,8 @@ fn validate_resource_read_info<R: AbiPod>(
     if info.size != core::mem::size_of::<R>() || info.align != core::mem::align_of::<R>() {
         return false;
     }
-    if let Some(uuid) = expected_uuid
-        && info.uuid != uuid
+    if let Some(filter) = expected_uuid
+        && !filter.matches(info.uuid)
     {
         return false;
     }
@@ -116,7 +159,7 @@ fn validate_resource_read_info<R: AbiPod>(
 #[inline]
 fn validate_resource_write_info<R: AbiPod>(
     info: &BamColumnInfo,
-    expected_uuid: Option<ComponentUuid>,
+    expected_uuid: Option<UuidFilter>,
 ) -> bool {
     if info.mode != AccessMode::RESOURCE_WRITE || info.is_immutable() {
         return false;
@@ -124,8 +167,8 @@ fn validate_resource_write_info<R: AbiPod>(
     if info.size != core::mem::size_of::<R>() || info.align != core::mem::align_of::<R>() {
         return false;
     }
-    if let Some(uuid) = expected_uuid
-        && info.uuid != uuid
+    if let Some(filter) = expected_uuid
+        && !filter.matches(info.uuid)
     {
         return false;
     }
@@ -200,6 +243,7 @@ pub struct ValidatedSlice<'a> {
     expected_size: Option<usize>,
     expected_align: Option<usize>,
     uuid: Option<ComponentUuid>,
+    manifest_name: &'a str,
     valid: bool,
     _marker: PhantomData<&'a [u8]>,
 }
@@ -215,6 +259,7 @@ impl<'a> ValidatedSlice<'a> {
             expected_size: None,
             expected_align: None,
             uuid: None,
+            manifest_name: "",
             valid: false,
             _marker: PhantomData,
         }
@@ -233,6 +278,7 @@ impl<'a> ValidatedSlice<'a> {
             expected_size: if stride > 0 { Some(stride) } else { None },
             expected_align: None,
             uuid: None,
+            manifest_name: "",
             valid: !ptr.is_null() || len == 0,
             _marker: PhantomData,
         }
@@ -257,9 +303,24 @@ impl<'a> ValidatedSlice<'a> {
             expected_size: Some(info.size),
             expected_align: Some(info.align),
             uuid: Some(info.uuid),
+            manifest_name: "",
             valid: ok_mode && (!ptr.is_null() || (len == 0 && !info.mode.is_optional())),
             _marker: PhantomData,
         }
+    }
+
+    /// Stamps this slice with the owning mod instance's `manifest_name` for `C-10` auto-namespaced
+    /// `GuestComponent` UUID matching.
+    #[inline]
+    pub const fn with_manifest_name(mut self, manifest_name: &'a str) -> Self {
+        self.manifest_name = manifest_name;
+        self
+    }
+
+    /// Returns the owning mod instance's manifest name (`""` if unspecified).
+    #[inline]
+    pub const fn manifest_name(&self) -> &'a str {
+        self.manifest_name
     }
 
     /// Returns the number of elements in this chunk view (`0` if invalid/absent).
@@ -319,14 +380,14 @@ impl<'a> ValidatedSlice<'a> {
     #[inline]
     pub fn as_typed_slice_checked<T: AbiPod>(
         &self,
-        expected_uuid: Option<ComponentUuid>,
+        expected_uuid: Option<UuidFilter>,
     ) -> Option<&'a [T]> {
         if !self.valid {
             return None;
         }
-        if let Some(req_uuid) = expected_uuid {
+        if let Some(filter) = expected_uuid {
             let actual_uuid = self.uuid?;
-            if actual_uuid != req_uuid {
+            if !filter.matches(actual_uuid) {
                 return None;
             }
         }
@@ -367,6 +428,7 @@ pub struct ValidatedSliceMut<'a> {
     expected_size: Option<usize>,
     expected_align: Option<usize>,
     uuid: Option<ComponentUuid>,
+    manifest_name: &'a str,
     valid: bool,
     _marker: PhantomData<&'a mut [u8]>,
 }
@@ -381,6 +443,7 @@ impl<'a> ValidatedSliceMut<'a> {
             expected_size: None,
             expected_align: None,
             uuid: None,
+            manifest_name: "",
             valid: false,
             _marker: PhantomData,
         }
@@ -399,6 +462,7 @@ impl<'a> ValidatedSliceMut<'a> {
             expected_size: if stride > 0 { Some(stride) } else { None },
             expected_align: None,
             uuid: None,
+            manifest_name: "",
             valid: !ptr.is_null() || len == 0,
             _marker: PhantomData,
         }
@@ -426,9 +490,24 @@ impl<'a> ValidatedSliceMut<'a> {
             expected_size: Some(info.size),
             expected_align: Some(info.align),
             uuid: Some(info.uuid),
+            manifest_name: "",
             valid: ok_mode && (!ptr.is_null() || (len == 0 && !info.mode.is_optional())),
             _marker: PhantomData,
         }
+    }
+
+    /// Stamps this slice with the owning mod instance's `manifest_name` for `C-10` auto-namespaced
+    /// `GuestComponent` UUID matching.
+    #[inline]
+    pub const fn with_manifest_name(mut self, manifest_name: &'a str) -> Self {
+        self.manifest_name = manifest_name;
+        self
+    }
+
+    /// Returns the owning mod instance's manifest name (`""` if unspecified).
+    #[inline]
+    pub const fn manifest_name(&self) -> &'a str {
+        self.manifest_name
     }
 
     /// Returns the number of elements in this chunk view (`0` if invalid/absent).
@@ -515,14 +594,14 @@ impl<'a> ValidatedSliceMut<'a> {
     #[inline]
     pub fn as_typed_slice_checked<T: AbiPod>(
         &self,
-        expected_uuid: Option<ComponentUuid>,
+        expected_uuid: Option<UuidFilter>,
     ) -> Option<&[T]> {
         if !self.valid {
             return None;
         }
-        if let Some(req_uuid) = expected_uuid {
+        if let Some(filter) = expected_uuid {
             let actual_uuid = self.uuid?;
-            if actual_uuid != req_uuid {
+            if !filter.matches(actual_uuid) {
                 return None;
             }
         }
@@ -558,14 +637,14 @@ impl<'a> ValidatedSliceMut<'a> {
     #[inline]
     pub fn as_typed_slice_mut_checked<T: AbiPod>(
         &mut self,
-        expected_uuid: Option<ComponentUuid>,
+        expected_uuid: Option<UuidFilter>,
     ) -> Option<&mut [T]> {
         if !self.valid {
             return None;
         }
-        if let Some(req_uuid) = expected_uuid {
+        if let Some(filter) = expected_uuid {
             let actual_uuid = self.uuid?;
-            if actual_uuid != req_uuid {
+            if !filter.matches(actual_uuid) {
                 return None;
             }
         }
@@ -600,14 +679,14 @@ impl<'a> ValidatedSliceMut<'a> {
     #[inline]
     pub fn into_typed_slice_mut_checked<T: AbiPod>(
         self,
-        expected_uuid: Option<ComponentUuid>,
+        expected_uuid: Option<UuidFilter>,
     ) -> Option<&'a mut [T]> {
         if !self.valid {
             return None;
         }
-        if let Some(req_uuid) = expected_uuid {
+        if let Some(filter) = expected_uuid {
             let actual_uuid = self.uuid?;
-            if actual_uuid != req_uuid {
+            if !filter.matches(actual_uuid) {
                 return None;
             }
         }
@@ -1129,6 +1208,7 @@ impl<'a> ValidatedIter<'a> {
         let ptr = self.column_readonly_ptr(term_index);
         // SAFETY: `ptr` comes from `iter_column_readonly` for `self.current_len` rows matching `info`.
         unsafe { ValidatedSlice::from_raw_parts_with_info(ptr, self.current_len, info) }
+            .with_manifest_name(self.host.manifest_name())
     }
 
     /// Returns a [`ValidatedSliceMut`] (marking chunk ticks changed) stamped with [`BamColumnInfo`].
@@ -1147,8 +1227,10 @@ impl<'a> ValidatedIter<'a> {
         }
         let len = self.current_len;
         let ptr = self.column_mutable_ptr(term_index);
+        let manifest_name = self.host.manifest_name();
         // SAFETY: `ptr` comes from `iter_column_mutable` for `len` rows under `&mut self`.
         unsafe { ValidatedSliceMut::from_raw_parts_with_info(ptr, len, info) }
+            .with_manifest_name(manifest_name)
     }
 
     /// Returns an untracked [`ValidatedSliceMut`] (without marking chunk ticks changed) stamped
@@ -1168,8 +1250,10 @@ impl<'a> ValidatedIter<'a> {
         }
         let len = self.current_len;
         let ptr = self.column_mutable_untracked_ptr(term_index);
+        let manifest_name = self.host.manifest_name();
         // SAFETY: `ptr` comes from `iter_column_mutable_untracked` for `len` rows under `&mut self`.
         unsafe { ValidatedSliceMut::from_raw_parts_with_info(ptr, len, info) }
+            .with_manifest_name(manifest_name)
     }
 
     /// Borrows dense column `term_index` as `&[T]` after validating [`BamColumnInfo`] and optional
@@ -1178,7 +1262,7 @@ impl<'a> ValidatedIter<'a> {
     pub fn column_checked<T: AbiPod>(
         &self,
         term_index: usize,
-        expected_uuid: Option<ComponentUuid>,
+        expected_uuid: Option<UuidFilter>,
     ) -> Option<&[T]> {
         let info = self.column_info(term_index).ok()?;
         if !validate_dense_read_info::<T>(&info, expected_uuid) {
@@ -1201,7 +1285,7 @@ impl<'a> ValidatedIter<'a> {
     pub fn column_mut_checked<T: AbiPod>(
         &mut self,
         term_index: usize,
-        expected_uuid: Option<ComponentUuid>,
+        expected_uuid: Option<UuidFilter>,
     ) -> Option<&mut [T]> {
         let info = self.column_info(term_index).ok()?;
         if !validate_dense_write_info::<T>(&info, expected_uuid) {
@@ -1225,7 +1309,7 @@ impl<'a> ValidatedIter<'a> {
     pub fn column_mut_untracked_checked<T: AbiPod>(
         &mut self,
         term_index: usize,
-        expected_uuid: Option<ComponentUuid>,
+        expected_uuid: Option<UuidFilter>,
     ) -> Option<&mut [T]> {
         let info = self.column_info(term_index).ok()?;
         if !validate_dense_write_info::<T>(&info, expected_uuid) {
@@ -1250,9 +1334,9 @@ impl<'a> ValidatedIter<'a> {
     pub fn read_write_checked<R: AbiPod, W: AbiPod>(
         &mut self,
         read_col: usize,
-        read_uuid: Option<ComponentUuid>,
+        read_uuid: Option<UuidFilter>,
         write_col: usize,
-        write_uuid: Option<ComponentUuid>,
+        write_uuid: Option<UuidFilter>,
     ) -> Option<(&[R], &mut [W])> {
         if read_col == write_col {
             return None;
@@ -1305,9 +1389,9 @@ impl<'a> ValidatedIter<'a> {
     pub fn write_2_checked<W1: AbiPod, W2: AbiPod>(
         &mut self,
         col_a: usize,
-        uuid_a: Option<ComponentUuid>,
+        uuid_a: Option<UuidFilter>,
         col_b: usize,
-        uuid_b: Option<ComponentUuid>,
+        uuid_b: Option<UuidFilter>,
     ) -> Option<(&mut [W1], &mut [W2])> {
         if col_a == col_b {
             return None;
@@ -1361,7 +1445,7 @@ impl<'a> ValidatedIter<'a> {
     pub fn entities_and_column_mut_checked<W: AbiPod>(
         &mut self,
         write_col: usize,
-        write_uuid: Option<ComponentUuid>,
+        write_uuid: Option<UuidFilter>,
     ) -> Option<(&[FfiEntity], &mut [W])> {
         let w_info = self.column_info(write_col).ok()?;
         if !validate_dense_write_info::<W>(&w_info, write_uuid) {
@@ -1412,9 +1496,9 @@ impl<'a> ValidatedIter<'a> {
     pub fn entities_and_read_write_checked<R: AbiPod, W: AbiPod>(
         &mut self,
         read_col: usize,
-        read_uuid: Option<ComponentUuid>,
+        read_uuid: Option<UuidFilter>,
         write_col: usize,
-        write_uuid: Option<ComponentUuid>,
+        write_uuid: Option<UuidFilter>,
     ) -> Option<(&[FfiEntity], &[R], &mut [W])> {
         if read_col == write_col {
             return None;
@@ -1489,7 +1573,7 @@ impl<'a> ValidatedIter<'a> {
     pub fn rows_checked<T: AbiPod>(
         &mut self,
         term_index: usize,
-        expected_uuid: Option<ComponentUuid>,
+        expected_uuid: Option<UuidFilter>,
     ) -> Option<SparseRows<'_, T>> {
         let info = self.column_info(term_index).ok()?;
         if !validate_rows_read_info::<T>(&info, expected_uuid) {
@@ -1517,7 +1601,7 @@ impl<'a> ValidatedIter<'a> {
     pub fn rows_mut_checked<T: AbiPod>(
         &mut self,
         term_index: usize,
-        expected_uuid: Option<ComponentUuid>,
+        expected_uuid: Option<UuidFilter>,
     ) -> Option<SparseRowsMut<'_, T>> {
         let info = self.column_info(term_index).ok()?;
         if !validate_rows_write_info::<T>(&info, expected_uuid) {
@@ -1571,7 +1655,7 @@ impl<'a> ValidatedIter<'a> {
     pub fn resource_checked<R: AbiPod>(
         &self,
         term_index: usize,
-        expected_uuid: Option<ComponentUuid>,
+        expected_uuid: Option<UuidFilter>,
     ) -> Option<&R> {
         let info = self.column_info(term_index).ok()?;
         if !validate_resource_read_info::<R>(&info, expected_uuid) {
@@ -1599,7 +1683,7 @@ impl<'a> ValidatedIter<'a> {
     pub fn resource_mut_checked<R: AbiPod>(
         &mut self,
         term_index: usize,
-        expected_uuid: Option<ComponentUuid>,
+        expected_uuid: Option<UuidFilter>,
     ) -> Option<&mut R> {
         let info = self.column_info(term_index).ok()?;
         if !validate_resource_write_info::<R>(&info, expected_uuid) {

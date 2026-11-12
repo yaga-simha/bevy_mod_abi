@@ -4,7 +4,7 @@ use bevy_abi_mod_guest_sys::{Host, SparseRows, SparseRowsMut, ValidatedIter};
 use bevy_abi_mod_sys::{AbiPod, BamColumnInfo, BamIter, FfiEntity, FfiResult};
 
 use crate::{
-    component::GuestComponent,
+    component::{GuestComponent, guest_uuid_filter},
     iter::{
         chunk::Chunk,
         slice::{ChunkSlice, ChunkSliceMut},
@@ -150,7 +150,8 @@ impl<'a> ChunkIter<'a> {
     /// Materializes indirect read-only sparse-set row pointers for `T: GuestComponent` (`C-13` + `P-02`).
     #[inline]
     pub fn component_rows<T: GuestComponent>(&mut self, col: usize) -> Option<SparseRows<'_, T>> {
-        self.inner.rows_checked::<T>(col, Some(T::UUID))
+        let filter = guest_uuid_filter::<T>(self.inner.host().manifest_name());
+        self.inner.rows_checked::<T>(col, Some(filter))
     }
 
     /// Materializes indirect mutable sparse-set row pointers `[ *mut u8; current_len ]` (`P-02`).
@@ -165,7 +166,8 @@ impl<'a> ChunkIter<'a> {
         &mut self,
         col: usize,
     ) -> Option<SparseRowsMut<'_, T>> {
-        self.inner.rows_mut_checked::<T>(col, Some(T::UUID))
+        let filter = guest_uuid_filter::<T>(self.inner.host().manifest_name());
+        self.inner.rows_mut_checked::<T>(col, Some(filter))
     }
 
     /// Borrows singleton resource `R` (`R: AbiPod`) declared at `term_index` in this query (`C-05`).
@@ -175,10 +177,11 @@ impl<'a> ChunkIter<'a> {
     }
 
     /// Borrows singleton resource `R` (`R: GuestComponent`) declared at `term_index`, validating
-    /// `R::UUID` (`C-05` + `C-13`).
+    /// `R`'s UUID (`C-05` + `C-13`).
     #[inline]
     pub fn component_resource<R: GuestComponent>(&self, term_index: usize) -> Option<&R> {
-        self.inner.resource_checked::<R>(term_index, Some(R::UUID))
+        let filter = guest_uuid_filter::<R>(self.inner.host().manifest_name());
+        self.inner.resource_checked::<R>(term_index, Some(filter))
     }
 
     /// Mutably borrows singleton resource `R` (`R: AbiPod`) declared with `RESOURCE_WRITE` at
@@ -189,14 +192,15 @@ impl<'a> ChunkIter<'a> {
     }
 
     /// Mutably borrows singleton resource `R` (`R: GuestComponent`) declared at `term_index`,
-    /// validating `R::UUID` (`C-05` + `C-13`).
+    /// validating `R`'s UUID (`C-05` + `C-13`).
     #[inline]
     pub fn component_resource_mut<R: GuestComponent>(
         &mut self,
         term_index: usize,
     ) -> Option<&mut R> {
+        let filter = guest_uuid_filter::<R>(self.inner.host().manifest_name());
         self.inner
-            .resource_mut_checked::<R>(term_index, Some(R::UUID))
+            .resource_mut_checked::<R>(term_index, Some(filter))
     }
 }
 

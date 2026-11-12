@@ -31,8 +31,18 @@ unsafe impl Send for HostCtxPtr {}
 // symbol/component queries and diagnostics.
 unsafe impl Sync for HostCtxPtr {}
 
+#[derive(Clone, Copy, Debug)]
+struct ManifestNamePtr(*const u8);
+
+// SAFETY: Points to immutable UTF-8 bytes owned by `GuestInstance` (or `NonNull::dangling()` when
+// `manifest_name_len == 0`) that remain valid and unmutated until after all closures and hooks in
+// `GuestInstance` finish dropping.
+unsafe impl Send for ManifestNamePtr {}
+// SAFETY: Shared read-only UTF-8 byte pointer safe to read concurrently across worker threads.
+unsafe impl Sync for ManifestNamePtr {}
+
 /// Validated, per-instance cached copy of [`BamHostApi`] paired with its world-scoped
-/// [`BamHostCtx`] token.
+/// [`BamHostCtx`] token and optional owning manifest name.
 ///
 /// Constructed once per mod load session during `bevy_abi_mod_init` by copying up to
 /// `min(api.struct_size, size_of::<BamHostApi>())` bytes (`>= BamHostApi::MIN_V0_2_SIZE`) and
@@ -41,6 +51,8 @@ unsafe impl Sync for HostCtxPtr {}
 pub struct Host {
     api: BamHostApi,
     host_ctx: HostCtxPtr,
+    manifest_name_ptr: ManifestNamePtr,
+    manifest_name_len: usize,
 }
 
 impl Host {
@@ -71,6 +83,8 @@ impl Host {
         Ok(Self {
             api,
             host_ctx: HostCtxPtr(host_ctx),
+            manifest_name_ptr: ManifestNamePtr(core::ptr::NonNull::<u8>::dangling().as_ptr()),
+            manifest_name_len: 0,
         })
     }
 
@@ -107,7 +121,39 @@ impl Host {
         Ok(Self {
             api,
             host_ctx: HostCtxPtr(host_ctx),
+            manifest_name_ptr: ManifestNamePtr(core::ptr::NonNull::<u8>::dangling().as_ptr()),
+            manifest_name_len: 0,
         })
+    }
+
+    /// Returns a copy of this [`Host`] stamped with the owning [`GuestInstance`]'s UTF-8
+    /// `manifest_name` (`ptr`, `len`).
+    ///
+    /// # Safety
+    /// If `len > 0`, `ptr` must be non-null and point to `len` immutable, valid UTF-8 bytes that
+    /// outlive every copy of the returned [`Host`].
+    #[inline]
+    pub const unsafe fn with_manifest_name(mut self, ptr: *const u8, len: usize) -> Self {
+        self.manifest_name_ptr = ManifestNamePtr(ptr);
+        self.manifest_name_len = len;
+        self
+    }
+
+    /// Returns the owning mod instance's manifest name (`""` when constructed standalone via
+    /// [`Self::from_raw`] without a [`GuestInstance`]).
+    #[inline]
+    pub const fn manifest_name(&self) -> &str {
+        if self.manifest_name_len == 0 {
+            return "";
+        }
+        // SAFETY: `with_manifest_name` guarantees that when `manifest_name_len > 0`,
+        // `manifest_name_ptr.0` points to `manifest_name_len` immutable, valid UTF-8 bytes
+        // outliving `&self`.
+        unsafe {
+            let bytes =
+                core::slice::from_raw_parts(self.manifest_name_ptr.0, self.manifest_name_len);
+            core::str::from_utf8_unchecked(bytes)
+        }
     }
 
     /// Returns a shared reference to the validated [`BamHostApi`] table.

@@ -5,7 +5,7 @@ use bevy_abi_mod_guest_sys::{SparseRows, SparseRowsMut, ValidatedIter};
 use bevy_abi_mod_sys::{AbiPod, BamColumnInfo, FfiEntity, FfiResult};
 
 use crate::{
-    component::GuestComponent,
+    component::{GuestComponent, guest_uuid_filter},
     iter::slice::{ChunkSlice, ChunkSliceMut},
 };
 
@@ -76,11 +76,13 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
         self.iter.column_checked::<T>(col, None)
     }
 
-    /// Borrows dense column `col` as `&[T]` (`T: GuestComponent`), validating `T::UUID` in addition
-    /// to `(size, align, mode, storage)` (`C-13`). Returns `None` on UUID or layout mismatch.
+    /// Borrows dense column `col` as `&[T]` (`T: GuestComponent`), validating `T`'s UUID (including
+    /// manifest-qualified `C-10` names) in addition to `(size, align, mode, storage)` (`C-13`).
+    /// Returns `None` on UUID or layout mismatch.
     #[inline]
     pub fn component<T: GuestComponent>(&self, col: usize) -> Option<&[T]> {
-        self.iter.column_checked::<T>(col, Some(T::UUID))
+        let filter = guest_uuid_filter::<T>(self.iter.host().manifest_name());
+        self.iter.column_checked::<T>(col, Some(filter))
     }
 
     /// Alias for [`Self::column`] on optional read columns (`Option<&[T]>` is `None` when the
@@ -103,11 +105,12 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
         self.iter.column_mut_checked::<T>(col, None)
     }
 
-    /// Mutably borrows dense column `col` as `&mut [T]` (`T: GuestComponent`), validating `T::UUID`
-    /// in addition to `(size, align, mode, storage)` (`C-13`) and marking chunk rows changed.
+    /// Mutably borrows dense column `col` as `&mut [T]` (`T: GuestComponent`), validating `T`'s
+    /// UUID in addition to `(size, align, mode, storage)` (`C-13`) and marking chunk rows changed.
     #[inline]
     pub fn component_mut<T: GuestComponent>(&mut self, col: usize) -> Option<&mut [T]> {
-        self.iter.column_mut_checked::<T>(col, Some(T::UUID))
+        let filter = guest_uuid_filter::<T>(self.iter.host().manifest_name());
+        self.iter.column_mut_checked::<T>(col, Some(filter))
     }
 
     /// Alias for [`Self::column_mut`] on optional write columns (`None` if absent on the archetype).
@@ -130,11 +133,12 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
         self.iter.column_mut_untracked_checked::<T>(col, None)
     }
 
-    /// Untracked mutable column slice for `T: GuestComponent`, validating `T::UUID` (`C-13` + `P-04`).
+    /// Untracked mutable column slice for `T: GuestComponent`, validating `T`'s UUID (`C-13` + `P-04`).
     #[inline]
     pub fn component_mut_untracked<T: GuestComponent>(&mut self, col: usize) -> Option<&mut [T]> {
+        let filter = guest_uuid_filter::<T>(self.iter.host().manifest_name());
         self.iter
-            .column_mut_untracked_checked::<T>(col, Some(T::UUID))
+            .column_mut_untracked_checked::<T>(col, Some(filter))
     }
 
     /// Marks rows `start_row..start_row + row_count` on writable column `col` as changed (`P-04`).
@@ -167,15 +171,18 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
     }
 
     /// Simultaneously borrows read-only dense column `read_col` and disjoint mutable dense column
-    /// `write_col`, verifying both `R::UUID` and `W::UUID` (`C-13`).
+    /// `write_col`, verifying both `R`'s and `W`'s UUIDs (`C-13`).
     #[inline]
     pub fn component_read_write<R: GuestComponent, W: GuestComponent>(
         &mut self,
         read_col: usize,
         write_col: usize,
     ) -> Option<(&[R], &mut [W])> {
+        let manifest = self.iter.host().manifest_name();
+        let r_filter = guest_uuid_filter::<R>(manifest);
+        let w_filter = guest_uuid_filter::<W>(manifest);
         self.iter
-            .read_write_checked::<R, W>(read_col, Some(R::UUID), write_col, Some(W::UUID))
+            .read_write_checked::<R, W>(read_col, Some(r_filter), write_col, Some(w_filter))
     }
 
     /// Simultaneously borrows two disjoint mutable dense columns (`col_a` and `col_b`).
@@ -190,15 +197,18 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
     }
 
     /// Simultaneously borrows two disjoint mutable dense columns (`col_a` and `col_b`), verifying
-    /// `W1::UUID` and `W2::UUID` (`C-13`).
+    /// `W1`'s and `W2`'s UUIDs (`C-13`).
     #[inline]
     pub fn component_write_2<W1: GuestComponent, W2: GuestComponent>(
         &mut self,
         col_a: usize,
         col_b: usize,
     ) -> Option<(&mut [W1], &mut [W2])> {
+        let manifest = self.iter.host().manifest_name();
+        let filter_a = guest_uuid_filter::<W1>(manifest);
+        let filter_b = guest_uuid_filter::<W2>(manifest);
         self.iter
-            .write_2_checked::<W1, W2>(col_a, Some(W1::UUID), col_b, Some(W2::UUID))
+            .write_2_checked::<W1, W2>(col_a, Some(filter_a), col_b, Some(filter_b))
     }
 
     /// Simultaneously borrows `[FfiEntity; len]` and mutable dense column `write_col`.
@@ -211,14 +221,16 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
             .entities_and_column_mut_checked::<W>(write_col, None)
     }
 
-    /// Simultaneously borrows `[FfiEntity; len]` and mutable dense column `write_col`, verifying `W::UUID`.
+    /// Simultaneously borrows `[FfiEntity; len]` and mutable dense column `write_col`, verifying
+    /// `W`'s UUID (`C-13`).
     #[inline]
     pub fn entities_and_component_mut<W: GuestComponent>(
         &mut self,
         write_col: usize,
     ) -> Option<(&[FfiEntity], &mut [W])> {
+        let filter = guest_uuid_filter::<W>(self.iter.host().manifest_name());
         self.iter
-            .entities_and_column_mut_checked::<W>(write_col, Some(W::UUID))
+            .entities_and_column_mut_checked::<W>(write_col, Some(filter))
     }
 
     /// Simultaneously borrows `[FfiEntity; len]`, read-only dense column `read_col`, and disjoint
@@ -234,18 +246,21 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
     }
 
     /// Simultaneously borrows `[FfiEntity; len]`, read-only dense column `read_col`, and disjoint
-    /// mutable dense column `write_col`, verifying `R::UUID` and `W::UUID` (`C-13`).
+    /// mutable dense column `write_col`, verifying `R`'s and `W`'s UUIDs (`C-13`).
     #[inline]
     pub fn entities_and_component_read_write<R: GuestComponent, W: GuestComponent>(
         &mut self,
         read_col: usize,
         write_col: usize,
     ) -> Option<(&[FfiEntity], &[R], &mut [W])> {
+        let manifest = self.iter.host().manifest_name();
+        let r_filter = guest_uuid_filter::<R>(manifest);
+        let w_filter = guest_uuid_filter::<W>(manifest);
         self.iter.entities_and_read_write_checked::<R, W>(
             read_col,
-            Some(R::UUID),
+            Some(r_filter),
             write_col,
-            Some(W::UUID),
+            Some(w_filter),
         )
     }
 
@@ -257,10 +272,11 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
     }
 
     /// Materializes indirect read-only sparse-set row pointers for `T: GuestComponent`, validating
-    /// `T::UUID` (`C-13` + `P-02`).
+    /// `T`'s UUID (`C-13` + `P-02`).
     #[inline]
     pub fn component_rows<T: GuestComponent>(&mut self, col: usize) -> Option<SparseRows<'_, T>> {
-        self.iter.rows_checked::<T>(col, Some(T::UUID))
+        let filter = guest_uuid_filter::<T>(self.iter.host().manifest_name());
+        self.iter.rows_checked::<T>(col, Some(filter))
     }
 
     /// Materializes indirect mutable sparse-set row pointers `[ *mut u8; len ]` for column `col`
@@ -271,13 +287,14 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
     }
 
     /// Materializes indirect mutable sparse-set row pointers for `T: GuestComponent`, validating
-    /// `T::UUID` (`C-13` + `P-02`).
+    /// `T`'s UUID (`C-13` + `P-02`).
     #[inline]
     pub fn component_rows_mut<T: GuestComponent>(
         &mut self,
         col: usize,
     ) -> Option<SparseRowsMut<'_, T>> {
-        self.iter.rows_mut_checked::<T>(col, Some(T::UUID))
+        let filter = guest_uuid_filter::<T>(self.iter.host().manifest_name());
+        self.iter.rows_mut_checked::<T>(col, Some(filter))
     }
 
     /// Returns a low-level [`ChunkSlice`] view over dense read column `col` (useful with opaque
@@ -305,10 +322,12 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
         self.iter.resource_checked::<R>(term_index, None)
     }
 
-    /// Borrows singleton resource `R` (`R: GuestComponent`) declared at `term_index`, validating `R::UUID`.
+    /// Borrows singleton resource `R` (`R: GuestComponent`) declared at `term_index`, validating
+    /// `R`'s UUID (`C-13`).
     #[inline]
     pub fn component_resource<R: GuestComponent>(&self, term_index: usize) -> Option<&R> {
-        self.iter.resource_checked::<R>(term_index, Some(R::UUID))
+        let filter = guest_uuid_filter::<R>(self.iter.host().manifest_name());
+        self.iter.resource_checked::<R>(term_index, Some(filter))
     }
 
     /// Mutably borrows singleton resource `R` (`R: AbiPod`) declared with `RESOURCE_WRITE` at `term_index`.
@@ -317,13 +336,15 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
         self.iter.resource_mut_checked::<R>(term_index, None)
     }
 
-    /// Mutably borrows singleton resource `R` (`R: GuestComponent`) at `term_index`, validating `R::UUID`.
+    /// Mutably borrows singleton resource `R` (`R: GuestComponent`) at `term_index`, validating
+    /// `R`'s UUID (`C-13`).
     #[inline]
     pub fn component_resource_mut<R: GuestComponent>(
         &mut self,
         term_index: usize,
     ) -> Option<&mut R> {
+        let filter = guest_uuid_filter::<R>(self.iter.host().manifest_name());
         self.iter
-            .resource_mut_checked::<R>(term_index, Some(R::UUID))
+            .resource_mut_checked::<R>(term_index, Some(filter))
     }
 }

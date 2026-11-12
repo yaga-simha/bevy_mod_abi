@@ -67,12 +67,24 @@ struct LocalCounter {
     ticks: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "derive", derive(AbiPod))]
+struct WrongCounter {
+    ticks: u32,
+}
+
 #[cfg(not(feature = "derive"))]
-impl_pod_no_derive!(Pos, Vel, Accel, LocalCounter);
+impl_pod_no_derive!(Pos, Vel, Accel, LocalCounter, WrongCounter);
 
 impl GuestComponent for LocalCounter {
     // Unqualified name: must auto-prefix with `<manifest_name>::LocalCounter` (`C-10`)!
     const NAME: &'static CStr = c"LocalCounter";
+}
+
+impl GuestComponent for WrongCounter {
+    // Identical `u32` layout, different unqualified name: `C-13` must still reject!
+    const NAME: &'static CStr = c"WrongCounter";
 }
 
 static SHUTDOWN_EVENTS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
@@ -102,20 +114,79 @@ impl GuestPlugin for IsolatedPlugin {
             Ok(h) => h,
             Err(e) => return e,
         };
+        assert_eq!(app.resolve_component::<LocalCounter>(), Ok(counter_h));
         let ticks = Arc::clone(&self.local_ticks);
         let tag = self.world_tag;
 
         app.system(c"tick_world")
-            .query(|q| q.write_handle(counter_h))
+            .query(|q| q.write::<LocalCounter>())
             .build(move |ctx| {
-                ticks.fetch_add(1, Ordering::SeqCst);
+                let run_idx = ticks.fetch_add(1, Ordering::SeqCst);
                 let (iter, cmds) = ctx.iter_and_commands();
                 while let Some(mut chunk) = iter.next_chunk_view() {
+                    // `C-10` + `C-13`: auto-prefixed `LocalCounter` succeeds on both `Chunk` and
+                    // `ChunkSlice` `component*` views, while `WrongCounter` (same layout) returns `None`!
+                    assert!(chunk.component::<LocalCounter>(0).is_some());
+                    assert!(chunk.component::<WrongCounter>(0).is_none());
+                    assert!(
+                        chunk
+                            .readonly_slice(0)
+                            .as_component_slice::<LocalCounter>()
+                            .is_some()
+                    );
+                    assert!(
+                        chunk
+                            .readonly_slice(0)
+                            .as_component_slice::<WrongCounter>()
+                            .is_none()
+                    );
+                    {
+                        let mut mut_slice = chunk.mutable_slice(0);
+                        assert!(mut_slice.as_component_slice_mut::<LocalCounter>().is_some());
+                        assert!(mut_slice.as_component_slice_mut::<WrongCounter>().is_none());
+                    }
+
                     let (entities, counters) = chunk
-                        .entities_and_column_mut::<LocalCounter>(0)
-                        .expect("entities + mutable LocalCounter");
+                        .entities_and_component_mut::<LocalCounter>(0)
+                        .expect("entities + mutable auto-prefixed LocalCounter");
                     for i in 0..counters.len() {
                         counters[i].ticks += tag;
+                        if run_idx == 0 && i == 0 {
+                            assert_eq!(
+                                cmds.insert_component::<LocalCounter>(
+                                    entities[i],
+                                    &LocalCounter { ticks: 777 }
+                                ),
+                                FfiResult::OK
+                            );
+                            // Dynamic guest components have `has_default == false` on the host, so
+                            // resolving `isolated_plugin::LocalCounter` succeeds and reaches
+                            // `cmd_insert_default` (`PERMISSION_DENIED`), whereas an unregistered
+                            // unqualified component fails resolution with `NOT_FOUND`.
+                            assert_eq!(
+                                cmds.insert_component_default::<LocalCounter>(entities[i]),
+                                FfiResult::PERMISSION_DENIED
+                            );
+                            assert_eq!(
+                                cmds.insert_component_default::<WrongCounter>(entities[i]),
+                                FfiResult::NOT_FOUND
+                            );
+                            assert_eq!(
+                                cmds.remove_component::<LocalCounter>(entities[i]),
+                                FfiResult::OK
+                            );
+                            assert_eq!(
+                                cmds.remove_component::<WrongCounter>(entities[i]),
+                                FfiResult::NOT_FOUND
+                            );
+                            assert_eq!(
+                                cmds.insert_component::<WrongCounter>(
+                                    entities[i],
+                                    &WrongCounter { ticks: 1 }
+                                ),
+                                FfiResult::NOT_FOUND
+                            );
+                        }
                         if counters[i].ticks > 100 {
                             let _ = cmds.despawn(entities[i]);
                         }
@@ -191,6 +262,35 @@ fn export_mod_manifest_and_multi_world_instance_isolation() {
         assert_eq!(world_a.run_system(0), FfiResult::OK);
     }
     assert_eq!(world_b.run_system(0), FfiResult::OK);
+
+    assert_eq!(
+        world_a.commands,
+        vec![
+            RecordedCommand::Insert {
+                entity: FfiEntity::from_bits(1),
+                component: comp_a,
+                byte_len: core::mem::size_of::<LocalCounter>(),
+            },
+            RecordedCommand::Remove {
+                entity: FfiEntity::from_bits(1),
+                component: comp_a,
+            },
+        ]
+    );
+    assert_eq!(
+        world_b.commands,
+        vec![
+            RecordedCommand::Insert {
+                entity: FfiEntity::from_bits(2),
+                component: comp_b,
+                byte_len: core::mem::size_of::<LocalCounter>(),
+            },
+            RecordedCommand::Remove {
+                entity: FfiEntity::from_bits(2),
+                component: comp_b,
+            },
+        ]
+    );
 
     // Shut down World A FIRST while World B remains live and continues ticking!
     // SAFETY: `inst_a` was returned by `bevy_abi_mod_init` for World A.
@@ -299,6 +399,111 @@ fn split_borrows_and_multi_query_nested_reset_enforce_disjointness() {
     assert_eq!(
         world.commands,
         vec![RecordedCommand::SpawnEmpty(FfiEntity::from_bits(100))]
+    );
+
+    world.unload_instance(inst);
+}
+
+#[test]
+fn regression_c10_c13_unqualified_guest_component_sparse_resource_and_cross_mod_rejection() {
+    use bevy_abi_mod_guest::raw::BAM_COMPONENT_FLAG_SPARSE_SET;
+
+    let mut world = MockHostWorld::new();
+    // Another mod registered `other_mod::LocalCounter` with the exact same `u32` layout:
+    let other_mod_uuid = guest_component_uuid::<LocalCounter>(
+        "other_mod::LocalCounter",
+        LocalCounter::FIELD_SCHEMA_HASH,
+    );
+    let other_h =
+        world.expose_component::<LocalCounter>("other_mod::LocalCounter", other_mod_uuid, 0, false);
+
+    let inst = world
+        .load_fn(c"my_mod", move |app| {
+            let sparse_h = app
+                .register_component_with_flags::<LocalCounter>(BAM_COMPONENT_FLAG_SPARSE_SET)
+                .expect("register sparse LocalCounter");
+            let res_h = app
+                .register_component::<WrongCounter>()
+                .expect("register WrongCounter resource");
+            assert_ne!(sparse_h, other_h);
+            assert_ne!(res_h, other_h);
+
+            app.system(c"check_unqualified_views")
+                .query(|q| q.write::<LocalCounter>().read_handle(other_h))
+                .resource_write::<WrongCounter>()
+                .build(|ctx| {
+                    // System-level resource (`my_mod::WrongCounter`): succeeds for `WrongCounter`,
+                    // rejects `LocalCounter`!
+                    assert!(ctx.component_resource::<LocalCounter>(0).is_none());
+                    assert!(ctx.component_resource_mut::<LocalCounter>(0).is_none());
+                    {
+                        let r = ctx
+                            .component_resource_mut::<WrongCounter>(0)
+                            .expect("qualified WrongCounter resource");
+                        r.ticks += 50;
+                    }
+                    assert_eq!(
+                        ctx.component_resource::<WrongCounter>(0),
+                        Some(&WrongCounter { ticks: 55 })
+                    );
+
+                    let iter = ctx.iter();
+                    while let Some(mut chunk) = iter.next_chunk_view() {
+                        // Sparse rows (`my_mod::LocalCounter` at col 0):
+                        assert!(chunk.component_rows::<WrongCounter>(0).is_none());
+                        {
+                            let mut rows = chunk
+                                .component_rows_mut::<LocalCounter>(0)
+                                .expect("auto-prefixed sparse rows");
+                            rows.for_each_mut(|_, c| c.ticks += 10);
+                        }
+                        let ro_rows = chunk
+                            .component_rows::<LocalCounter>(0)
+                            .expect("auto-prefixed readonly sparse rows");
+                        assert_eq!(ro_rows[0], LocalCounter { ticks: 17 });
+
+                        // Cross-mod rejection: col 1 is `other_mod::LocalCounter`, which MUST NOT
+                        // match `my_mod`'s unqualified `LocalCounter`!
+                        assert!(chunk.component::<LocalCounter>(1).is_none());
+                        assert!(
+                            chunk
+                                .readonly_slice(1)
+                                .as_component_slice::<LocalCounter>()
+                                .is_none()
+                        );
+                    }
+                })
+        })
+        .expect("load my_mod");
+
+    let my_sparse_h = world.name_to_handle["my_mod::LocalCounter"];
+    let my_res_h = world.name_to_handle["my_mod::WrongCounter"];
+    let my_res_uuid = guest_component_uuid::<WrongCounter>(
+        "my_mod::WrongCounter",
+        WrongCounter::FIELD_SCHEMA_HASH,
+    );
+    assert_eq!(
+        world.insert_resource(
+            "my_mod::WrongCounter",
+            my_res_uuid,
+            WrongCounter { ticks: 5 }
+        ),
+        my_res_h
+    );
+
+    let mut chunk = MockChunkData::new(vec![FfiEntity::from_bits(1)]);
+    chunk.insert_sparse(my_sparse_h, vec![Some(LocalCounter { ticks: 7 })]);
+    chunk.insert_dense(other_h, &[LocalCounter { ticks: 99 }]);
+    world.chunks.push(chunk);
+
+    assert_eq!(world.run_system(0), FfiResult::OK);
+    assert_eq!(
+        world.read_resource::<WrongCounter>(my_res_h),
+        WrongCounter { ticks: 55 }
+    );
+    assert_eq!(
+        world.chunks[0].read_sparse::<LocalCounter>(my_sparse_h),
+        vec![Some(LocalCounter { ticks: 17 })]
     );
 
     world.unload_instance(inst);
