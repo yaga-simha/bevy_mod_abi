@@ -1,89 +1,135 @@
 #![forbid(unsafe_code)]
-#![deny(improper_ctypes_definitions)]
 
-//! Safe, zero-Bevy Rust SDK for authoring `bevy_abi_mod` guest `.cdylib` modules.
+//! # `bevy_abi_mod_guest`: Safe Idiomatic Rust Guest SDK (`ABI 0.2.0`)
 //!
-//! Mod dynamic libraries compile independently of the host game engine. Depending solely on
-//! `bevy_abi_mod_guest_sys` and `#![no_std]` [`bevy_abi_mod_sys`] allows guest mods to communicate
-//! with the host exclusively over `extern "C"` without shared Rust ABI or allocator assumptions.
+//! Zero-Bevy-dependency safe Rust SDK for authoring native `.cdylib` mods targeting
+//! `bevy_abi_mod` (`ABI 0.2.0`).
 //!
-//! All `unsafe` FFI operations are isolated inside `bevy_abi_mod_guest_sys`; this crate enforces
-//! `#![forbid(unsafe_code)]`.
+//! Every unsafe FFI operation, pointer check, [`VTableHeader`] layout verification, and `extern "C"`
+//! panic trampoline is isolated inside `bevy_abi_mod_guest_sys`; this crate enforces
+//! `#![forbid(unsafe_code)]` unconditionally.
 //!
-//! ## Example
+//! ## Core Capabilities
+//! - **Per-World Instance Isolation (`L-02`, `L-08`):** [`export_mod!`] exports
+//!   `bevy_abi_mod_manifest`, `bevy_abi_mod_init`, and `bevy_abi_mod_shutdown` backed by a
+//!   heap-allocated per-World [`GuestInstance`](raw::GuestInstance) with **zero** process-global
+//!   mutable state—loading the same `.cdylib` into multiple Bevy `World`s simultaneously is
+//!   completely isolated.
+//! - **Unified `app.system(...)` Builder (`G-02`):** [`GuestApp::system`] compiles up to
+//!   [`MAX_QUERIES_PER_SYSTEM`] queries, declaration-indexed singleton resources, [`ScheduleId`]
+//!   selection, `.after(...)` / `.before(...)` named ordering, `.main_thread()` pinning, and
+//!   lock-free `.run_if(...)` predicates into a single [`BamSystemDesc`](raw::BamSystemDesc).
+//! - **Verified Zero-Copy Views (`C-13`, `P-02`, `P-04`):** [`Chunk`] validates [`BamColumnInfo`]
+//!   (`size`, `align`, `mode`, storage flags, and `ComponentUuid` via [`Chunk::component`]),
+//!   provides indirect sparse-set row views ([`Chunk::rows`] / [`Chunk::rows_mut`]), and supports
+//!   untracked mutable slices paired with [`Chunk::mark_changed_range`].
+//! - **Handle-Based & Batched Commands (`C-05`, `P-05`):** [`GuestCommands`] enqueues zero-steady-state-allocation
+//!   deferred spawns (`spawn_empty`, single-archetype batched `spawn`), `despawn`, `insert`,
+//!   `insert_default`, and `remove` using 1-based [`BamComponent`] handles.
 //!
-//! ```no_run
-//! use bevy_abi_mod_guest::prelude::*;
+//! ## Panic & Unwind Policy: `panic = "unwind"` vs. `panic = "abort"` (`G-05`, `S-09`)
 //!
-//! fn setup(app: &mut GuestApp<'_>) -> FfiResult {
-//!     let queries = [
-//!         ComponentAccessDesc::write(c"Position".as_ptr()),
-//!         ComponentAccessDesc::read(c"Velocity".as_ptr()),
-//!     ];
-//!     app.add_system(c"movement_system", &queries, |ctx| {
-//!         while let Some(mut chunk) = ctx.iter().next_chunk_view() {
-//!             let Some((vel, pos)) = chunk.read_write::<[f32; 3], [f32; 3]>(1, 0) else {
-//!                 return FfiResult::INTERNAL_ERROR;
-//!             };
-//!             for (p, v) in pos.iter_mut().zip(vel.iter()) {
-//!                 p[0] += v[0];
-//!                 p[1] += v[1];
-//!                 p[2] += v[2];
-//!             }
-//!         }
-//!         FfiResult::OK
-//!     })
-//! }
+//! Every function pointer across `bevy_abi_mod` uses `extern "C"` (`nounwind`), never
+//! `extern "C-unwind"`. Unwinding across an `extern "C"` boundary is Undefined Behavior, and the
+//! host never catches guest unwinds because freeing a guest-allocated `Box<dyn Any + Send>` panic
+//! payload on the host allocator would corrupt the heap.
 //!
-//! export_mod!(setup);
-//! ```
+//! - **`panic = "unwind"` *(Cargo default — recommended)*:** Every guest trampoline (`bevy_abi_mod_init`,
+//!   `bevy_abi_mod_shutdown`, system callbacks, `run_if` predicates, and component destructors)
+//!   catches panics **inside the guest runtime**, drops the panic payload on the **guest** heap,
+//!   releases its lock-free re-entrancy guard, and returns [`FfiResult::PANIC_CAUGHT`] (or
+//!   [`FfiBool::FALSE`] for `run_if`). The host discards uncommitted commands from that tick and
+//!   applies `ModErrorPolicy` (e.g. quarantining the faulting system) while keeping the host
+//!   application running.
+//! - **`panic = "abort"`:** `std::panic::catch_unwind` compiles to a zero-overhead direct call, and
+//!   any panic inside the guest immediately terminates the OS process via `abort()` without
+//!   crossing `extern "C"`. Use `panic = "abort"` only for trusted first-party mods when smaller
+//!   binary size and fail-fast termination are desired.
+
+pub use bevy_abi_mod_sys;
 
 pub mod app;
 pub mod commands;
 pub mod component;
 pub mod iter;
 pub mod lifecycle;
-mod macros;
+pub mod macros;
 pub mod prelude;
 pub mod raw;
 
-#[doc(hidden)]
-pub use bevy_abi_mod_guest_sys as sys;
-pub use bevy_abi_mod_sys;
+pub use bevy_abi_mod_guest_sys::SpawnEntry;
+pub use bevy_abi_mod_sys::{
+    ABI_VERSION, ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PATCH, AbiPod, AccessMode,
+    BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_IMMUTABLE,
+    BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET, BAM_SYSTEM_FLAG_MAIN_THREAD,
+    BamColumnInfo, BamComponent, BamManifest, BamTermDesc, ComponentDesc, ComponentUuid, FfiBool,
+    FfiEntity, FfiResult, FfiSlice, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent,
+    RawInsertable, ScheduleId, StrView, SymbolEntry, VTableHeader,
+};
 
 #[cfg(feature = "derive")]
-pub use bevy_abi_mod_macros::AbiPod;
-pub use bevy_abi_mod_sys::AbiPod;
+pub use bevy_abi_mod_macros::{AbiPod, ModComponent};
 
-pub use self::app::{GuestApp, MultiQueryContext, SystemContext};
-pub use self::commands::GuestCommandQueue;
-pub use self::component::GuestComponent;
-pub use self::iter::{Chunk, ChunkSlice, ChunkSliceMut, GuestChunkIter};
-pub use self::lifecycle::{GuestPlugin, run_validated_guest_app};
-pub use self::raw::{
-    ChunkSliceMutRawExt, ChunkSliceRawExt, CommandBridgeVTable, CommandBridgeVTableExt,
-    GuestAppInitExt, GuestAppRawExt, GuestChunkIterRawExt, GuestCommandQueueRawExt,
-    MAX_GUEST_MULTI_QUERIES, ResourceBridgeVTable, catch_guest_panic,
-    cleanup_registered_guest_state, register_runtime_component, resolve_fn, resolve_iter_reset,
-    resolve_register_conditional_multi_query, resolve_register_conditional_system,
-    resolve_register_multi_query, wrap_multi_query_callback, wrap_run_condition,
-    wrap_system_callback,
+pub use app::{
+    GuestApp, IntoSystemResult, MultiQueryContext, QueryBuilder, RunConditionContext,
+    SystemBuilder, SystemContext,
 };
+pub use commands::GuestCommands;
+pub use component::{GuestComponent, guest_component_uuid};
+pub use iter::{
+    Chunk, ChunkIter, ChunkSlice, ChunkSliceMut, SparseRows, SparseRowsIter, SparseRowsMut,
+};
+pub use lifecycle::{GuestPlugin, build_guest_fn, build_guest_plugin};
 
-pub use bevy_abi_mod_sys::{
-    ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PACKED, ABI_VERSION_PATCH, CmdDespawnFn,
-    CmdInsertComponentFn, CmdInsertDefaultFn, CmdRemoveComponentFn, CmdSpawnEmptyFn,
-    ComponentAccessDesc, ComponentAccessMode, ComponentDropFn, ComponentUuid,
-    ConditionalMultiQuerySystemDescriptor, ConditionalSystemDescriptor, DynamicComponentDescriptor,
-    DynamicSystemCallback, ExposableComponent, ExtensibleStruct, FFI_BOOL_FALSE, FFI_BOOL_TRUE,
-    FfiBool, FfiEntity, FfiLayout, FfiResult, FfiSlice, GetProcAddressFn, HostApi,
-    IterColumnMutableFn, IterColumnReadonlyFn, IterColumnStrideFn, IterEntitiesFn,
-    IterMarkChangedFn, IterNextChunkFn, IterResetFn, IterResourceMutableFn, IterResourceReadonlyFn,
-    ModAbiVersionFn, ModComponentDescriptor, ModInitFn, ModShutdownFn, MultiQuerySystemCallback,
-    MultiQuerySystemDescriptor, MultiQuerySystemDescriptorV2, MultiQuerySystemDescriptorV3,
-    QuerySpec, RawChunkIter, RawCommandQueue, RegisterComponentFn,
-    RegisterConditionalMultiQuerySystemFn, RegisterConditionalSystemFn, RegisterMultiQuerySystemFn,
-    RegisterSystemFn, RunConditionCallback, ScheduleLabelId, ScheduledMultiQuerySystemDescriptor,
-    ScheduledSystemDescriptor, StrView, SymbolEntry, SystemDescriptor, SystemDescriptorV2,
-    SystemDescriptorV3, ffi_bool_to_rust, rust_bool_to_ffi,
-};
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_abi_mod_guest_sys::ValidatedSlice;
+
+    // Verify `guest_component_uuid` is const-evaluatable over `AbiPod` array types unconditionally.
+    const _: () = {
+        let u = guest_component_uuid::<[f32; 2]>("game::Pos", 0);
+        assert!(!u.is_zero());
+    };
+
+    #[cfg(feature = "derive")]
+    mod derive_smoke {
+        use crate::prelude::*;
+
+        #[repr(C)]
+        #[derive(Clone, Copy, Debug, PartialEq, AbiPod)]
+        struct DerivedVec2 {
+            x: f32,
+            y: f32,
+        }
+
+        impl GuestComponent for DerivedVec2 {
+            const NAME: &'static core::ffi::CStr = c"demo::DerivedVec2";
+        }
+
+        #[test]
+        fn derived_guest_component_uuid_is_deterministic() {
+            let expected = ComponentUuid::from_parts(
+                "demo::DerivedVec2",
+                core::mem::size_of::<DerivedVec2>(),
+                core::mem::align_of::<DerivedVec2>(),
+                0,
+            );
+            assert_eq!(DerivedVec2::UUID, expected);
+        }
+    }
+
+    #[test]
+    fn invalid_slices_return_none_safely() {
+        let slice = ChunkSlice::from_validated(ValidatedSlice::invalid());
+        assert!(slice.is_empty());
+        assert_eq!(slice.len(), 0);
+        assert!(slice.as_typed_slice::<f32>().is_none());
+
+        let mut mut_slice =
+            ChunkSliceMut::from_validated(bevy_abi_mod_guest_sys::ValidatedSliceMut::invalid());
+        assert!(mut_slice.is_empty());
+        assert!(mut_slice.as_typed_slice::<f32>().is_none());
+        assert!(mut_slice.as_typed_slice_mut::<f32>().is_none());
+    }
+}

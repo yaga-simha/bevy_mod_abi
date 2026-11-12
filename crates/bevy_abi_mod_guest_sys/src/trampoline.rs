@@ -1,809 +1,750 @@
-//! C-ABI system/run-condition closure trampolines and validated handshake state.
+//! Lock-free re-entrancy-guarded guest closure trampolines (`BamSystemFn` and `BamRunIfFn`) and
+//! unified [`BamSystemDesc`] registration.
 
-use core::ffi::{CStr, c_void};
-use core::marker::PhantomData;
-use std::sync::Mutex;
+use core::{
+    cell::UnsafeCell,
+    ffi::{CStr, c_char, c_void},
+    sync::atomic::{AtomicBool, Ordering},
+};
+use std::ffi::CString;
 
 use bevy_abi_mod_sys::{
-    ComponentAccessDesc, FFI_BOOL_FALSE, FfiBool, FfiResult, GetProcAddressFn, HostApi,
-    IterResetFn, MultiQuerySystemDescriptor, QuerySpec, RawChunkIter, RawCommandQueue,
-    RegisterConditionalMultiQuerySystemFn, RegisterConditionalSystemFn, RegisterMultiQuerySystemFn,
-    SystemDescriptor, rust_bool_to_ffi,
+    AbiPod, BAM_SYSTEM_KNOWN_FLAGS, BamCommands, BamIter, BamLoadCtx, BamQueryDesc, BamRunIfFn,
+    BamSystemCtx, BamSystemDesc, BamSystemFn, BamTermDesc, ComponentUuid, FfiBool, FfiResult,
+    MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ScheduleId,
 };
 
-use crate::alloc::{ErasedAllocation, catch_guest_panic, drop_boxed_allocation};
-use crate::commands::ValidatedCommandQueue;
-use crate::component::register_runtime_component;
-use crate::iter::ValidatedIter;
-use crate::resolve::{
-    CommandBridgeVTable, CommandBridgeVTableExt, ResourceBridgeVTable, resolve_iter_reset,
-    resolve_register_conditional_multi_query, resolve_register_conditional_system,
-    resolve_register_multi_query, resolve_symbol_cstr, resolve_vtable_raw, validate_host_api,
+use crate::{
+    commands::ValidatedCommands,
+    host::Host,
+    instance::GuestInstance,
+    iter::ValidatedIter,
+    panic::{catch_guest_bool, catch_guest_result},
 };
 
-/// Maximum number of simultaneous queries supported per multi-query guest system without heap allocation.
-pub const MAX_GUEST_MULTI_QUERIES: usize = 8;
+struct ReleaseGuard<'a>(&'a AtomicBool);
 
-/// Macro to wrap a guest Rust system function into a C-ABI `DynamicSystemCallback`
-/// (`unsafe extern "C" fn`) that catches guest panics and returns [`FfiResult::PANIC_CAUGHT`].
-#[macro_export]
-macro_rules! wrap_system_callback {
-    ($vis:vis fn $wrapper_name:ident calls $inner_fn:path) => {
-        $vis unsafe extern "C" fn $wrapper_name(
-            iter: *mut $crate::RawChunkIter,
-            commands: *mut $crate::RawCommandQueue,
-            user_data: *mut ::core::ffi::c_void,
-        ) -> $crate::FfiResult {
-            $crate::catch_guest_panic(|| {
-                // SAFETY: Forwarding opaque handles received from the host executor.
-                unsafe { $inner_fn(iter, commands, user_data) }
-            })
+impl Drop for ReleaseGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Lock-free single-entry cell guarding `FnMut` system and `run_if` closures across FFI calls.
+///
+/// Uses an `Acquire`/`Release` [`AtomicBool`] re-entrancy flag instead of `std::sync::Mutex` so
+/// hot per-frame system dispatch avoids OS mutex operations while deterministically rejecting
+/// accidental re-entrant or concurrent entry without undefined behavior.
+pub struct ReentrantCell<T> {
+    in_use: AtomicBool,
+    value: UnsafeCell<T>,
+}
+
+// SAFETY: `T: Send` permits moving the cell across threads.
+unsafe impl<T: Send> Send for ReentrantCell<T> {}
+
+// SAFETY: Bevy's scheduler never runs the same system instance concurrently with itself across
+// worker threads; sequential ticks on different threads synchronize-with each other via both the
+// scheduler's thread-pool handoff and our `Acquire`/`Release` pair on `in_use`. Any buggy host or
+// re-entrant callback attempting overlapping entry observes `in_use == true` via atomic
+// `compare_exchange` and returns immediately without touching `UnsafeCell<T>`.
+unsafe impl<T: Send> Sync for ReentrantCell<T> {}
+
+impl<T> ReentrantCell<T> {
+    /// Wraps `value` in an unlocked [`ReentrantCell`].
+    #[inline]
+    pub const fn new(value: T) -> Self {
+        Self {
+            in_use: AtomicBool::new(false),
+            value: UnsafeCell::new(value),
         }
-    };
-}
+    }
 
-/// Macro to wrap a guest Rust multi-query system function into a C-ABI `MultiQuerySystemCallback`
-/// (`unsafe extern "C" fn`) that catches guest panics and returns [`FfiResult::PANIC_CAUGHT`].
-#[macro_export]
-macro_rules! wrap_multi_query_callback {
-    ($vis:vis fn $wrapper_name:ident calls $inner_fn:path) => {
-        $vis unsafe extern "C" fn $wrapper_name(
-            iters: *const *mut $crate::RawChunkIter,
-            iter_count: usize,
-            commands: *mut $crate::RawCommandQueue,
-            user_data: *mut ::core::ffi::c_void,
-        ) -> $crate::FfiResult {
-            $crate::catch_guest_panic(|| {
-                // SAFETY: Forwarding opaque handles received from the host executor.
-                unsafe { $inner_fn(iters, iter_count, commands, user_data) }
-            })
-        }
-    };
-}
-
-/// Macro to wrap a guest Rust run-condition function (`unsafe fn(*mut c_void) -> bool`) into a
-/// C-ABI `RunConditionCallback` (`unsafe extern "C" fn(*mut c_void) -> FfiBool`) that catches
-/// guest panics and returns [`FFI_BOOL_FALSE`] (`0`) instead of unwinding across `extern "C"`.
-#[macro_export]
-macro_rules! wrap_run_condition {
-    ($vis:vis fn $wrapper_name:ident calls $inner_fn:path) => {
-        $vis unsafe extern "C" fn $wrapper_name(
-            user_data: *mut ::core::ffi::c_void,
-        ) -> $crate::FfiBool {
-            match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                // SAFETY: Forwarding `user_data` received from the host executor.
-                let should_run: bool = unsafe { $inner_fn(user_data) };
-                $crate::rust_bool_to_ffi(should_run)
-            })) {
-                Ok(flag) => flag,
-                Err(_) => $crate::FFI_BOOL_FALSE,
-            }
-        }
-    };
-}
-
-/// Unforgeable validated handshake context produced from `bevy_abi_mod_init` arguments.
-#[derive(Clone, Copy)]
-pub struct ValidatedInit<'a> {
-    get_proc_address: GetProcAddressFn,
-    raw_host_api: *const HostApi,
-    host_api_val: HostApi,
-    host_context: *mut c_void,
-    cmd_vtable_ext: CommandBridgeVTableExt,
-    res_vtable: ResourceBridgeVTable,
-    iter_reset: Option<IterResetFn>,
-    register_multi_query: Option<RegisterMultiQuerySystemFn>,
-    register_conditional_system: Option<RegisterConditionalSystemFn>,
-    register_conditional_multi_query: Option<RegisterConditionalMultiQuerySystemFn>,
-    _marker: PhantomData<&'a HostApi>,
-}
-
-impl<'a> ValidatedInit<'a> {
-    /// Validates raw `bevy_abi_mod_init` arguments and resolves all host bridge VTables.
+    /// Acquires exclusive mutable access to `T` for the duration of `f`, returning `None` if this
+    /// cell is already executing on the current or another thread.
     ///
-    /// # Safety
-    /// - `get_proc_address` must be a valid host symbol-resolver function pointer.
-    /// - If `host_api` is non-null, it must point to an aligned [`HostApi`] prefix with at least 4
-    ///   readable bytes (`struct_size`) and, when `struct_size >= MIN_GUEST_APP_HOST_API_SIZE`,
-    ///   valid function pointers outliving all systems registered during this load session.
-    /// - If `host_context` is non-null, it must point to the host's active `bevy_abi_mod_init`
-    ///   context for `'a`.
-    pub unsafe fn from_raw(
-        get_proc_address: GetProcAddressFn,
-        host_api: *const HostApi,
-        host_context: *mut c_void,
-    ) -> Result<Self, FfiResult> {
-        // SAFETY: Caller guarantees `host_api` and `host_context` satisfy handshake invariants.
-        let host_api_val = unsafe { validate_host_api(host_api, host_context)? };
-
-        // SAFETY: Caller guarantees `get_proc_address` is a valid host symbol resolver.
-        let (
-            cmd_vtable_ext,
-            res_vtable,
-            iter_reset,
-            register_multi_query,
-            register_conditional_system,
-            register_conditional_multi_query,
-        ) = unsafe {
-            (
-                CommandBridgeVTableExt::resolve(get_proc_address),
-                ResourceBridgeVTable::resolve(get_proc_address),
-                resolve_iter_reset(get_proc_address),
-                resolve_register_multi_query(get_proc_address),
-                resolve_register_conditional_system(get_proc_address),
-                resolve_register_conditional_multi_query(get_proc_address),
-            )
-        };
-
-        Ok(Self {
-            get_proc_address,
-            raw_host_api: host_api,
-            host_api_val,
-            host_context,
-            cmd_vtable_ext,
-            res_vtable,
-            iter_reset,
-            register_multi_query,
-            register_conditional_system,
-            register_conditional_multi_query,
-            _marker: PhantomData,
-        })
-    }
-
-    /// Returns a reference to the validated [`HostApi`] table.
+    /// An RAII guard resets `in_use` to `false` with `Ordering::Release` even if `f` panics and
+    /// unwinds into [`catch_guest_result`] / [`catch_guest_bool`].
     #[inline]
-    pub fn host_api(&self) -> &HostApi {
-        &self.host_api_val
-    }
-
-    /// Returns the raw `host_context` pointer supplied to `bevy_abi_mod_init`.
-    #[inline]
-    pub fn host_context(&self) -> *mut c_void {
-        self.host_context
-    }
-
-    /// Returns the validated [`GetProcAddressFn`] symbol resolver.
-    #[inline]
-    pub fn get_proc_address(&self) -> GetProcAddressFn {
-        self.get_proc_address
-    }
-
-    /// Returns the pre-resolved [`CommandBridgeVTable`].
-    #[inline]
-    pub fn command_vtable(&self) -> CommandBridgeVTable {
-        self.cmd_vtable_ext.base
-    }
-
-    /// Returns the pre-resolved [`CommandBridgeVTableExt`].
-    #[inline]
-    pub fn command_vtable_ext(&self) -> CommandBridgeVTableExt {
-        self.cmd_vtable_ext
-    }
-
-    /// Returns the pre-resolved [`ResourceBridgeVTable`].
-    #[inline]
-    pub fn resource_vtable(&self) -> ResourceBridgeVTable {
-        self.res_vtable
-    }
-
-    /// Resolves a raw symbol pointer by nul-terminated name via `get_proc_address`.
-    #[inline]
-    pub fn resolve_symbol(&self, symbol_name: &CStr) -> *const c_void {
-        // SAFETY: `self.get_proc_address` was validated in `ValidatedInit::from_raw`.
-        unsafe { resolve_symbol_cstr(self.get_proc_address, symbol_name) }
-    }
-
-    /// Resolves a typed static component VTable reference (for example `c"Position_vtable"`).
-    ///
-    /// # Safety
-    /// Caller must ensure `V` matches the exact `#[repr(C)]` VTable layout exported by the host
-    /// under `symbol_name` and outlives `'a`.
-    #[inline]
-    pub unsafe fn resolve_vtable<V: Copy + 'static>(&self, symbol_name: &CStr) -> Option<&'a V> {
-        // SAFETY: `self.get_proc_address` was validated in `from_raw`; caller guarantees `V` layout.
-        unsafe { resolve_vtable_raw::<V>(self.get_proc_address, symbol_name) }
-    }
-
-    /// Registers a runtime dynamic component `T` under `name` on this host context.
-    #[inline]
-    pub fn register_component<T: 'static>(&self, name: &CStr) -> FfiResult {
-        // SAFETY: `self.raw_host_api` and `self.host_context` were validated in `ValidatedInit::from_raw`.
-        unsafe { register_runtime_component::<T>(self.raw_host_api, self.host_context, name) }
-    }
-
-    /// Extracts [`GuestInitHandles`] for closure registration helpers.
-    #[inline]
-    pub fn handles(&self) -> GuestInitHandles<'_> {
-        GuestInitHandles {
-            host_api: &self.host_api_val,
-            host_context: self.host_context,
-            cmd_vtable_ext: self.cmd_vtable_ext,
-            res_vtable: self.res_vtable,
-            iter_reset: self.iter_reset,
-            register_multi_query: self.register_multi_query,
-            register_conditional_system: self.register_conditional_system,
-            register_conditional_multi_query: self.register_conditional_multi_query,
+    pub fn try_with_mut<R>(&self, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+        if self
+            .in_use
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return None;
         }
+        let _guard = ReleaseGuard(&self.in_use);
+        // SAFETY: `compare_exchange` transitioned `in_use` from `false` to `true` with `Acquire`
+        // ordering, granting exclusive access to `self.value` until `_guard` drops (`Release`).
+        // Bevy's scheduler invariant ensures a single system instance is never scheduled
+        // concurrently with itself, and re-entrant entries fail `compare_exchange` above.
+        Some(f(unsafe { &mut *self.value.get() }))
+    }
+
+    /// Returns `true` if `try_with_mut` is currently active on this cell.
+    #[inline]
+    pub fn is_in_use(&self) -> bool {
+        self.in_use.load(Ordering::Acquire)
     }
 }
 
-/// Validated safe handles delivered to a single-query guest system closure trampoline.
+/// Validated per-tick system execution frame wrapping `*mut BamSystemCtx`, up to
+/// [`MAX_QUERIES_PER_SYSTEM`] disjoint [`ValidatedIter`] slots, and a lazy [`ValidatedCommands`] slot.
 pub struct ValidatedSystemInvocation<'a> {
-    /// Validated chunk iterator for this system execution.
-    pub iter: ValidatedIter<'a>,
-    /// Validated deferred command queue for this system execution.
-    pub commands: ValidatedCommandQueue<'a>,
-    /// Validated host API table.
-    pub host_api: &'a HostApi,
+    sys_ctx: *mut BamSystemCtx,
+    host: &'a Host,
+    total_query_count: usize,
+    user_query_count: usize,
+    resource_query_index: Option<usize>,
+    queries: [Option<ValidatedIter<'a>>; MAX_QUERIES_PER_SYSTEM],
+    empty_iter: ValidatedIter<'a>,
+    commands: Option<ValidatedCommands<'a>>,
 }
 
-/// Validated safe handles delivered to a multi-query guest system closure trampoline.
-pub struct ValidatedMultiQueryInvocation<'a> {
-    /// Array of validated chunk iterators (`0..iter_count` populated with `Some`).
-    pub iters: [Option<ValidatedIter<'a>>; MAX_GUEST_MULTI_QUERIES],
-    /// Number of active query iterators.
-    pub iter_count: usize,
-    /// Validated deferred command queue for this system execution.
-    pub commands: ValidatedCommandQueue<'a>,
-    /// Validated host API table.
-    pub host_api: &'a HostApi,
-    /// Pre-resolved resource bridge VTable.
-    pub res_vtable: ResourceBridgeVTable,
+impl<'a> ValidatedSystemInvocation<'a> {
+    /// Creates a new system execution frame over `sys_ctx` and `host`.
+    ///
+    /// # Safety
+    /// `sys_ctx` must be a non-null, active [`BamSystemCtx`] supplied by the host for the duration
+    /// of `'a` with `total_query_count <= MAX_QUERIES_PER_SYSTEM`.
+    pub unsafe fn from_raw(
+        sys_ctx: *mut BamSystemCtx,
+        host: &'a Host,
+        total_query_count: usize,
+        user_query_count: usize,
+        resource_query_index: Option<usize>,
+    ) -> Self {
+        let clamped_total = total_query_count.min(MAX_QUERIES_PER_SYSTEM);
+        let clamped_user = user_query_count.min(clamped_total);
+        Self {
+            sys_ctx,
+            host,
+            total_query_count: clamped_total,
+            user_query_count: clamped_user,
+            resource_query_index: resource_query_index.filter(|&idx| idx < clamped_total),
+            queries: [const { None }; MAX_QUERIES_PER_SYSTEM],
+            empty_iter: ValidatedIter::empty(host),
+            commands: None,
+        }
+    }
+
+    /// Returns the raw `*mut BamSystemCtx` pointer.
+    #[inline]
+    pub const fn as_raw_sys_ctx(&self) -> *mut BamSystemCtx {
+        self.sys_ctx
+    }
+
+    /// Returns the cached [`Host`] table for this mod instance.
+    #[inline]
+    pub const fn host(&self) -> &'a Host {
+        self.host
+    }
+
+    /// Returns the number of entity/explicit queries declared on this system (`0..=MAX_QUERIES_PER_SYSTEM`).
+    #[inline]
+    pub const fn query_count(&self) -> usize {
+        self.user_query_count
+    }
+
+    /// Returns the dedicated resource query index if system-level resources were declared.
+    #[inline]
+    pub const fn resource_query_index(&self) -> Option<usize> {
+        self.resource_query_index
+    }
+
+    /// Extracts validated query slot `index` (`0..total_query_count`) by value.
+    #[inline]
+    pub fn take_raw_query_slot(&mut self, index: usize) -> Option<ValidatedIter<'a>> {
+        if index >= self.total_query_count {
+            return None;
+        }
+        self.ensure_query_slot(index);
+        self.queries[index].take()
+    }
+
+    /// Fetches a [`ValidatedCommands`] buffer for this system invocation by value.
+    #[inline]
+    pub fn take_commands(&mut self) -> ValidatedCommands<'a> {
+        self.ensure_commands_slot();
+        self.commands
+            .take()
+            .unwrap_or_else(|| ValidatedCommands::empty(self.host))
+    }
+
+    #[inline]
+    fn ensure_query_slot(&mut self, index: usize) {
+        if index >= self.total_query_count || self.queries[index].is_some() {
+            return;
+        }
+        let iter = if self.sys_ctx.is_null() {
+            ValidatedIter::empty(self.host)
+        } else if let Some(sys_query_fn) = self.host.api().sys_query {
+            let mut raw_iter: *mut BamIter = core::ptr::null_mut();
+            // SAFETY: `self.sys_ctx` is active for `'a`, `index < total_query_count`, and
+            // `raw_iter` is writable stack storage.
+            let status = unsafe { sys_query_fn(self.sys_ctx, index, &mut raw_iter) };
+            if status.is_ok() && !raw_iter.is_null() {
+                // SAFETY: `raw_iter` was returned by `sys_query` for query `index` on `self.sys_ctx`.
+                unsafe { ValidatedIter::from_raw(raw_iter, self.host) }
+            } else {
+                ValidatedIter::empty(self.host)
+            }
+        } else {
+            ValidatedIter::empty(self.host)
+        };
+        self.queries[index] = Some(iter);
+    }
+
+    #[inline]
+    fn ensure_commands_slot(&mut self) {
+        if self.commands.is_some() {
+            return;
+        }
+        let cmds = if self.sys_ctx.is_null() {
+            ValidatedCommands::empty(self.host)
+        } else if let Some(sys_cmds_fn) = self.host.api().sys_commands {
+            let mut raw_cmds: *mut BamCommands = core::ptr::null_mut();
+            // SAFETY: `self.sys_ctx` is active for `'a` and `raw_cmds` is writable stack storage.
+            let status = unsafe { sys_cmds_fn(self.sys_ctx, &mut raw_cmds) };
+            if status.is_ok() && !raw_cmds.is_null() {
+                // SAFETY: `raw_cmds` was returned by `sys_commands` for `self.sys_ctx`.
+                unsafe { ValidatedCommands::from_raw(raw_cmds, self.host) }
+            } else {
+                ValidatedCommands::empty(self.host)
+            }
+        } else {
+            ValidatedCommands::empty(self.host)
+        };
+        self.commands = Some(cmds);
+    }
+
+    /// Borrows primary query `0` mutably (yielding an empty exhausted iterator if no entity query
+    /// was declared).
+    #[inline]
+    pub fn iter_mut(&mut self) -> &mut ValidatedIter<'a> {
+        if self.user_query_count == 0 {
+            return &mut self.empty_iter;
+        }
+        self.ensure_query_slot(0);
+        self.queries[0].as_mut().unwrap_or(&mut self.empty_iter)
+    }
+
+    /// Borrows declared query `index` (`0..query_count()`) mutably, returning `None` if out of range.
+    #[inline]
+    pub fn query_mut(&mut self, index: usize) -> Option<&mut ValidatedIter<'a>> {
+        if index >= self.user_query_count {
+            return None;
+        }
+        self.ensure_query_slot(index);
+        self.queries[index].as_mut()
+    }
+
+    /// Simultaneously borrows two distinct queries `idx_a` and `idx_b` (`None` if `idx_a == idx_b`
+    /// or either index is out of range).
+    pub fn queries_2_mut(
+        &mut self,
+        idx_a: usize,
+        idx_b: usize,
+    ) -> Option<(&mut ValidatedIter<'a>, &mut ValidatedIter<'a>)> {
+        if idx_a == idx_b || idx_a >= self.user_query_count || idx_b >= self.user_query_count {
+            return None;
+        }
+        self.ensure_query_slot(idx_a);
+        self.ensure_query_slot(idx_b);
+        if idx_a < idx_b {
+            let (left, right) = self.queries.split_at_mut(idx_b);
+            Some((left[idx_a].as_mut()?, right[0].as_mut()?))
+        } else {
+            let (left, right) = self.queries.split_at_mut(idx_a);
+            Some((right[0].as_mut()?, left[idx_b].as_mut()?))
+        }
+    }
+
+    /// Borrows the per-system [`ValidatedCommands`] buffer mutably.
+    #[inline]
+    pub fn commands_mut(&mut self) -> &mut ValidatedCommands<'a> {
+        self.ensure_commands_slot();
+        self.commands
+            .as_mut()
+            .expect("commands slot initialized by ensure_commands_slot")
+    }
+
+    /// Simultaneously borrows primary query `0` and the deferred [`ValidatedCommands`] buffer.
+    #[inline]
+    pub fn iter_and_commands_mut(
+        &mut self,
+    ) -> (&mut ValidatedIter<'a>, &mut ValidatedCommands<'a>) {
+        if self.user_query_count > 0 {
+            self.ensure_query_slot(0);
+        }
+        self.ensure_commands_slot();
+        let cmds = self
+            .commands
+            .as_mut()
+            .expect("commands slot initialized by ensure_commands_slot");
+        let iter = if self.user_query_count == 0 {
+            &mut self.empty_iter
+        } else {
+            self.queries[0].as_mut().unwrap_or(&mut self.empty_iter)
+        };
+        (iter, cmds)
+    }
+
+    /// Simultaneously borrows two distinct queries `idx_a` and `idx_b` alongside [`ValidatedCommands`].
+    pub fn queries_2_and_commands_mut(
+        &mut self,
+        idx_a: usize,
+        idx_b: usize,
+    ) -> Option<(
+        &mut ValidatedIter<'a>,
+        &mut ValidatedIter<'a>,
+        &mut ValidatedCommands<'a>,
+    )> {
+        if idx_a == idx_b || idx_a >= self.user_query_count || idx_b >= self.user_query_count {
+            return None;
+        }
+        self.ensure_query_slot(idx_a);
+        self.ensure_query_slot(idx_b);
+        self.ensure_commands_slot();
+        let cmds = self.commands.as_mut()?;
+        if idx_a < idx_b {
+            let (left, right) = self.queries.split_at_mut(idx_b);
+            Some((left[idx_a].as_mut()?, right[0].as_mut()?, cmds))
+        } else {
+            let (left, right) = self.queries.split_at_mut(idx_a);
+            Some((right[0].as_mut()?, left[idx_b].as_mut()?, cmds))
+        }
+    }
+
+    /// Borrows singleton resource `R` at declaration index `decl_index` (routing to the dedicated
+    /// system-level resource query if declared, or query `0` otherwise).
+    #[inline]
+    pub fn resource_checked<R: AbiPod>(
+        &mut self,
+        decl_index: usize,
+        expected_uuid: Option<ComponentUuid>,
+    ) -> Option<&R> {
+        let q_idx = self.resource_query_index.unwrap_or(0);
+        if q_idx >= self.total_query_count {
+            return None;
+        }
+        self.ensure_query_slot(q_idx);
+        self.queries[q_idx]
+            .as_ref()?
+            .resource_checked::<R>(decl_index, expected_uuid)
+    }
+
+    /// Mutably borrows singleton resource `R` at declaration index `decl_index` (routing to the
+    /// dedicated system-level resource query if declared, or query `0` otherwise).
+    #[inline]
+    pub fn resource_mut_checked<R: AbiPod>(
+        &mut self,
+        decl_index: usize,
+        expected_uuid: Option<ComponentUuid>,
+    ) -> Option<&mut R> {
+        let q_idx = self.resource_query_index.unwrap_or(0);
+        if q_idx >= self.total_query_count {
+            return None;
+        }
+        self.ensure_query_slot(q_idx);
+        self.queries[q_idx]
+            .as_mut()?
+            .resource_mut_checked::<R>(decl_index, expected_uuid)
+    }
 }
 
 struct SystemClosureState<F> {
-    host_api: HostApi,
-    cmd_vtable_ext: CommandBridgeVTableExt,
-    res_vtable: ResourceBridgeVTable,
-    iter_reset: Option<IterResetFn>,
-    callback: Mutex<F>,
+    host: Host,
+    total_query_count: usize,
+    user_query_count: usize,
+    resource_query_index: Option<usize>,
+    closure: ReentrantCell<F>,
 }
 
-unsafe extern "C" fn c_system_closure_trampoline<F>(
-    iter: *mut RawChunkIter,
-    commands: *mut RawCommandQueue,
+struct RunIfClosureState<R> {
+    host: Host,
+    closure: ReentrantCell<R>,
+}
+
+unsafe extern "C" fn system_closure_trampoline<F>(
+    sys_ctx: *mut BamSystemCtx,
     user_data: *mut c_void,
 ) -> FfiResult
 where
-    F: for<'a> FnMut(ValidatedSystemInvocation<'a>) -> FfiResult + Send + 'static,
+    F: FnMut(&mut ValidatedSystemInvocation<'_>) -> FfiResult + Send + 'static,
 {
-    catch_guest_panic(|| {
-        if user_data.is_null() {
+    catch_guest_result(|| {
+        if sys_ctx.is_null() || user_data.is_null() {
             return FfiResult::NULL_POINTER;
         }
-        // SAFETY: `user_data` points to an initialized `SystemClosureState<F>` owned by `GUEST_ALLOCATIONS`
-        // that remains alive until `bevy_abi_mod_shutdown` runs after all systems are deactivated.
+        // SAFETY: `user_data` was allocated via `GuestInstance::track_allocation` for
+        // `SystemClosureState<F>` and remains valid until `bevy_abi_mod_shutdown`.
         let state = unsafe { &*user_data.cast::<SystemClosureState<F>>() };
-        let Ok(mut cb_guard) = state.callback.try_lock() else {
+        let Some(result) = state.closure.try_with_mut(|func| {
+            // SAFETY: `sys_ctx` is non-null and active for the duration of this `BamSystemFn` call.
+            let mut invocation = unsafe {
+                ValidatedSystemInvocation::from_raw(
+                    sys_ctx,
+                    &state.host,
+                    state.total_query_count,
+                    state.user_query_count,
+                    state.resource_query_index,
+                )
+            };
+            func(&mut invocation)
+        }) else {
             return FfiResult::ACCESS_CONFLICT;
         };
-        let api = &state.host_api;
-        // SAFETY: `iter` and `commands` are scoped to this C-ABI system invocation and match `state`'s
-        // validated `HostApi` and resolved bridge VTables.
-        let (validated_iter, validated_commands) = unsafe {
-            (
-                ValidatedIter::with_bridges(iter, api, state.iter_reset, state.res_vtable),
-                ValidatedCommandQueue::with_ext(commands, state.cmd_vtable_ext),
-            )
-        };
-        (*cb_guard)(ValidatedSystemInvocation {
-            iter: validated_iter,
-            commands: validated_commands,
-            host_api: api,
-        })
+        result
     })
 }
 
-struct MultiQueryClosureState<F> {
-    host_api: HostApi,
-    cmd_vtable_ext: CommandBridgeVTableExt,
-    res_vtable: ResourceBridgeVTable,
-    iter_reset: Option<IterResetFn>,
-    callback: Mutex<F>,
-}
-
-unsafe extern "C" fn c_multi_query_closure_trampoline<F>(
-    iters: *const *mut RawChunkIter,
-    iter_count: usize,
-    commands: *mut RawCommandQueue,
-    user_data: *mut c_void,
-) -> FfiResult
+unsafe extern "C" fn run_if_closure_trampoline<R>(user_data: *mut c_void) -> FfiBool
 where
-    F: for<'a> FnMut(ValidatedMultiQueryInvocation<'a>) -> FfiResult + Send + 'static,
+    R: FnMut(&Host) -> bool + Send + 'static,
 {
-    catch_guest_panic(|| {
+    catch_guest_bool(|| {
         if user_data.is_null() {
-            return FfiResult::NULL_POINTER;
+            return FfiBool::FALSE;
         }
-        if iter_count > MAX_GUEST_MULTI_QUERIES {
-            return FfiResult::INVALID_COMPONENT;
-        }
-        if iter_count > 0 && iters.is_null() {
-            return FfiResult::NULL_POINTER;
-        }
-        // SAFETY: `user_data` points to an initialized `MultiQueryClosureState<F>` owned by `GUEST_ALLOCATIONS`.
-        let state = unsafe { &*user_data.cast::<MultiQueryClosureState<F>>() };
-        let Ok(mut cb_guard) = state.callback.try_lock() else {
-            return FfiResult::ACCESS_CONFLICT;
-        };
-        let api = &state.host_api;
-
-        let mut validated_iters: [Option<ValidatedIter<'_>>; MAX_GUEST_MULTI_QUERIES] =
-            core::array::from_fn(|_| None);
-        for (slot, item) in validated_iters.iter_mut().enumerate().take(iter_count) {
-            // SAFETY: `iters` is non-null and holds `iter_count` valid `RawChunkIter` handles for this call.
-            let raw_iter = unsafe { *iters.add(slot) };
-            // SAFETY: `raw_iter` belongs to query group `slot` of this system invocation.
-            *item =
-                Some(unsafe { ValidatedIter::for_multi_query(raw_iter, api, state.iter_reset) });
-        }
-
-        // SAFETY: `commands` is scoped to this C-ABI multi-query system invocation.
-        let validated_commands =
-            unsafe { ValidatedCommandQueue::with_ext(commands, state.cmd_vtable_ext) };
-
-        (*cb_guard)(ValidatedMultiQueryInvocation {
-            iters: validated_iters,
-            iter_count,
-            commands: validated_commands,
-            host_api: api,
-            res_vtable: state.res_vtable,
-        })
-    })
-}
-
-struct RunConditionClosureState<C> {
-    predicate: Mutex<C>,
-}
-
-unsafe extern "C" fn c_run_condition_closure_trampoline<C>(user_data: *mut c_void) -> FfiBool
-where
-    C: FnMut() -> bool + Send + 'static,
-{
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        if user_data.is_null() {
-            return FFI_BOOL_FALSE;
-        }
-        // SAFETY: `user_data` points to an initialized `RunConditionClosureState<C>` owned by `GUEST_ALLOCATIONS`.
-        let state = unsafe { &*user_data.cast::<RunConditionClosureState<C>>() };
-        let Ok(mut guard) = state.predicate.try_lock() else {
-            return FFI_BOOL_FALSE;
-        };
-        rust_bool_to_ffi((*guard)())
-    })) {
-        Ok(flag) => flag,
-        Err(_) => FFI_BOOL_FALSE,
-    }
-}
-
-/// Host context bundle used when registering guest closures.
-#[derive(Clone, Copy)]
-pub struct GuestInitHandles<'a> {
-    /// Validated host API table.
-    pub host_api: &'a HostApi,
-    /// Raw initialization context pointer supplied to `bevy_abi_mod_init`.
-    pub host_context: *mut c_void,
-    /// Pre-resolved command bridge VTable.
-    pub cmd_vtable_ext: CommandBridgeVTableExt,
-    /// Pre-resolved resource bridge VTable.
-    pub res_vtable: ResourceBridgeVTable,
-    /// Optional `iter_reset` symbol.
-    pub iter_reset: Option<IterResetFn>,
-    /// Optional `register_multi_query_system` symbol.
-    pub register_multi_query: Option<RegisterMultiQuerySystemFn>,
-    /// Optional `register_conditional_system` symbol.
-    pub register_conditional_system: Option<RegisterConditionalSystemFn>,
-    /// Optional `register_conditional_multi_query_system` symbol.
-    pub register_conditional_multi_query: Option<RegisterConditionalMultiQuerySystemFn>,
-}
-
-/// Registers a single-query guest closure with the host, staging its allocation on success.
-pub fn register_system_closure<F>(
-    handles: GuestInitHandles<'_>,
-    staged: &mut Vec<ErasedAllocation>,
-    name: &CStr,
-    queries: &[ComponentAccessDesc],
-    callback: F,
-) -> FfiResult
-where
-    F: for<'a> FnMut(ValidatedSystemInvocation<'a>) -> FfiResult + Send + 'static,
-{
-    let state = Box::new(SystemClosureState {
-        host_api: *handles.host_api,
-        cmd_vtable_ext: handles.cmd_vtable_ext,
-        res_vtable: handles.res_vtable,
-        iter_reset: handles.iter_reset,
-        callback: Mutex::new(callback),
-    });
-    let state_ptr = Box::into_raw(state);
-
-    let desc = SystemDescriptor {
-        struct_size: core::mem::size_of::<SystemDescriptor>() as u32,
-        name: name.as_ptr(),
-        queries: if queries.is_empty() {
-            core::ptr::null()
-        } else {
-            queries.as_ptr()
-        },
-        query_count: queries.len(),
-        callback: c_system_closure_trampoline::<F>,
-        user_data: state_ptr.cast::<c_void>(),
-    };
-
-    // SAFETY: `handles.host_context` and `desc` are valid for the duration of `register_system`.
-    let status = unsafe { (handles.host_api.register_system)(handles.host_context, &desc) };
-    if status.is_ok() {
-        staged.push(ErasedAllocation::from_raw_parts(
-            state_ptr.cast::<c_void>(),
-            drop_boxed_allocation::<SystemClosureState<F>>,
-        ));
-    } else {
-        // SAFETY: `state_ptr` was just allocated via `Box::into_raw` above and was not retained.
-        drop(unsafe { Box::from_raw(state_ptr) });
-    }
-    status
-}
-
-/// Registers a conditional single-query guest closure with the host, staging its allocations on success.
-pub fn register_conditional_system_closure<F, C>(
-    handles: GuestInitHandles<'_>,
-    staged: &mut Vec<ErasedAllocation>,
-    name: &CStr,
-    queries: &[ComponentAccessDesc],
-    run_if: C,
-    callback: F,
-) -> FfiResult
-where
-    C: FnMut() -> bool + Send + 'static,
-    F: for<'a> FnMut(ValidatedSystemInvocation<'a>) -> FfiResult + Send + 'static,
-{
-    let state = Box::new(SystemClosureState {
-        host_api: *handles.host_api,
-        cmd_vtable_ext: handles.cmd_vtable_ext,
-        res_vtable: handles.res_vtable,
-        iter_reset: handles.iter_reset,
-        callback: Mutex::new(callback),
-    });
-    let state_ptr = Box::into_raw(state);
-
-    let cond_state = Box::new(RunConditionClosureState {
-        predicate: Mutex::new(run_if),
-    });
-    let cond_ptr = Box::into_raw(cond_state);
-
-    let base = SystemDescriptor::new(
-        name.as_ptr(),
-        if queries.is_empty() {
-            core::ptr::null()
-        } else {
-            queries.as_ptr()
-        },
-        queries.len(),
-        c_system_closure_trampoline::<F>,
-        state_ptr.cast::<c_void>(),
-    );
-    let desc = base.with_run_if(
-        c_run_condition_closure_trampoline::<C>,
-        cond_ptr.cast::<c_void>(),
-    );
-
-    let status = if let Some(reg_cond) = handles.register_conditional_system {
-        // SAFETY: `handles.host_context` and `desc` are valid for the duration of `reg_cond`.
-        unsafe { reg_cond(handles.host_context, &desc) }
-    } else {
-        // SAFETY: `ConditionalSystemDescriptor` starts with the exact `SystemDescriptor` prefix.
-        unsafe { (handles.host_api.register_system)(handles.host_context, desc.as_base_ptr()) }
-    };
-
-    if status.is_ok() {
-        staged.push(ErasedAllocation::from_raw_parts(
-            state_ptr.cast::<c_void>(),
-            drop_boxed_allocation::<SystemClosureState<F>>,
-        ));
-        staged.push(ErasedAllocation::from_raw_parts(
-            cond_ptr.cast::<c_void>(),
-            drop_boxed_allocation::<RunConditionClosureState<C>>,
-        ));
-    } else {
-        // SAFETY: Neither `state_ptr` nor `cond_ptr` was retained by the host on registration error.
-        unsafe {
-            drop(Box::from_raw(cond_ptr));
-            drop(Box::from_raw(state_ptr));
-        }
-    }
-    status
-}
-
-/// Registers a multi-query guest closure with the host, staging its allocation on success.
-pub fn register_multi_query_closure<F>(
-    handles: GuestInitHandles<'_>,
-    staged: &mut Vec<ErasedAllocation>,
-    name: &CStr,
-    query_groups: &[&[ComponentAccessDesc]],
-    callback: F,
-) -> FfiResult
-where
-    F: for<'a> FnMut(ValidatedMultiQueryInvocation<'a>) -> FfiResult + Send + 'static,
-{
-    if query_groups.len() > MAX_GUEST_MULTI_QUERIES {
-        return FfiResult::INVALID_COMPONENT;
-    }
-    let Some(register_mq) = handles.register_multi_query else {
-        return FfiResult::NULL_POINTER;
-    };
-
-    let mut raw_specs = [QuerySpec {
-        queries: core::ptr::null(),
-        query_count: 0,
-    }; MAX_GUEST_MULTI_QUERIES];
-    for (slot, group) in raw_specs.iter_mut().zip(query_groups.iter()) {
-        *slot = QuerySpec {
-            queries: if group.is_empty() {
-                core::ptr::null()
-            } else {
-                group.as_ptr()
-            },
-            query_count: group.len(),
-        };
-    }
-
-    let state = Box::new(MultiQueryClosureState {
-        host_api: *handles.host_api,
-        cmd_vtable_ext: handles.cmd_vtable_ext,
-        res_vtable: handles.res_vtable,
-        iter_reset: handles.iter_reset,
-        callback: Mutex::new(callback),
-    });
-    let state_ptr = Box::into_raw(state);
-
-    let desc = MultiQuerySystemDescriptor {
-        struct_size: core::mem::size_of::<MultiQuerySystemDescriptor>() as u32,
-        name: name.as_ptr(),
-        query_specs: if query_groups.is_empty() {
-            core::ptr::null()
-        } else {
-            raw_specs.as_ptr()
-        },
-        query_spec_count: query_groups.len(),
-        callback: c_multi_query_closure_trampoline::<F>,
-        user_data: state_ptr.cast::<c_void>(),
-    };
-
-    // SAFETY: `handles.host_context` and `desc` (backed by stack `raw_specs`) remain valid for the call.
-    let status = unsafe { register_mq(handles.host_context, &desc) };
-    if status.is_ok() {
-        staged.push(ErasedAllocation::from_raw_parts(
-            state_ptr.cast::<c_void>(),
-            drop_boxed_allocation::<MultiQueryClosureState<F>>,
-        ));
-    } else {
-        // SAFETY: `state_ptr` was just allocated above and was not retained by the host.
-        drop(unsafe { Box::from_raw(state_ptr) });
-    }
-    status
-}
-
-/// Registers a conditional multi-query guest closure with the host, staging its allocations on success.
-pub fn register_conditional_multi_query_closure<F, C>(
-    handles: GuestInitHandles<'_>,
-    staged: &mut Vec<ErasedAllocation>,
-    name: &CStr,
-    query_groups: &[&[ComponentAccessDesc]],
-    run_if: C,
-    callback: F,
-) -> FfiResult
-where
-    C: FnMut() -> bool + Send + 'static,
-    F: for<'a> FnMut(ValidatedMultiQueryInvocation<'a>) -> FfiResult + Send + 'static,
-{
-    if query_groups.len() > MAX_GUEST_MULTI_QUERIES {
-        return FfiResult::INVALID_COMPONENT;
-    }
-    if handles.register_conditional_multi_query.is_none() && handles.register_multi_query.is_none()
-    {
-        return FfiResult::NULL_POINTER;
-    }
-
-    let mut raw_specs = [QuerySpec {
-        queries: core::ptr::null(),
-        query_count: 0,
-    }; MAX_GUEST_MULTI_QUERIES];
-    for (slot, group) in raw_specs.iter_mut().zip(query_groups.iter()) {
-        *slot = QuerySpec {
-            queries: if group.is_empty() {
-                core::ptr::null()
-            } else {
-                group.as_ptr()
-            },
-            query_count: group.len(),
-        };
-    }
-
-    let state = Box::new(MultiQueryClosureState {
-        host_api: *handles.host_api,
-        cmd_vtable_ext: handles.cmd_vtable_ext,
-        res_vtable: handles.res_vtable,
-        iter_reset: handles.iter_reset,
-        callback: Mutex::new(callback),
-    });
-    let state_ptr = Box::into_raw(state);
-
-    let cond_state = Box::new(RunConditionClosureState {
-        predicate: Mutex::new(run_if),
-    });
-    let cond_ptr = Box::into_raw(cond_state);
-
-    let base = MultiQuerySystemDescriptor::new(
-        name.as_ptr(),
-        if query_groups.is_empty() {
-            core::ptr::null()
-        } else {
-            raw_specs.as_ptr()
-        },
-        query_groups.len(),
-        c_multi_query_closure_trampoline::<F>,
-        state_ptr.cast::<c_void>(),
-    );
-    let desc = base.with_run_if(
-        c_run_condition_closure_trampoline::<C>,
-        cond_ptr.cast::<c_void>(),
-    );
-
-    let status = if let Some(reg_cond_mq) = handles.register_conditional_multi_query {
-        // SAFETY: `handles.host_context` and `desc` remain valid for the duration of `reg_cond_mq`.
-        unsafe { reg_cond_mq(handles.host_context, &desc) }
-    } else if let Some(reg_mq) = handles.register_multi_query {
-        // SAFETY: `ConditionalMultiQuerySystemDescriptor` starts with `MultiQuerySystemDescriptor`.
-        unsafe { reg_mq(handles.host_context, desc.as_base_ptr()) }
-    } else {
-        FfiResult::NULL_POINTER
-    };
-
-    if status.is_ok() {
-        staged.push(ErasedAllocation::from_raw_parts(
-            state_ptr.cast::<c_void>(),
-            drop_boxed_allocation::<MultiQueryClosureState<F>>,
-        ));
-        staged.push(ErasedAllocation::from_raw_parts(
-            cond_ptr.cast::<c_void>(),
-            drop_boxed_allocation::<RunConditionClosureState<C>>,
-        ));
-    } else {
-        // SAFETY: Neither `state_ptr` nor `cond_ptr` was retained by the host on registration error.
-        unsafe {
-            drop(Box::from_raw(cond_ptr));
-            drop(Box::from_raw(state_ptr));
-        }
-    }
-    status
-}
-
-/// Validates C-ABI handshake arguments inside [`catch_guest_panic`] and invokes `f` with the
-/// resulting [`ValidatedInit`].
-///
-/// # Safety
-/// Must be called with valid handshake arguments supplied to `bevy_abi_mod_init`.
-pub unsafe fn run_with_validated_init<F>(
-    get_proc_address: GetProcAddressFn,
-    host_api: *const HostApi,
-    host_context: *mut c_void,
-    f: F,
-) -> FfiResult
-where
-    F: FnOnce(ValidatedInit<'_>) -> FfiResult,
-{
-    catch_guest_panic(|| {
-        // SAFETY: Caller guarantees `get_proc_address`, `host_api`, and `host_context` satisfy
-        // the `bevy_abi_mod_init` handshake invariants.
-        let init = unsafe { ValidatedInit::from_raw(get_proc_address, host_api, host_context) };
-        match init {
-            Ok(validated) => f(validated),
-            Err(err) => err,
+        // SAFETY: `user_data` was allocated via `GuestInstance::track_allocation` for
+        // `RunIfClosureState<R>` and remains valid until `bevy_abi_mod_shutdown`.
+        let state = unsafe { &*user_data.cast::<RunIfClosureState<R>>() };
+        match state
+            .closure
+            .try_with_mut(|pred| FfiBool::from_bool(pred(&state.host)))
+        {
+            Some(flag) => flag,
+            None => FfiBool::FALSE,
         }
     })
 }
 
-/// Bridge trait implemented by the safe SDK's `GuestApp` to expose raw `unsafe` handshake helpers.
-pub trait ValidatedAppAdapter<'a>: Sized {
-    /// Constructs `Self` from an unforgeable [`ValidatedInit`].
-    fn from_validated_init(init: ValidatedInit<'a>) -> Self;
-    /// Borrows the underlying [`ValidatedInit`].
-    fn as_validated_init(&self) -> &ValidatedInit<'a>;
-}
-
-/// Raw `unsafe` handshake and VTable resolution extension for `GuestApp`.
-pub trait GuestAppRawExt<'a>: ValidatedAppAdapter<'a> {
-    /// Constructs `Self` from the raw C-ABI arguments passed to `bevy_abi_mod_init`.
-    ///
-    /// # Safety
-    /// - `get_proc_address` must be a valid host symbol-resolver function pointer.
-    /// - If non-null, `host_api` must point to an aligned [`HostApi`] prefix outliving all
-    ///   registered system executions for this mod load session.
-    /// - If non-null, `host_context` must point to the host's initialization context for `'a`.
-    unsafe fn from_raw(
-        get_proc_address: GetProcAddressFn,
-        host_api: *const HostApi,
-        host_context: *mut c_void,
-    ) -> Result<Self, FfiResult> {
-        // SAFETY: Forwarding caller's C-ABI handshake invariants to `ValidatedInit::from_raw`.
-        let init = unsafe { ValidatedInit::from_raw(get_proc_address, host_api, host_context)? };
-        Ok(Self::from_validated_init(init))
-    }
-
-    /// Resolves a typed static component VTable reference (for example `c"Position_vtable"`).
-    ///
-    /// # Safety
-    /// Caller must ensure `V` matches the exact `#[repr(C)]` VTable layout exported by the host
-    /// under `symbol_name` and outlives `'a`.
-    #[inline]
-    unsafe fn resolve_vtable<V: Copy + 'static>(&self, symbol_name: &CStr) -> Option<&'a V> {
-        // SAFETY: Forwarding caller's VTable layout guarantee to `ValidatedInit::resolve_vtable`.
-        unsafe { self.as_validated_init().resolve_vtable::<V>(symbol_name) }
-    }
-}
-
-impl<'a, T: ValidatedAppAdapter<'a>> GuestAppRawExt<'a> for T {}
-
-/// Lifecycle adapter enabling transactional C-ABI initialization for a safe `GuestApp` builder type.
-pub trait GuestAppLifecycle {
-    /// Builder type parameterized by the initialization lifetime.
-    type App<'a>;
-
-    /// Constructs the builder from an unforgeable [`ValidatedInit`].
-    fn build_from_validated<'a>(init: ValidatedInit<'a>) -> Self::App<'a>;
-
-    /// Commits staged allocations upon successful initialization.
-    fn commit_app(app: Self::App<'_>);
-}
-
-/// Executes a [`GuestAppLifecycle`] setup closure inside [`catch_guest_panic`], committing staged
-/// allocations on [`FfiResult::OK`] and rolling them back on error or panic.
-///
-/// # Safety
-/// Must be called with valid handshake arguments supplied to `bevy_abi_mod_init`.
-pub unsafe fn run_lifecycle_init<L, F>(
-    get_proc_address: GetProcAddressFn,
-    host_api: *const HostApi,
-    host_context: *mut c_void,
-    build_fn: F,
-) -> FfiResult
+/// Allocates a standalone `(BamSystemFn, *mut c_void)` closure pair inside `instance` (used by
+/// [`register_system_closure`] and direct re-entrancy / panic unit tests).
+pub fn allocate_system_trampoline<F>(
+    instance: &mut GuestInstance,
+    total_query_count: usize,
+    user_query_count: usize,
+    resource_query_index: Option<usize>,
+    closure: F,
+) -> (BamSystemFn, *mut c_void)
 where
-    L: GuestAppLifecycle,
-    F: for<'a> FnOnce(&mut L::App<'a>) -> FfiResult,
+    F: FnMut(&mut ValidatedSystemInvocation<'_>) -> FfiResult + Send + 'static,
 {
-    // SAFETY: Forwarding C-ABI handshake arguments to `run_with_validated_init`.
-    unsafe {
-        run_with_validated_init(get_proc_address, host_api, host_context, |init| {
-            let mut app = L::build_from_validated(init);
-            let status = build_fn(&mut app);
-            if status.is_ok() {
-                L::commit_app(app);
-            }
-            status
-        })
-    }
+    let host = *instance.host();
+    let raw = instance.track_allocation(Box::new(SystemClosureState {
+        host,
+        total_query_count,
+        user_query_count,
+        resource_query_index,
+        closure: ReentrantCell::new(closure),
+    }));
+    (system_closure_trampoline::<F>, raw.cast::<c_void>())
 }
 
-/// Extension trait providing `GuestApp::run_init` over raw C-ABI handshake arguments.
-pub trait GuestAppInitExt: GuestAppLifecycle + Sized {
-    /// Validates raw handshake arguments inside [`catch_guest_panic`], runs `build_fn`, and commits
-    /// staged allocations on [`FfiResult::OK`].
-    ///
-    /// # Safety
-    /// Must be called with valid handshake arguments supplied to `bevy_abi_mod_init`.
+/// Validated `(BamRunIfFn, *mut c_void)` pair allocated inside a [`GuestInstance`].
+pub struct PreparedRunIf {
+    pub(crate) func: BamRunIfFn,
+    pub(crate) user_data: *mut c_void,
+}
+
+impl PreparedRunIf {
+    /// Allocates a panic-safe, re-entrancy-guarded `run_if` predicate inside `instance`.
     #[inline]
-    unsafe fn run_init<F>(
-        get_proc_address: GetProcAddressFn,
-        host_api: *const HostApi,
-        host_context: *mut c_void,
-        build_fn: F,
-    ) -> FfiResult
+    pub fn new<R>(instance: &mut GuestInstance, predicate: R) -> Self
     where
-        F: for<'a> FnOnce(&mut Self::App<'a>) -> FfiResult,
+        R: FnMut(&Host) -> bool + Send + 'static,
     {
-        // SAFETY: Forwarding C-ABI handshake invariants to `run_lifecycle_init`.
-        unsafe { run_lifecycle_init::<Self, F>(get_proc_address, host_api, host_context, build_fn) }
+        let (func, user_data) = allocate_run_if_trampoline(instance, predicate);
+        Self { func, user_data }
+    }
+
+    /// Wraps a caller-managed raw `(BamRunIfFn, user_data)` pair.
+    ///
+    /// # Safety
+    /// `func(user_data)` must be valid to invoke for the lifetime of the target `World` without
+    /// unwinding across `extern "C"`.
+    #[inline]
+    pub const unsafe fn from_raw(func: BamRunIfFn, user_data: *mut c_void) -> Self {
+        Self { func, user_data }
+    }
+
+    /// Returns the underlying `(BamRunIfFn, *mut c_void)` tuple.
+    #[inline]
+    pub const fn into_raw(self) -> (BamRunIfFn, *mut c_void) {
+        (self.func, self.user_data)
     }
 }
 
-impl<T: GuestAppLifecycle> GuestAppInitExt for T {}
+/// Allocates a standalone `(BamRunIfFn, *mut c_void)` closure pair inside `instance`.
+pub fn allocate_run_if_trampoline<R>(
+    instance: &mut GuestInstance,
+    predicate: R,
+) -> (BamRunIfFn, *mut c_void)
+where
+    R: FnMut(&Host) -> bool + Send + 'static,
+{
+    let host = *instance.host();
+    let raw = instance.track_allocation(Box::new(RunIfClosureState {
+        host,
+        closure: ReentrantCell::new(predicate),
+    }));
+    (run_if_closure_trampoline::<R>, raw.cast::<c_void>())
+}
+
+/// Descriptor assembly configuration passed from safe `SystemBuilder` to [`register_system_closure`].
+pub struct SystemRegistrationConfig<'a> {
+    /// NUL-terminated UTF-8 system name.
+    pub name: &'a CStr,
+    /// User-declared entity/resource query clauses (`<= MAX_QUERIES_PER_SYSTEM`).
+    pub user_queries: &'a [&'a [BamTermDesc]],
+    /// Optional system-level singleton resource terms (`resource_read` / `resource_write` on `SystemBuilder`).
+    pub system_resources: &'a [BamTermDesc],
+    /// Target Bevy schedule.
+    pub schedule: ScheduleId,
+    /// `BAM_SYSTEM_FLAG_*` bitmask.
+    pub flags: u32,
+    /// Named system sets that this system must execute after.
+    pub after: &'a [&'a CStr],
+    /// Named system sets that this system must execute before.
+    pub before: &'a [&'a CStr],
+}
+
+struct OwnedDescriptorStorage {
+    name: CString,
+    _term_vecs: Vec<Box<[BamTermDesc]>>,
+    queries: Box<[BamQueryDesc]>,
+    _after_names: Vec<CString>,
+    after_ptrs: Box<[*const c_char]>,
+    _before_names: Vec<CString>,
+    before_ptrs: Box<[*const c_char]>,
+}
+
+// SAFETY: Every raw pointer inside `queries`, `after_ptrs`, and `before_ptrs` points exclusively
+// into heap-allocated `Box<[BamTermDesc]>` and `CString` buffers owned by the same struct and
+// never mutated after construction.
+unsafe impl Send for OwnedDescriptorStorage {}
+
+/// Validates and registers a unified [`BamSystemDesc`] on `load_ctx`, tracking all closure state
+/// and owned descriptor buffers inside `instance`.
+///
+/// # Safety
+/// `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance` during
+/// `bevy_abi_mod_init`.
+pub unsafe fn register_system_closure<F>(
+    instance: &mut GuestInstance,
+    load_ctx: *mut BamLoadCtx,
+    config: &SystemRegistrationConfig<'_>,
+    run_if: Option<(BamRunIfFn, *mut c_void)>,
+    closure: F,
+) -> FfiResult
+where
+    F: FnMut(&mut ValidatedSystemInvocation<'_>) -> FfiResult + Send + 'static,
+{
+    if load_ctx.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    if config.name.to_bytes().is_empty() {
+        return FfiResult::INVALID_ARGUMENT;
+    }
+    if config.name.to_str().is_err() {
+        return FfiResult::INVALID_UTF8;
+    }
+    if !config.schedule.is_valid() {
+        return FfiResult::INVALID_ARGUMENT;
+    }
+    if (config.flags & !BAM_SYSTEM_KNOWN_FLAGS) != 0 {
+        return FfiResult::UNSUPPORTED;
+    }
+
+    let has_sys_resources = !config.system_resources.is_empty();
+    let total_query_count = config.user_queries.len() + usize::from(has_sys_resources);
+    if total_query_count > MAX_QUERIES_PER_SYSTEM {
+        return FfiResult::CAPACITY_EXCEEDED;
+    }
+    if config.system_resources.len() > MAX_TERMS_PER_QUERY {
+        return FfiResult::CAPACITY_EXCEEDED;
+    }
+
+    for terms in config.user_queries {
+        if terms.len() > MAX_TERMS_PER_QUERY {
+            return FfiResult::CAPACITY_EXCEEDED;
+        }
+        for term in *terms {
+            let status = term.validate();
+            if !status.is_ok() {
+                return status;
+            }
+        }
+    }
+    for term in config.system_resources {
+        let status = term.validate();
+        if !status.is_ok() {
+            return status;
+        }
+    }
+    for set_name in config.after.iter().chain(config.before.iter()) {
+        if set_name.to_bytes().is_empty() {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        if set_name.to_str().is_err() {
+            return FfiResult::INVALID_UTF8;
+        }
+    }
+
+    let mut term_vecs: Vec<Box<[BamTermDesc]>> = Vec::with_capacity(total_query_count);
+    let mut query_descs: Vec<BamQueryDesc> = Vec::with_capacity(total_query_count);
+    for terms in config.user_queries {
+        if terms.is_empty() {
+            query_descs.push(BamQueryDesc::empty());
+        } else {
+            let boxed_terms: Box<[BamTermDesc]> = (*terms).into();
+            let ptr = boxed_terms.as_ptr();
+            let len = boxed_terms.len();
+            term_vecs.push(boxed_terms);
+            query_descs.push(BamQueryDesc::new(ptr, len));
+        }
+    }
+
+    let resource_query_index = if has_sys_resources {
+        let idx = query_descs.len();
+        let boxed_res: Box<[BamTermDesc]> = config.system_resources.into();
+        let ptr = boxed_res.as_ptr();
+        let len = boxed_res.len();
+        term_vecs.push(boxed_res);
+        query_descs.push(BamQueryDesc::new(ptr, len));
+        Some(idx)
+    } else {
+        None
+    };
+
+    let mut after_names: Vec<CString> = Vec::with_capacity(config.after.len());
+    let mut after_ptrs: Vec<*const c_char> = Vec::with_capacity(config.after.len());
+    for set_name in config.after {
+        let cstr = CString::from(*set_name);
+        after_ptrs.push(cstr.as_ptr());
+        after_names.push(cstr);
+    }
+
+    let mut before_names: Vec<CString> = Vec::with_capacity(config.before.len());
+    let mut before_ptrs: Vec<*const c_char> = Vec::with_capacity(config.before.len());
+    for set_name in config.before {
+        let cstr = CString::from(*set_name);
+        before_ptrs.push(cstr.as_ptr());
+        before_names.push(cstr);
+    }
+
+    let storage = OwnedDescriptorStorage {
+        name: CString::from(config.name),
+        _term_vecs: term_vecs,
+        queries: query_descs.into_boxed_slice(),
+        _after_names: after_names,
+        after_ptrs: after_ptrs.into_boxed_slice(),
+        _before_names: before_names,
+        before_ptrs: before_ptrs.into_boxed_slice(),
+    };
+    let raw_storage = instance.track_allocation(Box::new(storage));
+    // SAFETY: `raw_storage` was just allocated by `instance.track_allocation` and remains pinned
+    // on the heap until `instance` drops.
+    let storage_ref = unsafe { &*raw_storage };
+    let name_ptr = storage_ref.name.as_ptr();
+    let queries_ptr = if storage_ref.queries.is_empty() {
+        core::ptr::null()
+    } else {
+        storage_ref.queries.as_ptr()
+    };
+    let after_ptr = if storage_ref.after_ptrs.is_empty() {
+        core::ptr::null()
+    } else {
+        storage_ref.after_ptrs.as_ptr()
+    };
+    let before_ptr = if storage_ref.before_ptrs.is_empty() {
+        core::ptr::null()
+    } else {
+        storage_ref.before_ptrs.as_ptr()
+    };
+
+    let (callback_fn, user_data) = allocate_system_trampoline(
+        instance,
+        total_query_count,
+        config.user_queries.len(),
+        resource_query_index,
+        closure,
+    );
+
+    let mut desc = BamSystemDesc::new(
+        name_ptr,
+        queries_ptr,
+        total_query_count,
+        callback_fn,
+        user_data,
+    )
+    .with_flags(config.flags)
+    .with_schedule(config.schedule)
+    .with_after(after_ptr, config.after.len())
+    .with_before(before_ptr, config.before.len());
+
+    if let Some((run_if_fn, run_if_data)) = run_if {
+        desc = desc.with_run_if(run_if_fn, run_if_data);
+    }
+
+    let validation = desc.validate();
+    if !validation.is_ok() {
+        return validation;
+    }
+
+    let Some(register_fn) = instance.host().api().register_system else {
+        return FfiResult::NULL_POINTER;
+    };
+    // SAFETY: `load_ctx` is active per caller contract and `desc` passed full validation with all
+    // pointed-to strings, term slices, and closures owned by `instance`.
+    unsafe { register_fn(load_ctx, &desc) }
+}
+
+/// Generates a panic-safe [`BamSystemFn`] `extern "C"` wrapper around a Rust system function
+/// `fn(*mut BamSystemCtx, *mut c_void) -> FfiResult`.
+#[macro_export]
+macro_rules! wrap_system_callback {
+    ($wrapper_name:ident, $inner_fn:path) => {
+        /// Panic-safe `extern "C"` [`bevy_abi_mod_sys::BamSystemFn`] trampoline.
+        ///
+        /// # Safety
+        /// `sys_ctx` must be a valid active [`bevy_abi_mod_sys::BamSystemCtx`] pointer for the
+        /// duration of the invocation.
+        pub unsafe extern "C" fn $wrapper_name(
+            sys_ctx: *mut $crate::BamSystemCtx,
+            user_data: *mut ::core::ffi::c_void,
+        ) -> $crate::FfiResult {
+            $crate::catch_guest_result(|| {
+                if sys_ctx.is_null() {
+                    return $crate::FfiResult::NULL_POINTER;
+                }
+                // SAFETY: Caller guarantees `sys_ctx` and `user_data` satisfy `$inner_fn` contract.
+                unsafe { $inner_fn(sys_ctx, user_data) }
+            })
+        }
+    };
+}
+
+/// Generates a panic-safe [`BamRunIfFn`] `extern "C"` wrapper around a Rust predicate function
+/// `fn(*mut c_void) -> FfiBool`.
+#[macro_export]
+macro_rules! wrap_run_condition {
+    ($wrapper_name:ident, $inner_fn:path) => {
+        /// Panic-safe `extern "C"` [`bevy_abi_mod_sys::BamRunIfFn`] trampoline.
+        ///
+        /// # Safety
+        /// `user_data` must satisfy the safety contract of `$inner_fn`.
+        pub unsafe extern "C" fn $wrapper_name(
+            user_data: *mut ::core::ffi::c_void,
+        ) -> $crate::FfiBool {
+            $crate::catch_guest_bool(|| {
+                // SAFETY: Caller guarantees `user_data` satisfies `$inner_fn` contract.
+                unsafe { $inner_fn(user_data) }
+            })
+        }
+    };
+}

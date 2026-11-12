@@ -1,1133 +1,305 @@
-#![allow(
-    clippy::undocumented_unsafe_blocks,
-    clippy::ptr_as_ptr,
-    clippy::cast_ptr_alignment,
-    clippy::transmute_ptr_to_ptr,
-    unreachable_pub
-)]
-//! Soundness, Split-Borrow Ergonomics, and Lifecycle Cleanup Tests for `bevy_abi_mod_guest`
-//!
-//! Covers:
-//! 1. Disjoint multi-column read/write split borrows (`Chunk`, `GuestChunkIter::read_write`,
-//!    `write_2`, `columns_mut`, `split_slices`, `entities_and_column_mut`, `entities_and_read_write`).
-//! 2. Soundness rejection of duplicate column indices `(0, 0)` and overlapping host byte ranges
-//!    so aliasing `&mut` slices is impossible in safe Rust.
-//! 3. `entities_slice` and `Chunk::entities` bounds, alignment, null, wrapping, and empty-chunk safety.
-//! 4. `GuestChunkIter::reset` and `MultiQueryContext` nested multi-query iteration.
-//! 5. `GuestApp` / `GuestPlugin` / `SystemContext` automatic `user_data` cleanup on `shutdown`
-//!    with `Drop` counter assertions (`0` leaks), transactional rollback on failed/panicking `init`,
-//!    and re-entrant callback borrow protection (`FfiResult::ACCESS_CONFLICT`).
-//! 6. Cross-language asymmetric C99 (`tests/asymmetric_c_mod`) and Rust (`tests/asymmetric_rust_mod`)
-//!    build & ABI layout verification.
+//! Split-borrow, multi-query nested iteration, and per-World `GuestPlugin` / `export_mod!`
+//! lifecycle isolation tests (`L-02`, `L-08`, `G-02`).
 
-#![deny(unsafe_op_in_unsafe_fn)]
-#![deny(improper_ctypes_definitions)]
+mod common;
 
-use core::ffi::{CStr, c_char, c_void};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use core::ffi::CStr;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use bevy_abi_mod_guest::prelude::*;
+use common::{MockChunkData, MockHostWorld, RecordedCommand};
 
-/// Serializes tests that exercise the process-global `GUEST_ALLOCATIONS` registry.
-static LIFECYCLE_TEST_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(not(feature = "derive"))]
+macro_rules! impl_pod_no_derive {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            // SAFETY: Plain `#[repr(C)]` test struct with fixed-width POD fields.
+            unsafe impl RawInsertable for $ty {}
+            // SAFETY: Plain `#[repr(C)]` test struct with fixed-width POD fields.
+            unsafe impl AbiPod for $ty {}
+        )*
+    };
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "derive", derive(AbiPod))]
 struct Pos {
     x: f32,
     y: f32,
 }
 
-unsafe impl FfiLayout for Pos {}
-unsafe impl AbiPod for Pos {}
-
 impl GuestComponent for Pos {
-    const NAME: &'static CStr = c"Pos";
+    const NAME: &'static CStr = c"sim::Pos";
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "derive", derive(AbiPod))]
 struct Vel {
-    vx: f32,
-    vy: f32,
+    dx: f32,
+    dy: f32,
 }
-
-unsafe impl FfiLayout for Vel {}
-unsafe impl AbiPod for Vel {}
 
 impl GuestComponent for Vel {
-    const NAME: &'static CStr = c"Vel";
+    const NAME: &'static CStr = c"sim::Vel";
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Shield {
-    hp: i32,
+#[cfg_attr(feature = "derive", derive(AbiPod))]
+struct Accel {
+    ax: f32,
+    ay: f32,
 }
 
-unsafe impl FfiLayout for Shield {}
-unsafe impl AbiPod for Shield {}
-
-impl GuestComponent for Shield {
-    const NAME: &'static CStr = c"Shield";
+impl GuestComponent for Accel {
+    const NAME: &'static CStr = c"sim::Accel";
 }
 
-// ============================================================================
-// Mock Multi-Chunk / Multi-Column Host Harness
-// ============================================================================
-
-struct MockColumn {
-    ptr: *mut u8,
-    stride: usize,
-    mutable_allowed: bool,
-    changed_rows: Vec<usize>,
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "derive", derive(AbiPod))]
+struct LocalCounter {
+    ticks: u32,
 }
 
-struct MockChunk {
-    count: usize,
-    entities_ptr: *const FfiEntity,
-    columns: Vec<MockColumn>,
+#[cfg(not(feature = "derive"))]
+impl_pod_no_derive!(Pos, Vel, Accel, LocalCounter);
+
+impl GuestComponent for LocalCounter {
+    // Unqualified name: must auto-prefix with `<manifest_name>::LocalCounter` (`C-10`)!
+    const NAME: &'static CStr = c"LocalCounter";
 }
 
-struct MockIterState {
-    chunks: Vec<MockChunk>,
-    cursor: usize,
-    reset_calls: usize,
+static SHUTDOWN_EVENTS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+static NEXT_WORLD_TAG: AtomicUsize = AtomicUsize::new(1);
+
+struct IsolatedPlugin {
+    world_tag: u32,
+    local_ticks: Arc<AtomicUsize>,
 }
 
-unsafe extern "C" fn mock_iter_next_chunk(iter: *mut RawChunkIter) -> usize {
-    if iter.is_null() {
-        return 0;
-    }
-    // SAFETY: Test harness passes `MockIterState` cast to `*mut RawChunkIter`.
-    let state = unsafe { &mut *(iter as *mut MockIterState) };
-    if state.cursor >= state.chunks.len() {
-        return 0;
-    }
-    let idx = state.cursor;
-    state.cursor += 1;
-    state.chunks[idx].count
-}
-
-unsafe extern "C" fn mock_iter_reset(iter: *mut RawChunkIter) -> FfiResult {
-    if iter.is_null() {
-        return FfiResult::NULL_POINTER;
-    }
-    // SAFETY: Test harness passes `MockIterState` cast to `*mut RawChunkIter`.
-    let state = unsafe { &mut *(iter as *mut MockIterState) };
-    state.cursor = 0;
-    state.reset_calls += 1;
-    FfiResult::OK
-}
-
-unsafe extern "C" fn mock_iter_column_readonly(
-    iter: *const RawChunkIter,
-    query_index: usize,
-) -> *const u8 {
-    if iter.is_null() {
-        return core::ptr::null();
-    }
-    // SAFETY: Test harness passes `MockIterState` cast to `*const RawChunkIter`.
-    let state = unsafe { &*(iter as *const MockIterState) };
-    let Some(chunk_idx) = state.cursor.checked_sub(1) else {
-        return core::ptr::null();
-    };
-    state
-        .chunks
-        .get(chunk_idx)
-        .and_then(|c| c.columns.get(query_index))
-        .map(|col| col.ptr as *const u8)
-        .unwrap_or(core::ptr::null())
-}
-
-unsafe extern "C" fn mock_iter_column_mutable(
-    iter: *mut RawChunkIter,
-    query_index: usize,
-) -> *mut u8 {
-    if iter.is_null() {
-        return core::ptr::null_mut();
-    }
-    // SAFETY: Test harness passes `MockIterState` cast to `*mut RawChunkIter`.
-    let state = unsafe { &mut *(iter as *mut MockIterState) };
-    let Some(chunk_idx) = state.cursor.checked_sub(1) else {
-        return core::ptr::null_mut();
-    };
-    state
-        .chunks
-        .get_mut(chunk_idx)
-        .and_then(|c| c.columns.get_mut(query_index))
-        .and_then(|col| {
-            if col.mutable_allowed {
-                Some(col.ptr)
-            } else {
-                None
-            }
-        })
-        .unwrap_or(core::ptr::null_mut())
-}
-
-unsafe extern "C" fn mock_iter_mark_changed(
-    iter: *mut RawChunkIter,
-    query_index: usize,
-    row_index: usize,
-) -> FfiResult {
-    if iter.is_null() {
-        return FfiResult::NULL_POINTER;
-    }
-    // SAFETY: Test harness passes `MockIterState` cast to `*mut RawChunkIter`.
-    let state = unsafe { &mut *(iter as *mut MockIterState) };
-    if let Some(chunk_idx) = state.cursor.checked_sub(1) {
-        if let Some(col) = state
-            .chunks
-            .get_mut(chunk_idx)
-            .and_then(|c| c.columns.get_mut(query_index))
-        {
-            col.changed_rows.push(row_index);
-            return FfiResult::OK;
-        }
-    }
-    FfiResult::INTERNAL_ERROR
-}
-
-unsafe extern "C" fn mock_iter_entities(iter: *const RawChunkIter) -> *const FfiEntity {
-    if iter.is_null() {
-        return core::ptr::null();
-    }
-    // SAFETY: Test harness passes `MockIterState` cast to `*const RawChunkIter`.
-    let state = unsafe { &*(iter as *const MockIterState) };
-    let Some(chunk_idx) = state.cursor.checked_sub(1) else {
-        return core::ptr::null();
-    };
-    state
-        .chunks
-        .get(chunk_idx)
-        .map(|c| c.entities_ptr)
-        .unwrap_or(core::ptr::null())
-}
-
-unsafe extern "C" fn mock_iter_column_stride(
-    iter: *const RawChunkIter,
-    query_index: usize,
-) -> usize {
-    if iter.is_null() {
-        return 0;
-    }
-    // SAFETY: Test harness passes `MockIterState` cast to `*const RawChunkIter`.
-    let state = unsafe { &*(iter as *const MockIterState) };
-    let Some(chunk_idx) = state.cursor.checked_sub(1) else {
-        return 0;
-    };
-    state
-        .chunks
-        .get(chunk_idx)
-        .and_then(|c| c.columns.get(query_index))
-        .map(|col| col.stride)
-        .unwrap_or(0)
-}
-
-unsafe extern "C" fn noop_register_system(
-    _host_context: *mut c_void,
-    _descriptor: *const SystemDescriptor,
-) -> FfiResult {
-    FfiResult::OK
-}
-
-unsafe extern "C" fn noop_register_component(
-    _host_context: *mut c_void,
-    _descriptor: *const ModComponentDescriptor,
-) -> FfiResult {
-    FfiResult::OK
-}
-
-fn mock_host_api() -> HostApi {
-    HostApi {
-        struct_size: core::mem::size_of::<HostApi>() as u32,
-        abi_version: ABI_VERSION_PACKED,
-        register_system: noop_register_system,
-        iter_next_chunk: mock_iter_next_chunk,
-        iter_column_readonly: mock_iter_column_readonly,
-        iter_column_mutable: mock_iter_column_mutable,
-        iter_mark_changed: mock_iter_mark_changed,
-        iter_entities: mock_iter_entities,
-        iter_column_stride: mock_iter_column_stride,
-        register_component: noop_register_component,
-    }
-}
-
-// ============================================================================
-// 1. Disjoint Multi-Column Split Borrow Tests
-// ============================================================================
-
-#[test]
-fn test_chunk_disjoint_read_write_and_entities_simultaneous_borrow() {
-    let api = mock_host_api();
-    let entities = [FfiEntity(101), FfiEntity(202), FfiEntity(303)];
-    let mut positions = [
-        Pos { x: 1.0, y: 2.0 },
-        Pos { x: 3.0, y: 4.0 },
-        Pos { x: 5.0, y: 6.0 },
-    ];
-    let velocities = [
-        Vel { vx: 10.0, vy: 20.0 },
-        Vel { vx: 30.0, vy: 40.0 },
-        Vel { vx: 50.0, vy: 60.0 },
-    ];
-
-    let mut state = MockIterState {
-        chunks: vec![MockChunk {
-            count: 3,
-            entities_ptr: entities.as_ptr(),
-            columns: vec![
-                MockColumn {
-                    ptr: positions.as_mut_ptr() as *mut u8,
-                    stride: core::mem::size_of::<Pos>(),
-                    mutable_allowed: true,
-                    changed_rows: Vec::new(),
-                },
-                MockColumn {
-                    ptr: velocities.as_ptr() as *mut u8,
-                    stride: core::mem::size_of::<Vel>(),
-                    mutable_allowed: false,
-                    changed_rows: Vec::new(),
-                },
-            ],
-        }],
-        cursor: 0,
-        reset_calls: 0,
-    };
-
-    let mut iter =
-        unsafe { GuestChunkIter::new(&mut state as *mut MockIterState as *mut RawChunkIter, &api) };
-    let mut seen_entities = Vec::new();
-
-    while let Some(mut chunk) = iter.next_chunk_view() {
-        let len = chunk.len();
-        assert_eq!(len, 3);
-        assert!(!chunk.is_empty());
-
-        let (ents, vel_slice, pos_slice) = chunk
-            .entities_and_read_write::<Vel, Pos>(1, 0)
-            .expect("disjoint read col 1 + write col 0 + entities must succeed");
-
-        assert_eq!(ents.len(), 3);
-        for i in 0..len {
-            seen_entities.push(ents[i]);
-            pos_slice[i].x += vel_slice[i].vx;
-            pos_slice[i].y += vel_slice[i].vy;
-        }
-    }
-
-    assert_eq!(seen_entities, entities);
-    assert_eq!(
-        positions,
-        [
-            Pos { x: 11.0, y: 22.0 },
-            Pos { x: 33.0, y: 44.0 },
-            Pos { x: 55.0, y: 66.0 },
-        ]
-    );
-}
-
-#[test]
-fn test_columns_mut_3_way_and_split_slices_disjoint_borrows() {
-    let api = mock_host_api();
-    let mut positions = [Pos { x: 1.0, y: 2.0 }, Pos { x: 3.0, y: 4.0 }];
-    let mut velocities = [Vel { vx: 0.5, vy: 1.5 }, Vel { vx: 2.5, vy: 3.5 }];
-    let mut shields = [Shield { hp: 10 }, Shield { hp: 20 }];
-
-    let mut state = MockIterState {
-        chunks: vec![MockChunk {
-            count: 2,
-            entities_ptr: core::ptr::null(),
-            columns: vec![
-                MockColumn {
-                    ptr: positions.as_mut_ptr() as *mut u8,
-                    stride: core::mem::size_of::<Pos>(),
-                    mutable_allowed: true,
-                    changed_rows: Vec::new(),
-                },
-                MockColumn {
-                    ptr: velocities.as_mut_ptr() as *mut u8,
-                    stride: core::mem::size_of::<Vel>(),
-                    mutable_allowed: true,
-                    changed_rows: Vec::new(),
-                },
-                MockColumn {
-                    ptr: shields.as_mut_ptr() as *mut u8,
-                    stride: core::mem::size_of::<Shield>(),
-                    mutable_allowed: true,
-                    changed_rows: Vec::new(),
-                },
-            ],
-        }],
-        cursor: 0,
-        reset_calls: 0,
-    };
-
-    let mut iter = unsafe {
-        GuestChunkIter::with_reset(
-            &mut state as *mut MockIterState as *mut RawChunkIter,
-            &api,
-            Some(mock_iter_reset),
-        )
-    };
-
-    // Pass 1: 3 simultaneous mutable columns via `columns_mut` + `into_typed_slice`
-    {
-        let mut chunk = iter.next_chunk_view().expect("chunk 0 present");
-        let [pos_raw, vel_raw, sh_raw] = chunk
-            .columns_mut([0, 1, 2])
-            .expect("3 distinct mutable columns must succeed");
-
-        let pos = pos_raw.into_typed_slice::<Pos>().unwrap();
-        let vel = vel_raw.into_typed_slice::<Vel>().unwrap();
-        let sh = sh_raw.into_typed_slice::<Shield>().unwrap();
-
-        for i in 0..2 {
-            pos[i].x += vel[i].vx;
-            vel[i].vy *= 2.0;
-            sh[i].hp += 5;
-        }
-    }
-    assert!(iter.next_chunk_view().is_none());
-
-    // Pass 2: reset iterator and test `split_slices::<1, 2>` (entities + 1 read + 2 write)
-    assert_eq!(iter.reset(), FfiResult::OK);
-    {
-        let mut chunk = iter.next_chunk_view().expect("chunk 0 present after reset");
-        let (_ents, [vel_ro], [pos_rw, sh_rw]) = chunk
-            .split_slices([1], [0, 2])
-            .expect("read [1] + write [0, 2] must succeed");
-
-        let vel = vel_ro.as_typed_slice::<Vel>().unwrap();
-        let pos = pos_rw.into_typed_slice::<Pos>().unwrap();
-        let sh = sh_rw.into_typed_slice::<Shield>().unwrap();
-
-        for i in 0..2 {
-            pos[i].y += vel[i].vy;
-            sh[i].hp += 1;
-        }
-    }
-
-    assert_eq!(positions, [Pos { x: 1.5, y: 5.0 }, Pos { x: 5.5, y: 11.0 }]);
-    assert_eq!(shields, [Shield { hp: 16 }, Shield { hp: 26 }]);
-}
-
-// ============================================================================
-// 2. Duplicate Column & Overlapping Byte-Range Rejection Tests
-// ============================================================================
-
-#[test]
-fn test_rejects_duplicate_column_indices_preventing_mutable_aliasing() {
-    let api = mock_host_api();
-    let entities = [FfiEntity(1), FfiEntity(2)];
-    let mut positions = [Pos { x: 1.0, y: 2.0 }, Pos { x: 3.0, y: 4.0 }];
-    let mut velocities = [Vel { vx: 5.0, vy: 6.0 }, Vel { vx: 7.0, vy: 8.0 }];
-
-    let mut state = MockIterState {
-        chunks: vec![MockChunk {
-            count: 2,
-            entities_ptr: entities.as_ptr(),
-            columns: vec![
-                MockColumn {
-                    ptr: positions.as_mut_ptr() as *mut u8,
-                    stride: core::mem::size_of::<Pos>(),
-                    mutable_allowed: true,
-                    changed_rows: Vec::new(),
-                },
-                MockColumn {
-                    ptr: velocities.as_mut_ptr() as *mut u8,
-                    stride: core::mem::size_of::<Vel>(),
-                    mutable_allowed: true,
-                    changed_rows: Vec::new(),
-                },
-            ],
-        }],
-        cursor: 0,
-        reset_calls: 0,
-    };
-
-    let mut iter =
-        unsafe { GuestChunkIter::new(&mut state as *mut MockIterState as *mut RawChunkIter, &api) };
-    let mut chunk = iter.next_chunk_view().expect("chunk must exist");
-
-    // Duplicate mutable index (0, 0) MUST return None
-    assert!(chunk.write_2::<Pos, Pos>(0, 0).is_none());
-    assert!(chunk.columns_mut([0, 0]).is_none());
-    assert!(chunk.columns_mut([0, 1, 0]).is_none());
-
-    // Read + Write on same column index (0, 0) or (1, 1) MUST return None
-    assert!(chunk.read_write::<Pos, Pos>(0, 0).is_none());
-    assert!(chunk.read_write::<Vel, Vel>(1, 1).is_none());
-    assert!(chunk.entities_and_read_write::<Pos, Pos>(0, 0).is_none());
-    assert!(chunk.split_slices([0, 1], [1]).is_none());
-    assert!(chunk.split_slices([0], [1, 1]).is_none());
-
-    // Duplicate shared reads [0, 0] + disjoint write [1] IS sound (`&[T]` is Copy/shared)
-    let (ents, [r0_a, r0_b], [w1]) = chunk
-        .split_slices([0, 0], [1])
-        .expect("duplicate readonly indices with disjoint write must be allowed");
-    assert_eq!(ents, &entities);
-    assert_eq!(r0_a.as_typed_slice::<Pos>(), r0_b.as_typed_slice::<Pos>());
-    assert_eq!(w1.into_typed_slice::<Vel>().unwrap().len(), 2);
-}
-
-#[test]
-fn test_rejects_overlapping_host_byte_ranges_even_with_distinct_indices() {
-    let api = mock_host_api();
-    // Craft a single raw buffer where buggy/hostile host maps column 0, column 1, and entities
-    // to overlapping regions despite distinct column indices!
-    let mut backing = [0u64; 8];
-    let base_ptr = backing.as_mut_ptr() as *mut u8;
-    // Partial overlap at byte offset +8 (8 bytes into a 16-byte 2-element Pos column)
-    let overlapping_col_ptr = unsafe { base_ptr.add(8) };
-
-    let mut state = MockIterState {
-        chunks: vec![MockChunk {
-            count: 2,
-            entities_ptr: base_ptr as *const FfiEntity,
-            columns: vec![
-                MockColumn {
-                    ptr: base_ptr,
-                    stride: core::mem::size_of::<Pos>(), // 8 bytes * 2 = 16 bytes [base..base+16)
-                    mutable_allowed: true,
-                    changed_rows: Vec::new(),
-                },
-                MockColumn {
-                    ptr: overlapping_col_ptr,
-                    stride: core::mem::size_of::<Vel>(), // 8 bytes * 2 = 16 bytes [base+8..base+24)
-                    mutable_allowed: true,
-                    changed_rows: Vec::new(),
-                },
-            ],
-        }],
-        cursor: 0,
-        reset_calls: 0,
-    };
-
-    let mut iter =
-        unsafe { GuestChunkIter::new(&mut state as *mut MockIterState as *mut RawChunkIter, &api) };
-    let mut chunk = iter.next_chunk_view().expect("chunk exists");
-
-    // Distinct indices (0, 1) with overlapping memory ranges MUST be rejected!
-    assert!(chunk.write_2::<Pos, Vel>(0, 1).is_none());
-    assert!(chunk.read_write::<Vel, Pos>(1, 0).is_none());
-    assert!(chunk.columns_mut([0, 1]).is_none());
-    assert!(chunk.split_slices([1], [0]).is_none());
-
-    // Entities array overlaps mutable column 0 -> must reject simultaneous borrow!
-    assert!(chunk.entities_and_column_mut::<Pos>(0).is_none());
-    assert!(chunk.entities_and_read_write::<Vel, Pos>(1, 0).is_none());
-}
-
-// ============================================================================
-// 3. Entities Slice Bounds, Alignment, Wrapping & Empty Chunk Tests
-// ============================================================================
-
-#[test]
-fn test_entities_slice_defensive_bounds_and_empty_chunks() {
-    let api = mock_host_api();
-    let valid_entities = [FfiEntity(7), FfiEntity(8)];
-    let unaligned_buf = [0u64; 4];
-    let unaligned_entities_ptr =
-        unsafe { (unaligned_buf.as_ptr() as *const u8).add(1) } as *const FfiEntity;
-    let wrapping_entities_ptr = core::ptr::without_provenance::<FfiEntity>(usize::MAX - 3);
-
-    let huge_count = (isize::MAX as usize / core::mem::size_of::<FfiEntity>()) + 1;
-    let mut state = MockIterState {
-        chunks: vec![
-            // Chunk 0: valid entities
-            MockChunk {
-                count: 2,
-                entities_ptr: valid_entities.as_ptr(),
-                columns: Vec::new(),
-            },
-            // Chunk 1: null entities pointer
-            MockChunk {
-                count: 2,
-                entities_ptr: core::ptr::null(),
-                columns: Vec::new(),
-            },
-            // Chunk 2: misaligned entities pointer
-            MockChunk {
-                count: 2,
-                entities_ptr: unaligned_entities_ptr,
-                columns: Vec::new(),
-            },
-            // Chunk 3: address-space wrapping entities pointer
-            MockChunk {
-                count: 2,
-                entities_ptr: wrapping_entities_ptr,
-                columns: Vec::new(),
-            },
-            // Chunk 4: oversized count exceeding `isize::MAX` bytes
-            MockChunk {
-                count: huge_count,
-                entities_ptr: valid_entities.as_ptr(),
-                columns: Vec::new(),
-            },
-        ],
-        cursor: 0,
-        reset_calls: 0,
-    };
-
-    // Null RawChunkIter handle safety
-    let mut null_iter = unsafe { GuestChunkIter::new(core::ptr::null_mut(), &api) };
-    assert_eq!(null_iter.next_chunk(), 0);
-    assert!(null_iter.next_chunk_view().is_none());
-    assert!(null_iter.entities_slice().is_empty());
-    assert_eq!(null_iter.reset(), FfiResult::NULL_POINTER);
-
-    let mut iter =
-        unsafe { GuestChunkIter::new(&mut state as *mut MockIterState as *mut RawChunkIter, &api) };
-
-    // Before `next_chunk()`, `current_len == 0` -> empty slice
-    assert!(iter.entities_slice().is_empty());
-
-    // Chunk 0: valid
-    let c0 = iter.next_chunk();
-    assert_eq!(c0, 2);
-    assert_eq!(iter.entities_slice(), &valid_entities);
-
-    // Chunk 1: null pointer -> `&[]`
-    let chunk1 = iter.next_chunk_view().unwrap();
-    assert!(chunk1.entities().is_empty());
-
-    // Chunk 2: misaligned pointer -> `&[]`
-    let chunk2 = iter.next_chunk_view().unwrap();
-    assert!(chunk2.entities().is_empty());
-
-    // Chunk 3: wrapping pointer -> `&[]`
-    let chunk3 = iter.next_chunk_view().unwrap();
-    assert!(chunk3.entities().is_empty());
-
-    // Chunk 4: oversized count exceeding `isize::MAX` bytes must return empty slice without UB
-    let c4 = iter.next_chunk();
-    assert_eq!(c4, huge_count);
-    assert!(iter.entities_slice().is_empty());
-
-    // End of iteration
-    assert!(iter.next_chunk_view().is_none());
-    assert!(iter.entities_slice().is_empty());
-    // Without `IterResetFn` configured, `reset()` returns `NULL_POINTER`
-    assert_eq!(iter.reset(), FfiResult::NULL_POINTER);
-}
-
-// ============================================================================
-// 4. GuestApp, MultiQueryContext, Automatic Shutdown Cleanup & Drop Tests
-// ============================================================================
-
-#[derive(Clone)]
-struct DropTracker {
-    id: &'static str,
-    live_counter: Arc<AtomicUsize>,
-    drop_order: Arc<Mutex<Vec<&'static str>>>,
-}
-
-impl DropTracker {
-    fn new(
-        id: &'static str,
-        live_counter: &Arc<AtomicUsize>,
-        drop_order: &Arc<Mutex<Vec<&'static str>>>,
-    ) -> Self {
-        live_counter.fetch_add(1, Ordering::SeqCst);
+impl Default for IsolatedPlugin {
+    fn default() -> Self {
+        let tag = NEXT_WORLD_TAG.fetch_add(1, Ordering::SeqCst) as u32;
         Self {
-            id,
-            live_counter: Arc::clone(live_counter),
-            drop_order: Arc::clone(drop_order),
+            world_tag: tag,
+            local_ticks: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
 
-impl Drop for DropTracker {
-    fn drop(&mut self) {
-        self.live_counter.fetch_sub(1, Ordering::SeqCst);
-        self.drop_order
+impl GuestPlugin for IsolatedPlugin {
+    const NAME: &'static CStr = c"isolated_plugin";
+    const VERSION: &'static CStr = c"0.2.0";
+
+    fn build(&mut self, app: &mut GuestApp<'_>) -> FfiResult {
+        let counter_h = match app.register_component::<LocalCounter>() {
+            Ok(h) => h,
+            Err(e) => return e,
+        };
+        let ticks = Arc::clone(&self.local_ticks);
+        let tag = self.world_tag;
+
+        app.system(c"tick_world")
+            .query(|q| q.write_handle(counter_h))
+            .build(move |ctx| {
+                ticks.fetch_add(1, Ordering::SeqCst);
+                let (iter, cmds) = ctx.iter_and_commands();
+                while let Some(mut chunk) = iter.next_chunk_view() {
+                    let (entities, counters) = chunk
+                        .entities_and_column_mut::<LocalCounter>(0)
+                        .expect("entities + mutable LocalCounter");
+                    for i in 0..counters.len() {
+                        counters[i].ticks += tag;
+                        if counters[i].ticks > 100 {
+                            let _ = cmds.despawn(entities[i]);
+                        }
+                    }
+                }
+            })
+    }
+
+    fn on_shutdown(&mut self) {
+        let total = self.local_ticks.load(Ordering::SeqCst) as u32;
+        SHUTDOWN_EVENTS
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(self.id);
+            .unwrap()
+            .push(self.world_tag * 1000 + total);
     }
 }
 
-struct MockHostWorld {
-    registered_single: Vec<(String, DynamicSystemCallback, *mut c_void)>,
-    registered_multi: Vec<(String, MultiQuerySystemCallback, *mut c_void, usize)>,
-    fail_registration_after: Option<usize>,
-    spawn_counter: u64,
-}
-
-impl MockHostWorld {
-    fn new() -> Self {
-        Self {
-            registered_single: Vec::new(),
-            registered_multi: Vec::new(),
-            fail_registration_after: None,
-            spawn_counter: 500,
-        }
-    }
-}
-
-unsafe extern "C" fn world_register_system(
-    host_context: *mut c_void,
-    descriptor: *const SystemDescriptor,
-) -> FfiResult {
-    if host_context.is_null() || descriptor.is_null() {
-        return FfiResult::NULL_POINTER;
-    }
-    // SAFETY: Test harness passes `&mut MockHostWorld` as `host_context` and valid `descriptor`.
-    let world = unsafe { &mut *(host_context as *mut MockHostWorld) };
-    if let Some(limit) = world.fail_registration_after {
-        if world.registered_single.len() >= limit {
-            return FfiResult::INVALID_COMPONENT;
-        }
-    }
-    let desc = unsafe { &*descriptor };
-    let name = unsafe { CStr::from_ptr(desc.name) }
-        .to_string_lossy()
-        .into_owned();
-    world
-        .registered_single
-        .push((name, desc.callback, desc.user_data));
-    FfiResult::OK
-}
-
-unsafe extern "C" fn world_register_multi_query(
-    host_context: *mut c_void,
-    descriptor: *const MultiQuerySystemDescriptor,
-) -> FfiResult {
-    if host_context.is_null() || descriptor.is_null() {
-        return FfiResult::NULL_POINTER;
-    }
-    // SAFETY: Test harness passes `&mut MockHostWorld` and valid `MultiQuerySystemDescriptor`.
-    let world = unsafe { &mut *(host_context as *mut MockHostWorld) };
-    let desc = unsafe { &*descriptor };
-    let name = unsafe { CStr::from_ptr(desc.name) }
-        .to_string_lossy()
-        .into_owned();
-    world
-        .registered_multi
-        .push((name, desc.callback, desc.user_data, desc.query_spec_count));
-    FfiResult::OK
-}
-
-unsafe extern "C" fn mock_cmd_spawn(queue: *mut RawCommandQueue) -> FfiEntity {
-    if queue.is_null() {
-        return FfiEntity(0);
-    }
-    // SAFETY: Test passes `&mut MockHostWorld` as `RawCommandQueue`.
-    let world = unsafe { &mut *(queue as *mut MockHostWorld) };
-    world.spawn_counter += 1;
-    FfiEntity(world.spawn_counter)
-}
-
-unsafe extern "C" fn mock_get_proc_address(symbol: *const c_char) -> *const c_void {
-    if symbol.is_null() {
-        return core::ptr::null();
-    }
-    // SAFETY: Caller supplies nul-terminated symbol string.
-    let sym = unsafe { CStr::from_ptr(symbol) };
-    if sym == c"host_iter_reset" {
-        mock_iter_reset as *const c_void
-    } else if sym == c"host_register_multi_query_system" {
-        world_register_multi_query as *const c_void
-    } else if sym == c"host_cmd_spawn_empty" {
-        mock_cmd_spawn as *const c_void
-    } else {
-        core::ptr::null()
-    }
-}
+// Export real ABI v0.2 C entry points in this integration test binary (`L-02`, `L-08`).
+export_mod!(plugin: IsolatedPlugin);
 
 #[test]
-fn test_guest_app_zero_leak_shutdown_and_lifo_drop_order() {
-    let _guard = LIFECYCLE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    cleanup_registered_guest_state();
+fn export_mod_manifest_and_multi_world_instance_isolation() {
+    SHUTDOWN_EVENTS.lock().unwrap().clear();
+    NEXT_WORLD_TAG.store(1, Ordering::SeqCst);
 
-    let live_count = Arc::new(AtomicUsize::new(0));
-    let drop_order = Arc::new(Mutex::new(Vec::new()));
+    // 1. Validate `bevy_abi_mod_manifest()` metadata (`L-08`).
+    // SAFETY: `bevy_abi_mod_manifest` is side-effect free and returns a valid static `BamManifest`.
+    let manifest_ptr = unsafe { bevy_abi_mod_manifest() };
+    assert!(!manifest_ptr.is_null());
+    // SAFETY: `manifest_ptr` is non-null and points to static `BamManifest`.
+    let manifest = unsafe { &*manifest_ptr };
+    assert_eq!(manifest.validate(), FfiResult::OK);
+    // SAFETY: `manifest.name` and `manifest.version` are NUL-terminated static C strings.
+    let name_cstr = unsafe { CStr::from_ptr(manifest.name) };
+    // SAFETY: `manifest.version` is a NUL-terminated static C string.
+    let ver_cstr = unsafe { CStr::from_ptr(manifest.version) };
+    assert_eq!(name_cstr, c"isolated_plugin");
+    assert_eq!(ver_cstr, c"0.2.0");
 
-    let mut api = mock_host_api();
-    api.register_system = world_register_system;
-    let mut world = MockHostWorld::new();
+    // 2. Load the SAME exported `.cdylib` entry points into TWO independent `MockHostWorld`s simultaneously (`L-02`).
+    let mut world_a = MockHostWorld::new();
+    let mut world_b = MockHostWorld::new();
 
-    let live_clone = Arc::clone(&live_count);
-    let order_clone = Arc::clone(&drop_order);
+    let mut inst_a = core::ptr::null_mut();
+    let mut inst_b = core::ptr::null_mut();
 
-    let init_status = unsafe {
-        GuestApp::run_init(
-            mock_get_proc_address,
-            &api,
-            core::ptr::addr_of_mut!(world) as *mut c_void,
-            move |app| {
-                let raw_ctx = app.alloc_user_data(DropTracker::new(
-                    "alloc_user_data_1",
-                    &live_clone,
-                    &order_clone,
-                ));
-                assert!(!raw_ctx.is_null());
+    // SAFETY: Valid mock host pointers for World A.
+    let status_a =
+        unsafe { bevy_abi_mod_init(world_a.api_ptr(), world_a.raw_ptr().cast(), &mut inst_a) };
+    assert_eq!(status_a, FfiResult::OK);
+    // SAFETY: Valid mock host pointers for World B.
+    let status_b =
+        unsafe { bevy_abi_mod_init(world_b.api_ptr(), world_b.raw_ptr().cast(), &mut inst_b) };
+    assert_eq!(status_b, FfiResult::OK);
+    assert!(!inst_a.is_null());
+    assert!(!inst_b.is_null());
+    assert_ne!(inst_a, inst_b);
 
-                let sys_tracker = DropTracker::new("system_closure_2", &live_clone, &order_clone);
-                let mut tick_count = 0usize;
-                let res = app.add_system(
-                    c"kinematics_closure",
-                    &[Pos::write_desc(), Vel::read_desc()],
-                    move |ctx| {
-                        let _keep_alive = &sys_tracker;
-                        tick_count += 1;
-                        let step_scale = tick_count as f32;
-                        let (iter, cmds) = ctx.iter_and_commands();
-                        while let Some(mut chunk) = iter.next_chunk_view() {
-                            let (vel, pos) = chunk
-                                .read_write::<Vel, Pos>(1, 0)
-                                .ok_or(FfiResult::INTERNAL_ERROR)
-                                .unwrap_or((&[], &mut []));
-                            for i in 0..pos.len() {
-                                pos[i].x += vel[i].vx * step_scale;
-                            }
-                        }
-                        let spawned = cmds.spawn_empty();
-                        assert_ne!(spawned.0, 0);
-                        FfiResult::OK
-                    },
-                );
-                if res.is_err() {
-                    return res;
-                }
+    // Verify auto-qualified dynamic component name (`isolated_plugin::LocalCounter`, `C-10`):
+    let comp_a = world_a.name_to_handle["isolated_plugin::LocalCounter"];
+    let comp_b = world_b.name_to_handle["isolated_plugin::LocalCounter"];
 
-                let mq_tracker =
-                    DropTracker::new("multi_query_closure_3", &live_clone, &order_clone);
-                let mq_q0 = [Pos::write_desc()];
-                let mq_q1 = [Vel::read_desc()];
-                let mq_res =
-                    app.add_multi_query_system(c"nested_cartesian", &[&mq_q0, &mq_q1], move |mq| {
-                        let _keep_alive = &mq_tracker;
-                        // Duplicate query index must fail safely with None
-                        assert!(mq.iters_2_mut(0, 0).is_none());
+    let mut chunk_a = MockChunkData::new(vec![FfiEntity::from_bits(1)]);
+    chunk_a.insert_dense(comp_a, &[LocalCounter { ticks: 0 }]);
+    world_a.chunks.push(chunk_a);
 
-                        let Some((q0, q1, cmds)) = mq.iters_2_and_commands(0, 1) else {
-                            return FfiResult::INTERNAL_ERROR;
-                        };
-                        while let Some(mut c0) = q0.next_chunk_view() {
-                            let Some(pos) = c0.column_mut::<Pos>(0) else {
-                                return FfiResult::INTERNAL_ERROR;
-                            };
-                            let rst = q1.reset();
-                            if rst.is_err() {
-                                return rst;
-                            }
-                            while let Some(c1) = q1.next_chunk_view() {
-                                let Some(vel) = c1.column::<Vel>(0) else {
-                                    return FfiResult::INTERNAL_ERROR;
-                                };
-                                for p in pos.iter_mut() {
-                                    for v in vel.iter() {
-                                        p.y += v.vy;
-                                    }
-                                }
-                            }
-                        }
-                        let _ = cmds.spawn_empty();
-                        FfiResult::OK
-                    });
-                if mq_res.is_err() {
-                    return mq_res;
-                }
+    let mut chunk_b = MockChunkData::new(vec![FfiEntity::from_bits(2)]);
+    chunk_b.insert_dense(comp_b, &[LocalCounter { ticks: 10 }]);
+    world_b.chunks.push(chunk_b);
 
-                let hook_order = Arc::clone(&order_clone);
-                app.on_shutdown(move || {
-                    hook_order
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .push("on_shutdown_hook_4");
-                });
+    // Run World A 3 times (tag = 1) and World B 1 time (tag = 2):
+    for _ in 0..3 {
+        assert_eq!(world_a.run_system(0), FfiResult::OK);
+    }
+    assert_eq!(world_b.run_system(0), FfiResult::OK);
 
-                FfiResult::OK
-            },
-        )
-    };
+    // Shut down World A FIRST while World B remains live and continues ticking!
+    // SAFETY: `inst_a` was returned by `bevy_abi_mod_init` for World A.
+    unsafe { bevy_abi_mod_shutdown(inst_a) };
+    assert_eq!(*SHUTDOWN_EVENTS.lock().unwrap(), vec![1003]);
 
-    assert_eq!(init_status, FfiResult::OK);
-    assert_eq!(live_count.load(Ordering::SeqCst), 3);
-    assert_eq!(world.registered_single.len(), 1);
-    assert_eq!(world.registered_multi.len(), 1);
-
-    // Execute registered single-query and multi-query systems against mock ECS chunks
-    let mut positions = [Pos { x: 2.0, y: 3.0 }, Pos { x: 4.0, y: 5.0 }];
-    let velocities = [Vel { vx: 1.5, vy: 10.0 }, Vel { vx: 2.5, vy: 20.0 }];
-
-    let mut single_iter_state = MockIterState {
-        chunks: vec![MockChunk {
-            count: 2,
-            entities_ptr: core::ptr::null(),
-            columns: vec![
-                MockColumn {
-                    ptr: positions.as_mut_ptr() as *mut u8,
-                    stride: core::mem::size_of::<Pos>(),
-                    mutable_allowed: true,
-                    changed_rows: Vec::new(),
-                },
-                MockColumn {
-                    ptr: velocities.as_ptr() as *mut u8,
-                    stride: core::mem::size_of::<Vel>(),
-                    mutable_allowed: false,
-                    changed_rows: Vec::new(),
-                },
-            ],
-        }],
-        cursor: 0,
-        reset_calls: 0,
-    };
-
-    let (_name, single_cb, single_ud) = world.registered_single[0].clone();
-    let single_res = unsafe {
-        single_cb(
-            core::ptr::addr_of_mut!(single_iter_state) as *mut RawChunkIter,
-            core::ptr::addr_of_mut!(world) as *mut RawCommandQueue,
-            single_ud,
-        )
-    };
-    assert_eq!(single_res, FfiResult::OK);
-    assert_eq!(positions[0].x, 3.5);
-    assert_eq!(positions[1].x, 6.5);
-    assert_eq!(world.spawn_counter, 501);
-
-    // Execute multi-query system (outer q0 Pos, inner resettable q1 Vel)
-    let mut q0_state = MockIterState {
-        chunks: vec![MockChunk {
-            count: 2,
-            entities_ptr: core::ptr::null(),
-            columns: vec![MockColumn {
-                ptr: positions.as_mut_ptr() as *mut u8,
-                stride: core::mem::size_of::<Pos>(),
-                mutable_allowed: true,
-                changed_rows: Vec::new(),
-            }],
-        }],
-        cursor: 0,
-        reset_calls: 0,
-    };
-    let mut q1_state = MockIterState {
-        chunks: vec![MockChunk {
-            count: 2,
-            entities_ptr: core::ptr::null(),
-            columns: vec![MockColumn {
-                ptr: velocities.as_ptr() as *mut u8,
-                stride: core::mem::size_of::<Vel>(),
-                mutable_allowed: false,
-                changed_rows: Vec::new(),
-            }],
-        }],
-        cursor: 0,
-        reset_calls: 0,
-    };
-    let mut raw_iters = [
-        core::ptr::addr_of_mut!(q0_state) as *mut RawChunkIter,
-        core::ptr::addr_of_mut!(q1_state) as *mut RawChunkIter,
-    ];
-
-    let (_mq_name, mq_cb, mq_ud, mq_count) = world.registered_multi[0].clone();
-    let mq_exec_res = unsafe {
-        mq_cb(
-            raw_iters.as_mut_ptr(),
-            mq_count,
-            core::ptr::addr_of_mut!(world) as *mut RawCommandQueue,
-            mq_ud,
-        )
-    };
-    assert_eq!(mq_exec_res, FfiResult::OK);
-    assert_eq!(q1_state.reset_calls, 1);
-    // Each Pos.y had (10.0 + 20.0) = 30.0 added
-    assert_eq!(positions[0].y, 33.0);
-    assert_eq!(positions[1].y, 35.0);
-    assert_eq!(world.spawn_counter, 502);
-
-    // Still zero drops while mod is active
-    assert_eq!(live_count.load(Ordering::SeqCst), 3);
-
-    // Simulate `bevy_abi_mod_shutdown` -> all allocations must drop in LIFO order with 0 leaks!
-    cleanup_registered_guest_state();
-    assert_eq!(live_count.load(Ordering::SeqCst), 0);
+    // World B continues running cleanly with zero interference from World A's teardown:
+    assert_eq!(world_b.run_system(0), FfiResult::OK);
     assert_eq!(
-        *drop_order.lock().unwrap(),
-        vec![
-            "on_shutdown_hook_4",
-            "multi_query_closure_3",
-            "system_closure_2",
-            "alloc_user_data_1",
-        ]
+        world_b.chunks[0].read_dense::<LocalCounter>(comp_b),
+        vec![LocalCounter { ticks: 14 }]
     );
+
+    // SAFETY: `inst_b` was returned by `bevy_abi_mod_init` for World B.
+    unsafe { bevy_abi_mod_shutdown(inst_b) };
+    assert_eq!(*SHUTDOWN_EVENTS.lock().unwrap(), vec![1003, 2002]);
 }
 
 #[test]
-fn test_guest_app_rollback_on_failed_or_panicking_init_leaves_zero_leaks() {
-    let _guard = LIFECYCLE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    cleanup_registered_guest_state();
-
-    let live_count = Arc::new(AtomicUsize::new(0));
-    let drop_order = Arc::new(Mutex::new(Vec::new()));
-
-    let mut api = mock_host_api();
-    api.register_system = world_register_system;
+fn split_borrows_and_multi_query_nested_reset_enforce_disjointness() {
     let mut world = MockHostWorld::new();
-    // Fail on the 2nd system registration!
-    world.fail_registration_after = Some(1);
+    let pos_h = world.expose_component::<Pos>("sim::Pos", Pos::UUID, 0, false);
+    let vel_h = world.expose_component::<Vel>("sim::Vel", Vel::UUID, 0, false);
+    let acc_h = world.expose_component::<Accel>("sim::Accel", Accel::UUID, 0, false);
 
-    // Case A: Partial init returning an error -> must roll back immediately without shutdown!
-    {
-        let live_clone = Arc::clone(&live_count);
-        let order_clone = Arc::clone(&drop_order);
-        let res = unsafe {
-            GuestApp::run_init(
-                mock_get_proc_address,
-                &api,
-                core::ptr::addr_of_mut!(world) as *mut c_void,
-                move |app| {
-                    let _ = app.alloc_user_data(DropTracker::new(
-                        "staged_ctx",
-                        &live_clone,
-                        &order_clone,
-                    ));
-                    let t1 = DropTracker::new("sys_ok", &live_clone, &order_clone);
-                    let r1 = app.add_system(c"sys_1", &[], move |_ctx| {
-                        let _ = &t1;
-                        FfiResult::OK
-                    });
-                    assert_eq!(r1, FfiResult::OK);
+    let mut chunk0 = MockChunkData::new(vec![FfiEntity::from_bits(50), FfiEntity::from_bits(51)]);
+    chunk0.insert_dense(pos_h, &[Pos { x: 0.0, y: 0.0 }, Pos { x: 10.0, y: 10.0 }]);
+    chunk0.insert_dense(vel_h, &[Vel { dx: 1.0, dy: 2.0 }, Vel { dx: 3.0, dy: 4.0 }]);
+    chunk0.insert_dense(
+        acc_h,
+        &[Accel { ax: 0.5, ay: 0.5 }, Accel { ax: 1.0, ay: 1.0 }],
+    );
+    world.chunks.push(chunk0);
 
-                    // Second registration fails on the host -> `t2` must drop immediately,
-                    // and returning `r2` drops `app`, rolling back `t1` and `staged_ctx`!
-                    let t2 = DropTracker::new("sys_rejected", &live_clone, &order_clone);
-                    let r2 = app.add_system(c"sys_2", &[], move |_ctx| {
-                        let _ = &t2;
-                        FfiResult::OK
-                    });
-                    assert_eq!(r2, FfiResult::INVALID_COMPONENT);
-                    r2
-                },
-            )
-        };
-        assert_eq!(res, FfiResult::INVALID_COMPONENT);
-        assert_eq!(
-            live_count.load(Ordering::SeqCst),
-            0,
-            "failed init must leave 0 leaked allocations even before shutdown"
-        );
-    }
+    let inst = world
+        .load_fn(c"split_mod", move |app| {
+            app.system(c"split_and_multi_query")
+                .query(|q| {
+                    q.write::<Pos>()
+                        .write::<Vel>()
+                        .read::<Accel>()
+                        .write::<Pos>()
+                })
+                .query(|q| q.read::<Accel>())
+                .build(move |ctx| {
+                    assert_eq!(ctx.query_count(), 2);
+                    assert!(ctx.queries_2_mut(0, 0).is_none());
+                    assert!(ctx.queries_2_mut(0, 2).is_none());
 
-    // Case B: Panicking init -> `catch_guest_panic` + `GuestApp::drop` must roll back with 0 leaks!
-    drop_order.lock().unwrap().clear();
-    world.fail_registration_after = None;
-    {
-        let live_clone = Arc::clone(&live_count);
-        let order_clone = Arc::clone(&drop_order);
-        let res = unsafe {
-            GuestApp::run_init(
-                mock_get_proc_address,
-                &api,
-                core::ptr::addr_of_mut!(world) as *mut c_void,
-                move |app| {
-                    let _ = app.alloc_user_data(DropTracker::new(
-                        "panic_staged_ctx",
-                        &live_clone,
-                        &order_clone,
-                    ));
-                    panic!("simulated init panic");
-                },
-            )
-        };
-        assert_eq!(res, FfiResult::PANIC_CAUGHT);
-        assert_eq!(
-            live_count.load(Ordering::SeqCst),
-            0,
-            "panicking init must roll back all staged allocations with 0 leaks"
-        );
-    }
-}
+                    let (q0, q1, cmds) = ctx
+                        .queries_2_and_commands(0, 1)
+                        .expect("disjoint queries + commands");
 
-#[test]
-fn test_reentrant_closure_invocation_returns_access_conflict() {
-    let _guard = LIFECYCLE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    cleanup_registered_guest_state();
+                    let mut pair_count = 0usize;
+                    while let Some(mut c0) = q0.next_chunk_view() {
+                        // Same column index (`0, 0`) or duplicate component handle (`0, 3` both `Pos`) MUST return `None`!
+                        assert!(c0.write_2::<Pos, Pos>(0, 0).is_none());
+                        assert!(c0.write_2::<Pos, Pos>(0, 3).is_none());
+                        assert!(c0.read_write::<Pos, Pos>(0, 3).is_none());
 
-    #[derive(Clone, Copy)]
-    struct SendWorldPtr(*const MockHostWorld);
-    // SAFETY: Used strictly on the current test thread during synchronous reentrant callback test.
-    unsafe impl Send for SendWorldPtr {}
+                        // Disjoint `component_write_2` (`Pos` col 0 + `Vel` col 1):
+                        {
+                            let (pos, vel) = c0
+                                .component_write_2::<Pos, Vel>(0, 1)
+                                .expect("disjoint Pos + Vel write");
+                            for i in 0..pos.len() {
+                                pos[i].x += vel[i].dx;
+                                pos[i].y += vel[i].dy;
+                            }
+                        }
 
-    let mut api = mock_host_api();
-    api.register_system = world_register_system;
-    let mut world = MockHostWorld::new();
-    let world_ptr = core::ptr::addr_of_mut!(world);
+                        // Disjoint `entities_and_component_read_write` (`Accel` col 2 -> `Vel` col 1):
+                        {
+                            let (entities, acc, vel) = c0
+                                .entities_and_component_read_write::<Accel, Vel>(2, 1)
+                                .expect("entities + Accel + Vel");
+                            assert_eq!(entities.len(), 2);
+                            for i in 0..vel.len() {
+                                vel[i].dx += acc[i].ax;
+                                vel[i].dy += acc[i].ay;
+                            }
+                        }
 
-    let send_ptr = SendWorldPtr(world_ptr);
-    let setup = move |app: &mut GuestApp<'_>| {
-        app.add_system(c"reentrant_probe", &[], move |_ctx| {
-            // Attempt illegal re-entrant invocation of the same system closure while locked
-            let sp = send_ptr;
-            let w = unsafe { &*sp.0 };
-            let (_name, cb, ud) = &w.registered_single[0];
-            let nested = unsafe { (*cb)(core::ptr::null_mut(), core::ptr::null_mut(), *ud) };
-            assert_eq!(nested, FfiResult::ACCESS_CONFLICT);
-            FfiResult::OK
+                        // Nested inner query with `reset()` for N x M pairs:
+                        assert_eq!(q1.reset(), FfiResult::OK);
+                        while let Some(c1) = q1.next_chunk_view() {
+                            let acc = c1.component::<Accel>(0).unwrap();
+                            pair_count += c0.len() * acc.len();
+                        }
+                    }
+                    assert_eq!(pair_count, 4);
+                    let _ = cmds.spawn_empty().unwrap();
+                })
         })
-    };
+        .expect("load split_mod");
 
-    let init_res =
-        unsafe { GuestApp::run_init(mock_get_proc_address, &api, world_ptr as *mut c_void, setup) };
-    assert_eq!(init_res, FfiResult::OK);
+    assert_eq!(world.run_system(0), FfiResult::OK);
+    assert_eq!(
+        world.chunks[0].read_dense::<Pos>(pos_h),
+        vec![Pos { x: 1.0, y: 2.0 }, Pos { x: 13.0, y: 14.0 }]
+    );
+    assert_eq!(
+        world.chunks[0].read_dense::<Vel>(vel_h),
+        vec![Vel { dx: 1.5, dy: 2.5 }, Vel { dx: 4.0, dy: 5.0 }]
+    );
+    assert_eq!(
+        world.commands,
+        vec![RecordedCommand::SpawnEmpty(FfiEntity::from_bits(100))]
+    );
 
-    let (_name, cb, ud) = world.registered_single[0].clone();
-    let outer = unsafe { cb(core::ptr::null_mut(), core::ptr::null_mut(), ud) };
-    assert_eq!(outer, FfiResult::OK);
-
-    cleanup_registered_guest_state();
-}
-
-// ============================================================================
-// 5. Asymmetric C99 & Asymmetric Rust Guest Mod Fixture Verification
-// ============================================================================
-
-#[test]
-#[cfg_attr(miri, ignore)]
-fn test_asymmetric_c99_and_rust_mods_compile_cleanly() {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("workspace root exists");
-
-    let fixture_dir = std::env::var_os("BAM_FIXTURE_DIR")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| repo_root.join("target").join("fixtures"));
-
-    let (prefix, ext) = if cfg!(target_os = "windows") {
-        ("", "dll")
-    } else if cfg!(target_os = "macos") {
-        ("lib", "dylib")
-    } else {
-        ("lib", "so")
-    };
-
-    for stem in ["asymmetric_c_mod", "asymmetric_rust_mod"] {
-        let path = fixture_dir.join(format!("{prefix}{stem}.{ext}"));
-        let meta = std::fs::metadata(&path).unwrap_or_else(|_| {
-            panic!(
-                "Fixture missing at {} — run 'cargo xtask fixtures' before 'cargo test'",
-                path.display()
-            )
-        });
-        assert!(
-            meta.is_file() && meta.len() > 0,
-            "Staged fixture at {} must be a non-empty shared library",
-            path.display()
-        );
-    }
+    world.unload_instance(inst);
 }

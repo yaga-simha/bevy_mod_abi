@@ -1,228 +1,329 @@
-//! Scoped view over a single non-empty archetype chunk.
+//! Safe per-chunk view (`Chunk`) enforcing Rust borrow rules across dense columns, sparse rows,
+//! and fine-grained change-tick marking.
 
-use core::ffi::CStr;
+use bevy_abi_mod_guest_sys::{SparseRows, SparseRowsMut, ValidatedIter};
+use bevy_abi_mod_sys::{AbiPod, BamColumnInfo, FfiEntity, FfiResult};
 
-use bevy_abi_mod_sys::{AbiPod, FfiEntity, FfiResult};
+use crate::{
+    component::GuestComponent,
+    iter::slice::{ChunkSlice, ChunkSliceMut},
+};
 
-use crate::iter::chunk_iter::GuestChunkIter;
-use crate::iter::slice::{ChunkSlice, ChunkSliceMut};
-
-/// Scoped handle to a single non-empty chunk yielded by [`GuestChunkIter::next_chunk_view`].
+/// Active archetype chunk yielded by [`ChunkIter::next_chunk_view`](crate::ChunkIter::next_chunk_view).
 ///
-/// # Compile-Fail Safety Checks
-///
-/// `bool` is rejected as a column element type because byte values `2..=255` are undefined
-/// behavior in Rust (`bool` does not implement [`AbiPod`]):
+/// Enforces Rust's aliasing rules at compile time:
+/// - Multiple shared read columns (`column`, `component`, `entities`) may be borrowed simultaneously
+///   via `&self`.
+/// - Mutable column or sparse-row views (`column_mut`, `component_mut`, `column_mut_untracked`,
+///   `rows_mut`) require `&mut self`, preventing overlapping borrows unless explicitly split via
+///   [`Self::read_write`] / [`Self::write_2`] (which verify distinct columns, distinct component
+///   handles, and disjoint byte ranges).
 ///
 /// ```compile_fail
 /// use bevy_abi_mod_guest::Chunk;
 ///
-/// fn read_bool_column(chunk: &Chunk<'_, '_>) {
+/// fn simultaneous_mut(mut chunk: Chunk<'_, '_>) {
+///     let a = chunk.column_mut::<f32>(0).unwrap();
+///     let b = chunk.column_mut::<f32>(0).unwrap();
+///     a[0] += b[0];
+/// }
+/// ```
+///
+/// Non-`AbiPod` types (`bool`, `String`, `usize`, `u128`) are rejected at compile time:
+///
+/// ```compile_fail
+/// use bevy_abi_mod_guest::Chunk;
+///
+/// fn non_pod(chunk: &Chunk<'_, '_>) {
 ///     let _ = chunk.column::<bool>(0);
 /// }
 /// ```
-///
-/// `char` is likewise rejected because surrogate and out-of-range code points are invalid bit
-/// patterns:
-///
-/// ```compile_fail
-/// use bevy_abi_mod_guest::Chunk;
-///
-/// fn write_char_column(chunk: &mut Chunk<'_, '_>) {
-///     let _ = chunk.column_mut::<char>(0);
-/// }
-/// ```
-///
-/// Holding an immutable borrow from [`Chunk::column`] while taking a mutable borrow via
-/// [`Chunk::column_mut`] is rejected by the borrow checker (use [`Chunk::read_write`] for
-/// validated disjoint split borrows):
-///
-/// ```compile_fail
-/// use bevy_abi_mod_guest::Chunk;
-///
-/// fn aliasing_columns(chunk: &mut Chunk<'_, '_>) {
-///     let vel = chunk.column::<f32>(1).unwrap();
-///     let pos = chunk.column_mut::<f32>(0).unwrap();
-///     pos[0] += vel[0];
-/// }
-/// ```
-pub struct Chunk<'iter, 'api> {
-    iter: &'iter mut GuestChunkIter<'api>,
+pub struct Chunk<'iter, 'ctx> {
+    pub(crate) iter: &'iter mut ValidatedIter<'ctx>,
+    pub(crate) len: usize,
 }
 
-impl<'iter, 'api> Chunk<'iter, 'api> {
-    #[inline]
-    pub(crate) fn new(iter: &'iter mut GuestChunkIter<'api>) -> Self {
-        Self { iter }
-    }
-
-    /// Number of entities in this chunk (guaranteed `>= 1` when yielded by `next_chunk_view`).
+impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
+    /// Returns the number of entity rows in this chunk.
     #[inline]
     pub const fn len(&self) -> usize {
-        self.iter.current_len()
+        self.len
     }
 
-    /// Alias for [`Chunk::len`].
-    #[inline]
-    pub const fn count(&self) -> usize {
-        self.iter.current_len()
-    }
-
-    /// Returns `true` if this chunk has zero entities.
+    /// Returns `true` if `self.len() == 0`.
     #[inline]
     pub const fn is_empty(&self) -> bool {
-        self.iter.current_len() == 0
+        self.len == 0
     }
 
-    /// Returns the validated slice of [`FfiEntity`] handles for all rows in this chunk.
+    /// Queries [`BamColumnInfo`] metadata (UUID, size, align, access mode, storage flags) for
+    /// declared query term `col`.
+    #[inline]
+    pub fn column_info(&self, col: usize) -> Result<BamColumnInfo, FfiResult> {
+        self.iter.column_info(col)
+    }
+
+    /// Borrows the contiguous `[FfiEntity; len]` slice for this chunk.
     #[inline]
     pub fn entities(&self) -> &[FfiEntity] {
-        self.iter.entities_slice()
+        self.iter.entities()
     }
 
-    /// Returns an untyped bounds-checked read-only [`ChunkSlice`] for column `index`.
+    /// Borrows dense column `col` as `&[T]` (`T: AbiPod`), validating `(size, align, mode, storage)`
+    /// via [`BamColumnInfo`]. Returns `None` on layout/mode mismatch or absent optional column.
     #[inline]
-    pub fn readonly_slice(&self, index: usize) -> ChunkSlice<'_> {
-        self.iter.readonly_slice(index)
+    pub fn column<T: AbiPod>(&self, col: usize) -> Option<&[T]> {
+        self.iter.column_checked::<T>(col, None)
     }
 
-    /// Returns an untyped bounds-checked mutable [`ChunkSliceMut`] for column `index`.
+    /// Borrows dense column `col` as `&[T]` (`T: GuestComponent`), validating `T::UUID` in addition
+    /// to `(size, align, mode, storage)` (`C-13`). Returns `None` on UUID or layout mismatch.
     #[inline]
-    pub fn mutable_slice(&mut self, index: usize) -> ChunkSliceMut<'_> {
-        self.iter.mutable_slice(index)
+    pub fn component<T: GuestComponent>(&self, col: usize) -> Option<&[T]> {
+        self.iter.column_checked::<T>(col, Some(T::UUID))
     }
 
-    /// Borrows a typed read-only slice `&[T]` for column `index`.
+    /// Alias for [`Self::column`] on optional read columns (`Option<&[T]>` is `None` when the
+    /// archetype lacks the optional component).
     #[inline]
-    pub fn column<T: AbiPod>(&self, index: usize) -> Option<&[T]> {
-        self.iter.readonly_slice(index).as_typed_slice::<T>()
+    pub fn optional_column<T: AbiPod>(&self, col: usize) -> Option<&[T]> {
+        self.column::<T>(col)
     }
 
-    /// Borrows a typed mutable slice `&mut [T]` for column `index`.
+    /// Alias for [`Self::component`] on optional read columns, additionally validating `T::UUID`.
     #[inline]
-    pub fn column_mut<T: AbiPod>(&mut self, index: usize) -> Option<&mut [T]> {
-        self.iter.mutable_slice(index).into_typed_slice::<T>()
+    pub fn optional_component<T: GuestComponent>(&self, col: usize) -> Option<&[T]> {
+        self.component::<T>(col)
     }
 
-    /// Simultaneously borrows the chunk's [`FfiEntity`] slice and one typed mutable column `&mut [T]`.
+    /// Mutably borrows dense column `col` as `&mut [T]` (`T: AbiPod`), marking all chunk rows
+    /// changed once and validating `(size, align, mode, storage)` via [`BamColumnInfo`].
     #[inline]
-    pub fn entities_and_column_mut<T: AbiPod>(
+    pub fn column_mut<T: AbiPod>(&mut self, col: usize) -> Option<&mut [T]> {
+        self.iter.column_mut_checked::<T>(col, None)
+    }
+
+    /// Mutably borrows dense column `col` as `&mut [T]` (`T: GuestComponent`), validating `T::UUID`
+    /// in addition to `(size, align, mode, storage)` (`C-13`) and marking chunk rows changed.
+    #[inline]
+    pub fn component_mut<T: GuestComponent>(&mut self, col: usize) -> Option<&mut [T]> {
+        self.iter.column_mut_checked::<T>(col, Some(T::UUID))
+    }
+
+    /// Alias for [`Self::column_mut`] on optional write columns (`None` if absent on the archetype).
+    #[inline]
+    pub fn optional_column_mut<T: AbiPod>(&mut self, col: usize) -> Option<&mut [T]> {
+        self.column_mut::<T>(col)
+    }
+
+    /// Alias for [`Self::component_mut`] on optional write columns, additionally validating `T::UUID`.
+    #[inline]
+    pub fn optional_component_mut<T: GuestComponent>(&mut self, col: usize) -> Option<&mut [T]> {
+        self.component_mut::<T>(col)
+    }
+
+    /// Mutably borrows dense column `col` as `&mut [T]` (`T: AbiPod`) **without** automatically
+    /// marking Bevy change ticks (`P-04`). Pair with [`Self::mark_changed_range`] or
+    /// [`Self::mark_changed`] after selectively modifying rows.
+    #[inline]
+    pub fn column_mut_untracked<T: AbiPod>(&mut self, col: usize) -> Option<&mut [T]> {
+        self.iter.column_mut_untracked_checked::<T>(col, None)
+    }
+
+    /// Untracked mutable column slice for `T: GuestComponent`, validating `T::UUID` (`C-13` + `P-04`).
+    #[inline]
+    pub fn component_mut_untracked<T: GuestComponent>(&mut self, col: usize) -> Option<&mut [T]> {
+        self.iter
+            .column_mut_untracked_checked::<T>(col, Some(T::UUID))
+    }
+
+    /// Marks rows `start_row..start_row + row_count` on writable column `col` as changed (`P-04`).
+    #[inline]
+    pub fn mark_changed_range(
         &mut self,
-        index: usize,
-    ) -> Option<(&[FfiEntity], &mut [T])> {
-        let (entities, _, [rw]) = self.iter.split_slices([], [index])?;
-        let typed = rw.into_typed_slice::<T>()?;
-        Some((entities, typed))
+        col: usize,
+        start_row: usize,
+        row_count: usize,
+    ) -> FfiResult {
+        self.iter.mark_changed_range(col, start_row, row_count)
     }
 
-    /// Simultaneously borrows `entities`, `R` read-only [`ChunkSlice`]s, and `W` disjoint [`ChunkSliceMut`]s.
-    #[allow(clippy::type_complexity)]
+    /// Marks single row `row` on writable column `col` as changed (`P-04`).
     #[inline]
-    pub fn split_slices<const R: usize, const W: usize>(
-        &mut self,
-        read_cols: [usize; R],
-        write_cols: [usize; W],
-    ) -> Option<(&[FfiEntity], [ChunkSlice<'_>; R], [ChunkSliceMut<'_>; W])> {
-        self.iter.split_slices(read_cols, write_cols)
+    pub fn mark_changed(&mut self, col: usize, row: usize) -> FfiResult {
+        self.iter.mark_changed(col, row)
     }
 
-    /// Simultaneously borrows `N` disjoint mutable [`ChunkSliceMut`] columns.
-    #[inline]
-    pub fn columns_mut<const N: usize>(
-        &mut self,
-        indices: [usize; N],
-    ) -> Option<[ChunkSliceMut<'_>; N]> {
-        self.iter.columns_mut(indices)
-    }
-
-    /// Simultaneously borrows one typed read-only column `&[R]` and one disjoint typed mutable column `&mut [W]`.
+    /// Simultaneously borrows read-only dense column `read_col` (`&[R]`) and disjoint mutable dense
+    /// column `write_col` (`&mut [W]`).
     #[inline]
     pub fn read_write<R: AbiPod, W: AbiPod>(
         &mut self,
         read_col: usize,
         write_col: usize,
     ) -> Option<(&[R], &mut [W])> {
-        self.iter.read_write::<R, W>(read_col, write_col)
+        self.iter
+            .read_write_checked::<R, W>(read_col, None, write_col, None)
     }
 
-    /// Simultaneously borrows `entities`, one typed read-only column `&[R]`, and one disjoint typed mutable column `&mut [W]`.
+    /// Simultaneously borrows read-only dense column `read_col` and disjoint mutable dense column
+    /// `write_col`, verifying both `R::UUID` and `W::UUID` (`C-13`).
     #[inline]
-    pub fn entities_and_read_write<R: AbiPod, W: AbiPod>(
+    pub fn component_read_write<R: GuestComponent, W: GuestComponent>(
         &mut self,
         read_col: usize,
         write_col: usize,
-    ) -> Option<(&[FfiEntity], &[R], &mut [W])> {
-        let (entities, [ro], [rw]) = self.iter.split_slices([read_col], [write_col])?;
-        let r_typed = ro.as_typed_slice::<R>()?;
-        let w_typed = rw.into_typed_slice::<W>()?;
-        Some((entities, r_typed, w_typed))
+    ) -> Option<(&[R], &mut [W])> {
+        self.iter
+            .read_write_checked::<R, W>(read_col, Some(R::UUID), write_col, Some(W::UUID))
     }
 
-    /// Simultaneously borrows two disjoint typed mutable columns (`&mut [W1]`, `&mut [W2]`).
+    /// Simultaneously borrows two disjoint mutable dense columns (`col_a` and `col_b`).
     #[inline]
     pub fn write_2<W1: AbiPod, W2: AbiPod>(
         &mut self,
         col_a: usize,
         col_b: usize,
     ) -> Option<(&mut [W1], &mut [W2])> {
-        self.iter.write_2::<W1, W2>(col_a, col_b)
-    }
-
-    /// Explicitly marks `row` in column `index` as changed.
-    #[inline]
-    pub fn mark_changed(&mut self, index: usize, row: usize) -> FfiResult {
-        self.iter.mark_changed(index, row)
-    }
-
-    /// Returns `Some(ptr)` when an `OPTIONAL_READ` column is present on this chunk's archetype.
-    #[inline]
-    pub fn optional_column_ptr(&self, index: usize) -> Option<*const u8> {
-        self.iter.optional_column_ptr(index)
-    }
-
-    /// Returns `Some(ptr)` and marks ticks when an `OPTIONAL_WRITE` column is present on this chunk.
-    #[inline]
-    pub fn optional_column_mut_ptr(&mut self, index: usize) -> Option<*mut u8> {
-        self.iter.optional_column_mut_ptr(index)
-    }
-
-    /// Returns `Some(&[T])` when an `OPTIONAL_READ` [`AbiPod`] column is present on this chunk.
-    #[inline]
-    pub fn optional_column<T: AbiPod>(&self, index: usize) -> Option<&[T]> {
         self.iter
-            .optional_readonly_slice(index)?
-            .as_typed_slice::<T>()
+            .write_2_checked::<W1, W2>(col_a, None, col_b, None)
     }
 
-    /// Returns `Some(&mut [T])` and marks ticks when an `OPTIONAL_WRITE` [`AbiPod`] column is present on this chunk.
+    /// Simultaneously borrows two disjoint mutable dense columns (`col_a` and `col_b`), verifying
+    /// `W1::UUID` and `W2::UUID` (`C-13`).
     #[inline]
-    pub fn optional_column_mut<T: AbiPod>(&mut self, index: usize) -> Option<&mut [T]> {
-        self.iter
-            .optional_mutable_slice(index)?
-            .into_typed_slice::<T>()
-    }
-
-    /// Simultaneously borrows an optional read-only column (`Option<&[OptR]>`) and a required
-    /// disjoint mutable column (`&mut [W]`) for this chunk.
-    #[inline]
-    pub fn optional_read_write<OptR: AbiPod, W: AbiPod>(
+    pub fn component_write_2<W1: GuestComponent, W2: GuestComponent>(
         &mut self,
-        opt_read_col: usize,
-        write_col: usize,
-    ) -> Option<(Option<&[OptR]>, &mut [W])> {
+        col_a: usize,
+        col_b: usize,
+    ) -> Option<(&mut [W1], &mut [W2])> {
         self.iter
-            .optional_read_write::<OptR, W>(opt_read_col, write_col)
+            .write_2_checked::<W1, W2>(col_a, Some(W1::UUID), col_b, Some(W2::UUID))
     }
 
-    /// Reads an exposed [`AbiPod`] Bevy `Resource` (`Res<R>`) while inspecting this chunk.
+    /// Simultaneously borrows `[FfiEntity; len]` and mutable dense column `write_col`.
     #[inline]
-    pub fn resource<R: AbiPod>(&self, resource_name: &CStr) -> Option<&R> {
-        self.iter.resource::<R>(resource_name)
+    pub fn entities_and_column_mut<W: AbiPod>(
+        &mut self,
+        write_col: usize,
+    ) -> Option<(&[FfiEntity], &mut [W])> {
+        self.iter
+            .entities_and_column_mut_checked::<W>(write_col, None)
     }
 
-    /// Obtains a read-only byte pointer to an exposed Bevy `Resource` while inspecting this chunk.
+    /// Simultaneously borrows `[FfiEntity; len]` and mutable dense column `write_col`, verifying `W::UUID`.
     #[inline]
-    pub fn resource_ptr(&self, resource_name: &CStr) -> *const u8 {
-        self.iter.resource_ptr(resource_name)
+    pub fn entities_and_component_mut<W: GuestComponent>(
+        &mut self,
+        write_col: usize,
+    ) -> Option<(&[FfiEntity], &mut [W])> {
+        self.iter
+            .entities_and_column_mut_checked::<W>(write_col, Some(W::UUID))
+    }
+
+    /// Simultaneously borrows `[FfiEntity; len]`, read-only dense column `read_col`, and disjoint
+    /// mutable dense column `write_col`.
+    #[inline]
+    pub fn entities_and_read_write<R: AbiPod, W: AbiPod>(
+        &mut self,
+        read_col: usize,
+        write_col: usize,
+    ) -> Option<(&[FfiEntity], &[R], &mut [W])> {
+        self.iter
+            .entities_and_read_write_checked::<R, W>(read_col, None, write_col, None)
+    }
+
+    /// Simultaneously borrows `[FfiEntity; len]`, read-only dense column `read_col`, and disjoint
+    /// mutable dense column `write_col`, verifying `R::UUID` and `W::UUID` (`C-13`).
+    #[inline]
+    pub fn entities_and_component_read_write<R: GuestComponent, W: GuestComponent>(
+        &mut self,
+        read_col: usize,
+        write_col: usize,
+    ) -> Option<(&[FfiEntity], &[R], &mut [W])> {
+        self.iter.entities_and_read_write_checked::<R, W>(
+            read_col,
+            Some(R::UUID),
+            write_col,
+            Some(W::UUID),
+        )
+    }
+
+    /// Materializes indirect read-only sparse-set row pointers `[ *const u8; len ]` for column `col`
+    /// (`P-02`).
+    #[inline]
+    pub fn rows<T: AbiPod>(&mut self, col: usize) -> Option<SparseRows<'_, T>> {
+        self.iter.rows_checked::<T>(col, None)
+    }
+
+    /// Materializes indirect read-only sparse-set row pointers for `T: GuestComponent`, validating
+    /// `T::UUID` (`C-13` + `P-02`).
+    #[inline]
+    pub fn component_rows<T: GuestComponent>(&mut self, col: usize) -> Option<SparseRows<'_, T>> {
+        self.iter.rows_checked::<T>(col, Some(T::UUID))
+    }
+
+    /// Materializes indirect mutable sparse-set row pointers `[ *mut u8; len ]` for column `col`
+    /// (`P-02`), marking matched rows changed.
+    #[inline]
+    pub fn rows_mut<T: AbiPod>(&mut self, col: usize) -> Option<SparseRowsMut<'_, T>> {
+        self.iter.rows_mut_checked::<T>(col, None)
+    }
+
+    /// Materializes indirect mutable sparse-set row pointers for `T: GuestComponent`, validating
+    /// `T::UUID` (`C-13` + `P-02`).
+    #[inline]
+    pub fn component_rows_mut<T: GuestComponent>(
+        &mut self,
+        col: usize,
+    ) -> Option<SparseRowsMut<'_, T>> {
+        self.iter.rows_mut_checked::<T>(col, Some(T::UUID))
+    }
+
+    /// Returns a low-level [`ChunkSlice`] view over dense read column `col` (useful with opaque
+    /// VTable field accessors).
+    #[inline]
+    pub fn readonly_slice(&self, col: usize) -> ChunkSlice<'_> {
+        ChunkSlice::from_validated(self.iter.readonly_slice(col))
+    }
+
+    /// Returns a low-level [`ChunkSliceMut`] view over dense write column `col` (marking ticks changed).
+    #[inline]
+    pub fn mutable_slice(&mut self, col: usize) -> ChunkSliceMut<'_> {
+        ChunkSliceMut::from_validated(self.iter.mutable_slice(col))
+    }
+
+    /// Returns an untracked [`ChunkSliceMut`] view over dense write column `col` (`P-04`).
+    #[inline]
+    pub fn mutable_slice_untracked(&mut self, col: usize) -> ChunkSliceMut<'_> {
+        ChunkSliceMut::from_validated(self.iter.mutable_slice_untracked(col))
+    }
+
+    /// Borrows singleton resource `R` (`R: AbiPod`) declared at `term_index` inside this query.
+    #[inline]
+    pub fn resource<R: AbiPod>(&self, term_index: usize) -> Option<&R> {
+        self.iter.resource_checked::<R>(term_index, None)
+    }
+
+    /// Borrows singleton resource `R` (`R: GuestComponent`) declared at `term_index`, validating `R::UUID`.
+    #[inline]
+    pub fn component_resource<R: GuestComponent>(&self, term_index: usize) -> Option<&R> {
+        self.iter.resource_checked::<R>(term_index, Some(R::UUID))
+    }
+
+    /// Mutably borrows singleton resource `R` (`R: AbiPod`) declared with `RESOURCE_WRITE` at `term_index`.
+    #[inline]
+    pub fn resource_mut<R: AbiPod>(&mut self, term_index: usize) -> Option<&mut R> {
+        self.iter.resource_mut_checked::<R>(term_index, None)
+    }
+
+    /// Mutably borrows singleton resource `R` (`R: GuestComponent`) at `term_index`, validating `R::UUID`.
+    #[inline]
+    pub fn component_resource_mut<R: GuestComponent>(
+        &mut self,
+        term_index: usize,
+    ) -> Option<&mut R> {
+        self.iter
+            .resource_mut_checked::<R>(term_index, Some(R::UUID))
     }
 }

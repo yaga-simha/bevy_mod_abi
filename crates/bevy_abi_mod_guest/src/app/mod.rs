@@ -1,9 +1,8 @@
-//! High-level guest application builder and safe system execution contexts.
+//! Safe guest initialization builder (`GuestApp`, `SystemBuilder`, `QueryBuilder`) and unified
+//! execution contexts (`SystemContext`, `RunConditionContext`).
 
-mod builder;
-mod context;
-mod multi_query;
+pub mod builder;
+pub mod context;
 
-pub use self::builder::GuestApp;
-pub use self::context::SystemContext;
-pub use self::multi_query::MultiQueryContext;
+pub use builder::{GuestApp, IntoSystemResult, QueryBuilder, SystemBuilder};
+pub use context::{MultiQueryContext, RunConditionContext, SystemContext};

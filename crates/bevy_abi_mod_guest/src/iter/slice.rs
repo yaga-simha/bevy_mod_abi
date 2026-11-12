@@ -1,170 +1,204 @@
-//! Bounds-checked read-only and mutable column slice views.
+//! Safe dense column slice wrappers (`ChunkSlice` and `ChunkSliceMut`).
 
-use bevy_abi_mod_guest_sys::{
-    ValidatedSlice, ValidatedSliceAdapter, ValidatedSliceMut, ValidatedSliceMutAdapter,
-};
-use bevy_abi_mod_sys::AbiPod;
+use bevy_abi_mod_guest_sys::{ValidatedSlice, ValidatedSliceMut};
+use bevy_abi_mod_sys::{AbiPod, ComponentUuid};
 
-/// Read-only chunk slice view for iterating components in an archetype table chunk.
+use crate::component::GuestComponent;
+
+/// Safe read-only view over a dense archetype column for the current chunk.
 ///
-/// Obtain a `ChunkSlice` safely from [`Chunk::readonly_slice`](crate::Chunk::readonly_slice) or
-/// [`GuestChunkIter::readonly_slice`](crate::GuestChunkIter::readonly_slice).
+/// Carries optional [`BamColumnInfo`](bevy_abi_mod_sys::BamColumnInfo) layout and UUID metadata
+/// so [`Self::as_typed_slice`] and [`Self::as_component_slice`] reject mismatched element sizes,
+/// alignments, or component UUIDs by returning `None`.
 ///
-/// # Compile-Fail Safety Checks
-///
-/// Constructing `ChunkSlice` directly from a raw pointer without `unsafe` is rejected:
+/// Constructing a `ChunkSlice` from raw pointers without `unsafe` is rejected at compile time:
 ///
 /// ```compile_fail
-/// use bevy_abi_mod_guest::prelude::*;
-///
-/// let data = [10u32, 20, 30];
-/// let _slice = ChunkSlice::new(data.as_ptr().cast::<u8>(), 4, 3);
-/// ```
-///
-/// Reinterpreting column bytes as a type with invalid bit-pattern niches such as
-/// [`core::num::NonZeroU32`] is rejected because `NonZeroU32` does not implement [`AbiPod`]:
-///
-/// ```compile_fail
-/// use core::num::NonZeroU32;
 /// use bevy_abi_mod_guest::ChunkSlice;
 ///
-/// fn bad_view(slice: ChunkSlice<'_>) {
-///     let _ = slice.as_typed_slice::<NonZeroU32>();
+/// let data = [1.0f32, 2.0f32];
+/// let _s = ChunkSlice::from_raw_parts(data.as_ptr().cast::<u8>(), 2, 4);
+/// ```
+///
+/// Casting to non-`AbiPod` types (`bool`, `String`, `usize`, `u128`) is rejected at compile time:
+///
+/// ```compile_fail
+/// use bevy_abi_mod_guest::ChunkSlice;
+///
+/// fn bad(slice: &ChunkSlice<'_>) {
+///     let _ = slice.as_typed_slice::<bool>();
 /// }
 /// ```
-#[derive(Clone, Copy, Debug)]
 pub struct ChunkSlice<'a> {
     inner: ValidatedSlice<'a>,
 }
 
 impl<'a> ChunkSlice<'a> {
+    /// Wraps an already-validated [`ValidatedSlice`].
     #[inline]
-    pub(crate) fn from_validated(inner: ValidatedSlice<'a>) -> Self {
+    pub const fn from_validated(inner: ValidatedSlice<'a>) -> Self {
         Self { inner }
     }
 
-    /// Returns the number of entity elements in the current chunk.
+    /// Returns the number of elements in this column view (`0` if absent or invalid).
     #[inline]
-    pub const fn count(&self) -> usize {
-        self.inner.count()
+    pub const fn len(&self) -> usize {
+        self.inner.len()
     }
 
-    /// Returns the byte stride between consecutive elements in the column.
+    /// Returns `true` if `self.len() == 0`.
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Returns the known element byte stride (`0` if unspecified or zero-sized).
     #[inline]
     pub const fn stride(&self) -> usize {
         self.inner.stride()
     }
 
-    /// Returns `true` if the chunk slice contains zero elements or points to null.
+    /// Returns the column's [`ComponentUuid`] if constructed with [`BamColumnInfo`](bevy_abi_mod_sys::BamColumnInfo).
     #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+    pub const fn uuid(&self) -> Option<ComponentUuid> {
+        self.inner.uuid()
     }
 
-    /// Returns a pointer to the element at the specified index within the chunk.
+    /// Returns the raw base byte pointer for FFI or VTable field-accessor calls.
     #[inline]
-    pub fn get_ptr(&self, index: usize) -> Option<*const u8> {
-        self.inner.get_ptr(index)
+    pub const fn as_ptr(&self) -> *const u8 {
+        self.inner.as_ptr()
     }
 
-    /// Converts this chunk slice into a typed `&'a [T]` slice of [`AbiPod`] elements.
+    /// Computes a bounds-checked element pointer at `index` using `elem_stride` bytes per element.
+    #[inline]
+    pub fn get_ptr(&self, index: usize, elem_stride: usize) -> Option<*const u8> {
+        self.inner.get_ptr(index, elem_stride)
+    }
+
+    /// Casts this column view to `&[T]` (`T: AbiPod`), validating size and alignment.
     #[inline]
     pub fn as_typed_slice<T: AbiPod>(&self) -> Option<&'a [T]> {
         self.inner.as_typed_slice::<T>()
     }
-}
 
-impl<'a> ValidatedSliceAdapter<'a> for ChunkSlice<'a> {
+    /// Casts this column view to `&[T]` (`T: GuestComponent`), validating `T::UUID`, size, and alignment.
     #[inline]
-    fn from_validated_slice(inner: ValidatedSlice<'a>) -> Self {
-        Self { inner }
+    pub fn as_component_slice<T: GuestComponent>(&self) -> Option<&'a [T]> {
+        self.inner.as_typed_slice_checked::<T>(Some(T::UUID))
     }
 }
 
-/// Mutable chunk slice view for iterating components in an archetype table chunk.
+impl<'a> From<ValidatedSlice<'a>> for ChunkSlice<'a> {
+    #[inline]
+    fn from(inner: ValidatedSlice<'a>) -> Self {
+        Self::from_validated(inner)
+    }
+}
+
+/// Safe mutable view over a dense archetype column for the current chunk.
 ///
-/// Obtain a `ChunkSliceMut` safely from [`Chunk::mutable_slice`](crate::Chunk::mutable_slice) or
-/// [`GuestChunkIter::mutable_slice`](crate::GuestChunkIter::mutable_slice).
-///
-/// # Compile-Fail Safety Checks
-///
-/// Constructing `ChunkSliceMut` directly from a raw pointer without `unsafe` is rejected:
-///
-/// ```compile_fail
-/// use bevy_abi_mod_guest::prelude::*;
-///
-/// let mut data = [10u32, 20, 30];
-/// let _slice = ChunkSliceMut::new(data.as_mut_ptr().cast::<u8>(), 4, 3);
-/// ```
-///
-/// Reinterpreting column bytes as a fieldless `enum` is rejected because Rust `enum`s do not
-/// implement [`AbiPod`]:
+/// Mutable slice borrows are tied to `&mut self` so safe Rust cannot create aliasing mutable
+/// slices over the same column:
 ///
 /// ```compile_fail
 /// use bevy_abi_mod_guest::ChunkSliceMut;
 ///
-/// #[repr(C)]
-/// #[derive(Clone, Copy)]
-/// enum Team {
-///     Red = 0,
-///     Blue = 1,
-/// }
-///
-/// fn bad_enum_view(slice: &mut ChunkSliceMut<'_>) {
-///     let _ = slice.as_typed_slice::<Team>();
+/// fn alias_attempt(mut col: ChunkSliceMut<'_>) {
+///     let a = col.as_typed_slice_mut::<f32>().unwrap();
+///     let b = col.as_typed_slice_mut::<f32>().unwrap();
+///     a[0] = b[0];
 /// }
 /// ```
-#[derive(Debug)]
 pub struct ChunkSliceMut<'a> {
     inner: ValidatedSliceMut<'a>,
 }
 
 impl<'a> ChunkSliceMut<'a> {
+    /// Wraps an already-validated [`ValidatedSliceMut`].
     #[inline]
-    pub(crate) fn from_validated(inner: ValidatedSliceMut<'a>) -> Self {
+    pub const fn from_validated(inner: ValidatedSliceMut<'a>) -> Self {
         Self { inner }
     }
 
-    /// Returns the number of entity elements in the current chunk.
+    /// Returns the number of elements in this column view (`0` if absent or invalid).
     #[inline]
-    pub const fn count(&self) -> usize {
-        self.inner.count()
+    pub const fn len(&self) -> usize {
+        self.inner.len()
     }
 
-    /// Returns the byte stride between consecutive elements in the column.
+    /// Returns `true` if `self.len() == 0`.
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Returns the known element byte stride (`0` if unspecified or zero-sized).
     #[inline]
     pub const fn stride(&self) -> usize {
         self.inner.stride()
     }
 
-    /// Returns `true` if the chunk slice contains zero elements or points to null.
+    /// Returns the column's [`ComponentUuid`] if constructed with [`BamColumnInfo`](bevy_abi_mod_sys::BamColumnInfo).
     #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+    pub const fn uuid(&self) -> Option<ComponentUuid> {
+        self.inner.uuid()
     }
 
-    /// Returns a mutable pointer to the element at the specified index within the chunk.
+    /// Returns the raw read-only base byte pointer.
     #[inline]
-    pub fn get_ptr_mut(&mut self, index: usize) -> Option<*mut u8> {
-        self.inner.get_ptr_mut(index)
+    pub const fn as_ptr(&self) -> *const u8 {
+        self.inner.as_ptr()
     }
 
-    /// Reborrows this mutable chunk slice as a typed `&mut [T]` slice of [`AbiPod`] elements.
+    /// Returns the raw mutable base byte pointer.
     #[inline]
-    pub fn as_typed_slice<T: AbiPod>(&mut self) -> Option<&mut [T]> {
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.inner.as_mut_ptr()
+    }
+
+    /// Computes a bounds-checked read-only element pointer at `index`.
+    #[inline]
+    pub fn get_ptr(&self, index: usize, elem_stride: usize) -> Option<*const u8> {
+        self.inner.get_ptr(index, elem_stride)
+    }
+
+    /// Computes a bounds-checked mutable element pointer at `index`.
+    #[inline]
+    pub fn get_mut_ptr(&mut self, index: usize, elem_stride: usize) -> Option<*mut u8> {
+        self.inner.get_mut_ptr(index, elem_stride)
+    }
+
+    /// Borrows this column view immutably as `&[T]` (`T: AbiPod`), tied to `&self`.
+    #[inline]
+    pub fn as_typed_slice<T: AbiPod>(&self) -> Option<&[T]> {
         self.inner.as_typed_slice::<T>()
     }
 
-    /// Consumes this `ChunkSliceMut<'a>` and converts it into `&'a mut [T]` for `T: AbiPod`.
+    /// Borrows this column view immutably as `&[T]` (`T: GuestComponent`), validating `T::UUID`,
+    /// size, and alignment.
     #[inline]
-    pub fn into_typed_slice<T: AbiPod>(self) -> Option<&'a mut [T]> {
-        self.inner.into_typed_slice::<T>()
+    pub fn as_component_slice<T: GuestComponent>(&self) -> Option<&[T]> {
+        self.inner.as_typed_slice_checked::<T>(Some(T::UUID))
+    }
+
+    /// Borrows this column view mutably as `&mut [T]` (`T: AbiPod`), tied to `&mut self`.
+    #[inline]
+    pub fn as_typed_slice_mut<T: AbiPod>(&mut self) -> Option<&mut [T]> {
+        self.inner.as_typed_slice_mut::<T>()
+    }
+
+    /// Borrows this column view mutably as `&mut [T]` (`T: GuestComponent`), validating `T::UUID`,
+    /// size, and alignment.
+    #[inline]
+    pub fn as_component_slice_mut<T: GuestComponent>(&mut self) -> Option<&mut [T]> {
+        self.inner.as_typed_slice_mut_checked::<T>(Some(T::UUID))
     }
 }
 
-impl<'a> ValidatedSliceMutAdapter<'a> for ChunkSliceMut<'a> {
+impl<'a> From<ValidatedSliceMut<'a>> for ChunkSliceMut<'a> {
     #[inline]
-    fn from_validated_slice_mut(inner: ValidatedSliceMut<'a>) -> Self {
-        Self { inner }
+    fn from(inner: ValidatedSliceMut<'a>) -> Self {
+        Self::from_validated(inner)
     }
 }

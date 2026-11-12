@@ -1,377 +1,188 @@
-#![allow(
-    clippy::undocumented_unsafe_blocks,
-    clippy::ptr_as_ptr,
-    clippy::cast_ptr_alignment,
-    clippy::transmute_ptr_to_ptr,
-    unreachable_pub
-)]
-use bevy_abi_mod_guest::{
-    AbiPod, CommandBridgeVTable, FfiLayout, GuestCommandQueue, GuestCommandQueueRawExt,
-};
-use bevy_abi_mod_sys::{FfiEntity, FfiResult, RawCommandQueue};
-use core::ffi::{CStr, c_char};
+//! Handle-based and batched command queue stress & edge-case tests (`C-05`, `P-05`).
 
-macro_rules! impl_test_pod {
-    ($($ty:ty),+ $(,)?) => {
+#![deny(unsafe_code)]
+
+mod common;
+
+use core::ffi::CStr;
+
+use bevy_abi_mod_guest::prelude::*;
+use common::{MockHostWorld, RecordedCommand};
+
+#[cfg(not(feature = "derive"))]
+macro_rules! impl_pod_no_derive {
+    ($($ty:ty),* $(,)?) => {
         $(
-            unsafe impl FfiLayout for $ty {}
+            // SAFETY: Plain `#[repr(C)]` test struct with fixed-width POD fields.
+            #[allow(unsafe_code)]
+            unsafe impl RawInsertable for $ty {}
+            // SAFETY: Plain `#[repr(C)]` test struct with fixed-width POD fields.
+            #[allow(unsafe_code)]
             unsafe impl AbiPod for $ty {}
-        )+
+        )*
     };
 }
 
-#[derive(Default, Debug)]
-struct TestContext {
-    call_count: usize,
-    last_len: usize,
-    last_entity_bits: u64,
-    captured_bytes: Vec<u8>,
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "derive", derive(AbiPod))]
+struct PaddedPayload {
+    tag: u8,
+    // 3 bytes of natural C padding (`MaybeUninit<u8>`) — must be sound under Miri!
+    value: u32,
 }
 
-unsafe extern "C" fn mock_insert_ok(
-    queue: *mut RawCommandQueue,
-    entity: FfiEntity,
-    name: *const c_char,
-    data: *const u8,
-    len: usize,
-) -> FfiResult {
-    assert!(!queue.is_null(), "queue must not be null");
-    let ctx = unsafe { &mut *(queue as *mut TestContext) };
-    ctx.call_count += 1;
-    ctx.last_len = len;
-    ctx.last_entity_bits = entity.0;
+impl GuestComponent for PaddedPayload {
+    const NAME: &'static CStr = c"cmd::PaddedPayload";
+}
 
-    assert!(!name.is_null(), "component_name must not be null");
-    let cstr = unsafe { CStr::from_ptr(name) };
-    assert!(cstr.to_str().is_ok(), "component_name must be valid utf8");
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "derive", derive(AbiPod))]
+struct MarkerZst;
 
-    if len > 0 {
-        assert!(!data.is_null(), "data must not be null when len > 0");
-        let bytes = unsafe { core::slice::from_raw_parts(data, len) };
-        ctx.captured_bytes = bytes.to_vec();
+impl GuestComponent for MarkerZst {
+    const NAME: &'static CStr = c"cmd::MarkerZst";
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "derive", derive(AbiPod))]
+struct WithDefault {
+    hp: f32,
+}
+
+impl GuestComponent for WithDefault {
+    const NAME: &'static CStr = c"cmd::WithDefault";
+}
+
+#[cfg(not(feature = "derive"))]
+impl_pod_no_derive!(PaddedPayload, MarkerZst, WithDefault);
+
+#[test]
+fn handle_commands_and_batched_spawn_fast_and_heap_paths() {
+    let mut world = MockHostWorld::new();
+    let padded_h = world.expose_component::<PaddedPayload>(
+        "cmd::PaddedPayload",
+        PaddedPayload::UUID,
+        0,
+        false,
+    );
+    let marker_h = world.expose_component::<MarkerZst>("cmd::MarkerZst", MarkerZst::UUID, 0, true);
+    let def_h =
+        world.expose_component::<WithDefault>("cmd::WithDefault", WithDefault::UUID, 0, true);
+
+    // Also expose 20 u32 components to exercise the `> 16` heap fallback in `ValidatedCommands::spawn`.
+    let mut bulk_handles = Vec::with_capacity(20);
+    for idx in 0..20u32 {
+        let name = format!("cmd::Bulk{idx}");
+        let uuid = ComponentUuid::from_parts(&name, 4, 4, u64::from(idx));
+        bulk_handles.push(world.expose_component::<u32>(&name, uuid, 0, false));
+    }
+
+    let bulk_clone = bulk_handles.clone();
+    let inst = world
+        .load_fn(c"cmd_stress_mod", move |app| {
+            // Pre-resolve handles once at init (`C-05` O(1) pattern):
+            let resolved_padded = app
+                .resolve_component::<PaddedPayload>()
+                .expect("resolve PaddedPayload");
+            assert_eq!(resolved_padded, padded_h);
+
+            app.system(c"enqueue_all").build(move |ctx| {
+                let cmds = ctx.commands();
+                assert!(cmds.is_valid());
+
+                // 1. `spawn_empty` + handle `insert` (including padded struct & ZST) + `insert_default` + `remove`:
+                let e0 = cmds.spawn_empty().expect("spawn_empty");
+                let payload = PaddedPayload {
+                    tag: 7,
+                    value: 0x1234_5678,
+                };
+                assert_eq!(cmds.insert(e0, padded_h, &payload), FfiResult::OK);
+                assert_eq!(cmds.insert(e0, marker_h, &MarkerZst), FfiResult::OK);
+                assert_eq!(cmds.insert_default(e0, def_h), FfiResult::OK);
+                // `PaddedPayload` was registered with `has_default: false` -> `PERMISSION_DENIED`:
+                assert_eq!(
+                    cmds.insert_default(e0, padded_h),
+                    FfiResult::PERMISSION_DENIED
+                );
+                assert_eq!(cmds.remove(e0, marker_h), FfiResult::OK);
+
+                // 2. Convenience `GuestComponent` helpers:
+                assert_eq!(cmds.insert_component(e0, &payload), FfiResult::OK);
+                assert_eq!(
+                    cmds.insert_component_default::<WithDefault>(e0),
+                    FfiResult::OK
+                );
+                assert_eq!(cmds.remove_component::<PaddedPayload>(e0), FfiResult::OK);
+
+                // 3. Batched `spawn(&[])` (0 entries -> routes cleanly):
+                let e_empty_batch = cmds.spawn(&[]).expect("empty batch spawn");
+
+                // 4. Batched `spawn` fast stack path (`<= 16` entries, zero heap allocation `P-05`):
+                let def_val = WithDefault { hp: 99.5 };
+                let e_small = cmds
+                    .spawn(&[
+                        SpawnEntry::new(padded_h, &payload),
+                        SpawnEntry::marker(marker_h),
+                        SpawnEntry::new(def_h, &def_val),
+                    ])
+                    .expect("small batch spawn");
+                assert_ne!(e_empty_batch, e_small);
+
+                // 5. Batched `spawn` heap fallback (`20 > 16` entries):
+                let bulk_vals: [u32; 20] = core::array::from_fn(|i| (i as u32) * 10);
+                let bulk_entries: Vec<SpawnEntry<'_>> = bulk_clone
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &h)| SpawnEntry::new(h, &bulk_vals[i]))
+                    .collect();
+                let e_large = cmds.spawn(&bulk_entries).expect("large batch spawn");
+                assert_eq!(cmds.despawn(e_large), FfiResult::OK);
+
+                // 6. Invalid handle / null entity error checks:
+                assert_eq!(
+                    cmds.insert(e0, BamComponent::INVALID, &payload),
+                    FfiResult::INVALID_COMPONENT
+                );
+                assert_eq!(
+                    cmds.insert(FfiEntity::NULL, padded_h, &payload),
+                    FfiResult::INVALID_ENTITY
+                );
+                assert_eq!(cmds.despawn(FfiEntity::NULL), FfiResult::INVALID_ENTITY);
+                assert_eq!(
+                    cmds.spawn(&[SpawnEntry::new(BamComponent::INVALID, &payload)]),
+                    Err(FfiResult::INVALID_COMPONENT)
+                );
+            })
+        })
+        .expect("load cmd_stress_mod");
+
+    assert_eq!(world.run_system(0), FfiResult::OK);
+
+    assert_eq!(world.commands.len(), 12);
+    assert_eq!(
+        world.commands[0],
+        RecordedCommand::SpawnEmpty(FfiEntity::from_bits(100))
+    );
+    assert_eq!(
+        world.commands[9],
+        RecordedCommand::SpawnBatch {
+            entity: FfiEntity::from_bits(102),
+            components: vec![(padded_h, 8), (marker_h, 0), (def_h, 4)],
+        }
+    );
+    if let RecordedCommand::SpawnBatch { entity, components } = &world.commands[10] {
+        assert_eq!(*entity, FfiEntity::from_bits(103));
+        assert_eq!(components.len(), 20);
     } else {
-        ctx.captured_bytes.clear();
+        panic!("expected 20-component SpawnBatch");
     }
+    assert_eq!(
+        world.commands[11],
+        RecordedCommand::Despawn(FfiEntity::from_bits(103))
+    );
 
-    FfiResult::OK
-}
-
-unsafe extern "C" fn mock_insert_error(
-    _queue: *mut RawCommandQueue,
-    _entity: FfiEntity,
-    _name: *const c_char,
-    _data: *const u8,
-    _len: usize,
-) -> FfiResult {
-    FfiResult::INVALID_COMPONENT
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[repr(C)]
-struct EmptyZst;
-
-#[derive(Copy, Clone, Debug, PartialEq)]
-#[repr(C)]
-struct SimplePos {
-    x: f32,
-    y: f32,
-    z: f32,
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[repr(C, align(64))]
-struct OverAligned {
-    tag: u64,
-    bytes: [u8; 56],
-}
-
-#[derive(Copy, Clone, Debug, PartialEq)]
-#[repr(C)]
-struct PaddedStruct {
-    a: u8,
-    _pad0: [u8; 3],
-    b: u32,
-    c: u16,
-    _pad1: [u8; 6],
-    d: u64,
-}
-
-impl_test_pod!(EmptyZst, SimplePos, OverAligned, PaddedStruct);
-
-#[test]
-fn test_insert_null_queue_returns_null_pointer() {
-    let mut queue = unsafe {
-        GuestCommandQueue::new(
-            core::ptr::null_mut(),
-            CommandBridgeVTable {
-                spawn_empty: None,
-                despawn: None,
-                insert_component: Some(mock_insert_ok),
-            },
-        )
-    };
-
-    let val = 42u32;
-    let res_val = queue.insert_value(FfiEntity(1), c"MyComponent", &val);
-    assert_eq!(res_val, FfiResult::NULL_POINTER);
-
-    let slice = [1u32, 2, 3];
-    let res_slice = queue.insert_slice(FfiEntity(1), c"MyComponent", &slice);
-    assert_eq!(res_slice, FfiResult::NULL_POINTER);
-}
-
-#[test]
-fn test_insert_missing_vtable_function_returns_null_pointer() {
-    let mut ctx = TestContext::default();
-    let mut queue = unsafe {
-        GuestCommandQueue::new(
-            core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
-            CommandBridgeVTable {
-                spawn_empty: None,
-                despawn: None,
-                insert_component: None,
-            },
-        )
-    };
-
-    let val = 42u32;
-    let res_val = queue.insert_value(FfiEntity(1), c"MyComponent", &val);
-    assert_eq!(res_val, FfiResult::NULL_POINTER);
-
-    let slice = [1u32, 2, 3];
-    let res_slice = queue.insert_slice(FfiEntity(1), c"MyComponent", &slice);
-    assert_eq!(res_slice, FfiResult::NULL_POINTER);
-}
-
-#[test]
-fn test_insert_error_propagation() {
-    let mut ctx = TestContext::default();
-    let mut queue = unsafe {
-        GuestCommandQueue::new(
-            core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
-            CommandBridgeVTable {
-                spawn_empty: None,
-                despawn: None,
-                insert_component: Some(mock_insert_error),
-            },
-        )
-    };
-
-    let val = 42u32;
-    let res = queue.insert_value(FfiEntity(1), c"MyComponent", &val);
-    assert_eq!(res, FfiResult::INVALID_COMPONENT);
-
-    let slice = [10u32, 20];
-    let res_slice = queue.insert_slice(FfiEntity(1), c"MyComponent", &slice);
-    assert_eq!(res_slice, FfiResult::INVALID_COMPONENT);
-}
-
-#[test]
-fn test_insert_value_and_slice_valid_data() {
-    let mut ctx = TestContext::default();
-    let mut queue = unsafe {
-        GuestCommandQueue::new(
-            core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
-            CommandBridgeVTable {
-                spawn_empty: None,
-                despawn: None,
-                insert_component: Some(mock_insert_ok),
-            },
-        )
-    };
-
-    let pos = SimplePos {
-        x: 10.0,
-        y: 20.0,
-        z: 30.0,
-    };
-    let res = queue.insert_value(FfiEntity(42), c"Position", &pos);
-    assert_eq!(res, FfiResult::OK);
-    assert_eq!(ctx.call_count, 1);
-    assert_eq!(ctx.last_len, core::mem::size_of::<SimplePos>());
-    assert_eq!(ctx.last_entity_bits, 42);
-
-    let poses = [
-        SimplePos {
-            x: 1.0,
-            y: 2.0,
-            z: 3.0,
-        },
-        SimplePos {
-            x: 4.0,
-            y: 5.0,
-            z: 6.0,
-        },
-        SimplePos {
-            x: 7.0,
-            y: 8.0,
-            z: 9.0,
-        },
-    ];
-    let res_slice = queue.insert_slice(FfiEntity(99), c"Positions", &poses);
-    assert_eq!(res_slice, FfiResult::OK);
-    assert_eq!(ctx.call_count, 2);
-    assert_eq!(ctx.last_len, core::mem::size_of::<SimplePos>() * 3);
-    assert_eq!(ctx.last_entity_bits, 99);
-}
-
-#[test]
-fn test_data_content_fidelity() {
-    let mut ctx = TestContext::default();
-    let mut queue = unsafe {
-        GuestCommandQueue::new(
-            core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
-            CommandBridgeVTable {
-                spawn_empty: None,
-                despawn: None,
-                insert_component: Some(mock_insert_ok),
-            },
-        )
-    };
-
-    let padded = PaddedStruct {
-        a: 0x42,
-        _pad0: [0; 3],
-        b: 0xDEADBEEF,
-        c: 0x1234,
-        _pad1: [0; 6],
-        d: 0xCAFEBABE_FEEDFACE,
-    };
-
-    let res = queue.insert_value(FfiEntity(123), c"Padded", &padded);
-    assert_eq!(res, FfiResult::OK);
-    assert_eq!(ctx.last_len, core::mem::size_of::<PaddedStruct>());
-
-    let recovered: PaddedStruct =
-        unsafe { core::ptr::read_unaligned(ctx.captured_bytes.as_ptr() as *const PaddedStruct) };
-    assert_eq!(recovered, padded);
-}
-
-#[test]
-fn test_insert_zero_sized_types_and_empty_slices() {
-    let mut ctx = TestContext::default();
-    let mut queue = unsafe {
-        GuestCommandQueue::new(
-            core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
-            CommandBridgeVTable {
-                spawn_empty: None,
-                despawn: None,
-                insert_component: Some(mock_insert_ok),
-            },
-        )
-    };
-
-    let zst = EmptyZst;
-    let res = queue.insert_value(FfiEntity(100), c"EmptyZst", &zst);
-    assert_eq!(res, FfiResult::OK);
-    assert_eq!(ctx.call_count, 1);
-    assert_eq!(ctx.last_len, 0);
-    assert!(ctx.captured_bytes.is_empty());
-
-    let zst_slice = [EmptyZst, EmptyZst, EmptyZst];
-    let res = queue.insert_slice(FfiEntity(101), c"EmptyZstSlice", &zst_slice);
-    assert_eq!(res, FfiResult::OK);
-    assert_eq!(ctx.call_count, 2);
-    assert_eq!(ctx.last_len, 0);
-    assert!(ctx.captured_bytes.is_empty());
-
-    let empty_u32: [u32; 0] = [];
-    let res = queue.insert_slice(FfiEntity(102), c"EmptyU32Slice", &empty_u32);
-    assert_eq!(res, FfiResult::OK);
-    assert_eq!(ctx.call_count, 3);
-    assert_eq!(ctx.last_len, 0);
-    assert!(ctx.captured_bytes.is_empty());
-}
-
-#[test]
-fn test_insert_overaligned_type() {
-    let mut ctx = TestContext::default();
-    let mut queue = unsafe {
-        GuestCommandQueue::new(
-            core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
-            CommandBridgeVTable {
-                spawn_empty: None,
-                despawn: None,
-                insert_component: Some(mock_insert_ok),
-            },
-        )
-    };
-
-    let aligned = OverAligned {
-        tag: 0xCAFEBABE,
-        bytes: [0x5A; 56],
-    };
-    let res = queue.insert_value(FfiEntity(777), c"OverAligned", &aligned);
-    assert_eq!(res, FfiResult::OK);
-    assert_eq!(ctx.last_len, core::mem::size_of::<OverAligned>());
-    assert_eq!(core::mem::align_of::<OverAligned>(), 64);
-}
-
-#[test]
-fn test_insert_large_slice_scale() {
-    let mut ctx = TestContext::default();
-    let mut queue = unsafe {
-        GuestCommandQueue::new(
-            core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
-            CommandBridgeVTable {
-                spawn_empty: None,
-                despawn: None,
-                insert_component: Some(mock_insert_ok),
-            },
-        )
-    };
-
-    let large_buffer = vec![123456789u64; 10_000];
-    let res = queue.insert_slice(FfiEntity(888), c"LargeU64Array", &large_buffer);
-    assert_eq!(res, FfiResult::OK);
-    assert_eq!(ctx.last_len, 10_000 * 8);
-    assert_eq!(ctx.captured_bytes.len(), 10_000 * 8);
-}
-
-#[test]
-fn test_multiple_sequential_insertions_stress() {
-    let mut ctx = TestContext::default();
-    let mut queue = unsafe {
-        GuestCommandQueue::new(
-            core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
-            CommandBridgeVTable {
-                spawn_empty: None,
-                despawn: None,
-                insert_component: Some(mock_insert_ok),
-            },
-        )
-    };
-
-    let iterations = if cfg!(miri) { 100 } else { 5000 };
-
-    for i in 0..iterations {
-        let entity = FfiEntity(i as u64);
-        let val = (i * 3) as u32;
-        let res = queue.insert_value(entity, c"IterComp", &val);
-        assert_eq!(res, FfiResult::OK);
-    }
-
-    assert_eq!(ctx.call_count, iterations);
-    assert_eq!(ctx.last_entity_bits, (iterations - 1) as u64);
-}
-
-#[test]
-fn test_edge_case_component_names() {
-    let mut ctx = TestContext::default();
-    let mut queue = unsafe {
-        GuestCommandQueue::new(
-            core::ptr::addr_of_mut!(ctx) as *mut RawCommandQueue,
-            CommandBridgeVTable {
-                spawn_empty: None,
-                despawn: None,
-                insert_component: Some(mock_insert_ok),
-            },
-        )
-    };
-
-    let res = queue.insert_value(FfiEntity(1), c"", &1u8);
-    assert_eq!(res, FfiResult::OK);
-
-    let res2 = queue.insert_value(FfiEntity(2), c"Mod_🦀_Rocket🚀", &2u8);
-    assert_eq!(res2, FfiResult::OK);
+    world.unload_instance(inst);
 }
