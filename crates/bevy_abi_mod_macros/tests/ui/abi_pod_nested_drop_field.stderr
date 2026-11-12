@@ -10,7 +10,7 @@ help: the trait `Copy` is not implemented for `OuterWithDroppable`
 11 | pub struct OuterWithDroppable {
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 note: required by a bound in `AbiPod`
-  --> $WORKSPACE/crates/bevy_abi_mod_sys/src/lib.rs
+  --> $WORKSPACE/crates/bevy_abi_mod_sys/src/traits.rs
    |
    | pub unsafe trait AbiPod: FfiLayout + Copy + 'static {}
    |                                      ^^^^ required by this bound in `AbiPod`

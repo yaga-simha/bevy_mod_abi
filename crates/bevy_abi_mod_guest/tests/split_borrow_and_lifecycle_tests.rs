@@ -25,7 +25,6 @@
 
 use core::ffi::{CStr, c_char, c_void};
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -1092,7 +1091,7 @@ fn test_reentrant_closure_invocation_returns_access_conflict() {
 }
 
 // ============================================================================
-// 5. Asymmetric C99 & Asymmetric Rust Guest Mod Build Verification
+// 5. Asymmetric C99 & Asymmetric Rust Guest Mod Fixture Verification
 // ============================================================================
 
 #[test]
@@ -1104,43 +1103,31 @@ fn test_asymmetric_c99_and_rust_mods_compile_cleanly() {
         .and_then(|p| p.parent())
         .expect("workspace root exists");
 
-    let c_mod_dir = repo_root.join("tests").join("asymmetric_c_mod");
-    let c_status = if cfg!(target_os = "windows") {
-        let target_dir = repo_root.join("target");
-        let _ = std::fs::create_dir_all(&target_dir);
-        let out_dll = target_dir.join("asymmetric_c_mod_compile_check.dll");
-        Command::new("gcc")
-            .args(["-std=c99", "-Wall", "-Wextra", "-Werror", "-I"])
-            .arg(repo_root.join("include"))
-            .args(["-O3", "-shared"])
-            .arg(c_mod_dir.join("mod.c"))
-            .arg("-o")
-            .arg(&out_dll)
-            .status()
-            .expect("failed to invoke gcc for asymmetric_c_mod")
-    } else {
-        Command::new("make")
-            .arg("-C")
-            .arg(&c_mod_dir)
-            .status()
-            .expect("failed to invoke make for asymmetric_c_mod")
-    };
-    assert!(c_status.success(), "asymmetric_c_mod C99 build failed");
+    let fixture_dir = std::env::var_os("BAM_FIXTURE_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo_root.join("target").join("fixtures"));
 
-    let rust_mod_manifest = repo_root
-        .join("tests")
-        .join("asymmetric_rust_mod")
-        .join("Cargo.toml");
-    let cargo_bin = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let rust_status = Command::new(cargo_bin)
-        .arg("build")
-        .arg("--offline")
-        .arg("--manifest-path")
-        .arg(&rust_mod_manifest)
-        .status()
-        .expect("failed to invoke cargo build for asymmetric_rust_mod");
-    assert!(
-        rust_status.success(),
-        "asymmetric_rust_mod cdylib build failed"
-    );
+    let (prefix, ext) = if cfg!(target_os = "windows") {
+        ("", "dll")
+    } else if cfg!(target_os = "macos") {
+        ("lib", "dylib")
+    } else {
+        ("lib", "so")
+    };
+
+    for stem in ["asymmetric_c_mod", "asymmetric_rust_mod"] {
+        let path = fixture_dir.join(format!("{prefix}{stem}.{ext}"));
+        let meta = std::fs::metadata(&path).unwrap_or_else(|_| {
+            panic!(
+                "Fixture missing at {} — run 'cargo xtask fixtures' before 'cargo test'",
+                path.display()
+            )
+        });
+        assert!(
+            meta.is_file() && meta.len() > 0,
+            "Staged fixture at {} must be a non-empty shared library",
+            path.display()
+        );
+    }
 }

@@ -35,6 +35,18 @@ pub struct Velocity {
     pub z: f32,
 }
 
+#[derive(Component, Debug, Clone, Copy, PartialEq)]
+struct FragTagA(u32);
+
+#[derive(Component, Debug, Clone, Copy, PartialEq)]
+struct FragTagB(u32);
+
+#[derive(Component, Debug, Clone, Copy, PartialEq)]
+struct FragTagC(u32);
+
+#[derive(Component, Debug, Clone, Copy, PartialEq)]
+struct FragTagD(u32);
+
 /// Native Bevy baseline matching the 8-byte `(f32, u32)` payload of `RustModCustomData` / `CModCustomData`.
 #[derive(Component, Debug, Clone, Copy, PartialEq)]
 #[repr(C)]
@@ -80,6 +92,11 @@ fn get_dylib_paths() -> (PathBuf, PathBuf) {
         manifest_dir
     };
 
+    let fixture_dir = std::env::var_os("BAM_FIXTURE_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root_dir.join("target").join("fixtures"));
+
     let (prefix, ext) = if cfg!(target_os = "windows") {
         ("", "dll")
     } else if cfg!(target_os = "macos") {
@@ -88,12 +105,8 @@ fn get_dylib_paths() -> (PathBuf, PathBuf) {
         ("lib", "so")
     };
 
-    let rust_dylib = root_dir
-        .join("tests/asymmetric_rust_mod/target/release")
-        .join(format!("{prefix}asymmetric_rust_mod.{ext}"));
-    let c_dylib = root_dir
-        .join("tests/asymmetric_c_mod")
-        .join(format!("{prefix}asymmetric_c_mod.{ext}"));
+    let rust_dylib = fixture_dir.join(format!("{prefix}asymmetric_rust_mod.{ext}"));
+    let c_dylib = fixture_dir.join(format!("{prefix}asymmetric_c_mod.{ext}"));
 
     (rust_dylib, c_dylib)
 }
@@ -128,18 +141,16 @@ fn measure_app_rounds(
 fn main() {
     let (rust_dylib, c_dylib) = get_dylib_paths();
     if !rust_dylib.exists() {
-        eprintln!(
-            "Rust guest mod dynamic library not found at {:?}. Run `cargo build --manifest-path tests/asymmetric_rust_mod/Cargo.toml --release` first.",
-            rust_dylib
+        panic!(
+            "Fixture missing at {} — run 'cargo xtask fixtures' before 'cargo bench'",
+            rust_dylib.display()
         );
-        std::process::exit(1);
     }
     if !c_dylib.exists() {
-        eprintln!(
-            "C99 guest mod dynamic library not found at {:?}. Run `make -C tests/asymmetric_c_mod` first.",
-            c_dylib
+        panic!(
+            "Fixture missing at {} — run 'cargo xtask fixtures' before 'cargo bench'",
+            c_dylib.display()
         );
-        std::process::exit(1);
     }
 
     const WARMUP: usize = 5;
@@ -382,6 +393,49 @@ fn main() {
         println!(
             "  Static ModExposable VTable     | Median: {:>7.4} ms | {:>13.2} ent/s | {:>6.2} ns/ent",
             stat_med_ms, stat_tput, stat_ns
+        );
+    }
+
+    println!("\n--- Archetype Fragmentation Efficiency (10,000 entities, {ROUNDS} frames) ---");
+    for &num_archetypes in &[1_usize, 4, 16] {
+        let mut app = App::new();
+        app.add_plugins(AbiModPlugin);
+        app.register_mod_component::<Position>();
+        app.register_mod_component::<Velocity>();
+        for i in 0..10_000_usize {
+            let bucket = i % num_archetypes;
+            let mut emut = app.world_mut().spawn((
+                Position {
+                    x: i as f32,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                Velocity {
+                    x: 1.0,
+                    y: 2.0,
+                    z: 0.0,
+                },
+            ));
+            if bucket & 1 != 0 {
+                emut.insert(FragTagA(i as u32));
+            }
+            if bucket & 2 != 0 {
+                emut.insert(FragTagB(i as u32));
+            }
+            if bucket & 4 != 0 {
+                emut.insert(FragTagC(i as u32));
+            }
+            if bucket & 8 != 0 {
+                emut.insert(FragTagD(i as u32));
+            }
+        }
+        let mod_id = app.load_mod_tracked(&rust_dylib).expect("load rust mod");
+        let (frag_med_ms, frag_tput, frag_ns) =
+            measure_app_rounds(&mut app, WARMUP, ROUNDS, 10_000);
+        app.unload_mod(mod_id).expect("unload rust mod");
+        println!(
+            "  {:>2}-way Fragmented Archetypes   | Median: {:>7.4} ms | {:>13.2} ent/s | {:>6.2} ns/ent",
+            num_archetypes, frag_med_ms, frag_tput, frag_ns
         );
     }
 

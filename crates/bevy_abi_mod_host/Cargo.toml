@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+autotests = false
 
 [lints]
 workspace = true
@@ -22,6 +23,22 @@ bevy_app = { workspace = true }
 [dev-dependencies]
 bevy_abi_mod_host_sys = { workspace = true, features = ["test-utils"] }
 libloading = { workspace = true }
+
+[[test]]
+name = "ffi"
+path = "tests/ffi/main.rs"
+
+[[test]]
+name = "scheduling"
+path = "tests/scheduling/main.rs"
+
+[[test]]
+name = "lifecycle"
+path = "tests/lifecycle/main.rs"
+
+[[test]]
+name = "e2e"
+path = "tests/e2e/main.rs"
 
 [[bench]]
 name = "chunk_throughput"

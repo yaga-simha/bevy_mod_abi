@@ -79,12 +79,13 @@ fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "fixtures" => cmd_fixtures(rest),
+        "lint" => cmd_lint(rest),
         "ci" => cmd_ci(rest),
         "header" => cmd_header(rest),
         "bench" => cmd_bench(rest),
         "miri" => cmd_miri(rest),
         other => Err(format!(
-            "unknown subcommand `{other}` (expected `fixtures`, `ci`, `header`, `bench`, or `miri`)"
+            "unknown subcommand `{other}` (expected `fixtures`, `lint`, `ci`, `header`, `bench`, or `miri`)"
         )),
     }
 }
@@ -95,6 +96,9 @@ fn print_help() {
     println!("Subcommands:");
     println!(
         "  fixtures [--examples] [--benches] [--all]   Build guest mod fixtures into target/fixtures/"
+    );
+    println!(
+        "  lint [--quick]                              Run fmt, clippy, zero-Bevy check, and C99 header syntax check"
     );
     println!(
         "  ci                                          Run fmt, clippy, zero-Bevy check, fixtures, C99, and workspace tests"
@@ -206,6 +210,42 @@ fn build_c99_mod(
     if !out_path.is_file() {
         return Err(format!(
             "expected C99 shared library was not produced at {}",
+            out_path.display()
+        ));
+    }
+    Ok(out_path)
+}
+
+fn build_c99_test_fixture(root: &Path, stem: &str) -> Result<PathBuf, String> {
+    let src_dir = root.join("tests").join("fixtures").join("c_mods");
+    let src_path = src_dir.join(format!("{stem}.c"));
+    let build_dir = root.join("target").join("c_mods_build");
+    fs::create_dir_all(&build_dir)
+        .map_err(|e| format!("failed to create {}: {e}", build_dir.display()))?;
+
+    let (prefix, ext) = dylib_naming();
+    let out_name = format!("{prefix}{stem}.{ext}");
+    let out_path = build_dir.join(&out_name);
+
+    let cc = c_compiler();
+    let include_dir = root.join("include");
+    let mut cmd = Command::new(&cc);
+    cmd.current_dir(root)
+        .args(["-std=c99", "-Wall", "-Wextra", "-Werror"])
+        .arg(format!("-I{}", include_dir.display()))
+        .args(["-O2", "-shared"]);
+    if !cfg!(target_os = "windows") {
+        cmd.arg("-fPIC");
+    }
+    cmd.arg(&src_path).arg("-o").arg(&out_path);
+    run_cmd(
+        &mut cmd,
+        &format!("{cc} tests/fixtures/c_mods/{stem}.c -> target/c_mods_build/{out_name}"),
+    )?;
+
+    if !out_path.is_file() {
+        return Err(format!(
+            "expected C99 test fixture was not produced at {}",
             out_path.display()
         ));
     }
@@ -368,45 +408,101 @@ fn build_fixtures_internal(
         "asymmetric_c_mod",
     )?);
 
-    // 2. Optional example guest mods
+    // 2. Hermetic C99 integration test fixtures (`tests/fixtures/c_mods/*.c`)
+    let c_test_fixtures: &[&str] = &[
+        "c_uuid_oracle",
+        "s05_vtable_mod",
+        "s06_fail_init",
+        "s06_strict_fail",
+        "l01_late_startup",
+        "mod_alpha",
+        "mod_beta",
+        "mod_producer",
+        "mod_consumer",
+        "l05c_clean_mod",
+    ];
+    for &stem in c_test_fixtures {
+        let compiled = build_c99_test_fixture(root, stem)?;
+        let mut staged =
+            stage_fixture(root, &fixtures_dir, stem, "c99", "release", &compiled, stem)?;
+        staged.source_rel = format!("tests/fixtures/c_mods/{stem}.c");
+        built.push(staged);
+    }
+
+    // 3. Lightweight Bevy-free example 01..04 guest mods exercised by host E2E tests
+    let test_rust_examples: &[(&str, &str, &str, &str)] = &[
+        (
+            "example_01_guest_mod",
+            "examples/01_minimal_handshake/guest_mod/Cargo.toml",
+            "minimal_guest_mod",
+            "minimal_guest_mod",
+        ),
+        (
+            "example_02_guest_mod",
+            "examples/02_multi_system_pipeline/guest_mod/Cargo.toml",
+            "example_02_guest_mod",
+            "example_02_guest_mod",
+        ),
+        (
+            "example_03_rust_mod",
+            "examples/03_cross_language_interop/rust_mod/Cargo.toml",
+            "rust_mod",
+            "example_03_rust_mod",
+        ),
+        (
+            "mod_gravity",
+            "examples/04_visual_game/mods/mod_gravity/Cargo.toml",
+            "mod_gravity",
+            "mod_gravity",
+        ),
+        (
+            "mod_rainbow",
+            "examples/04_visual_game/mods/mod_rainbow/Cargo.toml",
+            "mod_rainbow",
+            "mod_rainbow",
+        ),
+        (
+            "mod_vortex",
+            "examples/04_visual_game/mods/mod_vortex/Cargo.toml",
+            "mod_vortex",
+            "mod_vortex",
+        ),
+    ];
+
+    for &(key, manifest_rel, crate_stem, dest_stem) in test_rust_examples {
+        let src = build_rust_cdylib(root, manifest_rel, crate_stem, true)?;
+        built.push(stage_fixture(
+            root,
+            &fixtures_dir,
+            key,
+            "rust",
+            "release",
+            &src,
+            dest_stem,
+        )?);
+    }
+
+    let ex3_c = build_c99_mod(
+        root,
+        "examples/03_cross_language_interop/c_mod",
+        "mod.c",
+        "c_mod",
+        "-O3",
+        false,
+    )?;
+    built.push(stage_fixture(
+        root,
+        &fixtures_dir,
+        "example_03_c_mod",
+        "c99",
+        "release",
+        &ex3_c,
+        "example_03_c_mod",
+    )?);
+
+    // 4. Additional optional example guest mods (Examples 05..06)
     if include_examples {
-        let rust_examples: &[(&str, &str, &str, &str)] = &[
-            (
-                "example_01_guest_mod",
-                "examples/01_minimal_handshake/guest_mod/Cargo.toml",
-                "minimal_guest_mod",
-                "minimal_guest_mod",
-            ),
-            (
-                "example_02_guest_mod",
-                "examples/02_multi_system_pipeline/guest_mod/Cargo.toml",
-                "example_02_guest_mod",
-                "example_02_guest_mod",
-            ),
-            (
-                "example_03_rust_mod",
-                "examples/03_cross_language_interop/rust_mod/Cargo.toml",
-                "rust_mod",
-                "example_03_rust_mod",
-            ),
-            (
-                "mod_gravity",
-                "examples/04_visual_game/mods/mod_gravity/Cargo.toml",
-                "mod_gravity",
-                "mod_gravity",
-            ),
-            (
-                "mod_rainbow",
-                "examples/04_visual_game/mods/mod_rainbow/Cargo.toml",
-                "mod_rainbow",
-                "mod_rainbow",
-            ),
-            (
-                "mod_vortex",
-                "examples/04_visual_game/mods/mod_vortex/Cargo.toml",
-                "mod_vortex",
-                "mod_vortex",
-            ),
+        let extra_rust_examples: &[(&str, &str, &str, &str)] = &[
             (
                 "mod_boing",
                 "examples/05_cute_3d_winit/mods/mod_boing/Cargo.toml",
@@ -433,7 +529,7 @@ fn build_fixtures_internal(
             ),
         ];
 
-        for &(key, manifest_rel, crate_stem, dest_stem) in rust_examples {
+        for &(key, manifest_rel, crate_stem, dest_stem) in extra_rust_examples {
             let src = build_rust_cdylib(root, manifest_rel, crate_stem, true)?;
             built.push(stage_fixture(
                 root,
@@ -445,24 +541,6 @@ fn build_fixtures_internal(
                 dest_stem,
             )?);
         }
-
-        let ex3_c = build_c99_mod(
-            root,
-            "examples/03_cross_language_interop/c_mod",
-            "mod.c",
-            "c_mod",
-            "-O3",
-            false,
-        )?;
-        built.push(stage_fixture(
-            root,
-            &fixtures_dir,
-            "example_03_c_mod",
-            "c99",
-            "release",
-            &ex3_c,
-            "example_03_c_mod",
-        )?);
 
         let ex5_c = build_c99_mod(
             root,
@@ -719,6 +797,46 @@ fn cmd_header(args: &[String]) -> Result<(), String> {
         )?;
     }
     verify_c99_header_and_tests(&root, run_standalone)
+}
+
+fn cmd_lint(args: &[String]) -> Result<(), String> {
+    let mut quick = false;
+    for arg in args {
+        match arg.as_str() {
+            "--quick" => quick = true,
+            other => {
+                return Err(format!(
+                    "unsupported `lint` flag `{other}` (expected `--quick`)"
+                ));
+            }
+        }
+    }
+
+    let root = repo_root()?;
+
+    let mut fmt_cmd = Command::new(cargo_bin());
+    fmt_cmd
+        .current_dir(&root)
+        .args(["fmt", "--all", "--", "--check"]);
+    run_cmd(&mut fmt_cmd, "cargo fmt --all -- --check")?;
+
+    let mut clippy_cmd = Command::new(cargo_bin());
+    clippy_cmd.current_dir(&root).args([
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings",
+    ]);
+    run_cmd(
+        &mut clippy_cmd,
+        "cargo clippy --workspace --all-targets -- -D warnings",
+    )?;
+
+    verify_zero_bevy_deps(&root)?;
+    verify_c99_header_and_tests(&root, !quick)?;
+    Ok(())
 }
 
 fn cmd_ci(args: &[String]) -> Result<(), String> {
