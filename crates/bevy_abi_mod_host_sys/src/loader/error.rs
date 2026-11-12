@@ -1,11 +1,12 @@
-//! Typed diagnostic errors for native shared-library mod loading and unloading.
+//! Typed diagnostic errors (`thiserror`) for native shared-library mod loading and unloading (`E-02`, `L-08`, `B-06`).
 
 use crate::loader::ModId;
-use bevy_abi_mod_sys::FfiResult;
-use core::fmt;
+use crate::registry::ComponentCollisionError;
+use bevy_abi_mod_sys::{FfiResult, ScheduleId};
 use std::path::PathBuf;
+use thiserror::Error;
 
-/// Checks SemVer compatibility between packed `(major << 24) | (minor << 16) | patch` ABI versions.
+/// Checks SemVer compatibility between packed `(major << 24) | (minor << 16) | patch` ABI versions (`C-06`).
 ///
 /// Delegates directly to [`bevy_abi_mod_sys::abi_version_is_compatible`].
 #[inline]
@@ -13,135 +14,150 @@ pub const fn is_abi_version_compatible(host_packed: u32, guest_packed: u32) -> b
     bevy_abi_mod_sys::abi_version_is_compatible(host_packed, guest_packed)
 }
 
-/// Typed diagnostic error returned when loading or unloading a native mod fails.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Typed diagnostic error returned when loading, validating, scheduling, or unloading a native mod fails (`E-02`).
+#[derive(Debug, Error)]
 pub enum ModLoadError {
+    /// Failed to shadow-copy the shared library prior to `dlopen` (`L-03`).
+    #[error("failed to shadow-copy mod '{path}': {source}")]
+    ShadowCopy {
+        /// Source or destination path involved in the copy failure.
+        path: PathBuf,
+        /// Underlying filesystem I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// Failed to open the shared library via OS dynamic linker (`dlopen` / `LoadLibrary`).
+    #[error("failed to load mod '{path}': {source}")]
     DlOpen {
         /// Path passed to the loader.
         path: PathBuf,
-        /// Underlying OS linker error message.
-        message: String,
+        /// Underlying `libloading` OS linker error.
+        #[source]
+        source: libloading::Error,
     },
-    /// Required symbol (`bevy_abi_mod_init`) was not exported by the shared library.
+
+    /// Shared library did not export the mandatory `bevy_abi_mod_manifest` symbol (`L-08`).
+    #[error("mod '{path}' is missing mandatory symbol 'bevy_abi_mod_manifest': {source}")]
+    MissingManifest {
+        /// Path of the loaded library.
+        path: PathBuf,
+        /// Underlying symbol lookup error.
+        #[source]
+        source: libloading::Error,
+    },
+
+    /// `bevy_abi_mod_manifest` returned null, malformed UTF-8, empty metadata, or invalid `struct_size` (`L-08`).
+    #[error("mod '{path}' returned an invalid BamManifest ({status}): {detail}")]
+    InvalidManifest {
+        /// Path of the loaded library.
+        path: PathBuf,
+        /// ABI status describing the manifest validation failure.
+        status: FfiResult,
+        /// Human-readable validation detail.
+        detail: String,
+    },
+
+    /// Guest `BamManifest::abi_version` reported an incompatible packed version (`C-06`, `L-08`).
+    #[error(
+        "mod '{path}' reported incompatible ABI version 0x{guest_version:08x} (host ABI is 0x{host_version:08x})"
+    )]
+    IncompatibleAbiVersion {
+        /// Path of the loaded library.
+        path: PathBuf,
+        /// Host's `ABI_VERSION`.
+        host_version: u32,
+        /// Guest's reported `BamManifest::abi_version`.
+        guest_version: u32,
+    },
+
+    /// Required entry point (`bevy_abi_mod_init` or `bevy_abi_mod_shutdown`) was not exported.
+    #[error("mod '{path}' is missing required symbol '{symbol}': {source}")]
     MissingEntryPoint {
         /// Path of the loaded library.
         path: PathBuf,
         /// Missing symbol name.
         symbol: &'static str,
-        /// Underlying symbol lookup error message.
-        message: String,
+        /// Underlying symbol lookup error.
+        #[source]
+        source: libloading::Error,
     },
-    /// Guest `bevy_abi_mod_abi_version` reported an incompatible packed version.
-    IncompatibleAbiVersion {
-        /// Path of the loaded library.
-        path: PathBuf,
-        /// Host's `ABI_VERSION_PACKED`.
-        host_version: u32,
-        /// Guest's reported packed ABI version.
-        guest_version: u32,
-    },
+
     /// Guest `bevy_abi_mod_init` returned a non-OK [`FfiResult`].
+    #[error("mod '{path}' initialization failed with {status}{}", if diagnostic.is_empty() { String::new() } else { format!(": {diagnostic}") })]
     InitFailed {
         /// Path of the loaded library.
         path: PathBuf,
         /// Error status returned by `bevy_abi_mod_init`.
         status: FfiResult,
+        /// Optional host `last_error` diagnostic captured from `BamHostCtx`.
+        diagnostic: String,
     },
-    /// Guest `bevy_abi_mod_init` reported a caught panic (`FfiResult::PANIC_CAUGHT`).
+
+    /// Guest `bevy_abi_mod_init` reported a caught guest panic (`FfiResult::PANIC_CAUGHT`).
+    #[error("mod '{path}' panicked during initialization{}", if diagnostic.is_empty() { String::new() } else { format!(": {diagnostic}") })]
     InitPanicked {
         /// Path of the loaded library.
         path: PathBuf,
+        /// Optional host `last_error` diagnostic captured from `BamHostCtx`.
+        diagnostic: String,
     },
+
     /// Strict validation failed because a guest system queried unregistered components.
+    #[error(
+        "mod '{path}' system '{system_name}' references unregistered component(s): {}",
+        missing.join(", ")
+    )]
     MissingComponents {
         /// Path of the loaded library.
         path: PathBuf,
         /// Guest system name requesting unknown components.
         system_name: String,
-        /// Unregistered component names.
+        /// Unregistered component identifiers.
         missing: Vec<String>,
     },
+
+    /// A guest system requested a custom [`ScheduleId`] (`>= 1024`) not registered in [`crate::ModScheduleMap`] (`B-06`).
+    #[error(
+        "mod '{path}' system '{system_name}' targets unregistered custom schedule {schedule:?}"
+    )]
+    UnregisteredSchedule {
+        /// Path of the loaded library.
+        path: PathBuf,
+        /// Guest system name.
+        system_name: String,
+        /// Unregistered schedule identifier.
+        schedule: ScheduleId,
+    },
+
+    /// Strict ordering validation failed because a `before`/`after` target was not found (`L-05`).
+    #[error(
+        "mod '{path}' system '{system_name}' declares ordering dependency on unresolved target '{target}'"
+    )]
+    UnresolvedOrderingTarget {
+        /// Path of the loaded library.
+        path: PathBuf,
+        /// Guest system name.
+        system_name: String,
+        /// Unresolved `before` or `after` target name.
+        target: String,
+    },
+
+    /// Host attempted to register a custom schedule with a reserved built-in [`ScheduleId`] (`< 1024`) (`B-06`).
+    #[error("custom schedule ID {schedule:?} must be >= ScheduleId::CUSTOM_BASE (1024)")]
+    InvalidScheduleRegistration {
+        /// Invalid non-custom `ScheduleId`.
+        schedule: ScheduleId,
+    },
+
+    /// Component or resource registration collided with an incompatible existing entry.
+    #[error(transparent)]
+    ComponentCollision(#[from] ComponentCollisionError),
+
     /// Attempted to unload a [`ModId`] that is not currently loaded in [`crate::ModHost`].
+    #[error("mod {id:?} is not loaded")]
     ModNotFound {
         /// Unknown mod identifier.
         id: ModId,
     },
 }
-
-impl ModLoadError {
-    /// Maps this [`ModLoadError`] onto its C-ABI [`FfiResult`] status equivalent.
-    #[inline]
-    pub const fn to_ffi_result(&self) -> FfiResult {
-        match self {
-            Self::DlOpen { .. } | Self::MissingEntryPoint { .. } => FfiResult::INTERNAL_ERROR,
-            Self::ModNotFound { .. } => FfiResult::NOT_FOUND,
-            Self::IncompatibleAbiVersion { .. } => FfiResult::INVALID_VERSION,
-            Self::InitFailed { status, .. } => *status,
-            Self::InitPanicked { .. } => FfiResult::PANIC_CAUGHT,
-            Self::MissingComponents { .. } => FfiResult::INVALID_COMPONENT,
-        }
-    }
-}
-
-impl From<ModLoadError> for FfiResult {
-    #[inline]
-    fn from(err: ModLoadError) -> Self {
-        err.to_ffi_result()
-    }
-}
-
-impl fmt::Display for ModLoadError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DlOpen { path, message } => {
-                write!(f, "failed to load mod '{}': {}", path.display(), message)
-            }
-            Self::MissingEntryPoint {
-                path,
-                symbol,
-                message,
-            } => write!(
-                f,
-                "mod '{}' is missing required symbol '{}': {}",
-                path.display(),
-                symbol,
-                message
-            ),
-            Self::IncompatibleAbiVersion {
-                path,
-                host_version,
-                guest_version,
-            } => write!(
-                f,
-                "mod '{}' reported incompatible ABI version 0x{:08x} (host expects compatible with 0x{:08x})",
-                path.display(),
-                guest_version,
-                host_version
-            ),
-            Self::InitFailed { path, status } => write!(
-                f,
-                "mod '{}' initialization failed with {:?}",
-                path.display(),
-                status
-            ),
-            Self::InitPanicked { path } => {
-                write!(f, "mod '{}' panicked during initialization", path.display())
-            }
-            Self::MissingComponents {
-                path,
-                system_name,
-                missing,
-            } => write!(
-                f,
-                "mod '{}' system '{}' references unregistered component(s): {}",
-                path.display(),
-                system_name,
-                missing.join(", ")
-            ),
-            Self::ModNotFound { id } => write!(f, "mod {:?} is not loaded", id),
-        }
-    }
-}
-
-impl std::error::Error for ModLoadError {}

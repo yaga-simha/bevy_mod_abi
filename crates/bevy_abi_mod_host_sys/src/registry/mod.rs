@@ -1,10 +1,11 @@
-//! Component, resource, VTable, and symbol registration catalog.
+//! Component, resource, VTable, and `"bam.v0.*"` symbol registration catalog (`ModRegistry`).
 
 pub mod catalog;
 pub mod collision;
-pub(crate) mod symbols;
 
-pub use catalog::{InsertDefaultFn, InsertRawFn, ModRegistry, RegisteredComponent};
+pub(crate) use catalog::component_flags_to_storage_flags;
+pub use catalog::{
+    ComponentOptions, InsertDefaultFn, InsertRawFn, ModRegistry, RegisteredComponent,
+    RegistrySnapshot,
+};
 pub use collision::ComponentCollisionError;
-#[cfg(any(test, feature = "test-utils"))]
-pub use symbols::CurrentRegistryGuard;

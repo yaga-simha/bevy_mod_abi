@@ -1,12 +1,14 @@
-//! Bevy [`Plugin`] types for initializing the native C-ABI modding host.
+//! Bevy [`Plugin`] types for initializing the native C-ABI modding host (`ABI 0.2.0`).
 
 pub use crate::app_ext::ModAppExt;
+pub use crate::commands_ext::ModCommandsExt;
 pub use crate::events::{LoadedModInfo, ModLoaded, ModUnloaded};
-pub use crate::schedule_sets::ModNamedSystemSet;
+pub use crate::schedule_sets::{ModNamedSystemSet, ModScheduleMap};
+pub use crate::world_ext::ModWorldExt;
 
 use bevy_abi_mod_host_sys::{
-    ModErrorPolicy, ModErrorPolicyConfig, ModHost, ModRegistry, ModSystemFaulted, StartupCompleted,
-    mark_startup_completed,
+    ModErrorPolicy, ModErrorPolicyConfig, ModHost, ModQuarantine, ModRegistry, ModSystemFaulted,
+    StartupCompleted, WorldDropGuard, mark_startup_completed,
 };
 use bevy_app::{App, Plugin, PostStartup};
 use bevy_ecs::message::Messages;
@@ -22,7 +24,7 @@ pub(crate) fn ensure_startup_tracker(app: &mut App) {
 ///
 /// Kept as a zero-sized unit struct so both `app.add_plugins(AbiModPlugin)` and
 /// `app.add_plugins(AbiModPlugin::default())` work idiomatically, while
-/// [`AbiModPlugin::with_error_policy`] configures custom error handling.
+/// [`AbiModPlugin::with_error_policy`] configures custom fault handling.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct AbiModPlugin;
 
@@ -50,11 +52,20 @@ pub struct ConfiguredAbiModPlugin {
 
 impl Plugin for ConfiguredAbiModPlugin {
     fn build(&self, app: &mut App) {
+        if !app.world().contains_resource::<WorldDropGuard>() {
+            app.insert_resource(WorldDropGuard::new());
+        }
         if !app.world().contains_resource::<ModRegistry>() {
             app.insert_resource(ModRegistry::new());
         }
         if !app.world().contains_resource::<ModHost>() {
             app.insert_resource(ModHost::new());
+        }
+        if !app.world().contains_resource::<ModQuarantine>() {
+            app.insert_resource(ModQuarantine::new());
+        }
+        if !app.world().contains_resource::<ModScheduleMap>() {
+            app.insert_resource(ModScheduleMap::new());
         }
         app.insert_resource(ModErrorPolicyConfig(self.error_policy));
 

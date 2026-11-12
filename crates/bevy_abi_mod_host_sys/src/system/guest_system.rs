@@ -1,19 +1,22 @@
-//! `DynamicCSystem` implementation of Bevy's `System` trait over C-ABI callbacks.
+//! `GuestSystem` implementation of Bevy's `System` trait and `HostSystemCtx` (`BamSystemCtx`)
+//! (`C-01`, `C-03`, `C-04`, `L-07`, `P-05`, `P-09`, `B-05`, `B-07`, `B-09`, `S-08`, `N-02`).
 
-use crate::ffi::commands::CommandQueueBridge;
-use crate::ffi::iter::HostChunkIter;
-use crate::loader::ModId;
-use crate::registry::ModRegistry;
-use crate::schedule::{ModSchedule, ModSystemSet};
+use crate::ffi::commands::{HostCommands, HostCommandsStorage};
+use crate::ffi::iter::HostIter;
+use crate::handle_header::{
+    HandleHeader, HostContext, SYS_CTX_MAGIC, validate_handle_mut, validate_handle_ref,
+};
+use crate::loader::{ModHost, ModId};
+use crate::registry::{ModRegistry, RegistrySnapshot};
+use crate::schedule::ModSystemSet;
 use crate::sync_ptr::{GuestFnPtr, GuestUserData};
 use crate::system::access_builder::initialize_query_groups_in_world;
 use crate::system::error_policy::{
     ModErrorPolicy, ModErrorPolicyConfig, ModSystemError, ModSystemFaulted, SystemInitError,
 };
-use crate::system::query_group::{CachedQueryGroup, ComponentAccessDescOwned, MAX_SYSTEM_QUERIES};
+use crate::system::query_group::{BamQuerySpecOwned, CachedQueryGroup, MAX_SYSTEM_QUERIES};
 use bevy_abi_mod_sys::{
-    DynamicSystemCallback, FfiResult, MultiQuerySystemCallback, RawChunkIter, RawCommandQueue,
-    RunConditionCallback, ffi_bool_to_rust,
+    BamCommands, BamHostCtx, BamIter, BamRunIfFn, BamSystemCtx, BamSystemFn, FfiResult, ScheduleId,
 };
 use bevy_ecs::change_detection::{CheckChangeTicks, Tick};
 use bevy_ecs::message::Messages;
@@ -26,156 +29,271 @@ use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-#[derive(Clone, Copy)]
-enum SystemCallbackKind {
-    Single(GuestFnPtr<DynamicSystemCallback>),
-    Multi(GuestFnPtr<MultiQuerySystemCallback>),
+/// Concrete `#[repr(C)]` system invocation context backing opaque [`BamSystemCtx`] (`S-08`, `C-01`).
+#[repr(C)]
+pub struct HostSystemCtx {
+    /// Leading handle validation header (`SYS_CTX_MAGIC`) at byte offset `0`.
+    pub header: HandleHeader,
+    host_ctx: HostContext,
+    iter_ptrs: [*mut BamIter; MAX_SYSTEM_QUERIES],
+    query_count: usize,
+    commands_ptr: *mut BamCommands,
 }
 
-/// Host-side Bevy [`System`] wrapping an opaque guest C-ABI system callback (single or multi-query).
-pub struct DynamicCSystem {
-    name: String,
+const _: () = assert!(core::mem::offset_of!(HostSystemCtx, header) == 0);
+
+impl HostSystemCtx {
+    /// Creates an active stack-scoped [`HostSystemCtx`] for one `GuestSystem` callback invocation.
+    pub fn new(
+        snapshot: Arc<RegistrySnapshot>,
+        mod_namespace: Option<Arc<str>>,
+        error_buf: String,
+        iter_ptrs: [*mut BamIter; MAX_SYSTEM_QUERIES],
+        query_count: usize,
+        commands_ptr: *mut BamCommands,
+    ) -> Self {
+        Self {
+            header: HandleHeader::new(SYS_CTX_MAGIC),
+            host_ctx: HostContext::with_error_buffer(snapshot, error_buf)
+                .with_namespace(mod_namespace),
+            iter_ptrs,
+            query_count,
+            commands_ptr,
+        }
+    }
+
+    /// Reclaims the internal diagnostic `String` capacity for zero-allocation reuse across frames.
+    #[inline]
+    pub fn reclaim_error_buffer(&mut self) -> String {
+        self.host_ctx.reclaim_error_buffer()
+    }
+
+    /// Casts `&mut self` to an opaque `*mut BamSystemCtx` FFI pointer.
+    #[inline]
+    pub fn as_ffi_ptr(&mut self) -> *mut BamSystemCtx {
+        (self as *mut Self).cast::<BamSystemCtx>()
+    }
+}
+
+impl Drop for HostSystemCtx {
+    #[inline]
+    fn drop(&mut self) {
+        self.header.poison();
+    }
+}
+
+/// Obtains the world-scoped [`BamHostCtx`] pointer from an active [`BamSystemCtx`].
+///
+/// # Safety
+/// `sys_ctx` must point to an active [`HostSystemCtx`] cast to [`BamSystemCtx`], or null.
+pub unsafe extern "C" fn host_sys_host_ctx(sys_ctx: *const BamSystemCtx) -> *const BamHostCtx {
+    // SAFETY: Validating `sys_ctx` against `SYS_CTX_MAGIC` under `STRICT_FFI_CHECKS`.
+    let Ok(ctx) = (unsafe {
+        validate_handle_ref::<HostSystemCtx>(sys_ctx.cast::<c_void>(), SYS_CTX_MAGIC, false)
+    }) else {
+        return core::ptr::null();
+    };
+    ctx.host_ctx.as_ffi_ptr()
+}
+
+/// Borrows the [`BamIter`] handle for declared query `query_index` (`0..query_count`).
+///
+/// # Safety
+/// - `sys_ctx` must point to an active [`HostSystemCtx`] cast to [`BamSystemCtx`], or null.
+/// - `out_iter` must point to writable `*mut BamIter` storage, or null.
+pub unsafe extern "C" fn host_sys_query(
+    sys_ctx: *mut BamSystemCtx,
+    query_index: usize,
+    out_iter: *mut *mut BamIter,
+) -> FfiResult {
+    if out_iter.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: Validating `sys_ctx` against `SYS_CTX_MAGIC` under `STRICT_FFI_CHECKS`.
+    let ctx = match unsafe {
+        validate_handle_mut::<HostSystemCtx>(sys_ctx.cast::<c_void>(), SYS_CTX_MAGIC, false)
+    } {
+        Ok(c) => c,
+        Err(err) => return err,
+    };
+    if query_index >= ctx.query_count {
+        return FfiResult::OUT_OF_RANGE;
+    }
+    // SAFETY: `out_iter` is non-null and writable.
+    unsafe {
+        *out_iter = ctx.iter_ptrs[query_index];
+    }
+    FfiResult::OK
+}
+
+/// Borrows the per-system [`BamCommands`] deferred command buffer from `sys_ctx`.
+///
+/// # Safety
+/// - `sys_ctx` must point to an active [`HostSystemCtx`] cast to [`BamSystemCtx`], or null.
+/// - `out_commands` must point to writable `*mut BamCommands` storage, or null.
+pub unsafe extern "C" fn host_sys_commands(
+    sys_ctx: *mut BamSystemCtx,
+    out_commands: *mut *mut BamCommands,
+) -> FfiResult {
+    if out_commands.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: Validating `sys_ctx` against `SYS_CTX_MAGIC` under `STRICT_FFI_CHECKS`.
+    let ctx = match unsafe {
+        validate_handle_mut::<HostSystemCtx>(sys_ctx.cast::<c_void>(), SYS_CTX_MAGIC, false)
+    } {
+        Ok(c) => c,
+        Err(err) => return err,
+    };
+    // SAFETY: `out_commands` is non-null and writable.
+    unsafe {
+        *out_commands = ctx.commands_ptr;
+    }
+    FfiResult::OK
+}
+
+/// Host-side Bevy [`System`] wrapping a unified ABI v0.2 [`BamSystemFn`] callback (`N-02`).
+pub struct GuestSystem {
+    name: Arc<str>,
     debug_name: DebugName,
     query_groups: Vec<CachedQueryGroup>,
 
     access: SystemAccess,
     self_conflict: bool,
-    missing_components: Vec<String>,
     init_error: Option<SystemInitError>,
     last_run: Tick,
     this_run: Tick,
 
-    callback: SystemCallbackKind,
+    callback: GuestFnPtr<BamSystemFn>,
     user_data: GuestUserData,
-    run_if: Option<(GuestFnPtr<RunConditionCallback>, GuestUserData)>,
+    run_if: Option<(GuestFnPtr<BamRunIfFn>, GuestUserData)>,
 
     mod_id: Option<ModId>,
-    schedule: ModSchedule,
+    mod_namespace: Option<Arc<str>>,
+    schedule: ScheduleId,
+    is_main_thread: bool,
     after_systems: Vec<String>,
     before_systems: Vec<String>,
     error_policy: ModErrorPolicy,
     error_policy_explicit: bool,
 
-    enabled: bool,
+    enabled_flag: Arc<AtomicBool>,
     is_active: Arc<AtomicBool>,
-    command_queue: CommandQueue,
-    registry: Arc<ModRegistry>,
+    commands_storage: HostCommandsStorage,
+    fault_queue: CommandQueue,
+    last_error_buf: String,
+
+    registry: ModRegistry,
+    cached_registry_gen: u64,
+    snapshot: Arc<RegistrySnapshot>,
 }
 
-impl DynamicCSystem {
-    /// Creates a single-query dynamic C-ABI system.
+impl GuestSystem {
+    /// Creates a unified ABI v0.2 [`GuestSystem`] over `0..=MAX_SYSTEM_QUERIES` query clauses.
     pub fn new(
-        name: String,
-        query_descs: Vec<ComponentAccessDescOwned>,
-        callback: DynamicSystemCallback,
+        name: impl Into<Arc<str>>,
+        query_specs: Vec<BamQuerySpecOwned>,
+        callback: BamSystemFn,
         user_data: *mut c_void,
-        registry: Arc<ModRegistry>,
+        registry: ModRegistry,
     ) -> Self {
-        let debug_name = DebugName::owned(name.clone());
-        Self {
-            name,
-            debug_name,
-            query_groups: vec![CachedQueryGroup::new(query_descs)],
-            access: SystemAccess::None,
-            self_conflict: false,
-            missing_components: Vec::new(),
-            init_error: None,
-            last_run: Tick::new(0),
-            this_run: Tick::new(0),
-            callback: SystemCallbackKind::Single(GuestFnPtr(callback)),
-            user_data: GuestUserData::new(user_data),
-            run_if: None,
-            mod_id: None,
-            schedule: ModSchedule::Update,
-            after_systems: Vec::new(),
-            before_systems: Vec::new(),
-            error_policy: ModErrorPolicy::Quarantine,
-            error_policy_explicit: false,
-            enabled: true,
-            is_active: Arc::new(AtomicBool::new(true)),
-            command_queue: CommandQueue::default(),
-            registry,
-        }
-    }
-
-    /// Creates a multi-query dynamic C-ABI system supporting up to [`MAX_SYSTEM_QUERIES`] nested queries.
-    pub fn new_multi_query(
-        name: String,
-        query_specs: Vec<Vec<ComponentAccessDescOwned>>,
-        callback: MultiQuerySystemCallback,
-        user_data: *mut c_void,
-        registry: Arc<ModRegistry>,
-    ) -> Self {
-        let debug_name = DebugName::owned(name.clone());
+        let name_arc: Arc<str> = name.into();
+        let debug_name = DebugName::owned(name_arc.to_string());
         let query_groups = query_specs.into_iter().map(CachedQueryGroup::new).collect();
+        let cached_registry_gen = registry.generation();
+        let snapshot = registry.snapshot_arc();
+
         Self {
-            name,
+            name: name_arc,
             debug_name,
             query_groups,
             access: SystemAccess::None,
             self_conflict: false,
-            missing_components: Vec::new(),
             init_error: None,
             last_run: Tick::new(0),
             this_run: Tick::new(0),
-            callback: SystemCallbackKind::Multi(GuestFnPtr(callback)),
+            callback: GuestFnPtr(callback),
             user_data: GuestUserData::new(user_data),
             run_if: None,
             mod_id: None,
-            schedule: ModSchedule::Update,
+            mod_namespace: None,
+            schedule: ScheduleId::UPDATE,
+            is_main_thread: false,
             after_systems: Vec::new(),
             before_systems: Vec::new(),
             error_policy: ModErrorPolicy::Quarantine,
             error_policy_explicit: false,
-            enabled: true,
+            enabled_flag: Arc::new(AtomicBool::new(true)),
             is_active: Arc::new(AtomicBool::new(true)),
-            command_queue: CommandQueue::default(),
+            commands_storage: HostCommandsStorage::new(),
+            fault_queue: CommandQueue::default(),
+            last_error_buf: String::new(),
             registry,
+            cached_registry_gen,
+            snapshot,
         }
     }
 
     /// Returns the guest system's registered name.
+    #[inline]
     pub fn system_name(&self) -> &str {
         &self.name
     }
 
-    /// Returns `true` if the system is currently enabled to execute.
+    /// Returns an `Arc<str>` clone of the guest system's registered name.
+    #[inline]
+    pub fn system_name_arc(&self) -> Arc<str> {
+        Arc::clone(&self.name)
+    }
+
+    /// Returns a clone of the shared atomic enablement flag used by [`crate::ModQuarantine`].
+    #[inline]
+    pub fn enabled_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.enabled_flag)
+    }
+
+    /// Returns `true` if the system is currently enabled (not quarantined).
+    #[inline]
     pub fn is_enabled(&self) -> bool {
-        self.enabled
+        self.enabled_flag.load(Ordering::Acquire)
     }
 
     /// Enables or disables execution of this system.
+    #[inline]
     pub fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = enabled;
+        self.enabled_flag.store(enabled, Ordering::Release);
     }
 
-    /// Replaces the component registry snapshot used by this system.
-    pub(crate) fn set_registry(&mut self, registry: Arc<ModRegistry>) {
+    /// Replaces the [`ModRegistry`] handle used by this system.
+    pub(crate) fn set_registry(&mut self, registry: ModRegistry) {
+        self.cached_registry_gen = registry.generation();
+        self.snapshot = registry.snapshot_arc();
         self.registry = registry;
     }
 
-    /// Returns `true` if the system was disabled due to internal query borrow conflicts.
-    pub fn has_self_conflict(&self) -> bool {
+    /// Returns `true` if the system was permanently disabled due to internal query borrow conflicts.
+    #[inline]
+    pub const fn has_self_conflict(&self) -> bool {
         self.self_conflict
     }
 
     /// Returns the structured [`SystemInitError`] recorded if `System::initialize` failed.
+    #[inline]
     pub fn init_error(&self) -> Option<&SystemInitError> {
         self.init_error.as_ref()
     }
 
-    /// Returns any component names that failed to resolve during `initialize` or validation.
-    pub fn missing_components(&self) -> &[String] {
-        &self.missing_components
-    }
-
-    /// Validates that all queried component names exist in the given [`ModRegistry`].
+    /// Validates that every `BamComponent` handle referenced in `query_groups` exists in `registry`.
     pub fn validate_against_registry(&self, registry: &ModRegistry) -> Result<(), Vec<String>> {
+        let snap = registry.snapshot();
         let mut missing = Vec::new();
         for group in &self.query_groups {
-            for desc in &group.descs {
-                if registry.get_by_name(&desc.name).is_none() && !missing.contains(&desc.name) {
-                    missing.push(desc.name.clone());
+            for term in &group.spec.terms {
+                if snap.get_by_handle(term.component).is_none() {
+                    let label = format!("BamComponent({})", term.component.0);
+                    if !missing.contains(&label) {
+                        missing.push(label);
+                    }
                 }
             }
         }
@@ -187,101 +305,143 @@ impl DynamicCSystem {
     }
 
     /// Returns the [`ModId`] associated with this system, if any.
-    pub fn mod_id(&self) -> Option<ModId> {
+    #[inline]
+    pub const fn mod_id(&self) -> Option<ModId> {
         self.mod_id
     }
 
     /// Associates this system with a [`ModId`] so it joins [`ModSystemSet::Mod`].
+    #[inline]
     pub fn set_mod_id(&mut self, mod_id: ModId) {
         self.mod_id = Some(mod_id);
     }
 
+    /// Sets the canonical module namespace (`BamManifest::name`) attached to `BamHostCtx`.
+    #[inline]
+    pub fn set_mod_namespace(&mut self, namespace: Option<Arc<str>>) {
+        self.mod_namespace = namespace;
+    }
+
     /// Builder helper to associate this system with a [`ModId`].
+    #[inline]
     pub fn with_mod_id(mut self, mod_id: ModId) -> Self {
         self.mod_id = Some(mod_id);
         self
     }
 
-    /// Returns the target [`ModSchedule`] requested for this system.
-    pub fn schedule(&self) -> ModSchedule {
+    /// Returns the target [`ScheduleId`] requested for this system.
+    #[inline]
+    pub const fn schedule(&self) -> ScheduleId {
         self.schedule
     }
 
-    /// Sets the target [`ModSchedule`] for this system.
-    pub fn set_schedule(&mut self, schedule: ModSchedule) {
+    /// Sets the target [`ScheduleId`] for this system.
+    #[inline]
+    pub fn set_schedule(&mut self, schedule: ScheduleId) {
         self.schedule = schedule;
     }
 
-    /// Builder helper to set the target [`ModSchedule`] for this system.
-    pub fn with_schedule(mut self, schedule: ModSchedule) -> Self {
+    /// Builder helper to set the target [`ScheduleId`] for this system.
+    #[inline]
+    pub const fn with_schedule(mut self, schedule: ScheduleId) -> Self {
         self.schedule = schedule;
         self
     }
 
-    /// Builder helper to configure explicit `after` and `before` system-name ordering dependencies.
+    /// Returns `true` if `BAM_SYSTEM_FLAG_MAIN_THREAD` was set (`SystemStateFlags::NON_SEND`).
+    #[inline]
+    pub const fn is_main_thread(&self) -> bool {
+        self.is_main_thread
+    }
+
+    /// Pins or unpins this system onto Bevy's main thread (`B-07`).
+    #[inline]
+    pub fn set_main_thread(&mut self, main_thread: bool) {
+        self.is_main_thread = main_thread;
+    }
+
+    /// Builder helper to pin this system onto Bevy's main thread (`B-07`).
+    #[inline]
+    pub const fn with_main_thread(mut self, main_thread: bool) -> Self {
+        self.is_main_thread = main_thread;
+        self
+    }
+
+    /// Builder helper to configure explicit `after` and `before` ordering target names.
     pub fn with_ordering(mut self, after: Vec<String>, before: Vec<String>) -> Self {
         self.after_systems = after;
         self.before_systems = before;
         self
     }
 
-    /// System names declared in `ScheduledSystemDescriptor::after`.
+    /// System-set target names declared in `BamSystemDesc::after`.
+    #[inline]
     pub fn after_systems(&self) -> &[String] {
         &self.after_systems
     }
 
-    /// System names declared in `ScheduledSystemDescriptor::before`.
+    /// System-set target names declared in `BamSystemDesc::before`.
+    #[inline]
     pub fn before_systems(&self) -> &[String] {
         &self.before_systems
     }
 
     /// Returns the [`ModErrorPolicy`] governing faults in this system.
-    pub fn error_policy(&self) -> ModErrorPolicy {
+    #[inline]
+    pub const fn error_policy(&self) -> ModErrorPolicy {
         self.error_policy
     }
 
     /// Overrides the [`ModErrorPolicy`] for this system.
+    #[inline]
     pub fn set_error_policy(&mut self, policy: ModErrorPolicy) {
         self.error_policy = policy;
         self.error_policy_explicit = true;
     }
 
     /// Builder helper to override the [`ModErrorPolicy`] for this system.
-    pub fn with_error_policy(mut self, policy: ModErrorPolicy) -> Self {
+    #[inline]
+    pub const fn with_error_policy(mut self, policy: ModErrorPolicy) -> Self {
         self.error_policy = policy;
         self.error_policy_explicit = true;
         self
     }
 
-    /// Obtains a clone of the atomic tombstone flag.
+    /// Obtains a clone of the atomic module liveness tombstone flag.
+    #[inline]
     pub fn is_active(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.is_active)
     }
 
-    /// Sets the atomic tombstone flag for this system.
+    /// Sets the atomic module liveness tombstone flag.
+    #[inline]
     pub fn set_is_active(&mut self, is_active: Arc<AtomicBool>) {
         self.is_active = is_active;
     }
 
-    /// Fluent builder method to attach an atomic tombstone flag.
+    /// Fluent builder method to attach an atomic module liveness tombstone flag.
+    #[inline]
     pub fn with_is_active(mut self, is_active: Arc<AtomicBool>) -> Self {
         self.is_active = is_active;
         self
     }
 
-    /// Configures an optional C-ABI run condition callback evaluated before each system run.
-    pub fn set_run_if(&mut self, run_if: Option<(RunConditionCallback, *mut c_void)>) {
+    /// Configures an optional C-ABI `run_if` predicate evaluated before each system run.
+    #[inline]
+    pub fn set_run_if(&mut self, run_if: Option<(BamRunIfFn, *mut c_void)>) {
         self.run_if = run_if.map(|(cb, ud)| (GuestFnPtr(cb), GuestUserData::new(ud)));
     }
 
-    /// Fluent builder method to attach an optional C-ABI run condition callback.
-    pub fn with_run_if(mut self, run_if: Option<(RunConditionCallback, *mut c_void)>) -> Self {
+    /// Fluent builder method to attach an optional C-ABI `run_if` predicate.
+    #[inline]
+    pub fn with_run_if(mut self, run_if: Option<(BamRunIfFn, *mut c_void)>) -> Self {
         self.set_run_if(run_if);
         self
     }
 
-    /// Returns the configured run condition callback and context pointer, if any.
-    pub fn run_if(&self) -> Option<(RunConditionCallback, *mut c_void)> {
+    /// Returns the configured `run_if` callback and context pointer, if any.
+    #[inline]
+    pub fn run_if(&self) -> Option<(BamRunIfFn, *mut c_void)> {
         self.run_if.map(|(GuestFnPtr(cb), ud)| (cb, ud.as_ptr()))
     }
 
@@ -290,33 +450,55 @@ impl DynamicCSystem {
         status: FfiResult,
         panicked: bool,
     ) -> Result<(), RunSystemError> {
-        self.enabled = false;
-        let fault_event = ModSystemFaulted {
-            mod_id: self.mod_id,
-            system_name: self.name.clone(),
+        self.enabled_flag.store(false, Ordering::Release);
+        // Discard any partial deferred commands recorded by the faulting callback invocation.
+        self.commands_storage.clear();
+
+        let mod_id = self.mod_id;
+        let sys_name = self.name.to_string();
+
+        match self.error_policy {
+            ModErrorPolicy::Quarantine => {
+                tracing::warn!(
+                    system = %sys_name,
+                    mod_id = ?mod_id,
+                    %status,
+                    panicked,
+                    "quarantined faulting guest mod system"
+                );
+            }
+            ModErrorPolicy::Log | ModErrorPolicy::ReportToBevy => {
+                tracing::error!(
+                    system = %sys_name,
+                    mod_id = ?mod_id,
+                    %status,
+                    panicked,
+                    "guest mod system faulted"
+                );
+            }
+        }
+
+        let fault_msg = ModSystemFaulted {
+            mod_id,
+            system_name: sys_name.clone(),
             status,
             panicked,
             init_error: None,
         };
-        self.command_queue.push(move |world: &mut World| {
-            if let Some(mut msgs) = world.get_resource_mut::<Messages<ModSystemFaulted>>() {
-                msgs.write(fault_event.clone());
+        self.fault_queue.push(move |world: &mut World| {
+            if let Some(id) = mod_id {
+                ModHost::record_fault_in_world(world, id);
             }
-            world.trigger(fault_event);
+            if let Some(mut msgs) = world.get_resource_mut::<Messages<ModSystemFaulted>>() {
+                msgs.write(fault_msg);
+            }
         });
 
         match self.error_policy {
-            ModErrorPolicy::Quarantine => Ok(()),
-            ModErrorPolicy::Log => {
-                eprintln!(
-                    "[bevy_abi_mod] guest system '{}' (mod_id={:?}) faulted: status={:?}, panicked={}",
-                    self.name, self.mod_id, status, panicked
-                );
-                Ok(())
-            }
+            ModErrorPolicy::Quarantine | ModErrorPolicy::Log => Ok(()),
             ModErrorPolicy::ReportToBevy => Err(RunSystemError::from(ModSystemError {
-                mod_id: self.mod_id,
-                system_name: self.name.clone(),
+                mod_id,
+                system_name: sys_name,
                 status,
                 panicked,
             })),
@@ -324,7 +506,7 @@ impl DynamicCSystem {
     }
 }
 
-impl System for DynamicCSystem {
+impl System for GuestSystem {
     type In = ();
     type Out = ();
 
@@ -333,7 +515,11 @@ impl System for DynamicCSystem {
     }
 
     fn flags(&self) -> SystemStateFlags {
-        SystemStateFlags::DEFERRED
+        if self.is_main_thread {
+            SystemStateFlags::DEFERRED | SystemStateFlags::NON_SEND
+        } else {
+            SystemStateFlags::DEFERRED
+        }
     }
 
     fn default_system_sets(&self) -> Vec<InternedSystemSet> {
@@ -348,7 +534,6 @@ impl System for DynamicCSystem {
         self.this_run = world.change_tick();
         self.last_run = Tick::new(world.change_tick().get().wrapping_sub(Tick::MAX.get()));
         self.self_conflict = false;
-        self.missing_components.clear();
         self.init_error = None;
 
         if !self.error_policy_explicit
@@ -358,10 +543,15 @@ impl System for DynamicCSystem {
         }
 
         if let Some(world_reg) = world.get_resource::<ModRegistry>() {
-            self.registry = Arc::new(world_reg.clone());
+            let world_gen = world_reg.generation();
+            if world_gen != self.cached_registry_gen {
+                self.snapshot = world_reg.snapshot_arc();
+                self.cached_registry_gen = world_gen;
+            }
+            self.registry = world_reg.clone();
         }
 
-        match initialize_query_groups_in_world(world, &self.registry, &mut self.query_groups) {
+        match initialize_query_groups_in_world(world, &self.snapshot, &mut self.query_groups) {
             Ok(access_set) => {
                 self.access = SystemAccess::Shared(access_set);
                 let cell = world.as_unsafe_world_cell();
@@ -371,28 +561,35 @@ impl System for DynamicCSystem {
                 self.access.clone()
             }
             Err(err) => {
-                self.enabled = false;
+                self.enabled_flag.store(false, Ordering::Release);
                 self.access = SystemAccess::None;
                 if matches!(err, SystemInitError::SelfConflict { .. }) {
                     self.self_conflict = true;
                 }
-                if let SystemInitError::UnknownComponent(ref missing_name) = err {
-                    self.missing_components.push(missing_name.clone());
-                }
-                let status = err.to_ffi_result();
+                let status = err.status_code();
                 self.init_error = Some(err.clone());
 
-                let fault_event = ModSystemFaulted {
+                tracing::error!(
+                    system = %self.name,
+                    mod_id = ?self.mod_id,
+                    error = %err,
+                    "guest mod system failed initialization and was quarantined"
+                );
+
+                if let Some(id) = self.mod_id {
+                    ModHost::record_fault_in_world(world, id);
+                }
+
+                let fault_msg = ModSystemFaulted {
                     mod_id: self.mod_id,
-                    system_name: self.name.clone(),
+                    system_name: self.name.to_string(),
                     status,
                     panicked: false,
                     init_error: Some(err),
                 };
                 if let Some(mut msgs) = world.get_resource_mut::<Messages<ModSystemFaulted>>() {
-                    msgs.write(fault_event.clone());
+                    msgs.write(fault_msg);
                 }
-                world.trigger(fault_event);
 
                 self.access.clone()
             }
@@ -404,16 +601,25 @@ impl System for DynamicCSystem {
         _input: SystemIn<'_, Self>,
         world: UnsafeWorldCell,
     ) -> Result<Self::Out, RunSystemError> {
-        if !self.enabled || self.self_conflict || !self.is_active.load(Ordering::Acquire) {
+        if self.self_conflict
+            || self.init_error.is_some()
+            || !self.enabled_flag.load(Ordering::Acquire)
+            || !self.is_active.load(Ordering::Acquire)
+        {
             return Ok(());
         }
 
-        let _reg_guard = self.registry.make_current_internal();
+        // L-07: Refresh cached `Arc<RegistrySnapshot>` in O(1) only if `ModRegistry` generation advanced.
+        let latest_gen = self.registry.latest_generation();
+        if latest_gen != self.cached_registry_gen {
+            self.snapshot = self.registry.latest_snapshot_arc();
+            self.cached_registry_gen = latest_gen;
+        }
 
         if let Some((GuestFnPtr(cond_fn), cond_ud)) = self.run_if {
-            // SAFETY: `cond_fn` is a foreign `extern "C"` predicate supplied by an active loaded mod.
+            // SAFETY: `cond_fn` is a foreign `extern "C"` predicate belonging to an active loaded mod.
             let flag = unsafe { cond_fn(cond_ud.as_ptr()) };
-            if !ffi_bool_to_rust(flag) {
+            if !flag.get() {
                 return Ok(());
             }
         }
@@ -430,87 +636,68 @@ impl System for DynamicCSystem {
         let storages = unsafe { world.storages() };
         let archetypes = world.archetypes();
 
-        let mut bridge = CommandQueueBridge::new(
-            &mut self.command_queue,
-            world.entity_allocator(),
-            &self.registry,
-        );
-        let commands_ptr = (&mut bridge as *mut CommandQueueBridge<'_>).cast::<RawCommandQueue>();
-        let user_data = self.user_data.as_ptr();
-        let registry_ref: &ModRegistry = &self.registry;
+        let count = self.query_groups.len().min(MAX_SYSTEM_QUERIES);
+        let mut host_iters: [Option<HostIter<'_>>; MAX_SYSTEM_QUERIES] =
+            [const { None }; MAX_SYSTEM_QUERIES];
 
-        let status = match self.callback {
-            SystemCallbackKind::Single(GuestFnPtr(callback)) => {
-                let group = &self.query_groups[0];
-                let mut host_iter = if group.is_dense {
-                    HostChunkIter::new(
-                        &storages.tables,
-                        &group.matched_tables,
-                        &group.columns,
-                        change_tick,
-                    )
-                } else {
-                    HostChunkIter::new_archetypal(
-                        &storages.tables,
-                        archetypes,
-                        &storages.sparse_sets,
-                        &group.matched_archetypes,
-                        &group.columns,
-                        group.sparse_column_mask,
-                        change_tick,
-                    )
-                }
-                .with_last_run(last_run)
-                .with_resources(world, registry_ref, &group.declared_resources);
-                let iter_ptr = (&mut host_iter as *mut HostChunkIter<'_>).cast::<RawChunkIter>();
-                // SAFETY: Calling foreign `extern "C"` callback with valid stack-allocated iterator and command bridge.
-                unsafe { callback(iter_ptr, commands_ptr, user_data) }
+        for (i, group) in self.query_groups.iter_mut().take(count).enumerate() {
+            let iter = if group.is_dense {
+                HostIter::new_dense(
+                    &storages.tables,
+                    &group.matched_tables,
+                    &group.plan,
+                    last_run,
+                    change_tick,
+                )
+            } else {
+                HostIter::new_archetypal(
+                    &storages.tables,
+                    archetypes,
+                    &storages.sparse_sets,
+                    &group.matched_archetypes,
+                    &group.plan,
+                    &mut group.sparse_scratch,
+                    last_run,
+                    change_tick,
+                )
             }
-            SystemCallbackKind::Multi(GuestFnPtr(callback)) => {
-                let count = self.query_groups.len().min(MAX_SYSTEM_QUERIES);
-                let mut host_iters: [Option<HostChunkIter<'_>>; MAX_SYSTEM_QUERIES] =
-                    [const { None }; MAX_SYSTEM_QUERIES];
-                for (i, group) in self.query_groups.iter().take(count).enumerate() {
-                    let iter = if group.is_dense {
-                        HostChunkIter::new(
-                            &storages.tables,
-                            &group.matched_tables,
-                            &group.columns,
-                            change_tick,
-                        )
-                    } else {
-                        HostChunkIter::new_archetypal(
-                            &storages.tables,
-                            archetypes,
-                            &storages.sparse_sets,
-                            &group.matched_archetypes,
-                            &group.columns,
-                            group.sparse_column_mask,
-                            change_tick,
-                        )
-                    }
-                    .with_last_run(last_run)
-                    .with_resources(
-                        world,
-                        registry_ref,
-                        &group.declared_resources,
-                    );
-                    host_iters[i] = Some(iter);
-                }
+            .with_world(world);
+            host_iters[i] = Some(iter);
+        }
 
-                let mut raw_ptrs: [*mut RawChunkIter; MAX_SYSTEM_QUERIES] =
-                    [core::ptr::null_mut(); MAX_SYSTEM_QUERIES];
-                for i in 0..count {
-                    if let Some(ref mut it) = host_iters[i] {
-                        raw_ptrs[i] = (it as *mut HostChunkIter<'_>).cast::<RawChunkIter>();
-                    }
-                }
-
-                // SAFETY: All `raw_ptrs[0..count]` point to disjoint stack-allocated `HostChunkIter`s
-                // whose borrow compatibility was verified by `FilteredAccessSet` in `initialize`.
-                unsafe { callback(raw_ptrs.as_ptr(), count, commands_ptr, user_data) }
+        let mut iter_ptrs: [*mut BamIter; MAX_SYSTEM_QUERIES] =
+            [core::ptr::null_mut(); MAX_SYSTEM_QUERIES];
+        for i in 0..count {
+            if let Some(ref mut it) = host_iters[i] {
+                iter_ptrs[i] = it.as_ffi_ptr();
             }
+        }
+
+        let status = {
+            let mut host_commands = HostCommands::new(
+                &mut self.commands_storage,
+                world.entity_allocator(),
+                &self.snapshot,
+            );
+            let commands_ptr = host_commands.as_ffi_ptr();
+            let err_buf = core::mem::take(&mut self.last_error_buf);
+            let mut sys_ctx = HostSystemCtx::new(
+                Arc::clone(&self.snapshot),
+                self.mod_namespace.clone(),
+                err_buf,
+                iter_ptrs,
+                count,
+                commands_ptr,
+            );
+            let sys_ctx_ptr = sys_ctx.as_ffi_ptr();
+            let GuestFnPtr(callback) = self.callback;
+            // SAFETY: Calling foreign `extern "C"` callback with stack-scoped `HostSystemCtx`,
+            // `HostIter`s, and `HostCommands` whose headers are poisoned when this block exits.
+            let res = unsafe { callback(sys_ctx_ptr, self.user_data.as_ptr()) };
+            self.last_error_buf = sys_ctx.reclaim_error_buffer();
+            res
         };
+        drop(host_iters);
 
         self.last_run = change_tick;
 
@@ -522,7 +709,10 @@ impl System for DynamicCSystem {
     }
 
     fn apply_deferred(&mut self, world: &mut World) {
-        self.command_queue.apply(world);
+        self.commands_storage.apply_to_world(world, &self.snapshot);
+        if !self.fault_queue.is_empty() {
+            self.fault_queue.apply(world);
+        }
     }
 
     fn run(
@@ -536,7 +726,16 @@ impl System for DynamicCSystem {
     }
 
     fn queue_deferred(&mut self, mut world: DeferredWorld) {
-        world.commands().append(&mut self.command_queue);
+        if !self.commands_storage.is_empty() {
+            let mut taken = self.commands_storage.take_for_deferred_queue();
+            let snap = Arc::clone(&self.snapshot);
+            world.commands().queue(move |w: &mut World| {
+                taken.apply_to_world(w, &snap);
+            });
+        }
+        if !self.fault_queue.is_empty() {
+            world.commands().append(&mut self.fault_queue);
+        }
     }
 
     fn check_change_tick(&mut self, check: CheckChangeTicks) {

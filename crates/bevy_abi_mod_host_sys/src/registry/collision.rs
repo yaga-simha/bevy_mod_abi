@@ -1,12 +1,16 @@
-//! Error diagnostics for conflicting component or resource registrations.
+//! Error diagnostics for conflicting component or resource registrations (`C-10`, `E-02`).
 
 use bevy_abi_mod_sys::ComponentUuid;
+use thiserror::Error;
 
 /// Error returned when a component or resource registration collides with an existing entry's
-/// 128-bit [`ComponentUuid`], canonical name, `(size, align)` layout, or component/resource kind.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 128-bit [`ComponentUuid`], canonical name, `(size, align)` layout, or storage/mutability flags.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ComponentCollisionError {
     /// Two distinct canonical names map to the same 128-bit [`ComponentUuid`].
+    #[error(
+        "ComponentUuid collision ({uuid:?}): '{new_name}' collides with already-registered '{existing_name}'"
+    )]
     UuidCollision {
         /// Existing registered name bound to `uuid`.
         existing_name: String,
@@ -15,7 +19,9 @@ pub enum ComponentCollisionError {
         /// Colliding 128-bit UUID.
         uuid: ComponentUuid,
     },
+
     /// Re-registration of an existing canonical name with mismatched metadata.
+    #[error("component/resource '{name}' re-registered with conflicting metadata: {reason}")]
     MetadataMismatch {
         /// Canonical component or resource name.
         name: String,
@@ -23,26 +29,3 @@ pub enum ComponentCollisionError {
         reason: String,
     },
 }
-
-impl core::fmt::Display for ComponentCollisionError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::UuidCollision {
-                existing_name,
-                new_name,
-                uuid,
-            } => write!(
-                f,
-                "ComponentUuid collision ({:?}): '{}' collides with already-registered '{}'",
-                uuid.bytes, new_name, existing_name
-            ),
-            Self::MetadataMismatch { name, reason } => write!(
-                f,
-                "component/resource '{}' re-registered with conflicting metadata: {}",
-                name, reason
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ComponentCollisionError {}

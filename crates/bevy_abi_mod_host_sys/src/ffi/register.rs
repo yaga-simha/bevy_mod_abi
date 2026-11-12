@@ -1,69 +1,96 @@
-//! `ModInitContext` validation (`magic` + `generation`) and C-ABI component/system registration.
+//! Transactional `LoadContext` (`BamLoadCtx`), `host_register_component`, `host_resolve_component`,
+//! and unified `host_register_system` (`C-01`, `C-04`, `C-05`, `S-08`, `B-07`, `B-08`, `N-02`).
 
-use crate::drop_trampoline::allocate_drop_trampoline;
-use crate::ffi::iter::MAX_QUERY_COMPONENTS;
-use crate::loader::ModId;
-use crate::registry::{ModRegistry, RegisteredComponent};
-use crate::schedule::ModSchedule;
-use crate::system::access_builder::validate_registry_independent_groups;
-use crate::system::{ComponentAccessDescOwned, DynamicCSystem, MAX_SYSTEM_QUERIES};
-use bevy_abi_mod_sys::{
-    ConditionalMultiQuerySystemDescriptor, ConditionalSystemDescriptor, FfiResult,
-    ModComponentDescriptor, MultiQuerySystemDescriptor, ScheduledMultiQuerySystemDescriptor,
-    ScheduledSystemDescriptor, SystemDescriptor, read_descriptor,
+use crate::drop_trampoline::{WorldDropGuard, on_insert_hook_for_slot};
+use crate::handle_header::{
+    HOST_CTX_MAGIC, HandleHeader, HostContext, LOAD_CTX_MAGIC, validate_handle_mut,
+    validate_handle_ref,
 };
-use bevy_ecs::component::{ComponentCloneBehavior, ComponentDescriptor, StorageType};
+use crate::loader::ModId;
+use crate::registry::{ModRegistry, component_flags_to_storage_flags};
+use crate::schedule::ModNamedSystemSet;
+use crate::system::access_builder::validate_system_queries_against_snapshot;
+use crate::system::{BamQuerySpecOwned, GuestSystem};
+use bevy_abi_mod_sys::{
+    BamComponent, BamHostCtx, BamLoadCtx, BamQueryDesc, BamSystemDesc, BamTermDesc, ComponentDesc,
+    ComponentUuid, FfiResult, read_descriptor,
+};
+use bevy_ecs::component::{ComponentCloneBehavior, ComponentDescriptor, ComponentId, StorageType};
 use bevy_ecs::world::World;
-use core::cell::Cell;
 use core::ffi::{CStr, c_char, c_void};
-use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-/// Expected magic tag (`"BAM_INIT"`) at byte offset `0` of an active [`ModInitContext`].
-pub const MOD_INIT_CONTEXT_MAGIC: u64 = 0x4241_4D5F_494E_4954;
-
-static NEXT_INIT_GENERATION: AtomicU32 = AtomicU32::new(1);
-
-/// Fixed `#[repr(C)]` validation prefix located at offset `0` of [`ModInitContext`].
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ModInitContextHeader {
-    /// Magic sentinel (`MOD_INIT_CONTEXT_MAGIC` while active, zeroed after `init` returns).
-    pub magic: u64,
-    /// Monotonic generation token matched against the active thread-local registration scope.
-    pub generation: u32,
-    _pad: u32,
-}
-
-/// Host initialization state passed as `host_context` to `bevy_abi_mod_init`.
+/// Concrete `#[repr(C)]` initialization context backing opaque [`BamLoadCtx`] (`N-02`, `S-08`).
 ///
-/// Prefixed at byte offset `0` by [`ModInitContextHeader`] so every `host_register_*` entry point
-/// verifies active scope, pointer identity, magic tag, and generation before mutating host state.
+/// Valid strictly for the duration of `bevy_abi_mod_init`; poisoned automatically on `finish_init`
+/// and `Drop` without any thread-local global state (`C-04`).
 #[repr(C)]
-pub struct ModInitContext {
-    /// Validation header pinned at byte offset `0`.
-    pub header: ModInitContextHeader,
-    /// Active component and symbol registry snapshot.
-    pub registry: Arc<ModRegistry>,
-    /// Accumulated dynamic systems registered during mod initialization.
-    pub registered_systems: Vec<DynamicCSystem>,
-    /// Shared atomic liveness flag for this module load attempt.
+pub struct LoadContext {
+    /// Leading handle validation header (`LOAD_CTX_MAGIC`) at byte offset `0`.
+    pub header: HandleHeader,
+    /// Embedded world-scoped `HostContext` returned by `host_load_host_ctx`.
+    pub host_ctx: HostContext,
+    /// Mutable Copy-on-Write [`ModRegistry`] updated as dynamic components register.
+    pub registry: ModRegistry,
+    /// Accumulated systems registered during `bevy_abi_mod_init`.
+    pub registered_systems: Vec<GuestSystem>,
+    /// Handles of dynamic components registered during this init session.
+    pub registered_components: Vec<BamComponent>,
+    /// Shared liveness flag for this module load session.
     pub is_active: Arc<AtomicBool>,
-    /// Pointer to the Bevy [`World`] during mod initialization (null if outside a `World` scope).
-    pub world: *mut World,
-    /// Dynamic components registered during initialization.
-    pub registered_components: Vec<RegisteredComponent>,
-    /// Optional [`ModId`] assigned to the module currently initializing.
+    /// Pointer to the exclusively borrowed Bevy [`World`] (or null in standalone unit tests).
+    pub world_ptr: *mut World,
+    /// Fallback standalone `World` used only when `world_ptr` is null in isolated FFI unit tests.
+    standalone_world: Option<Box<World>>,
+    /// Assigned [`ModId`] for this load session.
     pub mod_id: Option<ModId>,
+    /// Optional manifest module name used to prefix unqualified guest component names (`C-10`).
+    pub manifest_name: Option<Arc<str>>,
+    in_init: bool,
 }
 
-const _: () = assert!(core::mem::offset_of!(ModInitContext, header) == 0);
+const _: () = assert!(core::mem::offset_of!(LoadContext, header) == 0);
 
-impl ModInitContext {
-    /// Creates a new initialization context with a fresh active flag.
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn new(registry: Arc<ModRegistry>) -> Self {
+impl LoadContext {
+    /// Creates an active [`LoadContext`] bound to `registry`, `is_active`, `world_ptr`, and `mod_id`.
+    pub fn with_world_and_mod_id(
+        registry: ModRegistry,
+        is_active: Arc<AtomicBool>,
+        world_ptr: *mut World,
+        mod_id: Option<ModId>,
+    ) -> Self {
+        Self::with_manifest_name(registry, is_active, world_ptr, mod_id, None)
+    }
+
+    /// Creates an active [`LoadContext`] bound to `registry`, `is_active`, `world_ptr`, `mod_id`,
+    /// and canonical `manifest_name` (`"<manifest.name>::<Name>"` prefixing for unqualified components).
+    pub fn with_manifest_name(
+        registry: ModRegistry,
+        is_active: Arc<AtomicBool>,
+        world_ptr: *mut World,
+        mod_id: Option<ModId>,
+        manifest_name: Option<Arc<str>>,
+    ) -> Self {
+        let host_ctx =
+            HostContext::new(registry.snapshot_arc()).with_namespace(manifest_name.clone());
+        Self {
+            header: HandleHeader::new(LOAD_CTX_MAGIC),
+            host_ctx,
+            registry,
+            registered_systems: Vec::new(),
+            registered_components: Vec::new(),
+            is_active,
+            world_ptr,
+            standalone_world: None,
+            mod_id,
+            manifest_name,
+            in_init: true,
+        }
+    }
+
+    /// Creates an active standalone [`LoadContext`] for unit testing without an external `World`.
+    pub fn new(registry: ModRegistry) -> Self {
         Self::with_world_and_mod_id(
             registry,
             Arc::new(AtomicBool::new(true)),
@@ -72,693 +99,547 @@ impl ModInitContext {
         )
     }
 
-    /// Creates an initialization context sharing a specific active flag.
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn with_is_active(registry: Arc<ModRegistry>, is_active: Arc<AtomicBool>) -> Self {
-        Self::with_world_and_mod_id(registry, is_active, core::ptr::null_mut(), None)
+    /// Ends the active initialization window, poisoning both `LoadContext` and its embedded
+    /// `HostContext` so any stashed FFI pointers fail validation immediately (`S-08`).
+    #[inline]
+    pub fn finish_init(&mut self) {
+        self.in_init = false;
+        self.header.poison();
+        self.host_ctx.header.poison();
     }
 
-    /// Creates an initialization context with a specific active flag and mutable `World` access.
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn with_world(
-        registry: Arc<ModRegistry>,
-        is_active: Arc<AtomicBool>,
-        world: *mut World,
-    ) -> Self {
-        Self::with_world_and_mod_id(registry, is_active, world, None)
+    /// Casts `&mut self` to an opaque `*mut BamLoadCtx` FFI pointer.
+    #[inline]
+    pub fn as_ffi_ptr(&mut self) -> *mut BamLoadCtx {
+        (self as *mut Self).cast::<BamLoadCtx>()
     }
 
-    /// Creates an initialization context bound to a `World` and owning [`ModId`].
-    pub fn with_world_and_mod_id(
-        registry: Arc<ModRegistry>,
-        is_active: Arc<AtomicBool>,
-        world: *mut World,
-        mod_id: Option<ModId>,
-    ) -> Self {
-        Self {
-            header: ModInitContextHeader {
-                magic: 0,
-                generation: 0,
-                _pad: 0,
-            },
-            registry,
-            registered_systems: Vec::new(),
-            is_active,
-            world,
-            registered_components: Vec::new(),
-            mod_id,
+    fn world_mut(&mut self) -> &mut World {
+        if !self.world_ptr.is_null() {
+            // SAFETY: `self.world_ptr` comes from an exclusively borrowed `&mut World` held for the
+            // duration of `bevy_abi_mod_init` with no aliasing references.
+            unsafe { &mut *self.world_ptr }
+        } else {
+            self.standalone_world
+                .get_or_insert_with(|| Box::new(World::new()))
         }
     }
-
-    /// Marks this context as active on the current thread for the duration of the returned guard.
-    pub fn make_active(&mut self) -> ActiveInitContextGuard {
-        let mut generation = NEXT_INIT_GENERATION.fetch_add(1, Ordering::Relaxed);
-        if generation == 0 {
-            generation = NEXT_INIT_GENERATION.fetch_add(1, Ordering::Relaxed);
-        }
-        self.header = ModInitContextHeader {
-            magic: MOD_INIT_CONTEXT_MAGIC,
-            generation,
-            _pad: 0,
-        };
-        let nn = NonNull::from(&mut *self);
-        let prev = ACTIVE_INIT_CONTEXT.with(|c| c.replace(Some((nn, generation))));
-        ActiveInitContextGuard { ctx_ptr: nn, prev }
-    }
-
-    /// Corrupts the context header in-place for white-box context validation tests.
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn poison_header_for_testing(&mut self) {
-        self.header.magic = 0xDEAD_BEEF_CAFE_BABE;
-        self.header.generation = 0;
-    }
 }
 
-type ActiveContextSlot = Option<(NonNull<ModInitContext>, u32)>;
-
-thread_local! {
-    pub(crate) static ACTIVE_INIT_CONTEXT: Cell<ActiveContextSlot> = const { Cell::new(None) };
-}
-
-/// RAII guard that invalidates [`ModInitContextHeader`] and restores the previous thread-local
-/// active initialization context on drop.
-pub struct ActiveInitContextGuard {
-    ctx_ptr: NonNull<ModInitContext>,
-    prev: ActiveContextSlot,
-}
-
-impl Drop for ActiveInitContextGuard {
+impl Drop for LoadContext {
+    #[inline]
     fn drop(&mut self) {
-        // SAFETY: `ActiveInitContextGuard` is created from `&mut ModInitContext` and dropped before
-        // `ModInitContext` leaves scope during `init`, so `self.ctx_ptr` remains valid to poison.
-        unsafe {
-            let hdr_ptr = core::ptr::addr_of_mut!((*self.ctx_ptr.as_ptr()).header);
-            hdr_ptr.write(ModInitContextHeader {
-                magic: 0,
-                generation: 0,
-                _pad: 0,
-            });
-            if let Some((prev_nn, prev_gen)) = self.prev {
-                let prev_hdr = core::ptr::addr_of_mut!((*prev_nn.as_ptr()).header);
-                prev_hdr.write(ModInitContextHeader {
-                    magic: MOD_INIT_CONTEXT_MAGIC,
-                    generation: prev_gen,
-                    _pad: 0,
-                });
-            }
-        }
-        ACTIVE_INIT_CONTEXT.with(|c| c.set(self.prev));
+        self.in_init = false;
+        self.header.poison();
     }
 }
 
-/// Validates that `host_context` matches the currently active `ModInitContext` on this thread and
-/// carries an intact `(magic, generation)` header.
-///
-/// # Safety
-/// Safe for any non-null `host_context` pointer because pointer equality against the live
-/// thread-local `ACTIVE_INIT_CONTEXT` slot is verified *before* dereferencing `host_context`.
-unsafe fn validate_active_init_context<'a>(
-    host_context: *mut c_void,
-) -> Result<&'a mut ModInitContext, FfiResult> {
-    if host_context.is_null() {
-        return Err(FfiResult::NULL_POINTER);
-    }
-    let Some((active_nn, expected_gen)) = ACTIVE_INIT_CONTEXT.with(|c| c.get()) else {
-        return Err(FfiResult::INVALID_STATE);
+#[inline]
+unsafe fn validate_active_load_ctx<'a>(
+    load_ctx: *mut BamLoadCtx,
+) -> Result<&'a mut LoadContext, FfiResult> {
+    // SAFETY: Unconditionally validates non-null, alignment, and `LOAD_CTX_MAGIC` + non-zero generation.
+    let ctx = unsafe {
+        validate_handle_mut::<LoadContext>(load_ctx.cast::<c_void>(), LOAD_CTX_MAGIC, true)?
     };
-    if host_context != active_nn.as_ptr().cast::<c_void>() {
+    if !ctx.in_init {
         return Err(FfiResult::INVALID_STATE);
     }
-    // SAFETY: `host_context` equals `active_nn.as_ptr()`, which points to the live `ModInitContext`
-    // pinned on this thread's call stack by `ActiveInitContextGuard`.
-    let hdr = unsafe { core::ptr::addr_of!((*active_nn.as_ptr()).header).read() };
-    if hdr.magic != MOD_INIT_CONTEXT_MAGIC || hdr.generation != expected_gen || expected_gen == 0 {
-        return Err(FfiResult::INVALID_STATE);
-    }
-    // SAFETY: Verified active pointer match, magic tag, and generation; exclusive access holds
-    // inside this single-threaded C-ABI registration call.
-    Ok(unsafe { &mut *active_nn.as_ptr() })
+    Ok(ctx)
 }
 
-/// Parses an array of `count` NUL-terminated UTF-8 C strings.
+/// Obtains the world-scoped [`BamHostCtx`] pointer from an active [`BamLoadCtx`].
 ///
 /// # Safety
-/// If `count > 0` and `ptr` is non-null, `ptr` must reference `count` valid `*const c_char` slots,
-/// each either null or pointing to a NUL-terminated C string.
-unsafe fn parse_cstr_name_array(
+/// `load_ctx` must point to an active [`LoadContext`] cast to [`BamLoadCtx`], or null.
+pub unsafe extern "C" fn host_load_host_ctx(load_ctx: *const BamLoadCtx) -> *const BamHostCtx {
+    // SAFETY: Unconditionally validates `load_ctx` against `LOAD_CTX_MAGIC`.
+    let Ok(ctx) = (unsafe {
+        validate_handle_ref::<LoadContext>(load_ctx.cast::<c_void>(), LOAD_CTX_MAGIC, true)
+    }) else {
+        return core::ptr::null();
+    };
+    if !ctx.in_init {
+        return core::ptr::null();
+    }
+    ctx.host_ctx.as_ffi_ptr()
+}
+
+/// Resolves an existing component or resource by canonical `name`, `uuid`, or both (`C-05`).
+///
+/// # Safety
+/// - `ctx` must point to an active [`HostContext`] cast to [`BamHostCtx`], or null.
+/// - If non-null, `name` must point to a NUL-terminated C string.
+/// - If non-null, `uuid` must point to a readable [`ComponentUuid`].
+/// - `out_component` must point to writable [`BamComponent`] storage, or null.
+pub unsafe extern "C" fn host_resolve_component(
+    ctx: *const BamHostCtx,
+    name: *const c_char,
+    uuid: *const ComponentUuid,
+    out_component: *mut BamComponent,
+) -> FfiResult {
+    if out_component.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: Unconditionally validates `ctx` against `HOST_CTX_MAGIC`.
+    let host_ctx = match unsafe {
+        validate_handle_ref::<HostContext>(ctx.cast::<c_void>(), HOST_CTX_MAGIC, true)
+    } {
+        Ok(c) => c,
+        Err(err) => return err,
+    };
+
+    if name.is_null() && uuid.is_null() {
+        host_ctx.set_last_error("resolve_component requires at least one of `name` or `uuid`");
+        return FfiResult::INVALID_ARGUMENT;
+    }
+
+    let parsed_name = if !name.is_null() {
+        // SAFETY: Caller guarantees `name` points to a NUL-terminated C string.
+        let Ok(s) = (unsafe { CStr::from_ptr(name) }).to_str() else {
+            host_ctx.set_last_error("resolve_component `name` is not valid UTF-8");
+            return FfiResult::INVALID_UTF8;
+        };
+        if s.is_empty() {
+            host_ctx.set_last_error("resolve_component `name` must not be empty");
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        Some(s)
+    } else {
+        None
+    };
+
+    let parsed_uuid = if !uuid.is_null() {
+        // SAFETY: Caller guarantees `uuid` points to a readable `ComponentUuid`.
+        Some(unsafe { core::ptr::read_unaligned(uuid) })
+    } else {
+        None
+    };
+
+    let snap = host_ctx.snapshot();
+    let resolve_by_name = |raw_name: &str| {
+        if let Some(found) = snap.get_by_name(raw_name) {
+            return Some(found);
+        }
+        if !raw_name.contains("::")
+            && let Some(ns) = host_ctx.default_namespace()
+        {
+            let qualified = format!("{ns}::{raw_name}");
+            return snap.get_by_name(&qualified);
+        }
+        None
+    };
+
+    let entry = match (parsed_name, parsed_uuid) {
+        (Some(n), Some(u)) => match resolve_by_name(n) {
+            Some(by_name) => {
+                if by_name.uuid != u {
+                    host_ctx.set_last_error(format!(
+                        "resolve_component UUID mismatch for '{n}': expected {:?}, got {u:?}",
+                        by_name.uuid
+                    ));
+                    return FfiResult::TYPE_MISMATCH;
+                }
+                by_name
+            }
+            None => {
+                if let Some(by_uuid) = snap.get_by_uuid(&u) {
+                    host_ctx.set_last_error(format!(
+                        "resolve_component UUID {u:?} is bound to '{}', not '{n}'",
+                        by_uuid.name
+                    ));
+                    return FfiResult::TYPE_MISMATCH;
+                }
+                host_ctx.set_last_error(format!("component or resource '{n}' not found"));
+                return FfiResult::NOT_FOUND;
+            }
+        },
+        (Some(n), None) => {
+            let Some(by_name) = resolve_by_name(n) else {
+                host_ctx.set_last_error(format!("component or resource '{n}' not found"));
+                return FfiResult::NOT_FOUND;
+            };
+            by_name
+        }
+        (None, Some(u)) => {
+            let Some(by_uuid) = snap.get_by_uuid(&u) else {
+                host_ctx.set_last_error(format!("component or resource with UUID {u:?} not found"));
+                return FfiResult::NOT_FOUND;
+            };
+            by_uuid
+        }
+        (None, None) => unreachable!(),
+    };
+
+    // SAFETY: `out_component` was checked non-null above and caller guarantees writable `BamComponent`.
+    unsafe {
+        *out_component = entry.handle;
+    }
+    FfiResult::OK
+}
+
+/// Registers a dynamic component described by `desc_ptr` inside `load_ctx` and writes its 1-based
+/// [`BamComponent`] handle into `*out_component` (`C-05`, `L-06`, `B-08`).
+///
+/// # Safety
+/// - `load_ctx` must point to the active [`LoadContext`] cast to [`BamLoadCtx`], or null.
+/// - `desc_ptr` must point to a readable [`ComponentDesc`], or null.
+/// - `out_component` must point to writable [`BamComponent`] storage, or null.
+pub unsafe extern "C" fn host_register_component(
+    load_ctx: *mut BamLoadCtx,
+    desc_ptr: *const ComponentDesc,
+    out_component: *mut BamComponent,
+) -> FfiResult {
+    if out_component.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: Validates active `LoadContext` header and `in_init` state.
+    let ctx = match unsafe { validate_active_load_ctx(load_ctx) } {
+        Ok(c) => c,
+        Err(err) => return err,
+    };
+
+    // SAFETY: `read_descriptor` checks null and `struct_size >= ComponentDesc::MIN_V0_2_SIZE`.
+    let desc = match unsafe { read_descriptor::<ComponentDesc>(desc_ptr.cast::<c_void>()) } {
+        Ok(d) => d,
+        Err(err) => {
+            ctx.host_ctx
+                .set_last_error(format!("invalid ComponentDesc header ({err})"));
+            return err;
+        }
+    };
+
+    let val_status = desc.validate();
+    if val_status.is_err() {
+        ctx.host_ctx
+            .set_last_error(format!("ComponentDesc validation failed ({val_status})"));
+        return val_status;
+    }
+
+    let Some(layout) = desc.layout() else {
+        ctx.host_ctx
+            .set_last_error("ComponentDesc size/align violates C struct layout invariants");
+        return FfiResult::INVALID_ARGUMENT;
+    };
+
+    // SAFETY: `desc.validate()` verified `!desc.name.is_null()`.
+    let Ok(name_str) = (unsafe { CStr::from_ptr(desc.name) }).to_str() else {
+        ctx.host_ctx
+            .set_last_error("ComponentDesc `name` is not valid UTF-8");
+        return FfiResult::INVALID_UTF8;
+    };
+    if name_str.is_empty() {
+        ctx.host_ctx
+            .set_last_error("ComponentDesc `name` must not be empty");
+        return FfiResult::INVALID_ARGUMENT;
+    }
+
+    // C-10: Prefix unqualified dynamic component names with `"<manifest.name>::<Name>"` unless
+    // an unqualified entry of that exact name was already registered on the host.
+    let canonical_name: std::borrow::Cow<'_, str> =
+        if !name_str.contains("::") && ctx.registry.get_by_name(name_str).is_none() {
+            if let Some(ref ns) = ctx.manifest_name {
+                std::borrow::Cow::Owned(format!("{ns}::{name_str}"))
+            } else {
+                std::borrow::Cow::Borrowed(name_str)
+            }
+        } else {
+            std::borrow::Cow::Borrowed(name_str)
+        };
+    let name_ref = canonical_name.as_ref();
+
+    let storage_flags = component_flags_to_storage_flags(desc.flags);
+    let existing_comp_id = ctx.registry.get_by_name(name_ref).map(|e| e.component_id);
+
+    if let Err(collision) = ctx.registry.check_registration_collision(
+        name_ref,
+        desc.uuid,
+        desc.size,
+        desc.align,
+        storage_flags,
+        existing_comp_id,
+    ) {
+        ctx.host_ctx.set_last_error(collision.to_string());
+        return FfiResult::TYPE_MISMATCH;
+    }
+
+    let is_active = Arc::clone(&ctx.is_active);
+    let owner = ctx.mod_id;
+
+    let (comp_id, drop_slot): (ComponentId, Option<usize>) = {
+        let world = ctx.world_mut();
+        if !world.contains_resource::<WorldDropGuard>() {
+            world.insert_resource(WorldDropGuard::new());
+        }
+
+        let (slot_opt, trampoline_opt) = if let Some(drop_fn) = desc.drop_fn {
+            let bound = world
+                .get_resource_mut::<WorldDropGuard>()
+                .and_then(|mut g| g.bind_or_update(desc.uuid, drop_fn, is_active));
+            let Some((slot, tramp)) = bound else {
+                ctx.host_ctx.set_last_error(
+                    "exhausted MAX_DROP_TRAMPOLINES (1024) foreign destructor slots",
+                );
+                return FfiResult::CAPACITY_EXCEEDED;
+            };
+            (Some(slot), Some(tramp))
+        } else {
+            (None, None)
+        };
+
+        if let Some(existing_id) = existing_comp_id {
+            (existing_id, slot_opt)
+        } else {
+            let storage_type = if desc.is_sparse_set() {
+                StorageType::SparseSet
+            } else {
+                StorageType::Table
+            };
+            let clone_behavior = if desc.drop_fn.is_some() {
+                ComponentCloneBehavior::Ignore
+            } else {
+                ComponentCloneBehavior::Default
+            };
+            // SAFETY: `layout` was verified by `desc.layout()`; `trampoline_opt` follows Bevy's
+            // `OwningPtr` drop contract; `storage_type` and mutability match `desc.flags` (`B-08`).
+            let bevy_desc = unsafe {
+                ComponentDescriptor::new_with_layout(
+                    name_ref.to_string(),
+                    storage_type,
+                    layout,
+                    trampoline_opt,
+                    !desc.is_immutable(),
+                    storage_type == StorageType::Table,
+                    clone_behavior,
+                    None,
+                )
+            };
+            let new_id = world.register_component_with_descriptor(bevy_desc);
+            if let Some(slot) = slot_opt
+                && let Some(hooks) = world.register_component_hooks_by_id(new_id)
+            {
+                hooks.on_insert(on_insert_hook_for_slot(slot));
+            }
+            (new_id, slot_opt)
+        }
+    };
+
+    let handle = match ctx
+        .registry
+        .register_dynamic_component_owned(comp_id, &desc, name_ref, owner, drop_slot)
+    {
+        Ok(h) => h,
+        Err(err) => {
+            ctx.host_ctx.set_last_error(err.to_string());
+            return FfiResult::TYPE_MISMATCH;
+        }
+    };
+
+    ctx.host_ctx.set_snapshot(ctx.registry.snapshot_arc());
+    if !ctx.world_ptr.is_null() {
+        let updated_reg = ctx.registry.clone();
+        ctx.world_mut().insert_resource(updated_reg);
+    }
+    if !ctx.registered_components.contains(&handle) {
+        ctx.registered_components.push(handle);
+    }
+
+    // SAFETY: `out_component` was checked non-null above and caller guarantees writable `BamComponent`.
+    unsafe {
+        *out_component = handle;
+    }
+    FfiResult::OK
+}
+
+/// Parses an array of `count` NUL-terminated UTF-8 C strings and validates ordering target syntax.
+///
+/// # Safety
+/// If `count > 0` and `ptr` is non-null, `ptr` must point to `count` readable `*const c_char` slots.
+unsafe fn parse_ordering_targets(
     ptr: *const *const c_char,
     count: usize,
-) -> Result<Vec<String>, FfiResult> {
+) -> Result<Vec<String>, (FfiResult, String)> {
     if count == 0 {
         return Ok(Vec::new());
     }
     if ptr.is_null() {
-        return Err(FfiResult::NULL_POINTER);
+        return Err((
+            FfiResult::NULL_POINTER,
+            "ordering array pointer is null with non-zero count".to_string(),
+        ));
     }
-    // SAFETY: Caller passes an array of `count` C-string pointers.
+    // SAFETY: Caller guarantees `count` readable `*const c_char` elements.
     let slice = unsafe { core::slice::from_raw_parts(ptr, count) };
     let mut out = Vec::with_capacity(count);
-    for &entry in slice {
+    for (idx, &entry) in slice.iter().enumerate() {
         if entry.is_null() {
-            return Err(FfiResult::NULL_POINTER);
+            return Err((
+                FfiResult::NULL_POINTER,
+                format!("ordering target at index {idx} is null"),
+            ));
         }
-        // SAFETY: `entry` is checked non-null and points to a NUL-terminated C string.
+        // SAFETY: `entry` is non-null and points to a NUL-terminated C string.
         let Ok(s) = (unsafe { CStr::from_ptr(entry) }).to_str() else {
-            return Err(FfiResult::INVALID_UTF8);
+            return Err((
+                FfiResult::INVALID_UTF8,
+                format!("ordering target at index {idx} is not valid UTF-8"),
+            ));
         };
+        if ModNamedSystemSet::parse_target(s, "mod").is_none() {
+            return Err((
+                FfiResult::INVALID_ARGUMENT,
+                format!("invalid ordering target syntax '{s}' at index {idx}"),
+            ));
+        }
         out.push(s.to_string());
     }
     Ok(out)
 }
 
-unsafe fn register_system_from_extensible_ptr(
-    host_context: *mut c_void,
-    descriptor_ptr: *const c_void,
-    schedule_override: Option<ModSchedule>,
+/// Registers a unified [`BamSystemDesc`] inside `load_ctx` (`C-01`, `B-07`, `B-08`).
+///
+/// # Safety
+/// - `load_ctx` must point to the active [`LoadContext`] cast to [`BamLoadCtx`], or null.
+/// - `desc_ptr` must point to a readable [`BamSystemDesc`], or null.
+pub unsafe extern "C" fn host_register_system(
+    load_ctx: *mut BamLoadCtx,
+    desc_ptr: *const BamSystemDesc,
 ) -> FfiResult {
-    if host_context.is_null() || descriptor_ptr.is_null() {
-        return FfiResult::NULL_POINTER;
-    }
-
-    // SAFETY: Verifies active pointer identity, magic, and generation before any dereference.
-    let init_ctx = match unsafe { validate_active_init_context(host_context) } {
-        Ok(ctx) => ctx,
+    // SAFETY: Validates active `LoadContext` header and `in_init` state.
+    let ctx = match unsafe { validate_active_load_ctx(load_ctx) } {
+        Ok(c) => c,
         Err(err) => return err,
     };
 
-    // SAFETY: Copies `min(struct_size, size_of::<ConditionalSystemDescriptor>())` bytes into a
-    // zero-filled `MaybeUninit` and validates non-null `callback` prior to `assume_init()`.
-    let cond_desc = match unsafe { read_descriptor::<ConditionalSystemDescriptor>(descriptor_ptr) }
-    {
+    // SAFETY: `read_descriptor` checks null and `struct_size >= BamSystemDesc::MIN_V0_2_SIZE`.
+    let desc = match unsafe { read_descriptor::<BamSystemDesc>(desc_ptr.cast::<c_void>()) } {
         Ok(d) => d,
-        Err(err) => return err,
-    };
-    let sched_desc = cond_desc.sched;
-
-    if (sched_desc.flags & !ScheduledSystemDescriptor::KNOWN_FLAGS) != 0 {
-        return FfiResult::UNSUPPORTED;
-    }
-
-    let schedule = match schedule_override {
-        Some(s) => s,
-        None => {
-            let Some(s) = ModSchedule::from_label_id(sched_desc.schedule) else {
-                return FfiResult::INVALID_VERSION;
-            };
-            s
+        Err(err) => {
+            ctx.host_ctx
+                .set_last_error(format!("invalid BamSystemDesc header ({err})"));
+            return err;
         }
     };
 
-    // SAFETY: `sched_desc.after` is zero-filled (`count == 0`) for v1 descriptors or caller-supplied.
-    let after = match unsafe { parse_cstr_name_array(sched_desc.after, sched_desc.after_count) } {
-        Ok(v) => v,
-        Err(err) => return err,
-    };
-    // SAFETY: Same contract for `sched_desc.before`.
-    let before = match unsafe { parse_cstr_name_array(sched_desc.before, sched_desc.before_count) }
-    {
-        Ok(v) => v,
-        Err(err) => return err,
-    };
-
-    let desc = sched_desc.base;
-    let run_if = cond_desc.run_if.map(|cb| (cb, cond_desc.run_if_user_data));
-
-    if desc.query_count > MAX_QUERY_COMPONENTS {
-        return FfiResult::OUT_OF_RANGE;
+    let val_status = desc.validate();
+    if val_status.is_err() {
+        ctx.host_ctx
+            .set_last_error(format!("BamSystemDesc validation failed ({val_status})"));
+        return val_status;
     }
 
-    let sys_name = if !desc.name.is_null() {
-        // SAFETY: `desc.name` is non-null and points to a NUL-terminated C string.
-        unsafe { CStr::from_ptr(desc.name) }
-            .to_str()
-            .unwrap_or("unnamed_guest_system")
-            .to_string()
-    } else {
-        "unnamed_guest_system".to_string()
+    let Some(callback) = desc.callback else {
+        ctx.host_ctx
+            .set_last_error("BamSystemDesc `callback` is null");
+        return FfiResult::NULL_POINTER;
     };
 
-    let mut query_descs = Vec::with_capacity(desc.query_count);
+    // SAFETY: `desc.validate()` verified `!desc.name.is_null()`.
+    let Ok(sys_name) = (unsafe { CStr::from_ptr(desc.name) }).to_str() else {
+        ctx.host_ctx
+            .set_last_error("BamSystemDesc `name` is not valid UTF-8");
+        return FfiResult::INVALID_UTF8;
+    };
+    if sys_name.is_empty() {
+        ctx.host_ctx
+            .set_last_error("BamSystemDesc `name` must not be empty");
+        return FfiResult::INVALID_ARGUMENT;
+    }
+
+    // Parse `queries[0..desc.query_count]`.
+    let mut query_specs = Vec::with_capacity(desc.query_count);
     if desc.query_count > 0 {
-        if desc.queries.is_null() {
-            return FfiResult::NULL_POINTER;
+        let base_ptr = desc.queries.cast::<u8>();
+        // Determine element stride from the first `BamQueryDesc::struct_size` so forward-extended
+        // query arrays step accurately.
+        // SAFETY: `desc.validate()` verified `!desc.queries.is_null()` when `query_count > 0`.
+        let first_size = unsafe { core::ptr::read_unaligned(base_ptr.cast::<u32>()) } as usize;
+        if first_size < BamQueryDesc::MIN_V0_2_SIZE {
+            ctx.host_ctx.set_last_error(format!(
+                "BamQueryDesc[0] struct_size ({first_size}) < MIN_V0_2_SIZE"
+            ));
+            return FfiResult::INVALID_VERSION;
         }
-        // SAFETY: `desc.queries` is non-null and points to `desc.query_count` elements.
-        let queries_slice = unsafe { core::slice::from_raw_parts(desc.queries, desc.query_count) };
-        for q in queries_slice {
-            if q.name.is_null() {
-                return FfiResult::NULL_POINTER;
-            }
-            if !q.mode.is_valid() {
+
+        for q_idx in 0..desc.query_count {
+            let Some(byte_offset) = q_idx.checked_mul(first_size) else {
                 return FfiResult::INVALID_ARGUMENT;
-            }
-            // SAFETY: `q.name` is non-null and points to a NUL-terminated C string.
-            let Ok(q_name) = (unsafe { CStr::from_ptr(q.name) }).to_str() else {
-                return FfiResult::INVALID_UTF8;
             };
-            query_descs.push(ComponentAccessDescOwned {
-                name: q_name.to_string(),
-                mode: q.mode,
+            // SAFETY: Caller guarantees `desc.queries` holds `desc.query_count` contiguous elements.
+            let q_ptr = unsafe { base_ptr.add(byte_offset).cast::<c_void>() };
+            // SAFETY: Reading extensible `BamQueryDesc` element `q_idx`.
+            let q_desc = match unsafe { read_descriptor::<BamQueryDesc>(q_ptr) } {
+                Ok(q) => q,
+                Err(err) => {
+                    ctx.host_ctx
+                        .set_last_error(format!("invalid BamQueryDesc[{q_idx}] ({err})"));
+                    return err;
+                }
+            };
+            let q_val = q_desc.validate();
+            if q_val.is_err() {
+                ctx.host_ctx
+                    .set_last_error(format!("BamQueryDesc[{q_idx}] validation failed ({q_val})"));
+                return q_val;
+            }
+
+            let mut terms = Vec::with_capacity(q_desc.term_count);
+            for t_idx in 0..q_desc.term_count {
+                // SAFETY: `q_desc.validate()` verified `!q_desc.terms.is_null()` when `term_count > 0`.
+                let term: BamTermDesc =
+                    unsafe { core::ptr::read_unaligned(q_desc.terms.add(t_idx)) };
+                terms.push(term);
+            }
+            query_specs.push(BamQuerySpecOwned {
+                flags: q_desc.flags,
+                terms,
             });
         }
     }
 
-    if let Err(init_err) = validate_registry_independent_groups(core::slice::from_ref(&query_descs))
+    if let Err((status, msg)) =
+        validate_system_queries_against_snapshot(ctx.registry.snapshot(), &query_specs)
     {
-        return init_err.to_ffi_result();
+        ctx.host_ctx.set_last_error(msg);
+        return status;
     }
 
-    let mut system = DynamicCSystem::new(
-        sys_name,
-        query_descs,
-        desc.callback,
-        desc.user_data,
-        Arc::clone(&init_ctx.registry),
-    )
-    .with_schedule(schedule)
-    .with_ordering(after, before)
-    .with_run_if(run_if)
-    .with_is_active(Arc::clone(&init_ctx.is_active));
-    if let Some(mod_id) = init_ctx.mod_id {
-        system.set_mod_id(mod_id);
-    }
-    init_ctx.registered_systems.push(system);
-
-    FfiResult::OK
-}
-
-/// C-ABI implementation of `register_system`.
-///
-/// # Safety
-/// `host_context` must point to the active [`ModInitContext`] on the calling thread, and
-/// `descriptor` must point to a valid [`SystemDescriptor`], [`ScheduledSystemDescriptor`], or
-/// [`ConditionalSystemDescriptor`].
-pub unsafe extern "C" fn host_register_system(
-    host_context: *mut c_void,
-    descriptor: *const SystemDescriptor,
-) -> FfiResult {
-    // SAFETY: Delegating through `validate_active_init_context` and `read_descriptor`.
-    unsafe { register_system_from_extensible_ptr(host_context, descriptor.cast::<c_void>(), None) }
-}
-
-/// C-ABI implementation of `register_scheduled_system`.
-///
-/// # Safety
-/// `host_context` must point to the active [`ModInitContext`] on the calling thread, and
-/// `descriptor` must point to a valid [`ScheduledSystemDescriptor`] or [`ConditionalSystemDescriptor`].
-pub unsafe extern "C" fn host_register_scheduled_system(
-    host_context: *mut c_void,
-    descriptor: *const ScheduledSystemDescriptor,
-) -> FfiResult {
-    // SAFETY: Delegating through `validate_active_init_context` and `read_descriptor`.
-    unsafe { register_system_from_extensible_ptr(host_context, descriptor.cast::<c_void>(), None) }
-}
-
-/// C-ABI implementation of `register_conditional_system`.
-///
-/// # Safety
-/// `host_context` must point to the active [`ModInitContext`] on the calling thread, and
-/// `descriptor` must point to a valid [`ConditionalSystemDescriptor`].
-pub unsafe extern "C" fn host_register_conditional_system(
-    host_context: *mut c_void,
-    descriptor: *const ConditionalSystemDescriptor,
-) -> FfiResult {
-    // SAFETY: Delegating through `validate_active_init_context` and `read_descriptor`.
-    unsafe { register_system_from_extensible_ptr(host_context, descriptor.cast::<c_void>(), None) }
-}
-
-/// C-ABI symbol `register_system_in_schedule` targeting a specific [`ModSchedule`].
-///
-/// # Safety
-/// `host_context` must point to the active [`ModInitContext`] on the calling thread, and
-/// `descriptor` must point to a valid [`SystemDescriptor`].
-pub unsafe extern "C" fn host_register_system_in_schedule(
-    host_context: *mut c_void,
-    descriptor: *const SystemDescriptor,
-    schedule_raw: u32,
-) -> FfiResult {
-    if host_context.is_null() || descriptor.is_null() {
-        return FfiResult::NULL_POINTER;
-    }
-    // SAFETY: Verifies active context before inspecting `schedule_raw`.
-    if let Err(err) = unsafe { validate_active_init_context(host_context) } {
-        return err;
-    }
-    let Some(schedule) = ModSchedule::from_raw(schedule_raw) else {
-        return FfiResult::INVALID_ARGUMENT;
-    };
-    // SAFETY: Delegating through `validate_active_init_context` and `read_descriptor`.
-    unsafe {
-        register_system_from_extensible_ptr(
-            host_context,
-            descriptor.cast::<c_void>(),
-            Some(schedule),
-        )
-    }
-}
-
-unsafe fn register_multi_query_from_extensible_ptr(
-    host_context: *mut c_void,
-    descriptor_ptr: *const c_void,
-) -> FfiResult {
-    if host_context.is_null() || descriptor_ptr.is_null() {
-        return FfiResult::NULL_POINTER;
-    }
-
-    // SAFETY: Verifies active pointer identity, magic, and generation before any dereference.
-    let init_ctx = match unsafe { validate_active_init_context(host_context) } {
-        Ok(ctx) => ctx,
-        Err(err) => return err,
-    };
-
-    // SAFETY: Safely reads `ConditionalMultiQuerySystemDescriptor` via `struct_size`.
-    let cond_desc =
-        match unsafe { read_descriptor::<ConditionalMultiQuerySystemDescriptor>(descriptor_ptr) } {
-            Ok(d) => d,
-            Err(err) => return err,
-        };
-    let sched_desc = cond_desc.sched;
-
-    if (sched_desc.flags & !ScheduledMultiQuerySystemDescriptor::KNOWN_FLAGS) != 0 {
-        return FfiResult::UNSUPPORTED;
-    }
-
-    let Some(schedule) = ModSchedule::from_label_id(sched_desc.schedule) else {
-        return FfiResult::INVALID_VERSION;
-    };
-
-    // SAFETY: Zero-filled for v1 descriptors or caller-supplied pointer array for v2/v3 descriptors.
-    let after = match unsafe { parse_cstr_name_array(sched_desc.after, sched_desc.after_count) } {
+    // SAFETY: `desc.validate()` verified `after` and `before` non-null when their counts > 0.
+    let after_systems = match unsafe { parse_ordering_targets(desc.after, desc.after_count) } {
         Ok(v) => v,
-        Err(err) => return err,
+        Err((status, msg)) => {
+            ctx.host_ctx.set_last_error(msg);
+            return status;
+        }
     };
-    // SAFETY: Same contract for `sched_desc.before`.
-    let before = match unsafe { parse_cstr_name_array(sched_desc.before, sched_desc.before_count) }
-    {
+    // SAFETY: Same guarantee for `desc.before[0..desc.before_count]`.
+    let before_systems = match unsafe { parse_ordering_targets(desc.before, desc.before_count) } {
         Ok(v) => v,
-        Err(err) => return err,
+        Err((status, msg)) => {
+            ctx.host_ctx.set_last_error(msg);
+            return status;
+        }
     };
 
-    let desc = sched_desc.base;
-    let run_if = cond_desc.run_if.map(|cb| (cb, cond_desc.run_if_user_data));
+    let run_if = desc.run_if.map(|cb| (cb, desc.run_if_user_data));
 
-    if desc.query_spec_count == 0 || desc.query_spec_count > MAX_SYSTEM_QUERIES {
-        return FfiResult::OUT_OF_RANGE;
-    }
-    if desc.query_specs.is_null() {
-        return FfiResult::NULL_POINTER;
-    }
-
-    let sys_name = if !desc.name.is_null() {
-        // SAFETY: `desc.name` is non-null and points to a NUL-terminated C string.
-        unsafe { CStr::from_ptr(desc.name) }
-            .to_str()
-            .unwrap_or("unnamed_multi_query_guest_system")
-            .to_string()
-    } else {
-        "unnamed_multi_query_guest_system".to_string()
-    };
-
-    // SAFETY: `desc.query_specs` points to an array of `desc.query_spec_count` elements.
-    let specs_slice =
-        unsafe { core::slice::from_raw_parts(desc.query_specs, desc.query_spec_count) };
-    let mut parsed_specs = Vec::with_capacity(desc.query_spec_count);
-
-    for spec in specs_slice {
-        if spec.query_count > MAX_QUERY_COMPONENTS {
-            return FfiResult::OUT_OF_RANGE;
-        }
-        let mut query_descs = Vec::with_capacity(spec.query_count);
-        if spec.query_count > 0 {
-            if spec.queries.is_null() {
-                return FfiResult::NULL_POINTER;
-            }
-            // SAFETY: `spec.queries` points to an array of `spec.query_count` elements.
-            let queries_slice =
-                unsafe { core::slice::from_raw_parts(spec.queries, spec.query_count) };
-            for q in queries_slice {
-                if q.name.is_null() {
-                    return FfiResult::NULL_POINTER;
-                }
-                if !q.mode.is_valid() {
-                    return FfiResult::INVALID_ARGUMENT;
-                }
-                // SAFETY: `q.name` is non-null and points to a NUL-terminated C string.
-                let Ok(q_name) = (unsafe { CStr::from_ptr(q.name) }).to_str() else {
-                    return FfiResult::INVALID_UTF8;
-                };
-                query_descs.push(ComponentAccessDescOwned {
-                    name: q_name.to_string(),
-                    mode: q.mode,
-                });
-            }
-        }
-        parsed_specs.push(query_descs);
-    }
-
-    if let Err(init_err) = validate_registry_independent_groups(&parsed_specs) {
-        return init_err.to_ffi_result();
-    }
-
-    let mut system = DynamicCSystem::new_multi_query(
+    let mut sys = GuestSystem::new(
         sys_name,
-        parsed_specs,
-        desc.callback,
+        query_specs,
+        callback,
         desc.user_data,
-        Arc::clone(&init_ctx.registry),
+        ctx.registry.clone(),
     )
-    .with_schedule(schedule)
-    .with_ordering(after, before)
+    .with_schedule(desc.schedule)
+    .with_main_thread(desc.is_main_thread())
+    .with_ordering(after_systems, before_systems)
     .with_run_if(run_if)
-    .with_is_active(Arc::clone(&init_ctx.is_active));
-    if let Some(mod_id) = init_ctx.mod_id {
-        system.set_mod_id(mod_id);
-    }
-    init_ctx.registered_systems.push(system);
+    .with_is_active(Arc::clone(&ctx.is_active));
 
-    FfiResult::OK
-}
-
-/// C-ABI implementation of `register_multi_query_system`.
-///
-/// # Safety
-/// `host_context` must point to the active [`ModInitContext`] on the calling thread, and
-/// `descriptor` must point to a valid multi-query system descriptor.
-pub unsafe extern "C" fn host_register_multi_query_system(
-    host_context: *mut c_void,
-    descriptor: *const MultiQuerySystemDescriptor,
-) -> FfiResult {
-    // SAFETY: Delegating through `validate_active_init_context` and `read_descriptor`.
-    unsafe { register_multi_query_from_extensible_ptr(host_context, descriptor.cast::<c_void>()) }
-}
-
-/// C-ABI implementation of `register_conditional_multi_query_system`.
-///
-/// # Safety
-/// `host_context` must point to the active [`ModInitContext`] on the calling thread, and
-/// `descriptor` must point to a valid [`ConditionalMultiQuerySystemDescriptor`].
-pub unsafe extern "C" fn host_register_conditional_multi_query_system(
-    host_context: *mut c_void,
-    descriptor: *const ConditionalMultiQuerySystemDescriptor,
-) -> FfiResult {
-    // SAFETY: Delegating through `validate_active_init_context` and `read_descriptor`.
-    unsafe { register_multi_query_from_extensible_ptr(host_context, descriptor.cast::<c_void>()) }
-}
-
-/// C-ABI implementation of `register_component` for dynamically registering runtime components.
-///
-/// Validates active [`ModInitContext`] pointer, magic header, generation, non-null `World`,
-/// layout alignment/size invariants, and UUID/metadata collisions before registering the component.
-///
-/// # Safety
-/// - `host_context` must point to the active [`ModInitContext`] on the calling thread.
-/// - `descriptor` must point to a valid [`ModComponentDescriptor`].
-pub unsafe extern "C" fn host_register_component(
-    host_context: *mut c_void,
-    descriptor: *const ModComponentDescriptor,
-) -> FfiResult {
-    if host_context.is_null() || descriptor.is_null() {
-        return FfiResult::NULL_POINTER;
+    if let Some(id) = ctx.mod_id {
+        sys.set_mod_id(id);
     }
 
-    // SAFETY: Verifies active pointer identity, magic, and generation before any dereference.
-    let init_ctx = match unsafe { validate_active_init_context(host_context) } {
-        Ok(ctx) => ctx,
-        Err(err) => return err,
-    };
-
-    // SAFETY: Reads `struct_size` first and copies `min(struct_size, size_of::<ModComponentDescriptor>())`
-    // without forming `&ModComponentDescriptor` on truncated C buffers.
-    let desc =
-        match unsafe { read_descriptor::<ModComponentDescriptor>(descriptor.cast::<c_void>()) } {
-            Ok(d) => d,
-            Err(err) => return err,
-        };
-    if desc.name.is_null() {
-        return FfiResult::NULL_POINTER;
-    }
-    // SAFETY: `desc.name` is non-null and points to a NUL-terminated C string.
-    let Ok(name_str) = (unsafe { CStr::from_ptr(desc.name) }).to_str() else {
-        return FfiResult::INVALID_UTF8;
-    };
-    if desc.align == 0 || !desc.align.is_power_of_two() {
-        return FfiResult::INVALID_ARGUMENT;
-    }
-    if !desc.size.is_multiple_of(desc.align) {
-        return FfiResult::INVALID_ARGUMENT;
-    }
-    let Some(layout) = desc.layout() else {
-        return FfiResult::INVALID_ARGUMENT;
-    };
-
-    if init_ctx.world.is_null() {
-        return FfiResult::INVALID_STATE;
-    }
-    // SAFETY: `init_ctx.world` was constructed from an exclusive `&mut World` active during `init`.
-    let world = unsafe { &mut *init_ctx.world };
-    let world_id = world.id();
-    let owner = init_ctx.mod_id;
-
-    if init_ctx
-        .registry
-        .check_registration_collision(name_str, desc.uuid, desc.size, desc.align, false, None)
-        .is_err()
-    {
-        return FfiResult::INVALID_COMPONENT;
-    }
-    if let Some(world_reg) = world.get_resource::<ModRegistry>()
-        && world_reg
-            .check_registration_collision(name_str, desc.uuid, desc.size, desc.align, false, None)
-            .is_err()
-    {
-        return FfiResult::INVALID_COMPONENT;
-    }
-
-    if let Some(existing) = world
-        .get_resource::<ModRegistry>()
-        .and_then(|r| r.get_by_name(name_str))
-        .cloned()
-    {
-        if existing.size == desc.size
-            && existing.align == desc.align
-            && existing.uuid == desc.uuid
-            && !existing.is_resource
-        {
-            if existing.is_dynamic {
-                if let Some(drop_fn) = desc.drop_fn
-                    && allocate_drop_trampoline(
-                        world_id,
-                        desc.uuid,
-                        drop_fn,
-                        Arc::clone(&init_ctx.is_active),
-                    )
-                    .is_none()
-                {
-                    return FfiResult::CAPACITY_EXCEEDED;
-                }
-
-                if let Some(mut world_reg) = world.get_resource_mut::<ModRegistry>() {
-                    if world_reg
-                        .try_register_dynamic_component_owned(
-                            existing.component_id,
-                            &desc,
-                            name_str.to_string(),
-                            owner,
-                        )
-                        .is_err()
-                    {
-                        return FfiResult::INVALID_COMPONENT;
-                    }
-                    if let Some(updated) = world_reg.get_by_id(existing.component_id).cloned()
-                        && !init_ctx
-                            .registered_components
-                            .iter()
-                            .any(|c| c.component_id == existing.component_id)
-                    {
-                        init_ctx.registered_components.push(updated);
-                    }
-                }
-
-                let mut reg_clone = (*init_ctx.registry).clone();
-                if reg_clone
-                    .try_register_dynamic_component_owned(
-                        existing.component_id,
-                        &desc,
-                        name_str.to_string(),
-                        owner,
-                    )
-                    .is_err()
-                {
-                    return FfiResult::INVALID_COMPONENT;
-                }
-                init_ctx.registry = Arc::new(reg_clone);
-                crate::registry::symbols::CURRENT_REGISTRY.with(|cell| {
-                    *cell.borrow_mut() = Some(Arc::clone(&init_ctx.registry));
-                });
-            }
-            return FfiResult::OK;
-        }
-        return FfiResult::INVALID_COMPONENT;
-    }
-
-    let drop_trampoline = if let Some(drop_fn) = desc.drop_fn {
-        let Some(t) = allocate_drop_trampoline(
-            world_id,
-            desc.uuid,
-            drop_fn,
-            Arc::clone(&init_ctx.is_active),
-        ) else {
-            return FfiResult::CAPACITY_EXCEEDED;
-        };
-        Some(t)
-    } else {
-        None
-    };
-
-    let clone_behavior = if desc.drop_fn.is_some() {
-        ComponentCloneBehavior::Ignore
-    } else {
-        ComponentCloneBehavior::Default
-    };
-
-    // SAFETY: `layout` was verified above; `drop_trampoline` matches `OwningPtr` contract; `Table` storage is used.
-    let bevy_desc = unsafe {
-        ComponentDescriptor::new_with_layout(
-            name_str.to_string(),
-            StorageType::Table,
-            layout,
-            drop_trampoline,
-            true,
-            true,
-            clone_behavior,
-            None,
-        )
-    };
-    let comp_id = world.register_component_with_descriptor(bevy_desc);
-
-    if let Some(mut registry) = world.get_resource_mut::<ModRegistry>() {
-        if registry
-            .try_register_dynamic_component_owned(comp_id, &desc, name_str.to_string(), owner)
-            .is_err()
-        {
-            return FfiResult::INVALID_COMPONENT;
-        }
-        if let Some(reg_comp) = registry.get_by_id(comp_id) {
-            init_ctx.registered_components.push(reg_comp.clone());
-        }
-    }
-
-    let mut reg_clone = (*init_ctx.registry).clone();
-    if reg_clone
-        .try_register_dynamic_component_owned(comp_id, &desc, name_str.to_string(), owner)
-        .is_err()
-    {
-        return FfiResult::INVALID_COMPONENT;
-    }
-    init_ctx.registry = Arc::new(reg_clone);
-    crate::registry::symbols::CURRENT_REGISTRY.with(|cell| {
-        *cell.borrow_mut() = Some(Arc::clone(&init_ctx.registry));
-    });
-
+    ctx.registered_systems.push(sys);
     FfiResult::OK
 }

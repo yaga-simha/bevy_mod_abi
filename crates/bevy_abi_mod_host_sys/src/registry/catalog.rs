@@ -1,26 +1,29 @@
-//! Component, resource, VTable, and symbol catalog (`ModRegistry`).
+//! Copy-on-Write (`CoW`) component, resource, VTable, and `"bam.v0.*"` symbol catalog
+//! (`C-03..C-05`, `L-07`, `P-08`, `B-01`, `B-08`).
 
 use crate::loader::ModId;
 use crate::registry::collision::ComponentCollisionError;
-use crate::registry::symbols::{
-    CURRENT_REGISTRY, CurrentRegistryGuard, GLOBAL_SYMBOLS, SymbolEntry,
-};
 use crate::sync_ptr::SymbolAddress;
+use arc_swap::ArcSwap;
 use bevy_abi_mod_sys::{
-    ComponentDropFn, ComponentUuid, ExposableComponent, ModComponentDescriptor,
+    BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_IMMUTABLE,
+    BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET, BamComponent, ComponentDesc,
+    ComponentDropFn, ComponentUuid, ModComponent, RawInsertable,
 };
 use bevy_ecs::component::ComponentId;
 use bevy_ecs::entity::Entity;
 use bevy_ecs::prelude::{Component, Resource};
 use bevy_ecs::world::World;
+use bevy_platform::collections::HashMap;
 use core::ffi::c_void;
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use core::marker::PhantomData;
+use core::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Function signature for monomorphized raw component byte insertion into a Bevy [`World`].
 ///
-/// Takes a raw `*const u8` pointer (backed by `MaybeUninit<u8>` storage) rather than `&[u8]`
-/// so uninitialized struct padding bytes never form a Rust `[u8]` slice.
+/// Takes a raw `*const u8` pointer (backed by `MaybeUninit<u8>` arena storage) rather than `&[u8]`
+/// so uninitialized struct padding bytes never form a Rust `[u8]` slice (`S-04`).
 pub type InsertRawFn = unsafe fn(world: &mut World, entity: Entity, data: *const u8);
 
 /// Function signature for monomorphized `Default` component insertion into a Bevy [`World`].
@@ -31,7 +34,7 @@ pub type InsertDefaultFn = fn(world: &mut World, entity: Entity);
 /// # Safety
 /// Caller must ensure `T` has no drop glue or heap pointers and `data` points to `size_of::<T>()`
 /// readable bytes representing a valid bit-pattern for `T` (padding bytes may be uninitialized).
-unsafe fn insert_raw_impl<T: Component + ExposableComponent>(
+unsafe fn insert_raw_impl<T: Component + ModComponent>(
     world: &mut World,
     entity: Entity,
     data: *const u8,
@@ -39,13 +42,12 @@ unsafe fn insert_raw_impl<T: Component + ExposableComponent>(
     if core::mem::size_of::<T>() > 0 && data.is_null() {
         return;
     }
-    // SAFETY: Caller guarantees `data` points to `size_of::<T>()` bytes valid for `T` (or ZST).
-    // `read_unaligned` copies `T` directly without forming `&[u8]` over padding bytes.
     let comp: T = if core::mem::size_of::<T>() == 0 {
         // SAFETY: `T` is zero-sized and `T::IS_RAW_INSERTABLE && !needs_drop::<T>()` holds.
         unsafe { core::mem::MaybeUninit::<T>::zeroed().assume_init() }
     } else {
-        // SAFETY: `data` is non-null and holds `size_of::<T>()` bytes for `T`.
+        // SAFETY: `data` is non-null and holds `size_of::<T>()` bytes for `T`; `read_unaligned`
+        // copies `T` directly without forming `&[u8]` over padding bytes.
         unsafe { core::ptr::read_unaligned(data.cast::<T>()) }
     };
     if let Ok(mut e) = world.get_entity_mut(entity) {
@@ -60,238 +62,376 @@ fn insert_default_impl<T: Component + Default>(world: &mut World, entity: Entity
     }
 }
 
-/// Catalog record stored for each component or resource registered with [`ModRegistry`].
-#[derive(Clone)]
+/// Fluent registration options configuring how a host Rust [`Component`] is exposed to guest mods
+/// (`B-01`, ADR 0006).
+///
+/// By default (`ComponentOptions::default()`), raw byte insertion (`cmd_insert` / `cmd_spawn`) is
+/// enabled automatically when `T::IS_RAW_INSERTABLE && !needs_drop::<T>()`, and disabled otherwise.
+/// Call [`.opaque()`](Self::opaque) to force VTable-only access even for `RawInsertable` types, or
+/// [`.with_default()`](Self::with_default) to expose host-constructed `T::default()` via `cmd_insert_default`.
+pub struct ComponentOptions<T> {
+    allow_raw_insert: bool,
+    insert_default_fn: Option<InsertDefaultFn>,
+    extra_storage_flags: u32,
+    _marker: PhantomData<fn() -> T>,
+}
+
+impl<T> Clone for ComponentOptions<T> {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for ComponentOptions<T> {}
+
+impl<T> core::fmt::Debug for ComponentOptions<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ComponentOptions")
+            .field("allow_raw_insert", &self.allow_raw_insert)
+            .field("has_default", &self.insert_default_fn.is_some())
+            .field("extra_storage_flags", &self.extra_storage_flags)
+            .finish()
+    }
+}
+
+impl<T: Component + ModComponent> Default for ComponentOptions<T> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Component + ModComponent> ComponentOptions<T> {
+    /// Creates default options for `T`, automatically enabling raw byte insertion iff
+    /// `T::IS_RAW_INSERTABLE && !core::mem::needs_drop::<T>()`.
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            allow_raw_insert: T::IS_RAW_INSERTABLE && !core::mem::needs_drop::<T>(),
+            insert_default_fn: None,
+            extra_storage_flags: component_flags_to_storage_flags(T::COMPONENT_FLAGS),
+            _marker: PhantomData,
+        }
+    }
+
+    /// Disables raw byte insertion (`cmd_insert` and `cmd_spawn` will return
+    /// [`bevy_abi_mod_sys::FfiResult::PERMISSION_DENIED`]), restricting guest mutations to VTable
+    /// methods or [`Self::with_default`].
+    #[inline]
+    pub const fn opaque(mut self) -> Self {
+        self.allow_raw_insert = false;
+        self
+    }
+
+    /// Explicitly enables raw byte insertion for `T: RawInsertable`.
+    #[inline]
+    pub const fn with_raw_insert(mut self) -> Self
+    where
+        T: RawInsertable,
+    {
+        self.allow_raw_insert = !core::mem::needs_drop::<T>();
+        self
+    }
+
+    /// Exposes host-side `T::default()` construction for `cmd_insert_default`.
+    #[inline]
+    pub fn with_default(mut self) -> Self
+    where
+        T: Default,
+    {
+        self.insert_default_fn = Some(insert_default_impl::<T>);
+        self
+    }
+
+    /// Marks this component registration as immutable (`BAM_STORAGE_FLAG_IMMUTABLE`), rejecting
+    /// guest `WRITE` and `OPTIONAL_WRITE` query access with `PERMISSION_DENIED`.
+    #[inline]
+    pub const fn immutable(mut self) -> Self {
+        self.extra_storage_flags |= BAM_STORAGE_FLAG_IMMUTABLE;
+        self
+    }
+
+    /// Marks this component registration as sparse-set stored (`BAM_STORAGE_FLAG_SPARSE_SET`).
+    #[inline]
+    pub const fn sparse_set(mut self) -> Self {
+        self.extra_storage_flags |= BAM_STORAGE_FLAG_SPARSE_SET;
+        self
+    }
+
+    /// Returns additional `BAM_STORAGE_FLAG_*` bits configured on these options.
+    #[inline]
+    pub const fn extra_storage_flags(&self) -> u32 {
+        self.extra_storage_flags
+    }
+}
+
+#[inline]
+pub(crate) const fn component_flags_to_storage_flags(component_flags: u32) -> u32 {
+    let mut out = 0u32;
+    if (component_flags & BAM_COMPONENT_FLAG_SPARSE_SET) != 0 {
+        out |= BAM_STORAGE_FLAG_SPARSE_SET;
+    }
+    if (component_flags & BAM_COMPONENT_FLAG_IMMUTABLE) != 0 {
+        out |= BAM_STORAGE_FLAG_IMMUTABLE;
+    }
+    out
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SymbolRecord {
+    addr: SymbolAddress,
+    owner: Option<ModId>,
+}
+
+/// Catalog record stored for each component or singleton resource in [`RegistrySnapshot`].
+#[derive(Clone, Debug)]
 pub struct RegisteredComponent {
-    /// Canonical component or resource name (e.g. `"Position"` or `"WindConfig"`).
-    pub name: String,
-    /// Deterministic 128-bit compile-time UUID.
+    /// 1-based [`BamComponent`] handle (`index == (handle.0 - 1) as usize`).
+    pub handle: BamComponent,
+    /// Canonical namespaced component or resource name (e.g. `"my_game::Position"`).
+    pub name: Arc<str>,
+    /// Deterministic 128-bit UUID.
     pub uuid: ComponentUuid,
     /// Runtime Bevy [`ComponentId`].
     pub component_id: ComponentId,
-    /// Byte size of the type.
+    /// Byte size (`size_of::<T>()`).
     pub size: usize,
-    /// Memory alignment of the type.
+    /// Byte alignment (`align_of::<T>()`).
     pub align: usize,
-    /// Address of the C-ABI VTable (null if none or cleared on guest unload).
-    pub vtable_ptr: SymbolAddress,
-    /// Function pointer for deferred raw byte insertion (`None` for dynamic, resource, or non-POD types).
-    pub insert_raw_fn: Option<InsertRawFn>,
-    /// Optional host-side `T::default()` constructor for deferred `cmd_insert_default`.
-    pub insert_default_fn: Option<InsertDefaultFn>,
-    /// Optional foreign lifecycle drop callback (cleared on guest unload).
-    pub drop_fn: Option<ComponentDropFn>,
-    /// Indicates whether this component was registered dynamically at runtime.
+    /// Bitmask of `BAM_STORAGE_FLAG_*` (`SPARSE_SET`, `IMMUTABLE`, `RESOURCE`).
+    pub storage_flags: u32,
+    /// Whether this type satisfies cross-language `AbiPod`.
+    pub is_abi_pod: bool,
+    /// Whether this component was registered dynamically by a guest mod at runtime.
     pub is_dynamic: bool,
-    /// Indicates whether this entry represents a singleton Bevy `Resource` rather than an entity `Component`.
-    pub is_resource: bool,
-    /// Optional [`ModId`] owning a guest-registered dynamic component's VTable and drop callback.
+    /// Address of the C-ABI VTable (`SymbolAddress::NULL` if none or evicted on unload).
+    pub vtable_ptr: SymbolAddress,
+    /// Monomorphized raw byte inserter (`None` for dynamic, opaque, or resource entries).
+    pub insert_raw_fn: Option<InsertRawFn>,
+    /// Optional host-side `T::default()` constructor for `cmd_insert_default`.
+    pub insert_default_fn: Option<InsertDefaultFn>,
+    /// Optional foreign drop callback (cleared on guest unload).
+    pub drop_fn: Option<ComponentDropFn>,
+    /// Optional drop trampoline slot index assigned in [`crate::WorldDropGuard`].
+    pub drop_slot: Option<usize>,
+    /// Optional [`ModId`] owning a dynamic component's VTable and drop callback.
     pub owner: Option<ModId>,
 }
 
-/// Central registry mapping exposed components, VTables, and symbol addresses.
+impl RegisteredComponent {
+    /// Returns `true` if this entry represents a singleton Bevy `Resource`.
+    #[inline]
+    pub const fn is_resource(&self) -> bool {
+        (self.storage_flags & BAM_STORAGE_FLAG_RESOURCE) != 0
+    }
+
+    /// Returns `true` if this entry uses `StorageType::SparseSet`.
+    #[inline]
+    pub const fn is_sparse_set(&self) -> bool {
+        (self.storage_flags & BAM_STORAGE_FLAG_SPARSE_SET) != 0
+    }
+
+    /// Returns `true` if mutable guest access (`WRITE`, `OPTIONAL_WRITE`, `RESOURCE_WRITE`) is forbidden.
+    #[inline]
+    pub const fn is_immutable(&self) -> bool {
+        (self.storage_flags & BAM_STORAGE_FLAG_IMMUTABLE) != 0
+    }
+}
+
+/// Immutable dense snapshot shared via `Arc` across `ModRegistry`, `HostContext`, and `GuestSystem`
+/// (`L-07`, `P-08`).
+#[derive(Clone, Default)]
+pub struct RegistrySnapshot {
+    entries: Vec<RegisteredComponent>,
+    by_name: HashMap<Arc<str>, BamComponent>,
+    by_uuid: HashMap<ComponentUuid, BamComponent>,
+    by_component_id: HashMap<ComponentId, BamComponent>,
+    symbols: HashMap<Arc<str>, SymbolRecord>,
+}
+
+impl RegistrySnapshot {
+    /// Looks up a component or resource in `O(1)` by its 1-based [`BamComponent`] handle (`C-05`).
+    #[inline]
+    pub fn get_by_handle(&self, handle: BamComponent) -> Option<&RegisteredComponent> {
+        let idx = handle.0.checked_sub(1)? as usize;
+        self.entries.get(idx)
+    }
+
+    /// Looks up a component or resource by its runtime Bevy [`ComponentId`].
+    #[inline]
+    pub fn get_by_id(&self, id: ComponentId) -> Option<&RegisteredComponent> {
+        let &handle = self.by_component_id.get(&id)?;
+        self.get_by_handle(handle)
+    }
+
+    /// Looks up a component or resource by canonical string name.
+    #[inline]
+    pub fn get_by_name(&self, name: &str) -> Option<&RegisteredComponent> {
+        let &handle = self.by_name.get(name)?;
+        self.get_by_handle(handle)
+    }
+
+    /// Looks up a component or resource by 128-bit [`ComponentUuid`].
+    #[inline]
+    pub fn get_by_uuid(&self, uuid: &ComponentUuid) -> Option<&RegisteredComponent> {
+        let &handle = self.by_uuid.get(uuid)?;
+        self.get_by_handle(handle)
+    }
+
+    /// Resolves a `"bam.v0.*"` symbol or VTable address in this snapshot (`C-04`).
+    #[inline]
+    pub fn resolve_symbol(&self, name: &str) -> Option<*const c_void> {
+        if !name.starts_with("bam.v0.") {
+            return None;
+        }
+        let rec = self.symbols.get(name)?;
+        if rec.addr.is_null() {
+            None
+        } else {
+            Some(rec.addr.as_ptr())
+        }
+    }
+
+    /// Returns the total number of registered components and resources.
+    #[inline]
+    pub fn component_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns the total number of registered `"bam.v0.*"` symbols in this snapshot.
+    #[inline]
+    pub fn symbol_count(&self) -> usize {
+        self.symbols.len()
+    }
+
+    /// Returns the dense slice of all registered component/resource entries.
+    #[inline]
+    pub fn entries(&self) -> &[RegisteredComponent] {
+        &self.entries
+    }
+}
+
+struct RegistryTracker {
+    latest: ArcSwap<RegistrySnapshot>,
+    generation: AtomicU64,
+}
+
+/// World-scoped Copy-on-Write (`CoW`) component, resource, and `"bam.v0.*"` symbol registry (`L-07`).
+///
+/// Cloning `ModRegistry` is an `O(1)` `Arc` bump. Mutations run on cold setup/load/unload paths via
+/// `Arc::make_mut` and increment `generation` so `GuestSystem`s refresh their cached snapshot only
+/// when the registry actually changes.
 #[derive(Resource, Clone)]
 pub struct ModRegistry {
-    components_by_id: HashMap<ComponentId, RegisteredComponent>,
-    components_by_name: HashMap<String, ComponentId>,
-    components_by_uuid: HashMap<[u8; 16], ComponentId>,
-    symbols: HashMap<String, SymbolEntry>,
-    revoked_owners: Arc<RwLock<HashSet<ModId>>>,
+    snapshot: Arc<RegistrySnapshot>,
+    generation: u64,
+    tracker: Arc<RegistryTracker>,
 }
 
 impl Default for ModRegistry {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl ModRegistry {
-    /// Creates a new mod registry pre-populated with built-in engine bridge symbols.
+    /// Creates an empty [`ModRegistry`] with **zero** built-in function symbols (`C-03`).
+    #[inline]
     pub fn new() -> Self {
-        let mut reg = Self {
-            components_by_id: HashMap::new(),
-            components_by_name: HashMap::new(),
-            components_by_uuid: HashMap::new(),
-            symbols: HashMap::new(),
-            revoked_owners: Arc::new(RwLock::new(HashSet::new())),
-        };
-        let builtins: &[(&str, *const c_void)] = &[
-            (
-                "cmd_spawn_empty",
-                crate::ffi::commands::host_cmd_spawn_empty as *const c_void,
-            ),
-            (
-                "host_cmd_spawn_empty",
-                crate::ffi::commands::host_cmd_spawn_empty as *const c_void,
-            ),
-            (
-                "cmd_despawn",
-                crate::ffi::commands::host_cmd_despawn as *const c_void,
-            ),
-            (
-                "host_cmd_despawn",
-                crate::ffi::commands::host_cmd_despawn as *const c_void,
-            ),
-            (
-                "cmd_insert_component",
-                crate::ffi::commands::host_cmd_insert_component as *const c_void,
-            ),
-            (
-                "host_cmd_insert_component",
-                crate::ffi::commands::host_cmd_insert_component as *const c_void,
-            ),
-            (
-                "cmd_remove_component",
-                crate::ffi::commands::host_cmd_remove_component as *const c_void,
-            ),
-            (
-                "host_cmd_remove_component",
-                crate::ffi::commands::host_cmd_remove_component as *const c_void,
-            ),
-            (
-                "cmd_insert_default",
-                crate::ffi::commands::host_cmd_insert_default as *const c_void,
-            ),
-            (
-                "host_cmd_insert_default",
-                crate::ffi::commands::host_cmd_insert_default as *const c_void,
-            ),
-            (
-                "iter_reset",
-                crate::ffi::iter::host_iter_reset as *const c_void,
-            ),
-            (
-                "host_iter_reset",
-                crate::ffi::iter::host_iter_reset as *const c_void,
-            ),
-            (
-                "res_readonly",
-                crate::ffi::iter::host_iter_resource_readonly as *const c_void,
-            ),
-            (
-                "host_res_readonly",
-                crate::ffi::iter::host_iter_resource_readonly as *const c_void,
-            ),
-            (
-                "iter_resource_readonly",
-                crate::ffi::iter::host_iter_resource_readonly as *const c_void,
-            ),
-            (
-                "host_iter_resource_readonly",
-                crate::ffi::iter::host_iter_resource_readonly as *const c_void,
-            ),
-            (
-                "res_mutable",
-                crate::ffi::iter::host_iter_resource_mutable as *const c_void,
-            ),
-            (
-                "host_res_mutable",
-                crate::ffi::iter::host_iter_resource_mutable as *const c_void,
-            ),
-            (
-                "iter_resource_mutable",
-                crate::ffi::iter::host_iter_resource_mutable as *const c_void,
-            ),
-            (
-                "host_iter_resource_mutable",
-                crate::ffi::iter::host_iter_resource_mutable as *const c_void,
-            ),
-            (
-                "register_multi_query_system",
-                crate::ffi::register::host_register_multi_query_system as *const c_void,
-            ),
-            (
-                "host_register_multi_query_system",
-                crate::ffi::register::host_register_multi_query_system as *const c_void,
-            ),
-            (
-                "register_conditional_multi_query_system",
-                crate::ffi::register::host_register_conditional_multi_query_system as *const c_void,
-            ),
-            (
-                "host_register_conditional_multi_query_system",
-                crate::ffi::register::host_register_conditional_multi_query_system as *const c_void,
-            ),
-            (
-                "register_system_in_schedule",
-                crate::ffi::register::host_register_system_in_schedule as *const c_void,
-            ),
-            (
-                "host_register_system_in_schedule",
-                crate::ffi::register::host_register_system_in_schedule as *const c_void,
-            ),
-            (
-                "register_scheduled_system",
-                crate::ffi::register::host_register_scheduled_system as *const c_void,
-            ),
-            (
-                "host_register_scheduled_system",
-                crate::ffi::register::host_register_scheduled_system as *const c_void,
-            ),
-            (
-                "register_conditional_system",
-                crate::ffi::register::host_register_conditional_system as *const c_void,
-            ),
-            (
-                "host_register_conditional_system",
-                crate::ffi::register::host_register_conditional_system as *const c_void,
-            ),
-            (
-                "register_component",
-                crate::ffi::register::host_register_component as *const c_void,
-            ),
-            (
-                "host_register_component",
-                crate::ffi::register::host_register_component as *const c_void,
-            ),
-        ];
-        for &(name, ptr) in builtins {
-            reg.insert_symbol(name, ptr);
+        let initial = Arc::new(RegistrySnapshot::default());
+        let tracker = Arc::new(RegistryTracker {
+            latest: ArcSwap::from(Arc::clone(&initial)),
+            generation: AtomicU64::new(1),
+        });
+        Self {
+            snapshot: initial,
+            generation: 1,
+            tracker,
         }
-        reg
     }
 
-    /// Binds this registry as the thread-local active registry, returning an RAII restoration guard.
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn make_current(self: &Arc<Self>) -> CurrentRegistryGuard {
-        self.make_current_internal()
+    /// Returns the current monotonic mutation generation of this registry (`>= 1`).
+    #[inline]
+    pub const fn generation(&self) -> u64 {
+        self.generation
     }
 
-    /// Internal thread-local registry binder used during mod load and system execution.
-    pub(crate) fn make_current_internal(self: &Arc<Self>) -> CurrentRegistryGuard {
-        let prev = CURRENT_REGISTRY.with(|cell| cell.borrow_mut().replace(Arc::clone(self)));
-        CurrentRegistryGuard { prev }
+    /// Reads the latest published generation across this registry's shared `World` lineage (`O(1)`).
+    #[inline]
+    pub fn latest_generation(&self) -> u64 {
+        self.tracker.generation.load(Ordering::Acquire)
     }
 
-    /// Validates that registering `(name, uuid, size, align, is_resource, expected_comp_id)` does
-    /// not collide with an incompatible existing component or resource entry.
+    /// Loads the latest published `Arc<RegistrySnapshot>` across this registry's `World` lineage.
+    #[inline]
+    pub fn latest_snapshot_arc(&self) -> Arc<RegistrySnapshot> {
+        self.tracker.latest.load_full()
+    }
+
+    /// Borrows the current [`RegistrySnapshot`].
+    #[inline]
+    pub fn snapshot(&self) -> &RegistrySnapshot {
+        &self.snapshot
+    }
+
+    /// Clones the `Arc<RegistrySnapshot>` handle in `O(1)`.
+    #[inline]
+    pub fn snapshot_arc(&self) -> Arc<RegistrySnapshot> {
+        Arc::clone(&self.snapshot)
+    }
+
+    /// Restores a previously captured `Arc<RegistrySnapshot>` (used by transactional load rollback)
+    /// and advances `generation`.
+    pub(crate) fn restore_snapshot(&mut self, snapshot: Arc<RegistrySnapshot>) {
+        self.snapshot = Arc::clone(&snapshot);
+        let next_gen = self
+            .tracker
+            .generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        self.generation = next_gen;
+        self.tracker.latest.store(snapshot);
+    }
+
+    #[inline]
+    fn publish_after_mutation(&mut self) {
+        self.tracker.latest.store(Arc::clone(&self.snapshot));
+        let next_gen = self
+            .tracker
+            .generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        self.generation = next_gen;
+    }
+
+    /// Validates that registering `(name, uuid, size, align, storage_flags, expected_comp_id)` does
+    /// not collide with an incompatible existing component or resource entry (`C-10`).
     pub fn check_registration_collision(
         &self,
         name: &str,
         uuid: ComponentUuid,
         size: usize,
         align: usize,
-        is_resource: bool,
+        storage_flags: u32,
         expected_comp_id: Option<ComponentId>,
     ) -> Result<(), ComponentCollisionError> {
-        if let Some(existing_by_uuid) = self.get_by_uuid(&uuid)
-            && existing_by_uuid.name != name
+        if let Some(existing_by_uuid) = self.snapshot.get_by_uuid(&uuid)
+            && existing_by_uuid.name.as_ref() != name
         {
             return Err(ComponentCollisionError::UuidCollision {
-                existing_name: existing_by_uuid.name.clone(),
+                existing_name: existing_by_uuid.name.to_string(),
                 new_name: name.to_string(),
                 uuid,
             });
         }
 
-        if let Some(existing) = self.get_by_name(name) {
+        if let Some(existing) = self.snapshot.get_by_name(name) {
             if existing.uuid != uuid {
                 return Err(ComponentCollisionError::MetadataMismatch {
                     name: name.to_string(),
-                    reason: format!(
-                        "UUID mismatch (existing={:?}, new={:?})",
-                        existing.uuid.bytes, uuid.bytes
-                    ),
+                    reason: format!("UUID mismatch (existing={:?}, new={uuid:?})", existing.uuid),
                 });
             }
             if existing.size != size || existing.align != align {
@@ -303,12 +443,12 @@ impl ModRegistry {
                     ),
                 });
             }
-            if existing.is_resource != is_resource {
+            if existing.storage_flags != storage_flags {
                 return Err(ComponentCollisionError::MetadataMismatch {
                     name: name.to_string(),
                     reason: format!(
-                        "kind mismatch (existing is_resource={}, new is_resource={})",
-                        existing.is_resource, is_resource
+                        "storage_flags mismatch (existing=0x{:x}, new=0x{:x})",
+                        existing.storage_flags, storage_flags
                     ),
                 });
             }
@@ -328,401 +468,327 @@ impl ModRegistry {
         Ok(())
     }
 
-    /// Registers an exposable component type with its Bevy [`ComponentId`].
-    pub fn register_component<T: Component + ExposableComponent>(&mut self, comp_id: ComponentId) {
-        if let Err(err) = self.try_register_component::<T>(comp_id) {
-            panic!("ModRegistry::register_component failed: {err}");
-        }
-    }
-
-    /// Fallible variant of [`ModRegistry::register_component`].
-    pub fn try_register_component<T: Component + ExposableComponent>(
+    /// Registers a host [`Component`] implementing [`ModComponent`] with [`ComponentOptions`],
+    /// returning its 1-based [`BamComponent`] handle (`B-01`, `C-05`).
+    pub fn register_component<T: Component + ModComponent>(
         &mut self,
         comp_id: ComponentId,
-    ) -> Result<(), ComponentCollisionError> {
-        let allow_raw_insert = T::IS_RAW_INSERTABLE && !core::mem::needs_drop::<T>();
-        self.try_register_entry::<T>(comp_id, allow_raw_insert, None, false)
+        options: ComponentOptions<T>,
+    ) -> Result<BamComponent, ComponentCollisionError> {
+        self.register_component_with_world_flags::<T>(comp_id, options, 0)
     }
 
-    /// Registers an exposable component type along with its host-side [`Default`] constructor.
-    pub fn register_component_with_default<T: Component + ExposableComponent + Default>(
+    /// Internal helper merging Bevy's `ComponentInfo` storage/mutability flags (`SPARSE_SET`, `IMMUTABLE`)
+    /// with `ComponentOptions<T>`.
+    pub fn register_component_with_world_flags<T: Component + ModComponent>(
         &mut self,
         comp_id: ComponentId,
-    ) {
-        if let Err(err) = self.try_register_component_with_default::<T>(comp_id) {
-            panic!("ModRegistry::register_component_with_default failed: {err}");
-        }
-    }
-
-    /// Fallible variant of [`ModRegistry::register_component_with_default`].
-    pub fn try_register_component_with_default<T: Component + ExposableComponent + Default>(
-        &mut self,
-        comp_id: ComponentId,
-    ) -> Result<(), ComponentCollisionError> {
-        let allow_raw_insert = T::IS_RAW_INSERTABLE && !core::mem::needs_drop::<T>();
-        self.try_register_entry::<T>(
-            comp_id,
-            allow_raw_insert,
-            Some(insert_default_impl::<T>),
-            false,
-        )
-    }
-
-    /// Registers an exposable component type as VTable-only (disallowing raw byte insertion).
-    pub fn register_component_opaque<T: Component + ExposableComponent>(
-        &mut self,
-        comp_id: ComponentId,
-    ) {
-        if let Err(err) = self.try_register_component_opaque::<T>(comp_id) {
-            panic!("ModRegistry::register_component_opaque failed: {err}");
-        }
-    }
-
-    /// Fallible variant of [`ModRegistry::register_component_opaque`].
-    pub fn try_register_component_opaque<T: Component + ExposableComponent>(
-        &mut self,
-        comp_id: ComponentId,
-    ) -> Result<(), ComponentCollisionError> {
-        self.try_register_entry::<T>(comp_id, false, None, false)
-    }
-
-    /// Registers an exposable VTable-only component type along with its host-side [`Default`] constructor.
-    pub fn register_component_opaque_with_default<T: Component + ExposableComponent + Default>(
-        &mut self,
-        comp_id: ComponentId,
-    ) {
-        if let Err(err) = self.try_register_component_opaque_with_default::<T>(comp_id) {
-            panic!("ModRegistry::register_component_opaque_with_default failed: {err}");
-        }
-    }
-
-    /// Fallible variant of [`ModRegistry::register_component_opaque_with_default`].
-    pub fn try_register_component_opaque_with_default<
-        T: Component + ExposableComponent + Default,
-    >(
-        &mut self,
-        comp_id: ComponentId,
-    ) -> Result<(), ComponentCollisionError> {
-        self.try_register_entry::<T>(comp_id, false, Some(insert_default_impl::<T>), false)
-    }
-
-    /// Registers a Bevy singleton [`Resource`] type with its [`ComponentId`].
-    pub fn register_resource<R: Resource + ExposableComponent>(&mut self, comp_id: ComponentId) {
-        if let Err(err) = self.try_register_resource::<R>(comp_id) {
-            panic!("ModRegistry::register_resource failed: {err}");
-        }
-    }
-
-    /// Fallible variant of [`ModRegistry::register_resource`].
-    pub fn try_register_resource<R: Resource + ExposableComponent>(
-        &mut self,
-        comp_id: ComponentId,
-    ) -> Result<(), ComponentCollisionError> {
-        self.try_register_entry::<R>(comp_id, false, None, true)
-    }
-
-    fn try_register_entry<T: Component + ExposableComponent>(
-        &mut self,
-        comp_id: ComponentId,
-        allow_raw_insert: bool,
-        insert_default_fn: Option<InsertDefaultFn>,
-        is_resource: bool,
-    ) -> Result<(), ComponentCollisionError> {
-        let name = T::COMPONENT_NAME.to_string();
-        let uuid = T::UUID;
-        self.check_registration_collision(
-            &name,
-            uuid,
-            T::size(),
-            T::align(),
-            is_resource,
-            Some(comp_id),
-        )?;
-
-        let sym_addr = SymbolAddress::new(T::erased_vtable_ptr());
+        options: ComponentOptions<T>,
+        inferred_storage_flags: u32,
+    ) -> Result<BamComponent, ComponentCollisionError> {
+        let storage_flags = (options.extra_storage_flags
+            | inferred_storage_flags
+            | component_flags_to_storage_flags(T::COMPONENT_FLAGS))
+            & !BAM_STORAGE_FLAG_RESOURCE;
         let insert_raw_fn: Option<InsertRawFn> =
-            if !is_resource && allow_raw_insert && !core::mem::needs_drop::<T>() {
+            if options.allow_raw_insert && !core::mem::needs_drop::<T>() {
                 Some(insert_raw_impl::<T>)
             } else {
                 None
             };
-
-        let merged_default_fn = insert_default_fn.or_else(|| {
-            self.components_by_id
-                .get(&comp_id)
-                .and_then(|prev| prev.insert_default_fn)
-        });
-
-        let reg = RegisteredComponent {
-            name: name.clone(),
-            uuid,
-            component_id: comp_id,
-            size: T::size(),
-            align: T::align(),
-            vtable_ptr: sym_addr,
+        self.insert_host_entry::<T>(
+            comp_id,
+            storage_flags,
             insert_raw_fn,
-            insert_default_fn: merged_default_fn,
-            drop_fn: None,
-            is_dynamic: false,
-            is_resource,
-            owner: None,
-        };
+            options.insert_default_fn,
+        )
+    }
 
-        self.components_by_id.insert(comp_id, reg);
-        self.components_by_name.insert(name.clone(), comp_id);
-        self.components_by_uuid.insert(uuid.bytes, comp_id);
+    /// Registers a singleton Bevy [`Resource`] implementing [`ModComponent`], returning its
+    /// 1-based [`BamComponent`] handle (`B-01`, `C-05`).
+    pub fn register_resource<R: Resource + ModComponent>(
+        &mut self,
+        comp_id: ComponentId,
+    ) -> Result<BamComponent, ComponentCollisionError> {
+        let storage_flags =
+            component_flags_to_storage_flags(R::COMPONENT_FLAGS) | BAM_STORAGE_FLAG_RESOURCE;
+        self.insert_host_entry::<R>(comp_id, storage_flags, None, None)
+    }
 
-        let host_entry = SymbolEntry {
-            addr: sym_addr,
-            owner: None,
+    fn insert_host_entry<T: Component + ModComponent>(
+        &mut self,
+        comp_id: ComponentId,
+        storage_flags: u32,
+        insert_raw_fn: Option<InsertRawFn>,
+        insert_default_fn: Option<InsertDefaultFn>,
+    ) -> Result<BamComponent, ComponentCollisionError> {
+        let name_str = T::CANONICAL_NAME;
+        let uuid = T::UUID;
+        self.check_registration_collision(
+            name_str,
+            uuid,
+            T::size(),
+            T::align(),
+            storage_flags,
+            Some(comp_id),
+        )?;
+
+        let sym_addr = SymbolAddress::new(T::erased_vtable_ptr());
+        let handle = {
+            let snap = Arc::make_mut(&mut self.snapshot);
+            let handle = if let Some(&existing_handle) = snap.by_name.get(name_str) {
+                let idx = (existing_handle.0 - 1) as usize;
+                let merged_default = insert_default_fn.or(snap.entries[idx].insert_default_fn);
+                let merged_raw = insert_raw_fn.or(snap.entries[idx].insert_raw_fn);
+                snap.entries[idx].vtable_ptr = sym_addr;
+                snap.entries[idx].insert_raw_fn = merged_raw;
+                snap.entries[idx].insert_default_fn = merged_default;
+                snap.entries[idx].is_dynamic = false;
+                snap.entries[idx].owner = None;
+                existing_handle
+            } else {
+                let next_raw = u32::try_from(snap.entries.len() + 1)
+                    .expect("ModRegistry exceeded u32::MAX component handles");
+                let handle = BamComponent::from_raw(next_raw);
+                let arc_name: Arc<str> = Arc::from(name_str);
+                let entry = RegisteredComponent {
+                    handle,
+                    name: Arc::clone(&arc_name),
+                    uuid,
+                    component_id: comp_id,
+                    size: T::size(),
+                    align: T::align(),
+                    storage_flags,
+                    is_abi_pod: T::IS_ABI_POD,
+                    is_dynamic: false,
+                    vtable_ptr: sym_addr,
+                    insert_raw_fn,
+                    insert_default_fn,
+                    drop_fn: None,
+                    drop_slot: None,
+                    owner: None,
+                };
+                snap.entries.push(entry);
+                snap.by_name.insert(arc_name, handle);
+                snap.by_uuid.insert(uuid, handle);
+                snap.by_component_id.insert(comp_id, handle);
+                handle
+            };
+
+            Self::insert_mod_component_symbols::<T>(snap);
+            handle
         };
-        self.symbols.insert(name.clone(), host_entry);
-        self.symbols.insert(format!("{name}_vtable"), host_entry);
-        for sym in T::symbols() {
-            self.symbols.insert(
-                sym.name.to_string(),
-                SymbolEntry {
-                    addr: SymbolAddress::new(sym.ptr),
+        self.publish_after_mutation();
+        Ok(handle)
+    }
+
+    fn insert_mod_component_symbols<T: ModComponent>(snap: &mut RegistrySnapshot) {
+        let vtable_sym = format!("bam.v0.{}.vtable", T::CANONICAL_NAME);
+        let vtable_addr = SymbolAddress::new(T::erased_vtable_ptr());
+        if !vtable_addr.is_null() {
+            snap.symbols.insert(
+                Arc::from(vtable_sym.as_str()),
+                SymbolRecord {
+                    addr: vtable_addr,
                     owner: None,
                 },
             );
         }
-
-        if let Ok(mut global) = GLOBAL_SYMBOLS.write() {
-            global.insert(name.clone(), sym_addr);
-            global.insert(format!("{name}_vtable"), sym_addr);
-            for sym in T::symbols() {
-                global.insert(sym.name.to_string(), SymbolAddress::new(sym.ptr));
+        for sym in T::symbols() {
+            if sym.name.starts_with("bam.v0.") && !sym.ptr.is_null() {
+                snap.symbols.insert(
+                    Arc::from(sym.name),
+                    SymbolRecord {
+                        addr: SymbolAddress::new(sym.ptr),
+                        owner: None,
+                    },
+                );
             }
         }
-
-        Ok(())
     }
 
-    /// Registers a dynamic component descriptor declared at runtime by a guest mod.
-    pub fn register_dynamic_component(
-        &mut self,
-        comp_id: ComponentId,
-        desc: &ModComponentDescriptor,
-        name: String,
-    ) {
-        if let Err(err) = self.try_register_dynamic_component(comp_id, desc, name) {
-            panic!("ModRegistry::register_dynamic_component failed: {err}");
-        }
+    /// Registers a non-component [`ModComponent`] helper/nested struct type (e.g. `Vec3f`)
+    /// so its static `"bam.v0.<name>.vtable"` and accessor symbols are resolvable via `get_proc_address`.
+    pub fn register_type<T: ModComponent>(&mut self) {
+        let snap = Arc::make_mut(&mut self.snapshot);
+        Self::insert_mod_component_symbols::<T>(snap);
+        self.publish_after_mutation();
     }
 
-    /// Fallible variant of [`ModRegistry::register_dynamic_component`].
-    pub fn try_register_dynamic_component(
+    /// Registers a guest-owned dynamic component from a validated [`ComponentDesc`], returning its
+    /// 1-based [`BamComponent`] handle.
+    pub(crate) fn register_dynamic_component_owned(
         &mut self,
         comp_id: ComponentId,
-        desc: &ModComponentDescriptor,
-        name: String,
-    ) -> Result<(), ComponentCollisionError> {
-        self.try_register_dynamic_component_owned(comp_id, desc, name, None)
-    }
-
-    /// Registers a guest-owned dynamic component, tagging its VTable and symbols with `owner`
-    /// without inserting guest pointers into `GLOBAL_SYMBOLS`.
-    pub(crate) fn try_register_dynamic_component_owned(
-        &mut self,
-        comp_id: ComponentId,
-        desc: &ModComponentDescriptor,
-        name: String,
+        desc: &ComponentDesc,
+        name: &str,
         owner: Option<ModId>,
-    ) -> Result<(), ComponentCollisionError> {
-        let uuid = desc.uuid;
+        drop_slot: Option<usize>,
+    ) -> Result<BamComponent, ComponentCollisionError> {
+        let storage_flags = component_flags_to_storage_flags(desc.flags);
         self.check_registration_collision(
-            &name,
-            uuid,
+            name,
+            desc.uuid,
             desc.size,
             desc.align,
-            false,
+            storage_flags,
             Some(comp_id),
         )?;
 
-        if let Some(mod_id) = owner
-            && let Ok(mut revoked) = self.revoked_owners.write()
-        {
-            revoked.remove(&mod_id);
-        }
-
         let sym_addr = SymbolAddress::new(desc.vtable_ptr);
-        let reg = RegisteredComponent {
-            name: name.clone(),
-            uuid,
-            component_id: comp_id,
-            size: desc.size,
-            align: desc.align,
-            vtable_ptr: sym_addr,
-            insert_raw_fn: None,
-            insert_default_fn: None,
-            drop_fn: desc.drop_fn,
-            is_dynamic: true,
-            is_resource: false,
-            owner,
-        };
-
-        self.components_by_id.insert(comp_id, reg);
-        self.components_by_name.insert(name.clone(), comp_id);
-        self.components_by_uuid.insert(uuid.bytes, comp_id);
-
-        if !sym_addr.is_null() {
-            let entry = SymbolEntry {
-                addr: sym_addr,
-                owner,
+        let handle = {
+            let snap = Arc::make_mut(&mut self.snapshot);
+            let handle = if let Some(&existing_handle) = snap.by_name.get(name) {
+                let idx = (existing_handle.0 - 1) as usize;
+                let entry = &mut snap.entries[idx];
+                entry.vtable_ptr = sym_addr;
+                entry.drop_fn = desc.drop_fn;
+                if drop_slot.is_some() {
+                    entry.drop_slot = drop_slot;
+                }
+                if entry.is_dynamic {
+                    entry.owner = owner;
+                }
+                existing_handle
+            } else {
+                let next_raw = u32::try_from(snap.entries.len() + 1)
+                    .expect("ModRegistry exceeded u32::MAX component handles");
+                let handle = BamComponent::from_raw(next_raw);
+                let arc_name: Arc<str> = Arc::from(name);
+                let entry = RegisteredComponent {
+                    handle,
+                    name: Arc::clone(&arc_name),
+                    uuid: desc.uuid,
+                    component_id: comp_id,
+                    size: desc.size,
+                    align: desc.align,
+                    storage_flags,
+                    is_abi_pod: desc.is_pod(),
+                    is_dynamic: true,
+                    vtable_ptr: sym_addr,
+                    insert_raw_fn: None,
+                    insert_default_fn: None,
+                    drop_fn: desc.drop_fn,
+                    drop_slot,
+                    owner,
+                };
+                snap.entries.push(entry);
+                snap.by_name.insert(arc_name, handle);
+                snap.by_uuid.insert(desc.uuid, handle);
+                snap.by_component_id.insert(comp_id, handle);
+                handle
             };
-            self.symbols.insert(name.clone(), entry);
-            self.symbols.insert(format!("{name}_vtable"), entry);
-        } else {
-            self.symbols.remove(&name);
-            self.symbols.remove(&format!("{name}_vtable"));
-        }
 
-        Ok(())
+            let vtable_key: Arc<str> = Arc::from(format!("bam.v0.{name}.vtable").as_str());
+            if !sym_addr.is_null() {
+                snap.symbols.insert(
+                    vtable_key,
+                    SymbolRecord {
+                        addr: sym_addr,
+                        owner,
+                    },
+                );
+            } else if snap
+                .symbols
+                .get(vtable_key.as_ref())
+                .is_some_and(|r| r.owner.is_some())
+            {
+                snap.symbols.remove(vtable_key.as_ref());
+            }
+            handle
+        };
+        self.publish_after_mutation();
+
+        Ok(handle)
     }
 
-    /// Evicts all guest-owned VTable pointers, drop hooks, and symbol entries owned by `mod_id`
-    /// while preserving `ComponentId` bindings for subsequent reloads.
+    /// Registers a custom `"bam.v0.<name>"` host symbol scoped strictly to this [`ModRegistry`].
+    ///
+    /// If `name` does not already begin with `"bam.v0."`, it is automatically prefixed with `"bam.v0."`.
+    ///
+    /// # Safety
+    /// Caller must ensure `ptr` remains valid for any guest code resolving `name` against this registry.
+    pub unsafe fn register_custom_symbol(&mut self, name: &str, ptr: *const c_void) {
+        let full_name: Arc<str> = if name.starts_with("bam.v0.") {
+            Arc::from(name)
+        } else {
+            Arc::from(format!("bam.v0.{name}").as_str())
+        };
+        let snap = Arc::make_mut(&mut self.snapshot);
+        snap.symbols.insert(
+            full_name,
+            SymbolRecord {
+                addr: SymbolAddress::new(ptr),
+                owner: None,
+            },
+        );
+        self.publish_after_mutation();
+    }
+
+    /// Registers a custom `"bam.v0.<name>"` symbol owned by `owner` (`ModId`) so it is automatically
+    /// evicted when `owner` unloads.
+    ///
+    /// # Safety
+    /// Caller must ensure `ptr` remains valid until `owner` is evicted from this registry.
+    pub unsafe fn register_mod_symbol(&mut self, name: &str, ptr: *const c_void, owner: ModId) {
+        let full_name: Arc<str> = if name.starts_with("bam.v0.") {
+            Arc::from(name)
+        } else {
+            Arc::from(format!("bam.v0.{name}").as_str())
+        };
+        let snap = Arc::make_mut(&mut self.snapshot);
+        snap.symbols.insert(
+            full_name,
+            SymbolRecord {
+                addr: SymbolAddress::new(ptr),
+                owner: Some(owner),
+            },
+        );
+        self.publish_after_mutation();
+    }
+
+    /// Evicts all guest-owned VTable pointers, drop callbacks, and custom symbols owned by `mod_id`
+    /// while preserving 1-based [`BamComponent`] handles and Bevy [`ComponentId`]s across reloads.
     pub(crate) fn evict_mod(&mut self, mod_id: ModId) {
-        if let Ok(mut revoked) = self.revoked_owners.write() {
-            revoked.insert(mod_id);
-        }
-        self.symbols.retain(|_, entry| entry.owner != Some(mod_id));
-        for comp in self.components_by_id.values_mut() {
+        let snap = Arc::make_mut(&mut self.snapshot);
+        snap.symbols.retain(|_, rec| rec.owner != Some(mod_id));
+        for comp in &mut snap.entries {
             if comp.owner == Some(mod_id) {
                 comp.vtable_ptr = SymbolAddress::NULL;
                 comp.drop_fn = None;
                 comp.owner = None;
             }
         }
+        self.publish_after_mutation();
     }
 
-    /// Rolls back a failed or aborted module load (`mod_id`), removing newly registered dynamic
-    /// component entries and symbols completely while clearing VTable/drop hooks on any pre-existing ones.
-    pub(crate) fn rollback_mod(&mut self, mod_id: ModId, newly_created: &[ComponentId]) {
-        self.evict_mod(mod_id);
-        for &comp_id in newly_created {
-            if let Some(removed) = self.components_by_id.remove(&comp_id) {
-                self.components_by_name.remove(&removed.name);
-                self.components_by_uuid.remove(&removed.uuid.bytes);
-            }
-        }
-    }
-
-    /// Registers a non-component `ModExposable` helper/nested struct type (e.g. `Vec3f`)
-    /// so its static VTable and field accessors are resolvable via `GetProcAddressFn`.
-    pub fn register_type<T: ExposableComponent>(&mut self) {
-        let name = T::COMPONENT_NAME.to_string();
-        let sym_addr = SymbolAddress::new(T::erased_vtable_ptr());
-        let host_entry = SymbolEntry {
-            addr: sym_addr,
-            owner: None,
-        };
-
-        self.symbols.insert(name.clone(), host_entry);
-        self.symbols.insert(format!("{name}_vtable"), host_entry);
-        for sym in T::symbols() {
-            self.symbols.insert(
-                sym.name.to_string(),
-                SymbolEntry {
-                    addr: SymbolAddress::new(sym.ptr),
-                    owner: None,
-                },
-            );
-        }
-
-        if let Ok(mut global) = GLOBAL_SYMBOLS.write() {
-            global.insert(name.clone(), sym_addr);
-            global.insert(format!("{name}_vtable"), sym_addr);
-            for sym in T::symbols() {
-                global.insert(sym.name.to_string(), SymbolAddress::new(sym.ptr));
-            }
-        }
-    }
-
-    /// Registers a custom host symbol scoped strictly to this [`ModRegistry`] instance
-    /// (without polluting global symbols).
-    ///
-    /// # Safety
-    /// Caller must ensure `ptr` remains valid for any guest code resolving `name` against this registry.
-    pub unsafe fn register_custom_symbol(&mut self, name: impl Into<String>, ptr: *const c_void) {
-        self.symbols.insert(
-            name.into(),
-            SymbolEntry {
-                addr: SymbolAddress::new(ptr),
-                owner: None,
-            },
-        );
-    }
-
-    /// Registers a custom symbol owned by a specific guest [`ModId`] so it is automatically evicted
-    /// when `mod_id` unloads or rolls back.
-    ///
-    /// # Safety
-    /// Caller must ensure `ptr` remains valid until `owner` is evicted from this registry.
-    pub unsafe fn register_mod_symbol(
-        &mut self,
-        name: impl Into<String>,
-        ptr: *const c_void,
-        owner: ModId,
-    ) {
-        self.symbols.insert(
-            name.into(),
-            SymbolEntry {
-                addr: SymbolAddress::new(ptr),
-                owner: Some(owner),
-            },
-        );
+    /// Looks up registered component metadata in `O(1)` by 1-based [`BamComponent`] handle.
+    #[inline]
+    pub fn get_by_handle(&self, handle: BamComponent) -> Option<&RegisteredComponent> {
+        self.snapshot.get_by_handle(handle)
     }
 
     /// Looks up registered component metadata by runtime Bevy [`ComponentId`].
+    #[inline]
     pub fn get_by_id(&self, id: ComponentId) -> Option<&RegisteredComponent> {
-        self.components_by_id.get(&id)
+        self.snapshot.get_by_id(id)
     }
 
     /// Looks up registered component metadata by canonical string name.
+    #[inline]
     pub fn get_by_name(&self, name: &str) -> Option<&RegisteredComponent> {
-        self.components_by_name
-            .get(name)
-            .and_then(|id| self.components_by_id.get(id))
+        self.snapshot.get_by_name(name)
     }
 
     /// Looks up registered component metadata by deterministic 128-bit [`ComponentUuid`].
+    #[inline]
     pub fn get_by_uuid(&self, uuid: &ComponentUuid) -> Option<&RegisteredComponent> {
-        self.components_by_uuid
-            .get(&uuid.bytes)
-            .and_then(|id| self.components_by_id.get(id))
+        self.snapshot.get_by_uuid(uuid)
     }
 
-    /// Resolves a symbol address from this registry by name, returning `None` if not present or if
-    /// its owning guest module has been unloaded.
+    /// Resolves a `"bam.v0.*"` symbol address from this registry.
+    #[inline]
     pub fn resolve_symbol(&self, name: &str) -> Option<*const c_void> {
-        let entry = self.symbols.get(name)?;
-        if let Some(owner) = entry.owner
-            && self
-                .revoked_owners
-                .read()
-                .map(|revoked| revoked.contains(&owner))
-                .unwrap_or(true)
-        {
-            return None;
-        }
-        Some(entry.addr.as_ptr())
-    }
-
-    /// Inserts a host-owned `'static` symbol address into this registry and updates the global fallback cache.
-    pub fn insert_symbol(&mut self, name: impl Into<String>, ptr: *const c_void) {
-        let name_str = name.into();
-        let sym_addr = SymbolAddress::new(ptr);
-        self.symbols.insert(
-            name_str.clone(),
-            SymbolEntry {
-                addr: sym_addr,
-                owner: None,
-            },
-        );
-        if let Ok(mut global) = GLOBAL_SYMBOLS.write() {
-            global.insert(name_str, sym_addr);
-        }
+        self.snapshot.resolve_symbol(name)
     }
 }

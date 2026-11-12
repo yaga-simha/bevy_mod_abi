@@ -1,10 +1,13 @@
-//! Schedule discriminants, system sets, and startup tracking for dynamic guest systems.
+//! Schedule mapping (`ModScheduleMap`), system sets, and startup tracking (`B-06`).
 
 use crate::loader::ModId;
-use bevy_abi_mod_sys::ScheduleLabelId;
+use bevy_abi_mod_sys::ScheduleId;
+use bevy_app::{FixedUpdate, Last, PostUpdate, PreUpdate, Startup, Update};
 use bevy_ecs::prelude::Resource;
-use bevy_ecs::schedule::{Schedule, SystemSet};
+use bevy_ecs::schedule::{InternedScheduleLabel, Schedule, ScheduleLabel, SystemSet};
 use bevy_ecs::world::World;
+use bevy_platform::collections::HashMap;
+use std::sync::Arc;
 
 /// Bevy [`SystemSet`] labels automatically attached to dynamic guest systems.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -20,9 +23,9 @@ pub enum ModSystemSet {
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ModNamedSystemSet {
     /// Logical module name owning the system.
-    pub mod_name: String,
+    pub mod_name: Arc<str>,
     /// Guest system name registered by the mod.
-    pub system_name: String,
+    pub system_name: Arc<str>,
     /// Monotonic reload generation for `mod_name` so hot-reloads allocate a fresh
     /// `InternedSystemSet` rather than reusing a removed `SlotMap` key in Bevy `0.20`'s `SystemSets`.
     pub generation: u64,
@@ -31,15 +34,15 @@ pub struct ModNamedSystemSet {
 impl ModNamedSystemSet {
     /// Creates a module-scoped named system set at generation `0`.
     #[inline]
-    pub fn new(mod_name: impl Into<String>, system_name: impl Into<String>) -> Self {
+    pub fn new(mod_name: impl Into<Arc<str>>, system_name: impl Into<Arc<str>>) -> Self {
         Self::with_generation(mod_name, system_name, 0)
     }
 
     /// Creates a module-scoped named system set with an explicit reload `generation`.
     #[inline]
     pub fn with_generation(
-        mod_name: impl Into<String>,
-        system_name: impl Into<String>,
+        mod_name: impl Into<Arc<str>>,
+        system_name: impl Into<Arc<str>>,
         generation: u64,
     ) -> Self {
         Self {
@@ -57,10 +60,6 @@ impl ModNamedSystemSet {
     }
 
     /// Returns `true` if this named system set is currently active in `schedule`'s `ScheduleGraph`.
-    ///
-    /// Note: Bevy `0.20.1`'s `SystemSets::remove` removes the set from its `SlotMap` (`get`)
-    /// without removing the interned entry from its internal `ids` lookup table (`contains`),
-    /// so `get_key(...) + get(...)` is the authoritative check for live schedule membership.
     #[inline]
     pub fn is_present_in(&self, schedule: &Schedule) -> bool {
         let sets = &schedule.graph().system_sets;
@@ -88,11 +87,65 @@ impl ModNamedSystemSet {
     }
 }
 
+/// Resource mapping ABI [`ScheduleId`] discriminants (`0..=5` built-in and `>= 1024` custom game
+/// schedules) onto Bevy [`InternedScheduleLabel`]s (`B-06`, ADR 0002).
+#[derive(Resource, Default, Clone, Debug)]
+pub struct ModScheduleMap {
+    custom: HashMap<ScheduleId, InternedScheduleLabel>,
+}
+
+impl ModScheduleMap {
+    /// Creates an empty custom schedule map (built-in IDs `0..=5` are always available).
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers a game-defined custom [`ScheduleId`] (`id.0 >= ScheduleId::CUSTOM_BASE` = `1024`)
+    /// mapped to `label`.
+    ///
+    /// Returns `false` if `id` is not in the custom range (`< 1024`).
+    #[inline]
+    pub fn register<S: ScheduleLabel>(&mut self, id: ScheduleId, label: S) -> bool {
+        if !id.is_custom() {
+            return false;
+        }
+        self.custom.insert(id, label.intern());
+        true
+    }
+
+    /// Resolves `id` to its [`InternedScheduleLabel`], handling built-in IDs (`0..=5`) directly
+    /// and consulting registered custom entries for `id.0 >= 1024`.
+    #[inline]
+    pub fn resolve(&self, id: ScheduleId) -> Option<InternedScheduleLabel> {
+        if let Some(builtin) = resolve_builtin_schedule_id(id) {
+            return Some(builtin);
+        }
+        self.custom.get(&id).copied()
+    }
+
+    /// Returns `true` if `id` is a built-in schedule (`0..=5`) or a registered custom schedule.
+    #[inline]
+    pub fn contains(&self, id: ScheduleId) -> bool {
+        id.is_builtin() || self.custom.contains_key(&id)
+    }
+}
+
+/// Resolves one of the six built-in ABI [`ScheduleId`]s (`0..=5`) into its Bevy [`InternedScheduleLabel`].
+#[inline]
+pub fn resolve_builtin_schedule_id(id: ScheduleId) -> Option<InternedScheduleLabel> {
+    match id {
+        ScheduleId::UPDATE => Some(Update.intern()),
+        ScheduleId::STARTUP => Some(Startup.intern()),
+        ScheduleId::PRE_UPDATE => Some(PreUpdate.intern()),
+        ScheduleId::POST_UPDATE => Some(PostUpdate.intern()),
+        ScheduleId::FIXED_UPDATE => Some(FixedUpdate.intern()),
+        ScheduleId::LAST => Some(Last.intern()),
+        _ => None,
+    }
+}
+
 /// Resource tracking whether Bevy's one-time `Startup` schedule has already completed.
-///
-/// Pre-inserted with `false` during plugin setup and flipped to `true` in `PostStartup` so
-/// tracking startup completion spawns zero additional resource entities during `app.update()`,
-/// and any mod loaded after `Startup` runs its `Startup` systems immediately once on load.
 #[derive(Resource, Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct StartupCompleted(pub bool);
 
@@ -110,58 +163,5 @@ pub fn mark_startup_completed(world: &mut World) {
         state.0 = true;
     } else {
         world.insert_resource(StartupCompleted(true));
-    }
-}
-
-/// Target Bevy schedule for a dynamic guest system (matches [`ScheduleLabelId`] discriminant values).
-#[repr(u32)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum ModSchedule {
-    /// Main per-frame `Update` schedule (`0`).
-    #[default]
-    Update = 0,
-    /// One-time `Startup` schedule (`1`).
-    Startup = 1,
-    /// `PreUpdate` schedule (`2`).
-    PreUpdate = 2,
-    /// `PostUpdate` schedule (`3`).
-    PostUpdate = 3,
-    /// Fixed-timestep `FixedUpdate` schedule (`4`).
-    FixedUpdate = 4,
-    /// End-of-frame `Last` schedule (`5`).
-    Last = 5,
-}
-
-impl ModSchedule {
-    /// Converts a raw `u32` discriminant (`ScheduleLabelId`) into [`ModSchedule`].
-    #[inline]
-    pub const fn from_raw(raw: u32) -> Option<Self> {
-        match raw {
-            0 => Some(Self::Update),
-            1 => Some(Self::Startup),
-            2 => Some(Self::PreUpdate),
-            3 => Some(Self::PostUpdate),
-            4 => Some(Self::FixedUpdate),
-            5 => Some(Self::Last),
-            _ => None,
-        }
-    }
-
-    /// Converts a [`ScheduleLabelId`] into [`ModSchedule`].
-    #[inline]
-    pub const fn from_label_id(id: ScheduleLabelId) -> Option<Self> {
-        Self::from_raw(id.0)
-    }
-
-    /// Converts this [`ModSchedule`] into a [`ScheduleLabelId`].
-    #[inline]
-    pub const fn to_label_id(self) -> ScheduleLabelId {
-        ScheduleLabelId(self as u32)
-    }
-
-    /// Returns the raw `u32` discriminant value.
-    #[inline]
-    pub const fn as_raw(self) -> u32 {
-        self as u32
     }
 }

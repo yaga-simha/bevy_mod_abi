@@ -3,65 +3,62 @@
     clippy::undocumented_unsafe_blocks,
     clippy::missing_safety_doc
 )]
-//! Low-level `unsafe` FFI and Bevy ECS storage internals for `bevy_abi_mod_host`.
+//! Low-level `unsafe` FFI and Bevy ECS storage internals for `bevy_abi_mod_host` (`ABI 0.2.0`).
 //!
-//! Isolates all host-side `unsafe` code (chunk iteration over `UnsafeWorldCell`, deferred raw
-//! byte commands, `DynamicCSystem`, `ModRegistry` VTable/symbol lookup, drop trampolines, and
-//! `libloading` shared-library lifecycle) behind audited invariants so `bevy_abi_mod_host` and
-//! `bevy_abi_mod` enforce `#![forbid(unsafe_code)]`.
+//! Isolates all host-side `unsafe` code (`HostIter` chunk/sparse iteration over `UnsafeWorldCell`,
+//! arena-backed `HostCommands`, `GuestSystem`, CoW `ModRegistry` handle/VTable/symbol lookup,
+//! `ArcSwapOption` drop trampolines with two-condition `WorldDropGuard` reclamation, and
+//! `libloading` shadow-copy shared-library lifecycle) behind audited invariants so
+//! `bevy_abi_mod_host` and `bevy_abi_mod` enforce `#![forbid(unsafe_code)]`.
 
 pub mod drop_trampoline;
-#[cfg(any(test, feature = "test-utils"))]
 pub mod ffi;
-#[cfg(not(any(test, feature = "test-utils")))]
-#[allow(unreachable_pub)]
-pub(crate) mod ffi;
+pub mod handle_header;
 pub mod loader;
 pub mod registry;
 pub mod schedule;
 pub mod sync_ptr;
 pub mod system;
 
-pub use drop_trampoline::MAX_DROP_TRAMPOLINES;
-#[cfg(any(test, feature = "test-utils"))]
-pub use drop_trampoline::reset_drop_trampolines_for_testing;
+pub use drop_trampoline::{MAX_DROP_TRAMPOLINES, WorldDropGuard};
+pub use ffi::commands::{
+    CommandArena, HostCommands, HostCommandsStorage, host_cmd_despawn, host_cmd_insert,
+    host_cmd_insert_default, host_cmd_remove, host_cmd_spawn, host_cmd_spawn_empty,
+};
 pub use ffi::host_api::HOST_API;
+pub use ffi::iter::{
+    HostIter, QueryPlan, QueryTermMeta, SparseRowScratch, TickFilterTerm, host_iter_column_info,
+    host_iter_column_mutable, host_iter_column_mutable_untracked, host_iter_column_readonly,
+    host_iter_column_rows_mutable, host_iter_column_rows_readonly, host_iter_entities,
+    host_iter_mark_changed_range, host_iter_next_chunk, host_iter_reset, host_res_mut_ptr,
+    host_res_ptr,
+};
+pub use ffi::proc_address::host_get_proc_address;
+pub use ffi::register::{
+    LoadContext, host_load_host_ctx, host_register_component, host_register_system,
+    host_resolve_component,
+};
+pub use handle_header::{
+    COMMANDS_MAGIC, HOST_CTX_MAGIC, HandleHeader, HostContext, ITER_MAGIC, LOAD_CTX_MAGIC,
+    POISONED_MAGIC, STRICT_FFI_CHECKS, SYS_CTX_MAGIC, host_last_error,
+};
 pub use loader::{
-    LoadedMod, ModHost, ModId, ModLoadError, canonical_mod_name_from_path,
-    excise_and_unload_mod_in_world, is_abi_version_compatible, load_mod_in_world,
-    record_mod_named_sets_in_world, rollback_unscheduled_mod_in_world, unload_all_mods_in_world,
+    LoadOptions, LoadedMod, LoadedModInfo, ModHost, ModId, ModLoadError, ModLoaded, ModUnloaded,
+    canonical_mod_name_from_path, excise_and_unload_mod_in_world, is_abi_version_compatible,
+    load_mod_in_world, record_mod_named_sets_in_world, rollback_unscheduled_mod_in_world,
+    unload_all_mods_in_world,
 };
 pub use registry::{
-    ComponentCollisionError, InsertDefaultFn, InsertRawFn, ModRegistry, RegisteredComponent,
+    ComponentCollisionError, ComponentOptions, InsertDefaultFn, InsertRawFn, ModRegistry,
+    RegisteredComponent, RegistrySnapshot,
 };
 pub use schedule::{
-    ModNamedSystemSet, ModSchedule, ModSystemSet, StartupCompleted, mark_startup_completed,
+    ModNamedSystemSet, ModScheduleMap, ModSystemSet, StartupCompleted, mark_startup_completed,
+    resolve_builtin_schedule_id,
 };
-pub use sync_ptr::{GuestFnPtr, GuestUserData, SymbolAddress};
+pub use sync_ptr::{GuestFnPtr, GuestInstancePtr, GuestUserData, SymbolAddress};
 pub use system::{
-    ComponentAccessDescOwned, DynamicCSystem, MAX_SYSTEM_QUERIES, ModErrorPolicy,
-    ModErrorPolicyConfig, ModSystemError, ModSystemFaulted, SystemInitError,
+    BamQuerySpecOwned, GuestSystem, HostSystemCtx, MAX_SYSTEM_QUERIES, ModErrorPolicy,
+    ModErrorPolicyConfig, ModQuarantine, ModSystemError, ModSystemFaulted, SystemInitError,
+    host_sys_commands, host_sys_host_ctx, host_sys_query,
 };
-
-#[cfg(any(test, feature = "test-utils"))]
-pub use ffi::commands::{
-    CommandQueueBridge, host_cmd_despawn, host_cmd_insert_component, host_cmd_insert_default,
-    host_cmd_remove_component, host_cmd_spawn_empty,
-};
-#[cfg(any(test, feature = "test-utils"))]
-pub use ffi::iter::{
-    HostChunkIter, MAX_QUERY_COMPONENTS, QueryColumnDesc, host_iter_column_mutable,
-    host_iter_column_readonly, host_iter_column_stride, host_iter_entities, host_iter_mark_changed,
-    host_iter_next_chunk, host_iter_reset, host_iter_resource_mutable, host_iter_resource_readonly,
-};
-#[cfg(any(test, feature = "test-utils"))]
-pub use ffi::proc_address::host_get_proc_address;
-#[cfg(any(test, feature = "test-utils"))]
-pub use ffi::register::{
-    ActiveInitContextGuard, MOD_INIT_CONTEXT_MAGIC, ModInitContext, ModInitContextHeader,
-    host_register_component, host_register_conditional_multi_query_system,
-    host_register_conditional_system, host_register_multi_query_system,
-    host_register_scheduled_system, host_register_system, host_register_system_in_schedule,
-};
-#[cfg(any(test, feature = "test-utils"))]
-pub use registry::CurrentRegistryGuard;

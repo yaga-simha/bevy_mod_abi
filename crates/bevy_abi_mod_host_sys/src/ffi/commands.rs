@@ -1,36 +1,432 @@
-//! Deferred ECS command bridge and allocator-isolated byte insertion (`MaybeUninit<u8>`).
+//! Per-system bump-allocated deferred command queue (`HostCommands`, `CommandArena`)
+//! (`C-05`, `P-05`, `S-04`, `S-08`, `N-02`).
+//!
+//! Eliminates steady-state heap allocations across frames:
+//! - Component byte payloads are copied as `MaybeUninit<u8>` (never `&[u8]`) into reusable aligned
+//!   slabs inside [`CommandArena`].
+//! - Commands (`SpawnEmpty`, `SpawnBatch`, `Despawn`, `Insert`, `InsertDefault`, `Remove`) are
+//!   recorded in flat `Vec` buffers reused every frame.
+//! - `cmd_spawn` applies all `K` components in a single archetype transition via
+//!   [`bevy_ecs::world::EntityWorldMut::insert_by_ids`].
 
-use crate::registry::ModRegistry;
-use crate::sync_ptr::AlignedBytes;
-use bevy_abi_mod_sys::{FfiEntity, FfiResult, RawCommandQueue};
+use crate::handle_header::{COMMANDS_MAGIC, HandleHeader, validate_handle_mut};
+use crate::registry::{InsertDefaultFn, RegistrySnapshot};
+use bevy_abi_mod_sys::{BamCommands, BamComponent, FfiEntity, FfiResult};
+use bevy_ecs::component::ComponentId;
 use bevy_ecs::entity::{Entity, EntityAllocator};
 use bevy_ecs::ptr::OwningPtr;
-use bevy_ecs::world::{CommandQueue, World};
-use core::ffi::{CStr, c_char};
+use bevy_ecs::world::World;
+use core::ffi::c_void;
+use core::mem::MaybeUninit;
 use core::num::NonZeroUsize;
+use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 
-/// Concrete host bridge exposed behind the opaque [`RawCommandQueue`] handle.
-pub struct CommandQueueBridge<'a> {
-    /// Bevy command queue accumulating deferred mutations.
-    pub queue: &'a mut CommandQueue,
-    /// Atomic entity allocator for immediate ID generation.
-    pub allocator: &'a EntityAllocator,
-    /// Active mod registry for component lookup and raw deserialization.
-    pub registry: &'a ModRegistry,
+/// Maximum number of components accepted in a single [`host_cmd_spawn`] batch (`FfiResult::CAPACITY_EXCEEDED`).
+pub const MAX_SPAWN_BATCH_COMPONENTS: usize = 64;
+
+const DEFAULT_SLAB_BYTES: usize = 64 * 1024;
+const SLAB_BASE_ALIGN: usize = 64;
+
+struct ArenaSlab {
+    ptr: *mut MaybeUninit<u8>,
+    layout: Layout,
+    cursor: usize,
 }
 
-impl<'a> CommandQueueBridge<'a> {
-    /// Creates a new command queue bridge.
+impl ArenaSlab {
+    fn new(min_bytes: usize, min_align: usize) -> Self {
+        let align = min_align.max(SLAB_BASE_ALIGN).next_power_of_two();
+        let cap = min_bytes.max(DEFAULT_SLAB_BYTES).next_multiple_of(align);
+        let layout = Layout::from_size_align(cap, align).expect("valid CommandArena slab layout");
+        // SAFETY: `cap >= DEFAULT_SLAB_BYTES > 0` and `align` is a power of two.
+        let ptr = unsafe { alloc(layout) }.cast::<MaybeUninit<u8>>();
+        if ptr.is_null() {
+            handle_alloc_error(layout);
+        }
+        Self {
+            ptr,
+            layout,
+            cursor: 0,
+        }
+    }
+
+    #[inline]
+    fn try_alloc(&mut self, size: usize, align: usize) -> Option<*mut MaybeUninit<u8>> {
+        if align > self.layout.align() {
+            return None;
+        }
+        let aligned_offset = self.cursor.checked_add(align - 1)? & !(align - 1);
+        let end = aligned_offset.checked_add(size)?;
+        if end > self.layout.size() {
+            return None;
+        }
+        self.cursor = end;
+        // SAFETY: `aligned_offset + size <= self.layout.size()`, and `self.ptr` is aligned to
+        // `self.layout.align() >= align`, so `self.ptr.add(aligned_offset)` is aligned to `align`.
+        Some(unsafe { self.ptr.add(aligned_offset) })
+    }
+}
+
+impl Drop for ArenaSlab {
+    fn drop(&mut self) {
+        // SAFETY: `self.ptr` was allocated with `std::alloc::alloc(self.layout)`.
+        unsafe {
+            dealloc(self.ptr.cast::<u8>(), self.layout);
+        }
+    }
+}
+
+// SAFETY: `ArenaSlab` uniquely owns a raw heap byte slab containing Pod/raw component payloads.
+unsafe impl Send for ArenaSlab {}
+// SAFETY: Shared references to `ArenaSlab` expose no unsynchronized interior mutability.
+unsafe impl Sync for ArenaSlab {}
+
+#[derive(Clone, Copy, Debug)]
+struct ArenaSlice {
+    slab_idx: u32,
+    offset: usize,
+    size: usize,
+    align: usize,
+}
+
+/// Reusable multi-slab aligned bump arena storing `MaybeUninit<u8>` component payloads (`P-05`).
+#[derive(Default)]
+pub struct CommandArena {
+    slabs: Vec<ArenaSlab>,
+    active_slab: usize,
+}
+
+impl CommandArena {
+    /// Creates an empty [`CommandArena`] (allocates its first slab lazily on first non-ZST write).
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            slabs: Vec::new(),
+            active_slab: 0,
+        }
+    }
+
+    /// Copies `size` raw `MaybeUninit<u8>` bytes from `src` into `align`-aligned arena storage.
+    ///
+    /// # Safety
+    /// If `size > 0`, `src` must be non-null and readable for `size` `MaybeUninit<u8>` bytes.
+    unsafe fn alloc_copy_raw(
+        &mut self,
+        src: *const u8,
+        size: usize,
+        align: usize,
+    ) -> Result<ArenaSlice, FfiResult> {
+        let align = align.max(1);
+        if !align.is_power_of_two() {
+            return Err(FfiResult::INVALID_ARGUMENT);
+        }
+        if size == 0 {
+            return Ok(ArenaSlice {
+                slab_idx: u32::MAX,
+                offset: 0,
+                size: 0,
+                align,
+            });
+        }
+        if src.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+
+        while self.active_slab < self.slabs.len() {
+            let slab_idx = self.active_slab;
+            let base = self.slabs[slab_idx].ptr as usize;
+            if let Some(dst) = self.slabs[slab_idx].try_alloc(size, align) {
+                // SAFETY: Caller guarantees `src` is readable for `size` `MaybeUninit<u8>` bytes;
+                // `dst` is freshly bump-allocated inside `slabs[slab_idx]` and non-overlapping.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(src.cast::<MaybeUninit<u8>>(), dst, size);
+                }
+                return Ok(ArenaSlice {
+                    slab_idx: slab_idx as u32,
+                    offset: (dst as usize) - base,
+                    size,
+                    align,
+                });
+            }
+            self.active_slab += 1;
+        }
+
+        let mut slab = ArenaSlab::new(size, align);
+        let base = slab.ptr as usize;
+        let dst = slab
+            .try_alloc(size, align)
+            .expect("freshly allocated ArenaSlab must fit requested payload");
+        // SAFETY: Same as above; copying as `MaybeUninit<u8>` avoids forming `&[u8]` over padding.
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.cast::<MaybeUninit<u8>>(), dst, size);
+        }
+        let slab_idx = self.slabs.len();
+        self.slabs.push(slab);
+        self.active_slab = slab_idx;
+
+        Ok(ArenaSlice {
+            slab_idx: slab_idx as u32,
+            offset: (dst as usize) - base,
+            size,
+            align,
+        })
+    }
+
+    #[inline]
+    fn ptr_mut(&mut self, slice: ArenaSlice) -> core::ptr::NonNull<u8> {
+        if slice.size == 0 {
+            let nz = NonZeroUsize::new(slice.align.max(1)).expect("non-zero alignment");
+            return core::ptr::NonNull::<u8>::without_provenance(nz);
+        }
+        let slab = &mut self.slabs[slice.slab_idx as usize];
+        // SAFETY: `slice` was produced by `alloc_copy_raw` from `slabs[slice.slab_idx]` with
+        // `offset + size <= slab.layout.size()` and `slab.ptr` is non-null.
+        let raw = unsafe { slab.ptr.add(slice.offset).cast::<u8>() };
+        // SAFETY: `slab.ptr` is non-null, so `slab.ptr.add(slice.offset)` is non-null.
+        unsafe { core::ptr::NonNull::new_unchecked(raw) }
+    }
+
+    /// Resets all slabs to cursor `0` while retaining up to 2 slabs of allocated capacity for
+    /// zero-allocation reuse on subsequent frames.
+    #[inline]
+    pub fn reset(&mut self) {
+        if self.slabs.len() > 2 {
+            self.slabs.truncate(2);
+        }
+        for slab in &mut self.slabs {
+            slab.cursor = 0;
+        }
+        self.active_slab = 0;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RecordedCommand {
+    SpawnEmpty {
+        entity: Entity,
+    },
+    SpawnBatch {
+        entity: Entity,
+        batch_start: usize,
+        batch_len: usize,
+    },
+    Despawn {
+        entity: Entity,
+    },
+    Insert {
+        entity: Entity,
+        component: BamComponent,
+        slice: ArenaSlice,
+    },
+    InsertDefault {
+        entity: Entity,
+        insert_fn: InsertDefaultFn,
+    },
+    Remove {
+        entity: Entity,
+        component_id: ComponentId,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct BatchItem {
+    component_id: ComponentId,
+    slice: ArenaSlice,
+}
+
+/// Persistent per-system command buffer storage reused across frames with zero steady-state heap
+/// allocations (`P-05`).
+#[derive(Default)]
+pub struct HostCommandsStorage {
+    arena: CommandArena,
+    commands: Vec<RecordedCommand>,
+    batch_items: Vec<BatchItem>,
+    scratch_ids: Vec<ComponentId>,
+}
+
+impl HostCommandsStorage {
+    /// Creates empty persistent command storage.
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            arena: CommandArena::new(),
+            commands: Vec::new(),
+            batch_items: Vec::new(),
+            scratch_ids: Vec::new(),
+        }
+    }
+
+    /// Returns `true` if no commands are currently queued.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.commands.is_empty()
+    }
+
+    /// Returns the number of queued commands awaiting application.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.commands.len()
+    }
+
+    /// Discards all queued commands without applying them to the `World` (used when a guest system
+    /// faults mid-invocation) while preserving allocated slab and vector capacities.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.commands.clear();
+        self.batch_items.clear();
+        self.scratch_ids.clear();
+        self.arena.reset();
+    }
+
+    /// Takes ownership of all queued commands into a fresh `HostCommandsStorage` (used only by
+    /// the cold `System::queue_deferred` combinator path).
+    pub fn take_for_deferred_queue(&mut self) -> Self {
+        core::mem::take(self)
+    }
+
+    /// Applies all queued commands to `world` in FIFO order and resets all internal buffers for reuse.
+    pub fn apply_to_world(&mut self, world: &mut World, snapshot: &RegistrySnapshot) {
+        if self.commands.is_empty() {
+            return;
+        }
+
+        for i in 0..self.commands.len() {
+            match self.commands[i] {
+                RecordedCommand::SpawnEmpty { entity } => {
+                    let _ = world.spawn_empty_at(entity);
+                }
+                RecordedCommand::SpawnBatch {
+                    entity,
+                    batch_start,
+                    batch_len,
+                } => {
+                    if let Ok(mut entity_mut) = world.spawn_empty_at(entity) {
+                        self.scratch_ids.clear();
+                        let batch_slice = &self.batch_items[batch_start..(batch_start + batch_len)];
+                        for item in batch_slice {
+                            self.scratch_ids.push(item.component_id);
+                        }
+                        let arena = &mut self.arena;
+                        let ptrs_iter = batch_slice.iter().map(|item| {
+                            let nn = arena.ptr_mut(item.slice);
+                            // SAFETY: Each `nn` points to disjoint aligned arena storage matching
+                            // the registered `(size, align)` of `scratch_ids[k]` (or an aligned
+                            // ZST provenance-free address), transferring ownership into Bevy ECS.
+                            unsafe { OwningPtr::new(nn) }
+                        });
+                        // SAFETY: `scratch_ids` has no duplicate `ComponentId`s (verified during
+                        // `host_cmd_spawn`), matches `ptrs_iter` length, and each `ComponentId`
+                        // was registered in `world` with the exact payload layout.
+                        unsafe {
+                            entity_mut.insert_by_ids(&self.scratch_ids, ptrs_iter);
+                        }
+                    }
+                }
+                RecordedCommand::Despawn { entity } => {
+                    if let Ok(e) = world.get_entity_mut(entity) {
+                        e.despawn();
+                    }
+                }
+                RecordedCommand::Insert {
+                    entity,
+                    component,
+                    slice,
+                } => {
+                    let Some(meta) = snapshot.get_by_handle(component) else {
+                        continue;
+                    };
+                    let nn = self.arena.ptr_mut(slice);
+                    if !meta.is_dynamic {
+                        if let Some(insert_fn) = meta.insert_raw_fn {
+                            // SAFETY: `nn` points to `meta.size` bytes aligned to `meta.align`
+                            // inside `self.arena`; `insert_fn` reads `T` via `ptr::read_unaligned`.
+                            unsafe {
+                                insert_fn(world, entity, nn.as_ptr().cast_const());
+                            }
+                        }
+                    } else if let Ok(mut entity_mut) = world.get_entity_mut(entity) {
+                        // SAFETY: `nn` holds `meta.size` aligned bytes for dynamic `meta.component_id`;
+                        // ownership transfers into Bevy ECS storage (firing any `on_insert` hook).
+                        let owning = unsafe { OwningPtr::new(nn) };
+                        // SAFETY: `meta.component_id` was registered in `world` with `(meta.size, meta.align)`.
+                        unsafe {
+                            entity_mut.insert_by_id(meta.component_id, owning);
+                        }
+                    }
+                }
+                RecordedCommand::InsertDefault { entity, insert_fn } => {
+                    insert_fn(world, entity);
+                }
+                RecordedCommand::Remove {
+                    entity,
+                    component_id,
+                } => {
+                    if let Ok(mut entity_mut) = world.get_entity_mut(entity) {
+                        entity_mut.remove_by_id(component_id);
+                    }
+                }
+            }
+        }
+
+        self.clear();
+    }
+}
+
+/// Concrete `#[repr(C)]` command context backing opaque [`BamCommands`] (`S-08`, `N-02`).
+#[repr(C)]
+pub struct HostCommands<'a> {
+    /// Leading handle validation header (`COMMANDS_MAGIC`) at byte offset `0`.
+    pub header: HandleHeader,
+    storage: &'a mut HostCommandsStorage,
+    allocator: &'a EntityAllocator,
+    snapshot: &'a RegistrySnapshot,
+}
+
+const _: () = assert!(core::mem::offset_of!(HostCommands<'_>, header) == 0);
+
+impl<'a> HostCommands<'a> {
+    /// Creates a stack-scoped [`HostCommands`] handle over `storage`, `allocator`, and `snapshot`.
+    #[inline]
     pub fn new(
-        queue: &'a mut CommandQueue,
+        storage: &'a mut HostCommandsStorage,
         allocator: &'a EntityAllocator,
-        registry: &'a ModRegistry,
+        snapshot: &'a RegistrySnapshot,
     ) -> Self {
         Self {
-            queue,
+            header: HandleHeader::new(COMMANDS_MAGIC),
+            storage,
             allocator,
-            registry,
+            snapshot,
         }
+    }
+
+    /// Creates a stack-scoped [`HostCommands`] handle using a caller-supplied non-zero `generation`.
+    #[inline]
+    pub const fn with_generation(
+        generation: u32,
+        storage: &'a mut HostCommandsStorage,
+        allocator: &'a EntityAllocator,
+        snapshot: &'a RegistrySnapshot,
+    ) -> Self {
+        Self {
+            header: HandleHeader::with_generation(COMMANDS_MAGIC, generation),
+            storage,
+            allocator,
+            snapshot,
+        }
+    }
+
+    /// Casts `&mut self` to an opaque `*mut BamCommands` FFI pointer.
+    #[inline]
+    pub fn as_ffi_ptr(&mut self) -> *mut BamCommands {
+        (self as *mut Self).cast::<BamCommands>()
+    }
+}
+
+impl Drop for HostCommands<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.header.poison();
     }
 }
 
@@ -48,221 +444,293 @@ fn validate_command_entity(entity: FfiEntity) -> Result<Entity, FfiResult> {
     Ok(bevy_entity)
 }
 
-/// Spawns an empty entity deferred on the Bevy world and returns its 64-bit ID immediately.
+/// Reserves a fresh empty entity atomically and writes its [`FfiEntity`] identifier into `*out_entity`.
 ///
 /// # Safety
-/// `queue` must be a valid pointer to a [`CommandQueueBridge`] or null.
-pub unsafe extern "C" fn host_cmd_spawn_empty(queue: *mut RawCommandQueue) -> FfiEntity {
-    if queue.is_null() {
-        return FfiEntity::NULL;
-    }
-    // SAFETY: Caller passes a valid pointer to `CommandQueueBridge` cast to `RawCommandQueue`.
-    let bridge = unsafe { &mut *(queue.cast::<CommandQueueBridge<'_>>()) };
-    let entity = bridge.allocator.alloc();
-    bridge.queue.push(move |world: &mut World| {
-        let _ = world.spawn_empty_at(entity);
-    });
-    FfiEntity::from_bits(entity.to_bits())
-}
-
-/// Queues deferred despawning of an entity.
-///
-/// # Safety
-/// `queue` must be a valid pointer to a [`CommandQueueBridge`] or null.
-pub unsafe extern "C" fn host_cmd_despawn(
-    queue: *mut RawCommandQueue,
-    entity: FfiEntity,
+/// - `commands` must point to an active [`HostCommands`] cast to [`BamCommands`], or null.
+/// - `out_entity` must point to writable [`FfiEntity`] storage, or null.
+pub unsafe extern "C" fn host_cmd_spawn_empty(
+    commands: *mut BamCommands,
+    out_entity: *mut FfiEntity,
 ) -> FfiResult {
-    if queue.is_null() {
+    if out_entity.is_null() {
         return FfiResult::NULL_POINTER;
     }
-    let bevy_entity = match validate_command_entity(entity) {
-        Ok(e) => e,
+    // SAFETY: Validating `commands` against `COMMANDS_MAGIC` under `STRICT_FFI_CHECKS`.
+    let cmds = match unsafe {
+        validate_handle_mut::<HostCommands<'_>>(commands.cast::<c_void>(), COMMANDS_MAGIC, false)
+    } {
+        Ok(c) => c,
         Err(err) => return err,
     };
 
-    // SAFETY: Caller passes a valid pointer to `CommandQueueBridge` cast to `RawCommandQueue`.
-    let bridge = unsafe { &mut *(queue.cast::<CommandQueueBridge<'_>>()) };
-    bridge.queue.push(move |world: &mut World| {
-        if let Ok(e) = world.get_entity_mut(bevy_entity) {
-            e.despawn();
-        }
-    });
+    let entity = cmds.allocator.alloc();
+    cmds.storage
+        .commands
+        .push(RecordedCommand::SpawnEmpty { entity });
+    // SAFETY: `out_entity` was checked non-null above and caller guarantees writable `FfiEntity`.
+    unsafe {
+        *out_entity = FfiEntity::from_bits(entity.to_bits());
+    }
     FfiResult::OK
 }
 
-/// Queues deferred component insertion onto an entity, copying foreign bytes via `MaybeUninit<u8>`
-/// without forming `&[u8]` over uninitialized struct padding bytes.
+/// Reserves a fresh entity and queues a batched `count`-component spawn (`P-05`, `C-05`).
 ///
 /// # Safety
-/// `queue` must be a valid pointer to a [`CommandQueueBridge`] or null. `component_name` must point
-/// to a valid NUL-terminated C string or null. `data` must point to at least `len` readable bytes
-/// (padding bytes may be uninitialized) when `len > 0`.
-pub unsafe extern "C" fn host_cmd_insert_component(
-    queue: *mut RawCommandQueue,
-    entity: FfiEntity,
-    component_name: *const c_char,
-    data: *const u8,
-    len: usize,
+/// - `commands` must point to an active [`HostCommands`] cast to [`BamCommands`], or null.
+/// - `out_entity` must point to writable [`FfiEntity`] storage, or null.
+/// - If `count > 0`, `components` must point to `count` readable [`BamComponent`] handles and
+///   `data_ptrs` must point to `count` pointers readable for each component's byte size.
+pub unsafe extern "C" fn host_cmd_spawn(
+    commands: *mut BamCommands,
+    components: *const BamComponent,
+    data_ptrs: *const *const u8,
+    count: usize,
+    out_entity: *mut FfiEntity,
 ) -> FfiResult {
-    if queue.is_null() || component_name.is_null() || (len > 0 && data.is_null()) {
+    if out_entity.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: Validating `commands` against `COMMANDS_MAGIC` under `STRICT_FFI_CHECKS`.
+    let cmds = match unsafe {
+        validate_handle_mut::<HostCommands<'_>>(commands.cast::<c_void>(), COMMANDS_MAGIC, false)
+    } {
+        Ok(c) => c,
+        Err(err) => return err,
+    };
+
+    if count > MAX_SPAWN_BATCH_COMPONENTS {
+        return FfiResult::CAPACITY_EXCEEDED;
+    }
+    if count == 0 {
+        let entity = cmds.allocator.alloc();
+        cmds.storage
+            .commands
+            .push(RecordedCommand::SpawnEmpty { entity });
+        // SAFETY: `out_entity` is non-null and writable.
+        unsafe {
+            *out_entity = FfiEntity::from_bits(entity.to_bits());
+        }
+        return FfiResult::OK;
+    }
+    if components.is_null() || data_ptrs.is_null() {
         return FfiResult::NULL_POINTER;
     }
 
-    // SAFETY: Caller guarantees `component_name` is a valid NUL-terminated C string.
-    let Ok(name) = (unsafe { CStr::from_ptr(component_name) }).to_str() else {
-        return FfiResult::INVALID_UTF8;
-    };
+    // Pass 1: Validate every component handle, raw-insert permission, non-null payload, and
+    // absence of duplicate `ComponentId`s BEFORE allocating an entity or mutating batch buffers.
+    let mut validated: [(ComponentId, usize, usize, *const u8); MAX_SPAWN_BATCH_COMPONENTS] =
+        [(ComponentId::new(0), 0, 1, core::ptr::null()); MAX_SPAWN_BATCH_COMPONENTS];
 
-    // SAFETY: Caller passes a valid pointer to `CommandQueueBridge` cast to `RawCommandQueue`.
-    let bridge = unsafe { &mut *(queue.cast::<CommandQueueBridge<'_>>()) };
-    let Some(comp_meta) = bridge.registry.get_by_name(name) else {
-        return FfiResult::INVALID_COMPONENT;
-    };
-    if comp_meta.is_resource {
-        return FfiResult::INVALID_COMPONENT;
-    }
+    for i in 0..count {
+        // SAFETY: `components` and `data_ptrs` are non-null and caller guarantees `count` elements.
+        let handle = unsafe { *components.add(i) };
+        // SAFETY: Same bounds guarantee for `data_ptrs[0..count]`.
+        let ptr = unsafe { *data_ptrs.add(i) };
 
-    if !comp_meta.is_dynamic && comp_meta.insert_raw_fn.is_none() {
-        return FfiResult::PERMISSION_DENIED;
-    }
-
-    if comp_meta.size != len {
-        return FfiResult::INVALID_ARGUMENT;
-    }
-
-    let bevy_entity = match validate_command_entity(entity) {
-        Ok(e) => e,
-        Err(err) => return err,
-    };
-
-    let align = comp_meta.align.max(1);
-    // SAFETY: `data` is non-null when `len > 0` and points to `len` readable bytes;
-    // `AlignedBytes::copy_from_guest` copies as `MaybeUninit<u8>` without forming `&[u8]`.
-    let mut buf = match unsafe { AlignedBytes::copy_from_guest(data, len, align) } {
-        Ok(b) => b,
-        Err(err) => return err,
-    };
-
-    if !comp_meta.is_dynamic {
-        if let Some(insert_fn) = comp_meta.insert_raw_fn {
-            bridge.queue.push(move |world: &mut World| {
-                // SAFETY: `buf` holds `comp_meta.size` bytes aligned to `align`; `insert_fn` reads
-                // `T` via `ptr::read_unaligned` without forming `&[u8]`.
-                unsafe { insert_fn(world, bevy_entity, buf.as_u8_ptr()) };
-            });
-            return FfiResult::OK;
+        let Some(meta) = cmds.snapshot.get_by_handle(handle) else {
+            return FfiResult::INVALID_COMPONENT;
+        };
+        if meta.is_resource() {
+            return FfiResult::INVALID_COMPONENT;
         }
-        return FfiResult::PERMISSION_DENIED;
-    }
-
-    let comp_id = comp_meta.component_id;
-    bridge.queue.push(move |world: &mut World| {
-        if let Ok(mut entity_mut) = world.get_entity_mut(bevy_entity) {
-            let non_null = if len > 0 {
-                core::ptr::NonNull::new(buf.as_mut_u8_ptr())
-            } else {
-                NonZeroUsize::new(align).map(core::ptr::NonNull::<u8>::without_provenance)
-            };
-            if let Some(non_null) = non_null {
-                // SAFETY: `non_null` is non-null, aligned to `align`, and points to host-allocated
-                // bytes (or a valid aligned ZST address). Ownership of the component value transfers
-                // into Bevy's table storage, while `AlignedBytes::drop` frees only the raw backing buffer.
-                let owning_ptr = unsafe { OwningPtr::new(non_null) };
-                // SAFETY: `comp_id` was registered in this `World` with the exact `(len, align)` layout.
-                unsafe {
-                    entity_mut.insert_by_id(comp_id, owning_ptr);
-                }
+        if !meta.is_dynamic && meta.insert_raw_fn.is_none() {
+            return FfiResult::PERMISSION_DENIED;
+        }
+        if meta.size > 0 && ptr.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        for prev in &validated[..i] {
+            if prev.0 == meta.component_id {
+                return FfiResult::INVALID_ARGUMENT;
             }
         }
-        drop(buf);
-    });
+        validated[i] = (meta.component_id, meta.size, meta.align, ptr);
+    }
 
+    // Pass 2: Copy payloads into `CommandArena` and record single `SpawnBatch`.
+    let batch_start = cmds.storage.batch_items.len();
+    for &(component_id, size, align, ptr) in &validated[..count] {
+        // SAFETY: `ptr` was verified non-null when `size > 0`, and caller guarantees `size` readable bytes.
+        let slice = match unsafe { cmds.storage.arena.alloc_copy_raw(ptr, size, align) } {
+            Ok(s) => s,
+            Err(err) => {
+                cmds.storage.batch_items.truncate(batch_start);
+                return err;
+            }
+        };
+        cmds.storage.batch_items.push(BatchItem {
+            component_id,
+            slice,
+        });
+    }
+
+    let entity = cmds.allocator.alloc();
+    cmds.storage.commands.push(RecordedCommand::SpawnBatch {
+        entity,
+        batch_start,
+        batch_len: count,
+    });
+    // SAFETY: `out_entity` is non-null and writable.
+    unsafe {
+        *out_entity = FfiEntity::from_bits(entity.to_bits());
+    }
     FfiResult::OK
 }
 
-/// Queues deferred removal of component `component_name` from `entity`.
+/// Queues deferred despawning of `entity`.
 ///
 /// # Safety
-/// - `queue` must be a valid pointer to a [`CommandQueueBridge`] or null.
-/// - `component_name` must point to a valid NUL-terminated UTF-8 C string or null.
-pub unsafe extern "C" fn host_cmd_remove_component(
-    queue: *mut RawCommandQueue,
+/// `commands` must point to an active [`HostCommands`] cast to [`BamCommands`], or null.
+pub unsafe extern "C" fn host_cmd_despawn(
+    commands: *mut BamCommands,
     entity: FfiEntity,
-    component_name: *const c_char,
 ) -> FfiResult {
-    if queue.is_null() || component_name.is_null() {
+    // SAFETY: Validating `commands` against `COMMANDS_MAGIC` under `STRICT_FFI_CHECKS`.
+    let cmds = match unsafe {
+        validate_handle_mut::<HostCommands<'_>>(commands.cast::<c_void>(), COMMANDS_MAGIC, false)
+    } {
+        Ok(c) => c,
+        Err(err) => return err,
+    };
+    let bevy_entity = match validate_command_entity(entity) {
+        Ok(e) => e,
+        Err(err) => return err,
+    };
+    cmds.storage.commands.push(RecordedCommand::Despawn {
+        entity: bevy_entity,
+    });
+    FfiResult::OK
+}
+
+/// Queues deferred raw byte insertion of pre-resolved `component` onto `entity` (`C-05`, `P-05`).
+///
+/// # Safety
+/// - `commands` must point to an active [`HostCommands`] cast to [`BamCommands`], or null.
+/// - If `data_len > 0`, `data_ptr` must point to at least `data_len` readable `MaybeUninit<u8>` bytes.
+pub unsafe extern "C" fn host_cmd_insert(
+    commands: *mut BamCommands,
+    entity: FfiEntity,
+    component: BamComponent,
+    data_ptr: *const u8,
+    data_len: usize,
+) -> FfiResult {
+    if data_len > 0 && data_ptr.is_null() {
         return FfiResult::NULL_POINTER;
     }
-
-    // SAFETY: Caller guarantees `component_name` is a valid NUL-terminated C string.
-    let Ok(name) = (unsafe { CStr::from_ptr(component_name) }).to_str() else {
-        return FfiResult::INVALID_UTF8;
+    // SAFETY: Validating `commands` against `COMMANDS_MAGIC` under `STRICT_FFI_CHECKS`.
+    let cmds = match unsafe {
+        validate_handle_mut::<HostCommands<'_>>(commands.cast::<c_void>(), COMMANDS_MAGIC, false)
+    } {
+        Ok(c) => c,
+        Err(err) => return err,
     };
 
-    // SAFETY: Caller passes a valid pointer to `CommandQueueBridge` cast to `RawCommandQueue`.
-    let bridge = unsafe { &mut *(queue.cast::<CommandQueueBridge<'_>>()) };
-    let Some(comp_meta) = bridge.registry.get_by_name(name) else {
+    let Some(meta) = cmds.snapshot.get_by_handle(component) else {
         return FfiResult::INVALID_COMPONENT;
     };
-    if comp_meta.is_resource {
+    if meta.is_resource() {
         return FfiResult::INVALID_COMPONENT;
     }
-
+    if !meta.is_dynamic && meta.insert_raw_fn.is_none() {
+        return FfiResult::PERMISSION_DENIED;
+    }
+    if meta.size != data_len {
+        return FfiResult::INVALID_ARGUMENT;
+    }
     let bevy_entity = match validate_command_entity(entity) {
         Ok(e) => e,
         Err(err) => return err,
     };
 
-    let comp_id = comp_meta.component_id;
-    bridge.queue.push(move |world: &mut World| {
-        if let Ok(mut entity_mut) = world.get_entity_mut(bevy_entity) {
-            entity_mut.remove_by_id(comp_id);
-        }
-    });
+    // SAFETY: `data_ptr` is non-null when `data_len > 0` and readable for `meta.size` bytes.
+    let slice = match unsafe {
+        cmds.storage
+            .arena
+            .alloc_copy_raw(data_ptr, meta.size, meta.align)
+    } {
+        Ok(s) => s,
+        Err(err) => return err,
+    };
 
+    cmds.storage.commands.push(RecordedCommand::Insert {
+        entity: bevy_entity,
+        component,
+        slice,
+    });
     FfiResult::OK
 }
 
-/// Queues deferred insertion of host-constructed `T::default()` for `component_name` onto `entity`.
+/// Queues deferred insertion of host-constructed `T::default()` for `component` on `entity`.
 ///
 /// # Safety
-/// - `queue` must be a valid pointer to a [`CommandQueueBridge`] or null.
-/// - `component_name` must point to a valid NUL-terminated UTF-8 C string or null.
+/// `commands` must point to an active [`HostCommands`] cast to [`BamCommands`], or null.
 pub unsafe extern "C" fn host_cmd_insert_default(
-    queue: *mut RawCommandQueue,
+    commands: *mut BamCommands,
     entity: FfiEntity,
-    component_name: *const c_char,
+    component: BamComponent,
 ) -> FfiResult {
-    if queue.is_null() || component_name.is_null() {
-        return FfiResult::NULL_POINTER;
-    }
-
-    // SAFETY: Caller guarantees `component_name` is a valid NUL-terminated C string.
-    let Ok(name) = (unsafe { CStr::from_ptr(component_name) }).to_str() else {
-        return FfiResult::INVALID_UTF8;
+    // SAFETY: Validating `commands` against `COMMANDS_MAGIC` under `STRICT_FFI_CHECKS`.
+    let cmds = match unsafe {
+        validate_handle_mut::<HostCommands<'_>>(commands.cast::<c_void>(), COMMANDS_MAGIC, false)
+    } {
+        Ok(c) => c,
+        Err(err) => return err,
     };
 
-    // SAFETY: Caller passes a valid pointer to `CommandQueueBridge` cast to `RawCommandQueue`.
-    let bridge = unsafe { &mut *(queue.cast::<CommandQueueBridge<'_>>()) };
-    let Some(comp_meta) = bridge.registry.get_by_name(name) else {
+    let Some(meta) = cmds.snapshot.get_by_handle(component) else {
         return FfiResult::INVALID_COMPONENT;
     };
-    if comp_meta.is_resource {
+    if meta.is_resource() {
         return FfiResult::INVALID_COMPONENT;
     }
-    let Some(insert_default_fn) = comp_meta.insert_default_fn else {
+    let Some(insert_fn) = meta.insert_default_fn else {
         return FfiResult::PERMISSION_DENIED;
     };
-
     let bevy_entity = match validate_command_entity(entity) {
         Ok(e) => e,
         Err(err) => return err,
     };
 
-    bridge.queue.push(move |world: &mut World| {
-        insert_default_fn(world, bevy_entity);
+    cmds.storage.commands.push(RecordedCommand::InsertDefault {
+        entity: bevy_entity,
+        insert_fn,
     });
+    FfiResult::OK
+}
 
+/// Queues deferred removal of pre-resolved `component` from `entity`.
+///
+/// # Safety
+/// `commands` must point to an active [`HostCommands`] cast to [`BamCommands`], or null.
+pub unsafe extern "C" fn host_cmd_remove(
+    commands: *mut BamCommands,
+    entity: FfiEntity,
+    component: BamComponent,
+) -> FfiResult {
+    // SAFETY: Validating `commands` against `COMMANDS_MAGIC` under `STRICT_FFI_CHECKS`.
+    let cmds = match unsafe {
+        validate_handle_mut::<HostCommands<'_>>(commands.cast::<c_void>(), COMMANDS_MAGIC, false)
+    } {
+        Ok(c) => c,
+        Err(err) => return err,
+    };
+
+    let Some(meta) = cmds.snapshot.get_by_handle(component) else {
+        return FfiResult::INVALID_COMPONENT;
+    };
+    if meta.is_resource() {
+        return FfiResult::INVALID_COMPONENT;
+    }
+    let bevy_entity = match validate_command_entity(entity) {
+        Ok(e) => e,
+        Err(err) => return err,
+    };
+
+    cmds.storage.commands.push(RecordedCommand::Remove {
+        entity: bevy_entity,
+        component_id: meta.component_id,
+    });
     FfiResult::OK
 }

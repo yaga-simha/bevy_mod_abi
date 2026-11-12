@@ -1,7 +1,12 @@
-//! Archetype and table chunk traversal and C-ABI column access functions.
+//! Dense chunk and indirect sparse-row query iterator (`HostIter`)
+//! (`C-05`, `C-13`, `P-01..P-04`, `S-08`, `N-02`).
 
-use crate::registry::ModRegistry;
-use bevy_abi_mod_sys::{ComponentAccessMode, FfiEntity, FfiResult, RawChunkIter};
+use crate::handle_header::{HandleHeader, ITER_MAGIC, validate_handle_mut, validate_handle_ref};
+use bevy_abi_mod_sys::{
+    AccessMode, BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET,
+    BamColumnInfo, BamComponent, BamIter, ComponentUuid, FfiBool, FfiEntity, FfiResult,
+    MAX_TERMS_PER_QUERY,
+};
 use bevy_ecs::archetype::{ArchetypeId, Archetypes};
 use bevy_ecs::change_detection::{AtomicTick, Tick};
 use bevy_ecs::component::ComponentId;
@@ -9,35 +14,172 @@ use bevy_ecs::entity::Entity;
 use bevy_ecs::storage::{SparseSets, Table, TableId, TableRow, Tables};
 use bevy_ecs::world::unsafe_world_cell::UnsafeWorldCell;
 use core::cell::UnsafeCell;
-use core::ffi::{CStr, c_char};
+use core::ffi::c_void;
 use nonmax::NonMaxU32;
 
 // Compile-time layout assertions guarding zero-copy `Entity` -> `FfiEntity` slice casts.
 const _: () = assert!(core::mem::size_of::<Entity>() == core::mem::size_of::<FfiEntity>());
 const _: () = assert!(core::mem::align_of::<Entity>() == core::mem::align_of::<FfiEntity>());
+const _: () = assert!(core::mem::size_of::<*mut u8>() == core::mem::size_of::<*const u8>());
 
-/// Maximum number of component columns supported per single query.
-pub const MAX_QUERY_COMPONENTS: usize = 32;
-
-/// Descriptor of a queried component column inside a dynamic system.
+/// Pre-resolved metadata for one term inside a `BamQueryDesc` (`0..MAX_TERMS_PER_QUERY`).
 #[derive(Clone, Copy, Debug)]
-pub struct QueryColumnDesc {
-    /// Bevy component ID assigned in the host world.
+pub struct QueryTermMeta {
+    /// 1-based [`BamComponent`] handle.
+    pub component: BamComponent,
+    /// Bevy [`ComponentId`] assigned in the host `World`.
     pub component_id: ComponentId,
-    /// Requested access mode (`READ`, `WRITE`, `FILTER_ONLY`, `WITHOUT`, etc.).
-    pub mode: ComponentAccessMode,
-    /// Byte stride of the component type.
-    pub stride: usize,
+    /// Declared [`AccessMode`].
+    pub mode: AccessMode,
+    /// Registered 128-bit [`ComponentUuid`].
+    pub uuid: ComponentUuid,
+    /// Byte size (`size_of::<T>()`).
+    pub size: usize,
+    /// Byte alignment (`align_of::<T>()`).
+    pub align: usize,
+    /// Bitmask of `BAM_STORAGE_FLAG_*`.
+    pub storage_flags: u32,
 }
 
-/// Active column state cached for the current chunk.
-struct ActiveColumn<'w> {
+impl QueryTermMeta {
+    /// Returns `true` if this term uses `StorageType::SparseSet`.
+    #[inline]
+    pub const fn is_sparse_set(&self) -> bool {
+        (self.storage_flags & BAM_STORAGE_FLAG_SPARSE_SET) != 0
+    }
+
+    /// Returns `true` if this term is immutable (`BAM_STORAGE_FLAG_IMMUTABLE`).
+    #[inline]
+    pub const fn is_immutable(&self) -> bool {
+        (self.storage_flags & BAM_STORAGE_FLAG_IMMUTABLE) != 0
+    }
+
+    /// Returns `true` if this term refers to a singleton Bevy `Resource`.
+    #[inline]
+    pub const fn is_resource(&self) -> bool {
+        (self.storage_flags & BAM_STORAGE_FLAG_RESOURCE) != 0
+    }
+}
+
+/// Precomputed tick-filter term (`Changed<T>` or `Added<T>`) resolved at `GuestSystem::initialize` (`P-01`).
+#[derive(Clone, Copy, Debug)]
+pub struct TickFilterTerm {
+    /// Target Bevy [`ComponentId`].
+    pub component_id: ComponentId,
+    /// `true` for `AccessMode::ADDED`, `false` for `AccessMode::CHANGED`.
+    pub is_added: bool,
+    /// `true` if stored in `SparseSets` rather than `Table`.
+    pub is_sparse: bool,
+}
+
+/// Precomputed static layout and term plan for a `BamQueryDesc` (`P-01`, `P-02`, `P-03`).
+#[derive(Clone, Debug, Default)]
+pub struct QueryPlan {
+    /// Term metadata in declaration order (`0..term_count`).
+    pub terms: Vec<QueryTermMeta>,
+    /// Precomputed indices (`0..term_count`) of dense `Table` data columns (`P-03`).
+    pub dense_data_indices: Vec<u8>,
+    /// Bitmask of `term_index`es backed by `StorageType::SparseSet` with entity column data.
+    pub sparse_data_mask: u32,
+    /// Bitmask of `term_index`es backed by `StorageType::Table` with entity column data.
+    pub dense_data_mask: u32,
+    /// Precomputed `Changed<T>` / `Added<T>` filter terms (`P-01`).
+    pub tick_filters: Vec<TickFilterTerm>,
+    /// `true` when `terms.is_empty()` or at least one term is an entity term (`!mode.is_resource()`).
+    pub has_entity_terms: bool,
+}
+
+impl QueryPlan {
+    /// Builds a [`QueryPlan`] directly from a slice of [`QueryTermMeta`]s (useful for unit tests
+    /// as well as `GuestSystem::initialize`).
+    pub fn from_terms(terms: Vec<QueryTermMeta>) -> Self {
+        let mut dense_data_indices = Vec::new();
+        let mut sparse_data_mask = 0u32;
+        let mut dense_data_mask = 0u32;
+        let mut tick_filters = Vec::new();
+        let has_entity_terms = terms.is_empty() || terms.iter().any(|t| !t.mode.is_resource());
+
+        for (i, t) in terms.iter().enumerate().take(MAX_TERMS_PER_QUERY) {
+            if t.mode.is_tick_filter() {
+                tick_filters.push(TickFilterTerm {
+                    component_id: t.component_id,
+                    is_added: t.mode == AccessMode::ADDED,
+                    is_sparse: t.is_sparse_set(),
+                });
+            }
+
+            if !t.mode.has_entity_column_data() || t.is_resource() {
+                continue;
+            }
+
+            // If a tick filter (`Changed<T>` / `Added<T>`) shares a `component_id` with a
+            // `WRITE` / `OPTIONAL_WRITE` term in the same query, suppress column data on the
+            // read-filter term so both cannot alias `&mut T` and `&T` simultaneously.
+            if t.mode.is_tick_filter()
+                && terms.iter().any(|other| {
+                    other.component_id == t.component_id
+                        && (other.mode == AccessMode::WRITE
+                            || other.mode == AccessMode::OPTIONAL_WRITE)
+                })
+            {
+                continue;
+            }
+
+            if t.is_sparse_set() {
+                sparse_data_mask |= 1u32 << i;
+            } else {
+                dense_data_mask |= 1u32 << i;
+                dense_data_indices.push(i as u8);
+            }
+        }
+
+        Self {
+            terms,
+            dense_data_indices,
+            sparse_data_mask,
+            dense_data_mask,
+            tick_filters,
+            has_entity_terms,
+        }
+    }
+}
+
+/// Per-query-group reusable scratch storage for indirect sparse-set row pointer batching (`P-02`).
+#[derive(Default)]
+pub struct SparseRowScratch {
+    entities: Vec<FfiEntity>,
+    row_ptrs: Vec<Vec<*mut u8>>,
+    tick_ptrs: Vec<Vec<*const UnsafeCell<Tick>>>,
+    summary_ptrs: Vec<Option<*const AtomicTick>>,
+}
+
+// SAFETY: `SparseRowScratch` holds temporary pointers only during an active single-threaded
+// `GuestSystem::run_unsafe` chunk; all slices are cleared/overwritten before dereferencing and
+// never accessed across threads.
+unsafe impl Send for SparseRowScratch {}
+// SAFETY: Shared references to `GuestSystem` never read or dereference `SparseRowScratch`.
+unsafe impl Sync for SparseRowScratch {}
+
+impl SparseRowScratch {
+    /// Ensures inner per-term vectors cover `term_count` terms.
+    pub fn ensure_terms(&mut self, term_count: usize) {
+        if self.row_ptrs.len() < term_count {
+            self.row_ptrs.resize_with(term_count, Vec::new);
+            self.tick_ptrs.resize_with(term_count, Vec::new);
+            self.summary_ptrs.resize(term_count, None);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ActiveDenseColumn<'w> {
     data_ptr: *mut u8,
     changed_ticks: &'w [UnsafeCell<Tick>],
     summary_tick: Option<&'w AtomicTick>,
 }
 
 enum IterBacking<'w> {
+    ResourceOnly,
     DenseTables {
         matched_tables: &'w [TableId],
         table_cursor: usize,
@@ -49,239 +191,221 @@ enum IterBacking<'w> {
         matched_archetypes: &'w [ArchetypeId],
         archetype_cursor: usize,
         entity_cursor: usize,
-        sparse_column_mask: u32,
     },
 }
 
-/// Host-side concrete chunk iterator backing the opaque [`RawChunkIter`] handle.
-pub struct HostChunkIter<'w> {
-    tables: &'w Tables,
+/// Concrete `#[repr(C)]` host chunk and resource iterator backing opaque [`BamIter`] (`S-08`, `N-02`).
+#[repr(C)]
+pub struct HostIter<'w> {
+    /// Leading handle validation header (`ITER_MAGIC`) at byte offset `0`.
+    pub header: HandleHeader,
+    tables: Option<&'w Tables>,
     backing: IterBacking<'w>,
-    query_columns: &'w [QueryColumnDesc],
+    plan: &'w QueryPlan,
     last_run: Tick,
     this_run: Tick,
-    has_tick_filters: bool,
-
     world: Option<UnsafeWorldCell<'w>>,
-    registry: Option<&'w ModRegistry>,
-    declared_resources: &'w [(ComponentId, bool)],
+    sparse_scratch: Option<&'w mut SparseRowScratch>,
 
     current_entities_ptr: *const FfiEntity,
     current_entity_count: usize,
-    active_columns: [Option<ActiveColumn<'w>>; MAX_QUERY_COMPONENTS],
+    /// Bitmask tracking which writable terms have already marked ticks in the current chunk (`P-04`).
+    marked_changed_mask: u32,
+    /// Bitmask tracking which sparse terms have materialized indirect row pointers in the current chunk (`P-02`).
+    materialized_sparse_mask: u32,
+    /// Bitmask tracking which sparse terms are actually present on the current archetype.
+    present_sparse_mask: u32,
+    active_columns: [Option<ActiveDenseColumn<'w>>; MAX_TERMS_PER_QUERY],
 }
 
-impl<'w> HostChunkIter<'w> {
-    /// Creates a dense table chunk iterator for queries whose accessed and filtered components all
-    /// use [`StorageType::Table`](bevy_ecs::component::StorageType::Table).
-    pub fn new(
+const _: () = assert!(core::mem::offset_of!(HostIter<'_>, header) == 0);
+
+impl<'w> HostIter<'w> {
+    /// Constructs a dense `Table` chunk iterator (`P-01`, `P-03`, `P-04`).
+    pub fn new_dense(
         tables: &'w Tables,
         matched_tables: &'w [TableId],
-        query_columns: &'w [QueryColumnDesc],
+        plan: &'w QueryPlan,
+        last_run: Tick,
         this_run: Tick,
     ) -> Self {
-        const INIT_COL: Option<ActiveColumn<'static>> = None;
-        let has_tick_filters = query_columns.iter().any(|c| c.mode.is_tick_filter());
-        let last_run = Tick::new(this_run.get().wrapping_sub(Tick::MAX.get()));
-        Self {
-            tables,
-            backing: IterBacking::DenseTables {
+        let backing = if plan.has_entity_terms {
+            IterBacking::DenseTables {
                 matched_tables,
                 table_cursor: 0,
                 row_cursor: 0,
-            },
-            query_columns,
+            }
+        } else {
+            IterBacking::ResourceOnly
+        };
+        Self {
+            header: HandleHeader::new(ITER_MAGIC),
+            tables: Some(tables),
+            backing,
+            plan,
             last_run,
             this_run,
-            has_tick_filters,
             world: None,
-            registry: None,
-            declared_resources: &[],
+            sparse_scratch: None,
             current_entities_ptr: core::ptr::null(),
             current_entity_count: 0,
-            active_columns: [INIT_COL; MAX_QUERY_COMPONENTS],
+            marked_changed_mask: 0,
+            materialized_sparse_mask: 0,
+            present_sparse_mask: 0,
+            active_columns: [None; MAX_TERMS_PER_QUERY],
         }
     }
 
-    /// Creates an archetype-aware chunk iterator for queries involving at least one
-    /// [`StorageType::SparseSet`](bevy_ecs::component::StorageType::SparseSet) component.
+    /// Constructs an archetype-aware iterator supporting indirect `SparseSet` row batching (`P-02`).
+    #[allow(clippy::too_many_arguments)]
     pub fn new_archetypal(
         tables: &'w Tables,
         archetypes: &'w Archetypes,
         sparse_sets: &'w SparseSets,
         matched_archetypes: &'w [ArchetypeId],
-        query_columns: &'w [QueryColumnDesc],
-        sparse_column_mask: u32,
+        plan: &'w QueryPlan,
+        sparse_scratch: &'w mut SparseRowScratch,
+        last_run: Tick,
         this_run: Tick,
     ) -> Self {
-        const INIT_COL: Option<ActiveColumn<'static>> = None;
-        let has_tick_filters = query_columns.iter().any(|c| c.mode.is_tick_filter());
-        let last_run = Tick::new(this_run.get().wrapping_sub(Tick::MAX.get()));
-        Self {
-            tables,
-            backing: IterBacking::Archetypes {
+        sparse_scratch.ensure_terms(plan.terms.len());
+        let backing = if plan.has_entity_terms {
+            IterBacking::Archetypes {
                 archetypes,
                 sparse_sets,
                 matched_archetypes,
                 archetype_cursor: 0,
                 entity_cursor: 0,
-                sparse_column_mask,
-            },
-            query_columns,
+            }
+        } else {
+            IterBacking::ResourceOnly
+        };
+        Self {
+            header: HandleHeader::new(ITER_MAGIC),
+            tables: Some(tables),
+            backing,
+            plan,
             last_run,
             this_run,
-            has_tick_filters,
             world: None,
-            registry: None,
-            declared_resources: &[],
+            sparse_scratch: Some(sparse_scratch),
             current_entities_ptr: core::ptr::null(),
             current_entity_count: 0,
-            active_columns: [INIT_COL; MAX_QUERY_COMPONENTS],
+            marked_changed_mask: 0,
+            materialized_sparse_mask: 0,
+            present_sparse_mask: 0,
+            active_columns: [None; MAX_TERMS_PER_QUERY],
         }
     }
 
-    /// Sets the system's previous run tick (`last_run`) used to evaluate `Changed<T>` and `Added<T>`.
+    /// Overrides the handle generation (for zero-atomic per-frame initialization when `generation != 0`).
     #[inline]
-    pub fn with_last_run(mut self, last_run: Tick) -> Self {
-        self.last_run = last_run;
+    pub fn with_generation(mut self, generation: u32) -> Self {
+        self.header = HandleHeader::with_generation(ITER_MAGIC, generation);
         self
     }
 
-    /// Attaches singleton Bevy `Resource` access context (`UnsafeWorldCell` + declared permissions).
+    /// Attaches `UnsafeWorldCell` so `res_ptr` and `res_mut_ptr` can resolve singleton resources.
     #[inline]
-    pub fn with_resources(
-        mut self,
-        world: UnsafeWorldCell<'w>,
-        registry: &'w ModRegistry,
-        declared_resources: &'w [(ComponentId, bool)],
-    ) -> Self {
+    pub fn with_world(mut self, world: UnsafeWorldCell<'w>) -> Self {
         self.world = Some(world);
-        self.registry = Some(registry);
-        self.declared_resources = declared_resources;
         self
     }
 
+    /// Casts `&mut self` to an opaque `*mut BamIter` FFI pointer.
     #[inline]
-    fn row_matches_dense_tick_filters(
-        table: &'w Table,
-        table_len: usize,
+    pub fn as_ffi_ptr(&mut self) -> *mut BamIter {
+        (self as *mut Self).cast::<BamIter>()
+    }
+
+    #[inline(always)]
+    fn row_matches_dense_slices(
+        slices: &[&[UnsafeCell<Tick>]],
         row: usize,
-        query_columns: &'w [QueryColumnDesc],
         last_run: Tick,
         this_run: Tick,
     ) -> bool {
-        for q in query_columns {
-            match q.mode {
-                ComponentAccessMode::CHANGED => {
-                    let Some(col) = table.get_column(q.component_id) else {
-                        return false;
-                    };
-                    // SAFETY: `table_len == table.entity_count() as usize` and `row < table_len`.
-                    let ticks = unsafe { col.get_changed_ticks_slice(table_len) };
-                    // SAFETY: Read-only access to component ticks was declared in `FilteredAccess`.
-                    let tick = unsafe { *ticks[row].get() };
-                    if !tick.is_newer_than(last_run, this_run) {
-                        return false;
-                    }
-                }
-                ComponentAccessMode::ADDED => {
-                    let Some(col) = table.get_column(q.component_id) else {
-                        return false;
-                    };
-                    // SAFETY: `table_len == table.entity_count() as usize` and `row < table_len`.
-                    let ticks = unsafe { col.get_added_ticks_slice(table_len) };
-                    // SAFETY: Read-only access to component ticks was declared in `FilteredAccess`.
-                    let tick = unsafe { *ticks[row].get() };
-                    if !tick.is_newer_than(last_run, this_run) {
-                        return false;
-                    }
-                }
-                _ => {}
-            }
+        let mut ok = true;
+        for ticks in slices {
+            // SAFETY: `row < table_len == ticks.len()`, and shared tick access was declared in `FilteredAccess`.
+            let tick = unsafe { *ticks.get_unchecked(row).get() };
+            ok &= tick.is_newer_than(last_run, this_run);
         }
-        true
+        ok
     }
 
     #[inline]
     #[allow(clippy::too_many_arguments)]
-    fn entity_matches_archetypal_tick_filters(
-        table: &'w Table,
-        table_len: usize,
+    fn entity_matches_archetypal_filters(
+        dense_slices: &[(usize, &[UnsafeCell<Tick>])],
         sparse_sets: &'w SparseSets,
+        tick_filters: &[TickFilterTerm],
         entity: Entity,
         table_row_idx: usize,
-        query_columns: &'w [QueryColumnDesc],
+        table_len: usize,
         last_run: Tick,
         this_run: Tick,
     ) -> bool {
-        for q in query_columns {
-            match q.mode {
-                ComponentAccessMode::CHANGED => {
-                    let tick = if let Some(col) = table.get_column(q.component_id) {
-                        if table_row_idx >= table_len {
-                            return false;
-                        }
-                        // SAFETY: `table_len == table.entity_count() as usize` and `table_row_idx < table_len`.
-                        let ticks = unsafe { col.get_changed_ticks_slice(table_len) };
-                        // SAFETY: Read-only access to component ticks was declared in `FilteredAccess`.
-                        unsafe { *ticks[table_row_idx].get() }
-                    } else if let Some(sparse_set) = sparse_sets.get(q.component_id) {
-                        let Some(tick_cell) = sparse_set.get_changed_tick(entity) else {
-                            return false;
-                        };
-                        // SAFETY: Read-only access to sparse component ticks was declared in `FilteredAccess`.
-                        unsafe { *tick_cell.get() }
-                    } else {
-                        return false;
-                    };
-                    if !tick.is_newer_than(last_run, this_run) {
-                        return false;
-                    }
-                }
-                ComponentAccessMode::ADDED => {
-                    let tick = if let Some(col) = table.get_column(q.component_id) {
-                        if table_row_idx >= table_len {
-                            return false;
-                        }
-                        // SAFETY: `table_len == table.entity_count() as usize` and `table_row_idx < table_len`.
-                        let ticks = unsafe { col.get_added_ticks_slice(table_len) };
-                        // SAFETY: Read-only access to component ticks was declared in `FilteredAccess`.
-                        unsafe { *ticks[table_row_idx].get() }
-                    } else if let Some(sparse_set) = sparse_sets.get(q.component_id) {
-                        let Some(tick_cell) = sparse_set.get_added_tick(entity) else {
-                            return false;
-                        };
-                        // SAFETY: Read-only access to sparse component ticks was declared in `FilteredAccess`.
-                        unsafe { *tick_cell.get() }
-                    } else {
-                        return false;
-                    };
-                    if !tick.is_newer_than(last_run, this_run) {
-                        return false;
-                    }
-                }
-                _ => {}
+        if table_row_idx >= table_len {
+            return false;
+        }
+        for &(_, ticks) in dense_slices {
+            // SAFETY: `table_row_idx < table_len == ticks.len()`.
+            let tick = unsafe { *ticks.get_unchecked(table_row_idx).get() };
+            if !tick.is_newer_than(last_run, this_run) {
+                return false;
+            }
+        }
+        for tf in tick_filters {
+            if !tf.is_sparse {
+                continue;
+            }
+            let Some(ss) = sparse_sets.get(tf.component_id) else {
+                return false;
+            };
+            let tick_cell = if tf.is_added {
+                ss.get_added_tick(entity)
+            } else {
+                ss.get_changed_tick(entity)
+            };
+            let Some(cell) = tick_cell else {
+                return false;
+            };
+            // SAFETY: Shared sparse component tick access was declared in `FilteredAccess`.
+            let tick = unsafe { *cell.get() };
+            if !tick.is_newer_than(last_run, this_run) {
+                return false;
             }
         }
         true
     }
 
-    /// Advances to the next non-empty matching chunk, returning 0 when exhausted.
+    /// Advances to the next non-empty matching chunk, returning `0` when exhausted.
     pub fn next_chunk(&mut self) -> usize {
-        let has_tick_filters = self.has_tick_filters;
         let last_run = self.last_run;
         let this_run = self.this_run;
-        let query_columns = self.query_columns;
+        let plan = self.plan;
+        let Some(tables) = self.tables else {
+            self.clear_active_chunk();
+            return 0;
+        };
 
         match self.backing {
+            IterBacking::ResourceOnly => {
+                self.clear_active_chunk();
+                return 0;
+            }
             IterBacking::DenseTables {
                 matched_tables,
                 ref mut table_cursor,
                 ref mut row_cursor,
             } => {
+                let tick_filters = plan.tick_filters.as_slice();
+                let has_tick_filters = !tick_filters.is_empty();
+
                 while *table_cursor < matched_tables.len() {
                     let table_id = matched_tables[*table_cursor];
-                    let Some(table) = self.tables.get(table_id) else {
+                    let Some(table) = tables.get(table_id) else {
                         *table_cursor += 1;
                         *row_cursor = 0;
                         continue;
@@ -299,17 +423,48 @@ impl<'w> HostChunkIter<'w> {
                         *row_cursor = 0;
                         self.current_entities_ptr = table.entities().as_ptr().cast::<FfiEntity>();
                         self.current_entity_count = count;
-                        self.populate_dense_table_range_columns(table, count, 0, count);
+                        self.populate_dense_columns(table, count, 0, count);
                         return count;
                     }
 
+                    // P-01: Resolve all tick-filter slices ONCE per table, and skip the entire
+                    // table in O(1) if any `Changed<T>` summary tick is not newer than `last_run`.
+                    let mut filter_slices: [&[UnsafeCell<Tick>]; MAX_TERMS_PER_QUERY] =
+                        [&[]; MAX_TERMS_PER_QUERY];
+                    let mut skip_table = false;
+                    for (f_idx, tf) in tick_filters.iter().enumerate() {
+                        let Some(col) = table.get_column(tf.component_id) else {
+                            skip_table = true;
+                            break;
+                        };
+                        if !tf.is_added
+                            && let Some(summary) = col.get_summary_tick()
+                            && !summary.get().is_newer_than(last_run, this_run)
+                        {
+                            skip_table = true;
+                            break;
+                        }
+                        filter_slices[f_idx] = if tf.is_added {
+                            // SAFETY: `count == table.entity_count() as usize`.
+                            unsafe { col.get_added_ticks_slice(count) }
+                        } else {
+                            // SAFETY: `count == table.entity_count() as usize`.
+                            unsafe { col.get_changed_ticks_slice(count) }
+                        };
+                    }
+
+                    if skip_table {
+                        *table_cursor += 1;
+                        *row_cursor = 0;
+                        continue;
+                    }
+
+                    let active_slices = &filter_slices[..tick_filters.len()];
                     let mut start_row_idx = *row_cursor;
                     while start_row_idx < count
-                        && !Self::row_matches_dense_tick_filters(
-                            table,
-                            count,
+                        && !Self::row_matches_dense_slices(
+                            active_slices,
                             start_row_idx,
-                            query_columns,
                             last_run,
                             this_run,
                         )
@@ -325,11 +480,9 @@ impl<'w> HostChunkIter<'w> {
 
                     let mut run_len = 1usize;
                     while start_row_idx + run_len < count
-                        && Self::row_matches_dense_tick_filters(
-                            table,
-                            count,
+                        && Self::row_matches_dense_slices(
+                            active_slices,
                             start_row_idx + run_len,
-                            query_columns,
                             last_run,
                             this_run,
                         )
@@ -352,7 +505,7 @@ impl<'w> HostChunkIter<'w> {
                             .cast::<FfiEntity>()
                     };
                     self.current_entity_count = run_len;
-                    self.populate_dense_table_range_columns(table, count, start_row_idx, run_len);
+                    self.populate_dense_columns(table, count, start_row_idx, run_len);
                     return run_len;
                 }
             }
@@ -362,8 +515,11 @@ impl<'w> HostChunkIter<'w> {
                 matched_archetypes,
                 ref mut archetype_cursor,
                 ref mut entity_cursor,
-                sparse_column_mask,
             } => {
+                let tick_filters = plan.tick_filters.as_slice();
+                let has_tick_filters = !tick_filters.is_empty();
+                let require_contiguous_table_rows = plan.dense_data_mask != 0;
+
                 while *archetype_cursor < matched_archetypes.len() {
                     let arch_id = matched_archetypes[*archetype_cursor];
                     let Some(archetype) = archetypes.get(arch_id) else {
@@ -379,23 +535,64 @@ impl<'w> HostChunkIter<'w> {
                         continue;
                     }
 
-                    let Some(table) = self.tables.get(archetype.table_id()) else {
+                    let Some(table) = tables.get(archetype.table_id()) else {
                         *archetype_cursor += 1;
                         *entity_cursor = 0;
                         continue;
                     };
                     let table_len = table.entity_count() as usize;
 
+                    // Pre-resolve any dense tick-filter slices once for this archetype's table.
+                    let mut dense_filter_slices: [(usize, &[UnsafeCell<Tick>]);
+                        MAX_TERMS_PER_QUERY] = [(0, &[]); MAX_TERMS_PER_QUERY];
+                    let mut dense_filter_count = 0usize;
+                    let mut skip_arch = false;
+                    if has_tick_filters {
+                        for (f_idx, tf) in tick_filters.iter().enumerate() {
+                            if tf.is_sparse {
+                                continue;
+                            }
+                            let Some(col) = table.get_column(tf.component_id) else {
+                                skip_arch = true;
+                                break;
+                            };
+                            if !tf.is_added
+                                && let Some(summary) = col.get_summary_tick()
+                                && !summary.get().is_newer_than(last_run, this_run)
+                            {
+                                skip_arch = true;
+                                break;
+                            }
+                            let slice = if tf.is_added {
+                                // SAFETY: `table_len == table.entity_count() as usize`.
+                                unsafe { col.get_added_ticks_slice(table_len) }
+                            } else {
+                                // SAFETY: `table_len == table.entity_count() as usize`.
+                                unsafe { col.get_changed_ticks_slice(table_len) }
+                            };
+                            dense_filter_slices[dense_filter_count] = (f_idx, slice);
+                            dense_filter_count += 1;
+                        }
+                    }
+
+                    if skip_arch {
+                        *archetype_cursor += 1;
+                        *entity_cursor = 0;
+                        continue;
+                    }
+
+                    let active_dense_filters = &dense_filter_slices[..dense_filter_count];
+
                     if has_tick_filters {
                         while *entity_cursor < arch_entities.len() {
                             let cand = &arch_entities[*entity_cursor];
-                            if Self::entity_matches_archetypal_tick_filters(
-                                table,
-                                table_len,
+                            if Self::entity_matches_archetypal_filters(
+                                active_dense_filters,
                                 sparse_sets,
+                                tick_filters,
                                 cand.id(),
                                 cand.table_row().index(),
-                                query_columns,
+                                table_len,
                                 last_run,
                                 this_run,
                             ) {
@@ -410,65 +607,123 @@ impl<'w> HostChunkIter<'w> {
                         }
                     }
 
-                    let first = &arch_entities[*entity_cursor];
-                    let first_entity = first.id();
-                    let start_row = first.table_row();
-                    let start_row_idx = start_row.index();
+                    let start_entity_idx = *entity_cursor;
+                    let first = &arch_entities[start_entity_idx];
+                    let start_row_idx = first.table_row().index();
+                    let mut contiguous_table_rows = true;
 
-                    let run_len = if sparse_column_mask == 0 {
-                        let mut len = 1usize;
-                        while *entity_cursor + len < arch_entities.len() {
-                            let next_ent = &arch_entities[*entity_cursor + len];
-                            if next_ent.table_row().index() != start_row_idx + len {
+                    // P-02: Batch multi-entity runs even when `sparse_data_mask != 0`!
+                    let mut run_len = 1usize;
+                    while start_entity_idx + run_len < arch_entities.len() {
+                        let next_ent = &arch_entities[start_entity_idx + run_len];
+                        let next_row_idx = next_ent.table_row().index();
+                        if next_row_idx != start_row_idx + run_len {
+                            if require_contiguous_table_rows {
                                 break;
                             }
-                            if has_tick_filters
-                                && !Self::entity_matches_archetypal_tick_filters(
-                                    table,
-                                    table_len,
-                                    sparse_sets,
-                                    next_ent.id(),
-                                    start_row_idx + len,
-                                    query_columns,
-                                    last_run,
-                                    this_run,
-                                )
-                            {
-                                break;
-                            }
-                            len += 1;
+                            contiguous_table_rows = false;
                         }
-                        *entity_cursor += len;
-                        len
-                    } else {
-                        *entity_cursor += 1;
-                        1usize
-                    };
-
-                    if start_row_idx + run_len > table_len {
-                        continue;
+                        if has_tick_filters
+                            && !Self::entity_matches_archetypal_filters(
+                                active_dense_filters,
+                                sparse_sets,
+                                tick_filters,
+                                next_ent.id(),
+                                next_row_idx,
+                                table_len,
+                                last_run,
+                                this_run,
+                            )
+                        {
+                            break;
+                        }
+                        run_len += 1;
                     }
 
-                    // SAFETY: `start_row_idx + run_len <= table.entities().len()`, and `Entity`
-                    // matches the size, alignment, and `to_bits()` bit-layout of `FfiEntity`.
-                    self.current_entities_ptr = unsafe {
-                        table
-                            .entities()
-                            .as_ptr()
-                            .add(start_row_idx)
-                            .cast::<FfiEntity>()
-                    };
+                    *entity_cursor = start_entity_idx + run_len;
+                    if *entity_cursor >= arch_entities.len() {
+                        *archetype_cursor += 1;
+                        *entity_cursor = 0;
+                    }
+
+                    self.clear_active_chunk();
                     self.current_entity_count = run_len;
-                    self.populate_archetypal_columns(
-                        table,
-                        table_len,
-                        sparse_sets,
-                        first_entity,
-                        start_row,
-                        start_row_idx,
-                        run_len,
-                        sparse_column_mask,
-                    );
+
+                    if contiguous_table_rows && start_row_idx + run_len <= table_len {
+                        // SAFETY: `start_row_idx + run_len <= table_len == table.entities().len()`.
+                        self.current_entities_ptr = unsafe {
+                            table
+                                .entities()
+                                .as_ptr()
+                                .add(start_row_idx)
+                                .cast::<FfiEntity>()
+                        };
+                    } else if let Some(ref mut scratch) = self.sparse_scratch {
+                        scratch.entities.clear();
+                        scratch.entities.reserve(run_len);
+                        for arch_ent in &arch_entities[start_entity_idx..start_entity_idx + run_len]
+                        {
+                            scratch
+                                .entities
+                                .push(FfiEntity::from_bits(arch_ent.id().to_bits()));
+                        }
+                        self.current_entities_ptr = scratch.entities.as_ptr();
+                    }
+
+                    if plan.dense_data_mask != 0 {
+                        self.populate_dense_columns_inner(table, table_len, start_row_idx, run_len);
+                    }
+
+                    // Eagerly materialize sparse row pointers for declared sparse data columns into
+                    // reused scratch buffers (`P-02`) so `iter_column_rows_readonly`/`mutable` are O(1).
+                    if plan.sparse_data_mask != 0
+                        && let Some(ref mut scratch) = self.sparse_scratch
+                    {
+                        let mut mask = plan.sparse_data_mask;
+                        while mask != 0 {
+                            let idx = mask.trailing_zeros() as usize;
+                            mask &= mask - 1;
+                            let term = &plan.terms[idx];
+                            if !archetype.contains(term.component_id) {
+                                continue;
+                            }
+                            let Some(ss) = sparse_sets.get(term.component_id) else {
+                                continue;
+                            };
+                            let rows_vec = &mut scratch.row_ptrs[idx];
+                            let ticks_vec = &mut scratch.tick_ptrs[idx];
+                            rows_vec.clear();
+                            ticks_vec.clear();
+                            rows_vec.reserve(run_len);
+                            ticks_vec.reserve(run_len);
+                            let mut summary_ptr: Option<*const AtomicTick> = None;
+                            let mut all_present = true;
+
+                            for arch_ent in
+                                &arch_entities[start_entity_idx..start_entity_idx + run_len]
+                            {
+                                if let Some((ptr, tick_cells)) = ss.get_with_ticks(arch_ent.id()) {
+                                    rows_vec.push(ptr.as_ptr().cast_mut());
+                                    ticks_vec.push(tick_cells.changed as *const UnsafeCell<Tick>);
+                                    if summary_ptr.is_none()
+                                        && let Some(s) = tick_cells.summary_tick
+                                    {
+                                        summary_ptr = Some(s as *const AtomicTick);
+                                    }
+                                } else {
+                                    all_present = false;
+                                    break;
+                                }
+                            }
+
+                            if all_present {
+                                scratch.summary_ptrs[idx] = summary_ptr;
+                                self.present_sparse_mask |= 1u32 << idx;
+                                self.materialized_sparse_mask |= 1u32 << idx;
+                            }
+                        }
+                    }
+
                     return run_len;
                 }
             }
@@ -478,10 +733,11 @@ impl<'w> HostChunkIter<'w> {
         0
     }
 
-    /// Resets this iterator back to the first matched chunk.
+    /// Resets this iterator back to the first matched chunk (`iter_reset`).
     #[inline]
     pub fn reset(&mut self) {
         match &mut self.backing {
+            IterBacking::ResourceOnly => {}
             IterBacking::DenseTables {
                 table_cursor,
                 row_cursor,
@@ -502,127 +758,64 @@ impl<'w> HostChunkIter<'w> {
         self.clear_active_chunk();
     }
 
+    /// Clears only the active prefix `0..term_count` (`P-03`) and resets per-chunk bitmasks (`P-04`).
     #[inline]
     fn clear_active_chunk(&mut self) {
         self.current_entities_ptr = core::ptr::null();
         self.current_entity_count = 0;
-        for col in &mut self.active_columns {
-            *col = None;
+        self.marked_changed_mask = 0;
+        self.materialized_sparse_mask = 0;
+        self.present_sparse_mask = 0;
+        let active_len = self.plan.terms.len().min(MAX_TERMS_PER_QUERY);
+        for slot in &mut self.active_columns[..active_len] {
+            *slot = None;
         }
     }
 
     #[inline]
-    fn column_is_non_data(&self, q: &QueryColumnDesc) -> bool {
-        if q.mode == ComponentAccessMode::FILTER_ONLY
-            || q.mode == ComponentAccessMode::WITHOUT
-            || q.mode.is_resource()
-        {
-            return true;
-        }
-        if q.mode.is_tick_filter() {
-            return self.query_columns.iter().any(|other| {
-                other.component_id == q.component_id
-                    && (other.mode == ComponentAccessMode::WRITE
-                        || other.mode == ComponentAccessMode::OPTIONAL_WRITE)
-            });
-        }
-        false
-    }
-
-    fn populate_dense_table_range_columns(
+    fn populate_dense_columns(
         &mut self,
         table: &'w Table,
         table_len: usize,
         start_row_idx: usize,
         run_len: usize,
     ) {
-        for col in &mut self.active_columns {
-            *col = None;
+        self.marked_changed_mask = 0;
+        self.materialized_sparse_mask = 0;
+        self.present_sparse_mask = 0;
+        let active_len = self.plan.terms.len().min(MAX_TERMS_PER_QUERY);
+        for slot in &mut self.active_columns[..active_len] {
+            *slot = None;
         }
+        self.populate_dense_columns_inner(table, table_len, start_row_idx, run_len);
+    }
 
+    #[inline]
+    fn populate_dense_columns_inner(
+        &mut self,
+        table: &'w Table,
+        table_len: usize,
+        start_row_idx: usize,
+        run_len: usize,
+    ) {
         let Some(start_nonmax) = NonMaxU32::new(start_row_idx as u32) else {
             return;
         };
         let start_row = TableRow::new(start_nonmax);
 
-        for (i, q) in self
-            .query_columns
-            .iter()
-            .enumerate()
-            .take(MAX_QUERY_COMPONENTS)
-        {
-            if self.column_is_non_data(q) {
-                self.active_columns[i] = None;
-                continue;
-            }
-
-            if let Some(col) = table.get_column(q.component_id) {
+        // P-03: Iterate ONLY precomputed dense data-column indices!
+        for &raw_idx in &self.plan.dense_data_indices {
+            let idx = raw_idx as usize;
+            let term = &self.plan.terms[idx];
+            if let Some(col) = table.get_column(term.component_id) {
                 // SAFETY: `start_row_idx + run_len <= table_len == table.entity_count() as usize`.
-                let data_ptr = unsafe { col.get_data_unchecked(start_row).as_ptr().cast_mut() };
-                // SAFETY: `table_len` is the valid entity count of `table`.
-                let all_ticks = unsafe { col.get_changed_ticks_slice(table_len) };
-                let changed_ticks = &all_ticks[start_row_idx..start_row_idx + run_len];
-                let summary_tick = col.get_summary_tick();
-
-                self.active_columns[i] = Some(ActiveColumn {
-                    data_ptr,
-                    changed_ticks,
-                    summary_tick,
-                });
-            } else {
-                self.active_columns[i] = None;
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn populate_archetypal_columns(
-        &mut self,
-        table: &'w Table,
-        table_len: usize,
-        sparse_sets: &'w SparseSets,
-        first_entity: Entity,
-        start_row: TableRow,
-        start_row_idx: usize,
-        run_len: usize,
-        sparse_column_mask: u32,
-    ) {
-        for col in &mut self.active_columns {
-            *col = None;
-        }
-
-        for (i, q) in self
-            .query_columns
-            .iter()
-            .enumerate()
-            .take(MAX_QUERY_COMPONENTS)
-        {
-            if self.column_is_non_data(q) {
-                self.active_columns[i] = None;
-                continue;
-            }
-
-            let is_sparse_col = (sparse_column_mask & (1u32 << i)) != 0;
-            if is_sparse_col {
-                debug_assert_eq!(run_len, 1);
-                if let Some(sparse_set) = sparse_sets.get(q.component_id)
-                    && let Some((ptr, tick_cells)) = sparse_set.get_with_ticks(first_entity)
-                {
-                    self.active_columns[i] = Some(ActiveColumn {
-                        data_ptr: ptr.as_ptr().cast_mut(),
-                        changed_ticks: core::slice::from_ref(tick_cells.changed),
-                        summary_tick: tick_cells.summary_tick,
-                    });
-                }
-            } else if let Some(col) = table.get_column(q.component_id) {
-                // SAFETY: `start_row_idx + run_len <= table_len` was verified by caller.
                 let data_ptr = unsafe { col.get_data_unchecked(start_row).as_ptr().cast_mut() };
                 // SAFETY: `table_len` is `table.entity_count() as usize`.
                 let all_ticks = unsafe { col.get_changed_ticks_slice(table_len) };
                 let changed_ticks = &all_ticks[start_row_idx..start_row_idx + run_len];
                 let summary_tick = col.get_summary_tick();
 
-                self.active_columns[i] = Some(ActiveColumn {
+                self.active_columns[idx] = Some(ActiveDenseColumn {
                     data_ptr,
                     changed_ticks,
                     summary_tick,
@@ -632,258 +825,447 @@ impl<'w> HostChunkIter<'w> {
     }
 }
 
-/// Advances `RawChunkIter` to the next chunk, returning chunk entity count or 0 when done.
-///
-/// # Safety
-/// `iter` must be a valid pointer to a [`HostChunkIter`] or null.
-pub unsafe extern "C" fn host_iter_next_chunk(iter: *mut RawChunkIter) -> usize {
-    if iter.is_null() {
-        return 0;
-    }
-    // SAFETY: Caller passes a valid pointer to `HostChunkIter` cast to `RawChunkIter`.
-    let host_iter = unsafe { &mut *(iter.cast::<HostChunkIter<'_>>()) };
-    host_iter.next_chunk()
-}
-
-/// Borrows a read-only column byte pointer from `RawChunkIter`.
-///
-/// # Safety
-/// `iter` must be a valid pointer to a [`HostChunkIter`] or null.
-pub unsafe extern "C" fn host_iter_column_readonly(
-    iter: *const RawChunkIter,
-    index: usize,
-) -> *const u8 {
-    if iter.is_null() {
-        return core::ptr::null();
-    }
-    // SAFETY: Caller passes a valid pointer to `HostChunkIter` cast to `RawChunkIter`.
-    let host_iter = unsafe { &*(iter.cast::<HostChunkIter<'_>>()) };
-    if host_iter.current_entity_count == 0
-        || index >= host_iter.query_columns.len()
-        || index >= MAX_QUERY_COMPONENTS
-    {
-        return core::ptr::null();
-    }
-    let mode = host_iter.query_columns[index].mode;
-    if mode == ComponentAccessMode::FILTER_ONLY
-        || mode == ComponentAccessMode::WITHOUT
-        || mode.is_resource()
-    {
-        return core::ptr::null();
-    }
-    if let Some(col) = &host_iter.active_columns[index] {
-        col.data_ptr.cast_const()
-    } else {
-        core::ptr::null()
+impl Drop for HostIter<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.header.poison();
     }
 }
 
-/// Borrows a mutable column byte pointer from `RawChunkIter` and marks chunk ticks changed.
+/// Advances `iter` to the next non-empty chunk, writing chunk length into `*out_len` and returning
+/// [`FfiBool::TRUE`] while chunks remain or [`FfiBool::FALSE`] when exhausted.
 ///
 /// # Safety
-/// `iter` must be a valid pointer to a [`HostChunkIter`] or null.
-pub unsafe extern "C" fn host_iter_column_mutable(
-    iter: *mut RawChunkIter,
-    index: usize,
-) -> *mut u8 {
-    if iter.is_null() {
-        return core::ptr::null_mut();
+/// - `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
+/// - `out_len` must point to writable `usize` storage, or null.
+pub unsafe extern "C" fn host_iter_next_chunk(iter: *mut BamIter, out_len: *mut usize) -> FfiBool {
+    if out_len.is_null() {
+        return FfiBool::FALSE;
     }
-    // SAFETY: Caller passes a valid pointer to `HostChunkIter` cast to `RawChunkIter`.
-    let host_iter = unsafe { &mut *(iter.cast::<HostChunkIter<'_>>()) };
-    if host_iter.current_entity_count == 0
-        || index >= host_iter.query_columns.len()
-        || index >= MAX_QUERY_COMPONENTS
-    {
-        return core::ptr::null_mut();
-    }
-    let mode = host_iter.query_columns[index].mode;
-    if mode != ComponentAccessMode::WRITE && mode != ComponentAccessMode::OPTIONAL_WRITE {
-        return core::ptr::null_mut();
-    }
+    // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
+    let Ok(host_iter) =
+        (unsafe { validate_handle_mut::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false) })
+    else {
+        return FfiBool::FALSE;
+    };
 
-    if let Some(col) = &mut host_iter.active_columns[index] {
-        for tick_cell in col.changed_ticks {
-            // SAFETY: System holds exclusive access to this component's rows as granted by Bevy's scheduler.
-            unsafe {
-                *tick_cell.get() = host_iter.this_run;
-            }
-        }
-        if let Some(summary) = col.summary_tick {
-            summary.set(host_iter.this_run);
-        }
-        col.data_ptr
-    } else {
-        core::ptr::null_mut()
+    let len = host_iter.next_chunk();
+    // SAFETY: `out_len` was checked non-null above and caller guarantees writable `usize`.
+    unsafe {
+        *out_len = len;
     }
+    FfiBool::from(len > 0)
 }
 
-/// Marks an individual row's component tick as changed.
+/// Resets `iter` back to its initial chunk (`FfiResult::OK`).
 ///
 /// # Safety
-/// `iter` must be a valid pointer to a [`HostChunkIter`] or null.
-pub unsafe extern "C" fn host_iter_mark_changed(
-    iter: *mut RawChunkIter,
-    index: usize,
-    row: usize,
-) -> FfiResult {
-    if iter.is_null() {
-        return FfiResult::NULL_POINTER;
-    }
-    // SAFETY: Caller passes a valid pointer to `HostChunkIter` cast to `RawChunkIter`.
-    let host_iter = unsafe { &mut *(iter.cast::<HostChunkIter<'_>>()) };
-    if index >= host_iter.query_columns.len() || index >= MAX_QUERY_COMPONENTS {
-        return FfiResult::INVALID_COMPONENT;
-    }
-    let mode = host_iter.query_columns[index].mode;
-    if mode != ComponentAccessMode::WRITE && mode != ComponentAccessMode::OPTIONAL_WRITE {
-        return FfiResult::PERMISSION_DENIED;
-    }
-    if row >= host_iter.current_entity_count {
-        return FfiResult::OUT_OF_RANGE;
-    }
-
-    if let Some(col) = &mut host_iter.active_columns[index] {
-        // SAFETY: `row < current_entity_count == changed_ticks.len()`, and `WRITE` access is held.
-        unsafe {
-            *col.changed_ticks[row].get() = host_iter.this_run;
-        }
-        if let Some(summary) = col.summary_tick {
-            summary.set(host_iter.this_run);
-        }
-        FfiResult::OK
-    } else {
-        FfiResult::INVALID_COMPONENT
-    }
+/// `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
+pub unsafe extern "C" fn host_iter_reset(iter: *mut BamIter) -> FfiResult {
+    // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
+    let host_iter = match unsafe {
+        validate_handle_mut::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false)
+    } {
+        Ok(it) => it,
+        Err(err) => return err,
+    };
+    host_iter.reset();
+    FfiResult::OK
 }
 
-/// Borrows the contiguous `FfiEntity` slice for the current chunk.
+/// Returns a pointer to `[FfiEntity; chunk_len]` for the current chunk, or null.
 ///
 /// # Safety
-/// `iter` must be a valid pointer to a [`HostChunkIter`] or null.
-pub unsafe extern "C" fn host_iter_entities(iter: *const RawChunkIter) -> *const FfiEntity {
-    if iter.is_null() {
+/// `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
+pub unsafe extern "C" fn host_iter_entities(iter: *const BamIter) -> *const FfiEntity {
+    // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
+    let Ok(host_iter) =
+        (unsafe { validate_handle_ref::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false) })
+    else {
         return core::ptr::null();
-    }
-    // SAFETY: Caller passes a valid pointer to `HostChunkIter` cast to `RawChunkIter`.
-    let host_iter = unsafe { &*(iter.cast::<HostChunkIter<'_>>()) };
+    };
     if host_iter.current_entity_count == 0 {
         return core::ptr::null();
     }
     host_iter.current_entities_ptr
 }
 
-/// Queries the byte stride of column `index` in `RawChunkIter`.
+/// Returns a read-only byte pointer to dense `Table` column `term_index` in the current chunk,
+/// or null if out of bounds, absent on an optional term, sparse-set stored, or filter/resource.
 ///
 /// # Safety
-/// `iter` must be a valid pointer to a [`HostChunkIter`] or null.
-pub unsafe extern "C" fn host_iter_column_stride(iter: *const RawChunkIter, index: usize) -> usize {
-    if iter.is_null() {
-        return 0;
-    }
-    // SAFETY: Caller passes a valid pointer to `HostChunkIter` cast to `RawChunkIter`.
-    let host_iter = unsafe { &*(iter.cast::<HostChunkIter<'_>>()) };
-    if index >= host_iter.query_columns.len() {
-        return 0;
-    }
-    host_iter.query_columns[index].stride
-}
-
-/// Resets a `RawChunkIter` back to its first matched chunk for nested query iteration.
-///
-/// # Safety
-/// `iter` must be a valid pointer to a [`HostChunkIter`] or null.
-pub unsafe extern "C" fn host_iter_reset(iter: *mut RawChunkIter) -> FfiResult {
-    if iter.is_null() {
-        return FfiResult::NULL_POINTER;
-    }
-    // SAFETY: Caller passes a valid pointer to `HostChunkIter` cast to `RawChunkIter`.
-    let host_iter = unsafe { &mut *(iter.cast::<HostChunkIter<'_>>()) };
-    host_iter.reset();
-    FfiResult::OK
-}
-
-/// Borrows a read-only pointer to singleton Bevy `Resource` `resource_name` during system execution.
-///
-/// # Safety
-/// - `iter` must be a valid pointer to an active [`HostChunkIter`] or null.
-/// - `resource_name` must point to a valid NUL-terminated UTF-8 C string or null.
-pub unsafe extern "C" fn host_iter_resource_readonly(
-    iter: *const RawChunkIter,
-    resource_name: *const c_char,
+/// `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
+pub unsafe extern "C" fn host_iter_column_readonly(
+    iter: *const BamIter,
+    term_index: usize,
 ) -> *const u8 {
-    if iter.is_null() || resource_name.is_null() {
+    // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
+    let Ok(host_iter) =
+        (unsafe { validate_handle_ref::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false) })
+    else {
+        return core::ptr::null();
+    };
+    if host_iter.current_entity_count == 0 || term_index >= host_iter.plan.terms.len() {
         return core::ptr::null();
     }
-    // SAFETY: Caller passes a valid NUL-terminated C string.
-    let Ok(name) = (unsafe { CStr::from_ptr(resource_name) }).to_str() else {
-        return core::ptr::null();
-    };
-    // SAFETY: Caller passes a valid pointer to `HostChunkIter` cast to `RawChunkIter`.
-    let host_iter = unsafe { &*(iter.cast::<HostChunkIter<'_>>()) };
-    let (Some(world), Some(registry)) = (host_iter.world, host_iter.registry) else {
-        return core::ptr::null();
-    };
-    let Some(reg_comp) = registry.get_by_name(name) else {
-        return core::ptr::null();
-    };
-    if !reg_comp.is_resource {
+    let term = &host_iter.plan.terms[term_index];
+    if !term.mode.has_entity_column_data() || term.is_sparse_set() || term.is_resource() {
         return core::ptr::null();
     }
-    if !host_iter
-        .declared_resources
-        .iter()
-        .any(|&(cid, _)| cid == reg_comp.component_id)
+    match &host_iter.active_columns[term_index] {
+        Some(col) => col.data_ptr.cast_const(),
+        None => core::ptr::null(),
+    }
+}
+
+/// Returns a mutable byte pointer to dense `Table` column `term_index`, marking chunk change ticks
+/// at most once per chunk (`P-04`).
+///
+/// # Safety
+/// `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
+pub unsafe extern "C" fn host_iter_column_mutable(
+    iter: *mut BamIter,
+    term_index: usize,
+) -> *mut u8 {
+    // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
+    let Ok(host_iter) =
+        (unsafe { validate_handle_mut::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false) })
+    else {
+        return core::ptr::null_mut();
+    };
+    if host_iter.current_entity_count == 0 || term_index >= host_iter.plan.terms.len() {
+        return core::ptr::null_mut();
+    }
+    let term = &host_iter.plan.terms[term_index];
+    if (term.mode != AccessMode::WRITE && term.mode != AccessMode::OPTIONAL_WRITE)
+        || term.is_sparse_set()
+        || term.is_immutable()
+    {
+        return core::ptr::null_mut();
+    }
+
+    let Some(col) = host_iter.active_columns[term_index] else {
+        return core::ptr::null_mut();
+    };
+
+    let bit = 1u32 << term_index;
+    if (host_iter.marked_changed_mask & bit) == 0 {
+        let this_run = host_iter.this_run;
+        for tick_cell in col.changed_ticks {
+            // SAFETY: Exclusive mutable access to this component's rows is held by this system.
+            unsafe {
+                *tick_cell.get() = this_run;
+            }
+        }
+        if let Some(summary) = col.summary_tick {
+            summary.set(this_run);
+        }
+        host_iter.marked_changed_mask |= bit;
+    }
+
+    col.data_ptr
+}
+
+/// Returns a mutable byte pointer to dense `Table` column `term_index` without marking change ticks (`P-04`).
+///
+/// # Safety
+/// `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
+pub unsafe extern "C" fn host_iter_column_mutable_untracked(
+    iter: *mut BamIter,
+    term_index: usize,
+) -> *mut u8 {
+    // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
+    let Ok(host_iter) =
+        (unsafe { validate_handle_mut::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false) })
+    else {
+        return core::ptr::null_mut();
+    };
+    if host_iter.current_entity_count == 0 || term_index >= host_iter.plan.terms.len() {
+        return core::ptr::null_mut();
+    }
+    let term = &host_iter.plan.terms[term_index];
+    if (term.mode != AccessMode::WRITE && term.mode != AccessMode::OPTIONAL_WRITE)
+        || term.is_sparse_set()
+        || term.is_immutable()
+    {
+        return core::ptr::null_mut();
+    }
+    match host_iter.active_columns[term_index] {
+        Some(col) => col.data_ptr,
+        None => core::ptr::null_mut(),
+    }
+}
+
+/// Marks rows `start_row..start_row + row_count` in writable column `term_index` as changed (`P-04`).
+///
+/// # Safety
+/// `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
+pub unsafe extern "C" fn host_iter_mark_changed_range(
+    iter: *mut BamIter,
+    term_index: usize,
+    start_row: usize,
+    row_count: usize,
+) -> FfiResult {
+    // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
+    let host_iter = match unsafe {
+        validate_handle_mut::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false)
+    } {
+        Ok(it) => it,
+        Err(err) => return err,
+    };
+
+    if term_index >= host_iter.plan.terms.len() {
+        return FfiResult::OUT_OF_RANGE;
+    }
+    let term = &host_iter.plan.terms[term_index];
+    if (term.mode != AccessMode::WRITE && term.mode != AccessMode::OPTIONAL_WRITE)
+        || term.is_immutable()
+    {
+        return FfiResult::PERMISSION_DENIED;
+    }
+
+    let Some(end_row) = start_row.checked_add(row_count) else {
+        return FfiResult::OUT_OF_RANGE;
+    };
+    if end_row > host_iter.current_entity_count {
+        return FfiResult::OUT_OF_RANGE;
+    }
+    if row_count == 0 {
+        return FfiResult::OK;
+    }
+
+    let this_run = host_iter.this_run;
+    if term.is_sparse_set() {
+        if (host_iter.present_sparse_mask & (1u32 << term_index)) == 0 {
+            return if term.mode == AccessMode::OPTIONAL_WRITE {
+                FfiResult::OK
+            } else {
+                FfiResult::INVALID_COMPONENT
+            };
+        }
+        if let Some(ref scratch) = host_iter.sparse_scratch {
+            for &tick_cell_ptr in &scratch.tick_ptrs[term_index][start_row..end_row] {
+                // SAFETY: `tick_cell_ptr` points to a live `UnsafeCell<Tick>` for this chunk's entity
+                // under exclusive `WRITE` / `OPTIONAL_WRITE` component access.
+                unsafe {
+                    *(*tick_cell_ptr).get() = this_run;
+                }
+            }
+            if let Some(summary_ptr) = scratch.summary_ptrs[term_index] {
+                // SAFETY: `summary_ptr` points to the live sparse set summary `AtomicTick`.
+                unsafe {
+                    (*summary_ptr).set(this_run);
+                }
+            }
+            return FfiResult::OK;
+        }
+        return FfiResult::INTERNAL_ERROR;
+    }
+
+    if let Some(col) = host_iter.active_columns[term_index] {
+        for tick_cell in &col.changed_ticks[start_row..end_row] {
+            // SAFETY: `start_row..end_row` is in bounds and `WRITE`/`OPTIONAL_WRITE` access is held.
+            unsafe {
+                *tick_cell.get() = this_run;
+            }
+        }
+        if let Some(summary) = col.summary_tick {
+            summary.set(this_run);
+        }
+        FfiResult::OK
+    } else if term.mode == AccessMode::OPTIONAL_WRITE {
+        FfiResult::OK
+    } else {
+        FfiResult::INVALID_COMPONENT
+    }
+}
+
+/// Returns `[ *const u8; chunk_len ]` of indirect per-row pointers for `StorageType::SparseSet`
+/// columns (`P-02`), or null if out of bounds, absent on an optional term, or not sparse-set stored.
+///
+/// # Safety
+/// `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
+pub unsafe extern "C" fn host_iter_column_rows_readonly(
+    iter: *mut BamIter,
+    term_index: usize,
+) -> *const *const u8 {
+    // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
+    let Ok(host_iter) =
+        (unsafe { validate_handle_mut::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false) })
+    else {
+        return core::ptr::null();
+    };
+    if host_iter.current_entity_count == 0 || term_index >= host_iter.plan.terms.len() {
+        return core::ptr::null();
+    }
+    let term = &host_iter.plan.terms[term_index];
+    if !term.is_sparse_set() || !term.mode.has_entity_column_data() {
+        return core::ptr::null();
+    }
+    let bit = 1u32 << term_index;
+    if (host_iter.present_sparse_mask & bit) == 0 {
+        return core::ptr::null();
+    }
+    let Some(ref scratch) = host_iter.sparse_scratch else {
+        return core::ptr::null();
+    };
+    scratch.row_ptrs[term_index].as_ptr().cast::<*const u8>()
+}
+
+/// Returns `[ *mut u8; chunk_len ]` of indirect per-row mutable pointers for `StorageType::SparseSet`
+/// columns (`P-02`), marking matched rows changed at most once per chunk (`P-04`).
+///
+/// # Safety
+/// `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
+pub unsafe extern "C" fn host_iter_column_rows_mutable(
+    iter: *mut BamIter,
+    term_index: usize,
+) -> *const *mut u8 {
+    // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
+    let Ok(host_iter) =
+        (unsafe { validate_handle_mut::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false) })
+    else {
+        return core::ptr::null();
+    };
+    if host_iter.current_entity_count == 0 || term_index >= host_iter.plan.terms.len() {
+        return core::ptr::null();
+    }
+    let term = &host_iter.plan.terms[term_index];
+    if !term.is_sparse_set()
+        || (term.mode != AccessMode::WRITE && term.mode != AccessMode::OPTIONAL_WRITE)
+        || term.is_immutable()
     {
         return core::ptr::null();
     }
+    let bit = 1u32 << term_index;
+    if (host_iter.present_sparse_mask & bit) == 0 {
+        return core::ptr::null();
+    }
 
-    // SAFETY: Shared read access (or exclusive write access) to `reg_comp.component_id` was
-    // declared in `FilteredAccessSet` during `DynamicCSystem::initialize`.
-    match unsafe { world.get_resource_by_id(reg_comp.component_id) } {
+    let this_run = host_iter.this_run;
+    let should_mark = (host_iter.marked_changed_mask & bit) == 0;
+    let Some(ref scratch) = host_iter.sparse_scratch else {
+        return core::ptr::null();
+    };
+
+    if should_mark {
+        for &tick_cell_ptr in &scratch.tick_ptrs[term_index] {
+            // SAFETY: Exclusive mutable access to this sparse component is held by this system.
+            unsafe {
+                *(*tick_cell_ptr).get() = this_run;
+            }
+        }
+        if let Some(summary_ptr) = scratch.summary_ptrs[term_index] {
+            // SAFETY: `summary_ptr` points to the live sparse set summary `AtomicTick`.
+            unsafe {
+                (*summary_ptr).set(this_run);
+            }
+        }
+    }
+
+    let out_ptr = scratch.row_ptrs[term_index].as_ptr();
+    if should_mark {
+        host_iter.marked_changed_mask |= bit;
+    }
+    out_ptr
+}
+
+/// Writes [`BamColumnInfo`] metadata for `term_index` into `*out_info` (`C-13`).
+///
+/// # Safety
+/// - `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
+/// - `out_info` must point to writable [`BamColumnInfo`] storage, or null.
+pub unsafe extern "C" fn host_iter_column_info(
+    iter: *const BamIter,
+    term_index: usize,
+    out_info: *mut BamColumnInfo,
+) -> FfiResult {
+    if out_info.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
+    let host_iter = match unsafe {
+        validate_handle_ref::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false)
+    } {
+        Ok(it) => it,
+        Err(err) => return err,
+    };
+
+    if term_index >= host_iter.plan.terms.len() {
+        return FfiResult::OUT_OF_RANGE;
+    }
+    let t = &host_iter.plan.terms[term_index];
+    let info = BamColumnInfo {
+        component: t.component,
+        mode: t.mode,
+        uuid: t.uuid,
+        size: t.size,
+        align: t.align,
+        storage_flags: t.storage_flags,
+        reserved0: 0,
+    };
+    // SAFETY: `out_info` was checked non-null above and caller guarantees writable `BamColumnInfo`.
+    unsafe {
+        *out_info = info;
+    }
+    FfiResult::OK
+}
+
+/// Returns a read-only pointer to the singleton `Resource` declared at `term_index` (`C-05`),
+/// or null if unauthorized or absent in the `World`.
+///
+/// # Safety
+/// `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
+pub unsafe extern "C" fn host_res_ptr(iter: *const BamIter, term_index: usize) -> *const u8 {
+    // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
+    let Ok(host_iter) =
+        (unsafe { validate_handle_ref::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false) })
+    else {
+        return core::ptr::null();
+    };
+    if term_index >= host_iter.plan.terms.len() {
+        return core::ptr::null();
+    }
+    let term = &host_iter.plan.terms[term_index];
+    if !term.mode.is_resource() || !term.is_resource() {
+        return core::ptr::null();
+    }
+    let Some(world) = host_iter.world else {
+        return core::ptr::null();
+    };
+    // SAFETY: `RESOURCE_READ` or `RESOURCE_WRITE` on `term.component_id` was declared in
+    // `FilteredAccessSet` during `GuestSystem::initialize`.
+    match unsafe { world.get_resource_by_id(term.component_id) } {
         Some(ptr) => ptr.as_ptr(),
         None => core::ptr::null(),
     }
 }
 
-/// Borrows an exclusive mutable pointer to singleton Bevy `Resource` `resource_name` during system execution.
+/// Returns an exclusive mutable pointer to the singleton `Resource` declared with `RESOURCE_WRITE`
+/// at `term_index` (`C-05`), marking its Bevy change tick, or null if unauthorized or absent.
 ///
 /// # Safety
-/// - `iter` must be a valid pointer to an active [`HostChunkIter`] or null.
-/// - `resource_name` must point to a valid NUL-terminated UTF-8 C string or null.
-pub unsafe extern "C" fn host_iter_resource_mutable(
-    iter: *mut RawChunkIter,
-    resource_name: *const c_char,
-) -> *mut u8 {
-    if iter.is_null() || resource_name.is_null() {
-        return core::ptr::null_mut();
-    }
-    // SAFETY: Caller passes a valid NUL-terminated C string.
-    let Ok(name) = (unsafe { CStr::from_ptr(resource_name) }).to_str() else {
+/// `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
+pub unsafe extern "C" fn host_res_mut_ptr(iter: *mut BamIter, term_index: usize) -> *mut u8 {
+    // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
+    let Ok(host_iter) =
+        (unsafe { validate_handle_mut::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false) })
+    else {
         return core::ptr::null_mut();
     };
-    // SAFETY: Caller passes a valid pointer to `HostChunkIter` cast to `RawChunkIter`.
-    let host_iter = unsafe { &mut *(iter.cast::<HostChunkIter<'_>>()) };
-    let (Some(world), Some(registry)) = (host_iter.world, host_iter.registry) else {
-        return core::ptr::null_mut();
-    };
-    let Some(reg_comp) = registry.get_by_name(name) else {
-        return core::ptr::null_mut();
-    };
-    if !reg_comp.is_resource {
+    if term_index >= host_iter.plan.terms.len() {
         return core::ptr::null_mut();
     }
-    if !host_iter
-        .declared_resources
-        .iter()
-        .any(|&(cid, writable)| cid == reg_comp.component_id && writable)
-    {
+    let term = &host_iter.plan.terms[term_index];
+    if term.mode != AccessMode::RESOURCE_WRITE || !term.is_resource() || term.is_immutable() {
         return core::ptr::null_mut();
     }
-
-    // SAFETY: `RESOURCE_WRITE` was declared in `FilteredAccessSet` during `DynamicCSystem::initialize`,
-    // granting exclusive mutable access to `reg_comp.component_id` and its resource entity.
-    let Some(entity) = (unsafe { world.resource_entities() }).get(reg_comp.component_id) else {
+    let Some(world) = host_iter.world else {
+        return core::ptr::null_mut();
+    };
+    // SAFETY: `RESOURCE_WRITE` was declared in `FilteredAccessSet` during `GuestSystem::initialize`,
+    // granting exclusive mutable access to `term.component_id` and its resource entity.
+    let Some(entity) = (unsafe { world.resource_entities() }).get(term.component_id) else {
         return core::ptr::null_mut();
     };
     let Ok(entity_cell) =
@@ -892,60 +1274,8 @@ pub unsafe extern "C" fn host_iter_resource_mutable(
         return core::ptr::null_mut();
     };
     // SAFETY: Exclusive mutable access to this resource component is guaranteed by Bevy's scheduler.
-    let Ok(mut_untyped) = (unsafe { entity_cell.get_mut_by_id(reg_comp.component_id) }) else {
+    let Ok(mut_untyped) = (unsafe { entity_cell.get_mut_by_id(term.component_id) }) else {
         return core::ptr::null_mut();
     };
     mut_untyped.into_inner().as_ptr()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bevy_ecs::world::World;
-
-    #[test]
-    fn regression_s10_entity_bits_layout() {
-        let mut world = World::new();
-        let mut samples = Vec::new();
-
-        // Spawn and despawn cycles to exercise both diverse indices and bumped generations.
-        for _ in 0..64 {
-            samples.push(world.spawn_empty().id());
-        }
-        for e in samples.drain(..32).collect::<Vec<_>>() {
-            world.despawn(e);
-        }
-        for _ in 0..48 {
-            samples.push(world.spawn_empty().id());
-        }
-        samples.push(Entity::PLACEHOLDER);
-
-        // Also synthesize explicit bit-patterns across boundary indices and generations.
-        for &(idx, generation_bump) in &[
-            (0u32, 1u32),
-            (1u32, 1u32),
-            (0x7FFF_FFFEu32, 1u32),
-            (42u32, 0x1234_5678u32),
-            (u32::MAX - 1, u32::MAX),
-        ] {
-            let raw_bits = ((generation_bump as u64) << 32) | (idx as u64);
-            if let Some(ent) = Entity::try_from_bits(raw_bits) {
-                samples.push(ent);
-            }
-        }
-
-        for entity in samples {
-            // SAFETY: `Entity` and `u64` (`FfiEntity`) have identical size (8) and alignment (8),
-            // asserted at compile time above; `transmute_copy` verifies bit-pattern equivalence
-            // with `Entity::to_bits()` relied upon by zero-copy `Table::entities()` slice casts.
-            let raw_mem_bits: u64 = unsafe { core::mem::transmute_copy(&entity) };
-            assert_eq!(
-                raw_mem_bits,
-                entity.to_bits(),
-                "Entity memory representation diverged from Entity::to_bits() for {entity:?}"
-            );
-            let ffi = FfiEntity::from_bits(raw_mem_bits);
-            assert_eq!(Entity::try_from_bits(ffi.to_bits()), Some(entity));
-        }
-    }
 }

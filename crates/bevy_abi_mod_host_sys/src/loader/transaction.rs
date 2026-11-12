@@ -1,44 +1,42 @@
-//! RAII `LoadTransaction` rolling back drop trampolines, registry entries, and symbols before `dlclose`.
+//! RAII `LoadTransaction` rolling back drop trampolines and `ModRegistry` snapshot before `dlclose` (`S-06`).
 
 use crate::drop_trampoline::prune_drop_trampolines_for_guard;
-use crate::loader::ModId;
-use crate::registry::ModRegistry;
+use crate::registry::{ModRegistry, RegistrySnapshot};
 use bevy_ecs::world::World;
 use core::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-/// RAII transaction guard bound after opening a [`libloading::Library`] so that if initialization
-/// fails (and `commit` is not reached), all drop trampoline slots, guest symbol entries, and
-/// `ModRegistry` mutations are disarmed and rolled back *before* `Library::drop` (`dlclose`).
+/// RAII transaction guard bound after opening a [`crate::loader::shared_lib::LoadedLibrary`] so that
+/// if `bevy_abi_mod_init` or post-init validation fails (and `commit` is not reached), all drop
+/// trampoline slots and `ModRegistry` snapshot mutations are rolled back **strictly before**
+/// `LoadedLibrary::drop` (`dlclose`).
 pub(crate) struct LoadTransaction {
     world_ptr: *mut World,
-    mod_id: ModId,
     is_active: Arc<AtomicBool>,
-    pre_registry: ModRegistry,
+    pre_snapshot: Arc<RegistrySnapshot>,
     committed: bool,
 }
 
 impl LoadTransaction {
-    /// Starts a new rollback guard for `mod_id`.
+    /// Starts a new rollback guard restoring `pre_snapshot` on failure.
     ///
-    /// Declare this binding *after* `let lib = Library::new(...)` so Rust's reverse local drop
-    /// order guarantees `LoadTransaction::drop` runs prior to `dlclose`.
+    /// Declare this binding *after* `LoadedLibrary::open(...)` so Rust's reverse local drop order
+    /// guarantees `LoadTransaction::drop` executes prior to `dlclose`.
     pub(crate) fn new(
         world_ptr: *mut World,
-        mod_id: ModId,
         is_active: Arc<AtomicBool>,
-        pre_registry: ModRegistry,
+        pre_snapshot: Arc<RegistrySnapshot>,
     ) -> Self {
         Self {
             world_ptr,
-            mod_id,
             is_active,
-            pre_registry,
+            pre_snapshot,
             committed: false,
         }
     }
 
     /// Marks initialization as succeeded, disarming automatic rollback on drop.
+    #[inline]
     pub(crate) fn commit(mut self) {
         self.committed = true;
     }
@@ -53,14 +51,13 @@ impl Drop for LoadTransaction {
         // 1. Disarm `is_active = false` and prune all drop trampoline entries before `dlclose`.
         prune_drop_trampolines_for_guard(&self.is_active);
 
-        // 2. Mark `self.mod_id` revoked in the shared lineage and restore `World`'s `ModRegistry`.
-        self.pre_registry.evict_mod(self.mod_id);
+        // 2. Restore the pre-load `RegistrySnapshot` on `World`'s `ModRegistry`.
         if !self.world_ptr.is_null() {
             // SAFETY: `self.world_ptr` comes from the exclusive `&mut World` passed into `load_mod_core`
             // and no inner `&mut World` alias is live while `LoadTransaction` drops.
             let world = unsafe { &mut *self.world_ptr };
-            if world.contains_resource::<ModRegistry>() {
-                world.insert_resource(self.pre_registry.clone());
+            if let Some(mut reg) = world.get_resource_mut::<ModRegistry>() {
+                reg.restore_snapshot(Arc::clone(&self.pre_snapshot));
             }
         }
     }

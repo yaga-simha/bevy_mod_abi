@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
-//! Zero-serialization asymmetric C-ABI native modding framework for Bevy ECS.
+//! Zero-serialization asymmetric C-ABI native modding framework for Bevy ECS (`ABI 0.2.0`).
 //!
-//! Top-level host facade crate re-exporting [`bevy_abi_mod_host`], [`ModExposable`], [`AbiPod`],
+//! Top-level host facade crate re-exporting [`bevy_abi_mod_host`], [`ModComponent`], [`AbiPod`],
 //! and [`bevy_abi_mod_sys`]. All public host APIs in this crate enforce `#![forbid(unsafe_code)]`.
 
 pub use bevy_abi_mod_host;

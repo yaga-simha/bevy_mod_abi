@@ -1,0 +1,726 @@
+//! Unit and integration tests for `bevy_abi_mod_host_sys` (`ABI 0.2.0`):
+//! - `C-01`, `C-03`, `C-04`, `C-05`, `C-13` (27-slot `HOST_API`, context-scoped symbols & `last_error`,
+//!   1-based `BamComponent` handles, `iter_column_info`, `res_ptr`/`res_mut_ptr`)
+//! - `S-08` (`{ magic, generation }` handle headers + poison-on-drop)
+//! - `P-01..P-04`, `P-08`, `P-09` (dense tick skip, batched sparse rows, `marked_changed_mask`,
+//!   untracked mutable + `iter_mark_changed_range`)
+//! - `L-06`, `L-07`, `B-07`, `B-08` (`WorldDropGuard` reclamation & `CAPACITY_EXCEEDED`, CoW
+//!   `ModRegistry`, `BAM_SYSTEM_FLAG_MAIN_THREAD`, `SPARSE_SET` & `IMMUTABLE` dynamic components)
+
+use bevy_abi_mod_host_sys::drop_trampoline::available_drop_trampoline_slots;
+use bevy_abi_mod_host_sys::{
+    BamQuerySpecOwned, ComponentOptions, GuestSystem, HOST_API, LoadContext, LoadOptions,
+    ModLoadError, ModRegistry, POISONED_MAGIC, WorldDropGuard, host_cmd_spawn_empty,
+    host_get_proc_address, host_iter_column_info, host_iter_column_mutable,
+    host_iter_column_mutable_untracked, host_iter_column_readonly, host_iter_column_rows_mutable,
+    host_iter_column_rows_readonly, host_iter_entities, host_iter_mark_changed_range,
+    host_iter_next_chunk, host_last_error, host_load_host_ctx, host_register_component,
+    host_register_system, host_res_mut_ptr, host_res_ptr, host_resolve_component,
+    host_sys_commands, host_sys_host_ctx, host_sys_query, load_mod_in_world,
+};
+use bevy_abi_mod_sys::{
+    ABI_VERSION, AbiPod, AccessMode, BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET,
+    BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET,
+    BAM_SYSTEM_FLAG_MAIN_THREAD, BamColumnInfo, BamCommands, BamComponent, BamHostCtx, BamIter,
+    BamLoadCtx, BamQueryDesc, BamSystemCtx, BamSystemDesc, BamTermDesc, ComponentDesc,
+    ComponentUuid, FfiBool, FfiEntity, FfiResult, ModComponent, RawInsertable, SymbolEntry,
+    VTableHeader,
+};
+use bevy_ecs::prelude::{Component, Resource, World};
+use bevy_ecs::system::{System, SystemStateFlags};
+use core::ffi::{CStr, c_char, c_void};
+use core::sync::atomic::{AtomicUsize, Ordering};
+use std::error::Error as _;
+use std::path::Path;
+
+#[repr(C)]
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+struct Vel {
+    vx: f32,
+    vy: f32,
+}
+
+// SAFETY: `#[repr(C)]` struct of `f32` fields.
+unsafe impl RawInsertable for Vel {}
+// SAFETY: Cross-language POD layout.
+unsafe impl AbiPod for Vel {}
+
+impl ModComponent for Vel {
+    const CANONICAL_NAME: &'static str = "test_game::Vel";
+    const COMPONENT_CSTR: &'static CStr = c"test_game::Vel";
+    const UUID: ComponentUuid = ComponentUuid::from_canonical_name("test_game::Vel");
+    const IS_ABI_POD: bool = true;
+    const IS_RAW_INSERTABLE: bool = true;
+    type VTable = VTableHeader;
+
+    fn vtable() -> &'static Self::VTable {
+        static VT: VTableHeader = VTableHeader::new::<VTableHeader, Vel>(Vel::UUID);
+        &VT
+    }
+
+    fn symbols() -> &'static [SymbolEntry] {
+        &[]
+    }
+}
+
+#[repr(C)]
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq)]
+struct SimClock {
+    dt: f32,
+    frame: u32,
+}
+
+// SAFETY: `#[repr(C)]` struct of `f32` + `u32`.
+unsafe impl RawInsertable for SimClock {}
+// SAFETY: Cross-language POD layout.
+unsafe impl AbiPod for SimClock {}
+
+impl ModComponent for SimClock {
+    const CANONICAL_NAME: &'static str = "test_game::SimClock";
+    const COMPONENT_CSTR: &'static CStr = c"test_game::SimClock";
+    const UUID: ComponentUuid = ComponentUuid::from_canonical_name("test_game::SimClock");
+    const IS_ABI_POD: bool = true;
+    const IS_RAW_INSERTABLE: bool = true;
+    type VTable = VTableHeader;
+
+    fn vtable() -> &'static Self::VTable {
+        static VT: VTableHeader = VTableHeader::new::<VTableHeader, SimClock>(SimClock::UUID);
+        &VT
+    }
+
+    fn symbols() -> &'static [SymbolEntry] {
+        &[]
+    }
+}
+
+#[test]
+fn host_api_has_all_27_slots_and_registry_has_zero_builtin_symbols() {
+    assert_eq!(HOST_API.abi_version, ABI_VERSION);
+    assert_eq!(HOST_API.validate_for_guest(ABI_VERSION), FfiResult::OK);
+    assert!(HOST_API.get_proc_address.is_some());
+    assert!(HOST_API.last_error.is_some());
+    assert!(HOST_API.load_host_ctx.is_some());
+    assert!(HOST_API.register_component.is_some());
+    assert!(HOST_API.resolve_component.is_some());
+    assert!(HOST_API.register_system.is_some());
+    assert!(HOST_API.sys_host_ctx.is_some());
+    assert!(HOST_API.sys_query.is_some());
+    assert!(HOST_API.sys_commands.is_some());
+    assert!(HOST_API.iter_next_chunk.is_some());
+    assert!(HOST_API.iter_reset.is_some());
+    assert!(HOST_API.iter_entities.is_some());
+    assert!(HOST_API.iter_column_readonly.is_some());
+    assert!(HOST_API.iter_column_mutable.is_some());
+    assert!(HOST_API.iter_column_mutable_untracked.is_some());
+    assert!(HOST_API.iter_mark_changed_range.is_some());
+    assert!(HOST_API.iter_column_rows_readonly.is_some());
+    assert!(HOST_API.iter_column_rows_mutable.is_some());
+    assert!(HOST_API.iter_column_info.is_some());
+    assert!(HOST_API.res_ptr.is_some());
+    assert!(HOST_API.res_mut_ptr.is_some());
+    assert!(HOST_API.cmd_spawn_empty.is_some());
+    assert!(HOST_API.cmd_spawn.is_some());
+    assert!(HOST_API.cmd_despawn.is_some());
+    assert!(HOST_API.cmd_insert.is_some());
+    assert!(HOST_API.cmd_insert_default.is_some());
+    assert!(HOST_API.cmd_remove.is_some());
+
+    let reg = ModRegistry::new();
+    assert_eq!(reg.snapshot().symbol_count(), 0);
+    assert_eq!(reg.snapshot().component_count(), 0);
+}
+
+#[test]
+fn context_scoped_symbols_and_last_error_are_isolated_per_world() {
+    static SYM_A: u8 = 0xAA;
+    static SYM_B: u8 = 0xBB;
+
+    let mut reg_a = ModRegistry::new();
+    let mut reg_b = ModRegistry::new();
+    // SAFETY: Static addresses valid for `'static`.
+    unsafe {
+        reg_a.register_custom_symbol("bam.v0.custom.hook", (&SYM_A as *const u8).cast::<c_void>());
+        reg_b.register_custom_symbol("custom.hook", (&SYM_B as *const u8).cast::<c_void>());
+    }
+
+    let mut load_a = LoadContext::new(reg_a);
+    let mut load_b = LoadContext::new(reg_b);
+
+    // SAFETY: Valid active `LoadContext`s.
+    let ctx_a = unsafe { host_load_host_ctx(load_a.as_ffi_ptr()) };
+    // SAFETY: Valid active `LoadContext`s.
+    let ctx_b = unsafe { host_load_host_ctx(load_b.as_ffi_ptr()) };
+
+    // SAFETY: Resolving `"bam.v0.*"` symbols against distinct `BamHostCtx` handles.
+    let resolved_a = unsafe { host_get_proc_address(ctx_a, c"bam.v0.custom.hook".as_ptr()) };
+    // SAFETY: Resolving `"bam.v0.*"` symbols against distinct `BamHostCtx` handles.
+    let resolved_b = unsafe { host_get_proc_address(ctx_b, c"bam.v0.custom.hook".as_ptr()) };
+    assert_eq!(resolved_a, (&SYM_A as *const u8).cast::<c_void>());
+    assert_eq!(resolved_b, (&SYM_B as *const u8).cast::<c_void>());
+
+    // Non-"bam.v0." names must always return null (`C-04`).
+    // SAFETY: Valid `ctx_a` and C string.
+    let bad_ns = unsafe { host_get_proc_address(ctx_a, c"host_register_system".as_ptr()) };
+    assert!(bad_ns.is_null());
+
+    // Trigger an error on `ctx_a` and verify `ctx_b` diagnostic stays empty + `snprintf` semantics.
+    let mut out_comp = BamComponent::INVALID;
+    // SAFETY: Valid `ctx_a`, C string, and `out_comp`.
+    let st = unsafe {
+        host_resolve_component(
+            ctx_a,
+            c"missing::Comp".as_ptr(),
+            core::ptr::null(),
+            &mut out_comp,
+        )
+    };
+    assert_eq!(st, FfiResult::NOT_FOUND);
+
+    // SAFETY: Querying full length with null buffer, then truncated copy into 8-byte buffer.
+    let full_len = unsafe { host_last_error(ctx_a, core::ptr::null_mut(), 0) };
+    assert!(full_len > 10);
+    let mut small_buf = [0 as c_char; 8];
+    // SAFETY: `small_buf` has 8 writable bytes.
+    let reported_len = unsafe { host_last_error(ctx_a, small_buf.as_mut_ptr(), small_buf.len()) };
+    assert_eq!(reported_len, full_len);
+    assert_eq!(small_buf[7], 0);
+
+    // SAFETY: `ctx_b` had no error recorded.
+    let len_b = unsafe { host_last_error(ctx_b, core::ptr::null_mut(), 0) };
+    assert_eq!(len_b, 0);
+
+    load_a.finish_init();
+    load_b.finish_init();
+}
+
+#[test]
+fn handle_headers_reject_mismatched_and_poisoned_handles() {
+    let mut world = World::new();
+    let vel_id = world.register_component::<Vel>();
+    let mut reg = ModRegistry::new();
+    let _vel_handle = reg
+        .register_component::<Vel>(vel_id, ComponentOptions::new())
+        .unwrap();
+    world.insert_resource(reg.clone());
+
+    // 1. `LoadContext` + embedded `HostContext` poison on `finish_init`.
+    let mut load_ctx = LoadContext::new(reg.clone());
+    let raw_load_ptr: *mut BamLoadCtx = load_ctx.as_ffi_ptr();
+    // SAFETY: Valid while `in_init == true`.
+    let raw_host_ptr: *const BamHostCtx = unsafe { host_load_host_ctx(raw_load_ptr) };
+    assert!(!raw_host_ptr.is_null());
+
+    load_ctx.finish_init();
+    assert_eq!(load_ctx.header.magic, POISONED_MAGIC);
+    assert_eq!(load_ctx.header.generation, 0);
+
+    let mut out_comp = BamComponent::INVALID;
+    // SAFETY: Passing poisoned `raw_load_ptr` and `raw_host_ptr` while `load_ctx` stack frame is still live.
+    unsafe {
+        assert!(host_load_host_ctx(raw_load_ptr).is_null());
+        assert_eq!(
+            host_resolve_component(
+                raw_host_ptr,
+                c"test_game::Vel".as_ptr(),
+                core::ptr::null(),
+                &mut out_comp
+            ),
+            FfiResult::INVALID_STATE
+        );
+    }
+
+    // 2. Cross-handle type confusion inside an active `GuestSystem` callback (`S-08`).
+    unsafe extern "C" fn cross_handle_check_cb(
+        sys_ctx: *mut BamSystemCtx,
+        _ud: *mut c_void,
+    ) -> FfiResult {
+        let mut iter: *mut BamIter = core::ptr::null_mut();
+        let mut cmds: *mut BamCommands = core::ptr::null_mut();
+        // SAFETY: Valid `sys_ctx` during callback.
+        unsafe {
+            assert_eq!(host_sys_query(sys_ctx, 0, &mut iter), FfiResult::OK);
+            assert_eq!(host_sys_commands(sys_ctx, &mut cmds), FfiResult::OK);
+
+            // Passing `BamCommands*` cast as `BamIter*` must fail header validation (`FfiBool::FALSE`).
+            let mut len = 99usize;
+            assert_eq!(
+                host_iter_next_chunk(cmds.cast::<BamIter>(), &mut len),
+                FfiBool::FALSE
+            );
+
+            // Passing `BamIter*` cast as `BamCommands*` must return `FfiResult::INVALID_STATE`.
+            let mut ent = FfiEntity::NULL;
+            assert_eq!(
+                host_cmd_spawn_empty(iter.cast::<BamCommands>(), &mut ent),
+                FfiResult::INVALID_STATE
+            );
+
+            // Passing `BamSystemCtx*` cast as `BamLoadCtx*` must return `FfiResult::INVALID_STATE`.
+            assert_eq!(
+                host_register_system(sys_ctx.cast::<BamLoadCtx>(), core::ptr::null()),
+                FfiResult::INVALID_STATE
+            );
+        }
+        FfiResult::OK
+    }
+
+    let query = BamQuerySpecOwned {
+        flags: 0,
+        terms: vec![BamTermDesc {
+            component: BamComponent::from_raw(1),
+            mode: AccessMode::READ,
+            flags: 0,
+        }],
+    };
+    let mut sys = GuestSystem::new(
+        "cross_handle_check",
+        vec![query],
+        cross_handle_check_cb,
+        core::ptr::null_mut(),
+        reg,
+    );
+    sys.initialize(&mut world);
+    sys.run((), &mut world).unwrap();
+}
+
+#[test]
+fn sparse_set_batching_untracked_mutation_tick_skip_resources_and_column_info() {
+    let mut world = World::new();
+    let vel_id = world.register_component::<Vel>();
+    let clock_id = world.register_component::<SimClock>();
+    world.insert_resource(SimClock { dt: 0.5, frame: 10 });
+
+    let mut reg = ModRegistry::new();
+    let vel_comp = reg
+        .register_component::<Vel>(vel_id, ComponentOptions::new())
+        .unwrap();
+    let clock_comp = reg.register_resource::<SimClock>(clock_id).unwrap();
+    world.insert_resource(reg.clone());
+
+    // Register a dynamic `SparseSet` u32 component and a dynamic `Immutable` u32 component via `LoadContext`.
+    let sparse_uuid = ComponentUuid::from_parts("test_mod::Shield", 4, 4, 1);
+    let immut_uuid = ComponentUuid::from_parts("test_mod::TeamId", 4, 4, 2);
+
+    let mut load_ctx = LoadContext::with_manifest_name(
+        reg,
+        std::sync::Arc::new(core::sync::atomic::AtomicBool::new(true)),
+        &mut world as *mut World,
+        None,
+        Some(std::sync::Arc::from("test_mod")),
+    );
+
+    let sparse_desc = ComponentDesc::new(c"Shield".as_ptr(), sparse_uuid, 4, 4)
+        .with_flags(BAM_COMPONENT_FLAG_SPARSE_SET);
+    let immut_desc = ComponentDesc::new(c"TeamId".as_ptr(), immut_uuid, 4, 4)
+        .with_flags(BAM_COMPONENT_FLAG_IMMUTABLE);
+
+    let mut shield_comp = BamComponent::INVALID;
+    let mut team_comp = BamComponent::INVALID;
+    // SAFETY: Valid `load_ctx` and `ComponentDesc`s.
+    unsafe {
+        assert_eq!(
+            host_register_component(load_ctx.as_ffi_ptr(), &sparse_desc, &mut shield_comp),
+            FfiResult::OK
+        );
+        assert_eq!(
+            host_register_component(load_ctx.as_ffi_ptr(), &immut_desc, &mut team_comp),
+            FfiResult::OK
+        );
+
+        // Unqualified `"Shield"` resolves inside `test_mod`'s `HostContext` (`C-10`).
+        let hctx = host_load_host_ctx(load_ctx.as_ffi_ptr());
+        let mut resolved = BamComponent::INVALID;
+        assert_eq!(
+            host_resolve_component(hctx, c"Shield".as_ptr(), &sparse_uuid, &mut resolved),
+            FfiResult::OK
+        );
+        assert_eq!(resolved, shield_comp);
+
+        // Mismatched UUID returns `TYPE_MISMATCH`.
+        assert_eq!(
+            host_resolve_component(hctx, c"Shield".as_ptr(), &immut_uuid, &mut resolved),
+            FfiResult::TYPE_MISMATCH
+        );
+
+        // Attempting to register a system that writes to an `IMMUTABLE` component fails with `PERMISSION_DENIED` (`B-08`).
+        let bad_term = BamTermDesc {
+            component: team_comp,
+            mode: AccessMode::WRITE,
+            flags: 0,
+        };
+        let bad_query = BamQueryDesc {
+            struct_size: BamQueryDesc::MIN_V0_2_SIZE as u32,
+            flags: 0,
+            terms: &bad_term,
+            term_count: 1,
+        };
+        unsafe extern "C" fn noop_cb(_: *mut BamSystemCtx, _: *mut c_void) -> FfiResult {
+            FfiResult::OK
+        }
+        let bad_sys = BamSystemDesc::new(
+            c"bad_immut_writer".as_ptr(),
+            &bad_query,
+            1,
+            noop_cb,
+            core::ptr::null_mut(),
+        )
+        .with_flags(BAM_SYSTEM_FLAG_MAIN_THREAD);
+        assert_eq!(
+            host_register_system(load_ctx.as_ffi_ptr(), &bad_sys),
+            FfiResult::PERMISSION_DENIED
+        );
+    }
+    let updated_reg = load_ctx.registry.clone();
+    load_ctx.finish_init();
+
+    let shield_id = updated_reg.get_by_handle(shield_comp).unwrap().component_id;
+    let team_id = updated_reg.get_by_handle(team_comp).unwrap().component_id;
+
+    // Spawn 4 entities in the SAME archetype carrying dense `Vel`, sparse `Shield`, and immutable `TeamId`.
+    for i in 0..4u32 {
+        let mut e = world.spawn(Vel {
+            vx: (i + 1) as f32,
+            vy: 0.0,
+        });
+        let shield_val: u32 = 100 + i;
+        let team_val: u32 = 7;
+        // SAFETY: `shield_id` and `team_id` were registered with `(size = 4, align = 4)`.
+        unsafe {
+            bevy_ecs::ptr::OwningPtr::make(shield_val, |ptr| {
+                e.insert_by_id(shield_id, ptr);
+            });
+            bevy_ecs::ptr::OwningPtr::make(team_val, |ptr| {
+                e.insert_by_id(team_id, ptr);
+            });
+        }
+    }
+
+    // System 1: Tests `P-02` sparse batching (`chunk_len == 4`), `C-13` `iter_column_info`,
+    // `C-05` `res_ptr`/`res_mut_ptr`, and `P-04` `iter_column_mutable_untracked` + `iter_mark_changed_range`
+    // marking ONLY row 2 of `Vel` changed!
+    static OBSERVED_SPARSE_CHUNK_LEN: AtomicUsize = AtomicUsize::new(0);
+
+    #[allow(clippy::cast_ptr_alignment)]
+    unsafe extern "C" fn writer_cb(sys_ctx: *mut BamSystemCtx, _ud: *mut c_void) -> FfiResult {
+        let mut iter: *mut BamIter = core::ptr::null_mut();
+        // SAFETY: Active `sys_ctx` with 1 query.
+        unsafe {
+            assert_eq!(host_sys_query(sys_ctx, 0, &mut iter), FfiResult::OK);
+            assert!(!host_sys_host_ctx(sys_ctx).is_null());
+
+            // Check `BamColumnInfo` (`C-13`) on all 4 terms.
+            let mut info = core::mem::MaybeUninit::<BamColumnInfo>::uninit();
+            assert_eq!(
+                host_iter_column_info(iter, 0, info.as_mut_ptr()),
+                FfiResult::OK
+            );
+            assert_eq!(info.assume_init().storage_flags, 0);
+
+            assert_eq!(
+                host_iter_column_info(iter, 1, info.as_mut_ptr()),
+                FfiResult::OK
+            );
+            assert_eq!(
+                info.assume_init().storage_flags,
+                BAM_STORAGE_FLAG_SPARSE_SET
+            );
+
+            assert_eq!(
+                host_iter_column_info(iter, 2, info.as_mut_ptr()),
+                FfiResult::OK
+            );
+            assert_eq!(info.assume_init().storage_flags, BAM_STORAGE_FLAG_IMMUTABLE);
+
+            assert_eq!(
+                host_iter_column_info(iter, 3, info.as_mut_ptr()),
+                FfiResult::OK
+            );
+            assert_eq!(info.assume_init().storage_flags, BAM_STORAGE_FLAG_RESOURCE);
+
+            // Mutate `SimClock` resource (`term_index == 3`).
+            let clock_ro = host_res_ptr(iter, 3).cast::<SimClock>();
+            assert!(!clock_ro.is_null());
+            assert_eq!((*clock_ro).frame, 10);
+            let clock_mut = host_res_mut_ptr(iter, 3).cast::<SimClock>();
+            assert!(!clock_mut.is_null());
+            (*clock_mut).frame = 11;
+
+            let mut len = 0usize;
+            while host_iter_next_chunk(iter, &mut len).get() {
+                OBSERVED_SPARSE_CHUNK_LEN.store(len, Ordering::SeqCst);
+                let ents = host_iter_entities(iter);
+                assert!(!ents.is_null());
+
+                // Untracked mutable write on dense `Vel` (`term_index == 0`), marking ONLY row 2 changed!
+                let vel_ptr = host_iter_column_mutable_untracked(iter, 0).cast::<Vel>();
+                assert!(!vel_ptr.is_null());
+                (*vel_ptr.add(2)).vy = 99.0;
+                assert_eq!(host_iter_mark_changed_range(iter, 0, 2, 1), FfiResult::OK);
+
+                // Indirect sparse-set mutable rows (`term_index == 1`, `P-02`).
+                let shield_rows = host_iter_column_rows_mutable(iter, 1);
+                assert!(!shield_rows.is_null());
+                for r in 0..len {
+                    let row_p = (*shield_rows.add(r)).cast::<u32>();
+                    *row_p += 50;
+                }
+                let shield_ro = host_iter_column_rows_readonly(iter, 1);
+                assert!(!shield_ro.is_null());
+                assert_eq!(*(*shield_ro).cast::<u32>(), 150);
+
+                // Immutable dense `TeamId` (`term_index == 2`) readable, not writable.
+                let team_ro = host_iter_column_readonly(iter, 2).cast::<u32>();
+                assert!(!team_ro.is_null());
+                assert_eq!(*team_ro, 7);
+                assert!(host_iter_column_mutable(iter, 2).is_null());
+            }
+        }
+        FfiResult::OK
+    }
+
+    // System 2: `AccessMode::CHANGED` reader on `Vel` (`P-01` + `P-04` verification).
+    static CHANGED_ROW_COUNT: AtomicUsize = AtomicUsize::new(0);
+    unsafe extern "C" fn changed_vel_reader_cb(
+        sys_ctx: *mut BamSystemCtx,
+        _ud: *mut c_void,
+    ) -> FfiResult {
+        let mut iter: *mut BamIter = core::ptr::null_mut();
+        // SAFETY: Active `sys_ctx`.
+        unsafe {
+            assert_eq!(host_sys_query(sys_ctx, 0, &mut iter), FfiResult::OK);
+            let mut total = 0usize;
+            let mut len = 0usize;
+            while host_iter_next_chunk(iter, &mut len).get() {
+                total += len;
+            }
+            CHANGED_ROW_COUNT.store(total, Ordering::SeqCst);
+        }
+        FfiResult::OK
+    }
+
+    let mut changed_sys = GuestSystem::new(
+        "changed_vel_reader",
+        vec![BamQuerySpecOwned {
+            flags: 0,
+            terms: vec![BamTermDesc {
+                component: vel_comp,
+                mode: AccessMode::CHANGED,
+                flags: 0,
+            }],
+        }],
+        changed_vel_reader_cb,
+        core::ptr::null_mut(),
+        updated_reg.clone(),
+    );
+    changed_sys.initialize(&mut world);
+    // Initial run consumes initial spawn ticks (all 4 entities).
+    changed_sys.run((), &mut world).unwrap();
+    assert_eq!(CHANGED_ROW_COUNT.load(Ordering::SeqCst), 4);
+    // Second run with zero mutations skips the entire table via `P-01` summary tick check -> 0 rows!
+    changed_sys.run((), &mut world).unwrap();
+    assert_eq!(CHANGED_ROW_COUNT.load(Ordering::SeqCst), 0);
+
+    // Run `writer_sys` (also verify `BAM_SYSTEM_FLAG_MAIN_THREAD` -> `NON_SEND` flag `B-07`).
+    let mut writer_sys = GuestSystem::new(
+        "writer_sys",
+        vec![BamQuerySpecOwned {
+            flags: 0,
+            terms: vec![
+                BamTermDesc {
+                    component: vel_comp,
+                    mode: AccessMode::WRITE,
+                    flags: 0,
+                },
+                BamTermDesc {
+                    component: shield_comp,
+                    mode: AccessMode::WRITE,
+                    flags: 0,
+                },
+                BamTermDesc {
+                    component: team_comp,
+                    mode: AccessMode::READ,
+                    flags: 0,
+                },
+                BamTermDesc {
+                    component: clock_comp,
+                    mode: AccessMode::RESOURCE_WRITE,
+                    flags: 0,
+                },
+            ],
+        }],
+        writer_cb,
+        core::ptr::null_mut(),
+        updated_reg,
+    )
+    .with_main_thread(true);
+    assert!(writer_sys.flags().contains(SystemStateFlags::NON_SEND));
+    writer_sys.initialize(&mut world);
+    writer_sys.run((), &mut world).unwrap();
+
+    // `P-02`: All 4 sparse entities in the same archetype were batched into a SINGLE chunk of length 4!
+    assert_eq!(OBSERVED_SPARSE_CHUNK_LEN.load(Ordering::SeqCst), 4);
+    assert_eq!(world.resource::<SimClock>().frame, 11);
+
+    // `P-04`: Because `writer_sys` used `iter_column_mutable_untracked` + `iter_mark_changed_range(0, 2, 1)`,
+    // `changed_sys` sees ONLY the 1 modified row (not all 4 rows)!
+    changed_sys.run((), &mut world).unwrap();
+    assert_eq!(CHANGED_ROW_COUNT.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn world_drop_guard_reclaims_slots_on_world_drop_and_reports_capacity_exceeded() {
+    static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+    unsafe extern "C" fn custom_drop(ptr: *mut c_void) {
+        if !ptr.is_null() {
+            DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let baseline_free = available_drop_trampoline_slots();
+    DROP_COUNT.store(0, Ordering::SeqCst);
+
+    {
+        let mut world = World::new();
+        let reg = ModRegistry::new();
+        let mut load_ctx = LoadContext::with_world_and_mod_id(
+            reg,
+            std::sync::Arc::new(core::sync::atomic::AtomicBool::new(true)),
+            &mut world as *mut World,
+            None,
+        );
+        let uuid = ComponentUuid::from_parts("drop_test::OwnedBlob", 8, 8, 99);
+        let desc = ComponentDesc {
+            struct_size: ComponentDesc::MIN_V0_2_SIZE as u32,
+            flags: 0,
+            name: c"drop_test::OwnedBlob".as_ptr(),
+            uuid,
+            size: 8,
+            align: 8,
+            drop_fn: Some(custom_drop),
+            vtable_ptr: core::ptr::null(),
+        };
+        let mut handle = BamComponent::INVALID;
+        // SAFETY: Valid `load_ctx` and `desc`.
+        unsafe {
+            assert_eq!(
+                host_register_component(load_ctx.as_ffi_ptr(), &desc, &mut handle),
+                FfiResult::OK
+            );
+        }
+        let comp_id = load_ctx
+            .registry
+            .get_by_handle(handle)
+            .unwrap()
+            .component_id;
+        load_ctx.finish_init();
+
+        assert_eq!(available_drop_trampoline_slots(), baseline_free - 1);
+
+        // Spawn 3 entities; despawn 1 while active (`DROP_COUNT` -> 1), and leave 2 alive when `World` drops!
+        let mut entities = Vec::new();
+        for i in 0..3u64 {
+            let mut e = world.spawn_empty();
+            // SAFETY: `comp_id` has layout `(8, 8)` matching `u64`.
+            unsafe {
+                bevy_ecs::ptr::OwningPtr::make(i + 1, |ptr| {
+                    e.insert_by_id(comp_id, ptr);
+                });
+            }
+            entities.push(e.id());
+        }
+        world.entity_mut(entities[0]).despawn();
+        assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    // After `World` drops (even with 2 entities still in storage at `World::drop` time), the slot MUST be reclaimed!
+    assert_eq!(available_drop_trampoline_slots(), baseline_free);
+
+    // Exhaust all available slots in a separate `World` and verify `FfiResult::CAPACITY_EXCEEDED`.
+    {
+        let mut world = World::new();
+        world.insert_resource(WorldDropGuard::new());
+        let reg = ModRegistry::new();
+        let mut load_ctx = LoadContext::with_world_and_mod_id(
+            reg,
+            std::sync::Arc::new(core::sync::atomic::AtomicBool::new(true)),
+            &mut world as *mut World,
+            None,
+        );
+        let to_fill = available_drop_trampoline_slots();
+        for idx in 0..to_fill {
+            let cname = std::ffi::CString::new(format!("cap_test::C{idx}")).unwrap();
+            let uuid = ComponentUuid::from_parts(cname.to_str().unwrap(), 4, 4, idx as u64);
+            let desc = ComponentDesc {
+                struct_size: ComponentDesc::MIN_V0_2_SIZE as u32,
+                flags: 0,
+                name: cname.as_ptr(),
+                uuid,
+                size: 4,
+                align: 4,
+                drop_fn: Some(custom_drop),
+                vtable_ptr: core::ptr::null(),
+            };
+            let mut h = BamComponent::INVALID;
+            // SAFETY: Valid `load_ctx` and `desc`.
+            unsafe {
+                assert_eq!(
+                    host_register_component(load_ctx.as_ffi_ptr(), &desc, &mut h),
+                    FfiResult::OK
+                );
+            }
+        }
+        assert_eq!(available_drop_trampoline_slots(), 0);
+
+        // The 1025th distinct foreign-drop component must fail cleanly with `CAPACITY_EXCEEDED`!
+        let overflow_desc = ComponentDesc {
+            struct_size: ComponentDesc::MIN_V0_2_SIZE as u32,
+            flags: 0,
+            name: c"cap_test::Overflow".as_ptr(),
+            uuid: ComponentUuid::from_parts("cap_test::Overflow", 4, 4, 9999),
+            size: 4,
+            align: 4,
+            drop_fn: Some(custom_drop),
+            vtable_ptr: core::ptr::null(),
+        };
+        let mut h = BamComponent::INVALID;
+        // SAFETY: Valid `load_ctx` and `overflow_desc`.
+        unsafe {
+            assert_eq!(
+                host_register_component(load_ctx.as_ffi_ptr(), &overflow_desc, &mut h),
+                FfiResult::CAPACITY_EXCEEDED
+            );
+        }
+        load_ctx.finish_init();
+    }
+
+    // All 1024 slots reclaimed upon `World` drop!
+    assert_eq!(available_drop_trampoline_slots(), baseline_free);
+}
+
+#[test]
+fn mod_load_error_preserves_thiserror_sources() {
+    let mut world = World::new();
+    let missing_path = Path::new("/nonexistent/dir/libmissing_bam_mod.dylib");
+
+    // 1. With `shadow_copy: true`, missing source file yields `ModLoadError::ShadowCopy` with `io::Error` `source()`.
+    let err_shadow = load_mod_in_world(
+        &mut world,
+        missing_path,
+        &LoadOptions::new().with_shadow_copy(true),
+    )
+    .err()
+    .expect("missing file should fail shadow copy");
+    assert!(matches!(err_shadow, ModLoadError::ShadowCopy { .. }));
+    assert!(err_shadow.source().is_some());
+
+    // 2. With `shadow_copy: false`, missing file yields `ModLoadError::DlOpen` with `libloading::Error` `source()`.
+    let err_dlopen = load_mod_in_world(
+        &mut world,
+        missing_path,
+        &LoadOptions::new().with_shadow_copy(false),
+    )
+    .err()
+    .expect("missing file should fail dlopen");
+    assert!(matches!(err_dlopen, ModLoadError::DlOpen { .. }));
+    assert!(err_dlopen.source().is_some());
+}

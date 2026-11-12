@@ -1,4 +1,4 @@
-//! Host C-ABI entry points (`HOST_API`, chunk iteration, deferred commands, registration, symbols).
+//! `extern "C"` host FFI callbacks, handle-hardened contexts, and `HOST_API` table.
 
 pub mod commands;
 pub mod host_api;

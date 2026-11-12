@@ -84,8 +84,14 @@ bevy_abi_mod_guest = { path = "crates/bevy_abi_mod_guest" }
 bevy_abi_mod = { path = "crates/bevy_abi_mod" }
 bevy_ecs = { version = "0.20.1", default-features = false, features = ["std", "async_executor"] }
 bevy_app = { version = "0.20.1", default-features = false, features = ["std"] }
+bevy_platform = { version = "0.20.1", default-features = false, features = ["std"] }
 libloading = "0.8"
 nonmax = "0.5"
+arc-swap = "1.7"
+thiserror = "2"
+tracing = "0.1"
+loom = "0.7"
+proptest = "1"
 syn = { version = "2.0", features = ["full"] }
 quote = "1.0"
 proc-macro2 = "1.0"
