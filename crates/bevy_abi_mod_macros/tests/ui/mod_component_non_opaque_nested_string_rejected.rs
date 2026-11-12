@@ -1,11 +1,12 @@
-use bevy_abi_mod_macros::ModExposable;
+use bevy_abi_mod_macros::ModComponent;
 
-#[derive(ModExposable)]
+#[derive(Clone, ModComponent)]
 pub struct InnerLabel {
     pub text: String,
 }
 
-#[derive(ModExposable)]
+#[repr(C)]
+#[derive(Clone, ModComponent)]
 pub struct NonOpaqueOuter {
     pub label: InnerLabel,
 }

@@ -1,0 +1,26 @@
+error[E0277]: the trait bound `NamedComp: AbiPod` is not satisfied
+ --> tests/ui/mod_component_string_not_abi_pod.rs:9:40
+  |
+9 |     bevy_abi_mod_sys::assert_abi_pod::<NamedComp>();
+  |                                        ^^^^^^^^^ unsatisfied trait bound
+  |
+help: the trait `AbiPod` is not implemented for `NamedComp`
+ --> tests/ui/mod_component_string_not_abi_pod.rs:4:1
+  |
+4 | pub struct NamedComp {
+  | ^^^^^^^^^^^^^^^^^^^^
+  = help: the following other types implement trait `AbiPod`:
+            BamComponent
+            ComponentUuid
+            FfiBool
+            FfiEntity
+            [T; N]
+            f32
+            f64
+            i16
+          and $N others
+note: required by a bound in `assert_abi_pod`
+ --> $WORKSPACE/crates/bevy_abi_mod_sys/src/traits.rs
+  |
+  | pub const fn assert_abi_pod<T: AbiPod>() {}
+  |                                ^^^^^^ required by this bound in `assert_abi_pod`

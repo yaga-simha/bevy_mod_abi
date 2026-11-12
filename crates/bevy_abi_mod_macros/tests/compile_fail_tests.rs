@@ -1,10 +1,10 @@
 #![allow(unreachable_pub)]
 
 //! `trybuild` UI compile-fail and positive-control test suite for `#[derive(AbiPod)]`
-//! and `#[derive(ModExposable)]`.
+//! and `#[derive(ModComponent)]`.
 
-use bevy_abi_mod_macros::{AbiPod, ModExposable};
-use bevy_abi_mod_sys::ExposableComponent as _;
+use bevy_abi_mod_macros::{AbiPod, ModComponent};
+use bevy_abi_mod_sys::ModComponent as _;
 
 #[repr(C)]
 #[derive(Copy, Clone, AbiPod)]
@@ -13,19 +13,20 @@ struct LinkAnchorPod {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, ModExposable)]
+#[derive(Copy, Clone, ModComponent)]
 struct LinkAnchorComp {
     val: LinkAnchorPod,
 }
 
 #[test]
 fn link_anchor_traits_are_live() {
-    fn assert_pod<T: bevy_abi_mod_sys::AbiPod>() {}
-    fn assert_layout<T: bevy_abi_mod_sys::FfiLayout>() {}
-    assert_pod::<LinkAnchorPod>();
-    assert_pod::<LinkAnchorComp>();
-    assert_layout::<LinkAnchorComp>();
-    assert_eq!(LinkAnchorComp::COMPONENT_NAME, "LinkAnchorComp");
+    bevy_abi_mod_sys::assert_abi_pod::<LinkAnchorPod>();
+    bevy_abi_mod_sys::assert_abi_pod::<LinkAnchorComp>();
+    bevy_abi_mod_sys::assert_raw_insertable::<LinkAnchorComp>();
+    assert_eq!(
+        LinkAnchorComp::CANONICAL_NAME,
+        "compile_fail_tests::LinkAnchorComp"
+    );
 }
 
 #[test]
@@ -34,5 +35,5 @@ fn ui_compile_fail_and_pass_suite() {
     let t = trybuild::TestCases::new();
     t.pass("tests/ui/pass_*.rs");
     t.compile_fail("tests/ui/abi_pod_*.rs");
-    t.compile_fail("tests/ui/mod_exposable_*.rs");
+    t.compile_fail("tests/ui/mod_component_*.rs");
 }

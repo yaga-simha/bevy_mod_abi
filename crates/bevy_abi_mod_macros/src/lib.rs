@@ -1,91 +1,62 @@
 #![forbid(unsafe_code)]
 
-//! # `bevy_abi_mod_macros`: Procedural Macros for `#[derive(ModExposable)]` and `#[derive(AbiPod)]`
+//! # `bevy_abi_mod_macros`: Procedural Macros for `#[derive(ModComponent)]` and `#[derive(AbiPod)]`
 //!
-//! This crate provides:
-//! - `#[derive(ModExposable)]` for host Bevy components and compound types: generates C-ABI field
-//!   accessors (including sound `u8` boolean accessors), a `#[repr(C)]` `<Struct>VTable` with
-//!   static byte strides and function pointers, compile-time layout assertions, an implementation
-//!   of `ExposableComponent` with `IS_POD` and `IS_RAW_INSERTABLE` metadata, and conditional
-//!   `FfiLayout` / `AbiPod` implementations when layout and bit-validity invariants hold.
-//! - `#[derive(AbiPod)]` for standalone `#[repr(C)]` / `#[repr(transparent)]` Plain Old Data types:
-//!   verifies non-packed deterministic representation, `Copy + 'static`, zero drop glue, and
-//!   `AbiPod` conformance on every field.
+//! This crate provides zero-Bevy-dependency procedural macros targeting ABI `0.2`:
+//! - [`ModComponent`]: Generates a `#[repr(C)]` `<Struct>VTable` prefixed at byte offset `0` by
+//!   `VTableHeader` (`struct_size`, `abi_version`, `uuid`, `size`, `align`) with
+//!   `Option<unsafe extern "C" fn(...)>` field accessor slots, error-returning `FfiResult` setters,
+//!   namespaced `"bam.v0.<canonical_name>.*"` symbols, deterministic 128-bit SipHash-2-4
+//!   `ComponentUuid`s, `ModComponent` metadata (`IS_ABI_POD`, `IS_RAW_INSERTABLE`), and conditional
+//!   `RawInsertable` / `AbiPod` implementations.
+//! - [`AbiPod`]: Verifies standalone `#[repr(C)]` / `#[repr(transparent)]` non-packed Plain Old
+//!   Data structs (`Copy + Send + Sync + 'static`, zero drop glue, and `assert_abi_pod::<FieldTy>()`
+//!   on every field, rejecting `u128`, `i128`, `usize`, `isize`, `bool`, `char`, enums, and heap types).
 //!
-//! ## Macro Compilation Pipeline
+//! ## Syntactic Type Classification & `#[mod_field(...)]` Precedence
 //!
-//! ```text
-//! Rust Struct (#[derive(ModExposable)])
-//!         │
-//!         ▼
-//!    AST Parsing & Validation
-//!    ├── Reject generic structs
-//!    ├── Reject enums and packed structs
-//!    ├── Reject unsupported heap-owning types without #[mod_field(skip)]
-//!    └── Reject colliding symbol or accessor names
-//!         │
-//!         ▼
-//!    Field Classification (classify_type)
-//!    ├── Bool: bool (Exposed across extern "C" as u8: 0 / non-zero)
-//!    ├── Primitive: f32, f64, i8..i64, u8..u64, usize, isize, FfiEntity (AbiPod)
-//!    ├── HostString: String (Host-allocated)
-//!    ├── HostVec: Vec<T: AbiPod> (Host-allocated)
-//!    └── Nested: Compound struct / array (Interior pointer accessors)
-//!         │
-//!         ▼
-//!    Code Generation (expand_mod_exposable)
-//!    ├── VTable Struct Definition (<Struct>VTable { size, align, ... })
-//!    └── Hygienic `const _: () = { ... };` Scope
-//!        ├── Extern "C" field accessors (<Prefix>_get_<field>, <Prefix>_set_<field>)
-//!        ├── Compile-time layout assertions
-//!        ├── Inherent `VTABLE` and `vtable()` methods
-//!        ├── Conditional `FfiLayout` and `AbiPod` implementations
-//!        └── `ExposableComponent` implementation and static symbol table
-//! ```
+//! Because procedural macros inspect AST syntax prior to Rust type resolution, unannotated fields
+//! are classified by their syntactic type path (`bool`, fixed-width primitives, `usize`/`isize`,
+//! `String`, `Vec<T>`, or nested compound/array types) and **verified at compile time** via
+//! generated trait/type guards:
+//! - Explicit `#[mod_field(...)]` attributes **always override** syntactic path inspection, allowing
+//!   type aliases (`type Label = String;` with `#[mod_field(string)]`, `type Scores = Vec<u32>;`
+//!   with `#[mod_field(vec(u32))]`, `type Flag = bool;` with `#[mod_field(bool)]`) or custom types
+//!   named `String` (`#[mod_field(nested)]` / `#[mod_field(skip)]`).
+//! - Spoofed types (such as a user-defined `struct String;` without `#[mod_field(...)]`) fail a
+//!   compile-time `std::string::String` / `std::vec::Vec<T>` trait assertion cleanly instead of
+//!   generating unsound accessors.
 //!
 //! ## Attribute Reference
 //!
-//! ### Struct-Level Attributes (`#[mod_component(...)]` / `#[mod_exposable(...)]`)
-//! - `#[mod_component(name = "...")]`: Specifies a custom component name (e.g. `"game::Position"`),
-//!   disambiguating identically named structs across modules.
-//! - `#[mod_component(prefix = "...")]`: Custom symbol prefix. Replaces non-alphanumeric characters with `_`.
-//! - `#[mod_component(crate = path)]`: Overrides automatic `proc-macro-crate` resolution for the
-//!   `bevy_abi_mod_sys` contract module path.
-//! - `#[mod_component(export_symbols)]`: Emits `#[unsafe(export_name = "...")]` on generated accessors
-//!   for direct `.cdylib` export.
-//! - `#[mod_component(no_pod)]`: Opts out of automatic `AbiPod` implementation (`IS_POD = false`) even on `#[repr(C)]` structs.
-//! - `#[mod_component(opaque)]`: Marks the struct as VTable-only (`IS_RAW_INSERTABLE = false`, `IS_POD = false`; omits both `FfiLayout` and `AbiPod`), allowing nested fields that implement `ExposableComponent` without `FfiLayout`.
+//! ### Struct-Level Attributes (`#[mod_component(...)]`)
+//! - `#[mod_component(name = "...")]`: Custom component name. Names containing `"::"` (e.g.
+//!   `"physics::Position"`) set the full canonical name; unqualified names (e.g. `"CustomPos"`)
+//!   are prefixed with `module_path!()` (or `namespace = "..."` if provided).
+//! - `#[mod_component(namespace = "...")]`: Explicit namespace prefix overriding `module_path!()`.
+//! - `#[mod_component(uuid = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")]`: Explicit 128-bit UUID hex
+//!   override (36-char hyphenated or 32-char hex string) evaluated at compile time via
+//!   `ComponentUuid::parse_hex`.
+//! - `#[mod_component(prefix = "...")]`: Custom symbol stem for `export_symbols`.
+//! - `#[mod_component(crate = path)]`: Explicit path to `bevy_abi_mod_sys`.
+//! - `#[mod_component(export_symbols)]`: Emits `#[unsafe(export_name = "bam_<ns>_<Struct>_...")]`
+//!   on generated `extern "C"` functions.
+//! - `#[mod_component(no_pod)]`: Opts out of automatic `AbiPod` implementation (`IS_ABI_POD = false`)
+//!   even on `#[repr(C)]` structs while keeping `RawInsertable` when eligible.
+//! - `#[mod_component(opaque)]`: Marks the struct VTable-only (`IS_RAW_INSERTABLE = false`,
+//!   `IS_ABI_POD = false`), allowing nested fields that implement `ModComponent` without
+//!   `RawInsertable`.
+//! - `#[mod_component(sparse_set)]` / `#[mod_component(immutable)]`: Populates
+//!   `ModComponent::COMPONENT_FLAGS`.
 //!
 //! ### Field-Level Attributes (`#[mod_field(...)]`)
-//! - `#[mod_field(skip)]`: Skips field accessor generation (mandatory for host-private fields, closures,
-//!   raw pointers, or Rust collections like `Option<T>`, `Box<T>`, `HashMap<K, V>`).
-//! - `#[mod_field(primitive)]`: Forces classification as primitive value type.
-//! - `#[mod_field(string)]`: Forces classification as host-owned `String`.
-//! - `#[mod_field(vec)]`: Forces classification as host-owned `Vec<T>`.
-//! - `#[mod_field(nested)]`: Forces classification as nested compound struct exposed via interior pointers
-//!   (`ptr_<field>` and `ptr_mut_<field>`).
-//!
-//! ## Self-Aliasing Detection in Collection Setters
-//!
-//! When guest code invokes a setter for a host-allocated collection (`String` or `Vec<T>`), it may pass
-//! a pointer to memory that resides inside the component's own existing heap buffer:
-//!
-//! ```text
-//! Component Buffer: [ "Hello World" ]
-//!                     ▲       ▲
-//!                     │       └── Guest passes subslice [6..11]: "World"
-//!                     └────────── Existing buffer start
-//! ```
-//!
-//! If the host setter naively cleared the buffer before reading the incoming slice, it would
-//! deallocate or truncate the backing storage before copying from it, causing a use-after-free
-//! or data corruption.
-//!
-//! Generated setters detect interval overlap before mutating:
-//! 1. Read the existing buffer address interval `[buf_start .. buf_end)`.
-//! 2. Compute the incoming source interval `[src_start .. src_end)`.
-//! 3. Check interval intersection (`src_start < buf_end && buf_start < src_end`).
-//! 4. Allocate a replacement buffer first when overlapping, or mutate in place when disjoint.
+//! - `#[mod_field(skip)]`: Skips accessor generation for host-private fields.
+//! - `#[mod_field(bool)]`: Forces `FfiBool` accessor generation (`bool` or `bool` type alias).
+//! - `#[mod_field(primitive)]`: Forces by-value primitive accessor generation.
+//! - `#[mod_field(string)]`: Forces `StrView` host-allocated `::std::string::String` accessors.
+//! - `#[mod_field(vec)]` / `#[mod_field(vec(ElemTy))]`: Forces `FfiSlice<ElemTy>` + `push_<field>`
+//!   host-allocated `::std::vec::Vec<ElemTy>` accessors (`ElemTy: AbiPod`).
+//! - `#[mod_field(nested)]`: Forces `*const c_void` / `*mut c_void` interior pointer accessors.
 
 mod abi_pod;
 mod attrs;
@@ -95,16 +66,14 @@ mod codegen;
 use proc_macro::TokenStream;
 use syn::{DeriveInput, parse_macro_input};
 
-/// Derive macro for standalone `#[repr(C)]` / `#[repr(transparent)]` Plain Old Data (`AbiPod`) types.
+/// Derive macro for standalone `#[repr(C)]` / `#[repr(transparent)]` cross-language Plain Old Data
+/// (`AbiPod`) types.
 ///
 /// Enforces at compile time that:
 /// 1. The target is a non-generic struct annotated with `#[repr(C)]` or `#[repr(transparent)]` (and not `packed`).
-/// 2. Every field implements `AbiPod` (`bool`, `String`, `Vec<T>`, and `#[repr(Rust)]` structs are rejected).
+/// 2. Every field implements `AbiPod` via `assert_abi_pod::<FieldTy>()` (`u128`, `i128`, `usize`, `isize`, `bool`, `char`, `String`, `Vec<T>`, enums, and `#[repr(Rust)]` structs are rejected).
 /// 3. The struct implements `Copy` and has no drop glue (`!core::mem::needs_drop::<Self>()`).
-///
-/// Note: Host components using `#[derive(ModExposable)]` with `#[repr(C)]` and all-POD fields
-/// automatically implement `FfiLayout` and `AbiPod` without needing a separate `#[derive(AbiPod)]`.
-#[proc_macro_derive(AbiPod, attributes(mod_component, mod_exposable))]
+#[proc_macro_derive(AbiPod, attributes(mod_component))]
 pub fn derive_abi_pod(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     match abi_pod::expand_abi_pod(&input) {
@@ -113,11 +82,11 @@ pub fn derive_abi_pod(input: TokenStream) -> TokenStream {
     }
 }
 
-/// Derive macro for `ModExposable` components.
-#[proc_macro_derive(ModExposable, attributes(mod_component, mod_exposable, mod_field))]
-pub fn derive_mod_exposable(input: TokenStream) -> TokenStream {
+/// Derive macro for `ModComponent` host components and nested sub-structs.
+#[proc_macro_derive(ModComponent, attributes(mod_component, mod_field))]
+pub fn derive_mod_component(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
-    match codegen::expand_mod_exposable(&input) {
+    match codegen::expand_mod_component(&input) {
         Ok(ts) => ts.into(),
         Err(err) => err.to_compile_error().into(),
     }
@@ -127,35 +96,35 @@ pub fn derive_mod_exposable(input: TokenStream) -> TokenStream {
 mod tests {
     use crate::abi_pod::expand_abi_pod;
     use crate::attrs::resolve_sys_crate_with;
-    use crate::codegen::expand_mod_exposable;
+    use crate::codegen::{expand_mod_component, expand_mod_component_with_crate};
     use proc_macro_crate::FoundCrate;
     use syn::{DeriveInput, Path, parse_quote};
 
     #[test]
-    fn test_rejects_generic_structs() {
+    fn rejects_generic_structs() {
         let input: DeriveInput = parse_quote! {
             pub struct GenericComp<T> {
                 pub value: T,
             }
         };
-        let err = expand_mod_exposable(&input).unwrap_err();
+        let err = expand_mod_component(&input).unwrap_err();
         assert!(err.to_string().contains("does not support generic structs"));
     }
 
     #[test]
-    fn test_rejects_enums() {
+    fn rejects_enums() {
         let input: DeriveInput = parse_quote! {
             pub enum StateComp {
                 Idle,
                 Running,
             }
         };
-        let err = expand_mod_exposable(&input).unwrap_err();
+        let err = expand_mod_component(&input).unwrap_err();
         assert!(err.to_string().contains("can only be applied to structs"));
     }
 
     #[test]
-    fn test_rejects_packed_structs() {
+    fn rejects_packed_structs() {
         let input: DeriveInput = parse_quote! {
             #[repr(C, packed)]
             pub struct PackedComp {
@@ -163,19 +132,19 @@ mod tests {
                 pub y: u32,
             }
         };
-        let err = expand_mod_exposable(&input).unwrap_err();
+        let err = expand_mod_component(&input).unwrap_err();
         assert!(err.to_string().contains("packed"));
     }
 
     #[test]
-    fn test_rejects_nested_field_name_collision() {
+    fn rejects_nested_field_name_collision() {
         let input: DeriveInput = parse_quote! {
             pub struct CollidingNested {
                 pub x: SubVec,
                 pub mut_x: SubVec,
             }
         };
-        let err = expand_mod_exposable(&input).unwrap_err();
+        let err = expand_mod_component(&input).unwrap_err();
         assert!(
             err.to_string()
                 .contains("colliding interior-pointer accessor name")
@@ -183,14 +152,14 @@ mod tests {
     }
 
     #[test]
-    fn test_rejects_heap_owning_types_without_skip() {
+    fn rejects_heap_owning_types_without_skip() {
         for bad_input in [
             parse_quote! { pub struct Bad1 { pub opt: Option<String> } },
             parse_quote! { pub struct Bad2 { pub boxed: Box<u32> } },
             parse_quote! { pub struct Bad3 { pub map: HashMap<u32, u32> } },
             parse_quote! { pub struct Bad4 { pub r: &'static str } },
         ] {
-            let err = expand_mod_exposable(&bad_input).unwrap_err();
+            let err = expand_mod_component(&bad_input).unwrap_err();
             let msg = err.to_string();
             assert!(
                 msg.contains("mod_field(skip)") || msg.contains("cannot be exposed"),
@@ -200,51 +169,92 @@ mod tests {
     }
 
     #[test]
-    fn test_rejects_unknown_attributes() {
-        let input: DeriveInput = parse_quote! {
+    fn rejects_unknown_attributes_and_invalid_uuids() {
+        let bad_attr: DeriveInput = parse_quote! {
             #[mod_component(nonexistent_attr)]
             pub struct BadAttr {
                 pub x: f32,
             }
         };
-        let err = expand_mod_exposable(&input).unwrap_err();
-        assert!(err.to_string().contains("unsupported `#[mod_component"));
+        assert!(
+            expand_mod_component(&bad_attr)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported `#[mod_component")
+        );
+
+        let bad_uuid: DeriveInput = parse_quote! {
+            #[mod_component(uuid = "not-a-valid-uuid")]
+            pub struct BadUuid {
+                pub x: f32,
+            }
+        };
+        assert!(
+            expand_mod_component(&bad_uuid)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid `#[mod_component(uuid")
+        );
+
+        let conflicting_ns: DeriveInput = parse_quote! {
+            #[mod_component(namespace = "game", name = "other::Pos")]
+            pub struct BadNs {
+                pub x: f32,
+            }
+        };
+        assert!(
+            expand_mod_component(&conflicting_ns)
+                .unwrap_err()
+                .to_string()
+                .contains("cannot combine")
+        );
     }
 
     #[test]
-    fn test_bool_generates_u8_accessors_and_omits_ffi_layout() {
+    fn bool_generates_ffi_bool_and_ffi_result_and_omits_raw_insertable() {
         let input: DeriveInput = parse_quote! {
             #[repr(C)]
             pub struct Flagged {
                 pub active: bool,
             }
         };
-        let ts = expand_mod_exposable(&input).unwrap().to_string();
-        assert!(ts.contains("-> u8"));
-        assert!(ts.contains("val : u8"));
-        assert!(ts.contains("IS_POD : bool = false"));
+        let ts = expand_mod_component(&input).unwrap().to_string();
+        assert!(ts.contains("FfiBool"));
+        assert!(ts.contains("FfiResult"));
+        assert!(ts.contains("VTableHeader"));
+        assert!(ts.contains("IS_ABI_POD : bool = false"));
         assert!(ts.contains("IS_RAW_INSERTABLE : bool = false"));
-        assert!(!ts.contains("impl :: bevy_abi_mod_sys :: FfiLayout for Flagged"));
-        assert!(!ts.contains("impl :: bevy_abi_mod_sys :: AbiPod for Flagged"));
+        assert!(!ts.contains("unsafe impl :: bevy_abi_mod_sys :: RawInsertable for Flagged"));
+        assert!(!ts.contains("unsafe impl :: bevy_abi_mod_sys :: AbiPod for Flagged"));
     }
 
     #[test]
-    fn test_string_and_vec_omit_ffi_layout_and_pod() {
+    fn string_and_vec_omit_raw_insertable_and_emit_push() {
         for input in [
             parse_quote! { pub struct WithStr { pub s: String } },
             parse_quote! { pub struct WithVec { pub v: Vec<f32> } },
             parse_quote! { pub struct WithSkip { pub x: f32, #[mod_field(skip)] pub hidden: Option<u32> } },
         ] {
-            let ts = expand_mod_exposable(&input).unwrap().to_string();
-            assert!(ts.contains("IS_POD : bool = false"));
+            let ts = expand_mod_component(&input).unwrap().to_string();
+            assert!(ts.contains("IS_ABI_POD : bool = false"));
             assert!(ts.contains("IS_RAW_INSERTABLE : bool = false"));
-            assert!(!ts.contains("impl :: bevy_abi_mod_sys :: FfiLayout"));
-            assert!(!ts.contains("impl :: bevy_abi_mod_sys :: AbiPod"));
+            assert!(!ts.contains("unsafe impl :: bevy_abi_mod_sys :: RawInsertable"));
+            assert!(!ts.contains("unsafe impl :: bevy_abi_mod_sys :: AbiPod"));
         }
+
+        let vec_input: DeriveInput = parse_quote! {
+            pub struct Inventory {
+                pub items: Vec<u32>,
+            }
+        };
+        let vec_ts = expand_mod_component(&vec_input).unwrap().to_string();
+        assert!(vec_ts.contains("pub get_items"));
+        assert!(vec_ts.contains("pub set_items"));
+        assert!(vec_ts.contains("pub push_items"));
     }
 
     #[test]
-    fn test_repr_c_pod_emits_both_ffi_layout_and_abi_pod() {
+    fn repr_c_pod_emits_raw_insertable_abi_pod_and_schema_uuid() {
         let input: DeriveInput = parse_quote! {
             #[repr(C)]
             pub struct PodPos {
@@ -252,15 +262,32 @@ mod tests {
                 pub y: f32,
             }
         };
-        let ts = expand_mod_exposable(&input).unwrap().to_string();
-        assert!(ts.contains("IS_POD : bool = true"));
+        let ts = expand_mod_component(&input).unwrap().to_string();
+        assert!(ts.contains("IS_ABI_POD : bool = true"));
         assert!(ts.contains("IS_RAW_INSERTABLE : bool = true"));
-        assert!(ts.contains("impl :: bevy_abi_mod_sys :: FfiLayout for PodPos"));
-        assert!(ts.contains("impl :: bevy_abi_mod_sys :: AbiPod for PodPos"));
+        assert!(ts.contains("hash_field_schema"));
+        assert!(ts.contains("ComponentUuid :: from_parts"));
+        assert!(ts.contains("unsafe impl :: bevy_abi_mod_sys :: RawInsertable for PodPos"));
+        assert!(ts.contains("unsafe impl :: bevy_abi_mod_sys :: AbiPod for PodPos"));
     }
 
     #[test]
-    fn test_abi_pod_derive_validation() {
+    fn usize_in_mod_component_is_raw_insertable_but_not_abi_pod() {
+        let input: DeriveInput = parse_quote! {
+            #[repr(C)]
+            pub struct HostCounter {
+                pub count: usize,
+            }
+        };
+        let ts = expand_mod_component(&input).unwrap().to_string();
+        assert!(ts.contains("IS_RAW_INSERTABLE : bool = true"));
+        assert!(ts.contains("IS_ABI_POD : bool = false"));
+        assert!(ts.contains("unsafe impl :: bevy_abi_mod_sys :: RawInsertable for HostCounter"));
+        assert!(!ts.contains("unsafe impl :: bevy_abi_mod_sys :: AbiPod for HostCounter"));
+    }
+
+    #[test]
+    fn abi_pod_derive_uses_assert_abi_pod_and_raw_insertable() {
         let missing_repr: DeriveInput = parse_quote! {
             pub struct NotReprC {
                 pub x: f32,
@@ -295,11 +322,14 @@ mod tests {
             }
         };
         let ts = expand_abi_pod(&valid_pod).unwrap().to_string();
-        assert!(ts.contains("impl :: bevy_abi_mod_sys :: AbiPod for ValidPod"));
+        assert!(ts.contains("assert_abi_pod :: < f32 > ()"));
+        assert!(ts.contains("assert_abi_pod :: < u64 > ()"));
+        assert!(ts.contains("unsafe impl :: bevy_abi_mod_sys :: RawInsertable for ValidPod"));
+        assert!(ts.contains("unsafe impl :: bevy_abi_mod_sys :: AbiPod for ValidPod"));
     }
 
     #[test]
-    fn test_m01_crate_path_resolution_and_overrides() {
+    fn crate_path_resolution_and_overrides() {
         let override_path: Path = parse_quote!(crate::reexport::sys);
         assert_eq!(
             resolve_sys_crate_with(Some(&override_path), None, |_| None).to_string(),
@@ -340,38 +370,53 @@ mod tests {
 
         let input_with_override: DeriveInput = parse_quote! {
             #[repr(C)]
-            #[mod_exposable(crate = my_facade::bevy_abi_mod_sys)]
+            #[mod_component(crate = my_facade::bevy_abi_mod_sys)]
             pub struct CustomCrateComp {
                 pub x: f32,
             }
         };
-        let ts = expand_mod_exposable(&input_with_override)
+        let ts = expand_mod_component(&input_with_override)
             .unwrap()
             .to_string();
-        assert!(ts.contains("my_facade :: bevy_abi_mod_sys :: ExposableComponent"));
+        assert!(ts.contains("my_facade :: bevy_abi_mod_sys :: ModComponent"));
     }
 
     #[test]
-    fn test_m02_hygienic_const_scope_and_export_name() {
+    fn hygienic_const_scope_and_namespaced_bam_export_symbols() {
         let private_fns: DeriveInput = parse_quote! {
             pub struct LocalPos {
                 pub x: f32,
             }
         };
-        let ts_private = expand_mod_exposable(&private_fns).unwrap().to_string();
+        let ts_private = expand_mod_component(&private_fns).unwrap().to_string();
         assert!(ts_private.contains("const _ : () ="));
         assert!(!ts_private.contains("export_name"));
         assert!(!ts_private.contains("no_mangle"));
-        assert!(!ts_private.contains("pub unsafe extern \"C\" fn LocalPos_get_x"));
 
-        let exported_fns: DeriveInput = parse_quote! {
+        let exported_default_ns: DeriveInput = parse_quote! {
             #[mod_component(export_symbols)]
             pub struct ExportedPos {
                 pub x: f32,
             }
         };
-        let ts_exported = expand_mod_exposable(&exported_fns).unwrap().to_string();
-        assert!(ts_exported.contains("export_name = \"ExportedPos_get_x\""));
-        assert!(ts_exported.contains("export_name = \"ExportedPos_set_x\""));
+        let ts_exported = expand_mod_component_with_crate(&exported_default_ns, Some("my_game"))
+            .unwrap()
+            .to_string();
+        assert!(ts_exported.contains("export_name = \"bam_my_game_ExportedPos_get_x\""));
+        assert!(ts_exported.contains("export_name = \"bam_my_game_ExportedPos_set_x\""));
+
+        let exported_explicit_ns: DeriveInput = parse_quote! {
+            #[mod_component(name = "physics::Position", export_symbols)]
+            pub struct Position {
+                pub x: f32,
+            }
+        };
+        let ts_ns = expand_mod_component_with_crate(&exported_explicit_ns, Some("my_game"))
+            .unwrap()
+            .to_string();
+        assert!(ts_ns.contains("export_name = \"bam_physics_Position_get_x\""));
+        assert!(ts_ns.contains("export_name = \"bam_physics_Position_set_x\""));
+        assert!(ts_ns.contains("\"bam.v0.physics::Position.vtable\""));
+        assert!(ts_ns.contains("\"bam.v0.physics::Position.get_x\""));
     }
 }

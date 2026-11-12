@@ -1,22 +1,30 @@
 use proc_macro_crate::FoundCrate;
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
-use syn::{Attribute, DeriveInput, Ident, LitStr, Path};
+use syn::{Attribute, DeriveInput, Ident, LitStr, Path, Type};
 
-/// Parsed container-level `#[mod_component(...)]` or `#[mod_exposable(...)]` attributes.
+/// Parsed container-level `#[mod_component(...)]` attributes.
 pub(crate) struct ComponentAttrs {
-    /// Custom component name override.
+    /// Optional component name override (`#[mod_component(name = "...")]`).
     pub(crate) custom_name: Option<String>,
-    /// Custom symbol prefix override.
+    /// Optional component namespace override (`#[mod_component(namespace = "...")]`).
+    pub(crate) custom_namespace: Option<String>,
+    /// Optional explicit 128-bit UUID hex string (`#[mod_component(uuid = "...")]`).
+    pub(crate) custom_uuid: Option<String>,
+    /// Optional exported C symbol prefix override (`#[mod_component(prefix = "...")]`).
     pub(crate) custom_prefix: Option<String>,
     /// Optional explicit path override to the `bevy_abi_mod_sys` contract module/crate.
     pub(crate) crate_override: Option<Path>,
-    /// Whether to emit `#[unsafe(export_name = ...)]` on generated accessors.
+    /// Whether to emit `#[unsafe(export_name = "bam_<ns>_<Struct>_...")]` on generated accessors.
     pub(crate) export_symbols: bool,
     /// Explicit opt-out of `AbiPod` auto-implementation on `#[repr(C)]` structs (`#[mod_component(no_pod)]`).
     pub(crate) no_pod: bool,
-    /// Explicit opt-out of both `FfiLayout` and `AbiPod` (`#[mod_component(opaque)]`).
+    /// Explicit opt-out of both `RawInsertable` and `AbiPod` (`#[mod_component(opaque)]`).
     pub(crate) opaque: bool,
+    /// Sets `BAM_COMPONENT_FLAG_SPARSE_SET` on `ModComponent::COMPONENT_FLAGS`.
+    pub(crate) sparse_set: bool,
+    /// Sets `BAM_COMPONENT_FLAG_IMMUTABLE` on `ModComponent::COMPONENT_FLAGS`.
+    pub(crate) immutable: bool,
 }
 
 /// Parsed `#[repr(...)]` layout flags on a struct.
@@ -85,31 +93,113 @@ fn parse_crate_path_value(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<
     }
 }
 
-/// Parses container-level `#[mod_component(...)]` / `#[mod_exposable(...)]` attributes for `ModExposable`.
+/// Validates a UUID hex string against the exact 36-char hyphenated `"8-4-4-4-12"` or 32-char
+/// contiguous format accepted by `bevy_abi_mod_sys::ComponentUuid::parse_hex`.
+pub(crate) fn is_valid_uuid_hex(hex: &str) -> bool {
+    let src = hex.as_bytes();
+    let hyphenated = match src.len() {
+        36 => {
+            if src[8] != b'-' || src[13] != b'-' || src[18] != b'-' || src[23] != b'-' {
+                return false;
+            }
+            true
+        }
+        32 => false,
+        _ => return false,
+    };
+
+    let mut src_idx = 0;
+    let mut byte_idx = 0;
+    while byte_idx < 16 {
+        if hyphenated && (src_idx == 8 || src_idx == 13 || src_idx == 18 || src_idx == 23) {
+            src_idx += 1;
+        }
+        if !src[src_idx].is_ascii_hexdigit() || !src[src_idx + 1].is_ascii_hexdigit() {
+            return false;
+        }
+        src_idx += 2;
+        byte_idx += 1;
+    }
+    true
+}
+
+fn validate_non_empty_no_nul(lit: &LitStr, label: &str) -> syn::Result<String> {
+    let val = lit.value();
+    if val.is_empty() {
+        return Err(syn::Error::new_spanned(
+            lit,
+            format!("{label} must not be empty"),
+        ));
+    }
+    if val.as_bytes().contains(&0) {
+        return Err(syn::Error::new_spanned(
+            lit,
+            format!("{label} must not contain interior NUL bytes"),
+        ));
+    }
+    Ok(val)
+}
+
+/// Parses container-level `#[mod_component(...)]` attributes for `ModComponent`.
 pub(crate) fn parse_component_attrs(input: &DeriveInput) -> syn::Result<ComponentAttrs> {
     let mut attrs = ComponentAttrs {
         custom_name: None,
+        custom_namespace: None,
+        custom_uuid: None,
         custom_prefix: None,
         crate_override: None,
         export_symbols: false,
         no_pod: false,
         opaque: false,
+        sparse_set: false,
+        immutable: false,
     };
 
     for attr in &input.attrs {
-        if !attr.path().is_ident("mod_component") && !attr.path().is_ident("mod_exposable") {
+        if !attr.path().is_ident("mod_component") {
             continue;
         }
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("name") {
                 let value = meta.value()?;
-                let s: LitStr = value.parse()?;
-                attrs.custom_name = Some(s.value());
+                let lit: LitStr = value.parse()?;
+                let val = validate_non_empty_no_nul(&lit, "component name")?;
+                if val.starts_with("::") || val.ends_with("::") || val.contains("::::") {
+                    return Err(syn::Error::new_spanned(
+                        &lit,
+                        "component name has malformed `::` namespace separator",
+                    ));
+                }
+                attrs.custom_name = Some(val);
+                Ok(())
+            } else if meta.path.is_ident("namespace") {
+                let value = meta.value()?;
+                let lit: LitStr = value.parse()?;
+                let val = validate_non_empty_no_nul(&lit, "component namespace")?;
+                if val.starts_with("::") || val.ends_with("::") || val.contains("::::") {
+                    return Err(syn::Error::new_spanned(
+                        &lit,
+                        "component namespace has malformed `::` separator",
+                    ));
+                }
+                attrs.custom_namespace = Some(val);
+                Ok(())
+            } else if meta.path.is_ident("uuid") {
+                let value = meta.value()?;
+                let lit: LitStr = value.parse()?;
+                let val = lit.value();
+                if !is_valid_uuid_hex(&val) {
+                    return Err(syn::Error::new_spanned(
+                        &lit,
+                        "invalid `#[mod_component(uuid = \"...\")]` hex string; expected 36-char `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` or 32 hex digits",
+                    ));
+                }
+                attrs.custom_uuid = Some(val);
                 Ok(())
             } else if meta.path.is_ident("prefix") {
                 let value = meta.value()?;
-                let s: LitStr = value.parse()?;
-                attrs.custom_prefix = Some(s.value());
+                let lit: LitStr = value.parse()?;
+                attrs.custom_prefix = Some(validate_non_empty_no_nul(&lit, "symbol prefix")?);
                 Ok(())
             } else if meta.path.is_ident("crate") {
                 attrs.crate_override = Some(parse_crate_path_value(&meta)?);
@@ -124,22 +214,38 @@ pub(crate) fn parse_component_attrs(input: &DeriveInput) -> syn::Result<Componen
                 attrs.no_pod = true;
                 attrs.opaque = true;
                 Ok(())
+            } else if meta.path.is_ident("sparse_set") {
+                attrs.sparse_set = true;
+                Ok(())
+            } else if meta.path.is_ident("immutable") {
+                attrs.immutable = true;
+                Ok(())
             } else {
                 Err(meta.error(
-                    "unsupported `#[mod_component(...)]` attribute; expected `name = \"...\"`, `prefix = \"...\"`, `crate = ...`, `export_symbols`, `no_pod`, or `opaque`",
+                    "unsupported `#[mod_component(...)]` attribute; expected `name = \"...\"`, `namespace = \"...\"`, `uuid = \"...\"`, `prefix = \"...\"`, `crate = ...`, `export_symbols`, `no_pod`, `opaque`, `sparse_set`, or `immutable`",
                 ))
             }
         })?;
     }
 
+    if attrs.custom_namespace.is_some()
+        && let Some(ref name) = attrs.custom_name
+        && name.contains("::")
+    {
+        return Err(syn::Error::new_spanned(
+            &input.ident,
+            "cannot combine `#[mod_component(namespace = \"...\")]` with an already-namespaced `name = \"ns::Name\"`",
+        ));
+    }
+
     Ok(attrs)
 }
 
-/// Parses optional `#[mod_component(crate = ...)]` / `#[mod_exposable(crate = ...)]` override for `AbiPod`.
+/// Parses optional `#[mod_component(crate = ...)]` override for `#[derive(AbiPod)]`.
 pub(crate) fn parse_abi_pod_crate_override(input: &DeriveInput) -> syn::Result<Option<Path>> {
     let mut crate_override = None;
     for attr in &input.attrs {
-        if !attr.path().is_ident("mod_component") && !attr.path().is_ident("mod_exposable") {
+        if !attr.path().is_ident("mod_component") {
             continue;
         }
         attr.parse_nested_meta(|meta| {
@@ -148,7 +254,7 @@ pub(crate) fn parse_abi_pod_crate_override(input: &DeriveInput) -> syn::Result<O
                 Ok(())
             } else {
                 Err(meta.error(
-                    "unsupported attribute for `#[derive(AbiPod)]`; only `crate = ...` is supported",
+                    "unsupported `#[mod_component(...)]` attribute for `#[derive(AbiPod)]`; only `crate = ...` is supported",
                 ))
             }
         })?;
@@ -215,13 +321,14 @@ where
     quote! { ::bevy_abi_mod_sys }
 }
 
-/// Field-level override specified via `#[mod_field(...)]`.
+/// Field-level classification override specified via `#[mod_field(...)]`.
 pub(crate) enum FieldAttrOverride {
     None,
     Skip,
+    Bool,
     Primitive,
     HostString,
-    HostVec,
+    HostVec(Option<Box<Type>>),
     Nested,
 }
 
@@ -236,6 +343,9 @@ pub(crate) fn parse_field_attr(attrs: &[Attribute]) -> syn::Result<FieldAttrOver
             if meta.path.is_ident("skip") {
                 result = FieldAttrOverride::Skip;
                 Ok(())
+            } else if meta.path.is_ident("bool") {
+                result = FieldAttrOverride::Bool;
+                Ok(())
             } else if meta.path.is_ident("primitive") {
                 result = FieldAttrOverride::Primitive;
                 Ok(())
@@ -243,14 +353,21 @@ pub(crate) fn parse_field_attr(attrs: &[Attribute]) -> syn::Result<FieldAttrOver
                 result = FieldAttrOverride::HostString;
                 Ok(())
             } else if meta.path.is_ident("vec") {
-                result = FieldAttrOverride::HostVec;
+                if meta.input.peek(syn::token::Paren) {
+                    let content;
+                    syn::parenthesized!(content in meta.input);
+                    let elem_ty: Type = content.parse()?;
+                    result = FieldAttrOverride::HostVec(Some(Box::new(elem_ty)));
+                } else {
+                    result = FieldAttrOverride::HostVec(None);
+                }
                 Ok(())
             } else if meta.path.is_ident("nested") {
                 result = FieldAttrOverride::Nested;
                 Ok(())
             } else {
                 Err(meta.error(
-                    "unsupported `#[mod_field(...)]` attribute; expected `skip`, `primitive`, `string`, `vec`, or `nested`",
+                    "unsupported `#[mod_field(...)]` attribute; expected `skip`, `bool`, `primitive`, `string`, `vec`, `vec(ElemTy)`, or `nested`",
                 ))
             }
         })?;
@@ -258,10 +375,12 @@ pub(crate) fn parse_field_attr(attrs: &[Attribute]) -> syn::Result<FieldAttrOver
     Ok(result)
 }
 
-/// Sanitizes a string into a valid C identifier prefix.
-pub(crate) fn sanitize_symbol_prefix(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for ch in name.chars() {
+/// Sanitizes a namespace or identifier string into a valid C symbol segment,
+/// collapsing `"::"` into a single `'_'` and replacing non-ASCII-alphanumeric characters with `'_'`.
+pub(crate) fn sanitize_symbol_segment(raw: &str) -> String {
+    let collapsed = raw.replace("::", "_");
+    let mut out = String::with_capacity(collapsed.len());
+    for ch in collapsed.chars() {
         if ch.is_ascii_alphanumeric() || ch == '_' {
             out.push(ch);
         } else {

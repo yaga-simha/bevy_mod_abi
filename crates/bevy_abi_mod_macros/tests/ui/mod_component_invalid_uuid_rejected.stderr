@@ -1,0 +1,5 @@
+error: invalid `#[mod_component(uuid = "...")]` hex string; expected 36-char `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` or 32 hex digits
+ --> tests/ui/mod_component_invalid_uuid_rejected.rs:5:24
+  |
+5 | #[mod_component(uuid = "not-a-valid-hex-uuid")]
+  |                        ^^^^^^^^^^^^^^^^^^^^^^

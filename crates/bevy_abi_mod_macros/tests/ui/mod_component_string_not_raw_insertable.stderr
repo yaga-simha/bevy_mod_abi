@@ -1,0 +1,26 @@
+error[E0277]: the trait bound `NamedComp: RawInsertable` is not satisfied
+ --> tests/ui/mod_component_string_not_raw_insertable.rs:9:47
+  |
+9 |     bevy_abi_mod_sys::assert_raw_insertable::<NamedComp>();
+  |                                               ^^^^^^^^^ unsatisfied trait bound
+  |
+help: the trait `RawInsertable` is not implemented for `NamedComp`
+ --> tests/ui/mod_component_string_not_raw_insertable.rs:4:1
+  |
+4 | pub struct NamedComp {
+  | ^^^^^^^^^^^^^^^^^^^^
+  = help: the following other types implement trait `RawInsertable`:
+            BamComponent
+            ComponentUuid
+            FfiBool
+            FfiEntity
+            [T; N]
+            f32
+            f64
+            i128
+          and $N others
+note: required by a bound in `assert_raw_insertable`
+ --> $WORKSPACE/crates/bevy_abi_mod_sys/src/traits.rs
+  |
+  | pub const fn assert_raw_insertable<T: RawInsertable>() {}
+  |                                       ^^^^^^^^^^^^^ required by this bound in `assert_raw_insertable`

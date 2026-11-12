@@ -1,0 +1,21 @@
+error[E0277]: the trait bound `u128: AbiPod` is not satisfied
+ --> tests/ui/abi_pod_u128_field.rs:6:25
+  |
+6 |     pub high_precision: u128,
+  |                         ^^^^ the trait `AbiPod` is not implemented for `u128`
+  |
+  = help: the following other types implement trait `AbiPod`:
+            f32
+            f64
+            i16
+            i32
+            i64
+            i8
+            u16
+            u32
+          and $N others
+note: required by a bound in `assert_abi_pod`
+ --> $WORKSPACE/crates/bevy_abi_mod_sys/src/traits.rs
+  |
+  | pub const fn assert_abi_pod<T: AbiPod>() {}
+  |                                ^^^^^^ required by this bound in `assert_abi_pod`

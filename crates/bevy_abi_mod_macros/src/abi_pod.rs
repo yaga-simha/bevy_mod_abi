@@ -45,13 +45,12 @@ pub(crate) fn expand_abi_pod(input: &DeriveInput) -> syn::Result<TokenStream> {
         let field_ty = &field.ty;
         let span = field_ty.span();
         field_assertions.push(quote_spanned! { span =>
-            assert_field_abi_pod::<#field_ty>();
+            #sys_crate::assert_abi_pod::<#field_ty>();
         });
     }
 
     Ok(quote! {
         const _: () = {
-            fn assert_field_abi_pod<T: #sys_crate::AbiPod>() {}
             fn assert_self_copy<T: ::core::marker::Copy + 'static>() {}
             fn check_all() {
                 assert_self_copy::<#struct_ident>();
@@ -60,11 +59,12 @@ pub(crate) fn expand_abi_pod(input: &DeriveInput) -> syn::Result<TokenStream> {
             ::core::assert!(!::core::mem::needs_drop::<#struct_ident>());
 
             // SAFETY: Verified `#[repr(C)]` / `#[repr(transparent)]` non-packed struct, `Copy + 'static`,
-            // zero drop glue, and every field implements `AbiPod`.
+            // zero drop glue, and every field verified `AbiPod` via `assert_abi_pod` above.
             #[allow(clippy::undocumented_unsafe_blocks)]
-            unsafe impl #sys_crate::FfiLayout for #struct_ident {}
+            unsafe impl #sys_crate::RawInsertable for #struct_ident {}
 
-            // SAFETY: All `AbiPod` layout and bit-validity invariants are verified at compile time above.
+            // SAFETY: All cross-language `AbiPod` layout and bit-validity invariants are verified above
+            // (`u128`, `i128`, `usize`, `isize`, `bool`, `char`, heap types, and enums are rejected).
             #[allow(clippy::undocumented_unsafe_blocks)]
             unsafe impl #sys_crate::AbiPod for #struct_ident {}
         };

@@ -1,0 +1,94 @@
+error[E0277]: the trait bound `NonOpaqueOuter: Copy` is not satisfied
+  --> tests/ui/mod_component_non_opaque_nested_string_rejected.rs:10:12
+   |
+10 | pub struct NonOpaqueOuter {
+   |            ^^^^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `Copy` is not implemented for `NonOpaqueOuter`
+  --> tests/ui/mod_component_non_opaque_nested_string_rejected.rs:10:1
+   |
+10 | pub struct NonOpaqueOuter {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `AbiPod`
+  --> $WORKSPACE/crates/bevy_abi_mod_sys/src/traits.rs
+   |
+   | pub unsafe trait AbiPod: RawInsertable + Copy + Send + Sync + 'static {}
+   |                                          ^^^^ required by this bound in `AbiPod`
+
+error[E0080]: evaluation panicked: assertion failed: !::core::mem::needs_drop::<NonOpaqueOuter>()
+ --> tests/ui/mod_component_non_opaque_nested_string_rejected.rs:9:17
+  |
+9 | #[derive(Clone, ModComponent)]
+  |                 ^^^^^^^^^^^^ evaluation of `_` failed here
+
+error[E0277]: the trait bound `InnerLabel: RawInsertable` is not satisfied
+  --> tests/ui/mod_component_non_opaque_nested_string_rejected.rs:11:16
+   |
+11 |     pub label: InnerLabel,
+   |                ^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `RawInsertable` is not implemented for `InnerLabel`
+  --> tests/ui/mod_component_non_opaque_nested_string_rejected.rs:4:1
+   |
+ 4 | pub struct InnerLabel {
+   | ^^^^^^^^^^^^^^^^^^^^^
+   = help: the following other types implement trait `RawInsertable`:
+             BamComponent
+             ComponentUuid
+             FfiBool
+             FfiEntity
+             NonOpaqueOuter
+             [T; N]
+             f32
+             f64
+           and $N others
+note: required by a bound in `assert_raw_insertable`
+  --> $WORKSPACE/crates/bevy_abi_mod_sys/src/traits.rs
+   |
+   | pub const fn assert_raw_insertable<T: RawInsertable>() {}
+   |                                       ^^^^^^^^^^^^^ required by this bound in `assert_raw_insertable`
+
+error[E0277]: the trait bound `NonOpaqueOuter: Copy` is not satisfied
+  --> tests/ui/mod_component_non_opaque_nested_string_rejected.rs:10:12
+   |
+10 | pub struct NonOpaqueOuter {
+   |            ^^^^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `Copy` is not implemented for `NonOpaqueOuter`
+  --> tests/ui/mod_component_non_opaque_nested_string_rejected.rs:10:1
+   |
+10 | pub struct NonOpaqueOuter {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `assert_pod_self_copy`
+  --> tests/ui/mod_component_non_opaque_nested_string_rejected.rs:9:17
+   |
+ 9 | #[derive(Clone, ModComponent)]
+   |                 ^^^^^^^^^^^^ required by this bound in `assert_pod_self_copy`
+   = note: this error originates in the derive macro `ModComponent` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: the trait bound `InnerLabel: AbiPod` is not satisfied
+  --> tests/ui/mod_component_non_opaque_nested_string_rejected.rs:11:16
+   |
+11 |     pub label: InnerLabel,
+   |                ^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `AbiPod` is not implemented for `InnerLabel`
+  --> tests/ui/mod_component_non_opaque_nested_string_rejected.rs:4:1
+   |
+ 4 | pub struct InnerLabel {
+   | ^^^^^^^^^^^^^^^^^^^^^
+   = help: the following other types implement trait `AbiPod`:
+             BamComponent
+             ComponentUuid
+             FfiBool
+             FfiEntity
+             NonOpaqueOuter
+             [T; N]
+             f32
+             f64
+           and $N others
+note: required by a bound in `assert_abi_pod`
+  --> $WORKSPACE/crates/bevy_abi_mod_sys/src/traits.rs
+   |
+   | pub const fn assert_abi_pod<T: AbiPod>() {}
+   |                                ^^^^^^ required by this bound in `assert_abi_pod`
