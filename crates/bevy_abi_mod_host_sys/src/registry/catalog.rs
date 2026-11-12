@@ -468,6 +468,33 @@ impl ModRegistry {
         Ok(())
     }
 
+    /// Validates that dynamically re-registering `name` with `has_drop_fn` is compatible with the
+    /// destructor configuration permanently bound in Bevy's `ComponentInfo`.
+    pub fn check_dynamic_drop_compatibility(
+        &self,
+        name: &str,
+        has_drop_fn: bool,
+    ) -> Result<(), ComponentCollisionError> {
+        if let Some(existing) = self.snapshot.get_by_name(name) {
+            if !existing.is_dynamic && has_drop_fn {
+                return Err(ComponentCollisionError::MetadataMismatch {
+                    name: name.to_string(),
+                    reason: "cannot attach foreign drop_fn to host-owned component".to_string(),
+                });
+            }
+            if existing.drop_slot.is_some() != has_drop_fn {
+                return Err(ComponentCollisionError::MetadataMismatch {
+                    name: name.to_string(),
+                    reason: format!(
+                        "drop_fn presence mismatch on re-registration (existing_has_drop={}, new_has_drop={has_drop_fn})",
+                        existing.drop_slot.is_some()
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Registers a host [`Component`] implementing [`ModComponent`] with [`ComponentOptions`],
     /// returning its 1-based [`BamComponent`] handle (`B-01`, `C-05`).
     pub fn register_component<T: Component + ModComponent>(
@@ -634,19 +661,22 @@ impl ModRegistry {
             storage_flags,
             Some(comp_id),
         )?;
+        self.check_dynamic_drop_compatibility(name, desc.drop_fn.is_some())?;
 
         let sym_addr = SymbolAddress::new(desc.vtable_ptr);
         let handle = {
             let snap = Arc::make_mut(&mut self.snapshot);
+            let mut is_dynamic_entry = true;
             let handle = if let Some(&existing_handle) = snap.by_name.get(name) {
                 let idx = (existing_handle.0 - 1) as usize;
                 let entry = &mut snap.entries[idx];
-                entry.vtable_ptr = sym_addr;
-                entry.drop_fn = desc.drop_fn;
-                if drop_slot.is_some() {
-                    entry.drop_slot = drop_slot;
-                }
+                is_dynamic_entry = entry.is_dynamic;
                 if entry.is_dynamic {
+                    entry.vtable_ptr = sym_addr;
+                    entry.drop_fn = desc.drop_fn;
+                    if drop_slot.is_some() {
+                        entry.drop_slot = drop_slot;
+                    }
                     entry.owner = owner;
                 }
                 existing_handle
@@ -679,21 +709,23 @@ impl ModRegistry {
                 handle
             };
 
-            let vtable_key: Arc<str> = Arc::from(format!("bam.v0.{name}.vtable").as_str());
-            if !sym_addr.is_null() {
-                snap.symbols.insert(
-                    vtable_key,
-                    SymbolRecord {
-                        addr: sym_addr,
-                        owner,
-                    },
-                );
-            } else if snap
-                .symbols
-                .get(vtable_key.as_ref())
-                .is_some_and(|r| r.owner.is_some())
-            {
-                snap.symbols.remove(vtable_key.as_ref());
+            if is_dynamic_entry {
+                let vtable_key: Arc<str> = Arc::from(format!("bam.v0.{name}.vtable").as_str());
+                if !sym_addr.is_null() {
+                    snap.symbols.insert(
+                        vtable_key,
+                        SymbolRecord {
+                            addr: sym_addr,
+                            owner,
+                        },
+                    );
+                } else if snap
+                    .symbols
+                    .get(vtable_key.as_ref())
+                    .is_some_and(|r| r.owner.is_some())
+                {
+                    snap.symbols.remove(vtable_key.as_ref());
+                }
             }
             handle
         };

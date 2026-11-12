@@ -1,7 +1,7 @@
 //! `ModHost`, `LoadedMod`, `LoadedModInfo`, lifecycle `Message`s, and `&mut World`-scoped
 //! load/rollback/unload operations (`L-02`, `L-03`, `L-08`, `B-05`, `B-09`).
 
-use crate::drop_trampoline::{WorldDropGuard, prune_drop_trampolines_for_guard};
+use crate::drop_trampoline::{StagedDropBinding, WorldDropGuard, prune_drop_trampolines_for_guard};
 use crate::ffi::host_api::HOST_API;
 use crate::ffi::register::LoadContext;
 use crate::loader::error::{ModLoadError, is_abi_version_compatible};
@@ -114,6 +114,7 @@ pub struct LoadedMod {
 
     generation: u64,
     pre_snapshot: Arc<RegistrySnapshot>,
+    staged_drop_bindings: Vec<StagedDropBinding>,
     library: LoadedLibrary,
     shutdown_fn: BamShutdownFn,
     instance: GuestInstancePtr,
@@ -309,6 +310,9 @@ impl ModHost {
         if let Some(loaded) = self.get_mod_mut(id) {
             loaded.entity = Some(entity);
             loaded.system_count = system_count;
+            // Once scheduled in `World`, fresh slots are live and must only be pruned (never
+            // prematurely freed before `WorldDropGuard::drop` + `live_values == 0`) on unload.
+            loaded.staged_drop_bindings.clear();
         }
     }
 
@@ -455,7 +459,8 @@ impl ModHost {
             world_ptr,
             Some(mod_id),
             Some(Arc::clone(&manifest_name)),
-        );
+        )
+        .with_staged_drop_bindings(tx.staged_drop_bindings());
 
         let mut instance_ptr: *mut BamInstance = core::ptr::null_mut();
         // SAFETY: Invoking guest `bevy_abi_mod_init` with static `HOST_API`, stack-scoped `LoadContext`
@@ -497,7 +502,7 @@ impl ModHost {
             }
         }
 
-        tx.commit();
+        let staged_drop_bindings = tx.commit();
         state_guard.active_count += 1;
         drop(state_guard);
 
@@ -518,6 +523,7 @@ impl ModHost {
             entity: None,
             generation,
             pre_snapshot,
+            staged_drop_bindings,
             library: loaded_lib,
             shutdown_fn,
             instance: GuestInstancePtr::new(instance_ptr),
@@ -634,18 +640,25 @@ pub fn record_mod_named_sets_in_world(
 /// failure: disarms drop trampolines, restores the pre-load `RegistrySnapshot`, invokes
 /// `bevy_abi_mod_shutdown(instance)` (since `bevy_abi_mod_init` succeeded), and unmaps the library.
 pub fn rollback_unscheduled_mod_in_world(world: &mut World, id: ModId) {
-    let pre_snap = world
-        .get_resource::<ModHost>()
-        .and_then(|h| h.get_mod(id))
-        .map(|m| {
-            prune_drop_trampolines_for_guard(&m.is_active);
-            Arc::clone(&m.pre_snapshot)
-        });
+    let rollback_data = world.get_resource_mut::<ModHost>().and_then(|mut h| {
+        h.get_mod_mut(id).map(|m| {
+            let staged = core::mem::take(&mut m.staged_drop_bindings);
+            (
+                staged,
+                Arc::clone(&m.is_active),
+                Arc::clone(&m.pre_snapshot),
+            )
+        })
+    });
 
-    if let Some(snap) = pre_snap
-        && let Some(mut registry) = world.get_resource_mut::<ModRegistry>()
-    {
-        registry.restore_snapshot(snap);
+    if let Some((staged, is_active, snap)) = rollback_data {
+        if let Some(mut drop_guard) = world.get_resource_mut::<WorldDropGuard>() {
+            drop_guard.rollback_staged_bindings(&staged);
+        }
+        prune_drop_trampolines_for_guard(&is_active);
+        if let Some(mut registry) = world.get_resource_mut::<ModRegistry>() {
+            registry.restore_snapshot(snap);
+        }
     }
 
     if let Some(mut quarantine) = world.get_resource_mut::<ModQuarantine>() {

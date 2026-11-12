@@ -1,13 +1,15 @@
 //! Transactional `LoadContext` (`BamLoadCtx`), `host_register_component`, `host_resolve_component`,
 //! and unified `host_register_system` (`C-01`, `C-04`, `C-05`, `S-08`, `B-07`, `B-08`, `N-02`).
 
-use crate::drop_trampoline::{WorldDropGuard, on_insert_hook_for_slot};
+use crate::drop_trampoline::{
+    StagedDropBinding, WorldDropGuard, on_insert_hook_for_slot, prune_drop_trampolines_for_guard,
+};
 use crate::handle_header::{
     HOST_CTX_MAGIC, HandleHeader, HostContext, LOAD_CTX_MAGIC, validate_handle_mut,
     validate_handle_ref,
 };
 use crate::loader::ModId;
-use crate::registry::{ModRegistry, component_flags_to_storage_flags};
+use crate::registry::{ModRegistry, RegistrySnapshot, component_flags_to_storage_flags};
 use crate::schedule::ModNamedSystemSet;
 use crate::system::access_builder::validate_system_queries_against_snapshot;
 use crate::system::{BamQuerySpecOwned, GuestSystem};
@@ -19,7 +21,7 @@ use bevy_ecs::component::{ComponentCloneBehavior, ComponentDescriptor, Component
 use bevy_ecs::world::World;
 use core::ffi::{CStr, c_char, c_void};
 use core::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Concrete `#[repr(C)]` initialization context backing opaque [`BamLoadCtx`] (`N-02`, `S-08`).
 ///
@@ -47,6 +49,8 @@ pub struct LoadContext {
     pub mod_id: Option<ModId>,
     /// Optional manifest module name used to prefix unqualified guest component names (`C-10`).
     pub manifest_name: Option<Arc<str>>,
+    pre_snapshot: Arc<RegistrySnapshot>,
+    staged_drop_bindings: Arc<Mutex<Vec<StagedDropBinding>>>,
     in_init: bool,
 }
 
@@ -72,8 +76,9 @@ impl LoadContext {
         mod_id: Option<ModId>,
         manifest_name: Option<Arc<str>>,
     ) -> Self {
+        let pre_snapshot = registry.snapshot_arc();
         let host_ctx =
-            HostContext::new(registry.snapshot_arc()).with_namespace(manifest_name.clone());
+            HostContext::new(Arc::clone(&pre_snapshot)).with_namespace(manifest_name.clone());
         Self {
             header: HandleHeader::new(LOAD_CTX_MAGIC),
             host_ctx,
@@ -85,8 +90,20 @@ impl LoadContext {
             standalone_world: None,
             mod_id,
             manifest_name,
+            pre_snapshot,
+            staged_drop_bindings: Arc::new(Mutex::new(Vec::new())),
             in_init: true,
         }
+    }
+
+    /// Shares the transaction's [`StagedDropBinding`] log so `LoadTransaction::drop` automatically
+    /// rolls back every drop-trampoline mutation recorded during `bevy_abi_mod_init`.
+    pub(crate) fn with_staged_drop_bindings(
+        mut self,
+        staged: Arc<Mutex<Vec<StagedDropBinding>>>,
+    ) -> Self {
+        self.staged_drop_bindings = staged;
+        self
     }
 
     /// Creates an active standalone [`LoadContext`] for unit testing without an external `World`.
@@ -106,6 +123,34 @@ impl LoadContext {
         self.in_init = false;
         self.header.poison();
         self.host_ctx.header.poison();
+    }
+
+    /// Rolls back all drop trampoline bindings and registry mutations recorded in this `LoadContext`
+    /// (`ADR 0001` §2.4, `S-06`), returning freshly allocated trampoline slots to `FREE_LIST` and
+    /// restoring the initial `RegistrySnapshot`.
+    pub fn rollback(&mut self) {
+        self.finish_init();
+        let bindings = {
+            let mut guard = self
+                .staged_drop_bindings
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            core::mem::take(&mut *guard)
+        };
+        if let Some(mut drop_guard) = self.world_mut().get_resource_mut::<WorldDropGuard>() {
+            drop_guard.rollback_staged_bindings(&bindings);
+        }
+        prune_drop_trampolines_for_guard(&self.is_active);
+        let pre = Arc::clone(&self.pre_snapshot);
+        self.registry.restore_snapshot(Arc::clone(&pre));
+        self.host_ctx.set_snapshot(Arc::clone(&pre));
+        if !self.world_ptr.is_null()
+            && let Some(mut world_reg) = self.world_mut().get_resource_mut::<ModRegistry>()
+        {
+            world_reg.restore_snapshot(pre);
+        }
+        self.registered_components.clear();
+        self.registered_systems.clear();
     }
 
     /// Casts `&mut self` to an opaque `*mut BamLoadCtx` FFI pointer.
@@ -362,9 +407,17 @@ pub unsafe extern "C" fn host_register_component(
         ctx.host_ctx.set_last_error(collision.to_string());
         return FfiResult::TYPE_MISMATCH;
     }
+    if let Err(drop_mismatch) = ctx
+        .registry
+        .check_dynamic_drop_compatibility(name_ref, desc.drop_fn.is_some())
+    {
+        ctx.host_ctx.set_last_error(drop_mismatch.to_string());
+        return FfiResult::TYPE_MISMATCH;
+    }
 
     let is_active = Arc::clone(&ctx.is_active);
     let owner = ctx.mod_id;
+    let staged_log = Arc::clone(&ctx.staged_drop_bindings);
 
     let (comp_id, drop_slot): (ComponentId, Option<usize>) = {
         let world = ctx.world_mut();
@@ -376,12 +429,16 @@ pub unsafe extern "C" fn host_register_component(
             let bound = world
                 .get_resource_mut::<WorldDropGuard>()
                 .and_then(|mut g| g.bind_or_update(desc.uuid, drop_fn, is_active));
-            let Some((slot, tramp)) = bound else {
+            let Some((slot, tramp, staged_binding)) = bound else {
                 ctx.host_ctx.set_last_error(
                     "exhausted MAX_DROP_TRAMPOLINES (1024) foreign destructor slots",
                 );
                 return FfiResult::CAPACITY_EXCEEDED;
             };
+            staged_log
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(staged_binding);
             (Some(slot), Some(tramp))
         } else {
             (None, None)

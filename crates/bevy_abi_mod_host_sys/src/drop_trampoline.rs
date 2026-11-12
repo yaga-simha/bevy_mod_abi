@@ -96,6 +96,40 @@ fn reclaim_closed_slot(slot: usize) {
     }
 }
 
+/// Staged drop-trampoline mutation recorded during `bevy_abi_mod_init` so [`crate::loader::transaction::LoadTransaction`]
+/// or [`crate::rollback_unscheduled_mod_in_world`] can atomically undo uncommitted bindings (`ADR 0001` §2.4).
+#[derive(Clone)]
+pub(crate) struct StagedDropBinding {
+    uuid: ComponentUuid,
+    slot: usize,
+    fresh_slot_allocated: bool,
+    previous_snapshot: Option<Arc<DropSlotSnapshot>>,
+    is_active: Arc<AtomicBool>,
+}
+
+/// Invokes the most recent active foreign destructor bound to `slot` on an uncommitted arena
+/// payload (`CommandArena`) **without** decrementing `SLOT_LIFECYCLE` (`on_insert` has not fired).
+///
+/// # Safety
+/// `raw_ptr` must point to a valid initialized guest component payload matching `slot`'s layout.
+#[inline]
+pub(crate) unsafe fn run_uncommitted_slot_drop(slot: usize, raw_ptr: *mut u8) {
+    if slot >= MAX_DROP_TRAMPOLINES || raw_ptr.is_null() {
+        return;
+    }
+    if let Some(snap) = DROP_SLOTS[slot].load().as_ref()
+        && let Some(&(GuestFnPtr(drop_fn), _)) = snap
+            .entries
+            .iter()
+            .rev()
+            .find(|(_, guard)| guard.load(Ordering::Acquire))
+    {
+        // SAFETY: `raw_ptr` holds an uncommitted guest payload whose owning mod (`guard == true`)
+        // remains mapped in memory.
+        unsafe { drop_fn(raw_ptr.cast::<c_void>()) };
+    }
+}
+
 /// Increments the live-instance count for `slot` when a value of a drop-bearing dynamic component
 /// is inserted into Bevy ECS storage.
 #[inline]
@@ -295,14 +329,14 @@ impl WorldDropGuard {
     }
 
     /// Allocates a new drop trampoline slot for `uuid` or updates the existing slot bound to `uuid`
-    /// in this `World`, returning `(slot_index, trampoline_fn)` or `None` when all
+    /// in this `World`, returning `(slot_index, trampoline_fn, staged_binding)` or `None` when all
     /// [`MAX_DROP_TRAMPOLINES`] slots are currently in use (`FfiResult::CAPACITY_EXCEEDED`).
     pub(crate) fn bind_or_update(
         &mut self,
         uuid: ComponentUuid,
         drop_fn: ComponentDropFn,
         is_active: Arc<AtomicBool>,
-    ) -> Option<(usize, DropTrampolineFn)> {
+    ) -> Option<(usize, DropTrampolineFn, StagedDropBinding)> {
         let mut ctrl = DROP_CONTROL
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -310,6 +344,7 @@ impl WorldDropGuard {
         let wrapped = GuestFnPtr(drop_fn);
 
         if let Some(&slot) = self.slots_by_uuid.get(&uuid) {
+            let previous_snapshot = DROP_SLOTS[slot].load_full();
             let entries = &mut ctrl.entries[slot];
             entries.retain(|(_, g)| g.load(Ordering::Acquire));
             if let Some(existing) = entries.iter_mut().find(|(_, g)| Arc::ptr_eq(g, &is_active)) {
@@ -321,10 +356,19 @@ impl WorldDropGuard {
                 entries: entries.clone().into_boxed_slice(),
             });
             DROP_SLOTS[slot].store(Some(snap));
+            drop(ctrl);
+
             if !self.guards.iter().any(|g| Arc::ptr_eq(g, &is_active)) {
-                self.guards.push(is_active);
+                self.guards.push(Arc::clone(&is_active));
             }
-            return Some((slot, drop_trampoline_fn_for_slot(slot)));
+            let staged = StagedDropBinding {
+                uuid,
+                slot,
+                fresh_slot_allocated: false,
+                previous_snapshot,
+                is_active,
+            };
+            return Some((slot, drop_trampoline_fn_for_slot(slot), staged));
         }
 
         let slot = ctrl.free_list.pop()?;
@@ -341,9 +385,53 @@ impl WorldDropGuard {
 
         self.slots_by_uuid.insert(uuid, slot);
         if !self.guards.iter().any(|g| Arc::ptr_eq(g, &is_active)) {
-            self.guards.push(is_active);
+            self.guards.push(Arc::clone(&is_active));
         }
-        Some((slot, drop_trampoline_fn_for_slot(slot)))
+        let staged = StagedDropBinding {
+            uuid,
+            slot,
+            fresh_slot_allocated: true,
+            previous_snapshot: None,
+            is_active,
+        };
+        Some((slot, drop_trampoline_fn_for_slot(slot), staged))
+    }
+
+    /// Rolls back uncommitted [`StagedDropBinding`]s in reverse registration order (`ADR 0001` §2.4):
+    /// disarms `is_active`, restores `previous_snapshot` on hot-updated slots, and immediately
+    /// returns freshly allocated slots (`live_values == 0`) to `FREE_LIST`.
+    pub(crate) fn rollback_staged_bindings(&mut self, bindings: &[StagedDropBinding]) {
+        if bindings.is_empty() {
+            return;
+        }
+        for binding in bindings.iter().rev() {
+            binding.is_active.store(false, Ordering::Release);
+        }
+
+        let mut ctrl = DROP_CONTROL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        for binding in bindings.iter().rev() {
+            let slot = binding.slot;
+            if binding.fresh_slot_allocated {
+                self.slots_by_uuid.remove(&binding.uuid);
+                DROP_SLOTS[slot].store(None);
+                SLOT_LIFECYCLE[slot].store(0, Ordering::Release);
+                ctrl.entries[slot].clear();
+                if !ctrl.free_list.contains(&slot) {
+                    ctrl.free_list.push(slot);
+                }
+            } else {
+                ctrl.entries[slot].retain(|(_, g)| {
+                    !Arc::ptr_eq(g, &binding.is_active) && g.load(Ordering::Acquire)
+                });
+                DROP_SLOTS[slot].store(binding.previous_snapshot.clone());
+            }
+        }
+        drop(ctrl);
+
+        self.guards.retain(|g| g.load(Ordering::Acquire));
     }
 }
 

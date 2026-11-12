@@ -7,16 +7,19 @@
 //! - `L-06`, `L-07`, `B-07`, `B-08` (`WorldDropGuard` reclamation & `CAPACITY_EXCEEDED`, CoW
 //!   `ModRegistry`, `BAM_SYSTEM_FLAG_MAIN_THREAD`, `SPARSE_SET` & `IMMUTABLE` dynamic components)
 
-use bevy_abi_mod_host_sys::drop_trampoline::available_drop_trampoline_slots;
+use bevy_abi_mod_host_sys::drop_trampoline::{
+    MAX_DROP_TRAMPOLINES, available_drop_trampoline_slots,
+};
 use bevy_abi_mod_host_sys::{
-    BamQuerySpecOwned, ComponentOptions, GuestSystem, HOST_API, LoadContext, LoadOptions,
-    ModLoadError, ModRegistry, POISONED_MAGIC, WorldDropGuard, host_cmd_spawn_empty,
-    host_get_proc_address, host_iter_column_info, host_iter_column_mutable,
-    host_iter_column_mutable_untracked, host_iter_column_readonly, host_iter_column_rows_mutable,
-    host_iter_column_rows_readonly, host_iter_entities, host_iter_mark_changed_range,
-    host_iter_next_chunk, host_last_error, host_load_host_ctx, host_register_component,
-    host_register_system, host_res_mut_ptr, host_res_ptr, host_resolve_component,
-    host_sys_commands, host_sys_host_ctx, host_sys_query, load_mod_in_world,
+    BamQuerySpecOwned, ComponentOptions, GuestSystem, HOST_API, HostCommands, HostCommandsStorage,
+    LoadContext, LoadOptions, ModErrorPolicy, ModLoadError, ModRegistry, POISONED_MAGIC,
+    WorldDropGuard, host_cmd_insert, host_cmd_spawn, host_cmd_spawn_empty, host_get_proc_address,
+    host_iter_column_info, host_iter_column_mutable, host_iter_column_mutable_untracked,
+    host_iter_column_readonly, host_iter_column_rows_mutable, host_iter_column_rows_readonly,
+    host_iter_entities, host_iter_mark_changed_range, host_iter_next_chunk, host_last_error,
+    host_load_host_ctx, host_register_component, host_register_system, host_res_mut_ptr,
+    host_res_ptr, host_resolve_component, host_sys_commands, host_sys_host_ctx, host_sys_query,
+    load_mod_in_world,
 };
 use bevy_abi_mod_sys::{
     ABI_VERSION, AbiPod, AccessMode, BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET,
@@ -567,8 +570,13 @@ fn sparse_set_batching_untracked_mutation_tick_skip_resources_and_column_info() 
     assert_eq!(CHANGED_ROW_COUNT.load(Ordering::SeqCst), 1);
 }
 
+static DROP_POOL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn world_drop_guard_reclaims_slots_on_world_drop_and_reports_capacity_exceeded() {
+    let _serial = DROP_POOL_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
     unsafe extern "C" fn custom_drop(ptr: *mut c_void) {
         if !ptr.is_null() {
@@ -723,4 +731,382 @@ fn mod_load_error_preserves_thiserror_sources() {
     .expect("missing file should fail dlopen");
     assert!(matches!(err_dlopen, ModLoadError::DlOpen { .. }));
     assert!(err_dlopen.source().is_some());
+}
+
+#[test]
+fn regression_uncommitted_dynamic_drop_payloads_cleaned_on_fault_missing_entity_and_storage_drop() {
+    let _serial = DROP_POOL_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    static UNCOMMITTED_DROPS: AtomicUsize = AtomicUsize::new(0);
+    UNCOMMITTED_DROPS.store(0, Ordering::SeqCst);
+
+    unsafe extern "C" fn track_drop(ptr: *mut c_void) {
+        // SAFETY: `ptr` points to a 4-byte `u32` payload (`0xDEAD_BEEF`).
+        let val = unsafe { *ptr.cast::<u32>() };
+        assert_eq!(val, 0xDEAD_BEEF);
+        UNCOMMITTED_DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    let baseline_free = available_drop_trampoline_slots();
+
+    {
+        let mut world = World::new();
+        world.insert_resource(WorldDropGuard::new());
+        let reg = ModRegistry::new();
+        let is_active = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(true));
+
+        let mut load_ctx = LoadContext::with_world_and_mod_id(
+            reg,
+            std::sync::Arc::clone(&is_active),
+            &mut world as *mut World,
+            None,
+        );
+        let desc = ComponentDesc::new(
+            c"drop_cmd::OwnedItem".as_ptr(),
+            ComponentUuid::from_parts("drop_cmd::OwnedItem", 4, 4, 1),
+            4,
+            4,
+        )
+        .with_drop(track_drop);
+
+        let mut item_comp = BamComponent::INVALID;
+        // SAFETY: Valid `load_ctx`, `desc`, and `item_comp`.
+        unsafe {
+            assert_eq!(
+                host_register_component(load_ctx.as_ffi_ptr(), &desc, &mut item_comp),
+                FfiResult::OK
+            );
+        }
+        let reg = load_ctx.registry.clone();
+        load_ctx.finish_init();
+
+        // (a) Faulting system queues `cmd_spawn` + `cmd_insert` and returns `INVALID_STATE`:
+        //     `HostCommandsStorage::clear()` must drop both uncommitted payloads!
+        #[repr(C)]
+        struct FaultUd {
+            comp: BamComponent,
+            live_entity: FfiEntity,
+        }
+
+        unsafe extern "C" fn faulting_cb(sys_ctx: *mut BamSystemCtx, ud: *mut c_void) -> FfiResult {
+            // SAFETY: Valid `sys_ctx` and `FaultUd` pointer.
+            unsafe {
+                let state = &*ud.cast::<FaultUd>();
+                let mut cmds: *mut BamCommands = core::ptr::null_mut();
+                assert_eq!(host_sys_commands(sys_ctx, &mut cmds), FfiResult::OK);
+
+                let payload: u32 = 0xDEAD_BEEF;
+                let comps = [state.comp];
+                let ptrs = [(&payload as *const u32).cast::<u8>()];
+                let mut spawned = FfiEntity::NULL;
+                assert_eq!(
+                    host_cmd_spawn(cmds, comps.as_ptr(), ptrs.as_ptr(), 1, &mut spawned),
+                    FfiResult::OK
+                );
+                assert_eq!(
+                    host_cmd_insert(
+                        cmds,
+                        state.live_entity,
+                        state.comp,
+                        (&payload as *const u32).cast::<u8>(),
+                        4,
+                    ),
+                    FfiResult::OK
+                );
+            }
+            FfiResult::INVALID_STATE
+        }
+
+        let live_ent = world.spawn_empty().id();
+        let mut ud = FaultUd {
+            comp: item_comp,
+            live_entity: FfiEntity::from_bits(live_ent.to_bits()),
+        };
+        let mut fault_sys = GuestSystem::new(
+            "faulting_cmd_sys",
+            Vec::new(),
+            faulting_cb,
+            (&mut ud as *mut FaultUd).cast::<c_void>(),
+            reg.clone(),
+        )
+        .with_error_policy(ModErrorPolicy::Quarantine);
+        fault_sys.initialize(&mut world);
+        fault_sys.run((), &mut world).unwrap();
+        assert_eq!(UNCOMMITTED_DROPS.load(Ordering::SeqCst), 2);
+
+        // (b) `apply_to_world` with `cmd_insert` targeting a despawned entity drops the payload!
+        let doomed = world.spawn_empty().id();
+        let doomed_ffi = FfiEntity::from_bits(doomed.to_bits());
+        world.despawn(doomed);
+
+        let snap = reg.snapshot_arc();
+        let mut storage = HostCommandsStorage::new();
+        {
+            let mut host_cmds = HostCommands::new(&mut storage, world.entity_allocator(), &snap);
+            let payload: u32 = 0xDEAD_BEEF;
+            // SAFETY: Valid `host_cmds` and `payload`.
+            unsafe {
+                assert_eq!(
+                    host_cmd_insert(
+                        host_cmds.as_ffi_ptr(),
+                        doomed_ffi,
+                        item_comp,
+                        (&payload as *const u32).cast::<u8>(),
+                        4,
+                    ),
+                    FfiResult::OK
+                );
+            }
+        }
+        storage.apply_to_world(&mut world, &snap);
+        assert_eq!(UNCOMMITTED_DROPS.load(Ordering::SeqCst), 3);
+
+        // (c) `HostCommandsStorage::drop` while non-empty drops both `SpawnBatch` and `Insert` payloads!
+        {
+            let mut dropped_storage = HostCommandsStorage::new();
+            let mut host_cmds =
+                HostCommands::new(&mut dropped_storage, world.entity_allocator(), &snap);
+            let payload: u32 = 0xDEAD_BEEF;
+            let comps = [item_comp];
+            let ptrs = [(&payload as *const u32).cast::<u8>()];
+            let mut spawned = FfiEntity::NULL;
+            // SAFETY: Valid `host_cmds` and `payload`.
+            unsafe {
+                assert_eq!(
+                    host_cmd_spawn(
+                        host_cmds.as_ffi_ptr(),
+                        comps.as_ptr(),
+                        ptrs.as_ptr(),
+                        1,
+                        &mut spawned,
+                    ),
+                    FfiResult::OK
+                );
+                assert_eq!(
+                    host_cmd_insert(
+                        host_cmds.as_ffi_ptr(),
+                        FfiEntity::from_bits(live_ent.to_bits()),
+                        item_comp,
+                        (&payload as *const u32).cast::<u8>(),
+                        4,
+                    ),
+                    FfiResult::OK
+                );
+            }
+        }
+        assert_eq!(UNCOMMITTED_DROPS.load(Ordering::SeqCst), 5);
+    }
+
+    // `SLOT_LIFECYCLE` remained balanced (`live_values == 0`), so dropping `World` reclaims the slot!
+    assert_eq!(available_drop_trampoline_slots(), baseline_free);
+}
+
+#[test]
+fn regression_reregister_component_rejects_mismatched_drop_fn_presence() {
+    let _serial = DROP_POOL_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    unsafe extern "C" fn dummy_drop(_ptr: *mut c_void) {}
+
+    let baseline_free = available_drop_trampoline_slots();
+    {
+        let mut world = World::new();
+        world.insert_resource(WorldDropGuard::new());
+        let vel_id = world.register_component::<Vel>();
+        let mut reg = ModRegistry::new();
+        reg.register_component::<Vel>(vel_id, ComponentOptions::new())
+            .unwrap();
+        let host_vtable = reg.get_by_name(Vel::CANONICAL_NAME).unwrap().vtable_ptr;
+        world.insert_resource(reg.clone());
+
+        let is_active = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(true));
+        let mut load_ctx =
+            LoadContext::with_world_and_mod_id(reg, is_active, &mut world as *mut World, None);
+
+        // 1. Host-owned `Vel` cannot be re-registered by a guest with `drop_fn: Some(...)`.
+        let host_drop_attempt = ComponentDesc::new(
+            Vel::COMPONENT_CSTR.as_ptr(),
+            Vel::UUID,
+            core::mem::size_of::<Vel>(),
+            core::mem::align_of::<Vel>(),
+        )
+        .with_drop(dummy_drop);
+        let mut out = BamComponent::INVALID;
+        // SAFETY: Valid `load_ctx`, `host_drop_attempt`, and `out`.
+        unsafe {
+            assert_eq!(
+                host_register_component(load_ctx.as_ffi_ptr(), &host_drop_attempt, &mut out),
+                FfiResult::TYPE_MISMATCH
+            );
+        }
+        assert_eq!(available_drop_trampoline_slots(), baseline_free);
+        assert_eq!(
+            load_ctx
+                .registry
+                .get_by_name(Vel::CANONICAL_NAME)
+                .unwrap()
+                .vtable_ptr,
+            host_vtable
+        );
+
+        // 2. Dynamic POD component registered WITHOUT `drop_fn` rejects re-registration WITH `drop_fn`.
+        let pod_uuid = ComponentUuid::from_parts("dyn::PodOnly", 4, 4, 1);
+        let pod_desc = ComponentDesc::new(c"dyn::PodOnly".as_ptr(), pod_uuid, 4, 4);
+        let pod_with_drop = pod_desc.with_drop(dummy_drop);
+        // SAFETY: Valid `load_ctx` and descriptors.
+        unsafe {
+            assert_eq!(
+                host_register_component(load_ctx.as_ffi_ptr(), &pod_desc, &mut out),
+                FfiResult::OK
+            );
+            assert_eq!(
+                host_register_component(load_ctx.as_ffi_ptr(), &pod_with_drop, &mut out),
+                FfiResult::TYPE_MISMATCH
+            );
+        }
+        assert_eq!(available_drop_trampoline_slots(), baseline_free);
+
+        // 3. Dynamic drop-bearing component registered WITH `drop_fn` rejects re-registration WITHOUT `drop_fn`.
+        let drop_uuid = ComponentUuid::from_parts("dyn::WithDrop", 4, 4, 2);
+        let drop_desc =
+            ComponentDesc::new(c"dyn::WithDrop".as_ptr(), drop_uuid, 4, 4).with_drop(dummy_drop);
+        let drop_omitted = ComponentDesc::new(c"dyn::WithDrop".as_ptr(), drop_uuid, 4, 4);
+        // SAFETY: Valid `load_ctx` and descriptors.
+        unsafe {
+            assert_eq!(
+                host_register_component(load_ctx.as_ffi_ptr(), &drop_desc, &mut out),
+                FfiResult::OK
+            );
+            assert_eq!(
+                host_register_component(load_ctx.as_ffi_ptr(), &drop_omitted, &mut out),
+                FfiResult::TYPE_MISMATCH
+            );
+        }
+        assert_eq!(available_drop_trampoline_slots(), baseline_free - 1);
+        load_ctx.finish_init();
+    }
+    assert_eq!(available_drop_trampoline_slots(), baseline_free);
+}
+
+#[test]
+fn regression_failed_load_rollback_reclaims_fresh_slots_and_restores_hot_updated_snapshots() {
+    let _serial = DROP_POOL_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    static V1_DROPS: AtomicUsize = AtomicUsize::new(0);
+    static V2_DROPS: AtomicUsize = AtomicUsize::new(0);
+    V1_DROPS.store(0, Ordering::SeqCst);
+    V2_DROPS.store(0, Ordering::SeqCst);
+
+    unsafe extern "C" fn v1_drop(_ptr: *mut c_void) {
+        V1_DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+    unsafe extern "C" fn v2_drop(_ptr: *mut c_void) {
+        V2_DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    let baseline_free = available_drop_trampoline_slots();
+
+    {
+        let mut world = World::new();
+        world.insert_resource(WorldDropGuard::new());
+        world.insert_resource(ModRegistry::new());
+
+        // 1. Over 1,100 (> MAX_DROP_TRAMPOLINES) failed loads rolling back in a single live `World`
+        //    must return every fresh slot immediately to `FREE_LIST` without exhausting capacity!
+        for idx in 0..(MAX_DROP_TRAMPOLINES + 76) {
+            let reg = world.resource::<ModRegistry>().clone();
+            let is_active = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(true));
+            let mut load_ctx =
+                LoadContext::with_world_and_mod_id(reg, is_active, &mut world as *mut World, None);
+
+            let cname = std::ffi::CString::new(format!("rollback_test::Fresh{idx}")).unwrap();
+            let uuid = ComponentUuid::from_parts(cname.to_str().unwrap(), 4, 4, idx as u64);
+            let desc = ComponentDesc::new(cname.as_ptr(), uuid, 4, 4).with_drop(v1_drop);
+
+            let mut out = BamComponent::INVALID;
+            // SAFETY: Valid `load_ctx`, `desc`, and `out`.
+            unsafe {
+                assert_eq!(
+                    host_register_component(load_ctx.as_ffi_ptr(), &desc, &mut out),
+                    FfiResult::OK,
+                    "failed load #{idx} leaked trampoline slots"
+                );
+            }
+            load_ctx.rollback();
+        }
+
+        assert_eq!(world.resource::<WorldDropGuard>().len(), 0);
+        assert_eq!(available_drop_trampoline_slots(), baseline_free);
+
+        // 2. Commit `v1` with a live entity, then simulate a failed `v2` hot-reload that updates
+        //    the same UUID with `v2_drop` and rolls back: `v1_drop` must be restored!
+        let shared_uuid = ComponentUuid::from_parts("rollback_test::Shared", 4, 4, 77);
+        let v1_guard = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(true));
+        let mut v1_ctx = LoadContext::with_world_and_mod_id(
+            world.resource::<ModRegistry>().clone(),
+            std::sync::Arc::clone(&v1_guard),
+            &mut world as *mut World,
+            None,
+        );
+        let v1_desc = ComponentDesc::new(c"rollback_test::Shared".as_ptr(), shared_uuid, 4, 4)
+            .with_drop(v1_drop);
+        let mut comp_h = BamComponent::INVALID;
+        // SAFETY: Valid `v1_ctx`, `v1_desc`, and `comp_h`.
+        unsafe {
+            assert_eq!(
+                host_register_component(v1_ctx.as_ffi_ptr(), &v1_desc, &mut comp_h),
+                FfiResult::OK
+            );
+        }
+        let comp_id = v1_ctx.registry.get_by_handle(comp_h).unwrap().component_id;
+        v1_ctx.finish_init();
+
+        let val: u32 = 42;
+        let mut ent1 = world.spawn_empty();
+        // SAFETY: `comp_id` has `(size = 4, align = 4)`.
+        unsafe {
+            bevy_ecs::ptr::OwningPtr::make(val, |ptr| {
+                ent1.insert_by_id(comp_id, ptr);
+            });
+        }
+        let ent1_id = ent1.id();
+
+        let mut ent2 = world.spawn_empty();
+        // SAFETY: `comp_id` has `(size = 4, align = 4)`.
+        unsafe {
+            bevy_ecs::ptr::OwningPtr::make(val, |ptr| {
+                ent2.insert_by_id(comp_id, ptr);
+            });
+        }
+
+        // Failed `v2` hot-reload updates `shared_uuid` to `v2_drop`, then aborts via `rollback()`.
+        let v2_guard = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(true));
+        let mut v2_ctx = LoadContext::with_world_and_mod_id(
+            world.resource::<ModRegistry>().clone(),
+            v2_guard,
+            &mut world as *mut World,
+            None,
+        );
+        let v2_desc = ComponentDesc::new(c"rollback_test::Shared".as_ptr(), shared_uuid, 4, 4)
+            .with_drop(v2_drop);
+        // SAFETY: Valid `v2_ctx` and `v2_desc`.
+        unsafe {
+            assert_eq!(
+                host_register_component(v2_ctx.as_ffi_ptr(), &v2_desc, &mut comp_h),
+                FfiResult::OK
+            );
+        }
+        v2_ctx.rollback();
+
+        // Despawning `ent1` in the live `World` must invoke restored `v1_drop` (not rolled-back `v2_drop`),
+        // while leaving `ent2` alive exercises deferred slot reclamation across `World::drop`.
+        world.despawn(ent1_id);
+        assert_eq!(V1_DROPS.load(Ordering::SeqCst), 1);
+        assert_eq!(V2_DROPS.load(Ordering::SeqCst), 0);
+    }
+
+    assert_eq!(V2_DROPS.load(Ordering::SeqCst), 0);
+    assert_eq!(available_drop_trampoline_slots(), baseline_free);
 }

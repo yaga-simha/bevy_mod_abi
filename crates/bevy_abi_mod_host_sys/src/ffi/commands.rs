@@ -9,6 +9,7 @@
 //! - `cmd_spawn` applies all `K` components in a single archetype transition via
 //!   [`bevy_ecs::world::EntityWorldMut::insert_by_ids`].
 
+use crate::drop_trampoline::run_uncommitted_slot_drop;
 use crate::handle_header::{COMMANDS_MAGIC, HandleHeader, validate_handle_mut};
 use crate::registry::{InsertDefaultFn, RegistrySnapshot};
 use bevy_abi_mod_sys::{BamCommands, BamComponent, FfiEntity, FfiResult};
@@ -217,6 +218,7 @@ enum RecordedCommand {
         entity: Entity,
         component: BamComponent,
         slice: ArenaSlice,
+        drop_slot: Option<usize>,
     },
     InsertDefault {
         entity: Entity,
@@ -232,6 +234,7 @@ enum RecordedCommand {
 struct BatchItem {
     component_id: ComponentId,
     slice: ArenaSlice,
+    drop_slot: Option<usize>,
 }
 
 /// Persistent per-system command buffer storage reused across frames with zero steady-state heap
@@ -268,10 +271,65 @@ impl HostCommandsStorage {
         self.commands.len()
     }
 
+    /// Invokes foreign destructors on any uncommitted dynamic `drop_fn` payloads still held in
+    /// `CommandArena` (`ADR 0003` §2.3, Rule 2) without decrementing `SLOT_LIFECYCLE`.
+    fn drop_uncommitted_payloads(&mut self) {
+        if self.commands.is_empty() && self.batch_items.is_empty() {
+            return;
+        }
+        for i in 0..self.commands.len() {
+            match self.commands[i] {
+                RecordedCommand::SpawnBatch {
+                    batch_start,
+                    batch_len,
+                    ..
+                } => {
+                    for item in &mut self.batch_items[batch_start..(batch_start + batch_len)] {
+                        if let Some(slot) = item.drop_slot.take() {
+                            let nn = self.arena.ptr_mut(item.slice);
+                            // SAFETY: `nn` holds an uncommitted guest payload in `self.arena` whose
+                            // ownership never transferred into Bevy ECS.
+                            unsafe {
+                                run_uncommitted_slot_drop(slot, nn.as_ptr());
+                            }
+                        }
+                    }
+                }
+                RecordedCommand::Insert {
+                    slice,
+                    ref mut drop_slot,
+                    ..
+                } => {
+                    if let Some(slot) = drop_slot.take() {
+                        let nn = self.arena.ptr_mut(slice);
+                        // SAFETY: `nn` holds an uncommitted guest payload in `self.arena` whose
+                        // ownership never transferred into Bevy ECS.
+                        unsafe {
+                            run_uncommitted_slot_drop(slot, nn.as_ptr());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Catch any orphaned `batch_items` not yet linked to a `SpawnBatch` command.
+        for item in &mut self.batch_items {
+            if let Some(slot) = item.drop_slot.take() {
+                let nn = self.arena.ptr_mut(item.slice);
+                // SAFETY: Same as above.
+                unsafe {
+                    run_uncommitted_slot_drop(slot, nn.as_ptr());
+                }
+            }
+        }
+    }
+
     /// Discards all queued commands without applying them to the `World` (used when a guest system
-    /// faults mid-invocation) while preserving allocated slab and vector capacities.
+    /// faults mid-invocation), dropping any uncommitted foreign destructor payloads while preserving
+    /// allocated slab and vector capacities (`ADR 0003` §2.3).
     #[inline]
     pub fn clear(&mut self) {
+        self.drop_uncommitted_payloads();
         self.commands.clear();
         self.batch_items.clear();
         self.scratch_ids.clear();
@@ -302,8 +360,11 @@ impl HostCommandsStorage {
                 } => {
                     if let Ok(mut entity_mut) = world.spawn_empty_at(entity) {
                         self.scratch_ids.clear();
-                        let batch_slice = &self.batch_items[batch_start..(batch_start + batch_len)];
-                        for item in batch_slice {
+                        let batch_slice =
+                            &mut self.batch_items[batch_start..(batch_start + batch_len)];
+                        for item in batch_slice.iter_mut() {
+                            // Ownership of each payload transfers into Bevy ECS below.
+                            item.drop_slot = None;
                             self.scratch_ids.push(item.component_id);
                         }
                         let arena = &mut self.arena;
@@ -320,6 +381,16 @@ impl HostCommandsStorage {
                         unsafe {
                             entity_mut.insert_by_ids(&self.scratch_ids, ptrs_iter);
                         }
+                    } else {
+                        for item in &mut self.batch_items[batch_start..(batch_start + batch_len)] {
+                            if let Some(slot) = item.drop_slot.take() {
+                                let nn = self.arena.ptr_mut(item.slice);
+                                // SAFETY: `spawn_empty_at` failed, so ownership remained in `self.arena`.
+                                unsafe {
+                                    run_uncommitted_slot_drop(slot, nn.as_ptr());
+                                }
+                            }
+                        }
                     }
                 }
                 RecordedCommand::Despawn { entity } => {
@@ -331,8 +402,23 @@ impl HostCommandsStorage {
                     entity,
                     component,
                     slice,
+                    drop_slot,
                 } => {
+                    if let RecordedCommand::Insert {
+                        drop_slot: ref mut stored_slot,
+                        ..
+                    } = self.commands[i]
+                    {
+                        *stored_slot = None;
+                    }
                     let Some(meta) = snapshot.get_by_handle(component) else {
+                        if let Some(slot) = drop_slot {
+                            let nn = self.arena.ptr_mut(slice);
+                            // SAFETY: Component handle vanished before apply; drop uncommitted payload.
+                            unsafe {
+                                run_uncommitted_slot_drop(slot, nn.as_ptr());
+                            }
+                        }
                         continue;
                     };
                     let nn = self.arena.ptr_mut(slice);
@@ -352,6 +438,13 @@ impl HostCommandsStorage {
                         unsafe {
                             entity_mut.insert_by_id(meta.component_id, owning);
                         }
+                    } else if let Some(slot) = drop_slot {
+                        // SAFETY: Target `entity` did not exist (`get_entity_mut` failed), so
+                        // ownership remained in `self.arena`; run foreign destructor without
+                        // decrementing `SLOT_LIFECYCLE`.
+                        unsafe {
+                            run_uncommitted_slot_drop(slot, nn.as_ptr());
+                        }
                     }
                 }
                 RecordedCommand::InsertDefault { entity, insert_fn } => {
@@ -369,6 +462,12 @@ impl HostCommandsStorage {
         }
 
         self.clear();
+    }
+}
+
+impl Drop for HostCommandsStorage {
+    fn drop(&mut self) {
+        self.drop_uncommitted_payloads();
     }
 }
 
@@ -520,8 +619,9 @@ pub unsafe extern "C" fn host_cmd_spawn(
 
     // Pass 1: Validate every component handle, raw-insert permission, non-null payload, and
     // absence of duplicate `ComponentId`s BEFORE allocating an entity or mutating batch buffers.
-    let mut validated: [(ComponentId, usize, usize, *const u8); MAX_SPAWN_BATCH_COMPONENTS] =
-        [(ComponentId::new(0), 0, 1, core::ptr::null()); MAX_SPAWN_BATCH_COMPONENTS];
+    let mut validated: [(ComponentId, usize, usize, *const u8, Option<usize>);
+        MAX_SPAWN_BATCH_COMPONENTS] =
+        [(ComponentId::new(0), 0, 1, core::ptr::null(), None); MAX_SPAWN_BATCH_COMPONENTS];
 
     for i in 0..count {
         // SAFETY: `components` and `data_ptrs` are non-null and caller guarantees `count` elements.
@@ -534,7 +634,7 @@ pub unsafe extern "C" fn host_cmd_spawn(
         };
         if meta.is_resource() {
             return FfiResult::INVALID_COMPONENT;
-        }
+        };
         if !meta.is_dynamic && meta.insert_raw_fn.is_none() {
             return FfiResult::PERMISSION_DENIED;
         }
@@ -546,16 +646,30 @@ pub unsafe extern "C" fn host_cmd_spawn(
                 return FfiResult::INVALID_ARGUMENT;
             }
         }
-        validated[i] = (meta.component_id, meta.size, meta.align, ptr);
+        let drop_slot = if meta.is_dynamic {
+            meta.drop_slot
+        } else {
+            None
+        };
+        validated[i] = (meta.component_id, meta.size, meta.align, ptr, drop_slot);
     }
 
     // Pass 2: Copy payloads into `CommandArena` and record single `SpawnBatch`.
     let batch_start = cmds.storage.batch_items.len();
-    for &(component_id, size, align, ptr) in &validated[..count] {
+    for &(component_id, size, align, ptr, drop_slot) in &validated[..count] {
         // SAFETY: `ptr` was verified non-null when `size > 0`, and caller guarantees `size` readable bytes.
         let slice = match unsafe { cmds.storage.arena.alloc_copy_raw(ptr, size, align) } {
             Ok(s) => s,
             Err(err) => {
+                for item in &mut cmds.storage.batch_items[batch_start..] {
+                    if let Some(slot) = item.drop_slot.take() {
+                        let nn = cmds.storage.arena.ptr_mut(item.slice);
+                        // SAFETY: Partial batch failed before commit; drop already-copied payloads.
+                        unsafe {
+                            run_uncommitted_slot_drop(slot, nn.as_ptr());
+                        }
+                    }
+                }
                 cmds.storage.batch_items.truncate(batch_start);
                 return err;
             }
@@ -563,6 +677,7 @@ pub unsafe extern "C" fn host_cmd_spawn(
         cmds.storage.batch_items.push(BatchItem {
             component_id,
             slice,
+            drop_slot,
         });
     }
 
@@ -654,10 +769,16 @@ pub unsafe extern "C" fn host_cmd_insert(
         Err(err) => return err,
     };
 
+    let drop_slot = if meta.is_dynamic {
+        meta.drop_slot
+    } else {
+        None
+    };
     cmds.storage.commands.push(RecordedCommand::Insert {
         entity: bevy_entity,
         component,
         slice,
+        drop_slot,
     });
     FfiResult::OK
 }
