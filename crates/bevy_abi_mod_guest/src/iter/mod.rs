@@ -1,9 +1,10 @@
-//! Safe archetype chunk iteration, disjoint split borrows, and typed [`AbiPod`](crate::AbiPod) column views.
+//! Safe chunk iterators, dense column slices, and indirect sparse-set row views.
 
-mod chunk;
-mod chunk_iter;
-mod slice;
+pub mod chunk;
+pub mod chunk_iter;
+pub mod slice;
 
-pub use self::chunk::Chunk;
-pub use self::chunk_iter::GuestChunkIter;
-pub use self::slice::{ChunkSlice, ChunkSliceMut};
+pub use bevy_abi_mod_guest_sys::{SparseRows, SparseRowsIter, SparseRowsMut};
+pub use chunk::Chunk;
+pub use chunk_iter::ChunkIter;
+pub use slice::{ChunkSlice, ChunkSliceMut};

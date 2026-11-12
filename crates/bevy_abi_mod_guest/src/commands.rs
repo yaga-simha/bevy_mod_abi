@@ -1,150 +1,161 @@
-//! Safe deferred command queue wrapper for guest systems.
+//! Safe handle-based and batched deferred command buffer (`GuestCommands`).
 
 use core::ffi::CStr;
 
-use bevy_abi_mod_guest_sys::{ValidatedCommandQueue, ValidatedCommandQueueAdapter};
-use bevy_abi_mod_sys::{AbiPod, FfiEntity, FfiResult};
+use bevy_abi_mod_guest_sys::{Host, SpawnEntry, ValidatedCommands, resolve_component};
+use bevy_abi_mod_sys::{AbiPod, BamCommands, BamComponent, ComponentUuid, FfiEntity, FfiResult};
 
-use crate::component::GuestComponent;
+use crate::component::{GuestComponent, resolve_guest_component};
 
-/// Safe wrapper around the host's deferred command queue handle.
+/// Safe deferred command buffer bound to an active system execution context.
 ///
-/// Obtain a `GuestCommandQueue` safely through [`SystemContext::commands`](crate::SystemContext::commands),
-/// [`SystemContext::iter_and_commands`](crate::SystemContext::iter_and_commands), or
-/// [`MultiQueryContext::commands`](crate::MultiQueryContext::commands).
+/// Supports O(1) pre-resolved [`BamComponent`] handle operations (`spawn_empty`, batched `spawn`,
+/// `despawn`, `insert`, `insert_default`, `remove`) as well as typed [`GuestComponent`] convenience
+/// helpers.
 ///
-/// Constructing a `GuestCommandQueue` directly from a raw pointer without `unsafe` is rejected:
+/// Constructing `GuestCommands` from raw C pointers in safe Rust is rejected at compile time:
 ///
 /// ```compile_fail
-/// use bevy_abi_mod_guest::prelude::*;
+/// use bevy_abi_mod_guest::GuestCommands;
 ///
-/// let _queue = GuestCommandQueue::new(core::ptr::null_mut(), CommandBridgeVTable::default());
+/// let _cmds = GuestCommands::from_raw(core::ptr::null_mut());
 /// ```
 ///
-/// Inserting a type that does not implement [`AbiPod`] is rejected at compile time:
+/// Inserting non-`AbiPod` types (such as `String` or `bool`) is also rejected at compile time:
 ///
 /// ```compile_fail
-/// use bevy_abi_mod_guest::prelude::*;
+/// use bevy_abi_mod_guest::{BamComponent, FfiEntity, GuestCommands};
 ///
-/// #[repr(C)]
-/// #[derive(Clone, Copy)]
-/// struct NotPod {
-///     x: f32,
-/// }
-///
-/// fn bad_insert(cmds: &mut GuestCommandQueue<'_>, entity: FfiEntity) {
-///     let _ = cmds.insert_value(entity, c"NotPod", &NotPod { x: 1.0 });
+/// fn bad_insert(cmds: &mut GuestCommands<'_>, e: FfiEntity, c: BamComponent) {
+///     let s = String::from("heap");
+///     let _ = cmds.insert(e, c, &s);
 /// }
 /// ```
-pub struct GuestCommandQueue<'a> {
-    inner: ValidatedCommandQueue<'a>,
+pub struct GuestCommands<'a> {
+    pub(crate) inner: ValidatedCommands<'a>,
 }
 
-impl<'a> GuestCommandQueue<'a> {
+impl<'a> GuestCommands<'a> {
+    /// Wraps an already-validated [`ValidatedCommands`] handle.
     #[inline]
-    pub(crate) fn from_validated(inner: ValidatedCommandQueue<'a>) -> Self {
+    pub const fn from_validated(inner: ValidatedCommands<'a>) -> Self {
         Self { inner }
     }
 
-    /// Returns `true` if the underlying `RawCommandQueue` pointer is null.
+    /// Returns `true` if this command buffer holds an active non-null [`BamCommands`] handle.
     #[inline]
-    pub fn is_null(&self) -> bool {
-        self.inner.is_null()
+    pub fn is_valid(&self) -> bool {
+        self.inner.is_valid()
     }
 
-    /// Enqueues creation of a new empty entity and returns its allocated [`FfiEntity`].
+    /// Returns the cached [`Host`] table for this mod instance.
     #[inline]
-    pub fn spawn_empty(&mut self) -> FfiEntity {
+    pub const fn host(&self) -> &'a Host {
+        self.inner.host()
+    }
+
+    /// Returns the raw `*mut BamCommands` handle for FFI interoperability.
+    #[inline]
+    pub const fn as_raw_ptr(&self) -> *mut BamCommands {
+        self.inner.as_raw()
+    }
+
+    /// Resolves a [`BamComponent`] handle by `name`, `uuid`, or both via the host registry.
+    #[inline]
+    pub fn resolve_component(
+        &self,
+        name: Option<&CStr>,
+        uuid: Option<ComponentUuid>,
+    ) -> Result<BamComponent, FfiResult> {
+        resolve_component(self.inner.host(), name, uuid)
+    }
+
+    /// Reserves a fresh empty entity atomically and returns its [`FfiEntity`] identifier.
+    #[inline]
+    pub fn spawn_empty(&mut self) -> Result<FfiEntity, FfiResult> {
         self.inner.spawn_empty()
     }
 
-    /// Enqueues despawning of `entity`.
+    /// Reserves a fresh entity and batch-inserts `entries` in a single archetype transition (`P-05`).
+    #[inline]
+    pub fn spawn(&mut self, entries: &[SpawnEntry<'_>]) -> Result<FfiEntity, FfiResult> {
+        self.inner.spawn(entries)
+    }
+
+    /// Queues deferred despawning of `entity`.
     #[inline]
     pub fn despawn(&mut self, entity: FfiEntity) -> FfiResult {
         self.inner.despawn(entity)
     }
 
-    /// Safely enqueues insertion of a typed slice of [`AbiPod`] elements onto `entity`.
+    /// Queues deferred insertion of `value` (`T: AbiPod`) onto `entity` using pre-resolved
+    /// [`BamComponent`] handle (`C-05`).
     #[inline]
-    pub fn insert_slice<T: AbiPod>(
+    pub fn insert<T: AbiPod>(
         &mut self,
         entity: FfiEntity,
-        component_name: &CStr,
-        data: &[T],
-    ) -> FfiResult {
-        self.inner.insert_slice(entity, component_name, data)
-    }
-
-    /// Safely enqueues insertion of a single typed [`AbiPod`] component value onto `entity`.
-    #[inline]
-    pub fn insert_value<T: AbiPod>(
-        &mut self,
-        entity: FfiEntity,
-        component_name: &CStr,
+        component: BamComponent,
         value: &T,
     ) -> FfiResult {
-        self.inner.insert_value(entity, component_name, value)
+        self.inner.insert(entity, component, value)
     }
 
-    /// Safely enqueues deferred insertion of a typed [`GuestComponent`] value onto `entity`.
+    /// Queues deferred insertion of host-constructed `T::default()` for pre-resolved `component`
+    /// onto `entity` (`C-05`).
+    #[inline]
+    pub fn insert_default(&mut self, entity: FfiEntity, component: BamComponent) -> FfiResult {
+        self.inner.insert_default(entity, component)
+    }
+
+    /// Queues deferred removal of pre-resolved `component` from `entity` (`C-05`).
+    #[inline]
+    pub fn remove(&mut self, entity: FfiEntity, component: BamComponent) -> FfiResult {
+        self.inner.remove(entity, component)
+    }
+
+    /// Convenience helper resolving `T: GuestComponent` (including manifest-qualified `C-10` names)
+    /// and inserting `value`.
+    ///
+    /// Prefer pre-resolving [`BamComponent`] handles at mod init for hot per-frame loops.
     #[inline]
     pub fn insert_component<T: GuestComponent>(
         &mut self,
         entity: FfiEntity,
         value: &T,
     ) -> FfiResult {
-        self.insert_value(entity, T::NAME, value)
+        let host = self.inner.host();
+        match resolve_guest_component::<T>(host, host.manifest_name()) {
+            Ok(comp) => self.inner.insert(entity, comp, value),
+            Err(err) => err,
+        }
     }
 
-    /// Safely enqueues deferred insertion of a typed runtime dynamic [`AbiPod`] component value onto `entity`.
+    /// Convenience helper resolving `T: GuestComponent` (including manifest-qualified `C-10` names)
+    /// and inserting `T::default()` on the host.
     #[inline]
-    pub fn insert_runtime_component<T: AbiPod>(
-        &mut self,
-        entity: FfiEntity,
-        name: &CStr,
-        value: &T,
-    ) -> FfiResult {
-        self.insert_value(entity, name, value)
+    pub fn insert_component_default<T: GuestComponent>(&mut self, entity: FfiEntity) -> FfiResult {
+        let host = self.inner.host();
+        match resolve_guest_component::<T>(host, host.manifest_name()) {
+            Ok(comp) => self.inner.insert_default(entity, comp),
+            Err(err) => err,
+        }
     }
 
-    /// Safely enqueues deferred removal of `component_name` from `entity`.
+    /// Convenience helper resolving `T: GuestComponent` (including manifest-qualified `C-10` names)
+    /// and removing `T` from `entity`.
     #[inline]
-    pub fn remove_component(&mut self, entity: FfiEntity, component_name: &CStr) -> FfiResult {
-        self.inner.remove_component(entity, component_name)
-    }
-
-    /// Safely enqueues deferred removal of a typed [`GuestComponent`] from `entity`.
-    #[inline]
-    pub fn remove_guest_component<T: GuestComponent>(&mut self, entity: FfiEntity) -> FfiResult {
-        self.remove_component(entity, T::NAME)
-    }
-
-    /// Safely enqueues deferred insertion of a host-constructed default component onto `entity`.
-    #[inline]
-    pub fn insert_default(&mut self, entity: FfiEntity, component_name: &CStr) -> FfiResult {
-        self.inner.insert_default(entity, component_name)
-    }
-
-    /// Safely enqueues deferred default insertion of a typed [`GuestComponent`] onto `entity`.
-    #[inline]
-    pub fn insert_guest_default<T: GuestComponent>(&mut self, entity: FfiEntity) -> FfiResult {
-        self.insert_default(entity, T::NAME)
+    pub fn remove_component<T: GuestComponent>(&mut self, entity: FfiEntity) -> FfiResult {
+        let host = self.inner.host();
+        match resolve_guest_component::<T>(host, host.manifest_name()) {
+            Ok(comp) => self.inner.remove(entity, comp),
+            Err(err) => err,
+        }
     }
 }
 
-impl<'a> ValidatedCommandQueueAdapter<'a> for GuestCommandQueue<'a> {
+impl<'a> From<ValidatedCommands<'a>> for GuestCommands<'a> {
     #[inline]
-    fn from_validated_queue(inner: ValidatedCommandQueue<'a>) -> Self {
-        Self { inner }
-    }
-
-    #[inline]
-    fn as_validated_queue_mut(&mut self) -> &mut ValidatedCommandQueue<'a> {
-        &mut self.inner
-    }
-
-    #[inline]
-    fn into_validated_queue(self) -> ValidatedCommandQueue<'a> {
-        self.inner
+    fn from(inner: ValidatedCommands<'a>) -> Self {
+        Self::from_validated(inner)
     }
 }
