@@ -77,3 +77,35 @@ When prompting or continuing work in this codebase:
 1. **Always read `spec.md` and `docs/IMPROVEMENT_PLAN.md`** first to ensure alignment with architectural contracts and data structures.
 2. Maintain strict decoupling: verify that `bevy_abi_mod_sys`, `bevy_abi_mod_macros`, `bevy_abi_mod_guest_sys`, and `bevy_abi_mod_guest` **never** pull in `bevy`.
 3. When adding new features, update `spec.md` and ensure cross-language compatibility (both Rust mod and C mod test cases).
+
+---
+
+## 6. Idiomatic Bevy ECS Coding Standards (v0.20+)
+
+When writing or refactoring Bevy code within host plugins, examples, or test suites:
+
+### 6.1 Scheduler Parallelism & Query Ergonomics
+- **Borrow Precision:** Prefer `Res<T>` over `ResMut<T>` and `&T` over `&mut T`. Unnecessary mutable access serializes system scheduling.
+- **Selective Archetype Iteration:** Always use query filters (`With<T>`, `Without<T>`) to constrain iteration.
+- **Change Detection:** Leverage `Ref<T>`, `Added<T>`, and `Changed<T>` to skip redundant calculations rather than processing unchanged components every frame.
+- **Split Systems over Mega-Systems:** Prefer multiple single-responsibility systems over complex monolithic systems. When mutually exclusive queries are required in one system, use `ParamSet`.
+
+### 6.2 Sets, States & Run Conditions
+- **System Sets for Ordering:** Group related systems into `SystemSet`s and order them via `app.configure_sets(Update, (SetA, SetB).chain())`. Avoid system-to-system `.before()` or `.after()` references.
+- **Declarative Execution:** Gate system runs using `run_if(...)` (e.g. `run_if(in_state(...))`, `run_if(resource_exists::<R>)`) instead of procedural boolean guards inside system bodies.
+
+### 6.3 Modern Bevy Features (v0.14 - v0.20+)
+- **Required Components:** Use `#[derive(Component)]` with `#[require(RequiredComp)]` instead of complex manual bundle hierarchies.
+- **Observers vs. Event Queues:** For reactive logic or entity-targeted notifications, prefer `Trigger<E>` and `app.add_observer(...)` over polling `EventReader<E>` loops.
+- **Component Hooks:** Maintain relational invariants using `#[component(on_add = ..., on_remove = ...)]`.
+- **Safe Isolation:** Keep all safe Bevy code strictly under `#![forbid(unsafe_code)]`. All low-level raw pointer iterations or FFI bridging must remain inside host `-sys` crates with sound `# Safety` contracts.
+
+---
+
+## 7. Tooling, Linters & Churn Reduction
+
+To automate idiomatic code enforcement and reduce review churn:
+- **`bevy_lint` (The Bevy Flock):** Run `bevy lint` or install via `cargo install --git https://github.com/TheBevyFlock/bevy_cli bevy_cli` to detect engine-specific anti-patterns (unnecessary `ResMut`, inefficient queries).
+- **`clippy.toml` Tuning:** Ensure `too-many-arguments-threshold` and `type-complexity-threshold` accommodate ECS query signatures to prevent false-positive churn.
+- **Automated Verification:** Use `cargo xtask lint` before opening PRs, or install the pre-commit hook with `cargo xtask hook install`.
+

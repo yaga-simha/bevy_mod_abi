@@ -82,7 +82,6 @@ impl CliArgs {
                     if i + 1 < args.len() {
                         initial_mod = match args[i + 1].to_lowercase().as_str() {
                             "none" | "0" => None,
-                            "boing" | "1" => Some(ActiveMod::Boing),
                             "carousel" | "2" => Some(ActiveMod::Carousel),
                             "cuddle" | "c99" | "3" => Some(ActiveMod::CuddleC99),
                             _ => Some(ActiveMod::Boing),

@@ -3377,7 +3377,7 @@ mod high_volume_chunks_and_commands {
             Vec::new(),
             mass_spawn_callback,
             core::ptr::null_mut(),
-            Arc::new(registry.clone()),
+            Arc::new(registry),
         );
         app.add_systems(Update, spawn_system);
 

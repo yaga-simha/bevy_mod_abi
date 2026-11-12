@@ -171,7 +171,10 @@ impl AlignedBytes {
     }
 
     /// Returns a mutable byte pointer aligned to `self.layout.align()` for `OwningPtr` transfer.
+    ///
+    /// Requires `&mut self` to preserve exclusive access semantics when exposing a raw mutable pointer.
     #[inline]
+    #[allow(clippy::needless_pass_by_ref_mut)]
     pub(crate) fn as_mut_u8_ptr(&mut self) -> *mut u8 {
         self.ptr.cast::<u8>()
     }

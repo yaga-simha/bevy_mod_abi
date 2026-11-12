@@ -227,7 +227,7 @@ mod heterogeneous_alignment_and_isolation {
         BOUNDS_CALLBACK_RUNS.store(0, Ordering::SeqCst);
         let sys = DynamicCSystem::new(
             "bounds_checker".to_string(),
-            query_descs.clone(),
+            query_descs,
             bounds_checker_callback,
             core::ptr::null_mut(),
             Arc::clone(&registry),
@@ -440,7 +440,7 @@ mod dynamic_component_lifecycle {
         let is_active = Arc::new(AtomicBool::new(true));
         world.insert_resource(registry.clone());
         let mut init_ctx = ModInitContext::with_world(
-            Arc::new(registry.clone()),
+            Arc::new(registry),
             Arc::clone(&is_active),
             &mut world as *mut World,
         );

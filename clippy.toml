@@ -1,0 +1,18 @@
+# Workspace Clippy Configuration
+# Tune thresholds to accommodate idiomatic Bevy systems and complex ECS query tuples
+too-many-arguments-threshold = 12
+type-complexity-threshold = 350
+
+# Allow recognized engine & FFI acronyms in doc comments without spurious linting
+doc-valid-idents = [
+    "Bevy",
+    "ABI",
+    "VTable",
+    "FfiLayout",
+    "Entity",
+    "World",
+    "AbiPod",
+    "ModExposable",
+    "StrView",
+    "C99",
+]

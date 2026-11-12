@@ -544,7 +544,7 @@ impl CuteRenderer {
     }
 
     pub fn render_frame(
-        &mut self,
+        &self,
         camera: &OrbitCamera,
         slimes: &[SlimeRenderData],
         mod_status: &ModStatusResource,
@@ -553,8 +553,8 @@ impl CuteRenderer {
         time_secs: f32,
     ) {
         let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) => f,
-            wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Success(f)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.config);
                 return;

@@ -84,8 +84,9 @@ fn run(args: &[String]) -> Result<(), String> {
         "header" => cmd_header(rest),
         "bench" => cmd_bench(rest),
         "miri" => cmd_miri(rest),
+        "hook" => cmd_hook(rest),
         other => Err(format!(
-            "unknown subcommand `{other}` (expected `fixtures`, `lint`, `ci`, `header`, `bench`, or `miri`)"
+            "unknown subcommand `{other}` (expected `fixtures`, `lint`, `ci`, `header`, `bench`, `miri`, or `hook`)"
         )),
     }
 }
@@ -98,7 +99,7 @@ fn print_help() {
         "  fixtures [--examples] [--benches] [--all]   Build guest mod fixtures into target/fixtures/"
     );
     println!(
-        "  lint [--quick]                              Run fmt, clippy, zero-Bevy check, and C99 header syntax check"
+        "  lint [--quick]                              Run fmt, clippy, zero-Bevy check, C99 header, bevy_lint, and Bevy idiom audits"
     );
     println!(
         "  ci                                          Run fmt, clippy, zero-Bevy check, fixtures, C99, and workspace tests"
@@ -111,6 +112,9 @@ fn print_help() {
     );
     println!(
         "  miri [--all]                                Run Miri (-Zmiri-tree-borrows) on ABI and guest crates"
+    );
+    println!(
+        "  hook <install|uninstall>                    Install or remove git pre-commit hook for automated lint checks"
     );
 }
 
@@ -835,7 +839,14 @@ fn cmd_lint(args: &[String]) -> Result<(), String> {
     )?;
 
     verify_zero_bevy_deps(&root)?;
+    verify_forbid_unsafe(&root)?;
     verify_c99_header_and_tests(&root, !quick)?;
+    check_or_run_bevy_lint(&root)?;
+    audit_bevy_idioms(&root)?;
+
+    if !quick {
+        println!("==> All idiomatic Bevy and workspace lint checks passed");
+    }
     Ok(())
 }
 
@@ -999,4 +1010,155 @@ fn cmd_miri(args: &[String]) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn verify_forbid_unsafe(root: &Path) -> Result<(), String> {
+    println!("==> Verifying #![forbid(unsafe_code)] in safe host & guest crates");
+    let safe_crates = [
+        "crates/bevy_abi_mod/src/lib.rs",
+        "crates/bevy_abi_mod_host/src/lib.rs",
+        "crates/bevy_abi_mod_guest/src/lib.rs",
+    ];
+
+    for rel_path in &safe_crates {
+        let full_path = root.join(rel_path);
+        let content = fs::read_to_string(&full_path)
+            .map_err(|e| format!("failed to read {}: {e}", full_path.display()))?;
+        if !content.contains("#![forbid(unsafe_code)]") {
+            return Err(format!(
+                "{} is missing required `#![forbid(unsafe_code)]` declaration",
+                full_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_or_run_bevy_lint(root: &Path) -> Result<(), String> {
+    println!("==> Checking for specialized `bevy_lint`...");
+    let which_cmd = if cfg!(target_os = "windows") {
+        "where"
+    } else {
+        "which"
+    };
+    let has_bevy_lint = Command::new(which_cmd)
+        .arg("bevy_lint")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let has_bevy_cli = Command::new(which_cmd)
+        .arg("bevy")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if has_bevy_lint {
+        println!("==> Executing `bevy_lint` on host crates...");
+        let mut cmd = Command::new("bevy_lint");
+        cmd.current_dir(root).args(["-p", "bevy_abi_mod_host"]);
+        let _ = run_cmd(&mut cmd, "bevy_lint -p bevy_abi_mod_host");
+    } else if has_bevy_cli {
+        println!("==> Executing `bevy lint` on host crates...");
+        let mut cmd = Command::new("bevy");
+        cmd.current_dir(root)
+            .args(["lint", "--", "-p", "bevy_abi_mod_host"]);
+        let _ = run_cmd(&mut cmd, "bevy lint -- -p bevy_abi_mod_host");
+    } else {
+        println!("==> [Notice] Specialized `bevy_lint` tool not found on PATH.");
+        println!("    To install the official Bevy linter (The Bevy Flock):");
+        println!("      cargo install --git https://github.com/TheBevyFlock/bevy_cli bevy_cli");
+        println!("      bevy lint install");
+    }
+    Ok(())
+}
+
+fn audit_bevy_idioms(root: &Path) -> Result<(), String> {
+    println!("==> Performing static idiomatic Bevy & Rust audit...");
+    let host_src = root.join("crates").join("bevy_abi_mod_host").join("src");
+    if host_src.is_dir() {
+        audit_dir_bevy_idioms(&host_src)?;
+    }
+    Ok(())
+}
+
+fn audit_dir_bevy_idioms(dir: &Path) -> Result<(), String> {
+    let entries =
+        fs::read_dir(dir).map_err(|e| format!("failed to read {}: {e}", dir.display()))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            audit_dir_bevy_idioms(&path)?;
+        } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+            let content = fs::read_to_string(&path)
+                .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+            for (line_idx, line) in content.lines().enumerate() {
+                let trimmed = line.trim();
+                if trimmed.contains("&mut ResMut<") {
+                    eprintln!(
+                        "  [anti-pattern] {}:{}: `&mut ResMut<T>` is redundant and non-idiomatic. Use `mut res: ResMut<T>`.",
+                        path.display(),
+                        line_idx + 1
+                    );
+                }
+                if (trimmed.contains(".after(") || trimmed.contains(".before("))
+                    && !trimmed.contains("Set")
+                    && !trimmed.starts_with("//")
+                {
+                    eprintln!(
+                        "  [idiom critique] {}:{}: direct system chaining with `{}` detected. Consider grouping systems into a `SystemSet` instead.",
+                        path.display(),
+                        line_idx + 1,
+                        trimmed
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_hook(args: &[String]) -> Result<(), String> {
+    let root = repo_root()?;
+    let action = args.first().map(String::as_str).unwrap_or("help");
+    let hook_path = root.join(".git").join("hooks").join("pre-commit");
+
+    match action {
+        "install" => {
+            let hook_script = "#!/bin/sh\n# Generated by `cargo xtask hook install`\nset -e\necho \"==> [pre-commit] Running idiomatic Bevy & Rust checks...\"\ncargo xtask lint --quick\n";
+            fs::write(&hook_path, hook_script)
+                .map_err(|e| format!("failed to write {}: {e}", hook_path.display()))?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let perms = fs::Permissions::from_mode(0o755);
+                fs::set_permissions(&hook_path, perms).map_err(|e| {
+                    format!(
+                        "failed to set executable permissions on {}: {e}",
+                        hook_path.display()
+                    )
+                })?;
+            }
+
+            println!(
+                "==> Pre-commit hook installed successfully at {}",
+                hook_path.display()
+            );
+            Ok(())
+        }
+        "uninstall" => {
+            if hook_path.exists() {
+                fs::remove_file(&hook_path)
+                    .map_err(|e| format!("failed to remove {}: {e}", hook_path.display()))?;
+                println!(
+                    "==> Pre-commit hook uninstalled from {}",
+                    hook_path.display()
+                );
+            } else {
+                println!("==> No pre-commit hook found at {}", hook_path.display());
+            }
+            Ok(())
+        }
+        _ => Err("usage: cargo xtask hook <install|uninstall>".to_owned()),
+    }
 }
