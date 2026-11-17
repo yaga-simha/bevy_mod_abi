@@ -98,12 +98,7 @@ fn parse_crate_path_value(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<
 pub(crate) fn is_valid_uuid_hex(hex: &str) -> bool {
     let src = hex.as_bytes();
     let hyphenated = match src.len() {
-        36 => {
-            if src[8] != b'-' || src[13] != b'-' || src[18] != b'-' || src[23] != b'-' {
-                return false;
-            }
-            true
-        }
+        36 if src[8] == b'-' && src[13] == b'-' && src[18] == b'-' && src[23] == b'-' => true,
         32 => false,
         _ => return false,
     };
