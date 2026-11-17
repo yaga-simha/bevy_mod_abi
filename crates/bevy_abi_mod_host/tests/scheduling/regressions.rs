@@ -1,66 +1,56 @@
-//! Wave 1 scheduling & initialization regressions (`L-01`, `L-05a/b/c`, and `B-04`).
+//! Wave 1–3 scheduling, ordering, schedule-map, main-thread, and initialization regressions
+//! (`L-01`, `L-05a/b/c`, `B-04`, `B-05`, `B-06`, `B-07`, `B-08`, `B-09`).
 
 use crate::support::fixture_dylib;
 use bevy_abi_mod_host::{
-    AbiModPlugin, ModAppExt, ModErrorPolicy, ModNamedSystemSet, ModRegistry, ModSystemFaulted,
-    StartupCompleted, SystemInitError,
+    AbiModPlugin, ComponentOptions, LoadOptions, ModAppExt, ModErrorPolicy, ModLoadError,
+    ModNamedSystemSet, ModQuarantine, ModRegistry, ModSystemFaulted, StartupCompleted,
+    SystemInitError,
 };
 use bevy_abi_mod_host_sys::{
-    ComponentAccessDescOwned, DynamicCSystem, MAX_QUERY_COMPONENTS, MAX_SYSTEM_QUERIES,
-    ModInitContext, host_register_multi_query_system, host_register_system,
+    BamQuerySpecOwned, GuestSystem, LoadContext, MAX_SYSTEM_QUERIES, host_register_system,
 };
-use bevy_abi_mod_macros::ModExposable;
+use bevy_abi_mod_macros::ModComponent;
 use bevy_abi_mod_sys::{
-    ComponentAccessDesc, ComponentAccessMode, FfiResult, MultiQuerySystemDescriptor, QuerySpec,
-    RawChunkIter, RawCommandQueue, SystemDescriptor,
+    AccessMode, BAM_SYSTEM_FLAG_MAIN_THREAD, BamComponent, BamQueryDesc, BamSystemCtx,
+    BamSystemDesc, BamTermDesc, FfiResult, MAX_TERMS_PER_QUERY, ScheduleId,
 };
 use bevy_app::{App, Update};
 use bevy_ecs::component::Component;
 use bevy_ecs::message::Messages;
 use bevy_ecs::resource::Resource;
-use bevy_ecs::schedule::{ScheduleLabel, Schedules};
-use bevy_ecs::system::{System, SystemAccess};
+use bevy_ecs::schedule::{MultiThreadedExecutor, Schedule, ScheduleLabel, Schedules};
+use bevy_ecs::system::{System, SystemAccess, SystemStateFlags};
 use bevy_ecs::world::World;
 use core::ffi::c_void;
-use core::sync::atomic::AtomicBool;
-use std::ffi::CString;
-use std::sync::Arc;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 #[repr(C)]
-#[derive(Component, ModExposable, Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Component, ModComponent, Copy, Clone, Debug, PartialEq, Eq)]
+#[mod_component(name = "sched_reg::PaddedPair")]
 struct PaddedPair {
     tag: u8,
     value: u64,
 }
 
 #[repr(C)]
-#[derive(Resource, ModExposable, Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Resource, ModComponent, Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[mod_component(name = "sched_reg::CounterRes")]
 struct CounterRes {
     startup_hits: u32,
     update_hits: u32,
 }
 
 #[repr(C)]
-#[derive(Resource, ModExposable, Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Resource, ModComponent, Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[mod_component(name = "sched_reg::OrderTraceRes")]
 struct OrderTraceRes {
     steps: [u32; 4],
     len: u32,
 }
 
-unsafe extern "C" fn noop_single_cb(
-    _iter: *mut RawChunkIter,
-    _cmds: *mut RawCommandQueue,
-    _user_data: *mut c_void,
-) -> FfiResult {
-    FfiResult::OK
-}
-
-unsafe extern "C" fn noop_multi_cb(
-    _iters: *const *mut RawChunkIter,
-    _count: usize,
-    _cmds: *mut RawCommandQueue,
-    _user_data: *mut c_void,
-) -> FfiResult {
+unsafe extern "C" fn noop_cb(_sys_ctx: *mut BamSystemCtx, _user_data: *mut c_void) -> FfiResult {
     FfiResult::OK
 }
 
@@ -74,7 +64,8 @@ fn regression_l01_runtime_loaded_startup_runs_once() {
 
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
-    app.register_mod_resource::<CounterRes>();
+    app.register_mod_resource::<CounterRes>()
+        .expect("register CounterRes");
     app.insert_resource(CounterRes::default());
 
     // Advance the app once so `Startup` and `PostStartup` have already executed.
@@ -91,12 +82,12 @@ fn regression_l01_runtime_loaded_startup_runs_once() {
         }
     );
 
-    // Load the mod at runtime after `Startup` has completed.
+    // Load the mod at runtime after `Startup` has completed (with shadow copy for parallel test safety).
     let mod_id = app
-        .try_load_mod(&dylib_path)
+        .load_mod_with(&dylib_path, LoadOptions::new().with_shadow_copy(true))
         .expect("runtime load after Startup succeeds");
 
-    // `late_startup_sys` ran immediately once during `try_load_mod`.
+    // `late_startup_sys` ran immediately once during `load_mod_with`.
     assert_eq!(
         *app.world().resource::<CounterRes>(),
         CounterRes {
@@ -117,7 +108,7 @@ fn regression_l01_runtime_loaded_startup_runs_once() {
         );
     }
 
-    app.try_unload_mod(mod_id).expect("unload succeeds");
+    app.unload_mod(mod_id).expect("unload succeeds");
 }
 
 // ============================================================================
@@ -131,11 +122,16 @@ fn regression_l05a_cross_mod_name_isolation() {
 
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
-    app.register_mod_resource::<OrderTraceRes>();
+    app.register_mod_resource::<OrderTraceRes>()
+        .expect("register OrderTraceRes");
     app.insert_resource(OrderTraceRes::default());
 
-    let id_a = app.try_load_mod(&path_a).expect("load mod_alpha");
-    let id_b = app.try_load_mod(&path_b).expect("load mod_beta");
+    let id_a = app
+        .load_mod_with(&path_a, LoadOptions::new().with_shadow_copy(true))
+        .expect("load mod_alpha");
+    let id_b = app
+        .load_mod_with(&path_b, LoadOptions::new().with_shadow_copy(true))
+        .expect("load mod_beta");
 
     let set_a_step = ModNamedSystemSet::new("mod_alpha", "step");
     let set_b_step = ModNamedSystemSet::new("mod_beta", "step");
@@ -163,7 +159,7 @@ fn regression_l05a_cross_mod_name_isolation() {
     );
 
     // Unloading `mod_beta` must NOT remove `mod_alpha`'s `"step"` set!
-    app.try_unload_mod(id_b).expect("unload mod_beta");
+    app.unload_mod(id_b).expect("unload mod_beta");
     {
         let schedules = app.world().resource::<Schedules>();
         let update_sched = schedules.get(Update.intern()).expect("Update schedule");
@@ -177,7 +173,7 @@ fn regression_l05a_cross_mod_name_isolation() {
     assert_eq!(trace_after.len, 2);
     assert_eq!(&trace_after.steps[..2], &[10, 11]);
 
-    app.try_unload_mod(id_a).expect("unload mod_alpha");
+    app.unload_mod(id_a).expect("unload mod_alpha");
 }
 
 // ============================================================================
@@ -192,11 +188,16 @@ fn regression_l05b_later_mod_after_earlier_system() {
 
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
-    app.register_mod_resource::<OrderTraceRes>();
+    app.register_mod_resource::<OrderTraceRes>()
+        .expect("register OrderTraceRes");
     app.insert_resource(OrderTraceRes::default());
 
-    let id_p = app.try_load_mod(&path_p).expect("load mod_producer");
-    let id_c = app.try_load_mod(&path_c).expect("load mod_consumer");
+    let id_p = app
+        .load_mod_with(&path_p, LoadOptions::new().with_shadow_copy(true))
+        .expect("load mod_producer");
+    let id_c = app
+        .load_mod_with(&path_c, LoadOptions::new().with_shadow_copy(true))
+        .expect("load mod_consumer");
 
     for _ in 0..5 {
         app.insert_resource(OrderTraceRes::default());
@@ -210,8 +211,8 @@ fn regression_l05b_later_mod_after_earlier_system() {
         );
     }
 
-    app.try_unload_mod(id_c).expect("unload mod_consumer");
-    app.try_unload_mod(id_p).expect("unload mod_producer");
+    app.unload_mod(id_c).expect("unload mod_consumer");
+    app.unload_mod(id_p).expect("unload mod_producer");
 }
 
 // ============================================================================
@@ -224,7 +225,9 @@ fn regression_l05c_named_sets_removed_on_unload() {
 
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
-    let mod_id = app.try_load_mod(&dylib_path).expect("load l05c_clean_mod");
+    let mod_id = app
+        .load_mod_with(&dylib_path, LoadOptions::new().with_shadow_copy(true))
+        .expect("load l05c_clean_mod");
     app.update();
 
     let set1 = ModNamedSystemSet::new("l05c_clean_mod", "stage_one");
@@ -236,7 +239,7 @@ fn regression_l05c_named_sets_removed_on_unload() {
         assert!(set2.is_present_in(update));
     }
 
-    app.try_unload_mod(mod_id).expect("unload l05c_clean_mod");
+    app.unload_mod(mod_id).expect("unload l05c_clean_mod");
 
     {
         let schedules = app.world().resource::<Schedules>();
@@ -259,58 +262,47 @@ fn regression_l05c_named_sets_removed_on_unload() {
 #[test]
 fn regression_b04_too_many_terms() {
     let mut world = World::new();
-    let reg = Arc::new(ModRegistry::new());
+    let reg = ModRegistry::new();
     let active = Arc::new(AtomicBool::new(true));
-    let mut ctx = ModInitContext::with_world(Arc::clone(&reg), active, &mut world);
-    let _guard = ctx.make_active();
+    let mut ctx = LoadContext::with_world_and_mod_id(reg.clone(), active, &mut world, None);
 
-    let c_names: Vec<CString> = (0..=MAX_QUERY_COMPONENTS)
-        .map(|i| CString::new(format!("C{i}")).unwrap())
+    let raw_terms: Vec<BamTermDesc> = (0..=MAX_TERMS_PER_QUERY)
+        .map(|i| BamTermDesc::read(BamComponent::from_raw((i + 1) as u32)))
         .collect();
-    let raw_terms: Vec<ComponentAccessDesc> = c_names
-        .iter()
-        .map(|s| ComponentAccessDesc::read(s.as_ptr()))
-        .collect();
-    let desc = SystemDescriptor::new(
+    let q_desc = BamQueryDesc::new(raw_terms.as_ptr(), raw_terms.len());
+    let desc = BamSystemDesc::new(
         c"too_many_sys".as_ptr(),
-        raw_terms.as_ptr(),
-        raw_terms.len(),
-        noop_single_cb,
+        &q_desc,
+        1,
+        noop_cb,
         core::ptr::null_mut(),
     );
 
-    // 1. Synchronous rejection at registration time -> OUT_OF_RANGE
-    let rc = unsafe { host_register_system((&mut ctx as *mut ModInitContext).cast(), &desc) };
-    assert_eq!(rc, FfiResult::OUT_OF_RANGE);
+    // 1. Synchronous rejection at registration time -> CAPACITY_EXCEEDED (`C-07`)
+    let rc = unsafe { host_register_system(ctx.as_ffi_ptr(), &desc) };
+    assert_eq!(rc, FfiResult::CAPACITY_EXCEEDED);
 
-    // 2. Also verify `MAX_SYSTEM_QUERIES + 1` in multi-query -> OUT_OF_RANGE
-    let empty_specs = [QuerySpec {
-        queries: core::ptr::null(),
-        query_count: 0,
-    }; MAX_SYSTEM_QUERIES + 1];
-    let mq_desc = MultiQuerySystemDescriptor::new(
+    // 2. Also verify `MAX_SYSTEM_QUERIES + 1` in unified `BamSystemDesc` -> CAPACITY_EXCEEDED
+    let empty_specs = [BamQueryDesc::empty(); MAX_SYSTEM_QUERIES + 1];
+    let mq_desc = BamSystemDesc::new(
         c"too_many_mq".as_ptr(),
         empty_specs.as_ptr(),
         empty_specs.len(),
-        noop_multi_cb,
+        noop_cb,
         core::ptr::null_mut(),
     );
-    let rc_mq = unsafe {
-        host_register_multi_query_system((&mut ctx as *mut ModInitContext).cast(), &mq_desc)
-    };
-    assert_eq!(rc_mq, FfiResult::OUT_OF_RANGE);
+    let rc_mq = unsafe { host_register_system(ctx.as_ffi_ptr(), &mq_desc) };
+    assert_eq!(rc_mq, FfiResult::CAPACITY_EXCEEDED);
+    ctx.finish_init();
 
-    // 3. Direct DynamicCSystem construction records `SystemInitError::TooManyTerms`
-    let owned_terms: Vec<ComponentAccessDescOwned> = (0..=MAX_QUERY_COMPONENTS)
-        .map(|i| ComponentAccessDescOwned {
-            name: format!("C{i}"),
-            mode: ComponentAccessMode::READ,
-        })
-        .collect();
-    let mut sys = DynamicCSystem::new(
-        "too_many_direct".into(),
-        owned_terms,
-        noop_single_cb,
+    // 3. Direct GuestSystem construction records `SystemInitError::TooManyTerms`
+    let mut sys = GuestSystem::new(
+        "too_many_direct",
+        vec![BamQuerySpecOwned {
+            flags: 0,
+            terms: raw_terms,
+        }],
+        noop_cb,
         core::ptr::null_mut(),
         reg,
     );
@@ -321,44 +313,43 @@ fn regression_b04_too_many_terms() {
 #[test]
 fn regression_b04_invalid_mode() {
     let mut world = World::new();
-    let reg = Arc::new(ModRegistry::new());
+    let pair_id = world.register_component::<PaddedPair>();
+    let res_id = world.register_component::<CounterRes>();
+    let mut reg = ModRegistry::new();
+    let pair_h = reg
+        .register_component::<PaddedPair>(pair_id, ComponentOptions::new())
+        .unwrap();
+    let res_h = reg.register_resource::<CounterRes>(res_id).unwrap();
+
     let active = Arc::new(AtomicBool::new(true));
-    let mut ctx = ModInitContext::with_world(Arc::clone(&reg), active, &mut world);
-    let _guard = ctx.make_active();
+    let mut ctx = LoadContext::with_world_and_mod_id(reg.clone(), active, &mut world, None);
 
     let raw_terms = [
-        ComponentAccessDesc::read(c"PaddedPair".as_ptr()),
-        ComponentAccessDesc {
-            name: c"CounterRes".as_ptr(),
-            mode: ComponentAccessMode(99),
-        },
+        BamTermDesc::read(pair_h),
+        BamTermDesc::new(res_h, AccessMode(99)),
     ];
-    let desc = SystemDescriptor::new(
+    let q_desc = BamQueryDesc::new(raw_terms.as_ptr(), raw_terms.len());
+    let desc = BamSystemDesc::new(
         c"bad_mode_sys".as_ptr(),
-        raw_terms.as_ptr(),
-        raw_terms.len(),
-        noop_single_cb,
+        &q_desc,
+        1,
+        noop_cb,
         core::ptr::null_mut(),
     );
 
     // Synchronous rejection at registration time -> INVALID_ARGUMENT
-    let rc = unsafe { host_register_system((&mut ctx as *mut ModInitContext).cast(), &desc) };
+    let rc = unsafe { host_register_system(ctx.as_ffi_ptr(), &desc) };
     assert_eq!(rc, FfiResult::INVALID_ARGUMENT);
+    ctx.finish_init();
 
-    // Direct DynamicCSystem construction records `InvalidMode { index: 1 }`
-    let mut sys = DynamicCSystem::new(
-        "bad_mode_direct".into(),
-        vec![
-            ComponentAccessDescOwned {
-                name: "PaddedPair".into(),
-                mode: ComponentAccessMode::READ,
-            },
-            ComponentAccessDescOwned {
-                name: "CounterRes".into(),
-                mode: ComponentAccessMode(99),
-            },
-        ],
-        noop_single_cb,
+    // Direct GuestSystem construction records `InvalidMode { index: 1 }`
+    let mut sys = GuestSystem::new(
+        "bad_mode_direct",
+        vec![BamQuerySpecOwned {
+            flags: 0,
+            terms: raw_terms.to_vec(),
+        }],
+        noop_cb,
         core::ptr::null_mut(),
         reg,
     );
@@ -374,14 +365,15 @@ fn regression_b04_unknown_component() {
     let mut app = App::new();
     app.add_plugins(AbiModPlugin::with_error_policy(ModErrorPolicy::Quarantine));
 
-    let reg = Arc::new(app.world().resource::<ModRegistry>().clone());
-    let sys = DynamicCSystem::new(
-        "unknown_comp_sys".into(),
-        vec![ComponentAccessDescOwned {
-            name: "GhostComponent".into(),
-            mode: ComponentAccessMode::READ,
+    let reg = app.world().resource::<ModRegistry>().clone();
+    let ghost_handle = BamComponent::from_raw(999);
+    let sys = GuestSystem::new(
+        "unknown_comp_sys",
+        vec![BamQuerySpecOwned {
+            flags: 0,
+            terms: vec![BamTermDesc::read(ghost_handle)],
         }],
-        noop_single_cb,
+        noop_cb,
         core::ptr::null_mut(),
         reg,
     );
@@ -396,7 +388,9 @@ fn regression_b04_unknown_component() {
     assert_eq!(events[0].status, FfiResult::INVALID_COMPONENT);
     assert_eq!(
         events[0].init_error,
-        Some(SystemInitError::UnknownComponent("GhostComponent".into()))
+        Some(SystemInitError::UnknownComponent(
+            "BamComponent(999)".into()
+        ))
     );
 }
 
@@ -404,31 +398,33 @@ fn regression_b04_unknown_component() {
 fn regression_b04_kind_mismatch() {
     let mut app = App::new();
     app.add_plugins(AbiModPlugin::with_error_policy(ModErrorPolicy::Quarantine));
-    app.register_mod_component::<PaddedPair>();
-    app.register_mod_resource::<CounterRes>();
+    let pair_h = app
+        .register_mod_component::<PaddedPair>(ComponentOptions::new())
+        .unwrap();
+    let res_h = app.register_mod_resource::<CounterRes>().unwrap();
 
-    let reg = Arc::new(app.world().resource::<ModRegistry>().clone());
+    let reg = app.world().resource::<ModRegistry>().clone();
 
-    // 1. Entity Component queried with `RESOURCE_READ` -> KindMismatch("PaddedPair")
-    let sys_comp_as_res = DynamicCSystem::new(
-        "comp_as_res_sys".into(),
-        vec![ComponentAccessDescOwned {
-            name: "PaddedPair".into(),
-            mode: ComponentAccessMode::RESOURCE_READ,
+    // 1. Entity Component queried with `RESOURCE_READ` -> KindMismatch("sched_reg::PaddedPair")
+    let sys_comp_as_res = GuestSystem::new(
+        "comp_as_res_sys",
+        vec![BamQuerySpecOwned {
+            flags: 0,
+            terms: vec![BamTermDesc::resource_read(pair_h)],
         }],
-        noop_single_cb,
+        noop_cb,
         core::ptr::null_mut(),
-        Arc::clone(&reg),
+        reg.clone(),
     );
 
-    // 2. Singleton Resource queried with entity `READ` -> KindMismatch("CounterRes")
-    let sys_res_as_comp = DynamicCSystem::new(
-        "res_as_comp_sys".into(),
-        vec![ComponentAccessDescOwned {
-            name: "CounterRes".into(),
-            mode: ComponentAccessMode::READ,
+    // 2. Singleton Resource queried with entity `READ` -> KindMismatch("sched_reg::CounterRes")
+    let sys_res_as_comp = GuestSystem::new(
+        "res_as_comp_sys",
+        vec![BamQuerySpecOwned {
+            flags: 0,
+            terms: vec![BamTermDesc::read(res_h)],
         }],
-        noop_single_cb,
+        noop_cb,
         core::ptr::null_mut(),
         reg,
     );
@@ -440,75 +436,67 @@ fn regression_b04_kind_mismatch() {
     let mut cursor = msgs.get_cursor();
     let errors: Vec<Option<SystemInitError>> =
         cursor.read(msgs).map(|e| e.init_error.clone()).collect();
-    assert!(errors.contains(&Some(SystemInitError::KindMismatch("PaddedPair".into()))));
-    assert!(errors.contains(&Some(SystemInitError::KindMismatch("CounterRes".into()))));
+    assert!(errors.contains(&Some(SystemInitError::KindMismatch(
+        "sched_reg::PaddedPair".into()
+    ))));
+    assert!(errors.contains(&Some(SystemInitError::KindMismatch(
+        "sched_reg::CounterRes".into()
+    ))));
 }
 
 #[test]
 fn regression_b04_self_conflict() {
     let mut world = World::new();
     let comp_id = world.register_component::<PaddedPair>();
-    let mut registry = ModRegistry::new();
-    registry.register_component::<PaddedPair>(comp_id);
-    let reg = Arc::new(registry);
+    let res_id = world.register_component::<CounterRes>();
+    let mut reg = ModRegistry::new();
+    let pair_h = reg
+        .register_component::<PaddedPair>(comp_id, ComponentOptions::new())
+        .unwrap();
+    let res_h = reg.register_resource::<CounterRes>(res_id).unwrap();
+
     let active = Arc::new(AtomicBool::new(true));
-    let mut ctx = ModInitContext::with_world(Arc::clone(&reg), active, &mut world);
-    let _guard = ctx.make_active();
+    let mut ctx = LoadContext::with_world_and_mod_id(reg.clone(), active, &mut world, None);
 
     // 1. Intra-query WRITE + READ on same component -> synchronous ACCESS_CONFLICT
-    let raw_terms = [
-        ComponentAccessDesc::write(c"PaddedPair".as_ptr()),
-        ComponentAccessDesc::read(c"PaddedPair".as_ptr()),
-    ];
-    let desc = SystemDescriptor::new(
+    let raw_terms = [BamTermDesc::write(pair_h), BamTermDesc::read(pair_h)];
+    let q_single = BamQueryDesc::new(raw_terms.as_ptr(), raw_terms.len());
+    let desc = BamSystemDesc::new(
         c"self_conflict_single".as_ptr(),
-        raw_terms.as_ptr(),
-        raw_terms.len(),
-        noop_single_cb,
+        &q_single,
+        1,
+        noop_cb,
         core::ptr::null_mut(),
     );
-    let rc = unsafe { host_register_system((&mut ctx as *mut ModInitContext).cast(), &desc) };
+    let rc = unsafe { host_register_system(ctx.as_ffi_ptr(), &desc) };
     assert_eq!(rc, FfiResult::ACCESS_CONFLICT);
 
     // 2. Cross-group RESOURCE_WRITE + RESOURCE_READ in multi-query -> synchronous ACCESS_CONFLICT
-    let q0 = [ComponentAccessDesc::resource_write(c"CounterRes".as_ptr())];
-    let q1 = [ComponentAccessDesc::resource_read(c"CounterRes".as_ptr())];
+    let q0_terms = [BamTermDesc::resource_write(res_h)];
+    let q1_terms = [BamTermDesc::resource_read(res_h)];
     let specs = [
-        QuerySpec {
-            queries: q0.as_ptr(),
-            query_count: 1,
-        },
-        QuerySpec {
-            queries: q1.as_ptr(),
-            query_count: 1,
-        },
+        BamQueryDesc::new(q0_terms.as_ptr(), q0_terms.len()),
+        BamQueryDesc::new(q1_terms.as_ptr(), q1_terms.len()),
     ];
-    let mq_desc = MultiQuerySystemDescriptor::new(
+    let mq_desc = BamSystemDesc::new(
         c"self_conflict_mq".as_ptr(),
         specs.as_ptr(),
         specs.len(),
-        noop_multi_cb,
+        noop_cb,
         core::ptr::null_mut(),
     );
-    let rc_mq = unsafe {
-        host_register_multi_query_system((&mut ctx as *mut ModInitContext).cast(), &mq_desc)
-    };
+    let rc_mq = unsafe { host_register_system(ctx.as_ffi_ptr(), &mq_desc) };
     assert_eq!(rc_mq, FfiResult::ACCESS_CONFLICT);
+    ctx.finish_init();
 
-    // 3. Direct DynamicCSystem construction records `SystemInitError::SelfConflict`
-    let mut sys = DynamicCSystem::new(
-        "self_conflict_direct".into(),
-        vec![
-            ComponentAccessDescOwned {
-                name: "PaddedPair".into(),
-                mode: ComponentAccessMode::WRITE,
-            },
-            ComponentAccessDescOwned {
-                name: "PaddedPair".into(),
-                mode: ComponentAccessMode::READ,
-            },
-        ],
-        noop_single_cb,
+    // 3. Direct GuestSystem construction records `SystemInitError::SelfConflict`
+    let mut sys = GuestSystem::new(
+        "self_conflict_direct",
+        vec![BamQuerySpecOwned {
+            flags: 0,
+            terms: raw_terms.to_vec(),
+        }],
+        noop_cb,
         core::ptr::null_mut(),
         reg,
     );
@@ -516,8 +504,179 @@ fn regression_b04_self_conflict() {
     assert_eq!(
         sys.init_error(),
         Some(&SystemInitError::SelfConflict {
-            a: "PaddedPair".into(),
-            b: "PaddedPair".into(),
+            a: "sched_reg::PaddedPair".into(),
+            b: "sched_reg::PaddedPair".into(),
         })
     );
+}
+
+// ============================================================================
+// B-06 & B-07 & B-05: Custom `ScheduleId >= 1024`, `BAM_SYSTEM_FLAG_MAIN_THREAD`,
+//                     and `ModQuarantine::reenable`
+// ============================================================================
+
+#[derive(ScheduleLabel, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct CustomPhysicsSchedule;
+
+#[test]
+fn regression_b06_b07_b05_custom_schedule_main_thread_pinning_and_quarantine_reenable() {
+    let mut app = App::new();
+    app.add_plugins(AbiModPlugin);
+    app.register_mod_resource::<CounterRes>()
+        .expect("register CounterRes");
+    app.insert_resource(CounterRes::default());
+
+    // Reserved range `6..1024` and built-in `< 1024` are rejected by `register_mod_schedule`.
+    assert!(matches!(
+        app.register_mod_schedule(ScheduleId::UPDATE, CustomPhysicsSchedule),
+        Err(ModLoadError::InvalidScheduleRegistration { .. })
+    ));
+    assert!(matches!(
+        app.register_mod_schedule(ScheduleId(500), CustomPhysicsSchedule),
+        Err(ModLoadError::InvalidScheduleRegistration { .. })
+    ));
+
+    let custom_sched_id = ScheduleId::custom(1024);
+    app.register_mod_schedule(custom_sched_id, CustomPhysicsSchedule)
+        .expect("register custom schedule 1024");
+
+    // Load `l01_late_startup` overriding its schedule to our custom `CustomPhysicsSchedule`.
+    let dylib_path = fixture_dylib("l01_late_startup");
+    let mod_id = app
+        .load_mod_with(
+            &dylib_path,
+            LoadOptions::new()
+                .with_shadow_copy(true)
+                .with_schedule_override(custom_sched_id),
+        )
+        .expect("load mod into custom schedule");
+
+    // Standard `app.update()` does NOT run `CustomPhysicsSchedule`.
+    app.update();
+    assert_eq!(
+        *app.world().resource::<CounterRes>(),
+        CounterRes {
+            startup_hits: 0,
+            update_hits: 0,
+        }
+    );
+
+    // Running `CustomPhysicsSchedule` directly executes both overridden systems!
+    app.world_mut().run_schedule(CustomPhysicsSchedule);
+    assert_eq!(
+        *app.world().resource::<CounterRes>(),
+        CounterRes {
+            startup_hits: 1,
+            update_hits: 1,
+        }
+    );
+    app.unload_mod(mod_id).expect("unload custom-scheduled mod");
+
+    // B-07: Verify `BAM_SYSTEM_FLAG_MAIN_THREAD` sets `SystemStateFlags::NON_SEND` and executes
+    // exclusively on the main thread inside `MultiThreadedExecutor`.
+    let main_thread_id = std::thread::current().id();
+    let observed_threads: Arc<Mutex<Vec<std::thread::ThreadId>>> = Arc::new(Mutex::new(Vec::new()));
+
+    struct MainThreadProbe {
+        threads: Arc<Mutex<Vec<std::thread::ThreadId>>>,
+        fail_next: AtomicBool,
+        runs: AtomicUsize,
+    }
+
+    unsafe extern "C" fn main_thread_cb(_sys_ctx: *mut BamSystemCtx, ud: *mut c_void) -> FfiResult {
+        let probe = unsafe { &*(ud as *const MainThreadProbe) };
+        probe
+            .threads
+            .lock()
+            .unwrap()
+            .push(std::thread::current().id());
+        probe.runs.fetch_add(1, Ordering::SeqCst);
+        if probe.fail_next.swap(false, Ordering::SeqCst) {
+            FfiResult::INTERNAL_ERROR
+        } else {
+            FfiResult::OK
+        }
+    }
+
+    let probe = Arc::new(MainThreadProbe {
+        threads: Arc::clone(&observed_threads),
+        fail_next: AtomicBool::new(false),
+        runs: AtomicUsize::new(0),
+    });
+
+    let reg = app.world().resource::<ModRegistry>().clone();
+    let mut ctx = LoadContext::new(reg);
+    let desc = BamSystemDesc::new(
+        c"pinned_main_thread_sys".as_ptr(),
+        core::ptr::null(),
+        0,
+        main_thread_cb,
+        Arc::as_ptr(&probe) as *mut c_void,
+    )
+    .with_flags(BAM_SYSTEM_FLAG_MAIN_THREAD);
+    assert_eq!(
+        unsafe { host_register_system(ctx.as_ffi_ptr(), &desc) },
+        FfiResult::OK
+    );
+    ctx.finish_init();
+
+    let pinned_sys = ctx
+        .registered_systems
+        .pop()
+        .unwrap()
+        .with_mod_id(bevy_abi_mod_host::ModId(777));
+    assert!(pinned_sys.is_main_thread());
+    assert!(pinned_sys.flags().contains(SystemStateFlags::NON_SEND));
+
+    app.world_mut()
+        .resource_mut::<ModQuarantine>()
+        .register_system(
+            bevy_abi_mod_host::ModId(777),
+            pinned_sys.system_name_arc(),
+            pinned_sys.enabled_flag(),
+        );
+
+    let mut mt_schedule = Schedule::default();
+    mt_schedule.set_executor(MultiThreadedExecutor::default());
+    mt_schedule.add_systems(pinned_sys);
+
+    for _ in 0..5 {
+        mt_schedule.run(app.world_mut());
+    }
+    assert_eq!(probe.runs.load(Ordering::SeqCst), 5);
+    assert!(
+        observed_threads
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|&tid| tid == main_thread_id),
+        "BAM_SYSTEM_FLAG_MAIN_THREAD system must run strictly on the main thread"
+    );
+
+    // B-05 + B-09: Trigger a fault, verify quarantine + single `Messages<ModSystemFaulted>`, then re-enable.
+    probe.fail_next.store(true, Ordering::SeqCst);
+    mt_schedule.run(app.world_mut());
+    assert_eq!(probe.runs.load(Ordering::SeqCst), 6);
+    assert!(
+        app.world()
+            .resource::<ModQuarantine>()
+            .is_quarantined(bevy_abi_mod_host::ModId(777), "pinned_main_thread_sys")
+    );
+    assert_eq!(
+        app.world().resource::<Messages<ModSystemFaulted>>().len(),
+        1
+    );
+
+    // While quarantined, subsequent schedule runs skip the callback.
+    mt_schedule.run(app.world_mut());
+    assert_eq!(probe.runs.load(Ordering::SeqCst), 6);
+
+    // Re-enabling via `ModQuarantine::reenable` resumes execution!
+    assert!(
+        app.world()
+            .resource::<ModQuarantine>()
+            .reenable(bevy_abi_mod_host::ModId(777), "pinned_main_thread_sys")
+    );
+    mt_schedule.run(app.world_mut());
+    assert_eq!(probe.runs.load(Ordering::SeqCst), 7);
 }

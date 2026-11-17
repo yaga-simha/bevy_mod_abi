@@ -1,8 +1,10 @@
-//! Consolidated Scheduling, Concurrency, Multi-Query & Differential Parity Suite (`scheduling`).
+//! Consolidated Scheduling, Concurrency, Multi-Query & Differential Parity Suite (`scheduling`, `ABI 0.2.0`).
 //!
-//! Covers parallel disjoint writes, borrow/resource conflict detection, fault isolation,
-//! multi-query scoping, `run_if` condition callbacks, `ModNamedSystemSet` ordering,
-//! runtime `Startup` execution, and native-vs-dynamic differential Bevy ECS parity.
+//! Covers parallel disjoint writes, borrow/resource conflict detection, fault isolation &
+//! `ModQuarantine::reenable`, single-path `Messages<ModSystemFaulted>`, unified `BamSystemDesc`
+//! multi-query scoping, `run_if` condition callbacks, custom `ScheduleId >= 1024`,
+//! `BAM_SYSTEM_FLAG_MAIN_THREAD`, `ModNamedSystemSet` ordering, runtime `Startup` execution,
+//! and `T-05` `proptest!` native-vs-dynamic differential Bevy ECS parity.
 
 #![allow(
     clippy::undocumented_unsafe_blocks,
