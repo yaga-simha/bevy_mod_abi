@@ -234,7 +234,7 @@ jobs:
         run: |
           cargo xtask header --test-c99
           cargo xtask fixtures
-          make -C examples/07_cpp17_guest/cpp_mod clean all CXX="$CXX"
+          "$CXX" -std=c++17 -Wall -Wextra -Wpedantic -Werror -Iinclude -O3 -shared -fPIC examples/07_cpp17_guest/cpp_mod/mod.cpp -o examples/07_cpp17_guest/cpp_mod/libcpp17_mod.so
           (cd examples/08_zig_guest/zig_mod && zig build -Doptimize=ReleaseFast)
           BAM_FIXTURE_DIR="${{ github.workspace }}/target/fixtures" \
             cargo test -p example_07_cpp17_guest -p example_08_zig_guest

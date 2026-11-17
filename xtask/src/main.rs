@@ -187,36 +187,25 @@ fn build_c99_mod(
     let out_name = format!("{prefix}{artifact_stem}.{ext}");
     let out_path = mod_dir.join(&out_name);
 
-    if !cfg!(target_os = "windows") && mod_dir.join("Makefile").is_file() {
-        let mut cmd = Command::new("make");
-        cmd.arg("-C").arg(&mod_dir);
-        if let Ok(cc) = env::var("CC")
-            && !cc.trim().is_empty()
-        {
-            cmd.arg(format!("CC={cc}"));
-        }
-        run_cmd(&mut cmd, &format!("make -C {dir_rel}"))?;
-    } else {
-        let cc = c_compiler();
-        let include_dir = root.join("include");
-        let mut cmd = Command::new(&cc);
-        cmd.current_dir(&mod_dir)
-            .args(["-std=c99", "-Wall", "-Wextra", "-Werror"])
-            .arg(format!("-I{}", include_dir.display()))
-            .arg(opt_flag)
-            .arg("-shared");
-        if !cfg!(target_os = "windows") {
-            cmd.arg("-fPIC");
-        }
-        cmd.arg(src_file).arg("-o").arg(&out_path);
-        if link_math && !cfg!(target_os = "windows") {
-            cmd.arg("-lm");
-        }
-        run_cmd(
-            &mut cmd,
-            &format!("{cc} {dir_rel}/{src_file} -> {out_name}"),
-        )?;
+    let cc = c_compiler();
+    let include_dir = root.join("include");
+    let mut cmd = Command::new(&cc);
+    cmd.current_dir(&mod_dir)
+        .args(["-std=c99", "-Wall", "-Wextra", "-Werror"])
+        .arg(format!("-I{}", include_dir.display()))
+        .arg(opt_flag)
+        .arg("-shared");
+    if !cfg!(target_os = "windows") {
+        cmd.arg("-fPIC");
     }
+    cmd.arg(src_file).arg("-o").arg(&out_path);
+    if link_math && !cfg!(target_os = "windows") {
+        cmd.arg("-lm");
+    }
+    run_cmd(
+        &mut cmd,
+        &format!("{cc} {dir_rel}/{src_file} -> {out_name}"),
+    )?;
 
     if !out_path.is_file() {
         return Err(format!(
