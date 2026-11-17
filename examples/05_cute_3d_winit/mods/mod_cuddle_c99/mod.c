@@ -48,21 +48,83 @@ static const BamManifest MANIFEST = {
     0u
 };
 
+static int validate_vec3_vtable(const Vec3VTable* vt) {
+    if (vt == NULL) {
+        return 0;
+    }
+    if ((size_t)vt->header.struct_size < sizeof(Vec3VTable)) {
+        return 0;
+    }
+    if (!bam_version_is_compatible(vt->header.abi_version, BAM_ABI_VERSION)) {
+        return 0;
+    }
+    return (vt->get_x != NULL) && (vt->set_x != NULL) &&
+           (vt->get_y != NULL) && (vt->set_y != NULL) &&
+           (vt->get_z != NULL) && (vt->set_z != NULL);
+}
+
+static int validate_spirit_vtable(const CuteSpiritVTable* vt) {
+    if (vt == NULL) {
+        return 0;
+    }
+    if ((size_t)vt->header.struct_size < sizeof(CuteSpiritVTable)) {
+        return 0;
+    }
+    if (!bam_version_is_compatible(vt->header.abi_version, BAM_ABI_VERSION)) {
+        return 0;
+    }
+    return (vt->get_yaw != NULL) && (vt->set_yaw != NULL) &&
+           (vt->get_ear_wiggle != NULL) && (vt->set_ear_wiggle != NULL) &&
+           (vt->get_blush != NULL) && (vt->set_blush != NULL);
+}
+
 static BamResult c99_cozy_cuddle_system(BamSystemCtx* sys_ctx, void* user_data) {
     ModState* st = (ModState*)user_data;
     BamIter* iter = NULL;
+    BamColumnInfo pos_info;
+    BamColumnInfo vel_info;
+    BamColumnInfo scale_info;
+    BamColumnInfo spirit_info;
     size_t count = 0u;
     size_t global_idx = 0u;
     float t;
     BamResult res;
 
-    if (st == NULL) {
+    if (st == NULL || sys_ctx == NULL) {
         return BAM_RESULT_NULL_POINTER;
     }
 
     res = st->api.sys_query(sys_ctx, 0u, &iter);
     if (res != BAM_RESULT_OK) {
         return res;
+    }
+
+    res = st->api.iter_column_info(iter, 0u, &pos_info);
+    if (res != BAM_RESULT_OK) {
+        return res;
+    }
+    res = st->api.iter_column_info(iter, 1u, &vel_info);
+    if (res != BAM_RESULT_OK) {
+        return res;
+    }
+    res = st->api.iter_column_info(iter, 2u, &scale_info);
+    if (res != BAM_RESULT_OK) {
+        return res;
+    }
+    res = st->api.iter_column_info(iter, 3u, &spirit_info);
+    if (res != BAM_RESULT_OK) {
+        return res;
+    }
+
+    if (pos_info.size != st->pos_vt->header.size ||
+        vel_info.size != st->vel_vt->header.size ||
+        scale_info.size != st->scale_vt->header.size ||
+        spirit_info.size != st->spirit_vt->header.size ||
+        !bam_uuid_equals(pos_info.uuid, st->pos_vt->header.uuid) ||
+        !bam_uuid_equals(vel_info.uuid, st->vel_vt->header.uuid) ||
+        !bam_uuid_equals(scale_info.uuid, st->scale_vt->header.uuid) ||
+        !bam_uuid_equals(spirit_info.uuid, st->spirit_vt->header.uuid)) {
+        return BAM_RESULT_TYPE_MISMATCH;
     }
 
     st->tick += 1u;
@@ -73,10 +135,10 @@ static BamResult c99_cozy_cuddle_system(BamSystemCtx* sys_ctx, void* user_data) 
         uint8_t* vel_base    = st->api.iter_column_mutable(iter, 1u);
         uint8_t* scale_base  = st->api.iter_column_mutable(iter, 2u);
         uint8_t* spirit_base = st->api.iter_column_mutable(iter, 3u);
-        size_t pos_stride    = st->pos_vt->header.size;
-        size_t vel_stride    = st->vel_vt->header.size;
-        size_t scale_stride  = st->scale_vt->header.size;
-        size_t spirit_stride = st->spirit_vt->header.size;
+        size_t pos_stride    = pos_info.size;
+        size_t vel_stride    = vel_info.size;
+        size_t scale_stride  = scale_info.size;
+        size_t spirit_stride = spirit_info.size;
         size_t i;
 
         if (!pos_base || !vel_base || !scale_base || !spirit_base) {
@@ -120,19 +182,49 @@ static BamResult c99_cozy_cuddle_system(BamSystemCtx* sys_ctx, void* user_data) 
             float ear_wiggle = -0.22f + 0.14f * sinf(t * 3.2f + (float)idx);
             float blush = (dist < 1.2f) ? 1.0f : 0.65f;
 
-            (void)st->pos_vt->set_y(p_ptr, new_py);
+            res = st->pos_vt->set_y(p_ptr, new_py);
+            if (res != BAM_RESULT_OK) {
+                return res;
+            }
 
-            (void)st->vel_vt->set_x(v_ptr, vx);
-            (void)st->vel_vt->set_y(v_ptr, 0.0f);
-            (void)st->vel_vt->set_z(v_ptr, vz);
+            res = st->vel_vt->set_x(v_ptr, vx);
+            if (res != BAM_RESULT_OK) {
+                return res;
+            }
+            res = st->vel_vt->set_y(v_ptr, 0.0f);
+            if (res != BAM_RESULT_OK) {
+                return res;
+            }
+            res = st->vel_vt->set_z(v_ptr, vz);
+            if (res != BAM_RESULT_OK) {
+                return res;
+            }
 
-            (void)st->scale_vt->set_x(sc_ptr, sxz);
-            (void)st->scale_vt->set_y(sc_ptr, sy);
-            (void)st->scale_vt->set_z(sc_ptr, sxz);
+            res = st->scale_vt->set_x(sc_ptr, sxz);
+            if (res != BAM_RESULT_OK) {
+                return res;
+            }
+            res = st->scale_vt->set_y(sc_ptr, sy);
+            if (res != BAM_RESULT_OK) {
+                return res;
+            }
+            res = st->scale_vt->set_z(sc_ptr, sxz);
+            if (res != BAM_RESULT_OK) {
+                return res;
+            }
 
-            (void)st->spirit_vt->set_yaw(sp_ptr, yaw);
-            (void)st->spirit_vt->set_ear_wiggle(sp_ptr, ear_wiggle);
-            (void)st->spirit_vt->set_blush(sp_ptr, blush);
+            res = st->spirit_vt->set_yaw(sp_ptr, yaw);
+            if (res != BAM_RESULT_OK) {
+                return res;
+            }
+            res = st->spirit_vt->set_ear_wiggle(sp_ptr, ear_wiggle);
+            if (res != BAM_RESULT_OK) {
+                return res;
+            }
+            res = st->spirit_vt->set_blush(sp_ptr, blush);
+            if (res != BAM_RESULT_OK) {
+                return res;
+            }
         }
     }
 
@@ -167,6 +259,17 @@ BAM_EXPORT BamResult bevy_abi_mod_init(
         return res;
     }
 
+    if (local_api.load_host_ctx == NULL ||
+        local_api.get_proc_address == NULL ||
+        local_api.resolve_component == NULL ||
+        local_api.register_system == NULL ||
+        local_api.sys_query == NULL ||
+        local_api.iter_next_chunk == NULL ||
+        local_api.iter_column_mutable == NULL ||
+        local_api.iter_column_info == NULL) {
+        return BAM_RESULT_NULL_POINTER;
+    }
+
     st = (ModState*)calloc(1u, sizeof(ModState));
     if (st == NULL) {
         return BAM_RESULT_INTERNAL_ERROR;
@@ -184,7 +287,10 @@ BAM_EXPORT BamResult bevy_abi_mod_init(
     st->scale_vt  = (const Vec3VTable*)st->api.get_proc_address(host_ctx, "bam.v0.cute3d::Scale3D.vtable");
     st->spirit_vt = (const CuteSpiritVTable*)st->api.get_proc_address(host_ctx, "bam.v0.cute3d::CuteSpirit.vtable");
 
-    if (!st->pos_vt || !st->vel_vt || !st->scale_vt || !st->spirit_vt) {
+    if (!validate_vec3_vtable(st->pos_vt) ||
+        !validate_vec3_vtable(st->vel_vt) ||
+        !validate_vec3_vtable(st->scale_vt) ||
+        !validate_spirit_vtable(st->spirit_vt)) {
         free(st);
         return BAM_RESULT_INVALID_COMPONENT;
     }

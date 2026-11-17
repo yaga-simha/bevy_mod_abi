@@ -11,8 +11,7 @@
 use bevy_abi_mod::prelude::*;
 use bevy_app::App;
 use bevy_ecs::message::Messages;
-use std::path::PathBuf;
-use std::process::Command;
+use std::path::{Path, PathBuf};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -20,6 +19,43 @@ struct EnergyShield {
     current: f32,
     max: f32,
     frequency_mhz: u32,
+}
+
+fn resolve_fixture_dylib(manifest_dir: &Path, stem: &str, filename: &str) -> PathBuf {
+    let mut candidates = Vec::with_capacity(4);
+    if let Some(dir) = std::env::var_os("BAM_FIXTURE_DIR").filter(|v| !v.is_empty()) {
+        candidates.push(PathBuf::from(dir).join(filename));
+    }
+    if let Some(repo_root) = manifest_dir.parent().and_then(Path::parent) {
+        candidates.push(repo_root.join("target").join("fixtures").join(filename));
+    }
+    candidates.push(
+        manifest_dir
+            .join("mods")
+            .join(stem)
+            .join("target")
+            .join("release")
+            .join(filename),
+    );
+    candidates.push(
+        manifest_dir
+            .join("mods")
+            .join(stem)
+            .join("target")
+            .join("debug")
+            .join(filename),
+    );
+
+    for candidate in &candidates {
+        if candidate.is_file() {
+            return candidate.clone();
+        }
+    }
+
+    panic!(
+        "Hermetic guest fixture `{filename}` not found (searched: {candidates:?}); \
+         run `cargo xtask fixtures --examples` (or `cargo xtask fixtures`) before `cargo test`."
+    );
 }
 
 fn get_dylib_paths() -> (PathBuf, PathBuf) {
@@ -32,43 +68,13 @@ fn get_dylib_paths() -> (PathBuf, PathBuf) {
         ("lib", "so")
     };
 
-    if let Some(dir) = std::env::var_os("BAM_FIXTURE_DIR").filter(|v| !v.is_empty()) {
-        let fixture_dir = PathBuf::from(dir);
-        let staged_a = fixture_dir.join(format!("{prefix}mod_shield_emitter.{ext}"));
-        let staged_b = fixture_dir.join(format!("{prefix}mod_overcharge_siphon.{ext}"));
-        if staged_a.is_file() && staged_b.is_file() {
-            return (staged_a, staged_b);
-        }
-    }
+    let file_a = format!("{prefix}mod_shield_emitter.{ext}");
+    let file_b = format!("{prefix}mod_overcharge_siphon.{ext}");
 
-    let mod_a = manifest_dir
-        .join("mods/mod_shield_emitter/target/release")
-        .join(format!("{prefix}mod_shield_emitter.{ext}"));
-    let mod_b = manifest_dir
-        .join("mods/mod_overcharge_siphon/target/release")
-        .join(format!("{prefix}mod_overcharge_siphon.{ext}"));
-
-    if !mod_a.exists() {
-        let status = Command::new("cargo")
-            .args(["build", "--manifest-path"])
-            .arg(manifest_dir.join("mods/mod_shield_emitter/Cargo.toml"))
-            .arg("--release")
-            .status()
-            .expect("Failed to build mod_shield_emitter");
-        assert!(status.success());
-    }
-
-    if !mod_b.exists() {
-        let status = Command::new("cargo")
-            .args(["build", "--manifest-path"])
-            .arg(manifest_dir.join("mods/mod_overcharge_siphon/Cargo.toml"))
-            .arg("--release")
-            .status()
-            .expect("Failed to build mod_overcharge_siphon");
-        assert!(status.success());
-    }
-
-    (mod_a, mod_b)
+    (
+        resolve_fixture_dylib(&manifest_dir, "mod_shield_emitter", &file_a),
+        resolve_fixture_dylib(&manifest_dir, "mod_overcharge_siphon", &file_b),
+    )
 }
 
 #[test]
