@@ -1,3 +1,6 @@
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include "bevy_abi_mod.h"
 
@@ -6,57 +9,141 @@ typedef struct CounterRes {
     uint32_t update_hits;
 } CounterRes;
 
-static IterResourceMutableFn g_res_mut = NULL;
+struct BamInstance {
+    BamHostApi   api;
+    BamComponent counter_res;
+};
 
-static FfiResult on_startup(RawChunkIter* it, RawCommandQueue* q, void* ud) {
-    (void)q; (void)ud;
-    CounterRes* c = (CounterRes*)g_res_mut(it, "CounterRes");
-    if (c != NULL) { c->startup_hits += 1; }
-    return FFI_RESULT_OK;
+static const BamManifest MANIFEST = {
+    (uint32_t)sizeof(BamManifest),
+    BAM_ABI_VERSION,
+    "l01_late_startup",
+    "0.2.0",
+    0u,
+    0u
+};
+
+static BamResult on_startup(BamSystemCtx* sys_ctx, void* user_data) {
+    BamInstance* st = (BamInstance*)user_data;
+    BamIter* iter = NULL;
+    CounterRes* c;
+    if (st == NULL) {
+        return BAM_RESULT_INTERNAL_ERROR;
+    }
+    if (st->api.sys_query(sys_ctx, 0u, &iter) != BAM_RESULT_OK) {
+        return BAM_RESULT_INTERNAL_ERROR;
+    }
+    c = (CounterRes*)(void*)st->api.res_mut_ptr(iter, 0u);
+    if (c != NULL) {
+        c->startup_hits += 1u;
+    }
+    return BAM_RESULT_OK;
 }
 
-static FfiResult on_update(RawChunkIter* it, RawCommandQueue* q, void* ud) {
-    (void)q; (void)ud;
-    CounterRes* c = (CounterRes*)g_res_mut(it, "CounterRes");
-    if (c != NULL) { c->update_hits += 1; }
-    return FFI_RESULT_OK;
+static BamResult on_update(BamSystemCtx* sys_ctx, void* user_data) {
+    BamInstance* st = (BamInstance*)user_data;
+    BamIter* iter = NULL;
+    CounterRes* c;
+    if (st == NULL) {
+        return BAM_RESULT_INTERNAL_ERROR;
+    }
+    if (st->api.sys_query(sys_ctx, 0u, &iter) != BAM_RESULT_OK) {
+        return BAM_RESULT_INTERNAL_ERROR;
+    }
+    c = (CounterRes*)(void*)st->api.res_mut_ptr(iter, 0u);
+    if (c != NULL) {
+        c->update_hits += 1u;
+    }
+    return BAM_RESULT_OK;
 }
 
-BEVY_ABI_MOD_EXPORT uint32_t bevy_abi_mod_abi_version(void) {
-    return BEVY_ABI_VERSION_PACKED;
+BAM_EXPORT const BamManifest* bevy_abi_mod_manifest(void) {
+    return &MANIFEST;
 }
 
-BEVY_ABI_MOD_EXPORT FfiResult bevy_abi_mod_init(
-    GetProcAddressFn get_proc_address,
-    const HostApi* api,
-    void* ctx
+BAM_EXPORT BamResult bevy_abi_mod_init(
+    const BamHostApi* api,
+    BamLoadCtx* load_ctx,
+    BamInstance** instance_out
 ) {
-    (void)api;
-    g_res_mut = (IterResourceMutableFn)get_proc_address("iter_resource_mutable");
-    RegisterScheduledSystemFn reg_sched =
-        (RegisterScheduledSystemFn)get_proc_address("register_scheduled_system");
-    if (g_res_mut == NULL || reg_sched == NULL) { return FFI_RESULT_NOT_FOUND; }
+    BamHostApi local_api;
+    const BamHostCtx* host_ctx;
+    BamInstance* st;
+    BamTermDesc term;
+    BamQueryDesc q_desc;
+    BamSystemDesc d1;
+    BamSystemDesc d2;
+    BamResult rc;
 
-    ComponentAccessDesc term = bam_access_desc("CounterRes", COMPONENT_ACCESS_RESOURCE_WRITE);
+    if (load_ctx == NULL || instance_out == NULL) {
+        return BAM_RESULT_NULL_POINTER;
+    }
+    *instance_out = NULL;
 
-    ScheduledSystemDescriptor d1;
+    rc = bam_host_api_copy_bounded(&local_api, sizeof(local_api), api);
+    if (rc != BAM_RESULT_OK) {
+        return rc;
+    }
+    host_ctx = local_api.load_host_ctx(load_ctx);
+    if (host_ctx == NULL) {
+        return BAM_RESULT_INVALID_STATE;
+    }
+
+    st = (BamInstance*)calloc(1u, sizeof(BamInstance));
+    if (st == NULL) {
+        return BAM_RESULT_INTERNAL_ERROR;
+    }
+    st->api = local_api;
+
+    rc = st->api.resolve_component(host_ctx, "sched_reg::CounterRes", NULL, &st->counter_res);
+    if (rc != BAM_RESULT_OK) {
+        rc = st->api.resolve_component(host_ctx, "CounterRes", NULL, &st->counter_res);
+    }
+    if (rc != BAM_RESULT_OK) {
+        free(st);
+        return rc;
+    }
+
+    term = bam_term_desc(st->counter_res, BAM_ACCESS_RESOURCE_WRITE, 0u);
+    memset(&q_desc, 0, sizeof(q_desc));
+    q_desc.struct_size = (uint32_t)sizeof(BamQueryDesc);
+    q_desc.terms = &term;
+    q_desc.term_count = 1u;
+
     memset(&d1, 0, sizeof(d1));
-    d1.base.struct_size = sizeof(ScheduledSystemDescriptor);
-    d1.base.name = "late_startup_sys";
-    d1.base.queries = &term;
-    d1.base.query_count = 1;
-    d1.base.callback = on_startup;
-    d1.schedule = SCHEDULE_LABEL_STARTUP;
-    FfiResult r1 = reg_sched(ctx, &d1);
-    if (r1 != FFI_RESULT_OK) { return r1; }
+    d1.struct_size = (uint32_t)sizeof(BamSystemDesc);
+    d1.name = "late_startup_sys";
+    d1.queries = &q_desc;
+    d1.query_count = 1u;
+    d1.callback = on_startup;
+    d1.user_data = st;
+    d1.schedule = BAM_SCHEDULE_STARTUP;
+    rc = st->api.register_system(load_ctx, &d1);
+    if (rc != BAM_RESULT_OK) {
+        free(st);
+        return rc;
+    }
 
-    ScheduledSystemDescriptor d2;
     memset(&d2, 0, sizeof(d2));
-    d2.base.struct_size = sizeof(ScheduledSystemDescriptor);
-    d2.base.name = "regular_update_sys";
-    d2.base.queries = &term;
-    d2.base.query_count = 1;
-    d2.base.callback = on_update;
-    d2.schedule = SCHEDULE_LABEL_UPDATE;
-    return reg_sched(ctx, &d2);
+    d2.struct_size = (uint32_t)sizeof(BamSystemDesc);
+    d2.name = "regular_update_sys";
+    d2.queries = &q_desc;
+    d2.query_count = 1u;
+    d2.callback = on_update;
+    d2.user_data = st;
+    d2.schedule = BAM_SCHEDULE_UPDATE;
+    rc = st->api.register_system(load_ctx, &d2);
+    if (rc != BAM_RESULT_OK) {
+        free(st);
+        return rc;
+    }
+
+    *instance_out = st;
+    return BAM_RESULT_OK;
+}
+
+BAM_EXPORT void bevy_abi_mod_shutdown(BamInstance* instance) {
+    if (instance != NULL) {
+        free(instance);
+    }
 }

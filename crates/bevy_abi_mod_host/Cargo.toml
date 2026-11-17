@@ -26,6 +26,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 bevy_abi_mod_host_sys = { workspace = true, features = ["test-utils"] }
 libloading = { workspace = true }
+proptest = { workspace = true }
 
 [[test]]
 name = "ffi"

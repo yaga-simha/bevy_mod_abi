@@ -1,5 +1,4 @@
 #![allow(
-    clippy::undocumented_unsafe_blocks,
     clippy::ptr_as_ptr,
     clippy::cast_ptr_alignment,
     clippy::transmute_ptr_to_ptr,
@@ -8,76 +7,71 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(improper_ctypes_definitions)]
 
-use bevy_abi_mod_guest::{
-    AbiPod, CommandBridgeVTable, CommandBridgeVTableExt, ComponentAccessDesc, ComponentAccessMode,
-    FfiBool, FfiResult, GetProcAddressFn, GuestChunkIter, GuestChunkIterRawExt, GuestCommandQueue,
-    GuestCommandQueueRawExt, HostApi, RawChunkIter, RawCommandQueue, ResourceBridgeVTable, StrView,
-    SystemDescriptor, export_mod, ffi_bool_to_rust, register_runtime_component,
-    resolve_register_conditional_system, wrap_run_condition, wrap_system_callback,
-};
-use core::ffi::c_void;
-use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-use std::sync::Mutex;
+use bevy_abi_mod_guest::prelude::*;
+use bevy_abi_mod_guest::raw::{Host, read_descriptor};
+use core::ffi::{CStr, c_void};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 // ============================================================================
-// 1. Component VTable Definitions Matching Host Layouts
+// 1. Component VTable Mirrors Matching `#[derive(ModComponent)]` (`ABI 0.2.0`)
 // ============================================================================
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct PositionVTable {
-    pub size: usize,
-    pub align: usize,
-    pub get_x: unsafe extern "C" fn(*const c_void) -> f32,
-    pub set_x: unsafe extern "C" fn(*mut c_void, f32),
-    pub get_y: unsafe extern "C" fn(*const c_void) -> f32,
-    pub set_y: unsafe extern "C" fn(*mut c_void, f32),
-    pub get_z: unsafe extern "C" fn(*const c_void) -> f32,
-    pub set_z: unsafe extern "C" fn(*mut c_void, f32),
+    pub header: VTableHeader,
+    pub get_x: Option<unsafe extern "C" fn(*const c_void) -> f32>,
+    pub set_x: Option<unsafe extern "C" fn(*mut c_void, f32) -> FfiResult>,
+    pub get_y: Option<unsafe extern "C" fn(*const c_void) -> f32>,
+    pub set_y: Option<unsafe extern "C" fn(*mut c_void, f32) -> FfiResult>,
+    pub get_z: Option<unsafe extern "C" fn(*const c_void) -> f32>,
+    pub set_z: Option<unsafe extern "C" fn(*mut c_void, f32) -> FfiResult>,
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct VelocityVTable {
-    pub size: usize,
-    pub align: usize,
-    pub get_x: unsafe extern "C" fn(*const c_void) -> f32,
-    pub set_x: unsafe extern "C" fn(*mut c_void, f32),
-    pub get_y: unsafe extern "C" fn(*const c_void) -> f32,
-    pub set_y: unsafe extern "C" fn(*mut c_void, f32),
-    pub get_z: unsafe extern "C" fn(*const c_void) -> f32,
-    pub set_z: unsafe extern "C" fn(*mut c_void, f32),
+    pub header: VTableHeader,
+    pub get_x: Option<unsafe extern "C" fn(*const c_void) -> f32>,
+    pub set_x: Option<unsafe extern "C" fn(*mut c_void, f32) -> FfiResult>,
+    pub get_y: Option<unsafe extern "C" fn(*const c_void) -> f32>,
+    pub set_y: Option<unsafe extern "C" fn(*mut c_void, f32) -> FfiResult>,
+    pub get_z: Option<unsafe extern "C" fn(*const c_void) -> f32>,
+    pub set_z: Option<unsafe extern "C" fn(*mut c_void, f32) -> FfiResult>,
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct CombatHealthVTable {
-    pub size: usize,
-    pub align: usize,
-    pub get_current: unsafe extern "C" fn(*const c_void) -> i32,
-    pub set_current: unsafe extern "C" fn(*mut c_void, i32),
-    pub get_max: unsafe extern "C" fn(*const c_void) -> i32,
-    pub set_max: unsafe extern "C" fn(*mut c_void, i32),
+    pub header: VTableHeader,
+    pub get_current: Option<unsafe extern "C" fn(*const c_void) -> i32>,
+    pub set_current: Option<unsafe extern "C" fn(*mut c_void, i32) -> FfiResult>,
+    pub get_max: Option<unsafe extern "C" fn(*const c_void) -> i32>,
+    pub set_max: Option<unsafe extern "C" fn(*mut c_void, i32) -> FfiResult>,
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct MetadataTagVTable {
-    pub size: usize,
-    pub align: usize,
-    pub get_label: unsafe extern "C" fn(*const c_void) -> StrView,
-    pub set_label: unsafe extern "C" fn(*mut c_void, *const u8, usize),
+    pub header: VTableHeader,
+    pub get_label: Option<unsafe extern "C" fn(*const c_void) -> StrView>,
+    pub set_label: Option<unsafe extern "C" fn(*mut c_void, StrView) -> FfiResult>,
 }
 
 // ============================================================================
-// 1b. Dynamic Runtime Component Definitions (Milestone 3)
+// 2. Dynamic Component & POD Resource Definitions
 // ============================================================================
 
-/// Dynamic runtime component defined purely by the guest mod.
-///
-/// This component is not known to the host application at compile time.
-/// It is registered dynamically with Bevy ECS during `mod_init` via `register_runtime_component`.
+/// Dynamic runtime component registered by `asymmetric_rust_mod` (`asymmetric_rust_mod::RustModCustomData`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, AbiPod)]
 pub struct RustModCustomData {
     pub power: f32,
     pub shield: u32,
+}
+
+impl GuestComponent for RustModCustomData {
+    const NAME: &'static CStr = c"RustModCustomData";
 }
 
 /// POD resource layout mirrored in the Rust guest mod.
@@ -90,37 +84,26 @@ pub struct Phase4RustRes {
     pub spawned_default_entity: u64,
 }
 
-#[derive(Clone, Copy)]
-struct Phase4BridgeState {
-    pos_vt: *const PositionVTable,
-    cmd_ext: CommandBridgeVTableExt,
-    res_vt: ResourceBridgeVTable,
+#[repr(C)]
+#[derive(Clone, Copy, AbiPod)]
+struct RawPos {
+    x: f32,
+    y: f32,
+    z: f32,
 }
 
 // ============================================================================
-// 2. Mod Static State
+// 3. Test Harness Controls
 // ============================================================================
-
-static HOST_API_PTR: AtomicPtr<HostApi> = AtomicPtr::new(core::ptr::null_mut());
-static POS_VTABLE: AtomicPtr<PositionVTable> = AtomicPtr::new(core::ptr::null_mut());
-static VEL_VTABLE: AtomicPtr<VelocityVTable> = AtomicPtr::new(core::ptr::null_mut());
-static HEALTH_VTABLE: AtomicPtr<CombatHealthVTable> = AtomicPtr::new(core::ptr::null_mut());
-static TAG_VTABLE: AtomicPtr<MetadataTagVTable> = AtomicPtr::new(core::ptr::null_mut());
-
-static ALLOCATED_CMD_VTABLES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-static ALLOCATED_PHASE4_BRIDGES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 static PANIC_TRIGGER: AtomicBool = AtomicBool::new(false);
 static SHUTDOWN_CALLED: AtomicBool = AtomicBool::new(false);
 static PHASE4_RUST_RUN_ENABLED: AtomicBool = AtomicBool::new(true);
 
-// Test harness controls
-
-/// Triggers a simulated panic during subsequent system executions.
+/// Triggers a simulated panic during the next execution of `rust_panicking`.
 ///
 /// # Safety
-/// This function must be called from a test harness thread when it is safe to toggle
-/// the test panic trigger flag. It operates atomically with `SeqCst` ordering.
+/// Safe to invoke from test harness threads; operates atomically with `SeqCst` ordering.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn asymmetric_rust_mod_trigger_panic() {
     PANIC_TRIGGER.store(true, Ordering::SeqCst);
@@ -129,8 +112,7 @@ pub unsafe extern "C" fn asymmetric_rust_mod_trigger_panic() {
 /// Resets the simulated panic trigger so subsequent system executions run normally.
 ///
 /// # Safety
-/// This function must be called from a test harness thread when it is safe to reset
-/// the test panic trigger flag. It operates atomically with `SeqCst` ordering.
+/// Safe to invoke from test harness threads; operates atomically with `SeqCst` ordering.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn asymmetric_rust_mod_reset_panic() {
     PANIC_TRIGGER.store(false, Ordering::SeqCst);
@@ -139,8 +121,7 @@ pub unsafe extern "C" fn asymmetric_rust_mod_reset_panic() {
 /// Queries whether the mod has received a shutdown signal via `bevy_abi_mod_shutdown`.
 ///
 /// # Safety
-/// Callers must ensure the dynamic library remains loaded in memory during the call.
-/// It operates atomically with `SeqCst` ordering.
+/// Caller must ensure the dynamic library remains loaded during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn asymmetric_rust_mod_was_shutdown() -> bool {
     SHUTDOWN_CALLED.load(Ordering::SeqCst)
@@ -149,655 +130,518 @@ pub unsafe extern "C" fn asymmetric_rust_mod_was_shutdown() -> bool {
 /// Toggles the Phase 4 conditional system `run_if` predicate in `asymmetric_rust_mod`.
 ///
 /// # Safety
-/// Callers must ensure the dynamic library remains loaded in memory during the call.
+/// Caller must ensure the dynamic library remains loaded during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn asymmetric_rust_mod_set_phase4_enabled(enabled: FfiBool) {
-    PHASE4_RUST_RUN_ENABLED.store(ffi_bool_to_rust(enabled), Ordering::SeqCst);
+    PHASE4_RUST_RUN_ENABLED.store(enabled.get(), Ordering::SeqCst);
 }
 
 // ============================================================================
-// 3. Scenario Systems
+// 4. Per-Instance Resolution Helpers (Zero Process-Global API/VTable State)
 // ============================================================================
 
-// --- Scenario 1: 3D Kinematics System ---
-unsafe fn rust_kinematics_system(
-    iter: *mut RawChunkIter,
-    _commands: *mut RawCommandQueue,
-    _user_data: *mut c_void,
-) -> FfiResult {
-    let host_api_ptr = HOST_API_PTR.load(Ordering::Acquire);
-    let pos_vt_ptr = POS_VTABLE.load(Ordering::Acquire);
-    let vel_vt_ptr = VEL_VTABLE.load(Ordering::Acquire);
-
-    if host_api_ptr.is_null() || pos_vt_ptr.is_null() || vel_vt_ptr.is_null() {
-        return FfiResult::INTERNAL_ERROR;
+/// Resolves the first matching VTable symbol and its corresponding `BamComponent` handle.
+///
+/// # Safety
+/// `V` must be a `#[repr(C)]` VTable struct prefixed at byte offset `0` by `VTableHeader`.
+unsafe fn resolve_vtable_and_handle<'a, V: Copy + 'static>(
+    host: &Host,
+    vtable_candidates: &[&CStr],
+) -> Option<(&'a V, BamComponent)> {
+    for &sym in vtable_candidates {
+        let raw = host.get_proc_address(sym);
+        if raw.is_null() || !(raw as usize).is_multiple_of(core::mem::align_of::<V>()) {
+            continue;
+        }
+        // SAFETY: `raw` is non-null, aligned to `V`, and points to a `VTableHeader`-prefixed symbol.
+        let Ok(hdr) = (unsafe { read_descriptor::<VTableHeader>(raw) }) else {
+            continue;
+        };
+        if hdr.validate(core::mem::size_of::<V>(), hdr.uuid).is_err() {
+            continue;
+        }
+        let Ok(comp) = bevy_abi_mod_guest::raw::resolve_component(host, None, Some(hdr.uuid))
+        else {
+            continue;
+        };
+        // SAFETY: `hdr.validate` confirmed `struct_size >= size_of::<V>()` and ABI compatibility;
+        // static host VTables outlive the mod session.
+        let vt_ref: &'a V = unsafe { &*raw.cast::<V>() };
+        return Some((vt_ref, comp));
     }
-
-    // SAFETY: Valid static pointers resolved during mod_init.
-    let api = unsafe { &*host_api_ptr };
-    let pos_vt = unsafe { &*pos_vt_ptr };
-    let vel_vt = unsafe { &*vel_vt_ptr };
-
-    loop {
-        let count = unsafe { (api.iter_next_chunk)(iter) };
-        if count == 0 {
-            break;
-        }
-
-        let pos_base = unsafe { (api.iter_column_mutable)(iter, 0) };
-        let vel_base = unsafe { (api.iter_column_readonly)(iter, 1) };
-        let pos_stride = unsafe { (api.iter_column_stride)(iter, 0) };
-        let vel_stride = unsafe { (api.iter_column_stride)(iter, 1) };
-
-        if pos_base.is_null() || vel_base.is_null() {
-            return FfiResult::NULL_POINTER;
-        }
-
-        for i in 0..count {
-            let p_ptr = unsafe { pos_base.add(i * pos_stride) } as *mut c_void;
-            let v_ptr = unsafe { vel_base.add(i * vel_stride) } as *const c_void;
-
-            let px = unsafe { (pos_vt.get_x)(p_ptr) };
-            let vx = unsafe { (vel_vt.get_x)(v_ptr) };
-            unsafe { (pos_vt.set_x)(p_ptr, px + vx) };
-
-            let py = unsafe { (pos_vt.get_y)(p_ptr) };
-            let vy = unsafe { (vel_vt.get_y)(v_ptr) };
-            unsafe { (pos_vt.set_y)(p_ptr, py + vy) };
-
-            let pz = unsafe { (pos_vt.get_z)(p_ptr) };
-            let vz = unsafe { (vel_vt.get_z)(v_ptr) };
-            unsafe { (pos_vt.set_z)(p_ptr, pz + vz) };
-
-            // Call iter_mark_changed explicitly
-            let mark_res = unsafe { (api.iter_mark_changed)(iter, 0, i) };
-            if mark_res.is_err() {
-                return mark_res;
-            }
-        }
-    }
-
-    FfiResult::OK
+    None
 }
 
-// --- Scenario 2: Combat Damage System ---
-unsafe fn rust_combat_system(
-    iter: *mut RawChunkIter,
-    commands: *mut RawCommandQueue,
-    user_data: *mut c_void,
-) -> FfiResult {
-    let host_api_ptr = HOST_API_PTR.load(Ordering::Acquire);
-    let health_vt_ptr = HEALTH_VTABLE.load(Ordering::Acquire);
-
-    if host_api_ptr.is_null() || health_vt_ptr.is_null() {
-        return FfiResult::INTERNAL_ERROR;
+fn resolve_any_named(app: &GuestApp<'_>, candidates: &[&CStr]) -> Option<BamComponent> {
+    for &name in candidates {
+        if let Ok(comp) = app.resolve_component_named(Some(name), None) {
+            return Some(comp);
+        }
     }
+    None
+}
 
-    let api = unsafe { &*host_api_ptr };
-    let health_vt = unsafe { &*health_vt_ptr };
-    let cmd_vt = if !user_data.is_null() {
-        // SAFETY: `user_data` points to a valid `CommandBridgeVTable` allocated in `mod_init`.
-        unsafe { *(user_data as *const CommandBridgeVTable) }
-    } else {
-        CommandBridgeVTable::default()
+// ============================================================================
+// 5. Per-World `setup` (`L-02`, `L-08`, `G-02`)
+// ============================================================================
+
+fn setup(app: &mut GuestApp<'_>) -> FfiResult {
+    app.on_shutdown(|| {
+        SHUTDOWN_CALLED.store(true, Ordering::SeqCst);
+        PANIC_TRIGGER.store(false, Ordering::SeqCst);
+        PHASE4_RUST_RUN_ENABLED.store(true, Ordering::SeqCst);
+    });
+
+    // Register `asymmetric_rust_mod::RustModCustomData` dynamically (`C-10`, `G-07`).
+    let custom_comp = match app.register_component::<RustModCustomData>() {
+        Ok(h) => h,
+        Err(err) => return err,
     };
-    let mut cmd_queue = unsafe { GuestCommandQueue::new(commands, cmd_vt) };
 
-    loop {
-        let count = unsafe { (api.iter_next_chunk)(iter) };
-        if count == 0 {
-            break;
-        }
+    let host = *app.host();
 
-        let health_base = unsafe { (api.iter_column_mutable)(iter, 0) };
-        let health_stride = unsafe { (api.iter_column_stride)(iter, 0) };
-        let ents_ptr = unsafe { (api.iter_entities)(iter) };
+    // SAFETY: Each `*VTable` struct mirrors the `#[repr(C)]` layout emitted by `#[derive(ModComponent)]`.
+    let pos_resolved = unsafe {
+        resolve_vtable_and_handle::<PositionVTable>(
+            &host,
+            &[
+                c"bam.v0.testbed::Position.vtable",
+                c"bam.v0.e2e::asymmetric_mods::Position.vtable",
+                c"bam.v0.Position.vtable",
+            ],
+        )
+    };
+    // SAFETY: `VelocityVTable` mirrors `#[derive(ModComponent)]` VTable layout.
+    let vel_resolved = unsafe {
+        resolve_vtable_and_handle::<VelocityVTable>(
+            &host,
+            &[
+                c"bam.v0.testbed::Velocity.vtable",
+                c"bam.v0.e2e::asymmetric_mods::Velocity.vtable",
+                c"bam.v0.Velocity.vtable",
+            ],
+        )
+    };
+    // SAFETY: `CombatHealthVTable` mirrors `#[derive(ModComponent)]` VTable layout.
+    let health_resolved = unsafe {
+        resolve_vtable_and_handle::<CombatHealthVTable>(
+            &host,
+            &[
+                c"bam.v0.testbed::CombatHealth.vtable",
+                c"bam.v0.testbed::Health.vtable",
+                c"bam.v0.e2e::asymmetric_mods::CombatHealth.vtable",
+                c"bam.v0.CombatHealth.vtable",
+            ],
+        )
+    };
+    // SAFETY: `MetadataTagVTable` mirrors `#[derive(ModComponent)]` VTable layout.
+    let tag_resolved = unsafe {
+        resolve_vtable_and_handle::<MetadataTagVTable>(
+            &host,
+            &[
+                c"bam.v0.testbed::MetadataTag.vtable",
+                c"bam.v0.testbed::NameTag.vtable",
+                c"bam.v0.MetadataTag.vtable",
+                c"bam.v0.NameTag.vtable",
+            ],
+        )
+    };
 
-        if health_base.is_null() {
-            return FfiResult::NULL_POINTER;
-        }
+    // 1. Kinematics System (`Position` WRITE + `Velocity` READ)
+    if let (Some((&pos_vt, pos_comp)), Some((&vel_vt, vel_comp))) = (pos_resolved, vel_resolved) {
+        let status = app
+            .system(c"rust_kinematics")
+            .query(|q| q.write_handle(pos_comp).read_handle(vel_comp))
+            .build(move |ctx| {
+                let (
+                    Some(get_px),
+                    Some(set_px),
+                    Some(get_py),
+                    Some(set_py),
+                    Some(get_pz),
+                    Some(set_pz),
+                    Some(get_vx),
+                    Some(get_vy),
+                    Some(get_vz),
+                ) = (
+                    pos_vt.get_x,
+                    pos_vt.set_x,
+                    pos_vt.get_y,
+                    pos_vt.set_y,
+                    pos_vt.get_z,
+                    pos_vt.set_z,
+                    vel_vt.get_x,
+                    vel_vt.get_y,
+                    vel_vt.get_z,
+                )
+                else {
+                    return FfiResult::NULL_POINTER;
+                };
 
-        for i in 0..count {
-            let h_ptr = unsafe { health_base.add(i * health_stride) } as *mut c_void;
-            let current = unsafe { (health_vt.get_current)(h_ptr) };
-            let new_hp = (current - 15).max(0);
-            unsafe { (health_vt.set_current)(h_ptr, new_hp) };
+                while let Some(mut chunk) = ctx.iter().next_chunk_view() {
+                    let count = chunk.len();
+                    let vel_ptrs: Vec<*const c_void> = {
+                        let vel_slice = chunk.readonly_slice(1);
+                        let mut v = Vec::with_capacity(count);
+                        for row in 0..count {
+                            let Some(p) = vel_slice.get_ptr(row, vel_vt.header.size) else {
+                                return FfiResult::NULL_POINTER;
+                            };
+                            v.push(p.cast::<c_void>());
+                        }
+                        v
+                    };
 
-            // Trigger change detection for CombatHealth
-            unsafe { (api.iter_mark_changed)(iter, 0, i) };
-
-            // If health reaches 0, trigger deferred despawn command
-            if new_hp == 0 && !ents_ptr.is_null() && !commands.is_null() {
-                let entity = unsafe { *ents_ptr.add(i) };
-                cmd_queue.despawn(entity);
-            }
-        }
-    }
-
-    FfiResult::OK
-}
-
-// --- Scenario 3: Dynamic Metadata System ---
-unsafe fn rust_metadata_system(
-    iter: *mut RawChunkIter,
-    _commands: *mut RawCommandQueue,
-    _user_data: *mut c_void,
-) -> FfiResult {
-    let host_api_ptr = HOST_API_PTR.load(Ordering::Acquire);
-    let tag_vt_ptr = TAG_VTABLE.load(Ordering::Acquire);
-
-    if host_api_ptr.is_null() || tag_vt_ptr.is_null() {
-        return FfiResult::INTERNAL_ERROR;
-    }
-
-    let api = unsafe { &*host_api_ptr };
-    let tag_vt = unsafe { &*tag_vt_ptr };
-
-    loop {
-        let count = unsafe { (api.iter_next_chunk)(iter) };
-        if count == 0 {
-            break;
-        }
-
-        let tag_base = unsafe { (api.iter_column_mutable)(iter, 0) };
-        let tag_stride = unsafe { (api.iter_column_stride)(iter, 0) };
-
-        if tag_base.is_null() {
-            return FfiResult::NULL_POINTER;
-        }
-
-        for i in 0..count {
-            let t_ptr = unsafe { tag_base.add(i * tag_stride) } as *mut c_void;
-            let view = unsafe { (tag_vt.get_label)(t_ptr) };
-
-            // Safe UTF-8 inspection across C-ABI
-            if let Ok(label) = unsafe { view.as_str() } {
-                if !label.starts_with("Modded_") {
-                    let mut updated = String::with_capacity(label.len() + 8);
-                    updated.push_str("Modded_");
-                    updated.push_str(label);
-
-                    // Safe host-allocated mutation
-                    unsafe {
-                        (tag_vt.set_label)(t_ptr, updated.as_ptr(), updated.len());
+                    let mut pos_slice = chunk.mutable_slice(0);
+                    for (row, &v_ptr) in vel_ptrs.iter().enumerate() {
+                        let Some(p_raw) = pos_slice.get_mut_ptr(row, pos_vt.header.size) else {
+                            return FfiResult::NULL_POINTER;
+                        };
+                        let p_ptr = p_raw.cast::<c_void>();
+                        // SAFETY: `p_ptr` and `v_ptr` point to valid initialized `Position` and `Velocity` elements.
+                        unsafe {
+                            let rx = set_px(p_ptr, get_px(p_ptr) + get_vx(v_ptr));
+                            let ry = set_py(p_ptr, get_py(p_ptr) + get_vy(v_ptr));
+                            let rz = set_pz(p_ptr, get_pz(p_ptr) + get_vz(v_ptr));
+                            if rx.is_err() || ry.is_err() || rz.is_err() {
+                                return FfiResult::INTERNAL_ERROR;
+                            }
+                        }
                     }
-                    unsafe { (api.iter_mark_changed)(iter, 0, i) };
                 }
-            }
-        }
-    }
-
-    FfiResult::OK
-}
-
-// --- Scenario 4: Deferred Commands System ---
-unsafe fn rust_command_system(
-    _iter: *mut RawChunkIter,
-    commands: *mut RawCommandQueue,
-    user_data: *mut c_void,
-) -> FfiResult {
-    if commands.is_null() || user_data.is_null() {
-        return FfiResult::OK;
-    }
-
-    // SAFETY: `user_data` points to a valid `CommandBridgeVTable` allocated in `mod_init`.
-    let cmd_vt = unsafe { *(user_data as *const CommandBridgeVTable) };
-    let mut cmd_queue = unsafe { GuestCommandQueue::new(commands, cmd_vt) };
-
-    // 1. Spawn a new entity
-    let new_entity = cmd_queue.spawn_empty();
-    if new_entity.0 == 0 {
-        return FfiResult::INTERNAL_ERROR;
-    }
-
-    // 2. Insert Position component bytes
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct RawPos {
-        x: f32,
-        y: f32,
-        z: f32,
-    }
-    let p = RawPos {
-        x: 100.0,
-        y: 200.0,
-        z: 300.0,
-    };
-    let insert_res = unsafe {
-        cmd_queue.insert_bytes(
-            new_entity,
-            c"Position".as_ptr(),
-            &p as *const RawPos as *const u8,
-            core::mem::size_of::<RawPos>(),
-        )
-    };
-    if insert_res.is_err() {
-        return insert_res;
-    }
-
-    // Insert dynamic runtime component via typed helper (Milestone 3)
-    let custom_data = RustModCustomData {
-        power: 42.0,
-        shield: 100,
-    };
-    let insert_custom_res =
-        cmd_queue.insert_runtime_component(new_entity, c"RustModCustomData", &custom_data);
-    if insert_custom_res.is_err() {
-        return insert_custom_res;
-    }
-
-    let despawn_res = cmd_queue.despawn(new_entity);
-    if despawn_res.is_err() {
-        return despawn_res;
-    }
-
-    FfiResult::OK
-}
-
-// --- Scenario 5: Fault Isolation Panicking System ---
-unsafe fn rust_panicking_system(
-    _iter: *mut RawChunkIter,
-    _commands: *mut RawCommandQueue,
-    _user_data: *mut c_void,
-) -> FfiResult {
-    if PANIC_TRIGGER.swap(false, Ordering::SeqCst) {
-        panic!("Intentional cross-runtime panic in asymmetric_rust_mod");
-    }
-    FfiResult::OK
-}
-
-// --- Scenario 7: Dynamic Runtime Component Mutation System (Milestone 3) ---
-unsafe fn rust_custom_system(
-    iter: *mut RawChunkIter,
-    _commands: *mut RawCommandQueue,
-    _user_data: *mut c_void,
-) -> FfiResult {
-    if iter.is_null() {
-        return FfiResult::NULL_POINTER;
-    }
-    let host_api_ptr = HOST_API_PTR.load(Ordering::Acquire);
-    if host_api_ptr.is_null() {
-        return FfiResult::INTERNAL_ERROR;
-    }
-
-    let api = unsafe { &*host_api_ptr };
-    let mut chunk_iter = unsafe { GuestChunkIter::new(iter, api) };
-
-    loop {
-        let count = chunk_iter.next_chunk();
-        if count == 0 {
-            break;
-        }
-
-        // `mutable_slice` invokes `iter_column_mutable`, which marks all chunk rows changed in O(1) FFI calls.
-        let mut slice = chunk_iter.mutable_slice(0);
-        let Some(items) = slice.as_typed_slice::<RustModCustomData>() else {
-            return FfiResult::INTERNAL_ERROR;
-        };
-
-        for item in items.iter_mut() {
-            item.power += 10.0;
-            item.shield += 1;
-        }
-    }
-
-    FfiResult::OK
-}
-
-wrap_system_callback!(fn c_rust_kinematics calls rust_kinematics_system);
-wrap_system_callback!(fn c_rust_combat calls rust_combat_system);
-wrap_system_callback!(fn c_rust_metadata calls rust_metadata_system);
-wrap_system_callback!(fn c_rust_command calls rust_command_system);
-wrap_system_callback!(fn c_rust_panicking calls rust_panicking_system);
-wrap_system_callback!(fn c_rust_custom_system calls rust_custom_system);
-
-unsafe fn rust_phase4_run_if(_user_data: *mut c_void) -> bool {
-    PHASE4_RUST_RUN_ENABLED.load(Ordering::SeqCst)
-}
-
-// --- Scenario 8 (Phase 3 + Phase 4): Optional Columns, Changed/Added Row Filters, Resources, & Commands ---
-unsafe fn rust_phase4_ecs_system(
-    iter: *mut RawChunkIter,
-    commands: *mut RawCommandQueue,
-    user_data: *mut c_void,
-) -> FfiResult {
-    if iter.is_null() || user_data.is_null() {
-        return FfiResult::NULL_POINTER;
-    }
-    let host_api_ptr = HOST_API_PTR.load(Ordering::Acquire);
-    let vel_vt_ptr = VEL_VTABLE.load(Ordering::Acquire);
-    if host_api_ptr.is_null() {
-        return FfiResult::INTERNAL_ERROR;
-    }
-
-    // SAFETY: Validated non-null static/allocated pointers for the duration of the callback.
-    let api = unsafe { &*host_api_ptr };
-    let bridges = unsafe { *(user_data as *const Phase4BridgeState) };
-    if bridges.pos_vt.is_null() {
-        return FfiResult::INTERNAL_ERROR;
-    }
-    let pos_vt = unsafe { &*bridges.pos_vt };
-
-    let mut chunk_iter = unsafe { GuestChunkIter::with_bridges(iter, api, None, bridges.res_vt) };
-    let mut cmd_queue = unsafe { GuestCommandQueue::with_ext(commands, bridges.cmd_ext) };
-
-    let (scale, need_spawn_default) = {
-        let Some(res) = chunk_iter.resource::<Phase4RustRes>(c"Phase4RustRes") else {
-            return FfiResult::INVALID_COMPONENT;
-        };
-        (res.scale, res.spawned_default_entity == 0)
-    };
-
-    if need_spawn_default && !cmd_queue.is_null() {
-        let spawned = cmd_queue.spawn_empty();
-        if spawned.0 != 0 && cmd_queue.insert_default(spawned, c"NameTag").is_ok() {
-            if let Some(res_mut) = chunk_iter.resource_mut::<Phase4RustRes>(c"Phase4RustRes") {
-                res_mut.spawned_default_entity = spawned.0;
-            }
-        }
-    }
-
-    let mut matched_delta = 0u32;
-    let mut opt_vel_delta = 0u32;
-
-    while let Some(mut chunk) = chunk_iter.next_chunk_view() {
-        let count = chunk.len();
-        let entities_copy: Vec<_> = chunk.entities().to_vec();
-        let opt_vel_ptr = chunk.optional_column_ptr(1);
-        let vel_stride = if opt_vel_ptr.is_some() {
-            chunk.readonly_slice(1).stride()
-        } else {
-            0
-        };
-        let mut pos_slice = chunk.mutable_slice(0);
-        for i in 0..count {
-            let Some(p_raw) = pos_slice.get_ptr_mut(i) else {
-                return FfiResult::NULL_POINTER;
-            };
-            let p_ptr = p_raw as *mut c_void;
-            let px = unsafe { (pos_vt.get_x)(p_ptr) };
-            if let Some(v_base) = opt_vel_ptr {
-                if !vel_vt_ptr.is_null() {
-                    let vel_vt = unsafe { &*vel_vt_ptr };
-                    let v_ptr = unsafe { v_base.add(i * vel_stride) } as *const c_void;
-                    let vx = unsafe { (vel_vt.get_x)(v_ptr) };
-                    unsafe { (pos_vt.set_x)(p_ptr, px + vx * scale) };
-                    opt_vel_delta += 1;
-                }
-            } else {
-                unsafe { (pos_vt.set_x)(p_ptr, px + 1.0 * scale) };
-            }
-            matched_delta += 1;
-
-            if i < entities_copy.len() && !cmd_queue.is_null() {
-                let _ = cmd_queue.remove_component(entities_copy[i], c"Phase4Removable");
-            }
-        }
-    }
-
-    if matched_delta > 0 || opt_vel_delta > 0 {
-        let Some(res_mut) = chunk_iter.resource_mut::<Phase4RustRes>(c"Phase4RustRes") else {
-            return FfiResult::INVALID_COMPONENT;
-        };
-        res_mut.matched_rows += matched_delta;
-        res_mut.optional_vel_hits += opt_vel_delta;
-    }
-
-    FfiResult::OK
-}
-
-wrap_run_condition!(fn c_rust_phase4_run_if calls rust_phase4_run_if);
-wrap_system_callback!(fn c_rust_phase4_ecs_system calls rust_phase4_ecs_system);
-
-// ============================================================================
-// 4. Mod Lifecycle (Scenario 6)
-// ============================================================================
-
-fn mod_init(
-    get_proc_address: GetProcAddressFn,
-    host_api: *const HostApi,
-    host_context: *mut c_void,
-) -> FfiResult {
-    if host_api.is_null() {
-        return FfiResult::NULL_POINTER;
-    }
-    HOST_API_PTR.store(host_api as *mut HostApi, Ordering::Release);
-
-    // Register Dynamic Component (Milestone 3)
-    let reg_res = unsafe {
-        register_runtime_component::<RustModCustomData>(
-            host_api,
-            host_context,
-            c"RustModCustomData",
-        )
-    };
-    if reg_res.is_err() {
-        return reg_res;
-    }
-
-    // Resolve VTables with fallback naming support (store only non-null symbols so optional worlds never clobber globals)
-    let pos_sym = unsafe { (get_proc_address)(c"Position_vtable".as_ptr()) };
-    let vel_sym = unsafe { (get_proc_address)(c"Velocity_vtable".as_ptr()) };
-    if !pos_sym.is_null() {
-        POS_VTABLE.store(pos_sym as *mut PositionVTable, Ordering::Release);
-    }
-    if !vel_sym.is_null() {
-        VEL_VTABLE.store(vel_sym as *mut VelocityVTable, Ordering::Release);
-    }
-
-    let mut health_sym = unsafe { (get_proc_address)(c"CombatHealth_vtable".as_ptr()) };
-    if health_sym.is_null() {
-        health_sym = unsafe { (get_proc_address)(c"Health_vtable".as_ptr()) };
-    }
-    if !health_sym.is_null() {
-        HEALTH_VTABLE.store(health_sym as *mut CombatHealthVTable, Ordering::Release);
-    }
-
-    let mut tag_sym = unsafe { (get_proc_address)(c"MetadataTag_vtable".as_ptr()) };
-    if tag_sym.is_null() {
-        tag_sym = unsafe { (get_proc_address)(c"NameTag_vtable".as_ptr()) };
-    }
-    if !tag_sym.is_null() {
-        TAG_VTABLE.store(tag_sym as *mut MetadataTagVTable, Ordering::Release);
-    }
-
-    // Resolve deferred command functions into a per-instance heap box
-    let cmd_vt_ptr = Box::into_raw(Box::new(unsafe {
-        CommandBridgeVTable::resolve(get_proc_address)
-    }));
-    if let Ok(mut list) = ALLOCATED_CMD_VTABLES.lock() {
-        list.push(cmd_vt_ptr as usize);
-    }
-
-    let api = unsafe { &*host_api };
-
-    // Register System 1: Kinematics (when both Position and Velocity exist in this World)
-    if !pos_sym.is_null() && !vel_sym.is_null() {
-        let kin_queries = [
-            ComponentAccessDesc {
-                name: c"Position".as_ptr(),
-                mode: ComponentAccessMode::WRITE,
-            },
-            ComponentAccessDesc {
-                name: c"Velocity".as_ptr(),
-                mode: ComponentAccessMode::READ,
-            },
-        ];
-        let kin_desc = SystemDescriptor {
-            struct_size: core::mem::size_of::<SystemDescriptor>() as u32,
-            name: c"rust_kinematics".as_ptr(),
-            queries: kin_queries.as_ptr(),
-            query_count: kin_queries.len(),
-            callback: c_rust_kinematics,
-            user_data: core::ptr::null_mut(),
-        };
-        let status = unsafe { (api.register_system)(host_context, &kin_desc) };
+                FfiResult::OK
+            });
         if status.is_err() {
             return status;
         }
     }
 
-    // Register System 2: Combat Damage (if health component resolved)
-    if !health_sym.is_null() {
-        let health_name =
-            if unsafe { !(get_proc_address)(c"CombatHealth_vtable".as_ptr()).is_null() } {
-                c"CombatHealth".as_ptr()
-            } else {
-                c"Health".as_ptr()
+    // 2. Combat Damage System (`CombatHealth` WRITE + deferred despawn at 0 HP)
+    if let Some((&health_vt, health_comp)) = health_resolved {
+        let status = app
+            .system(c"rust_combat")
+            .query(|q| q.write_handle(health_comp))
+            .build(move |ctx| {
+                let (Some(get_cur), Some(set_cur)) = (health_vt.get_current, health_vt.set_current)
+                else {
+                    return FfiResult::NULL_POINTER;
+                };
+                let (iter, cmds) = ctx.iter_and_commands();
+                while let Some(mut chunk) = iter.next_chunk_view() {
+                    let entities: Vec<FfiEntity> = chunk.entities().to_vec();
+                    let mut health_slice = chunk.mutable_slice(0);
+                    for (row, &entity) in entities.iter().enumerate() {
+                        let Some(h_raw) = health_slice.get_mut_ptr(row, health_vt.header.size)
+                        else {
+                            return FfiResult::NULL_POINTER;
+                        };
+                        let h_ptr = h_raw.cast::<c_void>();
+                        // SAFETY: `h_ptr` points to a valid `CombatHealth` element in column 0.
+                        let new_hp = unsafe {
+                            let cur = get_cur(h_ptr);
+                            let next = (cur - 15).max(0);
+                            let rc = set_cur(h_ptr, next);
+                            if rc.is_err() {
+                                return rc;
+                            }
+                            next
+                        };
+                        if new_hp == 0 {
+                            let _ = cmds.despawn(entity);
+                        }
+                    }
+                }
+                FfiResult::OK
+            });
+        if status.is_err() {
+            return status;
+        }
+    }
+
+    // 3. Metadata System (`MetadataTag` / `NameTag` WRITE via untracked slice + selective `mark_changed`)
+    if let Some((&tag_vt, tag_comp)) = tag_resolved {
+        let status = app
+            .system(c"rust_metadata")
+            .query(|q| q.write_handle(tag_comp))
+            .build(move |ctx| {
+                let (Some(get_label), Some(set_label)) = (tag_vt.get_label, tag_vt.set_label)
+                else {
+                    return FfiResult::NULL_POINTER;
+                };
+                while let Some(mut chunk) = ctx.iter().next_chunk_view() {
+                    let count = chunk.len();
+                    let mut changed_rows = Vec::new();
+                    {
+                        let mut tag_slice = chunk.mutable_slice_untracked(0);
+                        for row in 0..count {
+                            let Some(t_raw) = tag_slice.get_mut_ptr(row, tag_vt.header.size) else {
+                                return FfiResult::NULL_POINTER;
+                            };
+                            let t_ptr = t_raw.cast::<c_void>();
+                            // SAFETY: `t_ptr` points to a valid `MetadataTag`/`NameTag` element.
+                            let view = unsafe { get_label(t_ptr) };
+                            // SAFETY: `view` borrows the UTF-8 buffer of the host `String` prior to mutation.
+                            if let Ok(label) = unsafe { view.as_str() }
+                                && !label.starts_with("Modded_")
+                            {
+                                let mut updated = String::with_capacity(label.len() + 8);
+                                updated.push_str("Modded_");
+                                updated.push_str(label);
+                                // SAFETY: `t_ptr` is valid and `StrView::from_str` borrows `updated` for the call.
+                                let rc = unsafe { set_label(t_ptr, StrView::from_str(&updated)) };
+                                if rc.is_err() {
+                                    return rc;
+                                }
+                                changed_rows.push(row);
+                            }
+                        }
+                    }
+                    for row in changed_rows {
+                        let rc = chunk.mark_changed(0, row);
+                        if rc.is_err() {
+                            return rc;
+                        }
+                    }
+                }
+                FfiResult::OK
+            });
+        if status.is_err() {
+            return status;
+        }
+    }
+
+    // 4. Command Spawner System (handle-based `spawn_empty`, `insert`, and `despawn`)
+    if let Some((_, pos_comp)) = pos_resolved {
+        let status = app.system(c"rust_command_spawner").build(move |ctx| {
+            let cmds = ctx.commands();
+            let new_entity = match cmds.spawn_empty() {
+                Ok(e) => e,
+                Err(err) => return err,
             };
-
-        let combat_queries = [ComponentAccessDesc {
-            name: health_name,
-            mode: ComponentAccessMode::WRITE,
-        }];
-        let combat_desc = SystemDescriptor {
-            struct_size: core::mem::size_of::<SystemDescriptor>() as u32,
-            name: c"rust_combat".as_ptr(),
-            queries: combat_queries.as_ptr(),
-            query_count: combat_queries.len(),
-            callback: c_rust_combat,
-            user_data: cmd_vt_ptr as *mut c_void,
-        };
-        let _ = unsafe { (api.register_system)(host_context, &combat_desc) };
-    }
-
-    // Register System 3: Metadata (if tag component resolved)
-    if !tag_sym.is_null() {
-        let tag_name = if unsafe { !(get_proc_address)(c"MetadataTag_vtable".as_ptr()).is_null() } {
-            c"MetadataTag".as_ptr()
-        } else {
-            c"NameTag".as_ptr()
-        };
-
-        let tag_queries = [ComponentAccessDesc {
-            name: tag_name,
-            mode: ComponentAccessMode::WRITE,
-        }];
-        let tag_desc = SystemDescriptor {
-            struct_size: core::mem::size_of::<SystemDescriptor>() as u32,
-            name: c"rust_metadata".as_ptr(),
-            queries: tag_queries.as_ptr(),
-            query_count: tag_queries.len(),
-            callback: c_rust_metadata,
-            user_data: core::ptr::null_mut(),
-        };
-        let _ = unsafe { (api.register_system)(host_context, &tag_desc) };
-    }
-
-    // Register System 4: Command Spawner (when Position exists in this World)
-    if !pos_sym.is_null() {
-        let spawner_desc = SystemDescriptor {
-            struct_size: core::mem::size_of::<SystemDescriptor>() as u32,
-            name: c"rust_command_spawner".as_ptr(),
-            queries: core::ptr::null(),
-            query_count: 0,
-            callback: c_rust_command,
-            user_data: cmd_vt_ptr as *mut c_void,
-        };
-        let _ = unsafe { (api.register_system)(host_context, &spawner_desc) };
-    }
-
-    // Register System 6: Dynamic Custom Data Mutation (Milestone 3)
-    let custom_queries = [ComponentAccessDesc {
-        name: c"RustModCustomData".as_ptr(),
-        mode: ComponentAccessMode::WRITE,
-    }];
-    let custom_desc = SystemDescriptor {
-        struct_size: core::mem::size_of::<SystemDescriptor>() as u32,
-        name: c"rust_custom_system".as_ptr(),
-        queries: custom_queries.as_ptr(),
-        query_count: custom_queries.len(),
-        callback: c_rust_custom_system,
-        user_data: core::ptr::null_mut(),
-    };
-    let custom_status = unsafe { (api.register_system)(host_context, &custom_desc) };
-    if custom_status.is_err() {
-        return custom_status;
-    }
-
-    // Register System 7 (Phase 3 + Phase 4): Optional + Changed + Added + Resource + run_if
-    let phase4_res_sym = unsafe { (get_proc_address)(c"Phase4RustRes_vtable".as_ptr()) };
-    let phase4_tf_sym = unsafe { (get_proc_address)(c"Phase4Transform_vtable".as_ptr()) };
-    if !phase4_res_sym.is_null() && !phase4_tf_sym.is_null() {
-        let bridges_ptr = Box::into_raw(Box::new(Phase4BridgeState {
-            pos_vt: phase4_tf_sym as *const PositionVTable,
-            cmd_ext: unsafe { CommandBridgeVTableExt::resolve(get_proc_address) },
-            res_vt: unsafe { ResourceBridgeVTable::resolve(get_proc_address) },
-        }));
-        if let Ok(mut list) = ALLOCATED_PHASE4_BRIDGES.lock() {
-            list.push(bridges_ptr as usize);
-        }
-
-        let p4_queries = [
-            ComponentAccessDesc::write(c"Phase4Transform".as_ptr()),
-            ComponentAccessDesc::optional_read(c"Velocity".as_ptr()),
-            ComponentAccessDesc::changed(c"Phase4Sensor".as_ptr()),
-            ComponentAccessDesc::added(c"Phase4FreshTag".as_ptr()),
-            ComponentAccessDesc::resource_write(c"Phase4RustRes".as_ptr()),
-        ];
-        let base_desc = SystemDescriptor::new(
-            c"rust_phase4_ecs_system".as_ptr(),
-            p4_queries.as_ptr(),
-            p4_queries.len(),
-            c_rust_phase4_ecs_system,
-            bridges_ptr as *mut c_void,
-        );
-        let cond_desc = base_desc.with_run_if(c_rust_phase4_run_if, core::ptr::null_mut());
-        let p4_status = if let Some(reg_cond) =
-            unsafe { resolve_register_conditional_system(get_proc_address) }
-        {
-            unsafe { reg_cond(host_context, &cond_desc) }
-        } else {
-            unsafe { (api.register_system)(host_context, cond_desc.as_base_ptr()) }
-        };
-        if p4_status.is_err() {
-            return p4_status;
+            let p = RawPos {
+                x: 100.0,
+                y: 200.0,
+                z: 300.0,
+            };
+            let rc = cmds.insert(new_entity, pos_comp, &p);
+            if rc.is_err() {
+                return rc;
+            }
+            let custom = RustModCustomData {
+                power: 42.0,
+                shield: 100,
+            };
+            let rc = cmds.insert(new_entity, custom_comp, &custom);
+            if rc.is_err() {
+                return rc;
+            }
+            cmds.despawn(new_entity)
+        });
+        if status.is_err() {
+            return status;
         }
     }
 
-    // Register System 5: Panicking
-    let panic_desc = SystemDescriptor {
-        struct_size: core::mem::size_of::<SystemDescriptor>() as u32,
-        name: c"rust_panicking".as_ptr(),
-        queries: core::ptr::null(),
-        query_count: 0,
-        callback: c_rust_panicking,
-        user_data: core::ptr::null_mut(),
+    // 5. Dynamic Runtime Component Mutation System (`asymmetric_rust_mod::RustModCustomData`)
+    {
+        let status = app
+            .system(c"rust_custom_system")
+            .query(|q| q.write_handle(custom_comp))
+            .build(|ctx| {
+                while let Some(mut chunk) = ctx.iter().next_chunk_view() {
+                    let Some(items) = chunk.component_mut::<RustModCustomData>(0) else {
+                        return FfiResult::TYPE_MISMATCH;
+                    };
+                    for item in items.iter_mut() {
+                        item.power += 10.0;
+                        item.shield += 1;
+                    }
+                }
+                FfiResult::OK
+            });
+        if status.is_err() {
+            return status;
+        }
+    }
+
+    // 6. Phase 4 Conditional System (`Optional` + `Changed` + `Added` + `Resource` + `run_if`)
+    // SAFETY: `PositionVTable` matches the `x, y, z: f32` VTable layout of `Phase4Transform`.
+    let p4_tf_resolved = unsafe {
+        resolve_vtable_and_handle::<PositionVTable>(
+            &host,
+            &[
+                c"bam.v0.testbed::Phase4Transform.vtable",
+                c"bam.v0.e2e::asymmetric_mods::Phase4Transform.vtable",
+                c"bam.v0.ffi::sparse_and_resources::p4_resources_and_optional::Phase4Transform.vtable",
+            ],
+        )
     };
-    unsafe { (api.register_system)(host_context, &panic_desc) }
+    let p4_sensor = resolve_any_named(
+        app,
+        &[
+            c"testbed::Phase4Sensor",
+            c"e2e::asymmetric_mods::Phase4Sensor",
+            c"ffi::sparse_and_resources::p4_resources_and_optional::Phase4Sensor",
+        ],
+    );
+    let p4_fresh = resolve_any_named(
+        app,
+        &[
+            c"testbed::Phase4FreshTag",
+            c"e2e::asymmetric_mods::Phase4FreshTag",
+            c"ffi::sparse_and_resources::p4_resources_and_optional::Phase4FreshTag",
+        ],
+    );
+    let p4_removable = resolve_any_named(
+        app,
+        &[
+            c"testbed::Phase4Removable",
+            c"e2e::asymmetric_mods::Phase4Removable",
+            c"ffi::sparse_and_resources::p4_resources_and_optional::Phase4Removable",
+        ],
+    );
+    let p4_res = resolve_any_named(
+        app,
+        &[
+            c"testbed::Phase4RustRes",
+            c"e2e::asymmetric_mods::Phase4RustRes",
+            c"ffi::sparse_and_resources::p4_resources_and_optional::Phase4RustRes",
+        ],
+    );
+    let nametag_comp = resolve_any_named(
+        app,
+        &[
+            c"testbed::NameTag",
+            c"e2e::asymmetric_mods::NameTag",
+            c"ffi::sparse_and_resources::p4_resources_and_optional::NameTag",
+            c"NameTag",
+        ],
+    );
+
+    if let (
+        Some((&p4_tf_vt, p4_tf_comp)),
+        Some((&vel_vt, vel_comp)),
+        Some(sensor_comp),
+        Some(fresh_comp),
+        Some(res_comp),
+    ) = (p4_tf_resolved, vel_resolved, p4_sensor, p4_fresh, p4_res)
+    {
+        let status = app
+            .system(c"rust_phase4_ecs_system")
+            .query(|q| {
+                q.write_handle(p4_tf_comp)
+                    .optional_read_handle(vel_comp)
+                    .changed_handle(sensor_comp)
+                    .added_handle(fresh_comp)
+            })
+            .resource_write_handle(res_comp)
+            .run_if_fn(|| PHASE4_RUST_RUN_ENABLED.load(Ordering::SeqCst))
+            .build(move |ctx| {
+                let (Some(get_px), Some(set_px), Some(get_vx)) =
+                    (p4_tf_vt.get_x, p4_tf_vt.set_x, vel_vt.get_x)
+                else {
+                    return FfiResult::NULL_POINTER;
+                };
+
+                let (scale, need_spawn_default) = {
+                    let Some(res) = ctx.resource::<Phase4RustRes>(0) else {
+                        return FfiResult::INVALID_COMPONENT;
+                    };
+                    (res.scale, res.spawned_default_entity == 0)
+                };
+
+                let mut spawned_id = 0u64;
+                if need_spawn_default
+                    && let Some(nt_comp) = nametag_comp
+                    && let Ok(spawned) = ctx.commands().spawn_empty()
+                    && ctx.commands().insert_default(spawned, nt_comp).is_ok()
+                {
+                    spawned_id = spawned.0;
+                }
+
+                let mut matched_delta = 0u32;
+                let mut opt_vel_delta = 0u32;
+
+                {
+                    let (iter, cmds) = ctx.iter_and_commands();
+                    while let Some(mut chunk) = iter.next_chunk_view() {
+                        let count = chunk.len();
+                        let entities_copy: Vec<FfiEntity> = chunk.entities().to_vec();
+                        let vel_ptrs: Option<Vec<*const c_void>> = {
+                            let vel_slice = chunk.readonly_slice(1);
+                            if vel_slice.is_empty() {
+                                None
+                            } else {
+                                let mut v = Vec::with_capacity(count);
+                                for row in 0..count {
+                                    let Some(p) = vel_slice.get_ptr(row, vel_vt.header.size) else {
+                                        return FfiResult::NULL_POINTER;
+                                    };
+                                    v.push(p.cast::<c_void>());
+                                }
+                                Some(v)
+                            }
+                        };
+
+                        let mut pos_slice = chunk.mutable_slice(0);
+                        for row in 0..count {
+                            let Some(p_raw) = pos_slice.get_mut_ptr(row, p4_tf_vt.header.size)
+                            else {
+                                return FfiResult::NULL_POINTER;
+                            };
+                            let p_ptr = p_raw.cast::<c_void>();
+                            // SAFETY: `p_ptr` points to a valid `Phase4Transform` element.
+                            let px = unsafe { get_px(p_ptr) };
+                            if let Some(ref v_vec) = vel_ptrs {
+                                // SAFETY: `v_vec[row]` points to a valid `Velocity` element.
+                                let vx = unsafe { get_vx(v_vec[row]) };
+                                // SAFETY: `p_ptr` is valid and aligned.
+                                let rc = unsafe { set_px(p_ptr, px + vx * scale) };
+                                if rc.is_err() {
+                                    return rc;
+                                }
+                                opt_vel_delta += 1;
+                            } else {
+                                // SAFETY: `p_ptr` is valid and aligned.
+                                let rc = unsafe { set_px(p_ptr, px + scale) };
+                                if rc.is_err() {
+                                    return rc;
+                                }
+                            }
+                            matched_delta += 1;
+
+                            if let Some(rem_comp) = p4_removable {
+                                let _ = cmds.remove(entities_copy[row], rem_comp);
+                            }
+                        }
+                    }
+                }
+
+                if spawned_id != 0 || matched_delta > 0 || opt_vel_delta > 0 {
+                    let Some(res_mut) = ctx.resource_mut::<Phase4RustRes>(0) else {
+                        return FfiResult::INVALID_COMPONENT;
+                    };
+                    if spawned_id != 0 {
+                        res_mut.spawned_default_entity = spawned_id;
+                    }
+                    res_mut.matched_rows += matched_delta;
+                    res_mut.optional_vel_hits += opt_vel_delta;
+                }
+
+                FfiResult::OK
+            });
+        if status.is_err() {
+            return status;
+        }
+    }
+
+    // 7. Fault Isolation Panicking System (`panic = "unwind"` -> `FfiResult::PANIC_CAUGHT`)
+    app.system(c"rust_panicking").build(|_ctx| {
+        if PANIC_TRIGGER.swap(false, Ordering::SeqCst) {
+            panic!("Intentional cross-runtime panic in asymmetric_rust_mod");
+        }
+        FfiResult::OK
+    })
 }
 
-fn mod_shutdown(_host_context: *mut c_void) -> FfiResult {
-    SHUTDOWN_CALLED.store(true, Ordering::SeqCst);
-    PANIC_TRIGGER.store(false, Ordering::SeqCst);
-    PHASE4_RUST_RUN_ENABLED.store(true, Ordering::SeqCst);
-
-    if let Ok(mut list) = ALLOCATED_CMD_VTABLES.lock() {
-        for ptr_usize in list.drain(..) {
-            let ptr = ptr_usize as *mut CommandBridgeVTable;
-            if !ptr.is_null() {
-                // SAFETY: Allocated via Box::into_raw in mod_init; systems are deactivated prior to mod_shutdown.
-                drop(unsafe { Box::from_raw(ptr) });
-            }
-        }
-    }
-    if let Ok(mut list) = ALLOCATED_PHASE4_BRIDGES.lock() {
-        for ptr_usize in list.drain(..) {
-            let ptr = ptr_usize as *mut Phase4BridgeState;
-            if !ptr.is_null() {
-                // SAFETY: Allocated via Box::into_raw in mod_init; systems are deactivated prior to mod_shutdown.
-                drop(unsafe { Box::from_raw(ptr) });
-            }
-        }
-    }
-
-    POS_VTABLE.store(core::ptr::null_mut(), Ordering::Release);
-    VEL_VTABLE.store(core::ptr::null_mut(), Ordering::Release);
-    HEALTH_VTABLE.store(core::ptr::null_mut(), Ordering::Release);
-    TAG_VTABLE.store(core::ptr::null_mut(), Ordering::Release);
-    HOST_API_PTR.store(core::ptr::null_mut(), Ordering::Release);
-
-    FfiResult::OK
-}
-
-export_mod!(mod_init, mod_shutdown);
+export_mod!(name: c"asymmetric_rust_mod", version: c"0.2.0", setup);

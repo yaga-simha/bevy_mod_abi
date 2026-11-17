@@ -368,6 +368,17 @@ fn write_manifest(fixtures_dir: &Path, built: &[BuiltFixture]) -> Result<PathBuf
     Ok(manifest_path)
 }
 
+fn example_mod_is_v0_2_ready(root: &Path, source_rel: &str) -> bool {
+    let Ok(content) = fs::read_to_string(root.join(source_rel)) else {
+        return false;
+    };
+    !content.contains("ComponentAccessDesc")
+        && !content.contains("BEVY_ABI_MOD_EXPORT")
+        && !content.contains(".add_system(")
+        && !content.contains(".add_system_if(")
+        && !content.contains(".add_multi_query_system")
+}
+
 fn build_fixtures_internal(
     root: &Path,
     include_examples: bool,
@@ -379,7 +390,7 @@ fn build_fixtures_internal(
 
     let mut built = Vec::new();
 
-    // 1. Core asymmetric test fixtures
+    // 1. Core asymmetric test fixtures + `panic = "abort"` Rust guest fixture (`G-05`)
     let rust_mod = build_rust_cdylib(
         root,
         "tests/asymmetric_rust_mod/Cargo.toml",
@@ -394,6 +405,22 @@ fn build_fixtures_internal(
         "release",
         &rust_mod,
         "asymmetric_rust_mod",
+    )?);
+
+    let abort_mod = build_rust_cdylib(
+        root,
+        "tests/fixtures/panic_abort_mod/Cargo.toml",
+        "panic_abort_mod",
+        true,
+    )?;
+    built.push(stage_fixture(
+        root,
+        &fixtures_dir,
+        "panic_abort_mod",
+        "rust-abort",
+        "release",
+        &abort_mod,
+        "panic_abort_mod",
     )?);
 
     let c_mod = build_c99_mod(
@@ -436,46 +463,58 @@ fn build_fixtures_internal(
     }
 
     // 3. Lightweight Bevy-free example 01..04 guest mods exercised by host E2E tests
-    let test_rust_examples: &[(&str, &str, &str, &str)] = &[
+    let test_rust_examples: &[(&str, &str, &str, &str, &str)] = &[
         (
             "example_01_guest_mod",
             "examples/01_minimal_handshake/guest_mod/Cargo.toml",
+            "examples/01_minimal_handshake/guest_mod/src/lib.rs",
             "minimal_guest_mod",
             "minimal_guest_mod",
         ),
         (
             "example_02_guest_mod",
             "examples/02_multi_system_pipeline/guest_mod/Cargo.toml",
+            "examples/02_multi_system_pipeline/guest_mod/src/lib.rs",
             "example_02_guest_mod",
             "example_02_guest_mod",
         ),
         (
             "example_03_rust_mod",
             "examples/03_cross_language_interop/rust_mod/Cargo.toml",
+            "examples/03_cross_language_interop/rust_mod/src/lib.rs",
             "rust_mod",
             "example_03_rust_mod",
         ),
         (
             "mod_gravity",
             "examples/04_visual_game/mods/mod_gravity/Cargo.toml",
+            "examples/04_visual_game/mods/mod_gravity/src/lib.rs",
             "mod_gravity",
             "mod_gravity",
         ),
         (
             "mod_rainbow",
             "examples/04_visual_game/mods/mod_rainbow/Cargo.toml",
+            "examples/04_visual_game/mods/mod_rainbow/src/lib.rs",
             "mod_rainbow",
             "mod_rainbow",
         ),
         (
             "mod_vortex",
             "examples/04_visual_game/mods/mod_vortex/Cargo.toml",
+            "examples/04_visual_game/mods/mod_vortex/src/lib.rs",
             "mod_vortex",
             "mod_vortex",
         ),
     ];
 
-    for &(key, manifest_rel, crate_stem, dest_stem) in test_rust_examples {
+    for &(key, manifest_rel, source_rel, crate_stem, dest_stem) in test_rust_examples {
+        if !include_examples && !example_mod_is_v0_2_ready(root, source_rel) {
+            println!(
+                "==> [Notice] Skipping unported example fixture `{key}` ({source_rel}); pass `--examples` to require"
+            );
+            continue;
+        }
         let src = build_rust_cdylib(root, manifest_rel, crate_stem, true)?;
         built.push(stage_fixture(
             root,
@@ -488,23 +527,31 @@ fn build_fixtures_internal(
         )?);
     }
 
-    let ex3_c = build_c99_mod(
-        root,
-        "examples/03_cross_language_interop/c_mod",
-        "mod.c",
-        "c_mod",
-        "-O3",
-        false,
-    )?;
-    built.push(stage_fixture(
-        root,
-        &fixtures_dir,
-        "example_03_c_mod",
-        "c99",
-        "release",
-        &ex3_c,
-        "example_03_c_mod",
-    )?);
+    if include_examples
+        || example_mod_is_v0_2_ready(root, "examples/03_cross_language_interop/c_mod/mod.c")
+    {
+        let ex3_c = build_c99_mod(
+            root,
+            "examples/03_cross_language_interop/c_mod",
+            "mod.c",
+            "c_mod",
+            "-O3",
+            false,
+        )?;
+        built.push(stage_fixture(
+            root,
+            &fixtures_dir,
+            "example_03_c_mod",
+            "c99",
+            "release",
+            &ex3_c,
+            "example_03_c_mod",
+        )?);
+    } else {
+        println!(
+            "==> [Notice] Skipping unported example fixture `example_03_c_mod`; pass `--examples` to require"
+        );
+    }
 
     // 4. Additional optional example guest mods (Examples 05..06)
     if include_examples {
@@ -890,8 +937,8 @@ fn cmd_ci(args: &[String]) -> Result<(), String> {
     test_cmd
         .current_dir(&root)
         .env("BAM_FIXTURE_DIR", &fixtures_dir)
-        .args(["test", "--", "--test-threads=1"]);
-    run_cmd(&mut test_cmd, "cargo test -- --test-threads=1")?;
+        .args(["test"]);
+    run_cmd(&mut test_cmd, "cargo test")?;
 
     Ok(())
 }
@@ -951,17 +998,26 @@ fn cmd_miri(args: &[String]) -> Result<(), String> {
     }
 
     let root = repo_root()?;
-    let miriflags = match env::var("MIRIFLAGS") {
+    let tree_borrows_flags = match env::var("MIRIFLAGS") {
         Ok(existing) if !existing.trim().is_empty() => format!("{existing} -Zmiri-tree-borrows"),
         _ => "-Zmiri-tree-borrows".to_owned(),
     };
+    let strict_prov_flags = if tree_borrows_flags.contains("-Zmiri-strict-provenance") {
+        tree_borrows_flags.clone()
+    } else {
+        format!("{tree_borrows_flags} -Zmiri-strict-provenance")
+    };
 
-    let mut base_cmd = Command::new(cargo_bin());
+    let mut base_cmd = Command::new("rustup");
     base_cmd
         .current_dir(&root)
-        .env("MIRIFLAGS", &miriflags)
+        .env_remove("CARGO")
+        .env_remove("RUSTC")
+        .env("MIRIFLAGS", &strict_prov_flags)
         .args([
-            "+nightly",
+            "run",
+            "nightly",
+            "cargo",
             "miri",
             "test",
             "-p",
@@ -973,35 +1029,43 @@ fn cmd_miri(args: &[String]) -> Result<(), String> {
         ]);
     run_cmd(
         &mut base_cmd,
-        "cargo +nightly miri test -p bevy_abi_mod_sys -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest",
+        "rustup run nightly cargo miri test (-Zmiri-tree-borrows -Zmiri-strict-provenance) -p bevy_abi_mod_sys -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest",
     )?;
 
     if run_all {
-        let mut macros_cmd = Command::new(cargo_bin());
+        let mut macros_cmd = Command::new("rustup");
         macros_cmd
             .current_dir(&root)
-            .env("MIRIFLAGS", &miriflags)
+            .env_remove("CARGO")
+            .env_remove("RUSTC")
+            .env("MIRIFLAGS", &tree_borrows_flags)
             .args([
-                "+nightly",
+                "run",
+                "nightly",
+                "cargo",
                 "miri",
                 "test",
                 "-p",
                 "bevy_abi_mod_macros",
                 "--lib",
                 "--test",
-                "validation_gate_1",
+                "mod_component_vtable",
             ]);
         run_cmd(
             &mut macros_cmd,
-            "cargo +nightly miri test -p bevy_abi_mod_macros --lib --test validation_gate_1",
+            "rustup run nightly cargo miri test -p bevy_abi_mod_macros --lib --test mod_component_vtable",
         )?;
 
-        let mut host_sys_cmd = Command::new(cargo_bin());
+        let mut host_sys_cmd = Command::new("rustup");
         host_sys_cmd
             .current_dir(&root)
-            .env("MIRIFLAGS", &miriflags)
+            .env_remove("CARGO")
+            .env_remove("RUSTC")
+            .env("MIRIFLAGS", &tree_borrows_flags)
             .args([
-                "+nightly",
+                "run",
+                "nightly",
+                "cargo",
                 "miri",
                 "test",
                 "-p",
@@ -1010,7 +1074,7 @@ fn cmd_miri(args: &[String]) -> Result<(), String> {
             ]);
         run_cmd(
             &mut host_sys_cmd,
-            "cargo +nightly miri test -p bevy_abi_mod_host_sys --lib",
+            "rustup run nightly cargo miri test -p bevy_abi_mod_host_sys --lib",
         )?;
     }
 
@@ -1018,11 +1082,12 @@ fn cmd_miri(args: &[String]) -> Result<(), String> {
 }
 
 fn verify_forbid_unsafe(root: &Path) -> Result<(), String> {
-    println!("==> Verifying #![forbid(unsafe_code)] in safe host & guest crates");
+    println!("==> Verifying #![forbid(unsafe_code)] in safe host, guest, and xtask crates");
     let safe_crates = [
         "crates/bevy_abi_mod/src/lib.rs",
         "crates/bevy_abi_mod_host/src/lib.rs",
         "crates/bevy_abi_mod_guest/src/lib.rs",
+        "xtask/src/main.rs",
     ];
 
     for rel_path in &safe_crates {

@@ -1,43 +1,97 @@
+#include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 #include "bevy_abi_mod.h"
 
-static uint64_t g_strict_vt = 0x55443322ULL;
-static void strict_drop(void* ptr) { (void)ptr; }
-static FfiResult noop_sys(RawChunkIter* it, RawCommandQueue* q, void* ud) {
-    (void)it; (void)q; (void)ud;
-    return FFI_RESULT_OK;
+static BamVTableHeader g_strict_vt;
+
+static void strict_drop(void* ptr) {
+    (void)ptr;
 }
 
-BEVY_ABI_MOD_EXPORT uint32_t bevy_abi_mod_abi_version(void) {
-    return BEVY_ABI_VERSION_PACKED;
+static BamResult noop_sys(BamSystemCtx* sys_ctx, void* user_data) {
+    (void)sys_ctx;
+    (void)user_data;
+    return BAM_RESULT_OK;
 }
 
-BEVY_ABI_MOD_EXPORT FfiResult bevy_abi_mod_init(
-    GetProcAddressFn get_proc_address,
-    const HostApi* api,
-    void* ctx
+static const BamManifest MANIFEST = {
+    (uint32_t)sizeof(BamManifest),
+    BAM_ABI_VERSION,
+    "s06_strict_fail",
+    "0.2.0",
+    0u,
+    0u
+};
+
+BAM_EXPORT const BamManifest* bevy_abi_mod_manifest(void) {
+    return &MANIFEST;
+}
+
+BAM_EXPORT BamResult bevy_abi_mod_init(
+    const BamHostApi* api,
+    BamLoadCtx* load_ctx,
+    BamInstance** instance_out
 ) {
-    (void)get_proc_address;
-    ModComponentDescriptor cdesc;
+    static const char* const MISSING_AFTER[] = { "nonexistent_mod::missing_stage" };
+    BamHostApi local_api;
+    BamComponentDesc cdesc;
+    BamComponent out_comp = BAM_COMPONENT_INVALID;
+    BamSystemDesc sdesc;
+    BamResult rc;
+
+    if (load_ctx == NULL || instance_out == NULL) {
+        return BAM_RESULT_NULL_POINTER;
+    }
+    *instance_out = NULL;
+
+    rc = bam_host_api_copy_bounded(&local_api, sizeof(local_api), api);
+    if (rc != BAM_RESULT_OK) {
+        return rc;
+    }
+
+    g_strict_vt.struct_size = (uint32_t)sizeof(BamVTableHeader);
+    g_strict_vt.abi_version = BAM_ABI_VERSION;
+    g_strict_vt.uuid = bam_uuid_from_parts("s06_strict_fail::S06StrictTempComp", 8u, 8u, 0ull);
+    g_strict_vt.size = 8u;
+    g_strict_vt.align = 8u;
+
     memset(&cdesc, 0, sizeof(cdesc));
-    cdesc.struct_size = sizeof(ModComponentDescriptor);
+    cdesc.struct_size = (uint32_t)sizeof(BamComponentDesc);
+    cdesc.flags = 0u;
     cdesc.name = "S06StrictTempComp";
-    cdesc.uuid = bevy_abi_uuid_from_name("S06StrictTempComp");
-    cdesc.size = 8;
-    cdesc.align = 8;
+    cdesc.uuid = g_strict_vt.uuid;
+    cdesc.size = 8u;
+    cdesc.align = 8u;
     cdesc.drop_fn = strict_drop;
     cdesc.vtable_ptr = (const void*)&g_strict_vt;
-    FfiResult r = api->register_component(ctx, &cdesc);
-    if (r != FFI_RESULT_OK) { return r; }
 
-    ComponentAccessDesc term = bam_access_desc("TotallyMissingHostComp", COMPONENT_ACCESS_READ);
-    SystemDescriptor sdesc;
+    rc = local_api.register_component(load_ctx, &cdesc, &out_comp);
+    if (rc != BAM_RESULT_OK) {
+        return rc;
+    }
+
+    /*
+     * Register a system whose `after` target is syntactically valid (`init` succeeds),
+     * so `LoadOptions::new().with_strict(true)` rejects it post-`init` with
+     * `ModLoadError::UnresolvedOrderingTarget` and exercises post-init rollback (`S-06`).
+     */
     memset(&sdesc, 0, sizeof(sdesc));
-    sdesc.struct_size = sizeof(SystemDescriptor);
+    sdesc.struct_size = (uint32_t)sizeof(BamSystemDesc);
+    sdesc.flags = 0u;
     sdesc.name = "strict_bad_sys";
-    sdesc.queries = &term;
-    sdesc.query_count = 1;
+    sdesc.queries = NULL;
+    sdesc.query_count = 0u;
     sdesc.callback = noop_sys;
     sdesc.user_data = NULL;
-    return api->register_system(ctx, &sdesc);
+    sdesc.schedule = BAM_SCHEDULE_UPDATE;
+    sdesc.reserved0 = 0u;
+    sdesc.after = MISSING_AFTER;
+    sdesc.after_count = 1u;
+
+    return local_api.register_system(load_ctx, &sdesc);
+}
+
+BAM_EXPORT void bevy_abi_mod_shutdown(BamInstance* instance) {
+    (void)instance;
 }

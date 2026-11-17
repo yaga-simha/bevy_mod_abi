@@ -1,9 +1,9 @@
 #![allow(dead_code)]
 
-use bevy_abi_mod_host::{AbiModPlugin, ModAppExt, ModId};
-use bevy_abi_mod_macros::ModExposable;
+use bevy_abi_mod_host::prelude::*;
 use bevy_app::App;
 use bevy_ecs::component::Component;
+use bevy_ecs::prelude::Resource;
 use bevy_ecs::world::World;
 use libloading::{Library, Symbol};
 use std::fs;
@@ -11,47 +11,161 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // ============================================================================
-// 1. ModExposable Component Definitions
+// 1. Canonical Namespaced `ModComponent` & `AbiPod` Definitions (`C-10`)
 // ============================================================================
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModExposable)]
+/// Canonical dynamic component name registered by `asymmetric_rust_mod`.
+pub const RUST_MOD_CUSTOM_DATA_NAME: &str = "asymmetric_rust_mod::RustModCustomData";
+
+/// Canonical dynamic component name registered by `asymmetric_c_mod`.
+pub const C_MOD_CUSTOM_DATA_NAME: &str = "asymmetric_c_mod::CModCustomData";
+
+#[repr(C)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+#[mod_component(name = "testbed::Position")]
 pub struct Position {
     pub x: f32,
     pub y: f32,
     pub z: f32,
 }
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModExposable)]
+#[repr(C)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+#[mod_component(name = "testbed::Velocity")]
 pub struct Velocity {
     pub x: f32,
     pub y: f32,
     pub z: f32,
 }
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModExposable)]
+#[repr(C)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+#[mod_component(name = "testbed::CombatHealth")]
 pub struct CombatHealth {
     pub current: i32,
     pub max: i32,
 }
 
-#[derive(Component, Debug, Clone, PartialEq, Default, ModExposable)]
+#[derive(Component, Debug, Clone, PartialEq, Default, ModComponent)]
+#[mod_component(name = "testbed::NameTag")]
 pub struct NameTag {
     pub label: String,
 }
 
-#[derive(Component, Debug, Clone, PartialEq, Default, ModExposable)]
+#[derive(Component, Debug, Clone, PartialEq, Default, ModComponent)]
+#[mod_component(name = "testbed::MetadataTag")]
 pub struct MetadataTag {
     pub label: String,
 }
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModExposable)]
+#[repr(C)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+#[mod_component(name = "testbed::Mass")]
 pub struct Mass {
     pub value: f32,
 }
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModExposable)]
+#[repr(C)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+#[mod_component(name = "testbed::Armor")]
 pub struct Armor {
     pub defense: i32,
+}
+
+/// Host-side mirror of `asymmetric_rust_mod::RustModCustomData`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, AbiPod)]
+pub struct RustModCustomData {
+    pub power: f32,
+    pub shield: u32,
+}
+
+/// Host-side mirror of `asymmetric_c_mod::CModCustomData`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, AbiPod)]
+pub struct CModCustomData {
+    pub mana: f32,
+    pub level: i32,
+}
+
+#[repr(C)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+#[mod_component(name = "testbed::Phase4Transform")]
+pub struct Phase4Transform {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+#[repr(C)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+#[mod_component(name = "testbed::Phase4CTransform")]
+pub struct Phase4CTransform {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+#[repr(C)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+#[mod_component(name = "testbed::Phase4Sensor")]
+pub struct Phase4Sensor {
+    pub val: u32,
+}
+
+#[repr(C)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+#[mod_component(name = "testbed::Phase4CSensor")]
+pub struct Phase4CSensor {
+    pub val: u32,
+}
+
+#[repr(C)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+#[mod_component(name = "testbed::Phase4FreshTag")]
+pub struct Phase4FreshTag {
+    pub code: u32,
+}
+
+#[repr(C)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+#[mod_component(name = "testbed::Phase4CFreshTag")]
+pub struct Phase4CFreshTag {
+    pub code: u32,
+}
+
+#[repr(C)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+#[mod_component(name = "testbed::Phase4Removable")]
+pub struct Phase4Removable {
+    pub dummy: u32,
+}
+
+#[repr(C)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+#[mod_component(name = "testbed::Phase4CRemovable")]
+pub struct Phase4CRemovable {
+    pub dummy: u32,
+}
+
+#[repr(C)]
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+#[mod_component(name = "testbed::Phase4RustRes")]
+pub struct Phase4RustRes {
+    pub scale: f32,
+    pub matched_rows: u32,
+    pub optional_vel_hits: u32,
+    pub spawned_default_entity: u64,
+}
+
+#[repr(C)]
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+#[mod_component(name = "testbed::Phase4CRes")]
+pub struct Phase4CRes {
+    pub scale: f32,
+    pub matched_rows: u32,
+    pub optional_vel_hits: u32,
+    pub spawned_default_entity: u64,
 }
 
 // ============================================================================
@@ -101,6 +215,47 @@ pub fn ensure_guest_mods_built() -> (PathBuf, PathBuf) {
         fixture_dylib("asymmetric_rust_mod"),
         fixture_dylib("asymmetric_c_mod"),
     )
+}
+
+/// RAII temporary copy of a shared library with a unique path/inode so tests that mutate static
+/// test-harness flags via `libloading::Library::new` remain 100% isolated under parallel `cargo test`.
+pub struct TempDylibCopy {
+    path: PathBuf,
+    dir: PathBuf,
+}
+
+impl TempDylibCopy {
+    pub fn new(original: &Path, tag: &str) -> Self {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let ext = original
+            .extension()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "dylib".to_owned());
+        let dir =
+            std::env::temp_dir().join(format!("bevy_abi_mod_shadow_{}_{}", std::process::id(), id));
+        fs::create_dir_all(&dir).expect("create shadow dir");
+        let path = dir.join(format!("{tag}_{id}.{ext}"));
+        fs::copy(original, &path).expect("copy shadow dylib");
+        Self { path, dir }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for TempDylibCopy {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDylibCopy {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+        let _ = fs::remove_dir_all(&self.dir);
+    }
 }
 
 pub fn create_shadow_copy(original: &Path, tag: &str) -> PathBuf {
@@ -181,7 +336,7 @@ pub fn spawn_metadata_entities(world: &mut World, count: usize) {
     }
 }
 
-/// Spawns `total` entities distributed evenly across `archetypes` distinct topologies.
+/// Spawns `total` entities distributed evenly across `num_archetypes` distinct topologies.
 pub fn spawn_heterogeneous_archetypes(world: &mut World, total: usize, num_archetypes: usize) {
     let archetypes = num_archetypes.max(1);
     let per_arch = total / archetypes;
@@ -326,7 +481,7 @@ pub fn spawn_heterogeneous_archetypes(world: &mut World, total: usize, num_arche
 }
 
 // ============================================================================
-// 4. Testbed App and Builder
+// 4. Testbed App and Builder (`ABI 0.2.0`)
 // ============================================================================
 
 pub struct TestbedBuilder {
@@ -341,13 +496,20 @@ impl TestbedBuilder {
         let mut app = App::new();
         app.add_plugins(AbiModPlugin);
 
-        app.register_mod_component::<Position>();
-        app.register_mod_component::<Velocity>();
-        app.register_mod_component::<CombatHealth>();
-        app.register_mod_component::<NameTag>();
-        app.register_mod_component::<MetadataTag>();
-        app.register_mod_component::<Mass>();
-        app.register_mod_component::<Armor>();
+        app.register_mod_component::<Position>(ComponentOptions::new().with_default())
+            .expect("register Position");
+        app.register_mod_component::<Velocity>(ComponentOptions::new().with_default())
+            .expect("register Velocity");
+        app.register_mod_component::<CombatHealth>(ComponentOptions::new().with_default())
+            .expect("register CombatHealth");
+        app.register_mod_component::<NameTag>(ComponentOptions::new().with_default())
+            .expect("register NameTag");
+        app.register_mod_component::<MetadataTag>(ComponentOptions::new().with_default())
+            .expect("register MetadataTag");
+        app.register_mod_component::<Mass>(ComponentOptions::new().with_default())
+            .expect("register Mass");
+        app.register_mod_component::<Armor>(ComponentOptions::new().with_default())
+            .expect("register Armor");
 
         Self {
             app,
@@ -379,11 +541,11 @@ impl TestbedBuilder {
     pub fn build_and_load_mods(mut self) -> (TestbedApp, ModId, ModId) {
         let r_id = self
             .app
-            .load_mod_tracked(&self.rust_dylib)
+            .load_mod_with(&self.rust_dylib, LoadOptions::new().with_shadow_copy(true))
             .expect("Failed to load asymmetric_rust_mod");
         let c_id = self
             .app
-            .load_mod_tracked(&self.c_dylib)
+            .load_mod_with(&self.c_dylib, LoadOptions::new().with_shadow_copy(true))
             .expect("Failed to load asymmetric_c_mod");
 
         (TestbedApp { app: self.app }, r_id, c_id)
