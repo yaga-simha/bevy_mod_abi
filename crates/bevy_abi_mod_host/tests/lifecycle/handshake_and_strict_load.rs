@@ -1,24 +1,14 @@
-//! ABI SemVer handshake compatibility, `try_load_mod_strict`, lifecycle events,
-//! truncated descriptors, and invalid lifecycle operations.
+//! ABI `0.2.0` SemVer handshake compatibility, `LoadOptions` strict validation,
+//! single-path lifecycle `Message`s (`B-09`), truncated descriptors, and invalid lifecycle operations.
 
-use crate::support::{Position, Velocity, ensure_guest_mods_built, reset_rust_mod_panic};
-use bevy_abi_mod_host::{
-    AbiModPlugin, LoadedModInfo, ModAppExt, ModHost, ModId, ModLoadError, ModLoaded, ModRegistry,
-    ModUnloaded, is_abi_version_compatible,
-};
-use bevy_abi_mod_host_sys::{
-    ModInitContext, host_register_component, host_register_multi_query_system,
-    host_register_scheduled_system, host_register_system,
-};
-use bevy_abi_mod_sys::{
-    ABI_VERSION_PACKED, FfiResult, ModComponentDescriptor, MultiQuerySystemDescriptor,
-    ScheduledMultiQuerySystemDescriptor, ScheduledSystemDescriptor, SystemDescriptor,
-};
+use crate::DROP_SLOT_POOL_RWLOCK;
+use crate::support::{Position, Velocity, ensure_guest_mods_built, fixture_dylib};
+use bevy_abi_mod_host::is_abi_version_compatible;
+use bevy_abi_mod_host::prelude::*;
+use bevy_abi_mod_host_sys::{LoadContext, host_register_component, host_register_system};
 use bevy_app::App;
 use bevy_ecs::message::Messages;
-use bevy_ecs::observer::On;
-use core::ffi::c_void;
-use std::sync::{Arc, Mutex};
+use std::error::Error as _;
 
 #[test]
 fn semver_abi_compatibility_and_typed_mod_load_error_work() {
@@ -26,43 +16,53 @@ fn semver_abi_compatibility_and_typed_mod_load_error_work() {
         (maj << 24) | (min << 16) | patch
     }
 
-    // Host is 0.1.0 (`ABI_VERSION_PACKED`): pre-1.0 requires exact minor match (`C-06`)
+    // Host is `0.2.0` (`ABI_VERSION = 0x0002_0000`): pre-1.0 requires exact minor match (`C-06`).
+    assert!(is_abi_version_compatible(ABI_VERSION, ABI_VERSION));
+    assert!(is_abi_version_compatible(ABI_VERSION, pack_ver(0, 2, 99)));
+    assert!(!is_abi_version_compatible(ABI_VERSION, pack_ver(0, 0, 9)));
+    assert!(!is_abi_version_compatible(ABI_VERSION, pack_ver(0, 1, 99)));
+    assert!(!is_abi_version_compatible(ABI_VERSION, pack_ver(0, 3, 0)));
+    assert!(!is_abi_version_compatible(ABI_VERSION, pack_ver(1, 0, 0)));
+
+    // Post-1.0 (`major >= 1`) allows `guest_minor <= host_minor`.
     assert!(is_abi_version_compatible(
-        ABI_VERSION_PACKED,
-        ABI_VERSION_PACKED
+        pack_ver(1, 2, 0),
+        pack_ver(1, 1, 5)
     ));
     assert!(!is_abi_version_compatible(
-        ABI_VERSION_PACKED,
-        pack_ver(0, 0, 9)
-    ));
-    assert!(is_abi_version_compatible(
-        ABI_VERSION_PACKED,
-        pack_ver(0, 1, 99)
-    ));
-    assert!(!is_abi_version_compatible(
-        ABI_VERSION_PACKED,
-        pack_ver(0, 2, 0)
-    ));
-    assert!(!is_abi_version_compatible(
-        ABI_VERSION_PACKED,
-        pack_ver(1, 0, 0)
+        pack_ver(1, 1, 0),
+        pack_ver(1, 2, 0)
     ));
 
     #[cfg(not(miri))]
-    let err = {
+    {
         let mut app = App::new();
         app.add_plugins(AbiModPlugin);
-        app.try_load_mod("/nonexistent/path/to/missing_mod.dylib")
-            .expect_err("Missing dylib must return ModLoadError::DlOpen")
-    };
-    #[cfg(miri)]
-    let err = ModLoadError::DlOpen {
-        path: std::path::PathBuf::from("/nonexistent/path/to/missing_mod.dylib"),
-        message: String::from("dlopen unavailable under Miri isolation"),
-    };
-    assert!(matches!(err, ModLoadError::DlOpen { .. }));
-    assert_eq!(FfiResult::from(err.clone()), FfiResult::INTERNAL_ERROR);
-    assert!(err.to_string().contains("missing_mod.dylib"));
+        let err = app
+            .load_mod_with(
+                "/nonexistent/path/to/missing_mod.dylib",
+                LoadOptions::new().with_shadow_copy(false),
+            )
+            .expect_err("Missing dylib without shadow-copy must return ModLoadError::DlOpen");
+        assert!(matches!(err, ModLoadError::DlOpen { .. }));
+        assert!(
+            err.source().is_some(),
+            "E-02: DlOpen must preserve source()"
+        );
+        assert!(err.to_string().contains("missing_mod.dylib"));
+
+        let shadow_err = app
+            .load_mod_with(
+                "/nonexistent/path/to/missing_shadow.dylib",
+                LoadOptions::new().with_shadow_copy(true),
+            )
+            .expect_err("Missing shadow source must return ModLoadError::ShadowCopy");
+        assert!(matches!(shadow_err, ModLoadError::ShadowCopy { .. }));
+        assert!(
+            shadow_err.source().is_some(),
+            "E-02: ShadowCopy must preserve io::Error source()"
+        );
+    }
 
     let _ = core::mem::size_of::<LoadedModInfo>();
     let _ = core::mem::size_of::<ModLoaded>();
@@ -70,60 +70,47 @@ fn semver_abi_compatibility_and_typed_mod_load_error_work() {
 }
 
 #[test]
-fn real_dylib_loaded_mod_entity_lifecycle_events_and_strict_validation_work() {
-    let (rust_dylib, c_dylib) = ensure_guest_mods_built();
-    reset_rust_mod_panic(&rust_dylib);
+fn real_dylib_loaded_mod_entity_lifecycle_messages_and_strict_validation_work() {
+    let _pool_guard = DROP_SLOT_POOL_RWLOCK
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let (_rust_dylib, c_dylib) = ensure_guest_mods_built();
+    let strict_fail_dylib = fixture_dylib("s06_strict_fail");
 
-    // 1. Strict mode validation: when `CombatHealth_vtable` symbol is exposed so `asymmetric_rust_mod`
-    // registers `rust_combat` querying `"CombatHealth"`, WITHOUT registering `CombatHealth` as an ECS
-    // component in `ModRegistry`, `try_load_mod_strict` must fail fast with `ModLoadError::MissingComponents`
-    // and cleanly unload the library.
+    // 1. Strict mode validation (`LoadOptions::new().strict()`): rejects unresolved
+    // ordering targets and rolls back the module cleanly (`ModHost` remains empty).
     {
         let mut strict_app = App::new();
         strict_app.add_plugins(AbiModPlugin);
-        strict_app.register_mod_component::<Position>();
-        strict_app.register_mod_component::<Velocity>();
-        // SAFETY: Stub non-null symbol address is only inspected for nullness during `mod_init`
-        // before strict validation aborts and unloads the module without running systems.
-        unsafe {
-            strict_app
-                .world_mut()
-                .resource_mut::<ModRegistry>()
-                .register_custom_symbol("CombatHealth_vtable", core::ptr::without_provenance(1));
-        }
-
         let strict_err = strict_app
-            .try_load_mod_strict(&rust_dylib)
-            .expect_err("Unregistered CombatHealth component must fail strict validation");
-        match strict_err {
-            ModLoadError::MissingComponents { ref missing, .. } => {
-                assert!(missing.iter().any(|c| c == "CombatHealth"));
-            }
-            other => panic!("Expected ModLoadError::MissingComponents, got {other:?}"),
-        }
-        assert_eq!(strict_app.world().resource::<ModHost>().len(), 0);
+            .load_mod_with(
+                &strict_fail_dylib,
+                LoadOptions::new().strict().with_shadow_copy(true),
+            )
+            .expect_err("Unresolved ordering target must fail strict validation");
+        assert!(matches!(
+            strict_err,
+            ModLoadError::UnresolvedOrderingTarget { .. }
+        ));
+        assert!(strict_app.world().resource::<ModHost>().is_empty());
+        assert_eq!(
+            strict_app.world().resource::<Messages<ModLoaded>>().len(),
+            0
+        );
     }
 
+    // 2. Load C99 mod and verify `LoadedModInfo` ECS entity (populated from `BamManifest`, `L-08`)
+    // and single-path `Messages<ModLoaded>` / `Messages<ModUnloaded>` (`B-09`).
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
-    app.register_mod_component::<Position>();
-    app.register_mod_component::<Velocity>();
+    app.register_mod_component::<Position>(ComponentOptions::new().with_default())
+        .unwrap();
+    app.register_mod_component::<Velocity>(ComponentOptions::new().with_default())
+        .unwrap();
 
-    // Load C99 mod and verify `LoadedModInfo` ECS entity + `ModLoaded` / `ModUnloaded` messages & observers!
-    let loaded_obs = Arc::new(Mutex::new(Vec::new()));
-    let unloaded_obs = Arc::new(Mutex::new(Vec::new()));
-    let l_clone = Arc::clone(&loaded_obs);
-    let u_clone = Arc::clone(&unloaded_obs);
-
-    app.world_mut().add_observer(move |trigger: On<ModLoaded>| {
-        l_clone.lock().unwrap().push(trigger.event().clone());
-    });
-    app.world_mut()
-        .add_observer(move |trigger: On<ModUnloaded>| {
-            u_clone.lock().unwrap().push(trigger.event().clone());
-        });
-
-    let mod_id = app.try_load_mod(&c_dylib).expect("C99 mod should load");
+    let mod_id = app
+        .load_mod_with(&c_dylib, LoadOptions::new().with_shadow_copy(true))
+        .expect("C99 mod should load");
 
     {
         let world = app.world_mut();
@@ -131,102 +118,56 @@ fn real_dylib_loaded_mod_entity_lifecycle_events_and_strict_validation_work() {
         let infos: Vec<&LoadedModInfo> = q.iter(world).collect();
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].id, mod_id);
+        assert_eq!(infos[0].name, "asymmetric_c_mod");
+        assert_eq!(infos[0].version, "0.2.0");
         assert!(infos[0].system_count >= 1);
     }
-    assert_eq!(loaded_obs.lock().unwrap().len(), 1);
     assert_eq!(app.world().resource::<Messages<ModLoaded>>().len(), 1);
 
     app.update();
 
-    app.try_unload_mod(mod_id).expect("C99 mod should unload");
+    app.unload_mod(mod_id).expect("C99 mod should unload");
     {
         let world = app.world_mut();
         let mut q = world.query::<&LoadedModInfo>();
         assert_eq!(q.iter(world).count(), 0);
     }
-    let u_events = unloaded_obs.lock().unwrap();
-    assert_eq!(u_events.len(), 1);
-    assert_eq!(u_events[0].id, mod_id);
-    assert!(u_events[0].removed_systems >= 1);
     assert_eq!(app.world().resource::<Messages<ModUnloaded>>().len(), 1);
 }
 
 #[test]
 fn truncated_descriptors_and_null_callbacks_rejected_without_ub() {
-    let mut init_ctx = ModInitContext::new(Arc::new(ModRegistry::new()));
-    let _guard = init_ctx.make_active();
-    let ctx_ptr = (&mut init_ctx as *mut ModInitContext).cast::<c_void>();
+    let mut load_ctx = LoadContext::new(ModRegistry::new());
+    let ctx_ptr = load_ctx.as_ffi_ptr();
 
     // 1. Genuinely 4-byte stack allocation (`struct_size == 4`)
     let tiny_4byte_header: u32 = 4;
     let tiny_ptr = &tiny_4byte_header as *const u32;
+    let mut out_comp = BamComponent::INVALID;
 
-    // SAFETY: `read_descriptor` reads only the 4-byte `struct_size` header when `< MIN_V1_SIZE`.
-    assert_eq!(
-        unsafe { host_register_system(ctx_ptr, tiny_ptr.cast::<SystemDescriptor>()) },
-        FfiResult::INVALID_VERSION
-    );
-    // SAFETY: Same 4-byte header safety invariant.
-    assert_eq!(
-        unsafe {
-            host_register_scheduled_system(ctx_ptr, tiny_ptr.cast::<ScheduledSystemDescriptor>())
-        },
-        FfiResult::INVALID_VERSION
-    );
-    // SAFETY: Same 4-byte header safety invariant.
-    assert_eq!(
-        unsafe {
-            host_register_multi_query_system(ctx_ptr, tiny_ptr.cast::<MultiQuerySystemDescriptor>())
-        },
-        FfiResult::INVALID_VERSION
-    );
-    // SAFETY: Same 4-byte header safety invariant.
-    assert_eq!(
-        unsafe { host_register_component(ctx_ptr, tiny_ptr.cast::<ModComponentDescriptor>()) },
-        FfiResult::INVALID_VERSION
-    );
+    // SAFETY: `read_descriptor` reads only the 4-byte `struct_size` header when `< MIN_V0_2_SIZE`.
+    let sys_tiny_res = unsafe { host_register_system(ctx_ptr, tiny_ptr.cast::<BamSystemDesc>()) };
+    assert_eq!(sys_tiny_res, FfiResult::INVALID_VERSION);
 
-    // 2. Zero-initialized C descriptor buffers with `callback == NULL` (`0`)
+    // SAFETY: Same 4-byte header safety invariant.
+    let comp_tiny_res = unsafe {
+        host_register_component(ctx_ptr, tiny_ptr.cast::<ComponentDesc>(), &mut out_comp)
+    };
+    assert_eq!(comp_tiny_res, FfiResult::INVALID_VERSION);
+
+    // 2. Zero-initialized C `BamSystemDesc` buffer with `callback == None` (`0`)
     #[repr(align(8))]
     struct AlignedBuf([u8; 128]);
 
     let mut zeroed_sys = AlignedBuf([0u8; 128]);
-    let sys_sz = (core::mem::size_of::<SystemDescriptor>() as u32).to_ne_bytes();
+    let sys_sz = (core::mem::size_of::<BamSystemDesc>() as u32).to_ne_bytes();
     zeroed_sys.0[..4].copy_from_slice(&sys_sz);
-    // SAFETY: Aligned, initialized byte buffer of size >= SystemDescriptor with null callback.
-    assert_eq!(
-        unsafe { host_register_system(ctx_ptr, zeroed_sys.0.as_ptr().cast::<SystemDescriptor>()) },
-        FfiResult::NULL_POINTER
-    );
+    // SAFETY: Aligned, initialized byte buffer of size >= `BamSystemDesc` with null `name`/`callback`.
+    let zeroed_sys_res =
+        unsafe { host_register_system(ctx_ptr, zeroed_sys.0.as_ptr().cast::<BamSystemDesc>()) };
+    assert_eq!(zeroed_sys_res, FfiResult::NULL_POINTER);
 
-    let mut zeroed_sched = AlignedBuf([0u8; 128]);
-    let sched_sz = (core::mem::size_of::<ScheduledSystemDescriptor>() as u32).to_ne_bytes();
-    zeroed_sched.0[..4].copy_from_slice(&sched_sz);
-    // SAFETY: Aligned, initialized byte buffer of size >= ScheduledSystemDescriptor with null callback.
-    assert_eq!(
-        unsafe {
-            host_register_scheduled_system(
-                ctx_ptr,
-                zeroed_sched.0.as_ptr().cast::<ScheduledSystemDescriptor>(),
-            )
-        },
-        FfiResult::NULL_POINTER
-    );
-
-    let mut zeroed_multi = AlignedBuf([0u8; 128]);
-    let multi_sz =
-        (core::mem::size_of::<ScheduledMultiQuerySystemDescriptor>() as u32).to_ne_bytes();
-    zeroed_multi.0[..4].copy_from_slice(&multi_sz);
-    // SAFETY: Aligned, initialized byte buffer of size >= MultiQuerySystemDescriptor with null callback.
-    assert_eq!(
-        unsafe {
-            host_register_multi_query_system(
-                ctx_ptr,
-                zeroed_multi.0.as_ptr().cast::<MultiQuerySystemDescriptor>(),
-            )
-        },
-        FfiResult::NULL_POINTER
-    );
+    load_ctx.finish_init();
 }
 
 #[test]
@@ -234,14 +175,23 @@ fn test_invalid_lifecycle_operations() {
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
 
-    let err_unload = app.unload_mod(ModId(99999));
-    assert_eq!(err_unload, Err(FfiResult::NOT_FOUND));
+    let err_unload = app.unload_mod(ModId(99_999));
+    assert!(matches!(
+        err_unload,
+        Err(ModLoadError::ModNotFound { id: ModId(99_999) })
+    ));
 
     let err_unload_zero = app.unload_mod(ModId(0));
-    assert_eq!(err_unload_zero, Err(FfiResult::NOT_FOUND));
+    assert!(matches!(
+        err_unload_zero,
+        Err(ModLoadError::ModNotFound { id: ModId(0) })
+    ));
 
-    let err_load = app.load_mod_tracked("non_existent_library_path.dylib");
-    assert_eq!(err_load, Err(FfiResult::INTERNAL_ERROR));
+    let err_load = app.load_mod_with(
+        "non_existent_library_path.dylib",
+        LoadOptions::new().with_shadow_copy(false),
+    );
+    assert!(matches!(err_load, Err(ModLoadError::DlOpen { .. })));
 
     app.unload_all_mods();
     assert!(app.world().resource::<ModHost>().is_empty());

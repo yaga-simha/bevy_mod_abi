@@ -1,12 +1,13 @@
-//! Hot-reload cycling, schedule system-set excision, asymmetric unload interleaving,
-//! post-unload execution/churn safety, and concurrent multi-App lifecycle stress.
+//! Hot-reload cycling, schedule system-set excision, shadow-copy loader (`L-03`),
+//! asymmetric unload interleaving, post-unload execution/churn safety, and concurrent multi-App lifecycle stress.
 
 use crate::support::{
-    CombatHealth, NameTag, Position, Velocity, ensure_guest_mods_built, reset_rust_mod_panic,
+    C_MOD_CUSTOM_DATA_NAME, CModCustomData, CombatHealth, NameTag, Position,
+    RUST_MOD_CUSTOM_DATA_NAME, RustModCustomData, TempDylibCopy, Velocity, ensure_guest_mods_built,
 };
-use bevy_abi_mod_host::{AbiModPlugin, ModAppExt, ModHost, ModId, ModRegistry, ModSystemSet};
-use bevy_abi_mod_host_sys::DynamicCSystem;
-use bevy_abi_mod_sys::{FfiResult, RawChunkIter, RawCommandQueue};
+use bevy_abi_mod_host::prelude::*;
+use bevy_abi_mod_host_sys::GuestSystem;
+use bevy_abi_mod_sys::BamSystemCtx;
 use bevy_app::{App, Update};
 use bevy_ecs::schedule::{ScheduleCleanupPolicy, Schedules};
 use core::ffi::c_void;
@@ -15,25 +16,8 @@ use libloading::{Library, Symbol};
 use std::sync::Arc;
 use std::thread;
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct RustModCustomData {
-    power: f32,
-    shield: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct CModCustomData {
-    mana: f32,
-    level: i32,
-}
-
-unsafe extern "C" fn count_runs_cb(
-    _iter: *mut RawChunkIter,
-    _commands: *mut RawCommandQueue,
-    user_data: *mut c_void,
-) -> FfiResult {
+unsafe extern "C" fn count_runs_cb(_ctx: *mut BamSystemCtx, user_data: *mut c_void) -> FfiResult {
+    // SAFETY: `user_data` points to an `Arc`-owned `AtomicUsize` outliving the `App`.
     unsafe { (*(user_data as *const AtomicUsize)).fetch_add(1, Ordering::SeqCst) };
     FfiResult::OK
 }
@@ -41,23 +25,23 @@ unsafe extern "C" fn count_runs_cb(
 #[test]
 fn hot_reload_1000_cycles_remove_systems_in_set_keeps_schedule_graph_constant() {
     #[cfg(not(miri))]
-    const CYCLES: u32 = 1000;
+    const CYCLES: u64 = 1000;
     #[cfg(miri)]
-    const CYCLES: u32 = 10;
+    const CYCLES: u64 = 10;
 
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
-    let reg = Arc::new(app.world().resource::<ModRegistry>().clone());
+    let reg = app.world().resource::<ModRegistry>().clone();
     let run_counter = Arc::new(AtomicUsize::new(0));
 
     for cycle in 1..=CYCLES {
         let mod_id = ModId(cycle);
-        let sys = DynamicCSystem::new(
+        let sys = GuestSystem::new(
             format!("hot_sys_{cycle}"),
             vec![],
             count_runs_cb,
             Arc::as_ptr(&run_counter) as *mut c_void,
-            Arc::clone(&reg),
+            reg.clone(),
         )
         .with_mod_id(mod_id);
 
@@ -88,19 +72,20 @@ fn hot_reload_1000_cycles_remove_systems_in_set_keeps_schedule_graph_constant() 
     assert_eq!(
         update_sched.systems_len(),
         0,
-        "{CYCLES} hot-reload cycles must leave 0 dead guest systems in Bevy's Update schedule!"
+        "{CYCLES} hot-reload cycles must leave 0 dead guest systems in Bevy's Update schedule"
     );
 }
 
 #[test]
 fn test_50_cycle_hot_reload_lifecycle_stress() {
     let (rust_dylib, c_dylib) = ensure_guest_mods_built();
-    reset_rust_mod_panic(&rust_dylib);
 
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
-    app.register_mod_component::<Position>();
-    app.register_mod_component::<Velocity>();
+    app.register_mod_component::<Position>(ComponentOptions::new().with_default())
+        .unwrap();
+    app.register_mod_component::<Velocity>(ComponentOptions::new().with_default())
+        .unwrap();
 
     const NUM_ENTITIES: usize = 100;
     for i in 0..NUM_ENTITIES {
@@ -124,9 +109,11 @@ fn test_50_cycle_hot_reload_lifecycle_stress() {
 
     for cycle in 0..CYCLES {
         let r_id = app
-            .load_mod_tracked(&rust_dylib)
+            .load_mod_with(&rust_dylib, LoadOptions::new().with_shadow_copy(true))
             .expect("load rust mod in cycle");
-        let c_id = app.load_mod_tracked(&c_dylib).expect("load c mod in cycle");
+        let c_id = app
+            .load_mod_with(&c_dylib, LoadOptions::new().with_shadow_copy(true))
+            .expect("load c mod in cycle");
         assert_ne!(r_id, c_id);
 
         for _ in 0..TICKS_PER_CYCLE {
@@ -159,12 +146,13 @@ fn test_50_cycle_hot_reload_lifecycle_stress() {
 #[test]
 fn test_post_unload_execution_safety() {
     let (rust_dylib, c_dylib) = ensure_guest_mods_built();
-    reset_rust_mod_panic(&rust_dylib);
 
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
-    app.register_mod_component::<Position>();
-    app.register_mod_component::<Velocity>();
+    app.register_mod_component::<Position>(ComponentOptions::new().with_default())
+        .unwrap();
+    app.register_mod_component::<Velocity>(ComponentOptions::new().with_default())
+        .unwrap();
 
     const ENTITIES: usize = 50;
     for i in 0..ENTITIES {
@@ -182,8 +170,12 @@ fn test_post_unload_execution_safety() {
         ));
     }
 
-    let r_id = app.load_mod_tracked(&rust_dylib).unwrap();
-    let c_id = app.load_mod_tracked(&c_dylib).unwrap();
+    let r_id = app
+        .load_mod_with(&rust_dylib, LoadOptions::new().with_shadow_copy(true))
+        .unwrap();
+    let c_id = app
+        .load_mod_with(&c_dylib, LoadOptions::new().with_shadow_copy(true))
+        .unwrap();
 
     for _ in 0..10 {
         app.update();
@@ -216,15 +208,20 @@ fn test_post_unload_execution_safety() {
 
 #[test]
 fn test_world_consistency_after_guest_failure() {
-    let (rust_dylib, c_dylib) = ensure_guest_mods_built();
-    reset_rust_mod_panic(&rust_dylib);
+    let (shared_rust_dylib, c_dylib) = ensure_guest_mods_built();
+    // Private copy so mutating `PANIC_TRIGGER` never races with parallel tests (`T-03`).
+    let isolated_rust = TempDylibCopy::new(&shared_rust_dylib, "world_consistency_panic");
 
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
-    app.register_mod_component::<Position>();
-    app.register_mod_component::<Velocity>();
-    app.register_mod_component::<CombatHealth>();
-    app.register_mod_component::<NameTag>();
+    app.register_mod_component::<Position>(ComponentOptions::new().with_default())
+        .unwrap();
+    app.register_mod_component::<Velocity>(ComponentOptions::new().with_default())
+        .unwrap();
+    app.register_mod_component::<CombatHealth>(ComponentOptions::new().with_default())
+        .unwrap();
+    app.register_mod_component::<NameTag>(ComponentOptions::new().with_default())
+        .unwrap();
 
     const INITIAL_COUNT: usize = 1_000;
     let mut spawned_entities = Vec::with_capacity(INITIAL_COUNT);
@@ -251,15 +248,23 @@ fn test_world_consistency_after_guest_failure() {
         spawned_entities.push(e);
     }
 
-    let r_id = app.load_mod_tracked(&rust_dylib).unwrap();
-    let c_id = app.load_mod_tracked(&c_dylib).unwrap();
+    let r_id = app
+        .load_mod_with(
+            isolated_rust.path(),
+            LoadOptions::new().with_shadow_copy(false),
+        )
+        .unwrap();
+    let c_id = app
+        .load_mod_with(&c_dylib, LoadOptions::new().with_shadow_copy(true))
+        .unwrap();
 
     for _ in 0..5 {
         app.update();
     }
 
+    // SAFETY: Opening our private `TempDylibCopy` to trigger one isolated `panic = "unwind"` fault.
     unsafe {
-        let lib = Library::new(&rust_dylib).expect("open rust dylib");
+        let lib = Library::new(isolated_rust.path()).expect("open isolated rust dylib");
         let trigger: Symbol<unsafe extern "C" fn()> = lib
             .get(b"asymmetric_rust_mod_trigger_panic\0")
             .expect("resolve trigger");
@@ -304,18 +309,18 @@ fn test_world_consistency_after_guest_failure() {
 
     app.unload_mod(r_id).unwrap();
     app.unload_mod(c_id).unwrap();
-    reset_rust_mod_panic(&rust_dylib);
 }
 
 #[test]
 fn test_asymmetric_unload_interleaving_and_unload_all() {
     let (rust_dylib, c_dylib) = ensure_guest_mods_built();
-    reset_rust_mod_panic(&rust_dylib);
 
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
-    app.register_mod_component::<Position>();
-    app.register_mod_component::<Velocity>();
+    app.register_mod_component::<Position>(ComponentOptions::new().with_default())
+        .unwrap();
+    app.register_mod_component::<Velocity>(ComponentOptions::new().with_default())
+        .unwrap();
 
     app.world_mut().spawn((
         Position {
@@ -330,8 +335,12 @@ fn test_asymmetric_unload_interleaving_and_unload_all() {
         },
     ));
 
-    let rust_id = app.load_mod_tracked(&rust_dylib).expect("load rust");
-    let c_id = app.load_mod_tracked(&c_dylib).expect("load c");
+    let rust_id = app
+        .load_mod_with(&rust_dylib, LoadOptions::new().with_shadow_copy(true))
+        .expect("load rust");
+    let c_id = app
+        .load_mod_with(&c_dylib, LoadOptions::new().with_shadow_copy(true))
+        .expect("load c");
 
     for _ in 0..5 {
         app.update();
@@ -365,7 +374,9 @@ fn test_asymmetric_unload_interleaving_and_unload_all() {
         assert_eq!(pos.z, 5.0);
     }
 
-    let _c_id2 = app.load_mod_tracked(&c_dylib).expect("reload c");
+    let _c_id2 = app
+        .load_mod_with(&c_dylib, LoadOptions::new().with_shadow_copy(true))
+        .expect("reload c");
     for _ in 0..5 {
         app.update();
     }
@@ -379,7 +390,9 @@ fn test_asymmetric_unload_interleaving_and_unload_all() {
         assert_eq!(pos.z, 10.0);
     }
 
-    let _rust_id2 = app.load_mod_tracked(&rust_dylib).expect("reload rust");
+    let _rust_id2 = app
+        .load_mod_with(&rust_dylib, LoadOptions::new().with_shadow_copy(true))
+        .expect("reload rust");
     for _ in 0..5 {
         app.update();
     }
@@ -412,13 +425,16 @@ fn test_asymmetric_unload_interleaving_and_unload_all() {
 
 #[test]
 fn test_cdylib_panic_containment_and_continued_execution() {
-    let (rust_dylib, c_dylib) = ensure_guest_mods_built();
-    reset_rust_mod_panic(&rust_dylib);
+    let (shared_rust_dylib, c_dylib) = ensure_guest_mods_built();
+    // Private copy so `trigger_panic` is 100% isolated under parallel `cargo test` (`T-03`).
+    let isolated_rust = TempDylibCopy::new(&shared_rust_dylib, "cdylib_panic_containment");
 
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
-    app.register_mod_component::<Position>();
-    app.register_mod_component::<Velocity>();
+    app.register_mod_component::<Position>(ComponentOptions::new().with_default())
+        .unwrap();
+    app.register_mod_component::<Velocity>(ComponentOptions::new().with_default())
+        .unwrap();
 
     const NUM_ENTITIES: usize = 200;
     for i in 0..NUM_ENTITIES {
@@ -437,18 +453,22 @@ fn test_cdylib_panic_containment_and_continued_execution() {
     }
 
     let rust_mod_id = app
-        .load_mod_tracked(&rust_dylib)
+        .load_mod_with(
+            isolated_rust.path(),
+            LoadOptions::new().with_shadow_copy(false),
+        )
         .expect("Failed to load asymmetric_rust_mod");
     let c_mod_id = app
-        .load_mod_tracked(&c_dylib)
+        .load_mod_with(&c_dylib, LoadOptions::new().with_shadow_copy(true))
         .expect("Failed to load asymmetric_c_mod");
 
     for _ in 0..20 {
         app.update();
     }
 
+    // SAFETY: Opening our private `TempDylibCopy` to trigger one isolated guest panic.
     unsafe {
-        let lib = Library::new(&rust_dylib).expect("Failed to open rust_dylib");
+        let lib = Library::new(isolated_rust.path()).expect("Failed to open isolated rust_dylib");
         let trigger: Symbol<unsafe extern "C" fn()> = lib
             .get(b"asymmetric_rust_mod_trigger_panic\0")
             .expect("Failed to resolve asymmetric_rust_mod_trigger_panic");
@@ -490,19 +510,18 @@ fn test_cdylib_panic_containment_and_continued_execution() {
             assert_eq!(pos.z, expected_z);
         }
     }
-
-    reset_rust_mod_panic(&rust_dylib);
 }
 
 #[test]
 fn test_massive_post_unload_entity_churn() {
     let (rust_dylib, c_dylib) = ensure_guest_mods_built();
-    reset_rust_mod_panic(&rust_dylib);
 
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
-    app.register_mod_component::<Position>();
-    app.register_mod_component::<Velocity>();
+    app.register_mod_component::<Position>(ComponentOptions::new().with_default())
+        .unwrap();
+    app.register_mod_component::<Velocity>(ComponentOptions::new().with_default())
+        .unwrap();
 
     const NUM_INITIAL: usize = 500;
     for i in 0..NUM_INITIAL {
@@ -520,8 +539,12 @@ fn test_massive_post_unload_entity_churn() {
         ));
     }
 
-    let r_id = app.load_mod_tracked(&rust_dylib).expect("load rust");
-    let c_id = app.load_mod_tracked(&c_dylib).expect("load c");
+    let r_id = app
+        .load_mod_with(&rust_dylib, LoadOptions::new().with_shadow_copy(true))
+        .expect("load rust");
+    let c_id = app
+        .load_mod_with(&c_dylib, LoadOptions::new().with_shadow_copy(true))
+        .expect("load c");
 
     for _ in 0..10 {
         app.update();
@@ -576,7 +599,6 @@ fn test_massive_post_unload_entity_churn() {
 #[test]
 fn test_concurrent_multi_app_threads_load_tick_unload() {
     let (rust_dylib, c_dylib) = ensure_guest_mods_built();
-    reset_rust_mod_panic(&rust_dylib);
 
     const NUM_THREADS: usize = 8;
     const TICKS_PER_THREAD: usize = 40;
@@ -591,8 +613,10 @@ fn test_concurrent_multi_app_threads_load_tick_unload() {
         let handle = thread::spawn(move || {
             let mut app = App::new();
             app.add_plugins(AbiModPlugin);
-            app.register_mod_component::<Position>();
-            app.register_mod_component::<Velocity>();
+            app.register_mod_component::<Position>(ComponentOptions::new().with_default())
+                .unwrap();
+            app.register_mod_component::<Velocity>(ComponentOptions::new().with_default())
+                .unwrap();
 
             for i in 0..NUM_ENTITIES_PER_APP {
                 app.world_mut().spawn((
@@ -609,12 +633,15 @@ fn test_concurrent_multi_app_threads_load_tick_unload() {
                 ));
             }
 
+            // Intentionally loads WITHOUT shadow copy across all 8 concurrent OS threads to stress
+            // per-World `BamInstance` isolation (`L-02`) and refcounted `dlopen`/`dlclose` mutexing!
+            let no_shadow = LoadOptions::new().with_shadow_copy(false);
             let r_id = app
-                .load_mod_tracked(&r_path)
-                .unwrap_or_else(|e| panic!("Thread {t_idx}: load rust failed: {:?}", e));
+                .load_mod_with(&r_path, no_shadow.clone())
+                .unwrap_or_else(|e| panic!("Thread {t_idx}: load rust failed: {e:?}"));
             let c_id = app
-                .load_mod_tracked(&c_path)
-                .unwrap_or_else(|e| panic!("Thread {t_idx}: load c failed: {:?}", e));
+                .load_mod_with(&c_path, no_shadow)
+                .unwrap_or_else(|e| panic!("Thread {t_idx}: load c failed: {e:?}"));
 
             for _ in 0..TICKS_PER_THREAD {
                 app.update();
@@ -630,9 +657,9 @@ fn test_concurrent_multi_app_threads_load_tick_unload() {
             }
 
             app.unload_mod(r_id)
-                .unwrap_or_else(|e| panic!("Thread {t_idx}: unload rust: {:?}", e));
+                .unwrap_or_else(|e| panic!("Thread {t_idx}: unload rust: {e:?}"));
             app.unload_mod(c_id)
-                .unwrap_or_else(|e| panic!("Thread {t_idx}: unload c: {:?}", e));
+                .unwrap_or_else(|e| panic!("Thread {t_idx}: unload c: {e:?}"));
 
             for _ in 0..10 {
                 app.update();
@@ -651,30 +678,39 @@ fn test_concurrent_multi_app_threads_load_tick_unload() {
     for (t_idx, handle) in handles.into_iter().enumerate() {
         handle
             .join()
-            .unwrap_or_else(|e| panic!("Thread {t_idx} panicked or crashed: {:?}", e));
+            .unwrap_or_else(|e| panic!("Thread {t_idx} panicked or crashed: {e:?}"));
     }
 }
 
 #[test]
 fn test_multilanguage_mod_unload_and_post_unload_update_stress() {
     let (rust_dylib, c_dylib) = ensure_guest_mods_built();
-    reset_rust_mod_panic(&rust_dylib);
 
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
-    app.register_mod_component::<Position>();
-    app.register_mod_component::<Velocity>();
+    app.register_mod_component::<Position>(ComponentOptions::new().with_default())
+        .unwrap();
+    app.register_mod_component::<Velocity>(ComponentOptions::new().with_default())
+        .unwrap();
 
     let rust_mod_id = app
-        .load_mod_tracked(&rust_dylib)
+        .load_mod_with(&rust_dylib, LoadOptions::new().with_shadow_copy(true))
         .expect("Failed to load asymmetric_rust_mod");
     let c_mod_id = app
-        .load_mod_tracked(&c_dylib)
+        .load_mod_with(&c_dylib, LoadOptions::new().with_shadow_copy(true))
         .expect("Failed to load asymmetric_c_mod");
 
     let reg = app.world().resource::<ModRegistry>().clone();
-    let rust_comp_id = reg.get_by_name("RustModCustomData").unwrap().component_id;
-    let c_comp_id = reg.get_by_name("CModCustomData").unwrap().component_id;
+    let rust_comp_id = reg
+        .snapshot()
+        .get_by_name(RUST_MOD_CUSTOM_DATA_NAME)
+        .unwrap()
+        .component_id;
+    let c_comp_id = reg
+        .snapshot()
+        .get_by_name(C_MOD_CUSTOM_DATA_NAME)
+        .unwrap()
+        .component_id;
 
     let e_rust = app
         .world_mut()
@@ -708,28 +744,28 @@ fn test_multilanguage_mod_unload_and_post_unload_update_stress() {
         ))
         .id();
 
+    let rust_data = RustModCustomData {
+        power: 100.0,
+        shield: 10,
+    };
+    // SAFETY: `rust_comp_id` has layout matching `RustModCustomData`.
     unsafe {
-        let rust_data = RustModCustomData {
-            power: 100.0,
-            shield: 10,
-        };
-        app.world_mut().entity_mut(e_rust).insert_by_id(
-            rust_comp_id,
-            bevy_ecs::ptr::OwningPtr::new(
-                core::ptr::NonNull::new(&rust_data as *const _ as *mut u8).unwrap(),
-            ),
-        );
+        bevy_ecs::ptr::OwningPtr::make(rust_data, |ptr| {
+            app.world_mut()
+                .entity_mut(e_rust)
+                .insert_by_id(rust_comp_id, ptr);
+        });
+    }
 
-        let c_data = CModCustomData {
-            mana: 50.0,
-            level: 5,
-        };
-        app.world_mut().entity_mut(e_c).insert_by_id(
-            c_comp_id,
-            bevy_ecs::ptr::OwningPtr::new(
-                core::ptr::NonNull::new(&c_data as *const _ as *mut u8).unwrap(),
-            ),
-        );
+    let c_data = CModCustomData {
+        mana: 50.0,
+        level: 5,
+    };
+    // SAFETY: `c_comp_id` has layout matching `CModCustomData`.
+    unsafe {
+        bevy_ecs::ptr::OwningPtr::make(c_data, |ptr| {
+            app.world_mut().entity_mut(e_c).insert_by_id(c_comp_id, ptr);
+        });
     }
 
     for _ in 0..5 {
@@ -737,6 +773,7 @@ fn test_multilanguage_mod_unload_and_post_unload_update_stress() {
     }
 
     {
+        // SAFETY: `rust_comp_id` holds initialized `RustModCustomData`.
         let data_r = unsafe {
             *(app
                 .world()
@@ -748,6 +785,7 @@ fn test_multilanguage_mod_unload_and_post_unload_update_stress() {
         assert_eq!(data_r.power, 150.0);
         assert_eq!(data_r.shield, 15);
 
+        // SAFETY: `c_comp_id` holds initialized `CModCustomData`.
         let data_c = unsafe {
             *(app
                 .world()
@@ -768,6 +806,7 @@ fn test_multilanguage_mod_unload_and_post_unload_update_stress() {
     }
 
     {
+        // SAFETY: `ComponentId` storage preserved across unload.
         let data_r = unsafe {
             *(app
                 .world()
@@ -778,6 +817,7 @@ fn test_multilanguage_mod_unload_and_post_unload_update_stress() {
         };
         assert_eq!(data_r.power, 150.0);
 
+        // SAFETY: `ComponentId` storage preserved across unload.
         let data_c = unsafe {
             *(app
                 .world()

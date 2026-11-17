@@ -506,6 +506,20 @@ fn build_fixtures_internal(
             "mod_vortex",
             "mod_vortex",
         ),
+        (
+            "mod_shield_emitter",
+            "examples/06_cross_mod_components/mods/mod_shield_emitter/Cargo.toml",
+            "examples/06_cross_mod_components/mods/mod_shield_emitter/src/lib.rs",
+            "mod_shield_emitter",
+            "mod_shield_emitter",
+        ),
+        (
+            "mod_overcharge_siphon",
+            "examples/06_cross_mod_components/mods/mod_overcharge_siphon/Cargo.toml",
+            "examples/06_cross_mod_components/mods/mod_overcharge_siphon/src/lib.rs",
+            "mod_overcharge_siphon",
+            "mod_overcharge_siphon",
+        ),
     ];
 
     for &(key, manifest_rel, source_rel, crate_stem, dest_stem) in test_rust_examples {
@@ -553,7 +567,7 @@ fn build_fixtures_internal(
         );
     }
 
-    // 4. Additional optional example guest mods (Examples 05..06)
+    // 4. Additional optional GUI/3D example guest mods (Example 05)
     if include_examples {
         let extra_rust_examples: &[(&str, &str, &str, &str)] = &[
             (
@@ -567,18 +581,6 @@ fn build_fixtures_internal(
                 "examples/05_cute_3d_winit/mods/mod_carousel/Cargo.toml",
                 "mod_carousel",
                 "mod_carousel",
-            ),
-            (
-                "mod_shield_emitter",
-                "examples/06_cross_mod_components/mods/mod_shield_emitter/Cargo.toml",
-                "mod_shield_emitter",
-                "mod_shield_emitter",
-            ),
-            (
-                "mod_overcharge_siphon",
-                "examples/06_cross_mod_components/mods/mod_overcharge_siphon/Cargo.toml",
-                "mod_overcharge_siphon",
-                "mod_overcharge_siphon",
             ),
         ];
 
