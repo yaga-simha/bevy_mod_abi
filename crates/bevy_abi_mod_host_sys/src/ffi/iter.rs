@@ -2,10 +2,12 @@
 //! (`C-05`, `C-13`, `P-01..P-04`, `S-08`, `N-02`).
 
 use crate::handle_header::{HandleHeader, ITER_MAGIC, validate_handle_mut, validate_handle_ref};
+use crate::registry::{MsgReadBatchFn, MsgSendFn};
+use crate::sync_ptr::{GuestFnPtr, GuestUserData};
 use bevy_abi_mod_sys::{
-    AccessMode, BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET,
-    BamColumnInfo, BamComponent, BamIter, ComponentUuid, FfiBool, FfiEntity, FfiResult,
-    MAX_TERMS_PER_QUERY,
+    AccessMode, BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE,
+    BAM_STORAGE_FLAG_SPARSE_SET, BamChunkTaskFn, BamColumnInfo, BamComponent, BamIter,
+    ComponentUuid, FfiBool, FfiEntity, FfiResult, MAX_TERMS_PER_QUERY,
 };
 use bevy_ecs::archetype::{ArchetypeId, Archetypes};
 use bevy_ecs::change_detection::{AtomicTick, Tick};
@@ -13,8 +15,11 @@ use bevy_ecs::component::ComponentId;
 use bevy_ecs::entity::Entity;
 use bevy_ecs::storage::{SparseSets, Table, TableId, TableRow, Tables};
 use bevy_ecs::world::unsafe_world_cell::UnsafeWorldCell;
+use bevy_tasks::{ComputeTaskPool, TaskPool};
+use core::any::Any;
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use nonmax::NonMaxU32;
 
 // Compile-time layout assertions guarding zero-copy `Entity` -> `FfiEntity` slice casts.
@@ -39,6 +44,10 @@ pub struct QueryTermMeta {
     pub align: usize,
     /// Bitmask of `BAM_STORAGE_FLAG_*`.
     pub storage_flags: u32,
+    /// Optional monomorphized batch message reader (`F-02`).
+    pub msg_read_batch_fn: Option<MsgReadBatchFn>,
+    /// Optional monomorphized message sender (`F-02`).
+    pub msg_send_fn: Option<MsgSendFn>,
 }
 
 impl QueryTermMeta {
@@ -58,6 +67,12 @@ impl QueryTermMeta {
     #[inline]
     pub const fn is_resource(&self) -> bool {
         (self.storage_flags & BAM_STORAGE_FLAG_RESOURCE) != 0
+    }
+
+    /// Returns `true` if this term refers to a buffered Bevy `Messages<M>` stream (`F-02`).
+    #[inline]
+    pub const fn is_message(&self) -> bool {
+        (self.storage_flags & BAM_STORAGE_FLAG_MESSAGE) != 0
     }
 }
 
@@ -97,7 +112,10 @@ impl QueryPlan {
         let mut sparse_data_mask = 0u32;
         let mut dense_data_mask = 0u32;
         let mut tick_filters = Vec::new();
-        let has_entity_terms = terms.is_empty() || terms.iter().any(|t| !t.mode.is_resource());
+        let has_entity_terms = terms.is_empty()
+            || terms
+                .iter()
+                .any(|t| !t.mode.is_resource() && !t.mode.is_message());
 
         for (i, t) in terms.iter().enumerate().take(MAX_TERMS_PER_QUERY) {
             if t.mode.is_tick_filter() {
@@ -108,7 +126,7 @@ impl QueryPlan {
                 });
             }
 
-            if !t.mode.has_entity_column_data() || t.is_resource() {
+            if !t.mode.has_entity_column_data() || t.is_resource() || t.is_message() {
                 continue;
             }
 
@@ -184,6 +202,7 @@ enum IterBacking<'w> {
         matched_tables: &'w [TableId],
         table_cursor: usize,
         row_cursor: usize,
+        single_table_end_row: Option<usize>,
     },
     Archetypes {
         archetypes: &'w Archetypes,
@@ -191,6 +210,7 @@ enum IterBacking<'w> {
         matched_archetypes: &'w [ArchetypeId],
         archetype_cursor: usize,
         entity_cursor: usize,
+        single_arch_end_entity: Option<usize>,
     },
 }
 
@@ -206,6 +226,10 @@ pub struct HostIter<'w> {
     this_run: Tick,
     world: Option<UnsafeWorldCell<'w>>,
     sparse_scratch: Option<&'w mut SparseRowScratch>,
+    msg_cursors: Option<&'w mut [Option<Box<dyn Any + Send + Sync>>]>,
+    in_par_iter: bool,
+    chunks_yielded: usize,
+    entities_yielded: usize,
 
     current_entities_ptr: *const FfiEntity,
     current_entity_count: usize,
@@ -234,6 +258,7 @@ impl<'w> HostIter<'w> {
                 matched_tables,
                 table_cursor: 0,
                 row_cursor: 0,
+                single_table_end_row: None,
             }
         } else {
             IterBacking::ResourceOnly
@@ -247,6 +272,10 @@ impl<'w> HostIter<'w> {
             this_run,
             world: None,
             sparse_scratch: None,
+            msg_cursors: None,
+            in_par_iter: false,
+            chunks_yielded: 0,
+            entities_yielded: 0,
             current_entities_ptr: core::ptr::null(),
             current_entity_count: 0,
             marked_changed_mask: 0,
@@ -276,6 +305,7 @@ impl<'w> HostIter<'w> {
                 matched_archetypes,
                 archetype_cursor: 0,
                 entity_cursor: 0,
+                single_arch_end_entity: None,
             }
         } else {
             IterBacking::ResourceOnly
@@ -289,6 +319,10 @@ impl<'w> HostIter<'w> {
             this_run,
             world: None,
             sparse_scratch: Some(sparse_scratch),
+            msg_cursors: None,
+            in_par_iter: false,
+            chunks_yielded: 0,
+            entities_yielded: 0,
             current_entities_ptr: core::ptr::null(),
             current_entity_count: 0,
             marked_changed_mask: 0,
@@ -310,6 +344,22 @@ impl<'w> HostIter<'w> {
     pub fn with_world(mut self, world: UnsafeWorldCell<'w>) -> Self {
         self.world = Some(world);
         self
+    }
+
+    /// Attaches per-system `MessageCursor` state for `MESSAGE_READ` terms (`F-02`).
+    #[inline]
+    pub fn with_msg_cursors(
+        mut self,
+        cursors: &'w mut [Option<Box<dyn Any + Send + Sync>>],
+    ) -> Self {
+        self.msg_cursors = Some(cursors);
+        self
+    }
+
+    /// Returns `(chunks_yielded, entities_yielded)` accumulated during this iterator's lifetime (`E-01`).
+    #[inline]
+    pub const fn stats(&self) -> (usize, usize) {
+        (self.chunks_yielded, self.entities_yielded)
     }
 
     /// Casts `&mut self` to an opaque `*mut BamIter` FFI pointer.
@@ -399,6 +449,7 @@ impl<'w> HostIter<'w> {
                 matched_tables,
                 ref mut table_cursor,
                 ref mut row_cursor,
+                single_table_end_row,
             } => {
                 let tick_filters = plan.tick_filters.as_slice();
                 let has_tick_filters = !tick_filters.is_empty();
@@ -411,20 +462,29 @@ impl<'w> HostIter<'w> {
                         continue;
                     };
 
-                    let count = table.entity_count() as usize;
-                    if count == 0 || *row_cursor >= count {
+                    let full_table_len = table.entity_count() as usize;
+                    let limit_len = single_table_end_row
+                        .map(|end| end.min(full_table_len))
+                        .unwrap_or(full_table_len);
+                    if limit_len == 0 || *row_cursor >= limit_len {
                         *table_cursor += 1;
                         *row_cursor = 0;
                         continue;
                     }
 
                     if !has_tick_filters {
+                        let start = *row_cursor;
+                        let run_len = limit_len - start;
                         *table_cursor += 1;
                         *row_cursor = 0;
-                        self.current_entities_ptr = table.entities().as_ptr().cast::<FfiEntity>();
-                        self.current_entity_count = count;
-                        self.populate_dense_columns(table, count, 0, count);
-                        return count;
+                        // SAFETY: `start + run_len == limit_len <= full_table_len == table.entities().len()`.
+                        self.current_entities_ptr =
+                            unsafe { table.entities().as_ptr().add(start).cast::<FfiEntity>() };
+                        self.current_entity_count = run_len;
+                        self.populate_dense_columns(table, full_table_len, start, run_len);
+                        self.chunks_yielded += 1;
+                        self.entities_yielded += run_len;
+                        return run_len;
                     }
 
                     // P-01: Resolve all tick-filter slices ONCE per table, and skip the entire
@@ -445,11 +505,11 @@ impl<'w> HostIter<'w> {
                             break;
                         }
                         filter_slices[f_idx] = if tf.is_added {
-                            // SAFETY: `count == table.entity_count() as usize`.
-                            unsafe { col.get_added_ticks_slice(count) }
+                            // SAFETY: `full_table_len == table.entity_count() as usize`.
+                            unsafe { col.get_added_ticks_slice(full_table_len) }
                         } else {
-                            // SAFETY: `count == table.entity_count() as usize`.
-                            unsafe { col.get_changed_ticks_slice(count) }
+                            // SAFETY: `full_table_len == table.entity_count() as usize`.
+                            unsafe { col.get_changed_ticks_slice(full_table_len) }
                         };
                     }
 
@@ -461,7 +521,7 @@ impl<'w> HostIter<'w> {
 
                     let active_slices = &filter_slices[..tick_filters.len()];
                     let mut start_row_idx = *row_cursor;
-                    while start_row_idx < count
+                    while start_row_idx < limit_len
                         && !Self::row_matches_dense_slices(
                             active_slices,
                             start_row_idx,
@@ -472,14 +532,14 @@ impl<'w> HostIter<'w> {
                         start_row_idx += 1;
                     }
 
-                    if start_row_idx >= count {
+                    if start_row_idx >= limit_len {
                         *table_cursor += 1;
                         *row_cursor = 0;
                         continue;
                     }
 
                     let mut run_len = 1usize;
-                    while start_row_idx + run_len < count
+                    while start_row_idx + run_len < limit_len
                         && Self::row_matches_dense_slices(
                             active_slices,
                             start_row_idx + run_len,
@@ -491,12 +551,12 @@ impl<'w> HostIter<'w> {
                     }
 
                     *row_cursor = start_row_idx + run_len;
-                    if *row_cursor >= count {
+                    if *row_cursor >= limit_len {
                         *table_cursor += 1;
                         *row_cursor = 0;
                     }
 
-                    // SAFETY: `start_row_idx + run_len <= count == table.entities().len()`.
+                    // SAFETY: `start_row_idx + run_len <= limit_len <= full_table_len == table.entities().len()`.
                     self.current_entities_ptr = unsafe {
                         table
                             .entities()
@@ -505,7 +565,9 @@ impl<'w> HostIter<'w> {
                             .cast::<FfiEntity>()
                     };
                     self.current_entity_count = run_len;
-                    self.populate_dense_columns(table, count, start_row_idx, run_len);
+                    self.populate_dense_columns(table, full_table_len, start_row_idx, run_len);
+                    self.chunks_yielded += 1;
+                    self.entities_yielded += run_len;
                     return run_len;
                 }
             }
@@ -515,6 +577,7 @@ impl<'w> HostIter<'w> {
                 matched_archetypes,
                 ref mut archetype_cursor,
                 ref mut entity_cursor,
+                single_arch_end_entity,
             } => {
                 let tick_filters = plan.tick_filters.as_slice();
                 let has_tick_filters = !tick_filters.is_empty();
@@ -529,7 +592,10 @@ impl<'w> HostIter<'w> {
                     };
 
                     let arch_entities = archetype.entities();
-                    if *entity_cursor >= arch_entities.len() {
+                    let limit_entities = single_arch_end_entity
+                        .map(|end| end.min(arch_entities.len()))
+                        .unwrap_or(arch_entities.len());
+                    if *entity_cursor >= limit_entities {
                         *archetype_cursor += 1;
                         *entity_cursor = 0;
                         continue;
@@ -584,7 +650,7 @@ impl<'w> HostIter<'w> {
                     let active_dense_filters = &dense_filter_slices[..dense_filter_count];
 
                     if has_tick_filters {
-                        while *entity_cursor < arch_entities.len() {
+                        while *entity_cursor < limit_entities {
                             let cand = &arch_entities[*entity_cursor];
                             if Self::entity_matches_archetypal_filters(
                                 active_dense_filters,
@@ -600,7 +666,7 @@ impl<'w> HostIter<'w> {
                             }
                             *entity_cursor += 1;
                         }
-                        if *entity_cursor >= arch_entities.len() {
+                        if *entity_cursor >= limit_entities {
                             *archetype_cursor += 1;
                             *entity_cursor = 0;
                             continue;
@@ -614,7 +680,7 @@ impl<'w> HostIter<'w> {
 
                     // P-02: Batch multi-entity runs even when `sparse_data_mask != 0`!
                     let mut run_len = 1usize;
-                    while start_entity_idx + run_len < arch_entities.len() {
+                    while start_entity_idx + run_len < limit_entities {
                         let next_ent = &arch_entities[start_entity_idx + run_len];
                         let next_row_idx = next_ent.table_row().index();
                         if next_row_idx != start_row_idx + run_len {
@@ -641,13 +707,15 @@ impl<'w> HostIter<'w> {
                     }
 
                     *entity_cursor = start_entity_idx + run_len;
-                    if *entity_cursor >= arch_entities.len() {
+                    if *entity_cursor >= limit_entities {
                         *archetype_cursor += 1;
                         *entity_cursor = 0;
                     }
 
                     self.clear_active_chunk();
                     self.current_entity_count = run_len;
+                    self.chunks_yielded += 1;
+                    self.entities_yielded += run_len;
 
                     if contiguous_table_rows && start_row_idx + run_len <= table_len {
                         // SAFETY: `start_row_idx + run_len <= table_len == table.entities().len()`.
@@ -869,6 +937,9 @@ pub unsafe extern "C" fn host_iter_reset(iter: *mut BamIter) -> FfiResult {
         Ok(it) => it,
         Err(err) => return err,
     };
+    if host_iter.in_par_iter {
+        return FfiResult::ACCESS_CONFLICT;
+    }
     host_iter.reset();
     FfiResult::OK
 }
@@ -1253,7 +1324,7 @@ pub unsafe extern "C" fn host_res_mut_ptr(iter: *mut BamIter, term_index: usize)
     else {
         return core::ptr::null_mut();
     };
-    if term_index >= host_iter.plan.terms.len() {
+    if host_iter.in_par_iter || term_index >= host_iter.plan.terms.len() {
         return core::ptr::null_mut();
     }
     let term = &host_iter.plan.terms[term_index];
@@ -1278,4 +1349,466 @@ pub unsafe extern "C" fn host_res_mut_ptr(iter: *mut BamIter, term_index: usize)
         return core::ptr::null_mut();
     };
     mut_untyped.into_inner().as_ptr()
+}
+
+/// Reads up to `max_count` buffered POD Bevy `Messages<M>` from `MESSAGE_READ` / `MESSAGE_WRITE`
+/// term `term_index` into `out_buf` (`F-02`), advancing this system's dedicated `MessageCursor<M>`.
+///
+/// # Safety
+/// - `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
+/// - If `max_count > 0`, `out_buf` must be writable for `max_count * size_of::<M>()` bytes.
+/// - `out_count` must point to writable `usize` storage, or null.
+pub unsafe extern "C" fn host_msg_read_batch(
+    iter: *mut BamIter,
+    term_index: usize,
+    out_buf: *mut u8,
+    max_count: usize,
+    out_count: *mut usize,
+) -> FfiResult {
+    if out_count.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
+    let host_iter = match unsafe {
+        validate_handle_mut::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false)
+    } {
+        Ok(it) => it,
+        Err(err) => return err,
+    };
+    if host_iter.in_par_iter {
+        return FfiResult::ACCESS_CONFLICT;
+    }
+    if term_index >= host_iter.plan.terms.len() {
+        return FfiResult::OUT_OF_RANGE;
+    }
+    let term = &host_iter.plan.terms[term_index];
+    if !term.mode.is_message() || !term.is_message() {
+        return FfiResult::PERMISSION_DENIED;
+    }
+    let Some(read_fn) = term.msg_read_batch_fn else {
+        return FfiResult::INVALID_COMPONENT;
+    };
+    let Some(world) = host_iter.world else {
+        return FfiResult::INVALID_STATE;
+    };
+    let Some(ref mut cursors) = host_iter.msg_cursors else {
+        return FfiResult::INVALID_STATE;
+    };
+    let Some(Some(cursor_box)) = cursors.get_mut(term_index) else {
+        return FfiResult::INVALID_STATE;
+    };
+    // SAFETY: `MESSAGE_READ` or `MESSAGE_WRITE` was declared in `FilteredAccessSet`; `cursor_box`
+    // was constructed by `create_msg_cursor_impl::<M>` for `term.component_id`.
+    unsafe {
+        read_fn(
+            world,
+            term.component_id,
+            cursor_box.as_mut(),
+            out_buf,
+            max_count,
+            out_count,
+        )
+    }
+}
+
+/// Sends a single POD Bevy `Message` into `Messages<M>` declared with `MESSAGE_WRITE` at `term_index` (`F-02`).
+///
+/// # Safety
+/// - `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
+/// - If `data_len > 0`, `data_ptr` must be readable for `data_len` bytes.
+pub unsafe extern "C" fn host_msg_send(
+    iter: *mut BamIter,
+    term_index: usize,
+    data_ptr: *const u8,
+    data_len: usize,
+) -> FfiResult {
+    // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
+    let host_iter = match unsafe {
+        validate_handle_mut::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false)
+    } {
+        Ok(it) => it,
+        Err(err) => return err,
+    };
+    if host_iter.in_par_iter {
+        return FfiResult::ACCESS_CONFLICT;
+    }
+    if term_index >= host_iter.plan.terms.len() {
+        return FfiResult::OUT_OF_RANGE;
+    }
+    let term = &host_iter.plan.terms[term_index];
+    if term.mode != AccessMode::MESSAGE_WRITE || !term.is_message() || term.is_immutable() {
+        return FfiResult::PERMISSION_DENIED;
+    }
+    let Some(send_fn) = term.msg_send_fn else {
+        return FfiResult::INVALID_COMPONENT;
+    };
+    let Some(world) = host_iter.world else {
+        return FfiResult::INVALID_STATE;
+    };
+    // SAFETY: `MESSAGE_WRITE` was declared in `FilteredAccessSet`; caller guarantees `data_ptr`
+    // readability when `data_len > 0`.
+    unsafe {
+        send_fn(
+            world,
+            host_iter.last_run,
+            host_iter.this_run,
+            term.component_id,
+            data_ptr,
+            data_len,
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+struct UnsafeWorldCellSend<'w>(Option<UnsafeWorldCell<'w>>);
+
+// SAFETY: Used strictly within `host_par_for_each_chunk` scoped worker tasks where:
+// 1. Each task operates on a disjoint `(TableId, start_row, end_row)` or `(ArchetypeId, start_idx, end_idx)` range.
+// 2. Mutable singleton/message operations (`res_mut_ptr`, `msg_read_batch`, `msg_send`) are rejected
+//    while `in_par_iter == true`, leaving only shared read-only `res_ptr` (`&R: Sync`) on `world`.
+unsafe impl Send for UnsafeWorldCellSend<'_> {}
+// SAFETY: Same scoped read-only resource and disjoint component-row invariants as `Send`.
+unsafe impl Sync for UnsafeWorldCellSend<'_> {}
+
+#[derive(Clone, Copy)]
+struct TablesSend<'w>(&'w Tables);
+// SAFETY: Shared read-only table metadata lookup across disjoint `(TableId, start_row, end_row)` slices
+// inside `ComputeTaskPool::scope`; column/tick writes occur strictly on disjoint entity rows.
+unsafe impl Send for TablesSend<'_> {}
+// SAFETY: Same scoped disjoint-row invariants as `Send`.
+unsafe impl Sync for TablesSend<'_> {}
+
+#[derive(Clone, Copy)]
+struct ArchetypesSend<'w>(&'w Archetypes);
+// SAFETY: Archetype metadata is immutable during `GuestSystem::run_unsafe` (`Deferred` commands only).
+unsafe impl Send for ArchetypesSend<'_> {}
+// SAFETY: Archetype metadata is immutable during `GuestSystem::run_unsafe`.
+unsafe impl Sync for ArchetypesSend<'_> {}
+
+#[derive(Clone, Copy)]
+struct SparseSetsSend<'w>(&'w SparseSets);
+// SAFETY: SparseSet index maps are immutable during `GuestSystem::run_unsafe`, and each worker task
+// accesses disjoint `ArchetypeEntity` indices `[start_entity..end_entity]` with task-local `SparseRowScratch`.
+unsafe impl Send for SparseSetsSend<'_> {}
+// SAFETY: Same scoped disjoint-entity invariants as `Send`.
+unsafe impl Sync for SparseSetsSend<'_> {}
+
+#[derive(Clone, Copy)]
+struct DenseParPartition {
+    table_id: TableId,
+    start_row: usize,
+    end_row: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ArchetypeParPartition {
+    arch_id: ArchetypeId,
+    start_entity: usize,
+    end_entity: usize,
+}
+
+/// Executes `chunk_fn(task_iter, user_data)` in parallel across Bevy's [`ComputeTaskPool`] over
+/// disjoint matched table/archetype sub-ranges (`P-07`).
+///
+/// Each worker task receives a scoped `BamIter` already positioned on an active non-empty chunk.
+/// Non-reentrant (`in_par_iter == true` rejects nested `par_for_each_chunk` with `ACCESS_CONFLICT`),
+/// and any non-`OK` `FfiResult` returned by a task (including `PANIC_CAUGHT`) aborts remaining
+/// chunk dispatches and is returned deterministically to the caller.
+///
+/// # Safety
+/// - `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
+/// - `chunk_fn` and `user_data` must be thread-safe (`Sync`) across concurrent worker invocations
+///   on disjoint entity chunks.
+pub unsafe extern "C" fn host_par_for_each_chunk(
+    iter: *mut BamIter,
+    chunk_fn: Option<BamChunkTaskFn>,
+    user_data: *mut c_void,
+) -> FfiResult {
+    let Some(task_cb) = chunk_fn else {
+        return FfiResult::NULL_POINTER;
+    };
+    // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
+    let host_iter = match unsafe {
+        validate_handle_mut::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false)
+    } {
+        Ok(it) => it,
+        Err(err) => return err,
+    };
+    if host_iter.in_par_iter {
+        return FfiResult::ACCESS_CONFLICT;
+    }
+
+    let Some(tables) = host_iter.tables else {
+        return FfiResult::OK;
+    };
+    let plan = host_iter.plan;
+    let last_run = host_iter.last_run;
+    let this_run = host_iter.this_run;
+    let send_world = UnsafeWorldCellSend(host_iter.world);
+    let cb_ptr = GuestFnPtr(task_cb);
+    let ud_ptr = GuestUserData::new(user_data);
+
+    let first_err = AtomicU32::new(FfiResult::OK.0);
+    let total_chunks = AtomicUsize::new(0);
+    let total_entities = AtomicUsize::new(0);
+
+    // Under Miri, run sequentially on the current thread to avoid spawning OS worker threads while
+    // exercising the exact sub-range `HostIter` partitioning and `in_par_iter` invariants.
+    let pool_opt: Option<&ComputeTaskPool> = if cfg!(miri) {
+        None
+    } else {
+        Some(ComputeTaskPool::get_or_init(TaskPool::new))
+    };
+    let worker_count = pool_opt.map_or(1, |p| p.thread_num().max(1));
+
+    match host_iter.backing {
+        IterBacking::ResourceOnly => {
+            host_iter.clear_active_chunk();
+            return FfiResult::OK;
+        }
+        IterBacking::DenseTables {
+            matched_tables,
+            ref mut table_cursor,
+            ref mut row_cursor,
+            single_table_end_row,
+        } => {
+            let mut total_rows = 0usize;
+            let start_tc = *table_cursor;
+            let start_rc = *row_cursor;
+            for &tid in &matched_tables[start_tc..] {
+                if let Some(t) = tables.get(tid) {
+                    let len = single_table_end_row
+                        .map(|e| e.min(t.entity_count() as usize))
+                        .unwrap_or(t.entity_count() as usize);
+                    total_rows += len;
+                }
+            }
+            *table_cursor = matched_tables.len();
+            *row_cursor = 0;
+            host_iter.clear_active_chunk();
+            if total_rows == 0 {
+                return FfiResult::OK;
+            }
+
+            let target_grain = (total_rows / (worker_count * 4).max(1)).max(256);
+            let mut partitions = Vec::new();
+            for (rel_idx, &tid) in matched_tables[start_tc..].iter().enumerate() {
+                let Some(t) = tables.get(tid) else {
+                    continue;
+                };
+                let full_len = t.entity_count() as usize;
+                let end_limit = single_table_end_row
+                    .map(|e| e.min(full_len))
+                    .unwrap_or(full_len);
+                let mut r = if rel_idx == 0 { start_rc } else { 0 };
+                while r < end_limit {
+                    let end = (r + target_grain).min(end_limit);
+                    partitions.push(DenseParPartition {
+                        table_id: tid,
+                        start_row: r,
+                        end_row: end,
+                    });
+                    r = end;
+                }
+            }
+
+            let send_tables = TablesSend(tables);
+            let run_partition = |part: DenseParPartition| {
+                if first_err.load(Ordering::Acquire) != FfiResult::OK.0 {
+                    return;
+                }
+                let st = send_tables;
+                let sw = send_world;
+                let tables_ref = st.0;
+                let table_slice = core::slice::from_ref(&part.table_id);
+                let mut sub_iter = HostIter {
+                    header: HandleHeader::new(ITER_MAGIC),
+                    tables: Some(tables_ref),
+                    backing: IterBacking::DenseTables {
+                        matched_tables: table_slice,
+                        table_cursor: 0,
+                        row_cursor: part.start_row,
+                        single_table_end_row: Some(part.end_row),
+                    },
+                    plan,
+                    last_run,
+                    this_run,
+                    world: sw.0,
+                    sparse_scratch: None,
+                    msg_cursors: None,
+                    in_par_iter: true,
+                    chunks_yielded: 0,
+                    entities_yielded: 0,
+                    current_entities_ptr: core::ptr::null(),
+                    current_entity_count: 0,
+                    marked_changed_mask: 0,
+                    materialized_sparse_mask: 0,
+                    present_sparse_mask: 0,
+                    active_columns: [None; MAX_TERMS_PER_QUERY],
+                };
+                let GuestFnPtr(cb) = cb_ptr;
+                // SAFETY: `sub_iter` owns a disjoint `[part.start_row..part.end_row]` slice of
+                // `part.table_id` whose `iter_next_chunk` yields only its assigned sub-range and
+                // poisons its `HandleHeader` on drop.
+                let rc = unsafe { cb(sub_iter.as_ffi_ptr(), ud_ptr.as_ptr()) };
+                if rc != FfiResult::OK {
+                    let _ = first_err.compare_exchange(
+                        FfiResult::OK.0,
+                        rc.0,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                }
+                let (c, e) = sub_iter.stats();
+                total_chunks.fetch_add(c, Ordering::Relaxed);
+                total_entities.fetch_add(e, Ordering::Relaxed);
+            };
+
+            if let Some(pool) = pool_opt
+                && partitions.len() > 1
+            {
+                pool.scope(|s| {
+                    for part in partitions {
+                        s.spawn(async move {
+                            run_partition(part);
+                        });
+                    }
+                });
+            } else {
+                for part in partitions {
+                    run_partition(part);
+                }
+            }
+        }
+        IterBacking::Archetypes {
+            archetypes,
+            sparse_sets,
+            matched_archetypes,
+            ref mut archetype_cursor,
+            ref mut entity_cursor,
+            single_arch_end_entity,
+        } => {
+            let start_ac = *archetype_cursor;
+            let start_ec = *entity_cursor;
+            let mut total_ents = 0usize;
+            for &aid in &matched_archetypes[start_ac..] {
+                if let Some(a) = archetypes.get(aid) {
+                    let len = single_arch_end_entity
+                        .map(|e| e.min(a.entities().len()))
+                        .unwrap_or(a.entities().len());
+                    total_ents += len;
+                }
+            }
+            *archetype_cursor = matched_archetypes.len();
+            *entity_cursor = 0;
+            host_iter.clear_active_chunk();
+            if total_ents == 0 {
+                return FfiResult::OK;
+            }
+
+            let target_grain = (total_ents / (worker_count * 4).max(1)).max(256);
+            let mut partitions = Vec::new();
+            for (rel_idx, &aid) in matched_archetypes[start_ac..].iter().enumerate() {
+                let Some(a) = archetypes.get(aid) else {
+                    continue;
+                };
+                let full_len = a.entities().len();
+                let end_limit = single_arch_end_entity
+                    .map(|e| e.min(full_len))
+                    .unwrap_or(full_len);
+                let mut idx = if rel_idx == 0 { start_ec } else { 0 };
+                while idx < end_limit {
+                    let end = (idx + target_grain).min(end_limit);
+                    partitions.push(ArchetypeParPartition {
+                        arch_id: aid,
+                        start_entity: idx,
+                        end_entity: end,
+                    });
+                    idx = end;
+                }
+            }
+
+            let send_tables = TablesSend(tables);
+            let send_archetypes = ArchetypesSend(archetypes);
+            let send_sparse_sets = SparseSetsSend(sparse_sets);
+            let run_arch_partition = |part: ArchetypeParPartition| {
+                if first_err.load(Ordering::Acquire) != FfiResult::OK.0 {
+                    return;
+                }
+                let st = send_tables;
+                let sa = send_archetypes;
+                let ss = send_sparse_sets;
+                let sw = send_world;
+                let tables_ref = st.0;
+                let archetypes_ref = sa.0;
+                let sparse_sets_ref = ss.0;
+                let mut local_scratch = SparseRowScratch::default();
+                local_scratch.ensure_terms(plan.terms.len());
+                let arch_slice = core::slice::from_ref(&part.arch_id);
+                let mut sub_iter = HostIter {
+                    header: HandleHeader::new(ITER_MAGIC),
+                    tables: Some(tables_ref),
+                    backing: IterBacking::Archetypes {
+                        archetypes: archetypes_ref,
+                        sparse_sets: sparse_sets_ref,
+                        matched_archetypes: arch_slice,
+                        archetype_cursor: 0,
+                        entity_cursor: part.start_entity,
+                        single_arch_end_entity: Some(part.end_entity),
+                    },
+                    plan,
+                    last_run,
+                    this_run,
+                    world: sw.0,
+                    sparse_scratch: Some(&mut local_scratch),
+                    msg_cursors: None,
+                    in_par_iter: true,
+                    chunks_yielded: 0,
+                    entities_yielded: 0,
+                    current_entities_ptr: core::ptr::null(),
+                    current_entity_count: 0,
+                    marked_changed_mask: 0,
+                    materialized_sparse_mask: 0,
+                    present_sparse_mask: 0,
+                    active_columns: [None; MAX_TERMS_PER_QUERY],
+                };
+                let GuestFnPtr(cb) = cb_ptr;
+                // SAFETY: `sub_iter` owns a disjoint `[part.start_entity..part.end_entity]`
+                // slice of `part.arch_id` with task-local `SparseRowScratch`, yielding only its
+                // assigned sub-range via `iter_next_chunk`.
+                let rc = unsafe { cb(sub_iter.as_ffi_ptr(), ud_ptr.as_ptr()) };
+                if rc != FfiResult::OK {
+                    let _ = first_err.compare_exchange(
+                        FfiResult::OK.0,
+                        rc.0,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                }
+                let (c, e) = sub_iter.stats();
+                total_chunks.fetch_add(c, Ordering::Relaxed);
+                total_entities.fetch_add(e, Ordering::Relaxed);
+            };
+
+            if let Some(pool) = pool_opt
+                && partitions.len() > 1
+            {
+                pool.scope(|s| {
+                    for part in partitions {
+                        s.spawn(async move {
+                            run_arch_partition(part);
+                        });
+                    }
+                });
+            } else {
+                for part in partitions {
+                    run_arch_partition(part);
+                }
+            }
+        }
+    }
+
+    host_iter.chunks_yielded += total_chunks.load(Ordering::Relaxed);
+    host_iter.entities_yielded += total_entities.load(Ordering::Relaxed);
+    FfiResult(first_err.load(Ordering::Acquire))
 }

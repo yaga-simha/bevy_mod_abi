@@ -3,12 +3,18 @@
 
 use core::ffi::{CStr, c_void};
 
-use bevy_abi_mod_sys::{BamHostApi, BamInstance, BamLoadCtx, BamManifest, FfiResult};
+use bevy_abi_mod_sys::{
+    BamHostApi, BamInstance, BamLoadCtx, BamManifest, BamStateWriterFn, FfiResult,
+};
 
 use crate::{
     host::{Host, ValidatedLoadCtx},
     panic::{catch_guest_result, catch_guest_unit},
+    trampoline::ReentrantCell,
 };
+
+type SaveStateHook = Box<dyn FnMut() -> Result<Vec<u8>, FfiResult> + Send + 'static>;
+type RestoreStateHook = Box<dyn FnMut(&[u8]) -> FfiResult + Send + 'static>;
 
 struct ErasedAllocation {
     ptr: *mut c_void,
@@ -77,12 +83,14 @@ impl Drop for OwnedManifestBytes {
 /// `bevy_abi_mod_init` and reclaimed in `bevy_abi_mod_shutdown`.
 ///
 /// Owns the validated [`Host`] table, all registered system/`run_if` closure states, owned
-/// descriptor strings, and per-instance shutdown hooks so loading the same `.cdylib` into multiple
-/// Bevy `World`s simultaneously shares zero mutable global state.
+/// descriptor strings, hot-reload state hooks (`F-01`), and per-instance shutdown hooks so loading
+/// the same `.cdylib` into multiple Bevy `World`s simultaneously shares zero mutable global state.
 pub struct GuestInstance {
     host: Host,
     allocations: Vec<ErasedAllocation>,
     shutdown_hooks: Vec<Box<dyn FnOnce() + Send + 'static>>,
+    save_state_hook: Option<ReentrantCell<SaveStateHook>>,
+    restore_state_hook: Option<ReentrantCell<RestoreStateHook>>,
     // Declared last so field drop runs strictly after `GuestInstance::drop` tears down every
     // closure/hook holding a copy of `host`.
     _manifest_bytes: OwnedManifestBytes,
@@ -101,6 +109,8 @@ impl GuestInstance {
             host,
             allocations: Vec::new(),
             shutdown_hooks: Vec::new(),
+            save_state_hook: None,
+            restore_state_hook: None,
             _manifest_bytes: manifest_bytes,
         }
     }
@@ -140,6 +150,22 @@ impl GuestInstance {
         self.shutdown_hooks.push(Box::new(hook));
     }
 
+    /// Registers or replaces the hot-reload state snapshot callback (`F-01`) for this instance.
+    pub fn set_save_state_hook<F>(&mut self, hook: F)
+    where
+        F: FnMut() -> Result<Vec<u8>, FfiResult> + Send + 'static,
+    {
+        self.save_state_hook = Some(ReentrantCell::new(Box::new(hook)));
+    }
+
+    /// Registers or replaces the hot-reload state restoration callback (`F-01`) for this instance.
+    pub fn set_restore_state_hook<F>(&mut self, hook: F)
+    where
+        F: FnMut(&[u8]) -> FfiResult + Send + 'static,
+    {
+        self.restore_state_hook = Some(ReentrantCell::new(Box::new(hook)));
+    }
+
     /// Returns the number of tracked heap allocations owned by this instance.
     #[inline]
     pub fn allocation_count(&self) -> usize {
@@ -160,6 +186,8 @@ impl Drop for GuestInstance {
         // descriptors drop before earlier dependencies. Unrun `shutdown_hooks` (from failed init
         // rollback) are dropped without invoking them.
         self.shutdown_hooks.clear();
+        self.save_state_hook = None;
+        self.restore_state_hook = None;
         while let Some(alloc) = self.allocations.pop() {
             drop(alloc);
         }
@@ -260,4 +288,80 @@ pub unsafe fn shutdown_guest_instance(instance: *mut BamInstance) {
         boxed.run_shutdown_hooks();
         drop(boxed);
     });
+}
+
+/// Panic-safe `BamSaveStateFn` trampoline exporting guest state into the host-owned writer (`F-01`).
+///
+/// # Safety
+/// - When `instance` is non-null, it must point to a live [`GuestInstance`] allocated by
+///   [`init_guest_instance`] in this guest binary.
+/// - `writer` and `writer_ctx` must satisfy [`BamStateWriterFn`] for the duration of this call.
+pub unsafe extern "C" fn guest_save_state_trampoline(
+    instance: *mut BamInstance,
+    writer: Option<BamStateWriterFn>,
+    writer_ctx: *mut c_void,
+) -> FfiResult {
+    catch_guest_result(|| {
+        let Some(writer_fn) = writer else {
+            return FfiResult::NULL_POINTER;
+        };
+        if instance.is_null() {
+            return FfiResult::OK;
+        }
+        // SAFETY: `instance` points to a live `GuestInstance` prior to `bevy_abi_mod_shutdown`.
+        let inst = unsafe { &*instance.cast::<GuestInstance>() };
+        let Some(ref hook_cell) = inst.save_state_hook else {
+            return FfiResult::OK;
+        };
+        let Some(blob_res) = hook_cell.try_with_mut(|hook| hook()) else {
+            return FfiResult::ACCESS_CONFLICT;
+        };
+        let bytes = match blob_res {
+            Ok(b) => b,
+            Err(err) => return err,
+        };
+        if bytes.is_empty() {
+            return FfiResult::OK;
+        }
+        // SAFETY: `writer_fn` copies `(bytes.as_ptr(), bytes.len())` into host-owned storage before
+        // returning; `bytes` is dropped on the guest heap immediately afterward.
+        unsafe { writer_fn(writer_ctx, bytes.as_ptr(), bytes.len()) }
+    })
+}
+
+/// Panic-safe `BamRestoreStateFn` trampoline restoring host-buffered state into a newly initialized
+/// [`GuestInstance`] (`F-01`).
+///
+/// # Safety
+/// - When `instance` is non-null, it must point to a live [`GuestInstance`] allocated by
+///   [`init_guest_instance`] in this guest binary.
+/// - When `len > 0`, `bytes` must be non-null and point to `len` initialized readable bytes.
+pub unsafe extern "C" fn guest_restore_state_trampoline(
+    instance: *mut BamInstance,
+    bytes: *const u8,
+    len: usize,
+) -> FfiResult {
+    catch_guest_result(|| {
+        if len > 0 && bytes.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if instance.is_null() {
+            return FfiResult::OK;
+        }
+        // SAFETY: `instance` points to a live `GuestInstance` after `bevy_abi_mod_init`.
+        let inst = unsafe { &*instance.cast::<GuestInstance>() };
+        let Some(ref hook_cell) = inst.restore_state_hook else {
+            return FfiResult::OK;
+        };
+        let slice = if len == 0 {
+            &[]
+        } else {
+            // SAFETY: When `len > 0`, `bytes` is non-null and valid for `len` bytes per caller contract.
+            unsafe { core::slice::from_raw_parts(bytes, len) }
+        };
+        let Some(status) = hook_cell.try_with_mut(|hook| hook(slice)) else {
+            return FfiResult::ACCESS_CONFLICT;
+        };
+        status
+    })
 }

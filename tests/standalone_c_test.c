@@ -448,12 +448,12 @@ static BamHostApi build_mock_host_api(void) {
 static BamHostApi g_guest_api;
 
 static const BamManifest g_guest_manifest = {
-    (uint32_t)sizeof(BamManifest),
-    BAM_ABI_VERSION,
-    "combat_mod",
-    "0.2.0",
-    0u,
-    0u
+    .struct_size = (uint32_t)sizeof(BamManifest),
+    .abi_version = BAM_ABI_VERSION,
+    .name = "combat_mod",
+    .version = "0.2.0",
+    .flags = 0u,
+    .reserved0 = 0u
 };
 
 static const BamManifest* mock_guest_manifest(void) {

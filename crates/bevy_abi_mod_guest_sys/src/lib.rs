@@ -31,19 +31,24 @@ pub use bevy_abi_mod_sys::{BamSystemCtx, FfiBool, FfiResult};
 
 pub use commands::{SpawnEntry, ValidatedCommands};
 pub use component::{
-    generic_drop_trampoline, register_component_raw, register_dynamic_component_with_drop,
-    register_pod_component, resolve_component,
+    PodComponentHooks, generic_drop_trampoline, register_component_raw,
+    register_dynamic_component_with_drop, register_pod_component,
+    register_pod_component_with_hooks, resolve_component,
 };
 pub use host::{CUSTOM_SYMBOL_PREFIX, Host, ValidatedLoadCtx};
-pub use instance::{GuestInstance, init_guest_instance, shutdown_guest_instance};
+pub use instance::{
+    GuestInstance, guest_restore_state_trampoline, guest_save_state_trampoline,
+    init_guest_instance, shutdown_guest_instance,
+};
 pub use iter::{
-    SparseRows, SparseRowsIter, SparseRowsMut, UuidFilter, ValidatedIter, ValidatedSlice,
-    ValidatedSliceMut,
+    ChunkColumnDispenser, SparseRows, SparseRowsIter, SparseRowsMut, UuidFilter, ValidatedIter,
+    ValidatedSlice, ValidatedSliceMut,
 };
 pub use panic::{catch_guest_bool, catch_guest_result, catch_guest_unit};
 pub use trampoline::{
     PreparedRunIf, ReentrantCell, SystemRegistrationConfig, ValidatedSystemInvocation,
-    allocate_run_if_trampoline, allocate_system_trampoline, register_system_closure,
+    ValidatedSystemRef, allocate_run_if_trampoline, allocate_system_trampoline,
+    register_system_closure,
 };
 
 #[cfg(test)]
@@ -382,6 +387,11 @@ mod tests {
             cmd_insert: Some(mock_cmd_insert),
             cmd_insert_default: Some(mock_cmd_insert_default),
             cmd_remove: Some(mock_cmd_remove),
+            par_for_each_chunk: None,
+            sys_entity_get: None,
+            sys_entity_get_mut: None,
+            msg_read_batch: None,
+            msg_send: None,
         }
     }
 

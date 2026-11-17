@@ -2,6 +2,7 @@
 
 //! Workspace build, fixture, header, benchmark, Miri, and CI automation runner (`cargo xtask`).
 
+mod component_header_gen;
 mod header_gen;
 
 use std::env;
@@ -84,11 +85,12 @@ fn run(args: &[String]) -> Result<(), String> {
         "lint" => cmd_lint(rest),
         "ci" => cmd_ci(rest),
         "header" => cmd_header(rest),
+        "gen-component-headers" => cmd_gen_component_headers(rest),
         "bench" => cmd_bench(rest),
         "miri" => cmd_miri(rest),
         "hook" => cmd_hook(rest),
         other => Err(format!(
-            "unknown subcommand `{other}` (expected `fixtures`, `lint`, `ci`, `header`, `bench`, `miri`, or `hook`)"
+            "unknown subcommand `{other}` (expected `fixtures`, `lint`, `ci`, `header`, `gen-component-headers`, `bench`, `miri`, or `hook`)"
         )),
     }
 }
@@ -108,6 +110,9 @@ fn print_help() {
     );
     println!(
         "  header [--check] [--test-c99]               Generate & validate include/bevy_abi_mod.h as strict ISO C99"
+    );
+    println!(
+        "  gen-component-headers [--check]             Generate & validate include/generated/*.h from ModComponent::C_DECL"
     );
     println!(
         "  bench [--permutation] [-- <args>...]        Run Criterion/host benchmarks or full permutation matrix"
@@ -453,6 +458,7 @@ fn build_fixtures_internal(
         "mod_producer",
         "mod_consumer",
         "l05c_clean_mod",
+        "w4_ext_mod",
     ];
     for &stem in c_test_fixtures {
         let compiled = build_c99_test_fixture(root, stem)?;
@@ -855,6 +861,47 @@ fn cmd_header(args: &[String]) -> Result<(), String> {
     verify_c99_header_and_tests(&root, run_standalone)
 }
 
+fn cmd_gen_component_headers(args: &[String]) -> Result<(), String> {
+    let mut check_only = false;
+    for arg in args {
+        match arg.as_str() {
+            "--check" => check_only = true,
+            other => {
+                return Err(format!(
+                    "unsupported `gen-component-headers` flag `{other}` (expected `--check`)"
+                ));
+            }
+        }
+    }
+
+    let root = repo_root()?;
+    component_header_gen::write_or_check_component_headers(&root, check_only)?;
+
+    let cc = c_compiler();
+    let gen_header = root
+        .join("include")
+        .join("generated")
+        .join("testbed_components.h");
+    let mut syntax_cmd = Command::new(&cc);
+    syntax_cmd
+        .current_dir(&root)
+        .args([
+            "-std=c99",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pedantic",
+            "-fsyntax-only",
+            "-x",
+            "c",
+        ])
+        .arg(&gen_header);
+    run_cmd(
+        &mut syntax_cmd,
+        &format!("{cc} -std=c99 -pedantic -fsyntax-only include/generated/testbed_components.h"),
+    )
+}
+
 fn cmd_lint(args: &[String]) -> Result<(), String> {
     let mut quick = false;
     for arg in args {
@@ -893,6 +940,7 @@ fn cmd_lint(args: &[String]) -> Result<(), String> {
     verify_zero_bevy_deps(&root)?;
     verify_forbid_unsafe(&root)?;
     header_gen::write_or_check_header(&root, true)?;
+    component_header_gen::write_or_check_component_headers(&root, true)?;
     verify_c99_header_and_tests(&root, !quick)?;
     check_or_run_bevy_lint(&root)?;
     audit_bevy_idioms(&root)?;
@@ -933,6 +981,7 @@ fn cmd_ci(args: &[String]) -> Result<(), String> {
 
     let fixtures_dir = build_fixtures_internal(&root, false, false)?;
     header_gen::write_or_check_header(&root, true)?;
+    component_header_gen::write_or_check_component_headers(&root, true)?;
     verify_c99_header_and_tests(&root, true)?;
 
     let mut test_cmd = Command::new(cargo_bin());

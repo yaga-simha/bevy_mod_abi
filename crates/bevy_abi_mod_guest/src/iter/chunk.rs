@@ -1,12 +1,15 @@
 //! Safe per-chunk view (`Chunk`) enforcing Rust borrow rules across dense columns, sparse rows,
 //! and fine-grained change-tick marking.
 
-use bevy_abi_mod_guest_sys::{SparseRows, SparseRowsMut, ValidatedIter};
+use bevy_abi_mod_guest_sys::{ChunkColumnDispenser, SparseRows, SparseRowsMut, ValidatedIter};
 use bevy_abi_mod_sys::{AbiPod, BamColumnInfo, FfiEntity, FfiResult};
 
 use crate::{
     component::{GuestComponent, guest_uuid_filter},
-    iter::slice::{ChunkSlice, ChunkSliceMut},
+    iter::{
+        slice::{ChunkSlice, ChunkSliceMut},
+        typed_query::QueryTuple,
+    },
 };
 
 /// Active archetype chunk yielded by [`ChunkIter::next_chunk_view`](crate::ChunkIter::next_chunk_view).
@@ -346,5 +349,44 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
         let filter = guest_uuid_filter::<R>(self.iter.host().manifest_name());
         self.iter
             .resource_mut_checked::<R>(term_index, Some(filter))
+    }
+
+    /// Dispenses all column slices declared by [`QueryTuple`] `Q` from this chunk without magic
+    /// column index literals (`G-03`).
+    #[inline]
+    pub fn typed<Q: QueryTuple>(&mut self) -> Result<Q::Slices<'_>, FfiResult> {
+        let mut dispenser = ChunkColumnDispenser::new(self.iter);
+        Q::fetch_slices(&mut dispenser)
+    }
+
+    /// Drains unread POD messages (`M: AbiPod`) from `term_index` (`F-02`).
+    #[inline]
+    pub fn read_pod_messages<M: AbiPod>(&mut self, term_index: usize) -> Result<Vec<M>, FfiResult> {
+        self.iter.drain_messages_checked::<M>(term_index, None)
+    }
+
+    /// Drains unread messages (`M: GuestComponent`) from `term_index`, validating `M`'s UUID (`F-02`).
+    #[inline]
+    pub fn read_messages<M: GuestComponent>(
+        &mut self,
+        term_index: usize,
+    ) -> Result<Vec<M>, FfiResult> {
+        let filter = guest_uuid_filter::<M>(self.iter.host().manifest_name());
+        self.iter
+            .drain_messages_checked::<M>(term_index, Some(filter))
+    }
+
+    /// Sends a POD message (`M: AbiPod`) on `term_index` declared with `MESSAGE_WRITE` (`F-02`).
+    #[inline]
+    pub fn send_pod_message<M: AbiPod>(&mut self, term_index: usize, msg: &M) -> FfiResult {
+        self.iter.send_message_checked::<M>(term_index, None, msg)
+    }
+
+    /// Sends a message (`M: GuestComponent`) on `term_index`, validating `M`'s UUID (`F-02`).
+    #[inline]
+    pub fn send_message<M: GuestComponent>(&mut self, term_index: usize, msg: &M) -> FfiResult {
+        let filter = guest_uuid_filter::<M>(self.iter.host().manifest_name());
+        self.iter
+            .send_message_checked::<M>(term_index, Some(filter), msg)
     }
 }

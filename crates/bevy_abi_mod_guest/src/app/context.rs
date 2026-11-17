@@ -2,16 +2,19 @@
 
 use core::ffi::{CStr, c_void};
 
-use bevy_abi_mod_guest_sys::{Host, ValidatedIter, ValidatedSystemInvocation, resolve_component};
+use bevy_abi_mod_guest_sys::{
+    Host, ValidatedIter, ValidatedSystemInvocation, ValidatedSystemRef, resolve_component,
+};
 use bevy_abi_mod_sys::{
-    AbiPod, BamComponent, BamHostApi, BamSystemCtx, ComponentUuid, FfiResult,
+    AbiPod, BamComponent, BamHostApi, BamSystemCtx, ComponentUuid, FfiEntity, FfiResult,
     MAX_QUERIES_PER_SYSTEM,
 };
 
 use crate::{
+    app::builder::IntoSystemResult,
     commands::GuestCommands,
-    component::{GuestComponent, resolve_guest_component},
-    iter::ChunkIter,
+    component::{GuestComponent, guest_uuid_filter, resolve_guest_component},
+    iter::{Chunk, ChunkIter, QueryTuple, TypedChunkIter},
 };
 
 /// Safe context passed to `.run_if(...)` condition closures.
@@ -78,7 +81,7 @@ impl<'a> RunConditionContext<'a> {
 /// (`resource`, `resource_mut`), and handle/batched [`GuestCommands`].
 pub struct SystemContext<'a> {
     host: &'a Host,
-    raw_sys_ctx: *mut BamSystemCtx,
+    sys_ref: ValidatedSystemRef<'a>,
     user_query_count: usize,
     queries: [Option<ChunkIter<'a>>; MAX_QUERIES_PER_SYSTEM],
     resource_query: Option<ChunkIter<'a>>,
@@ -92,7 +95,7 @@ pub type MultiQueryContext<'a> = SystemContext<'a>;
 impl<'a> SystemContext<'a> {
     pub(crate) fn from_invocation(inv: &mut ValidatedSystemInvocation<'a>) -> Self {
         let host = inv.host();
-        let raw_sys_ctx = inv.as_raw_sys_ctx();
+        let sys_ref = inv.system_ref();
         let user_query_count = inv.query_count();
         let mut queries: [Option<ChunkIter<'a>>; MAX_QUERIES_PER_SYSTEM] =
             [const { None }; MAX_QUERIES_PER_SYSTEM];
@@ -106,7 +109,7 @@ impl<'a> SystemContext<'a> {
         let commands = GuestCommands::from_validated(inv.take_commands());
         Self {
             host,
-            raw_sys_ctx,
+            sys_ref,
             user_query_count,
             queries,
             resource_query,
@@ -130,7 +133,7 @@ impl<'a> SystemContext<'a> {
     /// Returns the raw `*mut BamSystemCtx` pointer for low-level FFI helpers.
     #[inline]
     pub const fn as_raw_ptr(&self) -> *mut BamSystemCtx {
-        self.raw_sys_ctx
+        self.sys_ref.as_raw_sys_ctx()
     }
 
     /// Reads the most recent human-readable UTF-8 diagnostic recorded on this world's host context.
@@ -286,6 +289,205 @@ impl<'a> SystemContext<'a> {
                 .first_mut()?
                 .as_mut()?
                 .component_resource_mut::<R>(decl_index)
+        }
+    }
+
+    /// Processes primary query `0` chunks in parallel across the host `ComputeTaskPool` (`P-07`).
+    #[inline]
+    pub fn par_chunks<F>(&mut self, f: F) -> FfiResult
+    where
+        F: Fn(Chunk<'_, '_>) + Sync,
+    {
+        self.iter().par_for_each(f)
+    }
+
+    /// Fallible variant of [`Self::par_chunks`] propagating non-`OK` [`IntoSystemResult`] returns (`P-07`).
+    #[inline]
+    pub fn par_try_chunks<F, R>(&mut self, f: F) -> FfiResult
+    where
+        F: Fn(Chunk<'_, '_>) -> R + Sync,
+        R: IntoSystemResult,
+    {
+        self.iter().par_try_for_each(f)
+    }
+
+    /// Borrows primary query `0` as a [`TypedChunkIter`] for [`QueryTuple`] `Q` without magic
+    /// column index literals (`G-03`).
+    #[inline]
+    pub fn single_query<Q: QueryTuple>(&mut self) -> TypedChunkIter<'_, 'a, Q> {
+        self.iter().typed::<Q>()
+    }
+
+    /// Simultaneously borrows primary query `0` as a [`TypedChunkIter`] alongside [`GuestCommands`] (`G-03`).
+    #[inline]
+    pub fn single_query_and_commands<Q: QueryTuple>(
+        &mut self,
+    ) -> (TypedChunkIter<'_, 'a, Q>, &mut GuestCommands<'a>) {
+        let (iter, cmds) = self.iter_and_commands();
+        (iter.typed::<Q>(), cmds)
+    }
+
+    /// Borrows declared query `index` (`0..query_count()`) as a [`TypedChunkIter`] for [`QueryTuple`] `Q` (`G-03`).
+    #[inline]
+    pub fn query_typed<Q: QueryTuple>(
+        &mut self,
+        index: usize,
+    ) -> Option<TypedChunkIter<'_, 'a, Q>> {
+        Some(self.query_mut(index)?.typed::<Q>())
+    }
+
+    /// Simultaneously borrows two distinct queries as [`TypedChunkIter`]s (`G-03`).
+    #[inline]
+    pub fn queries_2_typed<Q1: QueryTuple, Q2: QueryTuple>(
+        &mut self,
+        idx_a: usize,
+        idx_b: usize,
+    ) -> Option<(TypedChunkIter<'_, 'a, Q1>, TypedChunkIter<'_, 'a, Q2>)> {
+        let (qa, qb) = self.queries_2_mut(idx_a, idx_b)?;
+        Some((qa.typed::<Q1>(), qb.typed::<Q2>()))
+    }
+
+    /// Looks up a shared `&T` (`T: GuestComponent`) on `entity` using declared access on
+    /// `(query_index, term_index)`, verifying `T`'s UUID (`F-03`).
+    #[inline]
+    pub fn get<T: GuestComponent>(
+        &self,
+        query_index: usize,
+        term_index: usize,
+        entity: FfiEntity,
+    ) -> Option<&T> {
+        if query_index >= self.user_query_count {
+            return None;
+        }
+        let q = self.queries[query_index].as_ref()?;
+        let filter = guest_uuid_filter::<T>(self.host.manifest_name());
+        self.sys_ref.entity_get_checked::<T>(
+            &q.inner,
+            query_index,
+            term_index,
+            entity,
+            Some(filter),
+        )
+    }
+
+    /// Looks up an exclusive `&mut T` (`T: GuestComponent`) on `entity` using declared writable
+    /// access on `(query_index, term_index)`, marking Bevy change ticks and verifying `T`'s UUID (`F-03`).
+    #[inline]
+    pub fn get_mut<T: GuestComponent>(
+        &mut self,
+        query_index: usize,
+        term_index: usize,
+        entity: FfiEntity,
+    ) -> Option<&mut T> {
+        if query_index >= self.user_query_count {
+            return None;
+        }
+        let q = self.queries[query_index].as_mut()?;
+        let filter = guest_uuid_filter::<T>(self.host.manifest_name());
+        self.sys_ref.entity_get_mut_checked::<T>(
+            &mut q.inner,
+            query_index,
+            term_index,
+            entity,
+            Some(filter),
+        )
+    }
+
+    /// Looks up a shared `&T` (`T: AbiPod`) on `entity` using declared access on
+    /// `(query_index, term_index)` (`F-03`).
+    #[inline]
+    pub fn get_pod<T: AbiPod>(
+        &self,
+        query_index: usize,
+        term_index: usize,
+        entity: FfiEntity,
+    ) -> Option<&T> {
+        if query_index >= self.user_query_count {
+            return None;
+        }
+        let q = self.queries[query_index].as_ref()?;
+        self.sys_ref
+            .entity_get_checked::<T>(&q.inner, query_index, term_index, entity, None)
+    }
+
+    /// Looks up an exclusive `&mut T` (`T: AbiPod`) on `entity` using declared writable access on
+    /// `(query_index, term_index)` (`F-03`).
+    #[inline]
+    pub fn get_pod_mut<T: AbiPod>(
+        &mut self,
+        query_index: usize,
+        term_index: usize,
+        entity: FfiEntity,
+    ) -> Option<&mut T> {
+        if query_index >= self.user_query_count {
+            return None;
+        }
+        let q = self.queries[query_index].as_mut()?;
+        self.sys_ref.entity_get_mut_checked::<T>(
+            &mut q.inner,
+            query_index,
+            term_index,
+            entity,
+            None,
+        )
+    }
+
+    /// Drains unread messages (`M: GuestComponent`) declared at `decl_index`, validating `M`'s UUID (`F-02`).
+    #[inline]
+    pub fn read_messages<M: GuestComponent>(
+        &mut self,
+        decl_index: usize,
+    ) -> Result<Vec<M>, FfiResult> {
+        if let Some(ref mut res_q) = self.resource_query {
+            res_q.read_messages::<M>(decl_index)
+        } else {
+            self.queries
+                .first_mut()
+                .and_then(Option::as_mut)
+                .ok_or(FfiResult::OUT_OF_RANGE)?
+                .read_messages::<M>(decl_index)
+        }
+    }
+
+    /// Drains unread POD messages (`M: AbiPod`) declared at `decl_index` (`F-02`).
+    #[inline]
+    pub fn read_pod_messages<M: AbiPod>(&mut self, decl_index: usize) -> Result<Vec<M>, FfiResult> {
+        if let Some(ref mut res_q) = self.resource_query {
+            res_q.read_pod_messages::<M>(decl_index)
+        } else {
+            self.queries
+                .first_mut()
+                .and_then(Option::as_mut)
+                .ok_or(FfiResult::OUT_OF_RANGE)?
+                .read_pod_messages::<M>(decl_index)
+        }
+    }
+
+    /// Appends a message (`M: GuestComponent`) to the stream declared with `MESSAGE_WRITE` at
+    /// `decl_index`, validating `M`'s UUID (`F-02`).
+    #[inline]
+    pub fn send_message<M: GuestComponent>(&mut self, decl_index: usize, msg: &M) -> FfiResult {
+        if let Some(ref mut res_q) = self.resource_query {
+            res_q.send_message::<M>(decl_index, msg)
+        } else {
+            match self.queries.first_mut().and_then(Option::as_mut) {
+                Some(q) => q.send_message::<M>(decl_index, msg),
+                None => FfiResult::OUT_OF_RANGE,
+            }
+        }
+    }
+
+    /// Appends a POD message (`M: AbiPod`) to the stream declared with `MESSAGE_WRITE` at
+    /// `decl_index` (`F-02`).
+    #[inline]
+    pub fn send_pod_message<M: AbiPod>(&mut self, decl_index: usize, msg: &M) -> FfiResult {
+        if let Some(ref mut res_q) = self.resource_query {
+            res_q.send_pod_message::<M>(decl_index, msg)
+        } else {
+            match self.queries.first_mut().and_then(Option::as_mut) {
+                Some(q) => q.send_pod_message::<M>(decl_index, msg),
+                None => FfiResult::OUT_OF_RANGE,
+            }
         }
     }
 }

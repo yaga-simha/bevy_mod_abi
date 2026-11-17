@@ -16,6 +16,8 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
 
     let is_raw_insertable = state.can_impl_raw_insertable;
     let is_abi_pod = state.can_impl_raw_insertable && state.can_impl_abi_pod;
+    let (c_decl_str, zig_decl_str) =
+        crate::codegen::c_decl::generate_decls(state, vtable_ident, is_abi_pod);
 
     let canonical_name_expr = state.canonical_name.as_str_expr();
     let canonical_cstr_bytes_expr = state.canonical_name.as_nul_bytes_expr();
@@ -358,6 +360,8 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
                 const IS_ABI_POD: bool = #is_abi_pod;
                 const IS_RAW_INSERTABLE: bool = #is_raw_insertable;
                 const COMPONENT_FLAGS: u32 = #component_flags_expr;
+                const C_DECL: &'static str = #c_decl_str;
+                const ZIG_DECL: &'static str = #zig_decl_str;
 
                 type VTable = #vtable_ident;
 

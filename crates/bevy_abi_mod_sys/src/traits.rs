@@ -171,6 +171,12 @@ pub trait ModComponent: Sized + 'static {
     /// Component registration flags (`BAM_COMPONENT_FLAG_*`, default `0`).
     const COMPONENT_FLAGS: u32 = 0;
 
+    /// Auto-generated ISO C99 struct, VTable, and layout assertion declarations (`M-07`).
+    const C_DECL: &'static str = "";
+
+    /// Auto-generated Zig `extern struct` and VTable declarations (`M-07`).
+    const ZIG_DECL: &'static str = "";
+
     /// Generated `#[repr(C)]` VTable struct prefixed at offset `0` by [`crate::VTableHeader`].
     type VTable: Copy + 'static;
 

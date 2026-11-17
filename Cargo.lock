@@ -352,6 +352,7 @@ dependencies = [
  "bevy_abi_mod_macros",
  "bevy_abi_mod_sys",
  "bevy_app",
+ "bevy_diagnostic",
  "bevy_ecs",
  "bevy_platform",
  "libloading",
@@ -370,6 +371,7 @@ dependencies = [
  "bevy_app",
  "bevy_ecs",
  "bevy_platform",
+ "bevy_tasks",
  "libloading",
  "loom",
  "nonmax",
@@ -925,10 +927,12 @@ version = "0.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "84c634a7f09e9ccd26137a2f541ab670c84854a1af4107fecca1541cfcd1b466"
 dependencies = [
+ "async-channel",
  "async-executor",
  "async-task",
  "atomic-waker",
  "bevy_platform",
+ "concurrent-queue",
  "crossbeam-queue",
  "derive_more",
  "futures-lite",
@@ -5268,6 +5272,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "bevy_abi_mod_macros",
  "bevy_abi_mod_sys",
 ]
 

@@ -13,7 +13,10 @@ use bevy_abi_mod_sys::{
 
 use crate::{
     app::context::{RunConditionContext, SystemContext},
-    component::{GuestComponent, qualify_component_identity, resolve_guest_component},
+    component::{
+        GuestComponent, GuestComponentHooks, qualify_component_identity, resolve_guest_component,
+    },
+    iter::typed_query::QueryTuple,
 };
 
 mod private {
@@ -187,6 +190,51 @@ impl<'a> GuestApp<'a> {
             .register_pod_component::<T>(self.instance, name, uuid, flags)
     }
 
+    /// Registers `T: GuestComponent` with optional `on_add` and `on_remove` hooks (`F-04`).
+    #[inline]
+    pub fn register_component_with_hooks<T: GuestComponent>(
+        &mut self,
+        hooks: GuestComponentHooks<T>,
+    ) -> Result<BamComponent, FfiResult> {
+        self.register_component_with_flags_and_hooks::<T>(T::FLAGS, hooks)
+    }
+
+    /// Registers `T: GuestComponent` with explicit `flags` and optional `on_add` / `on_remove`
+    /// hooks (`F-04`).
+    pub fn register_component_with_flags_and_hooks<T: GuestComponent>(
+        &mut self,
+        flags: u32,
+        hooks: GuestComponentHooks<T>,
+    ) -> Result<BamComponent, FfiResult> {
+        let (qualified_name, uuid) =
+            qualify_component_identity::<T>(self.instance.manifest_name())?;
+        self.load_ctx.register_pod_component_with_hooks::<T>(
+            self.instance,
+            qualified_name.as_c_str(),
+            uuid,
+            flags,
+            hooks.inner,
+        )
+    }
+
+    /// Registers a hot-reload state snapshot callback invoked prior to `bevy_abi_mod_shutdown` (`F-01`).
+    #[inline]
+    pub fn on_save_state<F>(&mut self, hook: F)
+    where
+        F: FnMut() -> Result<Vec<u8>, FfiResult> + Send + 'static,
+    {
+        self.instance.set_save_state_hook(hook);
+    }
+
+    /// Registers a hot-reload state restoration callback invoked after `bevy_abi_mod_init` (`F-01`).
+    #[inline]
+    pub fn on_restore_state<F>(&mut self, hook: F)
+    where
+        F: FnMut(&[u8]) -> FfiResult + Send + 'static,
+    {
+        self.instance.set_restore_state_hook(hook);
+    }
+
     /// Allocates guest-owned data inside this per-World [`GuestInstance`], returning a stable
     /// `*mut T` valid until `bevy_abi_mod_shutdown` (or freed immediately on init failure).
     #[inline]
@@ -333,6 +381,20 @@ impl<'b> QueryBuilder<'b> {
         self
     }
 
+    /// Appends a buffered message stream reader (`MessageReader<M>`) term (`F-02`).
+    #[inline]
+    pub fn message_read<M: GuestComponent>(mut self) -> Self {
+        self.push_guest_term::<M>(AccessMode::MESSAGE_READ);
+        self
+    }
+
+    /// Appends a buffered message stream writer (`MessageWriter<M>`) term (`F-02`).
+    #[inline]
+    pub fn message_write<M: GuestComponent>(mut self) -> Self {
+        self.push_guest_term::<M>(AccessMode::MESSAGE_WRITE);
+        self
+    }
+
     /// Appends a pre-resolved [`BamComponent`] handle with explicit [`AccessMode`].
     #[inline]
     pub fn term(mut self, component: BamComponent, mode: AccessMode) -> Self {
@@ -410,6 +472,20 @@ impl<'b> QueryBuilder<'b> {
         self
     }
 
+    /// Appends a pre-resolved `MessageReader<M>` handle term (`F-02`).
+    #[inline]
+    pub fn message_read_handle(mut self, component: BamComponent) -> Self {
+        self.push_term(component, AccessMode::MESSAGE_READ);
+        self
+    }
+
+    /// Appends a pre-resolved `MessageWriter<M>` handle term (`F-02`).
+    #[inline]
+    pub fn message_write_handle(mut self, component: BamComponent) -> Self {
+        self.push_term(component, AccessMode::MESSAGE_WRITE);
+        self
+    }
+
     /// Resolves `name` (with optional `uuid`) on the host and appends a term with `mode`.
     #[inline]
     pub fn term_named(
@@ -474,6 +550,21 @@ impl<'b, 'a> SystemBuilder<'b, 'a> {
         self
     }
 
+    /// Appends a typed query clause derived from [`QueryTuple`] `Q` (`G-03`), matching
+    /// [`SystemContext::single_query`] / [`SystemContext::query_typed`] without magic column indices.
+    pub fn query_typed<Q: QueryTuple>(mut self) -> Self {
+        if self.queries.len() >= MAX_QUERIES_PER_SYSTEM {
+            self.record_error(FfiResult::CAPACITY_EXCEEDED);
+            return self;
+        }
+        let host = *self.app.host();
+        match Q::collect_descs(&host, host.manifest_name()) {
+            Ok(terms) => self.queries.push(terms),
+            Err(err) => self.record_error(err),
+        }
+        self
+    }
+
     #[inline]
     fn push_system_resource_handle(&mut self, component: BamComponent, mode: AccessMode) {
         if !component.is_valid() {
@@ -519,6 +610,40 @@ impl<'b, 'a> SystemBuilder<'b, 'a> {
     #[inline]
     pub fn resource_write_handle(mut self, component: BamComponent) -> Self {
         self.push_system_resource_handle(component, AccessMode::RESOURCE_WRITE);
+        self
+    }
+
+    /// Declares a buffered message stream reader (`MessageReader<M>`) accessible via
+    /// [`SystemContext::read_messages`] at declaration index (`0, 1, ...`) (`F-02`).
+    pub fn message_read<M: GuestComponent>(mut self) -> Self {
+        match self.app.resolve_component::<M>() {
+            Ok(comp) => self.push_system_resource_handle(comp, AccessMode::MESSAGE_READ),
+            Err(err) => self.record_error(err),
+        }
+        self
+    }
+
+    /// Declares a buffered message stream writer (`MessageWriter<M>`) accessible via
+    /// [`SystemContext::send_message`] at declaration index (`0, 1, ...`) (`F-02`).
+    pub fn message_write<M: GuestComponent>(mut self) -> Self {
+        match self.app.resolve_component::<M>() {
+            Ok(comp) => self.push_system_resource_handle(comp, AccessMode::MESSAGE_WRITE),
+            Err(err) => self.record_error(err),
+        }
+        self
+    }
+
+    /// Declares a buffered message stream reader using a pre-resolved [`BamComponent`] handle (`F-02`).
+    #[inline]
+    pub fn message_read_handle(mut self, component: BamComponent) -> Self {
+        self.push_system_resource_handle(component, AccessMode::MESSAGE_READ);
+        self
+    }
+
+    /// Declares a buffered message stream writer using a pre-resolved [`BamComponent`] handle (`F-02`).
+    #[inline]
+    pub fn message_write_handle(mut self, component: BamComponent) -> Self {
+        self.push_system_resource_handle(component, AccessMode::MESSAGE_WRITE);
         self
     }
 

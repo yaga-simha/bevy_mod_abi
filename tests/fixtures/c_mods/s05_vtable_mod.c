@@ -10,12 +10,12 @@ static void guest_drop_hook(void* ptr) {
 }
 
 static const BamManifest MANIFEST = {
-    (uint32_t)sizeof(BamManifest),
-    BAM_ABI_VERSION,
-    "s05_vtable_mod",
-    "0.2.0",
-    0u,
-    0u
+    .struct_size = (uint32_t)sizeof(BamManifest),
+    .abi_version = BAM_ABI_VERSION,
+    .name = "s05_vtable_mod",
+    .version = "0.2.0",
+    .flags = 0u,
+    .reserved0 = 0u
 };
 
 BAM_EXPORT const BamManifest* bevy_abi_mod_manifest(void) {

@@ -146,6 +146,8 @@ typedef uint32_t BamAccessMode;
 #define BAM_ACCESS_ADDED          ((BamAccessMode)7u)
 #define BAM_ACCESS_RESOURCE_READ  ((BamAccessMode)8u)
 #define BAM_ACCESS_RESOURCE_WRITE ((BamAccessMode)9u)
+#define BAM_ACCESS_MESSAGE_READ   ((BamAccessMode)10u)
+#define BAM_ACCESS_MESSAGE_WRITE  ((BamAccessMode)11u)
 
 typedef uint32_t BamScheduleId;
 #define BAM_SCHEDULE_UPDATE       ((BamScheduleId)0u)
@@ -167,6 +169,7 @@ typedef uint32_t BamScheduleId;
 #define BAM_STORAGE_FLAG_SPARSE_SET   0x00000001u
 #define BAM_STORAGE_FLAG_IMMUTABLE    0x00000002u
 #define BAM_STORAGE_FLAG_RESOURCE     0x00000004u
+#define BAM_STORAGE_FLAG_MESSAGE      0x00000008u
 
 /* ==========================================================================
 * 4. Opaque Context Handles, Wire Descriptors & Function Pointer Typedefs
@@ -191,6 +194,10 @@ typedef struct BamComponentUuid {
 uint8_t bytes[16];
 } BamComponentUuid;
 
+typedef BamResult (*BamStateWriterFn)(void* ctx, const uint8_t* bytes, size_t len);
+typedef BamResult (*BamSaveStateFn)(BamInstance* instance, BamStateWriterFn writer, void* writer_ctx);
+typedef BamResult (*BamRestoreStateFn)(BamInstance* instance, const uint8_t* bytes, size_t len);
+
 typedef struct BamManifest {
 uint32_t    struct_size;
 uint32_t    abi_version;
@@ -198,9 +205,17 @@ const char* name;
 const char* version;
 uint32_t    flags;
 uint32_t    reserved0;
+#if defined(__cplusplus) && (__cplusplus >= 201402L)
+BamSaveStateFn    save_state    = nullptr;
+BamRestoreStateFn restore_state = nullptr;
+#else
+BamSaveStateFn    save_state;
+BamRestoreStateFn restore_state;
+#endif
 } BamManifest;
 
 typedef void      (*BamComponentDropFn)(void* ptr);
+typedef void      (*BamComponentHookFn)(BamEntity entity, const void* data_ptr, void* user_data);
 typedef BamResult (*BamSystemFn)(BamSystemCtx* sys_ctx, void* user_data);
 typedef BamBool   (*BamRunIfFn)(void* user_data);
 
@@ -244,6 +259,15 @@ size_t             size;
 size_t             align;
 BamComponentDropFn drop_fn;
 const void*        vtable_ptr;
+#if defined(__cplusplus) && (__cplusplus >= 201402L)
+BamComponentHookFn on_add         = nullptr;
+BamComponentHookFn on_remove      = nullptr;
+void*              hook_user_data = nullptr;
+#else
+BamComponentHookFn on_add;
+BamComponentHookFn on_remove;
+void*              hook_user_data;
+#endif
 } BamComponentDesc;
 
 typedef struct BamColumnInfo {
@@ -308,6 +332,14 @@ typedef BamResult (*BamCmdInsertFn)(BamCommands* commands, BamEntity entity, Bam
 typedef BamResult (*BamCmdInsertDefaultFn)(BamCommands* commands, BamEntity entity, BamComponent component);
 typedef BamResult (*BamCmdRemoveFn)(BamCommands* commands, BamEntity entity, BamComponent component);
 
+/* --- 7. Optional Wave 4 Engine Extension Slots (`P-07`, `F-02`, `F-03`) --- */
+typedef BamResult      (*BamChunkTaskFn)(BamIter* iter, void* user_data);
+typedef BamResult      (*BamParForEachChunkFn)(BamIter* iter, BamChunkTaskFn chunk_fn, void* user_data);
+typedef const uint8_t* (*BamSysEntityGetFn)(const BamSystemCtx* sys_ctx, size_t query_index, BamEntity entity, size_t term_index);
+typedef uint8_t*       (*BamSysEntityGetMutFn)(BamSystemCtx* sys_ctx, size_t query_index, BamEntity entity, size_t term_index);
+typedef BamResult      (*BamMsgReadBatchFn)(BamIter* iter, size_t term_index, uint8_t* out_buf, size_t max_count, size_t* out_read);
+typedef BamResult      (*BamMsgSendFn)(BamIter* iter, size_t term_index, const uint8_t* data_ptr, size_t data_len);
+
 struct BamHostApi {
 uint32_t struct_size;
 uint32_t abi_version;
@@ -350,6 +382,13 @@ BamCmdDespawnFn       cmd_despawn;
 BamCmdInsertFn        cmd_insert;
 BamCmdInsertDefaultFn cmd_insert_default;
 BamCmdRemoveFn        cmd_remove;
+
+/* Optional Wave 4 engine extension slots (appended after `BAM_HOST_API_MIN_V0_2_SIZE`) */
+BamParForEachChunkFn par_for_each_chunk;
+BamSysEntityGetFn    sys_entity_get;
+BamSysEntityGetMutFn sys_entity_get_mut;
+BamMsgReadBatchFn    msg_read_batch;
+BamMsgSendFn         msg_send;
 };
 
 #define BAM_MANIFEST_MIN_V0_2_SIZE       (offsetof(BamManifest, reserved0) + sizeof(uint32_t))
@@ -655,7 +694,7 @@ BAM_STATIC_ASSERT(sizeof(BamStrView) == 16u, bam_str_view_size_64);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamStrView) == 8u, bam_str_view_align_64);
 BAM_STATIC_ASSERT(offsetof(BamStrView, ptr) == 0u, bam_str_view_off_ptr_64);
 BAM_STATIC_ASSERT(offsetof(BamStrView, len) == 8u, bam_str_view_off_len_64);
-BAM_STATIC_ASSERT(sizeof(BamManifest) == 32u, bam_manifest_size_64);
+BAM_STATIC_ASSERT(sizeof(BamManifest) == 48u, bam_manifest_size_64);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamManifest) == 8u, bam_manifest_align_64);
 BAM_STATIC_ASSERT(offsetof(BamManifest, struct_size) == 0u, bam_manifest_off_struct_size_64);
 BAM_STATIC_ASSERT(offsetof(BamManifest, abi_version) == 4u, bam_manifest_off_abi_version_64);
@@ -663,6 +702,8 @@ BAM_STATIC_ASSERT(offsetof(BamManifest, name) == 8u, bam_manifest_off_name_64);
 BAM_STATIC_ASSERT(offsetof(BamManifest, version) == 16u, bam_manifest_off_version_64);
 BAM_STATIC_ASSERT(offsetof(BamManifest, flags) == 24u, bam_manifest_off_flags_64);
 BAM_STATIC_ASSERT(offsetof(BamManifest, reserved0) == 28u, bam_manifest_off_reserved0_64);
+BAM_STATIC_ASSERT(offsetof(BamManifest, save_state) == 32u, bam_manifest_off_save_state_64);
+BAM_STATIC_ASSERT(offsetof(BamManifest, restore_state) == 40u, bam_manifest_off_restore_state_64);
 BAM_STATIC_ASSERT(sizeof(BamTermDesc) == 12u, bam_term_desc_size_64);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamTermDesc) == 4u, bam_term_desc_align_64);
 BAM_STATIC_ASSERT(offsetof(BamTermDesc, component) == 0u, bam_term_desc_off_component_64);
@@ -691,7 +732,7 @@ BAM_STATIC_ASSERT(offsetof(BamSystemDesc, before) == 72u, bam_system_desc_off_be
 BAM_STATIC_ASSERT(offsetof(BamSystemDesc, before_count) == 80u, bam_system_desc_off_before_count_64);
 BAM_STATIC_ASSERT(offsetof(BamSystemDesc, run_if) == 88u, bam_system_desc_off_run_if_64);
 BAM_STATIC_ASSERT(offsetof(BamSystemDesc, run_if_user_data) == 96u, bam_system_desc_off_run_if_user_data_64);
-BAM_STATIC_ASSERT(sizeof(BamComponentDesc) == 64u, bam_component_desc_size_64);
+BAM_STATIC_ASSERT(sizeof(BamComponentDesc) == 88u, bam_component_desc_size_64);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamComponentDesc) == 8u, bam_component_desc_align_64);
 BAM_STATIC_ASSERT(offsetof(BamComponentDesc, struct_size) == 0u, bam_component_desc_off_struct_size_64);
 BAM_STATIC_ASSERT(offsetof(BamComponentDesc, flags) == 4u, bam_component_desc_off_flags_64);
@@ -701,6 +742,9 @@ BAM_STATIC_ASSERT(offsetof(BamComponentDesc, size) == 32u, bam_component_desc_of
 BAM_STATIC_ASSERT(offsetof(BamComponentDesc, align) == 40u, bam_component_desc_off_align_64);
 BAM_STATIC_ASSERT(offsetof(BamComponentDesc, drop_fn) == 48u, bam_component_desc_off_drop_fn_64);
 BAM_STATIC_ASSERT(offsetof(BamComponentDesc, vtable_ptr) == 56u, bam_component_desc_off_vtable_ptr_64);
+BAM_STATIC_ASSERT(offsetof(BamComponentDesc, on_add) == 64u, bam_component_desc_off_on_add_64);
+BAM_STATIC_ASSERT(offsetof(BamComponentDesc, on_remove) == 72u, bam_component_desc_off_on_remove_64);
+BAM_STATIC_ASSERT(offsetof(BamComponentDesc, hook_user_data) == 80u, bam_component_desc_off_hook_user_data_64);
 BAM_STATIC_ASSERT(sizeof(BamColumnInfo) == 48u, bam_column_info_size_64);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamColumnInfo) == 8u, bam_column_info_align_64);
 BAM_STATIC_ASSERT(offsetof(BamColumnInfo, component) == 0u, bam_column_info_off_component_64);
@@ -717,7 +761,7 @@ BAM_STATIC_ASSERT(offsetof(BamVTableHeader, abi_version) == 4u, bam_vtable_heade
 BAM_STATIC_ASSERT(offsetof(BamVTableHeader, uuid) == 8u, bam_vtable_header_off_uuid_64);
 BAM_STATIC_ASSERT(offsetof(BamVTableHeader, size) == 24u, bam_vtable_header_off_size_64);
 BAM_STATIC_ASSERT(offsetof(BamVTableHeader, align) == 32u, bam_vtable_header_off_align_64);
-BAM_STATIC_ASSERT(sizeof(BamHostApi) == 224u, bam_host_api_size_64);
+BAM_STATIC_ASSERT(sizeof(BamHostApi) == 264u, bam_host_api_size_64);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamHostApi) == 8u, bam_host_api_align_64);
 BAM_STATIC_ASSERT(offsetof(BamHostApi, struct_size) == 0u, bam_host_api_off_struct_size_64);
 BAM_STATIC_ASSERT(offsetof(BamHostApi, abi_version) == 4u, bam_host_api_off_abi_version_64);
@@ -748,6 +792,11 @@ BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_despawn) == 192u, bam_host_api_off_cm
 BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_insert) == 200u, bam_host_api_off_cmd_insert_64);
 BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_insert_default) == 208u, bam_host_api_off_cmd_insert_default_64);
 BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_remove) == 216u, bam_host_api_off_cmd_remove_64);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, par_for_each_chunk) == 224u, bam_host_api_off_par_for_each_chunk_64);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, sys_entity_get) == 232u, bam_host_api_off_sys_entity_get_64);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, sys_entity_get_mut) == 240u, bam_host_api_off_sys_entity_get_mut_64);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, msg_read_batch) == 248u, bam_host_api_off_msg_read_batch_64);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, msg_send) == 256u, bam_host_api_off_msg_send_64);
 BAM_STATIC_ASSERT(BAM_MANIFEST_MIN_V0_2_SIZE == 32u, bam_manifest_min_64);
 BAM_STATIC_ASSERT(BAM_QUERY_DESC_MIN_V0_2_SIZE == 24u, bam_query_desc_min_64);
 BAM_STATIC_ASSERT(BAM_SYSTEM_DESC_MIN_V0_2_SIZE == 104u, bam_system_desc_min_64);
@@ -762,7 +811,7 @@ BAM_STATIC_ASSERT(sizeof(BamStrView) == 8u, bam_str_view_size_32);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamStrView) == 4u, bam_str_view_align_32);
 BAM_STATIC_ASSERT(offsetof(BamStrView, ptr) == 0u, bam_str_view_off_ptr_32);
 BAM_STATIC_ASSERT(offsetof(BamStrView, len) == 4u, bam_str_view_off_len_32);
-BAM_STATIC_ASSERT(sizeof(BamManifest) == 24u, bam_manifest_size_32);
+BAM_STATIC_ASSERT(sizeof(BamManifest) == 32u, bam_manifest_size_32);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamManifest) == 4u, bam_manifest_align_32);
 BAM_STATIC_ASSERT(offsetof(BamManifest, struct_size) == 0u, bam_manifest_off_struct_size_32);
 BAM_STATIC_ASSERT(offsetof(BamManifest, abi_version) == 4u, bam_manifest_off_abi_version_32);
@@ -770,6 +819,8 @@ BAM_STATIC_ASSERT(offsetof(BamManifest, name) == 8u, bam_manifest_off_name_32);
 BAM_STATIC_ASSERT(offsetof(BamManifest, version) == 12u, bam_manifest_off_version_32);
 BAM_STATIC_ASSERT(offsetof(BamManifest, flags) == 16u, bam_manifest_off_flags_32);
 BAM_STATIC_ASSERT(offsetof(BamManifest, reserved0) == 20u, bam_manifest_off_reserved0_32);
+BAM_STATIC_ASSERT(offsetof(BamManifest, save_state) == 24u, bam_manifest_off_save_state_32);
+BAM_STATIC_ASSERT(offsetof(BamManifest, restore_state) == 28u, bam_manifest_off_restore_state_32);
 BAM_STATIC_ASSERT(sizeof(BamTermDesc) == 12u, bam_term_desc_size_32);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamTermDesc) == 4u, bam_term_desc_align_32);
 BAM_STATIC_ASSERT(offsetof(BamTermDesc, component) == 0u, bam_term_desc_off_component_32);
@@ -798,7 +849,7 @@ BAM_STATIC_ASSERT(offsetof(BamSystemDesc, before) == 44u, bam_system_desc_off_be
 BAM_STATIC_ASSERT(offsetof(BamSystemDesc, before_count) == 48u, bam_system_desc_off_before_count_32);
 BAM_STATIC_ASSERT(offsetof(BamSystemDesc, run_if) == 52u, bam_system_desc_off_run_if_32);
 BAM_STATIC_ASSERT(offsetof(BamSystemDesc, run_if_user_data) == 56u, bam_system_desc_off_run_if_user_data_32);
-BAM_STATIC_ASSERT(sizeof(BamComponentDesc) == 44u, bam_component_desc_size_32);
+BAM_STATIC_ASSERT(sizeof(BamComponentDesc) == 56u, bam_component_desc_size_32);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamComponentDesc) == 4u, bam_component_desc_align_32);
 BAM_STATIC_ASSERT(offsetof(BamComponentDesc, struct_size) == 0u, bam_component_desc_off_struct_size_32);
 BAM_STATIC_ASSERT(offsetof(BamComponentDesc, flags) == 4u, bam_component_desc_off_flags_32);
@@ -808,6 +859,9 @@ BAM_STATIC_ASSERT(offsetof(BamComponentDesc, size) == 28u, bam_component_desc_of
 BAM_STATIC_ASSERT(offsetof(BamComponentDesc, align) == 32u, bam_component_desc_off_align_32);
 BAM_STATIC_ASSERT(offsetof(BamComponentDesc, drop_fn) == 36u, bam_component_desc_off_drop_fn_32);
 BAM_STATIC_ASSERT(offsetof(BamComponentDesc, vtable_ptr) == 40u, bam_component_desc_off_vtable_ptr_32);
+BAM_STATIC_ASSERT(offsetof(BamComponentDesc, on_add) == 44u, bam_component_desc_off_on_add_32);
+BAM_STATIC_ASSERT(offsetof(BamComponentDesc, on_remove) == 48u, bam_component_desc_off_on_remove_32);
+BAM_STATIC_ASSERT(offsetof(BamComponentDesc, hook_user_data) == 52u, bam_component_desc_off_hook_user_data_32);
 BAM_STATIC_ASSERT(sizeof(BamColumnInfo) == 40u, bam_column_info_size_32);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamColumnInfo) == 4u, bam_column_info_align_32);
 BAM_STATIC_ASSERT(offsetof(BamColumnInfo, component) == 0u, bam_column_info_off_component_32);
@@ -824,7 +878,7 @@ BAM_STATIC_ASSERT(offsetof(BamVTableHeader, abi_version) == 4u, bam_vtable_heade
 BAM_STATIC_ASSERT(offsetof(BamVTableHeader, uuid) == 8u, bam_vtable_header_off_uuid_32);
 BAM_STATIC_ASSERT(offsetof(BamVTableHeader, size) == 24u, bam_vtable_header_off_size_32);
 BAM_STATIC_ASSERT(offsetof(BamVTableHeader, align) == 28u, bam_vtable_header_off_align_32);
-BAM_STATIC_ASSERT(sizeof(BamHostApi) == 116u, bam_host_api_size_32);
+BAM_STATIC_ASSERT(sizeof(BamHostApi) == 136u, bam_host_api_size_32);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamHostApi) == 4u, bam_host_api_align_32);
 BAM_STATIC_ASSERT(offsetof(BamHostApi, struct_size) == 0u, bam_host_api_off_struct_size_32);
 BAM_STATIC_ASSERT(offsetof(BamHostApi, abi_version) == 4u, bam_host_api_off_abi_version_32);
@@ -855,6 +909,11 @@ BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_despawn) == 100u, bam_host_api_off_cm
 BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_insert) == 104u, bam_host_api_off_cmd_insert_32);
 BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_insert_default) == 108u, bam_host_api_off_cmd_insert_default_32);
 BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_remove) == 112u, bam_host_api_off_cmd_remove_32);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, par_for_each_chunk) == 116u, bam_host_api_off_par_for_each_chunk_32);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, sys_entity_get) == 120u, bam_host_api_off_sys_entity_get_32);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, sys_entity_get_mut) == 124u, bam_host_api_off_sys_entity_get_mut_32);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, msg_read_batch) == 128u, bam_host_api_off_msg_read_batch_32);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, msg_send) == 132u, bam_host_api_off_msg_send_32);
 BAM_STATIC_ASSERT(BAM_MANIFEST_MIN_V0_2_SIZE == 24u, bam_manifest_min_32);
 BAM_STATIC_ASSERT(BAM_QUERY_DESC_MIN_V0_2_SIZE == 16u, bam_query_desc_min_32);
 BAM_STATIC_ASSERT(BAM_SYSTEM_DESC_MIN_V0_2_SIZE == 60u, bam_system_desc_min_32);

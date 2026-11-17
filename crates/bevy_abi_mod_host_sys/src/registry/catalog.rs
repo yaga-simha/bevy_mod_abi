@@ -6,15 +6,20 @@ use crate::registry::collision::ComponentCollisionError;
 use crate::sync_ptr::SymbolAddress;
 use arc_swap::ArcSwap;
 use bevy_abi_mod_sys::{
-    BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_IMMUTABLE,
-    BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET, BamComponent, ComponentDesc,
-    ComponentDropFn, ComponentUuid, ModComponent, RawInsertable,
+    AbiPod, BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET,
+    BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE,
+    BAM_STORAGE_FLAG_SPARSE_SET, BamComponent, ComponentDesc, ComponentDropFn, ComponentUuid,
+    FfiResult, ModComponent, RawInsertable,
 };
+use bevy_ecs::change_detection::Tick;
 use bevy_ecs::component::ComponentId;
 use bevy_ecs::entity::Entity;
+use bevy_ecs::message::{Message, MessageCursor, Messages};
 use bevy_ecs::prelude::{Component, Resource};
 use bevy_ecs::world::World;
+use bevy_ecs::world::unsafe_world_cell::UnsafeWorldCell;
 use bevy_platform::collections::HashMap;
+use core::any::Any;
 use core::ffi::c_void;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -28,6 +33,130 @@ pub type InsertRawFn = unsafe fn(world: &mut World, entity: Entity, data: *const
 
 /// Function signature for monomorphized `Default` component insertion into a Bevy [`World`].
 pub type InsertDefaultFn = fn(world: &mut World, entity: Entity);
+
+/// Monomorphized factory creating a per-system type-erased `MessageCursor<M>` (`F-02`).
+pub type CreateMsgCursorFn = fn() -> Box<dyn Any + Send + Sync>;
+
+/// Monomorphized batch reader advancing a per-system `MessageCursor<M>` over `Messages<M>` (`F-02`).
+///
+/// # Safety
+/// - `world` must hold shared read (or write) access to `msg_res_id` (`Messages<M>`).
+/// - `cursor` must have been created by the matching [`CreateMsgCursorFn`].
+/// - If `max_count > 0`, `out_buf` must be writable for `max_count * size_of::<M>()` bytes.
+/// - `out_count` must be non-null and writable.
+pub type MsgReadBatchFn = unsafe fn(
+    world: UnsafeWorldCell<'_>,
+    msg_res_id: ComponentId,
+    cursor: &mut dyn Any,
+    out_buf: *mut u8,
+    max_count: usize,
+    out_count: *mut usize,
+) -> FfiResult;
+
+/// Monomorphized message writer pushing a single POD `M` into `Messages<M>` (`F-02`).
+///
+/// # Safety
+/// - `world` must hold exclusive write access to `msg_res_id` (`Messages<M>`).
+/// - If `data_len > 0`, `data_ptr` must be readable for `data_len` bytes.
+pub type MsgSendFn = unsafe fn(
+    world: UnsafeWorldCell<'_>,
+    last_run: Tick,
+    this_run: Tick,
+    msg_res_id: ComponentId,
+    data_ptr: *const u8,
+    data_len: usize,
+) -> FfiResult;
+
+fn create_msg_cursor_impl<M: Message>() -> Box<dyn Any + Send + Sync> {
+    Box::new(MessageCursor::<M>::default())
+}
+
+unsafe fn msg_read_batch_impl<M: Message + AbiPod>(
+    world: UnsafeWorldCell<'_>,
+    msg_res_id: ComponentId,
+    cursor: &mut dyn Any,
+    out_buf: *mut u8,
+    max_count: usize,
+    out_count: *mut usize,
+) -> FfiResult {
+    // SAFETY: Caller guarantees `out_count` is non-null and writable.
+    unsafe {
+        *out_count = 0;
+    }
+    let Some(typed_cursor) = cursor.downcast_mut::<MessageCursor<M>>() else {
+        return FfiResult::TYPE_MISMATCH;
+    };
+    if max_count == 0 {
+        return FfiResult::OK;
+    }
+    if core::mem::size_of::<M>() > 0 && out_buf.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: `MESSAGE_READ` or `MESSAGE_WRITE` on `msg_res_id` (`Messages<M>`) was declared in `FilteredAccessSet`.
+    let Some(res_ptr) = (unsafe { world.get_resource_by_id(msg_res_id) }) else {
+        return FfiResult::OK;
+    };
+    // SAFETY: `msg_res_id` was registered from `world.register_component::<Messages<M>>()`.
+    let messages: &Messages<M> = unsafe { res_ptr.deref::<Messages<M>>() };
+    let mut written = 0usize;
+    for msg in typed_cursor.read(messages) {
+        if written >= max_count {
+            break;
+        }
+        if core::mem::size_of::<M>() > 0 {
+            // SAFETY: `out_buf` is writable for `max_count * size_of::<M>()` bytes; `write_unaligned`
+            // supports arbitrary guest buffer alignments cleanly.
+            unsafe {
+                core::ptr::write_unaligned(out_buf.cast::<M>().add(written), *msg);
+            }
+        }
+        written += 1;
+    }
+    // SAFETY: `out_count` is non-null and writable.
+    unsafe {
+        *out_count = written;
+    }
+    FfiResult::OK
+}
+
+unsafe fn msg_send_impl<M: Message + AbiPod>(
+    world: UnsafeWorldCell<'_>,
+    last_run: Tick,
+    this_run: Tick,
+    msg_res_id: ComponentId,
+    data_ptr: *const u8,
+    data_len: usize,
+) -> FfiResult {
+    if data_len != core::mem::size_of::<M>() {
+        return FfiResult::INVALID_ARGUMENT;
+    }
+    if data_len > 0 && data_ptr.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: `MESSAGE_WRITE` on `msg_res_id` (`Messages<M>`) was declared in `FilteredAccessSet`,
+    // granting exclusive mutable access to `Messages<M>` and its resource entity.
+    let Some(entity) = (unsafe { world.resource_entities() }).get(msg_res_id) else {
+        return FfiResult::NOT_FOUND;
+    };
+    let Ok(entity_cell) = world.get_entity_with_ticks(entity, last_run, this_run) else {
+        return FfiResult::NOT_FOUND;
+    };
+    // SAFETY: Exclusive mutable access to `Messages<M>` is guaranteed by Bevy's scheduler.
+    let Ok(mut_untyped) = (unsafe { entity_cell.get_mut_by_id(msg_res_id) }) else {
+        return FfiResult::NOT_FOUND;
+    };
+    // SAFETY: `msg_res_id` was registered for `Messages<M>`.
+    let mut messages = unsafe { mut_untyped.with_type::<Messages<M>>() };
+    let msg: M = if data_len == 0 {
+        // SAFETY: `M: AbiPod` is zero-sized, `Copy`, and valid when zeroed.
+        unsafe { core::mem::MaybeUninit::<M>::zeroed().assume_init() }
+    } else {
+        // SAFETY: `data_ptr` is non-null and readable for `size_of::<M>()` bytes.
+        unsafe { core::ptr::read_unaligned(data_ptr.cast::<M>()) }
+    };
+    messages.write(msg);
+    FfiResult::OK
+}
 
 /// Monomorphized typed component insertion function using unaligned memory reading.
 ///
@@ -215,6 +344,18 @@ pub struct RegisteredComponent {
     pub drop_fn: Option<ComponentDropFn>,
     /// Optional drop trampoline slot index assigned in [`crate::WorldDropGuard`].
     pub drop_slot: Option<usize>,
+    /// Optional dynamic component hook (`on_add` / `on_remove`) trampoline slot index (`F-04`).
+    pub hook_slot: Option<usize>,
+    /// Whether `on_add` hook trampoline was registered on Bevy's `ComponentHooks` (`F-04`).
+    pub has_on_add_hook: bool,
+    /// Whether `on_remove` hook trampoline was registered on Bevy's `ComponentHooks` (`F-04`).
+    pub has_on_remove_hook: bool,
+    /// Optional `MessageCursor<M>` constructor for buffered Bevy `Messages<M>` entries (`F-02`).
+    pub create_msg_cursor_fn: Option<CreateMsgCursorFn>,
+    /// Optional monomorphized batch reader for `Messages<M>` (`F-02`).
+    pub msg_read_batch_fn: Option<MsgReadBatchFn>,
+    /// Optional monomorphized writer for `Messages<M>` (`F-02`).
+    pub msg_send_fn: Option<MsgSendFn>,
     /// Optional [`ModId`] owning a dynamic component's VTable and drop callback.
     pub owner: Option<ModId>,
 }
@@ -224,6 +365,12 @@ impl RegisteredComponent {
     #[inline]
     pub const fn is_resource(&self) -> bool {
         (self.storage_flags & BAM_STORAGE_FLAG_RESOURCE) != 0
+    }
+
+    /// Returns `true` if this entry represents a buffered Bevy `Messages<M>` stream (`F-02`).
+    #[inline]
+    pub const fn is_message(&self) -> bool {
+        (self.storage_flags & BAM_STORAGE_FLAG_MESSAGE) != 0
     }
 
     /// Returns `true` if this entry uses `StorageType::SparseSet`.
@@ -495,6 +642,37 @@ impl ModRegistry {
         Ok(())
     }
 
+    /// Validates that dynamically re-registering `name` with `(has_on_add, has_on_remove)` matches
+    /// the lifecycle hooks permanently wired into Bevy's `ComponentHooks` (`F-04`).
+    pub fn check_dynamic_hook_compatibility(
+        &self,
+        name: &str,
+        has_on_add: bool,
+        has_on_remove: bool,
+    ) -> Result<(), ComponentCollisionError> {
+        if let Some(existing) = self.snapshot.get_by_name(name) {
+            if !existing.is_dynamic && (has_on_add || has_on_remove) {
+                return Err(ComponentCollisionError::MetadataMismatch {
+                    name: name.to_string(),
+                    reason: "cannot attach foreign on_add/on_remove hooks to host-owned component"
+                        .to_string(),
+                });
+            }
+            if existing.has_on_add_hook != has_on_add
+                || existing.has_on_remove_hook != has_on_remove
+            {
+                return Err(ComponentCollisionError::MetadataMismatch {
+                    name: name.to_string(),
+                    reason: format!(
+                        "hook presence mismatch on re-registration (existing=({}, {}), new=({has_on_add}, {has_on_remove}))",
+                        existing.has_on_add_hook, existing.has_on_remove_hook
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Registers a host [`Component`] implementing [`ModComponent`] with [`ComponentOptions`],
     /// returning its 1-based [`BamComponent`] handle (`B-01`, `C-05`).
     pub fn register_component<T: Component + ModComponent>(
@@ -540,6 +718,76 @@ impl ModRegistry {
         let storage_flags =
             component_flags_to_storage_flags(R::COMPONENT_FLAGS) | BAM_STORAGE_FLAG_RESOURCE;
         self.insert_host_entry::<R>(comp_id, storage_flags, None, None)
+    }
+
+    /// Registers a buffered POD Bevy [`Message`] type (`Messages<M>`) implementing [`ModComponent`]
+    /// and [`AbiPod`], returning its 1-based [`BamComponent`] handle (`F-02`).
+    pub fn register_message<M: Message + ModComponent + AbiPod>(
+        &mut self,
+        messages_res_id: ComponentId,
+    ) -> Result<BamComponent, ComponentCollisionError> {
+        let storage_flags =
+            component_flags_to_storage_flags(M::COMPONENT_FLAGS) | BAM_STORAGE_FLAG_MESSAGE;
+        let name_str = M::CANONICAL_NAME;
+        let uuid = M::UUID;
+        self.check_registration_collision(
+            name_str,
+            uuid,
+            M::size(),
+            M::align(),
+            storage_flags,
+            Some(messages_res_id),
+        )?;
+
+        let sym_addr = SymbolAddress::new(M::erased_vtable_ptr());
+        let handle = {
+            let snap = Arc::make_mut(&mut self.snapshot);
+            let handle = if let Some(&existing_handle) = snap.by_name.get(name_str) {
+                let idx = (existing_handle.0 - 1) as usize;
+                snap.entries[idx].vtable_ptr = sym_addr;
+                snap.entries[idx].create_msg_cursor_fn = Some(create_msg_cursor_impl::<M>);
+                snap.entries[idx].msg_read_batch_fn = Some(msg_read_batch_impl::<M>);
+                snap.entries[idx].msg_send_fn = Some(msg_send_impl::<M>);
+                existing_handle
+            } else {
+                let next_raw = u32::try_from(snap.entries.len() + 1)
+                    .expect("ModRegistry exceeded u32::MAX component handles");
+                let handle = BamComponent::from_raw(next_raw);
+                let arc_name: Arc<str> = Arc::from(name_str);
+                let entry = RegisteredComponent {
+                    handle,
+                    name: Arc::clone(&arc_name),
+                    uuid,
+                    component_id: messages_res_id,
+                    size: M::size(),
+                    align: M::align(),
+                    storage_flags,
+                    is_abi_pod: true,
+                    is_dynamic: false,
+                    vtable_ptr: sym_addr,
+                    insert_raw_fn: None,
+                    insert_default_fn: None,
+                    drop_fn: None,
+                    drop_slot: None,
+                    hook_slot: None,
+                    has_on_add_hook: false,
+                    has_on_remove_hook: false,
+                    create_msg_cursor_fn: Some(create_msg_cursor_impl::<M>),
+                    msg_read_batch_fn: Some(msg_read_batch_impl::<M>),
+                    msg_send_fn: Some(msg_send_impl::<M>),
+                    owner: None,
+                };
+                snap.entries.push(entry);
+                snap.by_name.insert(arc_name, handle);
+                snap.by_uuid.insert(uuid, handle);
+                snap.by_component_id.insert(messages_res_id, handle);
+                handle
+            };
+            Self::insert_mod_component_symbols::<M>(snap);
+            handle
+        };
+        self.publish_after_mutation();
+        Ok(handle)
     }
 
     fn insert_host_entry<T: Component + ModComponent>(
@@ -593,6 +841,12 @@ impl ModRegistry {
                     insert_default_fn,
                     drop_fn: None,
                     drop_slot: None,
+                    hook_slot: None,
+                    has_on_add_hook: false,
+                    has_on_remove_hook: false,
+                    create_msg_cursor_fn: None,
+                    msg_read_batch_fn: None,
+                    msg_send_fn: None,
                     owner: None,
                 };
                 snap.entries.push(entry);
@@ -651,6 +905,7 @@ impl ModRegistry {
         name: &str,
         owner: Option<ModId>,
         drop_slot: Option<usize>,
+        hook_slot: Option<usize>,
     ) -> Result<BamComponent, ComponentCollisionError> {
         let storage_flags = component_flags_to_storage_flags(desc.flags);
         self.check_registration_collision(
@@ -662,6 +917,11 @@ impl ModRegistry {
             Some(comp_id),
         )?;
         self.check_dynamic_drop_compatibility(name, desc.drop_fn.is_some())?;
+        self.check_dynamic_hook_compatibility(
+            name,
+            desc.on_add.is_some(),
+            desc.on_remove.is_some(),
+        )?;
 
         let sym_addr = SymbolAddress::new(desc.vtable_ptr);
         let handle = {
@@ -676,6 +936,9 @@ impl ModRegistry {
                     entry.drop_fn = desc.drop_fn;
                     if drop_slot.is_some() {
                         entry.drop_slot = drop_slot;
+                    }
+                    if hook_slot.is_some() {
+                        entry.hook_slot = hook_slot;
                     }
                     entry.owner = owner;
                 }
@@ -700,6 +963,12 @@ impl ModRegistry {
                     insert_default_fn: None,
                     drop_fn: desc.drop_fn,
                     drop_slot,
+                    hook_slot,
+                    has_on_add_hook: desc.on_add.is_some(),
+                    has_on_remove_hook: desc.on_remove.is_some(),
+                    create_msg_cursor_fn: None,
+                    msg_read_batch_fn: None,
+                    msg_send_fn: None,
                     owner,
                 };
                 snap.entries.push(entry);

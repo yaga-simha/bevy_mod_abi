@@ -13,6 +13,7 @@ workspace = true
 [features]
 strict-ffi-checks = ["bevy_abi_mod_host_sys/strict-ffi-checks"]
 test-utils = ["bevy_abi_mod_host_sys/test-utils"]
+diagnostics = ["bevy_abi_mod_host_sys/diagnostics", "dep:bevy_diagnostic"]
 
 [dependencies]
 bevy_abi_mod_sys = { workspace = true }
@@ -21,6 +22,7 @@ bevy_abi_mod_macros = { workspace = true }
 bevy_ecs = { workspace = true }
 bevy_app = { workspace = true }
 bevy_platform = { workspace = true }
+bevy_diagnostic = { workspace = true, optional = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

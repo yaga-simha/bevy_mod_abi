@@ -46,21 +46,23 @@ pub use commands::{
 };
 pub use component::{
     BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_COMPONENT_KNOWN_FLAGS,
-    ComponentDesc, ComponentDropFn, VTableHeader,
+    ComponentDesc, ComponentDropFn, ComponentHookFn, VTableHeader,
 };
 pub use extensible::{ExtensibleStruct, read_descriptor, read_extensible_struct};
 pub use host_api::{
     BAM_MANIFEST_KNOWN_FLAGS, BamGetProcAddressFn, BamHostApi, BamInitFn, BamInstance,
     BamLastErrorFn, BamLoadHostCtxFn, BamManifest, BamManifestFn, BamRegisterComponentFn,
-    BamRegisterSystemFn, BamResolveComponentFn, BamShutdownFn, BamSysCommandsFn, BamSysHostCtxFn,
+    BamRegisterSystemFn, BamResolveComponentFn, BamRestoreStateFn, BamSaveStateFn, BamShutdownFn,
+    BamStateWriterFn, BamSysCommandsFn, BamSysEntityGetFn, BamSysEntityGetMutFn, BamSysHostCtxFn,
     BamSysQueryFn,
 };
 pub use iter::{
-    BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET,
-    BamColumnInfo, BamIter, BamIterColumnInfoFn, BamIterColumnMutableFn,
-    BamIterColumnMutableUntrackedFn, BamIterColumnReadonlyFn, BamIterColumnRowsMutableFn,
-    BamIterColumnRowsReadonlyFn, BamIterEntitiesFn, BamIterMarkChangedRangeFn, BamIterNextChunkFn,
-    BamIterResetFn, BamResMutPtrFn, BamResPtrFn,
+    BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE,
+    BAM_STORAGE_FLAG_SPARSE_SET, BamChunkTaskFn, BamColumnInfo, BamIter, BamIterColumnInfoFn,
+    BamIterColumnMutableFn, BamIterColumnMutableUntrackedFn, BamIterColumnReadonlyFn,
+    BamIterColumnRowsMutableFn, BamIterColumnRowsReadonlyFn, BamIterEntitiesFn,
+    BamIterMarkChangedRangeFn, BamIterNextChunkFn, BamIterResetFn, BamMsgReadBatchFn, BamMsgSendFn,
+    BamParForEachChunkFn, BamResMutPtrFn, BamResPtrFn,
 };
 pub use primitives::{
     BamComponent, ComponentUuid, FfiBool, FfiEntity, FfiResult, FfiSlice, SIPHASH_KEY_0,

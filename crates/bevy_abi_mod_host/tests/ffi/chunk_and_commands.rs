@@ -294,6 +294,8 @@ mod archetype_and_permission_boundaries {
                 size: core::mem::size_of::<Position>(),
                 align: core::mem::align_of::<Position>(),
                 storage_flags: 0,
+                msg_read_batch_fn: None,
+                msg_send_fn: None,
             },
             QueryTermMeta {
                 component: BamComponent::from_raw(2),
@@ -303,6 +305,8 @@ mod archetype_and_permission_boundaries {
                 size: core::mem::size_of::<Velocity>(),
                 align: core::mem::align_of::<Velocity>(),
                 storage_flags: 0,
+                msg_read_batch_fn: None,
+                msg_send_fn: None,
             },
         ]);
 
@@ -402,6 +406,8 @@ mod archetype_and_permission_boundaries {
                 size: core::mem::size_of::<Position>(),
                 align: core::mem::align_of::<Position>(),
                 storage_flags: 0,
+                msg_read_batch_fn: None,
+                msg_send_fn: None,
             },
             QueryTermMeta {
                 component: BamComponent::from_raw(2),
@@ -411,6 +417,8 @@ mod archetype_and_permission_boundaries {
                 size: core::mem::size_of::<Velocity>(),
                 align: core::mem::align_of::<Velocity>(),
                 storage_flags: 0,
+                msg_read_batch_fn: None,
+                msg_send_fn: None,
             },
             QueryTermMeta {
                 component: BamComponent::from_raw(3),
@@ -420,6 +428,8 @@ mod archetype_and_permission_boundaries {
                 size: core::mem::size_of::<Armor>(),
                 align: core::mem::align_of::<Armor>(),
                 storage_flags: 0,
+                msg_read_batch_fn: None,
+                msg_send_fn: None,
             },
         ]);
 
@@ -487,6 +497,8 @@ mod archetype_and_permission_boundaries {
             size: core::mem::size_of::<Position>(),
             align: core::mem::align_of::<Position>(),
             storage_flags: 0,
+            msg_read_batch_fn: None,
+            msg_send_fn: None,
         }]);
 
         let matched_tables = vec![cell.archetypes().iter().last().unwrap().table_id()];
@@ -879,6 +891,8 @@ mod archetype_and_permission_boundaries {
                 size: core::mem::size_of::<Position>(),
                 align: core::mem::align_of::<Position>(),
                 storage_flags: 0,
+                msg_read_batch_fn: None,
+                msg_send_fn: None,
             });
         }
         let plan = QueryPlan::from_terms(max_terms);

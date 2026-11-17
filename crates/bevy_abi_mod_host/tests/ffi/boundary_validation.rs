@@ -1089,6 +1089,8 @@ mod fuzz_boundaries {
                 size: core::mem::size_of::<Position>(),
                 align: core::mem::align_of::<Position>(),
                 storage_flags: 0,
+                msg_read_batch_fn: None,
+                msg_send_fn: None,
             },
             QueryTermMeta {
                 component: BamComponent::from_raw(2),
@@ -1098,6 +1100,8 @@ mod fuzz_boundaries {
                 size: core::mem::size_of::<Velocity>(),
                 align: core::mem::align_of::<Velocity>(),
                 storage_flags: 0,
+                msg_read_batch_fn: None,
+                msg_send_fn: None,
             },
             QueryTermMeta {
                 component: BamComponent::from_raw(3),
@@ -1107,6 +1111,8 @@ mod fuzz_boundaries {
                 size: 0,
                 align: 1,
                 storage_flags: 0,
+                msg_read_batch_fn: None,
+                msg_send_fn: None,
             },
         ]);
 
@@ -1126,6 +1132,8 @@ mod fuzz_boundaries {
                 size: core::mem::size_of::<Position>(),
                 align: core::mem::align_of::<Position>(),
                 storage_flags: 0,
+                msg_read_batch_fn: None,
+                msg_send_fn: None,
             },
             QueryTermMeta {
                 component: BamComponent::from_raw(4),
@@ -1135,6 +1143,8 @@ mod fuzz_boundaries {
                 size: core::mem::size_of::<FuzzSparseVal>(),
                 align: core::mem::align_of::<FuzzSparseVal>(),
                 storage_flags: BAM_STORAGE_FLAG_SPARSE_SET,
+                msg_read_batch_fn: None,
+                msg_send_fn: None,
             },
             QueryTermMeta {
                 component: BamComponent::from_raw(2),
@@ -1144,6 +1154,8 @@ mod fuzz_boundaries {
                 size: core::mem::size_of::<Velocity>(),
                 align: core::mem::align_of::<Velocity>(),
                 storage_flags: 0,
+                msg_read_batch_fn: None,
+                msg_send_fn: None,
             },
         ]);
 
@@ -1735,7 +1747,7 @@ mod host_api_boundary_and_proc_address {
         {
             assert_eq!(core::mem::size_of::<TruncatedHostApi40>(), 40);
             assert_eq!(core::mem::align_of::<TruncatedHostApi40>(), 8);
-            assert_eq!(core::mem::size_of::<BamHostApi>(), 224);
+            assert_eq!(core::mem::size_of::<BamHostApi>(), 264);
             assert_eq!(BamHostApi::MIN_V0_2_SIZE, 224);
             assert_eq!(core::mem::align_of::<BamHostApi>(), 8);
         }
@@ -2156,7 +2168,8 @@ mod dynamic_descriptor_layouts {
     fn test_host_api_layout_stability_and_byte_offsets() {
         #[cfg(target_pointer_width = "64")]
         {
-            assert_eq!(core::mem::size_of::<BamHostApi>(), 224);
+            assert_eq!(BamHostApi::MIN_V0_2_SIZE, 224);
+            assert_eq!(core::mem::size_of::<BamHostApi>(), 264);
             assert_eq!(core::mem::align_of::<BamHostApi>(), 8);
             assert_eq!(core::mem::offset_of!(BamHostApi, struct_size), 0);
             assert_eq!(core::mem::offset_of!(BamHostApi, abi_version), 4);
@@ -2199,6 +2212,11 @@ mod dynamic_descriptor_layouts {
             assert_eq!(core::mem::offset_of!(BamHostApi, cmd_insert), 200);
             assert_eq!(core::mem::offset_of!(BamHostApi, cmd_insert_default), 208);
             assert_eq!(core::mem::offset_of!(BamHostApi, cmd_remove), 216);
+            assert_eq!(core::mem::offset_of!(BamHostApi, par_for_each_chunk), 224);
+            assert_eq!(core::mem::offset_of!(BamHostApi, sys_entity_get), 232);
+            assert_eq!(core::mem::offset_of!(BamHostApi, sys_entity_get_mut), 240);
+            assert_eq!(core::mem::offset_of!(BamHostApi, msg_read_batch), 248);
+            assert_eq!(core::mem::offset_of!(BamHostApi, msg_send), 256);
         }
     }
 

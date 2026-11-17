@@ -90,6 +90,10 @@ macro_rules! export_mod {
         static __BAM_EXPORTED_MANIFEST: $crate::BamManifest = $crate::BamManifest::new(
             ::core::ffi::CStr::as_ptr($name),
             ::core::ffi::CStr::as_ptr($version),
+        )
+        .with_state_callbacks(
+            $crate::raw::guest_save_state_trampoline,
+            $crate::raw::guest_restore_state_trampoline,
         );
 
         /// Returns a pointer to the static [`BamManifest`]($crate::BamManifest) for this guest mod.
@@ -143,6 +147,10 @@ macro_rules! export_mod {
             concat!(env!("CARGO_PKG_VERSION"), "\0")
                 .as_ptr()
                 .cast::<::core::ffi::c_char>(),
+        )
+        .with_state_callbacks(
+            $crate::raw::guest_save_state_trampoline,
+            $crate::raw::guest_restore_state_trampoline,
         );
 
         /// Returns a pointer to the static [`BamManifest`]($crate::BamManifest) for this guest mod.

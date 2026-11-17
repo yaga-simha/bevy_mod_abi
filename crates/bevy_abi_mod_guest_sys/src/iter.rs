@@ -1,13 +1,14 @@
 //! Validated chunk iteration, `BamColumnInfo` layout/UUID verification, dense slices, indirect
 //! sparse-set row views, untracked mutation + `mark_changed_range`, and singleton resource access.
 
-use core::{marker::PhantomData, mem::MaybeUninit, ops::Index};
+use core::{ffi::c_void, marker::PhantomData, mem::MaybeUninit, ops::Index};
 
 use bevy_abi_mod_sys::{
-    AbiPod, AccessMode, BamColumnInfo, BamIter, ComponentUuid, FfiEntity, FfiResult,
+    AbiPod, AccessMode, BamColumnInfo, BamComponent, BamHostApi, BamIter, BamMsgReadBatchFn,
+    BamMsgSendFn, BamParForEachChunkFn, ComponentUuid, FfiEntity, FfiResult, MAX_TERMS_PER_QUERY,
 };
 
-use crate::host::Host;
+use crate::{host::Host, panic::catch_guest_result};
 
 /// Expected [`ComponentUuid`] predicate for `C-13` typed column and resource introspection.
 ///
@@ -1703,5 +1704,560 @@ impl<'a> ValidatedIter<'a> {
         // SAFETY: `validate_resource_write_info` confirmed `RESOURCE_WRITE`, non-immutable, layout,
         // and optional UUID; `&mut self` guarantees exclusive access.
         Some(unsafe { &mut *ptr.cast::<R>() })
+    }
+
+    /// Executes `f` in parallel across disjoint sub-range chunks on the host `ComputeTaskPool`
+    /// (`P-07`), catching panics per task so unwinding never crosses `extern "C"`.
+    pub fn par_for_each_chunk<F>(&mut self, f: F) -> FfiResult
+    where
+        F: Fn(&mut ValidatedIter<'_>) -> FfiResult + Sync,
+    {
+        if self.raw.is_null() {
+            return FfiResult::OK;
+        }
+        if !self.host.api().covers_slot(
+            core::mem::offset_of!(BamHostApi, par_for_each_chunk),
+            core::mem::size_of::<Option<BamParForEachChunkFn>>(),
+        ) {
+            return FfiResult::UNSUPPORTED;
+        }
+        let Some(par_fn) = self.host.api().par_for_each_chunk else {
+            return FfiResult::UNSUPPORTED;
+        };
+        self.current_len = 0;
+        let task_ctx = ParChunkTaskContext {
+            host: self.host,
+            func: f,
+        };
+        // SAFETY: `self.raw` is an active top-level `BamIter`, `task_ctx` stays live on the stack
+        // across the synchronous `par_fn` scope, `F: Sync` permits concurrent calls across worker
+        // threads, and `par_chunk_task_trampoline` catches any panic on the guest heap.
+        unsafe {
+            par_fn(
+                self.raw,
+                Some(par_chunk_task_trampoline::<F>),
+                (&raw const task_ctx).cast_mut().cast::<c_void>(),
+            )
+        }
+    }
+
+    /// Reads up to `max_count` unread POD messages from `term_index` (`MESSAGE_READ` or
+    /// `MESSAGE_WRITE`), advancing the running system's per-term message cursor (`F-02`).
+    pub fn read_messages_batch_checked<M: AbiPod>(
+        &mut self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+        max_count: usize,
+    ) -> Result<Vec<M>, FfiResult> {
+        if self.raw.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        if !self.host.api().covers_slot(
+            core::mem::offset_of!(BamHostApi, msg_read_batch),
+            core::mem::size_of::<Option<BamMsgReadBatchFn>>(),
+        ) {
+            return Err(FfiResult::UNSUPPORTED);
+        }
+        let Some(read_fn) = self.host.api().msg_read_batch else {
+            return Err(FfiResult::UNSUPPORTED);
+        };
+        let info = self.column_info(term_index)?;
+        if !validate_message_read_info::<M>(&info, expected_uuid) {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        if max_count == 0 {
+            return Ok(Vec::new());
+        }
+        let mut scratch: Vec<MaybeUninit<M>> = Vec::with_capacity(max_count);
+        let out_ptr = if core::mem::size_of::<M>() == 0 {
+            core::ptr::NonNull::<u8>::dangling().as_ptr()
+        } else {
+            scratch.as_mut_ptr().cast::<u8>()
+        };
+        let mut read_count = 0usize;
+        // SAFETY: `self.raw` is active, `validate_message_read_info` confirmed element size and
+        // alignment match `M`, and `scratch` has capacity for `max_count` elements of `M`.
+        let status = unsafe { read_fn(self.raw, term_index, out_ptr, max_count, &mut read_count) };
+        if !status.is_ok() {
+            return Err(status);
+        }
+        let actual = read_count.min(max_count);
+        // SAFETY: Host copied `actual` initialized elements of `M` into `scratch[..actual]`.
+        unsafe {
+            scratch.set_len(actual);
+        }
+        let mut out = Vec::with_capacity(actual);
+        for slot in scratch {
+            // SAFETY: Every element in `scratch[..actual]` was initialized by `msg_read_batch`.
+            out.push(unsafe { slot.assume_init() });
+        }
+        Ok(out)
+    }
+
+    /// Drains all currently unread POD messages from `term_index` (`F-02`).
+    pub fn drain_messages_checked<M: AbiPod>(
+        &mut self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<Vec<M>, FfiResult> {
+        const BATCH_SIZE: usize = 64;
+        let mut all = Vec::new();
+        loop {
+            let batch =
+                self.read_messages_batch_checked::<M>(term_index, expected_uuid, BATCH_SIZE)?;
+            let count = batch.len();
+            all.extend(batch);
+            if count < BATCH_SIZE {
+                break;
+            }
+        }
+        Ok(all)
+    }
+
+    /// Appends a POD message `msg` to the Bevy `Messages<M>` stream declared with `MESSAGE_WRITE`
+    /// at `term_index` (`F-02`).
+    pub fn send_message_checked<M: AbiPod>(
+        &mut self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+        msg: &M,
+    ) -> FfiResult {
+        if self.raw.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if !self.host.api().covers_slot(
+            core::mem::offset_of!(BamHostApi, msg_send),
+            core::mem::size_of::<Option<BamMsgSendFn>>(),
+        ) {
+            return FfiResult::UNSUPPORTED;
+        }
+        let Some(send_fn) = self.host.api().msg_send else {
+            return FfiResult::UNSUPPORTED;
+        };
+        let info = match self.column_info(term_index) {
+            Ok(i) => i,
+            Err(err) => return err,
+        };
+        if !validate_message_write_info::<M>(&info, expected_uuid) {
+            return FfiResult::TYPE_MISMATCH;
+        }
+        let data_ptr = if core::mem::size_of::<M>() == 0 {
+            core::ptr::NonNull::<u8>::dangling().as_ptr().cast_const()
+        } else {
+            core::ptr::from_ref(msg).cast::<u8>()
+        };
+        // SAFETY: `self.raw` is active, `validate_message_write_info` verified `M`'s exact layout
+        // and `MESSAGE_WRITE` permission, and `data_ptr` points to `size_of::<M>()` readable bytes.
+        unsafe { send_fn(self.raw, term_index, data_ptr, core::mem::size_of::<M>()) }
+    }
+}
+
+struct ParChunkTaskContext<'h, F> {
+    host: &'h Host,
+    func: F,
+}
+
+unsafe extern "C" fn par_chunk_task_trampoline<F>(
+    sub_iter: *mut BamIter,
+    user_data: *mut c_void,
+) -> FfiResult
+where
+    F: Fn(&mut ValidatedIter<'_>) -> FfiResult + Sync,
+{
+    catch_guest_result(|| {
+        if sub_iter.is_null() || user_data.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        // SAFETY: `user_data` points to `ParChunkTaskContext<'_, F>` live on the caller's stack
+        // throughout `par_for_each_chunk`, and `F: Sync` allows concurrent shared reads.
+        let ctx = unsafe { &*user_data.cast::<ParChunkTaskContext<'_, F>>() };
+        // SAFETY: `sub_iter` is an isolated sub-range `BamIter` valid on this worker thread for
+        // the duration of this task callback.
+        let mut task_iter = unsafe { ValidatedIter::from_raw(sub_iter, ctx.host) };
+        while task_iter.next_chunk().is_some() {
+            let status = (ctx.func)(&mut task_iter);
+            if !status.is_ok() {
+                return status;
+            }
+        }
+        FfiResult::OK
+    })
+}
+
+#[inline]
+fn validate_message_read_info<M: AbiPod>(
+    info: &BamColumnInfo,
+    expected_uuid: Option<UuidFilter>,
+) -> bool {
+    if !matches!(
+        info.mode,
+        AccessMode::MESSAGE_READ | AccessMode::MESSAGE_WRITE
+    ) || !info.is_message()
+        || info.is_resource()
+    {
+        return false;
+    }
+    if info.size != core::mem::size_of::<M>() || info.align != core::mem::align_of::<M>() {
+        return false;
+    }
+    if let Some(filter) = expected_uuid
+        && !filter.matches(info.uuid)
+    {
+        return false;
+    }
+    true
+}
+
+#[inline]
+fn validate_message_write_info<M: AbiPod>(
+    info: &BamColumnInfo,
+    expected_uuid: Option<UuidFilter>,
+) -> bool {
+    if info.mode != AccessMode::MESSAGE_WRITE
+        || info.is_immutable()
+        || !info.is_message()
+        || info.is_resource()
+    {
+        return false;
+    }
+    if info.size != core::mem::size_of::<M>() || info.align != core::mem::align_of::<M>() {
+        return false;
+    }
+    if let Some(filter) = expected_uuid
+        && !filter.matches(info.uuid)
+    {
+        return false;
+    }
+    true
+}
+
+#[derive(Clone, Copy)]
+struct DispensedBorrow {
+    component: BamComponent,
+    start: usize,
+    end: usize,
+    is_mut: bool,
+}
+
+/// Sequential per-chunk column dispenser verifying disjoint borrows across up to
+/// [`MAX_TERMS_PER_QUERY`] tuple terms (`G-03`) so safe `bevy_abi_mod_guest` tuple queries require
+/// zero `unsafe` code.
+pub struct ChunkColumnDispenser<'chunk, 'ctx> {
+    iter: &'chunk mut ValidatedIter<'ctx>,
+    next_term_index: usize,
+    borrowed: [DispensedBorrow; MAX_TERMS_PER_QUERY],
+    borrowed_count: usize,
+    entities_range: Option<(usize, usize)>,
+}
+
+impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
+    /// Creates a column dispenser over the currently active chunk of `iter`.
+    #[inline]
+    pub fn new(iter: &'chunk mut ValidatedIter<'ctx>) -> Self {
+        Self {
+            iter,
+            next_term_index: 0,
+            borrowed: [DispensedBorrow {
+                component: BamComponent::INVALID,
+                start: 0,
+                end: 0,
+                is_mut: false,
+            }; MAX_TERMS_PER_QUERY],
+            borrowed_count: 0,
+            entities_range: None,
+        }
+    }
+
+    /// Returns the cached [`Host`] table for this iterator.
+    #[inline]
+    pub const fn host(&self) -> &'ctx Host {
+        self.iter.host()
+    }
+
+    /// Returns the number of entity rows in the active chunk.
+    #[inline]
+    pub const fn len(&self) -> usize {
+        self.iter.current_len()
+    }
+
+    /// Returns `true` if `len() == 0`.
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    fn check_and_record_borrow(
+        &mut self,
+        component: BamComponent,
+        start: usize,
+        byte_len: usize,
+        is_mut: bool,
+    ) -> Result<(), FfiResult> {
+        let end = start.checked_add(byte_len).ok_or(FfiResult::OUT_OF_RANGE)?;
+        if is_mut
+            && byte_len > 0
+            && let Some((ent_start, ent_end)) = self.entities_range
+            && ent_end > ent_start
+            && start < ent_end
+            && ent_start < end
+        {
+            return Err(FfiResult::ACCESS_CONFLICT);
+        }
+        for prev in &self.borrowed[..self.borrowed_count] {
+            if is_mut || prev.is_mut {
+                if prev.component == component {
+                    return Err(FfiResult::ACCESS_CONFLICT);
+                }
+                let prev_non_empty = prev.end > prev.start;
+                if byte_len > 0 && prev_non_empty && start < prev.end && prev.start < end {
+                    return Err(FfiResult::ACCESS_CONFLICT);
+                }
+            }
+        }
+        if self.borrowed_count >= MAX_TERMS_PER_QUERY {
+            return Err(FfiResult::CAPACITY_EXCEEDED);
+        }
+        self.borrowed[self.borrowed_count] = DispensedBorrow {
+            component,
+            start,
+            end,
+            is_mut,
+        };
+        self.borrowed_count += 1;
+        Ok(())
+    }
+
+    /// Dispenses the contiguous `[FfiEntity; len]` slice for the active chunk without consuming a
+    /// `BamTermDesc` index (`G-03`).
+    pub fn entities(&mut self) -> Result<&'chunk [FfiEntity], FfiResult> {
+        let len = self.iter.current_len();
+        if len == 0 {
+            return Ok(&[]);
+        }
+        let ent_fn = self
+            .iter
+            .host
+            .api()
+            .iter_entities
+            .ok_or(FfiResult::NULL_POINTER)?;
+        // SAFETY: `self.iter.raw` is active at a chunk of `len` entities for `'chunk`.
+        let ptr = unsafe { ent_fn(self.iter.raw.cast_const()) };
+        if ptr.is_null() || !(ptr as usize).is_multiple_of(core::mem::align_of::<FfiEntity>()) {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        let byte_len = len
+            .checked_mul(core::mem::size_of::<FfiEntity>())
+            .ok_or(FfiResult::OUT_OF_RANGE)?;
+        let start = ptr as usize;
+        let end = start.checked_add(byte_len).ok_or(FfiResult::OUT_OF_RANGE)?;
+        for prev in &self.borrowed[..self.borrowed_count] {
+            if prev.is_mut && prev.end > prev.start && start < prev.end && prev.start < end {
+                return Err(FfiResult::ACCESS_CONFLICT);
+            }
+        }
+        self.entities_range = Some((start, end));
+        // SAFETY: `ptr` is non-null, aligned, disjoint from all mutable column borrows, and valid
+        // for `len` `FfiEntity` elements throughout `'chunk`.
+        Ok(unsafe { core::slice::from_raw_parts(ptr, len) })
+    }
+
+    /// Dispenses the next dense read-only `&'chunk [T]` column (`READ`, `CHANGED`, or `ADDED`).
+    pub fn next_read<T: AbiPod>(
+        &mut self,
+        expected_mode: AccessMode,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<&'chunk [T], FfiResult> {
+        let term_index = self.next_term_index;
+        self.next_term_index += 1;
+        let info = self.iter.column_info(term_index)?;
+        if info.mode != expected_mode || !validate_dense_read_info::<T>(&info, expected_uuid) {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        let len = self.iter.current_len();
+        if len == 0 || core::mem::size_of::<T>() == 0 {
+            self.check_and_record_borrow(info.component, 0, 0, false)?;
+            // SAFETY: Zero-length or ZST slice uses `NonNull::dangling()` without dereferencing.
+            return Ok(unsafe {
+                core::slice::from_raw_parts(core::ptr::NonNull::<T>::dangling().as_ptr(), len)
+            });
+        }
+        let col_fn = self
+            .iter
+            .host
+            .api()
+            .iter_column_readonly
+            .ok_or(FfiResult::NULL_POINTER)?;
+        // SAFETY: `self.iter.raw` is active at a chunk of `len` rows for `'chunk`.
+        let ptr = unsafe { col_fn(self.iter.raw.cast_const(), term_index) };
+        if ptr.is_null() || !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        let byte_len = len
+            .checked_mul(core::mem::size_of::<T>())
+            .ok_or(FfiResult::OUT_OF_RANGE)?;
+        self.check_and_record_borrow(info.component, ptr as usize, byte_len, false)?;
+        // SAFETY: `validate_dense_read_info` confirmed `T`'s layout and UUID; `check_and_record_borrow`
+        // confirmed no mutable borrow aliases this component or byte range for `'chunk`.
+        Ok(unsafe { core::slice::from_raw_parts(ptr.cast::<T>(), len) })
+    }
+
+    /// Dispenses the next dense mutable `&'chunk mut [T]` column (`WRITE`).
+    pub fn next_write<T: AbiPod>(
+        &mut self,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<&'chunk mut [T], FfiResult> {
+        let term_index = self.next_term_index;
+        self.next_term_index += 1;
+        let info = self.iter.column_info(term_index)?;
+        if info.mode != AccessMode::WRITE || !validate_dense_write_info::<T>(&info, expected_uuid) {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        let len = self.iter.current_len();
+        if len == 0 || core::mem::size_of::<T>() == 0 {
+            self.check_and_record_borrow(info.component, 0, 0, true)?;
+            if len > 0
+                && let Some(col_fn) = self.iter.host.api().iter_column_mutable
+            {
+                // Mark ZST change ticks via host `iter_column_mutable`.
+                // SAFETY: `self.iter.raw` is active at a valid chunk.
+                let _ = unsafe { col_fn(self.iter.raw, term_index) };
+            }
+            // SAFETY: Zero-length or ZST mutable slice over `NonNull::dangling()` with unique component check.
+            return Ok(unsafe {
+                core::slice::from_raw_parts_mut(core::ptr::NonNull::<T>::dangling().as_ptr(), len)
+            });
+        }
+        let col_fn = self
+            .iter
+            .host
+            .api()
+            .iter_column_mutable
+            .ok_or(FfiResult::NULL_POINTER)?;
+        // SAFETY: `self.iter.raw` is active at a chunk of `len` rows for `'chunk`.
+        let ptr = unsafe { col_fn(self.iter.raw, term_index) };
+        if ptr.is_null() || !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        let byte_len = len
+            .checked_mul(core::mem::size_of::<T>())
+            .ok_or(FfiResult::OUT_OF_RANGE)?;
+        self.check_and_record_borrow(info.component, ptr as usize, byte_len, true)?;
+        // SAFETY: `validate_dense_write_info` verified `WRITE`, non-immutable, layout, and UUID;
+        // `check_and_record_borrow` verified strict disjointness from all other borrows in `'chunk`.
+        Ok(unsafe { core::slice::from_raw_parts_mut(ptr.cast::<T>(), len) })
+    }
+
+    /// Dispenses the next optional dense read-only `Option<&'chunk [T]>` column (`OPTIONAL_READ`).
+    pub fn next_optional_read<T: AbiPod>(
+        &mut self,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<Option<&'chunk [T]>, FfiResult> {
+        let term_index = self.next_term_index;
+        self.next_term_index += 1;
+        let info = self.iter.column_info(term_index)?;
+        if info.mode != AccessMode::OPTIONAL_READ
+            || !validate_dense_read_info::<T>(&info, expected_uuid)
+        {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        let len = self.iter.current_len();
+        let col_fn = self
+            .iter
+            .host
+            .api()
+            .iter_column_readonly
+            .ok_or(FfiResult::NULL_POINTER)?;
+        // SAFETY: `self.iter.raw` is active at a chunk of `len` rows for `'chunk`.
+        let ptr = unsafe { col_fn(self.iter.raw.cast_const(), term_index) };
+        if ptr.is_null() {
+            return Ok(None);
+        }
+        if core::mem::size_of::<T>() == 0 {
+            self.check_and_record_borrow(info.component, 0, 0, false)?;
+            // SAFETY: Non-null optional ZST column is present for all `len` entities in the chunk.
+            return Ok(Some(unsafe {
+                core::slice::from_raw_parts(core::ptr::NonNull::<T>::dangling().as_ptr(), len)
+            }));
+        }
+        if !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        let byte_len = len
+            .checked_mul(core::mem::size_of::<T>())
+            .ok_or(FfiResult::OUT_OF_RANGE)?;
+        self.check_and_record_borrow(info.component, ptr as usize, byte_len, false)?;
+        // SAFETY: Present optional dense column verified for layout, UUID, alignment, and non-aliasing.
+        Ok(Some(unsafe {
+            core::slice::from_raw_parts(ptr.cast::<T>(), len)
+        }))
+    }
+
+    /// Dispenses the next optional dense mutable `Option<&'chunk mut [T]>` column (`OPTIONAL_WRITE`).
+    pub fn next_optional_write<T: AbiPod>(
+        &mut self,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<Option<&'chunk mut [T]>, FfiResult> {
+        let term_index = self.next_term_index;
+        self.next_term_index += 1;
+        let info = self.iter.column_info(term_index)?;
+        if info.mode != AccessMode::OPTIONAL_WRITE
+            || !validate_dense_write_info::<T>(&info, expected_uuid)
+        {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        let len = self.iter.current_len();
+        let col_fn = self
+            .iter
+            .host
+            .api()
+            .iter_column_mutable
+            .ok_or(FfiResult::NULL_POINTER)?;
+        // SAFETY: `self.iter.raw` is active at a chunk of `len` rows for `'chunk`.
+        let ptr = unsafe { col_fn(self.iter.raw, term_index) };
+        if ptr.is_null() {
+            return Ok(None);
+        }
+        if core::mem::size_of::<T>() == 0 {
+            self.check_and_record_borrow(info.component, 0, 0, true)?;
+            // SAFETY: Present optional ZST mutable column verified disjoint by component handle.
+            return Ok(Some(unsafe {
+                core::slice::from_raw_parts_mut(core::ptr::NonNull::<T>::dangling().as_ptr(), len)
+            }));
+        }
+        if !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        let byte_len = len
+            .checked_mul(core::mem::size_of::<T>())
+            .ok_or(FfiResult::OUT_OF_RANGE)?;
+        self.check_and_record_borrow(info.component, ptr as usize, byte_len, true)?;
+        // SAFETY: Present optional dense mutable column verified for layout, UUID, alignment, and disjointness.
+        Ok(Some(unsafe {
+            core::slice::from_raw_parts_mut(ptr.cast::<T>(), len)
+        }))
+    }
+
+    /// Validates and advances past a pure filter term (`FILTER_ONLY` / `WITHOUT`) (`G-03`).
+    pub fn next_filter<T: AbiPod>(
+        &mut self,
+        expected_mode: AccessMode,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<(), FfiResult> {
+        let term_index = self.next_term_index;
+        self.next_term_index += 1;
+        let info = self.iter.column_info(term_index)?;
+        if info.mode != expected_mode || info.is_resource() || info.is_message() {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        if info.size != core::mem::size_of::<T>() || info.align != core::mem::align_of::<T>() {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        if let Some(filter) = expected_uuid
+            && !filter.matches(info.uuid)
+        {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        Ok(())
     }
 }

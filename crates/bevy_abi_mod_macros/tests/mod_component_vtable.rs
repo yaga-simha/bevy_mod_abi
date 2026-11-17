@@ -867,3 +867,32 @@ fn regression_m02_duplicate_struct_names_in_submodules() {
     assert_eq!(a.x, 5.5f32);
     assert!(b.enabled);
 }
+
+#[test]
+fn wave4_m07_emits_c_decl_and_zig_decl_for_pod_and_non_pod_components() {
+    // 1. `#[repr(C)]` `AbiPod` struct emits full C struct + VTable + static layout assertions,
+    //    and Zig `extern struct` + `callconv(.c)` VTable.
+    let pod_c = PodPosition::C_DECL;
+    assert!(pod_c.contains(
+        "typedef struct PodPosition {\n    float x;\n    float y;\n    float z;\n} PodPosition;"
+    ));
+    assert!(pod_c.contains("typedef struct PodPositionVTable {"));
+    assert!(pod_c.contains("float (*get_x)(const void* ptr);"));
+    assert!(pod_c.contains("BamResult (*set_x)(void* ptr, float val);"));
+    assert!(pod_c.contains("BAM_STATIC_ASSERT(sizeof(PodPositionVTable) == 88u"));
+
+    let pod_zig = PodPosition::ZIG_DECL;
+    assert!(pod_zig.contains("pub const PodPosition = extern struct {"));
+    assert!(pod_zig.contains("x: f32,"));
+    assert!(pod_zig.contains("pub const PodPositionVTable = extern struct {"));
+    assert!(pod_zig.contains("callconv(.c)"));
+
+    // 2. Non-POD `MixedComponent` emits opaque forward typedef, Vec slice typedef, and VTable.
+    let mixed_c = MixedComponent::C_DECL;
+    assert!(mixed_c.contains("typedef struct MixedComponent MixedComponent;"));
+    assert!(mixed_c.contains("typedef struct MixedComponentVTable_scores_Slice {"));
+    assert!(mixed_c.contains("BamBool   (*get_active)(const void* ptr);"));
+    assert!(mixed_c.contains("BamStrView (*get_tag)(const void* ptr);"));
+    assert!(mixed_c.contains("BamResult (*push_scores)(void* ptr, uint32_t val);"));
+    assert!(mixed_c.contains("const void* (*ptr_position)(const void* ptr);"));
+}

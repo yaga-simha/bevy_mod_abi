@@ -12,12 +12,14 @@ workspace = true
 [features]
 strict-ffi-checks = []
 test-utils = []
+diagnostics = []
 
 [dependencies]
 bevy_abi_mod_sys = { workspace = true }
 bevy_ecs = { workspace = true }
 bevy_app = { workspace = true }
 bevy_platform = { workspace = true }
+bevy_tasks = { workspace = true }
 libloading = { workspace = true }
 nonmax = { workspace = true }
 arc-swap = { workspace = true }

@@ -160,4 +160,26 @@ pub enum ModLoadError {
         /// Unknown mod identifier.
         id: ModId,
     },
+
+    /// Optional `BamManifest::save_state` callback returned a non-OK [`FfiResult`] during hot-reload (`F-01`).
+    #[error("mod '{mod_name}' ({id:?}) save_state failed with {status}")]
+    StateSaveFailed {
+        /// Active mod identifier whose state save failed.
+        id: ModId,
+        /// Canonical mod name.
+        mod_name: String,
+        /// Status returned by `BamManifest::save_state`.
+        status: FfiResult,
+    },
+
+    /// Optional `BamManifest::restore_state` callback returned a non-OK [`FfiResult`] during hot-reload (`F-01`).
+    #[error("mod '{mod_name}' ({path}) restore_state failed with {status}")]
+    StateRestoreFailed {
+        /// Path of the reloaded shared library.
+        path: PathBuf,
+        /// Canonical mod name.
+        mod_name: String,
+        /// Status returned by `BamManifest::restore_state`.
+        status: FfiResult,
+    },
 }

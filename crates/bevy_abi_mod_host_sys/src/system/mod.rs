@@ -10,6 +10,9 @@ pub use error_policy::{
     SystemInitError,
 };
 pub use guest_system::{
-    GuestSystem, HostSystemCtx, host_sys_commands, host_sys_host_ctx, host_sys_query,
+    GuestSystem, HostSystemCtx, host_sys_commands, host_sys_entity_get, host_sys_entity_get_mut,
+    host_sys_host_ctx, host_sys_query,
 };
+#[cfg(feature = "diagnostics")]
+pub use guest_system::{ModDiagnosticsCollector, ModDiagnosticsSample};
 pub use query_group::{BamQuerySpecOwned, MAX_SYSTEM_QUERIES};

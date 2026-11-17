@@ -16,11 +16,12 @@ use std::collections::HashMap;
 
 use bevy_abi_mod_guest::raw::{
     ABI_VERSION, AccessMode, BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET,
-    BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET,
-    BamColumnInfo, BamCommands, BamComponent, BamHostApi, BamHostCtx, BamInstance, BamIter,
-    BamLoadCtx, BamManifest, BamRunIfFn, BamSystemCtx, BamSystemDesc, BamSystemFn, BamTermDesc,
-    ComponentDesc, ComponentDropFn, ComponentUuid, FfiBool, FfiEntity, FfiResult, ScheduleId,
-    init_guest_instance, shutdown_guest_instance,
+    BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE,
+    BAM_STORAGE_FLAG_SPARSE_SET, BamChunkTaskFn, BamColumnInfo, BamCommands, BamComponent,
+    BamHostApi, BamHostCtx, BamInstance, BamIter, BamLoadCtx, BamManifest, BamRunIfFn,
+    BamSystemCtx, BamSystemDesc, BamSystemFn, BamTermDesc, ComponentDesc, ComponentDropFn,
+    ComponentHookFn, ComponentUuid, FfiBool, FfiEntity, FfiResult, ScheduleId, init_guest_instance,
+    shutdown_guest_instance,
 };
 use bevy_abi_mod_guest::{GuestApp, GuestPlugin, build_guest_fn, build_guest_plugin};
 
@@ -35,6 +36,9 @@ pub struct RegisteredComp {
     pub has_default: bool,
     pub drop_fn: Option<ComponentDropFn>,
     pub vtable_ptr: *const c_void,
+    pub on_add: Option<ComponentHookFn>,
+    pub on_remove: Option<ComponentHookFn>,
+    pub hook_user_data: *mut c_void,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -174,15 +178,20 @@ impl MockChunkData {
 
 pub struct MockIterState {
     pub world: *mut MockHostWorld,
+    pub sys_idx: usize,
+    pub query_idx: usize,
     pub terms: Vec<BamTermDesc>,
     pub next_chunk_idx: usize,
+    pub end_chunk_idx: Option<usize>,
     pub active_chunk_idx: Option<usize>,
+    pub in_par_iter: bool,
     pub ro_rows_scratch: Vec<*const u8>,
     pub mut_rows_scratch: Vec<*mut u8>,
 }
 
 pub struct MockSystemFrame {
     pub world: *mut MockHostWorld,
+    pub sys_idx: usize,
     pub iters: Vec<Box<MockIterState>>,
 }
 
@@ -192,6 +201,8 @@ pub struct MockHostWorld {
     pub name_to_handle: HashMap<String, BamComponent>,
     pub uuid_to_handle: HashMap<ComponentUuid, BamComponent>,
     pub resources: HashMap<BamComponent, Vec<u64>>,
+    pub messages: HashMap<BamComponent, Vec<Vec<MaybeUninit<u8>>>>,
+    pub msg_cursors: HashMap<(usize, usize, usize), usize>,
     pub chunks: Vec<MockChunkData>,
     pub systems: Vec<RegisteredSystem>,
     pub commands: Vec<RecordedCommand>,
@@ -305,12 +316,17 @@ impl TestHost {
         let world_ptr = self.raw;
         let iters = queries
             .into_iter()
-            .map(|terms| {
+            .enumerate()
+            .map(|(q_idx, terms)| {
                 Box::new(MockIterState {
                     world: world_ptr,
+                    sys_idx,
+                    query_idx: q_idx,
                     terms,
                     next_chunk_idx: 0,
+                    end_chunk_idx: None,
                     active_chunk_idx: None,
+                    in_par_iter: false,
                     ro_rows_scratch: Vec::new(),
                     mut_rows_scratch: Vec::new(),
                 })
@@ -318,6 +334,7 @@ impl TestHost {
             .collect();
         let mut frame = MockSystemFrame {
             world: world_ptr,
+            sys_idx,
             iters,
         };
         let sys_ctx = (&raw mut frame).cast::<BamSystemCtx>();
@@ -335,6 +352,8 @@ impl MockHostWorld {
                 name_to_handle: HashMap::new(),
                 uuid_to_handle: HashMap::new(),
                 resources: HashMap::new(),
+                messages: HashMap::new(),
+                msg_cursors: HashMap::new(),
                 chunks: Vec::new(),
                 systems: Vec::new(),
                 commands: Vec::new(),
@@ -365,6 +384,9 @@ impl MockHostWorld {
             has_default,
             drop_fn: None,
             vtable_ptr: core::ptr::null(),
+            on_add: None,
+            on_remove: None,
+            hook_user_data: core::ptr::null_mut(),
         });
         self.name_to_handle.insert(name.to_owned(), handle);
         if !uuid.is_zero() {
@@ -495,6 +517,9 @@ unsafe extern "C" fn host_register_component(
         has_default: false,
         drop_fn: d.drop_fn,
         vtable_ptr: d.vtable_ptr,
+        on_add: d.on_add,
+        on_remove: d.on_remove,
+        hook_user_data: d.hook_user_data,
     });
     world.name_to_handle.insert(name_str.to_owned(), handle);
     if !d.uuid.is_zero() {
@@ -642,13 +667,16 @@ unsafe extern "C" fn host_iter_next_chunk(iter: *mut BamIter, out_len: *mut usiz
     }
     let state = unsafe { &mut *iter.cast::<MockIterState>() };
     let world = unsafe { &*state.world };
-    while state.next_chunk_idx < world.chunks.len() {
+    let limit = state
+        .end_chunk_idx
+        .map_or(world.chunks.len(), |end| end.min(world.chunks.len()));
+    while state.next_chunk_idx < limit {
         let idx = state.next_chunk_idx;
         state.next_chunk_idx += 1;
         let chunk = &world.chunks[idx];
         // Filter check: skip chunks missing required non-optional entity components or matching `WITHOUT`.
         let matches = state.terms.iter().all(|term| {
-            if term.mode.is_resource() {
+            if term.mode.is_resource() || term.mode.is_message() {
                 return true;
             }
             let has_dense = chunk.dense_columns.contains_key(&term.component);
@@ -884,6 +912,9 @@ unsafe extern "C" fn host_iter_col_info(
     if term.mode.is_resource() {
         storage_flags |= BAM_STORAGE_FLAG_RESOURCE;
     }
+    if term.mode.is_message() {
+        storage_flags |= BAM_STORAGE_FLAG_MESSAGE;
+    }
     unsafe {
         *out_info = BamColumnInfo {
             component: term.component,
@@ -1094,6 +1125,250 @@ unsafe extern "C" fn host_cmd_remove(
     FfiResult::OK
 }
 
+unsafe extern "C" fn host_par_for_each_chunk(
+    iter: *mut BamIter,
+    chunk_fn: Option<BamChunkTaskFn>,
+    user_data: *mut c_void,
+) -> FfiResult {
+    if iter.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    let Some(cb) = chunk_fn else {
+        return FfiResult::NULL_POINTER;
+    };
+    let state = unsafe { &mut *iter.cast::<MockIterState>() };
+    if state.in_par_iter {
+        return FfiResult::ACCESS_CONFLICT;
+    }
+    let world_len = unsafe { (*state.world).chunks.len() };
+    let start = state.next_chunk_idx;
+    state.next_chunk_idx = world_len;
+    state.active_chunk_idx = None;
+    for chunk_idx in start..world_len {
+        let mut sub = MockIterState {
+            world: state.world,
+            sys_idx: state.sys_idx,
+            query_idx: state.query_idx,
+            terms: state.terms.clone(),
+            next_chunk_idx: chunk_idx,
+            end_chunk_idx: Some(chunk_idx + 1),
+            active_chunk_idx: None,
+            in_par_iter: true,
+            ro_rows_scratch: Vec::new(),
+            mut_rows_scratch: Vec::new(),
+        };
+        let status = unsafe { cb((&raw mut sub).cast::<BamIter>(), user_data) };
+        if !status.is_ok() {
+            return status;
+        }
+    }
+    FfiResult::OK
+}
+
+unsafe extern "C" fn host_sys_entity_get(
+    sys_ctx: *const BamSystemCtx,
+    query_index: usize,
+    entity: FfiEntity,
+    term_index: usize,
+) -> *const u8 {
+    if sys_ctx.is_null() || entity.is_null() {
+        return core::ptr::null();
+    }
+    let frame = unsafe { &*sys_ctx.cast::<MockSystemFrame>() };
+    let Some(iter_state) = frame.iters.get(query_index) else {
+        return core::ptr::null();
+    };
+    let Some(term) = iter_state.terms.get(term_index) else {
+        return core::ptr::null();
+    };
+    if !term.mode.has_entity_column_data() {
+        return core::ptr::null();
+    }
+    let world = unsafe { &*frame.world };
+    let Some(meta) = world.comp_meta(term.component) else {
+        return core::ptr::null();
+    };
+    for chunk in &world.chunks {
+        if let Some(row) = chunk.entities.iter().position(|&e| e == entity) {
+            // Check query filter membership on this chunk.
+            let matches = iter_state.terms.iter().all(|t| {
+                if t.mode.is_resource() || t.mode.is_message() {
+                    return true;
+                }
+                let present = chunk.dense_columns.contains_key(&t.component)
+                    || chunk.sparse_columns.contains_key(&t.component);
+                if t.mode.is_without() {
+                    !present
+                } else if t.mode.is_optional() {
+                    true
+                } else {
+                    present
+                }
+            });
+            if !matches {
+                return core::ptr::null();
+            }
+            if let Some(words) = chunk.dense_columns.get(&term.component) {
+                return unsafe { words.as_ptr().cast::<u8>().add(row * meta.size) };
+            }
+            return core::ptr::null();
+        }
+    }
+    core::ptr::null()
+}
+
+unsafe extern "C" fn host_sys_entity_get_mut(
+    sys_ctx: *mut BamSystemCtx,
+    query_index: usize,
+    entity: FfiEntity,
+    term_index: usize,
+) -> *mut u8 {
+    if sys_ctx.is_null() || entity.is_null() {
+        return core::ptr::null_mut();
+    }
+    let frame = unsafe { &mut *sys_ctx.cast::<MockSystemFrame>() };
+    let Some(iter_state) = frame.iters.get(query_index) else {
+        return core::ptr::null_mut();
+    };
+    let Some(term) = iter_state.terms.get(term_index) else {
+        return core::ptr::null_mut();
+    };
+    if !term.mode.is_mutable() || !term.mode.has_entity_column_data() {
+        return core::ptr::null_mut();
+    }
+    let world = unsafe { &mut *frame.world };
+    let Some(meta) = world.comp_meta(term.component) else {
+        return core::ptr::null_mut();
+    };
+    if (meta.flags & BAM_COMPONENT_FLAG_IMMUTABLE) != 0 {
+        return core::ptr::null_mut();
+    }
+    let elem_size = meta.size;
+    let terms = iter_state.terms.clone();
+    let comp = term.component;
+    for chunk in &mut world.chunks {
+        if let Some(row) = chunk.entities.iter().position(|&e| e == entity) {
+            let matches = terms.iter().all(|t| {
+                if t.mode.is_resource() || t.mode.is_message() {
+                    return true;
+                }
+                let present = chunk.dense_columns.contains_key(&t.component)
+                    || chunk.sparse_columns.contains_key(&t.component);
+                if t.mode.is_without() {
+                    !present
+                } else if t.mode.is_optional() {
+                    true
+                } else {
+                    present
+                }
+            });
+            if !matches {
+                return core::ptr::null_mut();
+            }
+            chunk.marked_rows.entry(comp).or_default().push(row);
+            if let Some(words) = chunk.dense_columns.get_mut(&comp) {
+                return unsafe { words.as_mut_ptr().cast::<u8>().add(row * elem_size) };
+            }
+            return core::ptr::null_mut();
+        }
+    }
+    core::ptr::null_mut()
+}
+
+unsafe extern "C" fn host_msg_read_batch(
+    iter: *mut BamIter,
+    term_index: usize,
+    out_buf: *mut u8,
+    max_count: usize,
+    out_read: *mut usize,
+) -> FfiResult {
+    if iter.is_null() || out_read.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    unsafe { *out_read = 0 };
+    let state = unsafe { &mut *iter.cast::<MockIterState>() };
+    let Some(term) = state.terms.get(term_index) else {
+        return FfiResult::OUT_OF_RANGE;
+    };
+    if !term.mode.is_message() {
+        return FfiResult::PERMISSION_DENIED;
+    }
+    let world = unsafe { &mut *state.world };
+    let Some(meta) = world.comp_meta(term.component) else {
+        return FfiResult::INVALID_COMPONENT;
+    };
+    let elem_size = meta.size;
+    if max_count > 0 && elem_size > 0 && out_buf.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    let cursor_key = (state.sys_idx, state.query_idx, term_index);
+    let cursor = world.msg_cursors.get(&cursor_key).copied().unwrap_or(0);
+    let Some(stream) = world.messages.get(&term.component) else {
+        return FfiResult::OK;
+    };
+    let avail = stream.len().saturating_sub(cursor);
+    let to_copy = avail.min(max_count);
+    for i in 0..to_copy {
+        if elem_size > 0 {
+            let bytes = &stream[cursor + i];
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    out_buf.add(i * elem_size).cast::<MaybeUninit<u8>>(),
+                    elem_size,
+                );
+            }
+        }
+    }
+    world.msg_cursors.insert(cursor_key, cursor + to_copy);
+    unsafe { *out_read = to_copy };
+    FfiResult::OK
+}
+
+unsafe extern "C" fn host_msg_send(
+    iter: *mut BamIter,
+    term_index: usize,
+    data_ptr: *const u8,
+    data_len: usize,
+) -> FfiResult {
+    if iter.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    let state = unsafe { &mut *iter.cast::<MockIterState>() };
+    let Some(term) = state.terms.get(term_index) else {
+        return FfiResult::OUT_OF_RANGE;
+    };
+    if term.mode != AccessMode::MESSAGE_WRITE {
+        return FfiResult::PERMISSION_DENIED;
+    }
+    let world = unsafe { &mut *state.world };
+    let Some(meta) = world.comp_meta(term.component) else {
+        return FfiResult::INVALID_COMPONENT;
+    };
+    if meta.size != data_len {
+        return FfiResult::TYPE_MISMATCH;
+    }
+    let mut entry = vec![MaybeUninit::uninit(); data_len];
+    if data_len > 0 {
+        if data_ptr.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                data_ptr.cast::<MaybeUninit<u8>>(),
+                entry.as_mut_ptr(),
+                data_len,
+            );
+        }
+    }
+    world
+        .messages
+        .entry(term.component)
+        .or_default()
+        .push(entry);
+    FfiResult::OK
+}
+
 pub fn make_mock_host_api() -> BamHostApi {
     BamHostApi {
         struct_size: core::mem::size_of::<BamHostApi>() as u32,
@@ -1125,5 +1400,10 @@ pub fn make_mock_host_api() -> BamHostApi {
         cmd_insert: Some(host_cmd_insert),
         cmd_insert_default: Some(host_cmd_insert_default),
         cmd_remove: Some(host_cmd_remove),
+        par_for_each_chunk: Some(host_par_for_each_chunk),
+        sys_entity_get: Some(host_sys_entity_get),
+        sys_entity_get_mut: Some(host_sys_entity_get_mut),
+        msg_read_batch: Some(host_msg_read_batch),
+        msg_send: Some(host_msg_send),
     }
 }

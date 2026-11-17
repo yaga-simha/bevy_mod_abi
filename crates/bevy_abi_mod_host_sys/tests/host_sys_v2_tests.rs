@@ -597,16 +597,9 @@ fn world_drop_guard_reclaims_slots_on_world_drop_and_reports_capacity_exceeded()
             None,
         );
         let uuid = ComponentUuid::from_parts("drop_test::OwnedBlob", 8, 8, 99);
-        let desc = ComponentDesc {
-            struct_size: ComponentDesc::MIN_V0_2_SIZE as u32,
-            flags: 0,
-            name: c"drop_test::OwnedBlob".as_ptr(),
-            uuid,
-            size: 8,
-            align: 8,
-            drop_fn: Some(custom_drop),
-            vtable_ptr: core::ptr::null(),
-        };
+        let mut desc =
+            ComponentDesc::new(c"drop_test::OwnedBlob".as_ptr(), uuid, 8, 8).with_drop(custom_drop);
+        desc.struct_size = ComponentDesc::MIN_V0_2_SIZE as u32;
         let mut handle = BamComponent::INVALID;
         // SAFETY: Valid `load_ctx` and `desc`.
         unsafe {
@@ -658,16 +651,8 @@ fn world_drop_guard_reclaims_slots_on_world_drop_and_reports_capacity_exceeded()
         for idx in 0..to_fill {
             let cname = std::ffi::CString::new(format!("cap_test::C{idx}")).unwrap();
             let uuid = ComponentUuid::from_parts(cname.to_str().unwrap(), 4, 4, idx as u64);
-            let desc = ComponentDesc {
-                struct_size: ComponentDesc::MIN_V0_2_SIZE as u32,
-                flags: 0,
-                name: cname.as_ptr(),
-                uuid,
-                size: 4,
-                align: 4,
-                drop_fn: Some(custom_drop),
-                vtable_ptr: core::ptr::null(),
-            };
+            let mut desc = ComponentDesc::new(cname.as_ptr(), uuid, 4, 4).with_drop(custom_drop);
+            desc.struct_size = ComponentDesc::MIN_V0_2_SIZE as u32;
             let mut h = BamComponent::INVALID;
             // SAFETY: Valid `load_ctx` and `desc`.
             unsafe {
@@ -680,16 +665,14 @@ fn world_drop_guard_reclaims_slots_on_world_drop_and_reports_capacity_exceeded()
         assert_eq!(available_drop_trampoline_slots(), 0);
 
         // The 1025th distinct foreign-drop component must fail cleanly with `CAPACITY_EXCEEDED`!
-        let overflow_desc = ComponentDesc {
-            struct_size: ComponentDesc::MIN_V0_2_SIZE as u32,
-            flags: 0,
-            name: c"cap_test::Overflow".as_ptr(),
-            uuid: ComponentUuid::from_parts("cap_test::Overflow", 4, 4, 9999),
-            size: 4,
-            align: 4,
-            drop_fn: Some(custom_drop),
-            vtable_ptr: core::ptr::null(),
-        };
+        let mut overflow_desc = ComponentDesc::new(
+            c"cap_test::Overflow".as_ptr(),
+            ComponentUuid::from_parts("cap_test::Overflow", 4, 4, 9999),
+            4,
+            4,
+        )
+        .with_drop(custom_drop);
+        overflow_desc.struct_size = ComponentDesc::MIN_V0_2_SIZE as u32;
         let mut h = BamComponent::INVALID;
         // SAFETY: Valid `load_ctx` and `overflow_desc`.
         unsafe {

@@ -16,9 +16,9 @@ use crate::{
         BamIter, BamIterColumnInfoFn, BamIterColumnMutableFn, BamIterColumnMutableUntrackedFn,
         BamIterColumnReadonlyFn, BamIterColumnRowsMutableFn, BamIterColumnRowsReadonlyFn,
         BamIterEntitiesFn, BamIterMarkChangedRangeFn, BamIterNextChunkFn, BamIterResetFn,
-        BamResMutPtrFn, BamResPtrFn,
+        BamMsgReadBatchFn, BamMsgSendFn, BamParForEachChunkFn, BamResMutPtrFn, BamResPtrFn,
     },
-    primitives::{BamComponent, ComponentUuid, FfiResult},
+    primitives::{BamComponent, ComponentUuid, FfiEntity, FfiResult},
     system::{BamHostCtx, BamLoadCtx, BamSystemCtx, BamSystemDesc},
     version::{ABI_VERSION, abi_version_is_compatible},
 };
@@ -33,6 +33,42 @@ pub struct BamInstance {
     _marker: PhantomData<(*mut u8, PhantomPinned)>,
 }
 
+/// Host-provided byte-sink callback passed to [`BamSaveStateFn`] (`F-01`) so serialized hot-reload
+/// state bytes are copied directly into a host-allocated `Vec<u8>` without cross-ABI heap ownership.
+///
+/// # Safety
+/// - `ctx` must be the opaque `writer_ctx` supplied by the host to `save_state`.
+/// - When `len > 0`, `bytes` must point to `len` readable initialized bytes.
+pub type BamStateWriterFn =
+    unsafe extern "C" fn(ctx: *mut c_void, bytes: *const u8, len: usize) -> FfiResult;
+
+/// Optional guest hot-reload state snapshot callback on [`BamManifest`] (`F-01`).
+///
+/// Invoked by `world.reload_mod(id)` prior to `bevy_abi_mod_shutdown(instance)`.
+///
+/// # Safety
+/// - `instance` is the `*mut BamInstance` returned by `bevy_abi_mod_init` for the active load session.
+/// - `writer` and `writer_ctx` are valid strictly for the synchronous duration of `save_state`.
+/// - The callback must never unwind across `extern "C"`.
+pub type BamSaveStateFn = unsafe extern "C" fn(
+    instance: *mut BamInstance,
+    writer: Option<BamStateWriterFn>,
+    writer_ctx: *mut c_void,
+) -> FfiResult;
+
+/// Optional guest hot-reload state restoration callback on [`BamManifest`] (`F-01`).
+///
+/// Invoked by `world.reload_mod(id)` immediately after the replacement library's `bevy_abi_mod_init`
+/// succeeds.
+///
+/// # Safety
+/// - `instance` is the newly initialized `*mut BamInstance` for the reloaded session.
+/// - When `len > 0`, `bytes` points to `len` readable bytes valid strictly for the synchronous
+///   duration of `restore_state`.
+/// - The callback must never unwind across `extern "C"`.
+pub type BamRestoreStateFn =
+    unsafe extern "C" fn(instance: *mut BamInstance, bytes: *const u8, len: usize) -> FfiResult;
+
 /// Bitmask of recognized [`BamManifest::flags`] bits in ABI `0.2` (`0`).
 pub const BAM_MANIFEST_KNOWN_FLAGS: u32 = 0;
 
@@ -40,8 +76,8 @@ pub const BAM_MANIFEST_KNOWN_FLAGS: u32 = 0;
 /// (`typedef struct BamManifest BamManifest;`).
 ///
 /// Layout:
-/// - 64-bit: `MIN_V0_2_SIZE = 32` bytes, `8`-byte alignment, zero implicit padding.
-/// - 32-bit: `MIN_V0_2_SIZE = 24` bytes, `4`-byte alignment, zero implicit padding.
+/// - 64-bit: `MIN_V0_2_SIZE = 32` bytes (`size_of = 48` bytes with optional state-transfer slots), `8`-byte alignment, zero implicit padding.
+/// - 32-bit: `MIN_V0_2_SIZE = 24` bytes (`size_of = 32` bytes with optional state-transfer slots), `4`-byte alignment, zero implicit padding.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct BamManifest {
@@ -57,11 +93,15 @@ pub struct BamManifest {
     pub flags: u32,
     /// Explicit zero-reserved field (`must be 0`, `offset 28` / `20`).
     pub reserved0: u32,
+    /// Optional hot-reload state snapshot callback (`F-01`, `offset 32` / `24`).
+    pub save_state: Option<BamSaveStateFn>,
+    /// Optional hot-reload state restoration callback (`F-01`, `offset 40` / `28`).
+    pub restore_state: Option<BamRestoreStateFn>,
 }
 
-// SAFETY: `BamManifest` holds integer fields and `'static` C-string pointers that require `unsafe`
-// to dereference; sharing static `BamManifest` instances across threads cannot cause data races
-// in safe Rust.
+// SAFETY: `BamManifest` holds integer fields, `'static` C-string pointers, and optional `extern "C"`
+// function pointers that require `unsafe` to dereference or invoke; sharing static `BamManifest`
+// instances across threads cannot cause data races in safe Rust.
 unsafe impl Send for BamManifest {}
 // SAFETY: See `Send` implementation above; enables `static MANIFEST: BamManifest` in `export_mod!`.
 unsafe impl Sync for BamManifest {}
@@ -81,6 +121,17 @@ impl BamManifest {
             version,
             flags: 0,
             reserved0: 0,
+            save_state: None,
+            restore_state: None,
+        }
+    }
+
+    /// Returns `true` if `self.struct_size` covers a field of `slot_size` bytes at `slot_offset`.
+    #[inline]
+    pub const fn covers_slot(&self, slot_offset: usize, slot_size: usize) -> bool {
+        match slot_offset.checked_add(slot_size) {
+            Some(end) => (self.struct_size as usize) >= end,
+            None => false,
         }
     }
 
@@ -88,6 +139,32 @@ impl BamManifest {
     #[inline]
     pub const fn with_flags(mut self, flags: u32) -> Self {
         self.flags = flags;
+        self
+    }
+
+    /// Attaches an optional hot-reload `save_state` callback (`F-01`).
+    #[inline]
+    pub const fn with_save_state(mut self, save_state: BamSaveStateFn) -> Self {
+        self.save_state = Some(save_state);
+        self
+    }
+
+    /// Attaches an optional hot-reload `restore_state` callback (`F-01`).
+    #[inline]
+    pub const fn with_restore_state(mut self, restore_state: BamRestoreStateFn) -> Self {
+        self.restore_state = Some(restore_state);
+        self
+    }
+
+    /// Attaches both hot-reload `save_state` and `restore_state` callbacks (`F-01`).
+    #[inline]
+    pub const fn with_state_callbacks(
+        mut self,
+        save_state: BamSaveStateFn,
+        restore_state: BamRestoreStateFn,
+    ) -> Self {
+        self.save_state = Some(save_state);
+        self.restore_state = Some(restore_state);
         self
     }
 
@@ -125,7 +202,7 @@ const _: () = {
     #[cfg(target_pointer_width = "64")]
     {
         assert!(BamManifest::MIN_V0_2_SIZE == 32);
-        assert!(core::mem::size_of::<BamManifest>() == 32);
+        assert!(core::mem::size_of::<BamManifest>() == 48);
         assert!(core::mem::align_of::<BamManifest>() == 8);
         assert!(core::mem::offset_of!(BamManifest, struct_size) == 0);
         assert!(core::mem::offset_of!(BamManifest, abi_version) == 4);
@@ -133,11 +210,13 @@ const _: () = {
         assert!(core::mem::offset_of!(BamManifest, version) == 16);
         assert!(core::mem::offset_of!(BamManifest, flags) == 24);
         assert!(core::mem::offset_of!(BamManifest, reserved0) == 28);
+        assert!(core::mem::offset_of!(BamManifest, save_state) == 32);
+        assert!(core::mem::offset_of!(BamManifest, restore_state) == 40);
     }
     #[cfg(target_pointer_width = "32")]
     {
         assert!(BamManifest::MIN_V0_2_SIZE == 24);
-        assert!(core::mem::size_of::<BamManifest>() == 24);
+        assert!(core::mem::size_of::<BamManifest>() == 32);
         assert!(core::mem::align_of::<BamManifest>() == 4);
         assert!(core::mem::offset_of!(BamManifest, struct_size) == 0);
         assert!(core::mem::offset_of!(BamManifest, abi_version) == 4);
@@ -145,6 +224,8 @@ const _: () = {
         assert!(core::mem::offset_of!(BamManifest, version) == 12);
         assert!(core::mem::offset_of!(BamManifest, flags) == 16);
         assert!(core::mem::offset_of!(BamManifest, reserved0) == 20);
+        assert!(core::mem::offset_of!(BamManifest, save_state) == 24);
+        assert!(core::mem::offset_of!(BamManifest, restore_state) == 28);
     }
 };
 
@@ -277,6 +358,35 @@ pub type BamSysCommandsFn = unsafe extern "C" fn(
     out_commands: *mut *mut BamCommands,
 ) -> FfiResult;
 
+/// Random O(1) read-only per-entity component lookup for `entity` under declared `query_index`
+/// and `term_index` (`F-03`), returning null if `entity` does not match `query_index`'s archetype
+/// filters, lacks the component, or `term_index` did not declare entity read/write access.
+///
+/// # Safety
+/// `sys_ctx` must point to the active [`BamSystemCtx`], and the caller must not alias any active
+/// mutable borrow of the same component on `entity`.
+pub type BamSysEntityGetFn = unsafe extern "C" fn(
+    sys_ctx: *const BamSystemCtx,
+    query_index: usize,
+    entity: FfiEntity,
+    term_index: usize,
+) -> *const u8;
+
+/// Random O(1) mutable per-entity component lookup for `entity` under declared `query_index` and
+/// `term_index` (`F-03`), marking `entity`'s component change tick and returning null if `entity`
+/// does not match `query_index`'s archetype filters, lacks the component, or `term_index` did not
+/// declare `WRITE` / `OPTIONAL_WRITE` access.
+///
+/// # Safety
+/// `sys_ctx` must point to the active [`BamSystemCtx`], and the caller must not create overlapping
+/// mutable or shared borrows to the same component on `entity`.
+pub type BamSysEntityGetMutFn = unsafe extern "C" fn(
+    sys_ctx: *mut BamSystemCtx,
+    query_index: usize,
+    entity: FfiEntity,
+    term_index: usize,
+) -> *mut u8;
+
 /// Complete versioned host function table passed to `bevy_abi_mod_init`
 /// (`typedef struct BamHostApi BamHostApi;`).
 ///
@@ -284,8 +394,8 @@ pub type BamSysCommandsFn = unsafe extern "C" fn(
 /// null-pointer checks are sound without raw pointer byte-probing.
 ///
 /// Layout:
-/// - 64-bit: `MIN_V0_2_SIZE = 224` bytes (`8`B header + `27 * 8`B slots), `8`-byte alignment.
-/// - 32-bit: `MIN_V0_2_SIZE = 116` bytes (`8`B header + `27 * 4`B slots), `4`-byte alignment.
+/// - 64-bit: `MIN_V0_2_SIZE = 224` bytes (`8`B header + `27 * 8`B mandatory slots; `size_of = 264` bytes with 5 optional Wave 4 extension slots), `8`-byte alignment.
+/// - 32-bit: `MIN_V0_2_SIZE = 116` bytes (`8`B header + `27 * 4`B mandatory slots; `size_of = 136` bytes with 5 optional Wave 4 extension slots), `4`-byte alignment.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct BamHostApi {
@@ -359,6 +469,18 @@ pub struct BamHostApi {
     pub cmd_insert_default: Option<BamCmdInsertDefaultFn>,
     /// Queue component removal by [`BamComponent`] handle (`offset 216` / `112`).
     pub cmd_remove: Option<BamCmdRemoveFn>,
+
+    // Optional Wave 4 engine extension slots (appended after `MIN_V0_2_SIZE`)
+    /// Host-driven parallel chunk iteration across `ComputeTaskPool` (`P-07`, `offset 224` / `116`).
+    pub par_for_each_chunk: Option<BamParForEachChunkFn>,
+    /// Random O(1) read-only per-entity component lookup (`F-03`, `offset 232` / `120`).
+    pub sys_entity_get: Option<BamSysEntityGetFn>,
+    /// Random O(1) mutable per-entity component lookup (`F-03`, `offset 240` / `124`).
+    pub sys_entity_get_mut: Option<BamSysEntityGetMutFn>,
+    /// Buffered Bevy `Messages<M>` batch reader (`F-02`, `offset 248` / `128`).
+    pub msg_read_batch: Option<BamMsgReadBatchFn>,
+    /// Buffered Bevy `Messages<M>` writer (`F-02`, `offset 256` / `132`).
+    pub msg_send: Option<BamMsgSendFn>,
 }
 
 impl BamHostApi {
@@ -438,6 +560,17 @@ impl BamHostApi {
             && self.cmd_remove.is_some()
     }
 
+    /// Returns `true` if all 32 ABI `0.2` + Wave 4 optional function-pointer slots are `Some`.
+    #[inline]
+    pub const fn has_all_wave4_slots(&self) -> bool {
+        self.has_all_v0_2_slots()
+            && self.par_for_each_chunk.is_some()
+            && self.sys_entity_get.is_some()
+            && self.sys_entity_get_mut.is_some()
+            && self.msg_read_batch.is_some()
+            && self.msg_send.is_some()
+    }
+
     /// Validates `struct_size >= MIN_V0_2_SIZE`, SemVer compatibility against `guest_version`,
     /// and non-nullness of all 27 core `0.2` slots.
     #[inline]
@@ -460,7 +593,7 @@ const _: () = {
     #[cfg(target_pointer_width = "64")]
     {
         assert!(BamHostApi::MIN_V0_2_SIZE == 224);
-        assert!(core::mem::size_of::<BamHostApi>() == 224);
+        assert!(core::mem::size_of::<BamHostApi>() == 264);
         assert!(core::mem::align_of::<BamHostApi>() == 8);
         assert!(core::mem::offset_of!(BamHostApi, struct_size) == 0);
         assert!(core::mem::offset_of!(BamHostApi, abi_version) == 4);
@@ -491,11 +624,16 @@ const _: () = {
         assert!(core::mem::offset_of!(BamHostApi, cmd_insert) == 200);
         assert!(core::mem::offset_of!(BamHostApi, cmd_insert_default) == 208);
         assert!(core::mem::offset_of!(BamHostApi, cmd_remove) == 216);
+        assert!(core::mem::offset_of!(BamHostApi, par_for_each_chunk) == 224);
+        assert!(core::mem::offset_of!(BamHostApi, sys_entity_get) == 232);
+        assert!(core::mem::offset_of!(BamHostApi, sys_entity_get_mut) == 240);
+        assert!(core::mem::offset_of!(BamHostApi, msg_read_batch) == 248);
+        assert!(core::mem::offset_of!(BamHostApi, msg_send) == 256);
     }
     #[cfg(target_pointer_width = "32")]
     {
         assert!(BamHostApi::MIN_V0_2_SIZE == 116);
-        assert!(core::mem::size_of::<BamHostApi>() == 116);
+        assert!(core::mem::size_of::<BamHostApi>() == 136);
         assert!(core::mem::align_of::<BamHostApi>() == 4);
         assert!(core::mem::offset_of!(BamHostApi, struct_size) == 0);
         assert!(core::mem::offset_of!(BamHostApi, abi_version) == 4);
@@ -526,6 +664,11 @@ const _: () = {
         assert!(core::mem::offset_of!(BamHostApi, cmd_insert) == 104);
         assert!(core::mem::offset_of!(BamHostApi, cmd_insert_default) == 108);
         assert!(core::mem::offset_of!(BamHostApi, cmd_remove) == 112);
+        assert!(core::mem::offset_of!(BamHostApi, par_for_each_chunk) == 116);
+        assert!(core::mem::offset_of!(BamHostApi, sys_entity_get) == 120);
+        assert!(core::mem::offset_of!(BamHostApi, sys_entity_get_mut) == 124);
+        assert!(core::mem::offset_of!(BamHostApi, msg_read_batch) == 128);
+        assert!(core::mem::offset_of!(BamHostApi, msg_send) == 132);
     }
 };
 

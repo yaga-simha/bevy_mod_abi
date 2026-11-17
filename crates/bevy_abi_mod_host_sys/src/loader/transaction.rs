@@ -1,6 +1,8 @@
 //! RAII `LoadTransaction` rolling back drop trampolines and `ModRegistry` snapshot before `dlclose` (`S-06`, `ADR 0001` §2.4).
 
-use crate::drop_trampoline::{StagedDropBinding, WorldDropGuard, prune_drop_trampolines_for_guard};
+use crate::drop_trampoline::{
+    StagedDropBinding, StagedHookBinding, WorldDropGuard, prune_drop_trampolines_for_guard,
+};
 use crate::registry::{ModRegistry, RegistrySnapshot};
 use bevy_ecs::world::World;
 use core::sync::atomic::AtomicBool;
@@ -15,6 +17,7 @@ pub(crate) struct LoadTransaction {
     is_active: Arc<AtomicBool>,
     pre_snapshot: Arc<RegistrySnapshot>,
     staged_drop_bindings: Arc<Mutex<Vec<StagedDropBinding>>>,
+    staged_hook_bindings: Arc<Mutex<Vec<StagedHookBinding>>>,
     committed: bool,
 }
 
@@ -33,6 +36,7 @@ impl LoadTransaction {
             is_active,
             pre_snapshot,
             staged_drop_bindings: Arc::new(Mutex::new(Vec::new())),
+            staged_hook_bindings: Arc::new(Mutex::new(Vec::new())),
             committed: false,
         }
     }
@@ -43,17 +47,33 @@ impl LoadTransaction {
         Arc::clone(&self.staged_drop_bindings)
     }
 
+    /// Returns a shared handle to the staged hook-binding log for `LoadContext`.
+    #[inline]
+    pub(crate) fn staged_hook_bindings(&self) -> Arc<Mutex<Vec<StagedHookBinding>>> {
+        Arc::clone(&self.staged_hook_bindings)
+    }
+
     /// Marks `bevy_abi_mod_init` as succeeded, disarming automatic drop rollback and returning the
     /// staged bindings so `rollback_unscheduled_mod_in_world` can still reclaim fresh slots if
     /// post-init schedule/strict validation fails before scheduling.
     #[inline]
-    pub(crate) fn commit(mut self) -> Vec<StagedDropBinding> {
+    pub(crate) fn commit(mut self) -> (Vec<StagedDropBinding>, Vec<StagedHookBinding>) {
         self.committed = true;
-        let mut guard = self
-            .staged_drop_bindings
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        core::mem::take(&mut *guard)
+        let drops = {
+            let mut guard = self
+                .staged_drop_bindings
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            core::mem::take(&mut *guard)
+        };
+        let hooks = {
+            let mut guard = self
+                .staged_hook_bindings
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            core::mem::take(&mut *guard)
+        };
+        (drops, hooks)
     }
 }
 
@@ -70,8 +90,15 @@ impl Drop for LoadTransaction {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             core::mem::take(&mut *guard)
         };
+        let hook_bindings = {
+            let mut guard = self
+                .staged_hook_bindings
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            core::mem::take(&mut *guard)
+        };
 
-        // 1. Roll back staged drop bindings in `WorldDropGuard` (returning fresh slots to `FREE_LIST`
+        // 1. Roll back staged drop & hook bindings in `WorldDropGuard` (returning fresh slots to `FREE_LIST`
         //    and restoring `previous_snapshot` on hot-updated slots) and restore `ModRegistry` (`ADR 0001` §2.4).
         if !self.world_ptr.is_null() {
             // SAFETY: `self.world_ptr` comes from the exclusive `&mut World` passed into `load_mod_core`
@@ -79,6 +106,7 @@ impl Drop for LoadTransaction {
             let world = unsafe { &mut *self.world_ptr };
             if let Some(mut drop_guard) = world.get_resource_mut::<WorldDropGuard>() {
                 drop_guard.rollback_staged_bindings(&bindings);
+                drop_guard.rollback_staged_hook_bindings(&hook_bindings);
             }
             if let Some(mut reg) = world.get_resource_mut::<ModRegistry>() {
                 reg.restore_snapshot(Arc::clone(&self.pre_snapshot));

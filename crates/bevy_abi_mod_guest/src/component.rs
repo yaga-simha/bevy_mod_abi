@@ -3,8 +3,49 @@
 use core::ffi::CStr;
 use std::ffi::CString;
 
-use bevy_abi_mod_guest_sys::{Host, UuidFilter, resolve_component};
-use bevy_abi_mod_sys::{AbiPod, BamComponent, ComponentUuid, FfiResult};
+use bevy_abi_mod_guest_sys::{Host, PodComponentHooks, UuidFilter, resolve_component};
+use bevy_abi_mod_sys::{AbiPod, BamComponent, ComponentUuid, FfiEntity, FfiResult};
+
+/// Safe builder for optional `on_add` and `on_remove` dynamic component hooks (`F-04`).
+pub struct GuestComponentHooks<T: AbiPod> {
+    pub(crate) inner: PodComponentHooks<T>,
+}
+
+impl<T: AbiPod> Default for GuestComponentHooks<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: AbiPod> GuestComponentHooks<T> {
+    /// Creates an empty hook configuration with neither `on_add` nor `on_remove` set.
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            inner: PodComponentHooks::default(),
+        }
+    }
+
+    /// Attaches an `on_add` hook invoked whenever `T` is inserted onto an entity (`F-04`).
+    #[inline]
+    pub fn on_add<F>(mut self, callback: F) -> Self
+    where
+        F: FnMut(FfiEntity, &T) + Send + 'static,
+    {
+        self.inner.on_add = Some(Box::new(callback));
+        self
+    }
+
+    /// Attaches an `on_remove` hook invoked immediately before `T` is removed from an entity (`F-04`).
+    #[inline]
+    pub fn on_remove<F>(mut self, callback: F) -> Self
+    where
+        F: FnMut(FfiEntity, &T) + Send + 'static,
+    {
+        self.inner.on_remove = Some(Box::new(callback));
+        self
+    }
+}
 
 /// Computes a deterministic 128-bit [`ComponentUuid`] for `T: AbiPod` from its canonical
 /// namespaced name (`"<namespace>::<Name>"`) and optional `field_schema_hash`.

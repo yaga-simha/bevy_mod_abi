@@ -2,7 +2,7 @@
 //! (`C-01`, `C-03`, `C-04`, `L-07`, `P-05`, `P-09`, `B-05`, `B-07`, `B-09`, `S-08`, `N-02`).
 
 use crate::ffi::commands::{HostCommands, HostCommandsStorage};
-use crate::ffi::iter::HostIter;
+use crate::ffi::iter::{HostIter, QueryPlan};
 use crate::handle_header::{
     HandleHeader, HostContext, SYS_CTX_MAGIC, validate_handle_mut, validate_handle_ref,
 };
@@ -16,11 +16,17 @@ use crate::system::error_policy::{
 };
 use crate::system::query_group::{BamQuerySpecOwned, CachedQueryGroup, MAX_SYSTEM_QUERIES};
 use bevy_abi_mod_sys::{
-    BamCommands, BamHostCtx, BamIter, BamRunIfFn, BamSystemCtx, BamSystemFn, FfiResult, ScheduleId,
+    AccessMode, BamCommands, BamHostCtx, BamIter, BamRunIfFn, BamSystemCtx, BamSystemFn, FfiEntity,
+    FfiResult, ScheduleId,
 };
+use bevy_ecs::archetype::ArchetypeId;
 use bevy_ecs::change_detection::{CheckChangeTicks, Tick};
+use bevy_ecs::entity::Entity;
 use bevy_ecs::message::Messages;
+#[cfg(feature = "diagnostics")]
+use bevy_ecs::prelude::Resource;
 use bevy_ecs::schedule::{InternedSystemSet, SystemSet};
+use bevy_ecs::storage::TableId;
 use bevy_ecs::system::{RunSystemError, System, SystemAccess, SystemIn, SystemStateFlags};
 use bevy_ecs::utils::DebugName;
 use bevy_ecs::world::unsafe_world_cell::UnsafeWorldCell;
@@ -28,21 +34,86 @@ use bevy_ecs::world::{CommandQueue, DeferredWorld, World};
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+#[cfg(feature = "diagnostics")]
+use std::sync::Mutex;
+
+/// Snapshot of a single guest system execution recorded when the `diagnostics` feature is enabled (`E-01`).
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Debug)]
+pub struct ModDiagnosticsSample {
+    /// Owning [`ModId`], if associated with a loaded mod.
+    pub mod_id: Option<ModId>,
+    /// Canonical mod namespace (`BamManifest::name` or `"unscoped"`).
+    pub mod_name: Arc<str>,
+    /// Guest system name.
+    pub system_name: Arc<str>,
+    /// Wall-clock CPU duration of the foreign `extern "C"` callback in microseconds.
+    pub cpu_time_us: f64,
+    /// Number of deferred commands queued during this system invocation.
+    pub commands_queued: usize,
+    /// Whether this invocation faulted or caught a guest panic.
+    pub faulted: bool,
+}
+
+/// World resource buffering [`ModDiagnosticsSample`]s from parallel [`GuestSystem`] executions
+/// until flushed into Bevy's `DiagnosticsStore` (`E-01`).
+#[cfg(feature = "diagnostics")]
+#[derive(Resource, Default)]
+pub struct ModDiagnosticsCollector {
+    samples: Mutex<Vec<ModDiagnosticsSample>>,
+}
+
+#[cfg(feature = "diagnostics")]
+impl ModDiagnosticsCollector {
+    /// Creates an empty [`ModDiagnosticsCollector`].
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Appends a single execution sample from a `GuestSystem` run.
+    pub fn push(&self, sample: ModDiagnosticsSample) {
+        if let Ok(mut guard) = self.samples.lock() {
+            guard.push(sample);
+        }
+    }
+
+    /// Drains all buffered samples accumulated since the last flush.
+    pub fn drain(&self) -> Vec<ModDiagnosticsSample> {
+        match self.samples.lock() {
+            Ok(mut guard) => core::mem::take(&mut *guard),
+            Err(poisoned) => core::mem::take(&mut *poisoned.into_inner()),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RandomQueryView<'w> {
+    pub(crate) plan: &'w QueryPlan,
+    pub(crate) is_dense: bool,
+    pub(crate) matched_tables: &'w [TableId],
+    pub(crate) matched_archetypes: &'w [ArchetypeId],
+    pub(crate) has_query_state: bool,
+}
 
 /// Concrete `#[repr(C)]` system invocation context backing opaque [`BamSystemCtx`] (`S-08`, `C-01`).
 #[repr(C)]
-pub struct HostSystemCtx {
+pub struct HostSystemCtx<'w> {
     /// Leading handle validation header (`SYS_CTX_MAGIC`) at byte offset `0`.
     pub header: HandleHeader,
     host_ctx: HostContext,
     iter_ptrs: [*mut BamIter; MAX_SYSTEM_QUERIES],
+    query_views: [Option<RandomQueryView<'w>>; MAX_SYSTEM_QUERIES],
     query_count: usize,
     commands_ptr: *mut BamCommands,
+    world: Option<UnsafeWorldCell<'w>>,
+    last_run: Tick,
+    this_run: Tick,
 }
 
-const _: () = assert!(core::mem::offset_of!(HostSystemCtx, header) == 0);
+const _: () = assert!(core::mem::offset_of!(HostSystemCtx<'_>, header) == 0);
 
-impl HostSystemCtx {
+impl<'w> HostSystemCtx<'w> {
     /// Creates an active stack-scoped [`HostSystemCtx`] for one `GuestSystem` callback invocation.
     pub fn new(
         snapshot: Arc<RegistrySnapshot>,
@@ -57,9 +128,28 @@ impl HostSystemCtx {
             host_ctx: HostContext::with_error_buffer(snapshot, error_buf)
                 .with_namespace(mod_namespace),
             iter_ptrs,
+            query_views: [None; MAX_SYSTEM_QUERIES],
             query_count,
             commands_ptr,
+            world: None,
+            last_run: Tick::new(0),
+            this_run: Tick::new(0),
         }
+    }
+
+    #[inline]
+    pub(crate) fn with_world_and_queries(
+        mut self,
+        world: UnsafeWorldCell<'w>,
+        query_views: [Option<RandomQueryView<'w>>; MAX_SYSTEM_QUERIES],
+        last_run: Tick,
+        this_run: Tick,
+    ) -> Self {
+        self.world = Some(world);
+        self.query_views = query_views;
+        self.last_run = last_run;
+        self.this_run = this_run;
+        self
     }
 
     /// Reclaims the internal diagnostic `String` capacity for zero-allocation reuse across frames.
@@ -75,7 +165,7 @@ impl HostSystemCtx {
     }
 }
 
-impl Drop for HostSystemCtx {
+impl Drop for HostSystemCtx<'_> {
     #[inline]
     fn drop(&mut self) {
         self.header.poison();
@@ -89,7 +179,7 @@ impl Drop for HostSystemCtx {
 pub unsafe extern "C" fn host_sys_host_ctx(sys_ctx: *const BamSystemCtx) -> *const BamHostCtx {
     // SAFETY: Validating `sys_ctx` against `SYS_CTX_MAGIC` under `STRICT_FFI_CHECKS`.
     let Ok(ctx) = (unsafe {
-        validate_handle_ref::<HostSystemCtx>(sys_ctx.cast::<c_void>(), SYS_CTX_MAGIC, false)
+        validate_handle_ref::<HostSystemCtx<'_>>(sys_ctx.cast::<c_void>(), SYS_CTX_MAGIC, false)
     }) else {
         return core::ptr::null();
     };
@@ -111,7 +201,7 @@ pub unsafe extern "C" fn host_sys_query(
     }
     // SAFETY: Validating `sys_ctx` against `SYS_CTX_MAGIC` under `STRICT_FFI_CHECKS`.
     let ctx = match unsafe {
-        validate_handle_mut::<HostSystemCtx>(sys_ctx.cast::<c_void>(), SYS_CTX_MAGIC, false)
+        validate_handle_mut::<HostSystemCtx<'_>>(sys_ctx.cast::<c_void>(), SYS_CTX_MAGIC, false)
     } {
         Ok(c) => c,
         Err(err) => return err,
@@ -140,7 +230,7 @@ pub unsafe extern "C" fn host_sys_commands(
     }
     // SAFETY: Validating `sys_ctx` against `SYS_CTX_MAGIC` under `STRICT_FFI_CHECKS`.
     let ctx = match unsafe {
-        validate_handle_mut::<HostSystemCtx>(sys_ctx.cast::<c_void>(), SYS_CTX_MAGIC, false)
+        validate_handle_mut::<HostSystemCtx<'_>>(sys_ctx.cast::<c_void>(), SYS_CTX_MAGIC, false)
     } {
         Ok(c) => c,
         Err(err) => return err,
@@ -150,6 +240,180 @@ pub unsafe extern "C" fn host_sys_commands(
         *out_commands = ctx.commands_ptr;
     }
     FfiResult::OK
+}
+
+fn entity_matches_random_query_view<'w>(
+    world: UnsafeWorldCell<'w>,
+    view: &RandomQueryView<'_>,
+    entity: Entity,
+    last_run: Tick,
+    this_run: Tick,
+) -> Option<bevy_ecs::world::unsafe_world_cell::UnsafeEntityCell<'w>> {
+    if !view.has_query_state {
+        return None;
+    }
+    let entity_cell = world
+        .get_entity_with_ticks(entity, last_run, this_run)
+        .ok()?;
+    let location = entity_cell.location();
+    let archetype_matched = if view.is_dense {
+        view.matched_tables.contains(&location.table_id)
+    } else {
+        view.matched_archetypes.contains(&location.archetype_id)
+    };
+    if !archetype_matched {
+        return None;
+    }
+    if !view.plan.tick_filters.is_empty() {
+        // SAFETY: `FilteredAccessSet` declared read/write access on every tick-filter component in `view.plan`.
+        let storages = unsafe { world.storages() };
+        for tf in &view.plan.tick_filters {
+            let tick = if tf.is_sparse {
+                let ss = storages.sparse_sets.get(tf.component_id)?;
+                let cell = if tf.is_added {
+                    ss.get_added_tick(entity)?
+                } else {
+                    ss.get_changed_tick(entity)?
+                };
+                // SAFETY: Shared tick access declared in `FilteredAccessSet`.
+                unsafe { *cell.get() }
+            } else {
+                let table = storages.tables.get(location.table_id)?;
+                let col = table.get_column(tf.component_id)?;
+                let table_len = table.entity_count() as usize;
+                let row = location.table_row.index();
+                if row >= table_len {
+                    return None;
+                }
+                let slice = if tf.is_added {
+                    // SAFETY: `table_len == table.entity_count() as usize`.
+                    unsafe { col.get_added_ticks_slice(table_len) }
+                } else {
+                    // SAFETY: `table_len == table.entity_count() as usize`.
+                    unsafe { col.get_changed_ticks_slice(table_len) }
+                };
+                // SAFETY: `row < table_len == slice.len()`.
+                unsafe { *slice.get_unchecked(row).get() }
+            };
+            if !tick.is_newer_than(last_run, this_run) {
+                return None;
+            }
+        }
+    }
+    Some(entity_cell)
+}
+
+/// Random `O(1)` read-only component lookup on `entity` using the access declared by
+/// `(query_index, term_index)` in `FilteredAccessSet` (`F-03`).
+///
+/// Strictly verifies both that `term_index` declared component data read/write access and that
+/// `entity`'s archetype matches `query_index`'s `With`/`Without`/tick filters so Bevy's parallel
+/// scheduler aliasing invariants remain sound.
+///
+/// # Safety
+/// `sys_ctx` must point to an active [`HostSystemCtx`] cast to [`BamSystemCtx`], or null.
+pub unsafe extern "C" fn host_sys_entity_get(
+    sys_ctx: *const BamSystemCtx,
+    query_index: usize,
+    entity: FfiEntity,
+    term_index: usize,
+) -> *const u8 {
+    // SAFETY: Validating `sys_ctx` against `SYS_CTX_MAGIC` under `STRICT_FFI_CHECKS`.
+    let Ok(ctx) = (unsafe {
+        validate_handle_ref::<HostSystemCtx<'_>>(sys_ctx.cast::<c_void>(), SYS_CTX_MAGIC, false)
+    }) else {
+        return core::ptr::null();
+    };
+    if query_index >= ctx.query_count || entity.is_null() {
+        return core::ptr::null();
+    }
+    let Some(bevy_entity) = Entity::try_from_bits(entity.to_bits()) else {
+        return core::ptr::null();
+    };
+    if bevy_entity == Entity::PLACEHOLDER {
+        return core::ptr::null();
+    }
+    let Some(ref view) = ctx.query_views[query_index] else {
+        return core::ptr::null();
+    };
+    if term_index >= view.plan.terms.len() {
+        return core::ptr::null();
+    }
+    let term = &view.plan.terms[term_index];
+    if !term.mode.has_entity_column_data() || term.is_resource() || term.is_message() {
+        return core::ptr::null();
+    }
+    let Some(world) = ctx.world else {
+        return core::ptr::null();
+    };
+    let Some(entity_cell) =
+        entity_matches_random_query_view(world, view, bevy_entity, ctx.last_run, ctx.this_run)
+    else {
+        return core::ptr::null();
+    };
+    // SAFETY: `view` verified that `entity` belongs to an archetype matched by `query_index` and
+    // `term_index` declared read or write component access in `FilteredAccessSet`.
+    match unsafe { entity_cell.get_by_id(term.component_id) } {
+        Some(ptr) => ptr.as_ptr(),
+        None => core::ptr::null(),
+    }
+}
+
+/// Random `O(1)` mutable component lookup on `entity` using the `WRITE` / `OPTIONAL_WRITE` access
+/// declared by `(query_index, term_index)` in `FilteredAccessSet` (`F-03`), marking `entity`'s
+/// component change tick on success.
+///
+/// # Safety
+/// `sys_ctx` must point to an active [`HostSystemCtx`] cast to [`BamSystemCtx`], or null.
+pub unsafe extern "C" fn host_sys_entity_get_mut(
+    sys_ctx: *mut BamSystemCtx,
+    query_index: usize,
+    entity: FfiEntity,
+    term_index: usize,
+) -> *mut u8 {
+    // SAFETY: Validating `sys_ctx` against `SYS_CTX_MAGIC` under `STRICT_FFI_CHECKS`.
+    let Ok(ctx) = (unsafe {
+        validate_handle_mut::<HostSystemCtx<'_>>(sys_ctx.cast::<c_void>(), SYS_CTX_MAGIC, false)
+    }) else {
+        return core::ptr::null_mut();
+    };
+    if query_index >= ctx.query_count || entity.is_null() {
+        return core::ptr::null_mut();
+    }
+    let Some(bevy_entity) = Entity::try_from_bits(entity.to_bits()) else {
+        return core::ptr::null_mut();
+    };
+    if bevy_entity == Entity::PLACEHOLDER {
+        return core::ptr::null_mut();
+    }
+    let Some(ref view) = ctx.query_views[query_index] else {
+        return core::ptr::null_mut();
+    };
+    if term_index >= view.plan.terms.len() {
+        return core::ptr::null_mut();
+    }
+    let term = &view.plan.terms[term_index];
+    if (term.mode != AccessMode::WRITE && term.mode != AccessMode::OPTIONAL_WRITE)
+        || term.is_immutable()
+        || term.is_resource()
+        || term.is_message()
+    {
+        return core::ptr::null_mut();
+    }
+    let Some(world) = ctx.world else {
+        return core::ptr::null_mut();
+    };
+    let Some(entity_cell) =
+        entity_matches_random_query_view(world, view, bevy_entity, ctx.last_run, ctx.this_run)
+    else {
+        return core::ptr::null_mut();
+    };
+    // SAFETY: `view` verified that `entity` belongs to an archetype matched by `query_index` and
+    // `term_index` declared exclusive `WRITE` or `OPTIONAL_WRITE` access in `FilteredAccessSet`.
+    match unsafe { entity_cell.get_mut_by_id(term.component_id) } {
+        Ok(mut_untyped) => mut_untyped.into_inner().as_ptr(),
+        Err(_) => core::ptr::null_mut(),
+    }
 }
 
 /// Host-side Bevy [`System`] wrapping a unified ABI v0.2 [`BamSystemFn`] callback (`N-02`).
@@ -186,6 +450,8 @@ pub struct GuestSystem {
     registry: ModRegistry,
     cached_registry_gen: u64,
     snapshot: Arc<RegistrySnapshot>,
+    #[cfg(feature = "diagnostics")]
+    diagnostics_collector_id: Option<bevy_ecs::component::ComponentId>,
 }
 
 impl GuestSystem {
@@ -231,6 +497,8 @@ impl GuestSystem {
             registry,
             cached_registry_gen,
             snapshot,
+            #[cfg(feature = "diagnostics")]
+            diagnostics_collector_id: None,
         }
     }
 
@@ -320,6 +588,13 @@ impl GuestSystem {
     #[inline]
     pub fn set_mod_namespace(&mut self, namespace: Option<Arc<str>>) {
         self.mod_namespace = namespace;
+    }
+
+    /// Builder helper to attach the canonical module namespace (`BamManifest::name`).
+    #[inline]
+    pub fn with_mod_namespace(mut self, namespace: impl Into<Arc<str>>) -> Self {
+        self.mod_namespace = Some(namespace.into());
+        self
     }
 
     /// Builder helper to associate this system with a [`ModId`].
@@ -553,6 +828,19 @@ impl System for GuestSystem {
 
         match initialize_query_groups_in_world(world, &self.snapshot, &mut self.query_groups) {
             Ok(access_set) => {
+                #[cfg(feature = "diagnostics")]
+                let access_set = {
+                    let mut access_set = access_set;
+                    if let Some(col_id) =
+                        world.components().component_id::<ModDiagnosticsCollector>()
+                    {
+                        access_set.add_resource_read(col_id);
+                        self.diagnostics_collector_id = Some(col_id);
+                    } else {
+                        self.diagnostics_collector_id = None;
+                    }
+                    access_set
+                };
                 self.access = SystemAccess::Shared(access_set);
                 let cell = world.as_unsafe_world_cell();
                 for group in &mut self.query_groups {
@@ -639,8 +927,17 @@ impl System for GuestSystem {
         let count = self.query_groups.len().min(MAX_SYSTEM_QUERIES);
         let mut host_iters: [Option<HostIter<'_>>; MAX_SYSTEM_QUERIES] =
             [const { None }; MAX_SYSTEM_QUERIES];
+        let mut query_views: [Option<RandomQueryView<'_>>; MAX_SYSTEM_QUERIES] =
+            [None; MAX_SYSTEM_QUERIES];
 
         for (i, group) in self.query_groups.iter_mut().take(count).enumerate() {
+            query_views[i] = Some(RandomQueryView {
+                plan: &group.plan,
+                is_dense: group.is_dense,
+                matched_tables: &group.matched_tables,
+                matched_archetypes: &group.matched_archetypes,
+                has_query_state: group.query_state.is_some(),
+            });
             let iter = if group.is_dense {
                 HostIter::new_dense(
                     &storages.tables,
@@ -661,7 +958,8 @@ impl System for GuestSystem {
                     change_tick,
                 )
             }
-            .with_world(world);
+            .with_world(world)
+            .with_msg_cursors(&mut group.msg_cursors);
             host_iters[i] = Some(iter);
         }
 
@@ -672,6 +970,20 @@ impl System for GuestSystem {
                 iter_ptrs[i] = it.as_ffi_ptr();
             }
         }
+
+        let mod_label = self.mod_namespace.as_deref().unwrap_or("unscoped");
+        let sys_span = tracing::debug_span!(
+            "bam_guest_system",
+            mod_name = %mod_label,
+            system = %self.name,
+            chunks = tracing::field::Empty,
+            entities = tracing::field::Empty,
+            commands = tracing::field::Empty,
+        );
+        let _span_guard = sys_span.enter();
+
+        #[cfg(feature = "diagnostics")]
+        let start_time = std::time::Instant::now();
 
         let status = {
             let mut host_commands = HostCommands::new(
@@ -688,7 +1000,8 @@ impl System for GuestSystem {
                 iter_ptrs,
                 count,
                 commands_ptr,
-            );
+            )
+            .with_world_and_queries(world, query_views, last_run, change_tick);
             let sys_ctx_ptr = sys_ctx.as_ffi_ptr();
             let GuestFnPtr(callback) = self.callback;
             // SAFETY: Calling foreign `extern "C"` callback with stack-scoped `HostSystemCtx`,
@@ -697,11 +1010,50 @@ impl System for GuestSystem {
             self.last_error_buf = sys_ctx.reclaim_error_buffer();
             res
         };
+
+        let mut total_chunks = 0usize;
+        let mut total_entities = 0usize;
+        for it in host_iters.iter().take(count).flatten() {
+            let (c, e) = it.stats();
+            total_chunks += c;
+            total_entities += e;
+        }
         drop(host_iters);
 
+        let commands_queued = self.commands_storage.len();
+        if !sys_span.is_disabled() {
+            sys_span.record("chunks", total_chunks);
+            sys_span.record("entities", total_entities);
+            sys_span.record("commands", commands_queued);
+        }
+
+        let faulted = status == FfiResult::PANIC_CAUGHT || status.is_err();
+
+        #[cfg(feature = "diagnostics")]
+        if let Some(col_id) = self.diagnostics_collector_id {
+            let cpu_time_us = start_time.elapsed().as_secs_f64() * 1_000_000.0;
+            // SAFETY: Shared read access to `ModDiagnosticsCollector` (`col_id`) was declared in `FilteredAccessSet`.
+            if let Some(ptr) = unsafe { world.get_resource_by_id(col_id) } {
+                // SAFETY: `col_id` is `ModDiagnosticsCollector`'s `ComponentId`.
+                let collector = unsafe { ptr.deref::<ModDiagnosticsCollector>() };
+                collector.push(ModDiagnosticsSample {
+                    mod_id: self.mod_id,
+                    mod_name: self
+                        .mod_namespace
+                        .clone()
+                        .unwrap_or_else(|| Arc::from("unscoped")),
+                    system_name: Arc::clone(&self.name),
+                    cpu_time_us,
+                    commands_queued: if faulted { 0 } else { commands_queued },
+                    faulted,
+                });
+            }
+        }
+
+        drop(_span_guard);
         self.last_run = change_tick;
 
-        if status == FfiResult::PANIC_CAUGHT || status.is_err() {
+        if faulted {
             return self.record_fault_and_apply_policy(status, status == FfiResult::PANIC_CAUGHT);
         }
 

@@ -1,19 +1,20 @@
-//! [`ModAppExt`] extension methods on Bevy [`App`], delegating to [`ModWorldExt`] (`B-01`).
+//! [`ModAppExt`] extension methods on Bevy [`App`], delegating to [`ModWorldExt`] (`B-01`, `F-01`, `F-02`, `F-05`).
 
 use crate::plugin::ensure_startup_tracker;
 use crate::world_ext::ModWorldExt;
 use bevy_abi_mod_host_sys::{
     ComponentCollisionError, ComponentOptions, LoadOptions, ModErrorPolicy, ModId, ModLoadError,
 };
-use bevy_abi_mod_sys::{BamComponent, ModComponent, ScheduleId};
+use bevy_abi_mod_sys::{AbiPod, BamComponent, ModComponent, ScheduleId};
 use bevy_app::App;
 use bevy_ecs::component::Component;
+use bevy_ecs::message::{Message, Messages};
 use bevy_ecs::prelude::Resource;
-use bevy_ecs::schedule::ScheduleLabel;
+use bevy_ecs::schedule::{ScheduleLabel, SystemSet};
 use std::path::Path;
 
-/// Extension methods on Bevy [`App`] for exposing components/resources/schedules and loading or
-/// unloading native C-ABI mods (`B-01`).
+/// Extension methods on Bevy [`App`] for exposing components/resources/messages/schedules/sets and
+/// loading, reloading, or unloading native C-ABI mods (`B-01`, `F-01`, `F-02`, `F-05`).
 ///
 /// Loading and unloading shared libraries require exclusive [`World`](bevy_ecs::world::World) or
 /// [`App`] access (or deferred [`ModCommandsExt`](crate::ModCommandsExt)) so guest code cannot be
@@ -42,6 +43,12 @@ pub trait ModAppExt {
         &mut self,
     ) -> Result<BamComponent, ComponentCollisionError>;
 
+    /// Registers a buffered POD Bevy [`Message`] type (`Messages<M>`), adding `Messages<M>` frame
+    /// maintenance to this [`App`] and returning its 1-based [`BamComponent`] handle (`F-02`).
+    fn register_mod_message<M: Message + ModComponent + AbiPod>(
+        &mut self,
+    ) -> Result<BamComponent, ComponentCollisionError>;
+
     /// Registers a non-component [`ModComponent`] helper/nested struct type so its static VTable
     /// and field accessors are resolvable via `get_proc_address`.
     fn register_mod_type<T: ModComponent>(&mut self) -> &mut Self;
@@ -52,6 +59,10 @@ pub trait ModAppExt {
         id: ScheduleId,
         label: S,
     ) -> Result<(), ModLoadError>;
+
+    /// Exposes a host [`SystemSet`] under `"host::<name>"` in [`crate::ModVisibleSets`] so guest
+    /// systems can declare `.after(c"host::<name>")` or `.before(c"host::<name>")` (`F-05`).
+    fn register_mod_visible_set<S: SystemSet>(&mut self, name: &str, set: S) -> &mut Self;
 
     /// Sets the default [`ModErrorPolicy`] for guest systems in this [`App`].
     fn set_mod_error_policy(&mut self, policy: ModErrorPolicy) -> &mut Self;
@@ -71,6 +82,23 @@ pub trait ModAppExt {
 
     /// Unloads all currently loaded mods in LIFO order.
     fn unload_all_mods(&mut self) -> &mut Self;
+
+    /// Hot-reloads `id` from its original source path with shadow-copying enabled, transferring
+    /// optional `save_state` / `restore_state` bytes (`F-01`).
+    fn reload_mod(&mut self, id: ModId) -> Result<ModId, ModLoadError>;
+
+    /// Hot-reloads `id` from its original source path with explicit [`LoadOptions`], transferring
+    /// optional `save_state` / `restore_state` bytes (`F-01`).
+    fn reload_mod_with(&mut self, id: ModId, options: LoadOptions) -> Result<ModId, ModLoadError>;
+
+    /// Hot-reloads `id` from a replacement shared-library `path` with explicit [`LoadOptions`],
+    /// transferring optional `save_state` / `restore_state` bytes (`F-01`).
+    fn reload_mod_from<P: AsRef<Path>>(
+        &mut self,
+        id: ModId,
+        path: P,
+        options: LoadOptions,
+    ) -> Result<ModId, ModLoadError>;
 }
 
 impl ModAppExt for App {
@@ -90,6 +118,16 @@ impl ModAppExt for App {
     }
 
     #[inline]
+    fn register_mod_message<M: Message + ModComponent + AbiPod>(
+        &mut self,
+    ) -> Result<BamComponent, ComponentCollisionError> {
+        if !self.world().contains_resource::<Messages<M>>() {
+            self.add_message::<M>();
+        }
+        self.world_mut().register_mod_message::<M>()
+    }
+
+    #[inline]
     fn register_mod_type<T: ModComponent>(&mut self) -> &mut Self {
         self.world_mut().register_mod_type::<T>();
         self
@@ -102,6 +140,12 @@ impl ModAppExt for App {
         label: S,
     ) -> Result<(), ModLoadError> {
         self.world_mut().register_mod_schedule(id, label)
+    }
+
+    #[inline]
+    fn register_mod_visible_set<S: SystemSet>(&mut self, name: &str, set: S) -> &mut Self {
+        let _ = self.world_mut().register_mod_visible_set(name, set);
+        self
     }
 
     #[inline]
@@ -134,5 +178,28 @@ impl ModAppExt for App {
     fn unload_all_mods(&mut self) -> &mut Self {
         self.world_mut().unload_all_mods();
         self
+    }
+
+    #[inline]
+    fn reload_mod(&mut self, id: ModId) -> Result<ModId, ModLoadError> {
+        ensure_startup_tracker(self);
+        self.world_mut().reload_mod(id)
+    }
+
+    #[inline]
+    fn reload_mod_with(&mut self, id: ModId, options: LoadOptions) -> Result<ModId, ModLoadError> {
+        ensure_startup_tracker(self);
+        self.world_mut().reload_mod_with(id, options)
+    }
+
+    #[inline]
+    fn reload_mod_from<P: AsRef<Path>>(
+        &mut self,
+        id: ModId,
+        path: P,
+        options: LoadOptions,
+    ) -> Result<ModId, ModLoadError> {
+        ensure_startup_tracker(self);
+        self.world_mut().reload_mod_from(id, path, options)
     }
 }

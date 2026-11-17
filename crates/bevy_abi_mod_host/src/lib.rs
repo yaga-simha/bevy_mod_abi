@@ -11,6 +11,8 @@
 
 pub mod app_ext;
 pub mod commands_ext;
+#[cfg(feature = "diagnostics")]
+pub mod diagnostics;
 pub mod events;
 pub mod plugin;
 pub mod schedule_sets;
@@ -30,7 +32,9 @@ pub use events::{
     LoadedModInfo, ModLoaded, ModSystemError, ModSystemFaulted, ModUnloaded, SystemInitError,
 };
 pub use plugin::{AbiModPlugin, ConfiguredAbiModPlugin};
-pub use schedule_sets::{ModNamedSystemSet, ModScheduleMap, ModSystemSet, StartupCompleted};
+pub use schedule_sets::{
+    ModNamedSystemSet, ModScheduleMap, ModSystemSet, ModVisibleSets, StartupCompleted,
+};
 pub use world_ext::ModWorldExt;
 
 /// Convenient prelude module for Bevy games hosting native C-ABI mods (`ABI 0.2.0`).
@@ -42,7 +46,7 @@ pub mod prelude {
     };
     pub use crate::plugin::{AbiModPlugin, ConfiguredAbiModPlugin};
     pub use crate::schedule_sets::{
-        ModNamedSystemSet, ModScheduleMap, ModSystemSet, StartupCompleted,
+        ModNamedSystemSet, ModScheduleMap, ModSystemSet, ModVisibleSets, StartupCompleted,
     };
     pub use crate::world_ext::ModWorldExt;
     pub use crate::{
