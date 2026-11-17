@@ -10,7 +10,66 @@ env:
 
 jobs:
   # ============================================================================
-  # 1. Cross-Platform Workspace & Asymmetric Mod Matrix (Linux / macOS / Windows)
+  # 1. Core Static Quality, Docs, SemVer, Deny, Typos & 32-bit/Wasm Wire Checks (`CI-04`, `T-10`)
+  # ============================================================================
+  quality-gates:
+    name: Quality, Docs, Deny, Typos & Wire Targets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install stable Rust toolchain + 32-bit & Wasm targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: i686-unknown-linux-gnu, wasm32-unknown-unknown
+
+      - name: Cache Cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Spellcheck repository (`typos`)
+        uses: crate-ci/typos@v1.31.1
+
+      - name: Supply-chain, license & duplicate-Bevy audit (`cargo-deny`)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources
+
+      - name: Formatting, workspace clippy & single-source C99 header verification
+        run: |
+          cargo fmt --all -- --check
+          cargo xtask header --check --test-c99
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy --manifest-path fuzz/Cargo.toml --bins -- -D warnings
+
+      - name: Strict rustdoc warnings check (`CI-04`, `D-05`)
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps
+
+      - name: 32-bit (`i686`) & `wasm32` ABI contract layout checks (`T-10`)
+        run: |
+          cargo check -p bevy_abi_mod_sys --target i686-unknown-linux-gnu
+          cargo check -p bevy_abi_mod_sys --target wasm32-unknown-unknown
+
+      - name: SemVer compatibility check on `bevy_abi_mod_sys` (`CI-04`)
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          package: bevy_abi_mod_sys
+          baseline-rev: ${{ github.event.pull_request.base.sha || 'HEAD~1' }}
+
+      - name: Build mdBook developer guide (`D-06`)
+        uses: peaceiris/actions-mdbook@v2
+        with:
+          mdbook-version: "0.4.48"
+      - name: Render `docs/book`
+        run: mdbook build docs/book
+
+  # ============================================================================
+  # 2. Cross-Platform Default Workspace Parallel Test Matrix (`T-03`, `CI-05`)
   # ============================================================================
   test-matrix:
     name: Test Matrix (${{ matrix.os }})
@@ -31,14 +90,112 @@ jobs:
       - name: Cache Cargo registry & build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Run cargo xtask ci
-        run: cargo xtask ci
+      - name: Build hermetic fixtures & run parallel default tests (no `--test-threads=1`)
+        run: |
+          cargo xtask ci
+          cargo test --doc
 
   # ============================================================================
-  # 2. Strict ISO C99 & C++17 Header Verification (-Wall -Wextra -Werror)
+  # 3. Heavy GUI / 3D Examples (`04_visual_game`, `05_cute_3d_winit`) (`CI-04`, `H-06`)
   # ============================================================================
-  c99-strict:
-    name: Strict C99 (${{ matrix.cc }})
+  heavy-examples:
+    name: Heavy GUI & 3D Examples
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux X11 / Wayland / ALSA / udev system headers for Bevy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libudev-dev libx11-dev libxi-dev libxkbcommon-dev libwayland-dev pkg-config
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: heavy-examples
+
+      - name: Check, lint & test `04_visual_game` and `05_cute_3d_winit` + guest mods
+        run: |
+          cargo xtask fixtures --examples
+          cargo clippy -p example_04_visual_game -p example_05_cute_3d_winit --all-targets -- -D warnings
+          BAM_FIXTURE_DIR="${{ github.workspace }}/target/fixtures" \
+            cargo test -p example_04_visual_game -p example_05_cute_3d_winit
+
+  # ============================================================================
+  # 4. True Asymmetry Matrix: MSRV / Stable / Nightly + O0/O3 + panic=abort + C99 + C++17 + Zig (`T-08`, `X-02`)
+  # ============================================================================
+  asymmetry-rust:
+    name: Asymmetric Rust Guest (${{ matrix.guest_toolchain }}, opt=${{ matrix.opt_level }}, panic=${{ matrix.panic_mode }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - guest_toolchain: "1.95.0"
+            opt_level: "0"
+            panic_mode: "unwind"
+          - guest_toolchain: "1.95.0"
+            opt_level: "3"
+            panic_mode: "unwind"
+          - guest_toolchain: "stable"
+            opt_level: "0"
+            panic_mode: "unwind"
+          - guest_toolchain: "stable"
+            opt_level: "3"
+            panic_mode: "abort"
+          - guest_toolchain: "nightly"
+            opt_level: "0"
+            panic_mode: "unwind"
+          - guest_toolchain: "nightly"
+            opt_level: "3"
+            panic_mode: "abort"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable host toolchain + ${{ matrix.guest_toolchain }} guest toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup toolchain install "${{ matrix.guest_toolchain }}" --profile minimal
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: asym-rust-${{ matrix.guest_toolchain }}-o${{ matrix.opt_level }}-${{ matrix.panic_mode }}
+
+      - name: Stage base fixtures with stable host, then rebuild `asymmetric_rust_mod` asymmetrically
+        env:
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: ${{ matrix.opt_level }}
+          CARGO_PROFILE_RELEASE_PANIC: ${{ matrix.panic_mode }}
+        run: |
+          cargo +stable xtask fixtures
+          cargo "+${{ matrix.guest_toolchain }}" build \
+            --manifest-path tests/asymmetric_rust_mod/Cargo.toml \
+            --release
+          cp tests/asymmetric_rust_mod/target/release/libasymmetric_rust_mod.so \
+             target/fixtures/libasymmetric_rust_mod.so
+
+      - name: Load asymmetric guest into stable host & execute integration suites
+        env:
+          BAM_FIXTURE_DIR: "${{ github.workspace }}/target/fixtures"
+        run: |
+          if [ "${{ matrix.panic_mode }}" = "unwind" ]; then
+            cargo +stable test -p bevy_abi_mod_host
+          else
+            # Under `panic=abort`, run non-panicking FFI/scheduling/lifecycle suites + dedicated G-05 abort subprocess test
+            cargo +stable test -p bevy_abi_mod_host --test ffi --test scheduling
+            cargo +stable test -p bevy_abi_mod_host --test e2e panic_abort
+          fi
+
+  asymmetry-polyglot:
+    name: Polyglot Guest Matrix (C99 gcc/clang + C++17 + Zig)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -51,23 +208,97 @@ jobs:
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Cargo registry & build artifacts
-        uses: Swatinem/rust-cache@v2
+      - name: Install Zig toolchain (`goto-bus-stop/setup-zig`)
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.14.0
 
-      - name: Validate C99 header, standalone harness & C99 fixture mods
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: polyglot-${{ matrix.cc }}
+
+      - name: Validate strict C99 (`${{ matrix.cc }}`), C++17 (`07_cpp17_guest`), and Zig (`08_zig_guest`)
         env:
           CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cc == 'clang' && 'clang++' || 'g++' }}
         run: |
           cargo xtask header --test-c99
-          cargo xtask fixtures --all
-
-      - name: Verify C++17 header compatibility
-        if: matrix.cc == 'clang'
-        run: |
-          clang++ -std=c++17 -Wall -Wextra -Werror -fsyntax-only -x c++ include/bevy_abi_mod.h
+          cargo xtask fixtures
+          make -C examples/07_cpp17_guest/cpp_mod clean all CXX="$CXX"
+          (cd examples/08_zig_guest/zig_mod && zig build -Doptimize=ReleaseFast)
+          BAM_FIXTURE_DIR="${{ github.workspace }}/target/fixtures" \
+            cargo test -p example_07_cpp17_guest -p example_08_zig_guest
+          cargo run -p example_07_cpp17_guest
+          cargo run -p example_08_zig_guest
 
   # ============================================================================
-  # 3. Miri Soundness & Tree Borrows Verification
+  # 5. Deterministic Benchmark Gate (`iai-callgrind` + Smoke Bench) (`X-03`)
+  # ============================================================================
+  benchmark-gate:
+    name: Deterministic Callgrind & Benchmark Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Valgrind + `iai-callgrind-runner`
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Valgrind & iai-callgrind-runner
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends valgrind
+          cargo install iai-callgrind-runner --version 0.16.1 --locked
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: bench-gate
+
+      - name: Run deterministic `iai-callgrind` gate & `chunk_throughput --test`
+        run: |
+          cargo xtask fixtures
+          cargo bench --manifest-path benches/deterministic_gate/Cargo.toml
+          BAM_FIXTURE_DIR="${{ github.workspace }}/target/fixtures" \
+            cargo bench -p bevy_abi_mod_host --bench chunk_throughput -- --test
+
+  # ============================================================================
+  # 6. Line Coverage Gate (`>= 85%` on `ffi/` and `system/`) (`T-12`)
+  # ============================================================================
+  coverage:
+    name: Coverage Gate (>=85% ffi/ & system/)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust with `llvm-tools-preview`
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install `cargo-llvm-cov`
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: llvm-cov
+
+      - name: Build fixtures & enforce >= 85% line coverage on `ffi/` and `system/`
+        run: |
+          cargo xtask fixtures
+          BAM_FIXTURE_DIR="${{ github.workspace }}/target/fixtures" \
+            cargo llvm-cov --no-report \
+              -p bevy_abi_mod_host_sys \
+              -p bevy_abi_mod_host
+          cargo llvm-cov report \
+            --ignore-filename-regex '(crates/bevy_abi_mod_host_sys/src/(drop_trampoline|handle_header|loader|registry|schedule|sync_ptr)|crates/bevy_abi_mod_host/|tests/)' \
+            --fail-under-lines 85
+
+  # ============================================================================
+  # 7. Miri Soundness, Tree Borrows & ASan/UBSan (`CI-06`)
   # ============================================================================
   miri:
     name: Miri (-Zmiri-tree-borrows)
@@ -91,12 +322,9 @@ jobs:
         with:
           key: miri-tree-borrows
 
-      - name: Run Miri via cargo xtask
+      - name: Run Miri via `cargo xtask miri --all`
         run: cargo xtask miri --all
 
-  # ============================================================================
-  # 4. ASan & UBSan Sanitizer Verification on C99 ABI & Guest Mod
-  # ============================================================================
   sanitizers:
     name: ASan / UBSan C99 Verification
     runs-on: ubuntu-latest
@@ -110,7 +338,7 @@ jobs:
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Run standalone_c_test under AddressSanitizer + UndefinedBehaviorSanitizer
+      - name: Run `standalone_c_test` under AddressSanitizer + UndefinedBehaviorSanitizer
         env:
           ASAN_OPTIONS: "detect_leaks=1:strict_string_checks=1:halt_on_error=1"
           UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
@@ -134,35 +362,4 @@ jobs:
             -o tests/asymmetric_c_mod/libasymmetric_c_mod.so
           cp tests/asymmetric_c_mod/libasymmetric_c_mod.so target/fixtures/libasymmetric_c_mod.so
           BAM_FIXTURE_DIR="${{ github.workspace }}/target/fixtures" \
-            cargo test -p bevy_abi_mod_host -- --test-threads=1
-
-  # ============================================================================
-  # 5. Randomized Rust Layout Check (-Zrandomize-layout)
-  # ============================================================================
-  randomize-layout:
-    name: Randomized Rust Layout (-Zrandomize-layout)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install nightly Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-
-      - name: Cache Cargo artifacts
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: randomize-layout
-
-      - name: Build asymmetric C99 & Rust guest fixtures with default layout
-        run: cargo +nightly xtask fixtures
-
-      - name: Run host & ABI suites under -Zrandomize-layout
-        env:
-          RUSTFLAGS: "-Zrandomize-layout"
-          BAM_FIXTURE_DIR: "${{ github.workspace }}/target/fixtures"
-        run: |
-          cargo +nightly test -p bevy_abi_mod_sys -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest
-          cargo +nightly test -p bevy_abi_mod_macros --lib --test validation_gate_1
-          cargo +nightly test -p bevy_abi_mod_host_sys --lib -- --test-threads=1
-          cargo +nightly test -p bevy_abi_mod_host -- --test-threads=1
+            cargo test -p bevy_abi_mod_host

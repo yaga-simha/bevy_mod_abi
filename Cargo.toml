@@ -17,6 +17,8 @@ members = [
     "examples/04_visual_game",
     "examples/05_cute_3d_winit",
     "examples/06_cross_mod_components",
+    "examples/07_cpp17_guest",
+    "examples/08_zig_guest",
 ]
 default-members = [
     "crates/bevy_abi_mod_sys",
@@ -31,6 +33,8 @@ default-members = [
     "examples/02_multi_system_pipeline",
     "examples/03_cross_language_interop",
     "examples/06_cross_mod_components",
+    "examples/07_cpp17_guest",
+    "examples/08_zig_guest",
 ]
 exclude = [
     # `shared_scenario` has `crate-type = ["dylib"]` so `permutation_bench` and
@@ -41,6 +45,8 @@ exclude = [
     "benches/shared_scenario",
     "tests/asymmetric_rust_mod",
     "benches/c_abi_rust_mod",
+    "benches/deterministic_gate",
+    "fuzz",
     "examples/01_minimal_handshake/guest_mod",
     "examples/02_multi_system_pipeline/guest_mod",
     "examples/03_cross_language_interop/rust_mod",

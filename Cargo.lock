@@ -1907,6 +1907,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "example_07_cpp17_guest"
+version = "0.1.0"
+dependencies = [
+ "bevy_abi_mod",
+ "bevy_abi_mod_sys",
+ "bevy_app",
+ "bevy_ecs",
+]
+
+[[package]]
+name = "example_08_zig_guest"
+version = "0.1.0"
+dependencies = [
+ "bevy_abi_mod",
+ "bevy_abi_mod_sys",
+ "bevy_app",
+ "bevy_ecs",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,152 @@
+name: Nightly Deep Verification (Fuzz, TSan, Big-Endian Miri, Randomize-Layout)
+
+on:
+  schedule:
+    - cron: "15 3 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ============================================================================
+  # 1. `T-06`: Continuous `cargo-fuzz` (`10` minutes per target over committed corpus)
+  # ============================================================================
+  fuzz:
+    name: cargo-fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_read_extensible
+          - fuzz_system_desc
+          - fuzz_commands
+          - fuzz_cstr_array
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install nightly Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+
+      - name: Install `cargo-fuzz`
+        uses: taiki-e/install-action@cargo-fuzz
+
+      - name: Cache fuzz build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          key: fuzz-${{ matrix.target }}
+
+      - name: Fuzz `${{ matrix.target }}` for 600 seconds (`T-06`)
+        run: |
+          cargo +nightly fuzz run "${{ matrix.target }}" \
+            "fuzz/corpus/${{ matrix.target }}" \
+            -- -max_total_time=600
+
+  # ============================================================================
+  # 2. `T-07`: ThreadSanitizer (`-Zsanitizer=thread -Zbuild-std`) + `loom` Concurrency Model
+  # ============================================================================
+  tsan-and-loom:
+    name: ThreadSanitizer & Loom Concurrency Verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install nightly Rust with `rust-src`
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: tsan-loom
+
+      - name: Run `loom` drop-trampoline publish/reclaim model tests (`T-07`)
+        env:
+          RUSTFLAGS: "--cfg loom"
+        run: cargo +nightly test -p bevy_abi_mod_host_sys --lib drop_trampoline --release
+
+      - name: Stage hermetic fixtures (uninstrumented foreign mods)
+        run: cargo +nightly xtask fixtures
+
+      - name: Run multi-threaded scheduler & lifecycle suites under ThreadSanitizer (`T-07`)
+        env:
+          RUSTFLAGS: "-Zsanitizer=thread"
+          TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
+          BAM_FIXTURE_DIR: "${{ github.workspace }}/target/fixtures"
+        run: |
+          cargo +nightly test \
+            -Zbuild-std \
+            --target x86_64-unknown-linux-gnu \
+            -p bevy_abi_mod_host \
+            --test scheduling --test lifecycle
+
+  # ============================================================================
+  # 3. `S-10` & `T-10`: Big-Endian (`s390x-unknown-linux-gnu`) Cross-Target Miri
+  # ============================================================================
+  miri-big-endian:
+    name: Miri Big-Endian (s390x-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    env:
+      MIRIFLAGS: "-Zmiri-tree-borrows"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install nightly Rust with Miri & `rust-src`
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+
+      - name: Setup Miri sysroot for `s390x-unknown-linux-gnu`
+        run: cargo +nightly miri setup --target s390x-unknown-linux-gnu
+
+      - name: Cache Miri s390x artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: miri-s390x
+
+      - name: Run ABI, guest, and `Entity <-> FfiEntity` endianness parity tests on `s390x`
+        run: |
+          cargo +nightly miri test --target s390x-unknown-linux-gnu \
+            -p bevy_abi_mod_sys -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest
+          cargo +nightly miri test --target s390x-unknown-linux-gnu \
+            -p bevy_abi_mod_host_sys --lib
+
+  # ============================================================================
+  # 4. Randomized Rust Struct Layout (`-Zrandomize-layout`) + Long Proptest Parity (`T-05`)
+  # ============================================================================
+  randomize-layout-and-proptest:
+    name: Randomized Rust Layout & Extended Differential Proptest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install nightly Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: nightly-randomize-layout
+
+      - name: Build guest fixtures with default layout
+        run: cargo +nightly xtask fixtures
+
+      - name: Run host, macro, and ABI suites under `-Zrandomize-layout`
+        env:
+          RUSTFLAGS: "-Zrandomize-layout"
+          PROPTEST_CASES: "2048"
+          BAM_FIXTURE_DIR: "${{ github.workspace }}/target/fixtures"
+        run: |
+          cargo +nightly test -p bevy_abi_mod_sys -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest
+          cargo +nightly test -p bevy_abi_mod_macros --lib --test mod_component_vtable
+          cargo +nightly test -p bevy_abi_mod_host_sys --lib
+          cargo +nightly test -p bevy_abi_mod_host
