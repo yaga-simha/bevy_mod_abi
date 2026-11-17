@@ -1357,7 +1357,7 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
                  st->v0 ^= m;\n\
                  idx += 8u;\n\
              }\n\
-             while (idx < len) {\n\
+             while (idx < len && st->tail_len < 8u) {\n\
                  st->tail[st->tail_len] = bytes[idx];\n\
                  st->tail_len += 1u;\n\
                  idx += 1u;\n\

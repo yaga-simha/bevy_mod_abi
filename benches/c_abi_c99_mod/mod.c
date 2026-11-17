@@ -239,7 +239,7 @@ static BamResult c99_sys_chunk_optimized(BamSystemCtx* sys_ctx, void* user_data)
             float energy = st->vit_vt->get_energy(vit_p);
 
             float r_kin = st->res_vt->get_kinetic(res_p);
-            float r_thm = st->res_vt->get_thermal(res_p);
+            float r_therm = st->res_vt->get_thermal(res_p);
             float r_ion = st->res_vt->get_ionic(res_p);
             uint32_t u_team = st->fac_vt->get_team_id(fac_p);
             size_t e;
@@ -278,7 +278,7 @@ static BamResult c99_sys_chunk_optimized(BamSystemCtx* sys_ctx, void* user_data)
                         vy += dy * imp;
                         vz += dz * imp;
 
-                        raw_dmg = em->thermal_dps * atten * SIM_DT * (1.0f - 0.6f * r_thm);
+                        raw_dmg = em->thermal_dps * atten * SIM_DT * (1.0f - 0.6f * r_therm);
                         absorbed = (shield >= raw_dmg) ? raw_dmg : shield;
                         shield -= absorbed;
                         nh = health - (raw_dmg - absorbed);
@@ -382,7 +382,7 @@ static BamResult c99_sys_entity_nested_vtable(BamSystemCtx* sys_ctx, void* user_
             float energy = st->vit_vt->get_energy(vit_p);
 
             float r_kin = st->res_vt->get_kinetic(res_p);
-            float r_thm = st->res_vt->get_thermal(res_p);
+            float r_therm = st->res_vt->get_thermal(res_p);
             float r_ion = st->res_vt->get_ionic(res_p);
             uint32_t u_team = st->fac_vt->get_team_id(fac_p);
             size_t e_count = 0u;
@@ -439,7 +439,7 @@ static BamResult c99_sys_entity_nested_vtable(BamSystemCtx* sys_ctx, void* user_
                             vz += dz * imp;
 
                             tdps = st->aura_vt->get_thermal_dps(e_aura_p);
-                            raw_dmg = tdps * atten * SIM_DT * (1.0f - 0.6f * r_thm);
+                            raw_dmg = tdps * atten * SIM_DT * (1.0f - 0.6f * r_therm);
                             absorbed = (shield >= raw_dmg) ? raw_dmg : shield;
                             shield -= absorbed;
                             nh = health - (raw_dmg - absorbed);
@@ -589,14 +589,14 @@ static BamResult c99_sys_naive_chatty_ffi(BamSystemCtx* sys_ctx, void* user_data
                         } else {
                             float r_kin = st->res_vt->get_kinetic(res_p);
                             float imp = force * atten * SIM_DT * (1.0f - 0.5f * r_kin) * inv_dist;
-                            float tdps, r_thm, raw_dmg, cur_sh, absorbed, nh, r_ion, drain, ne;
+                            float tdps, r_therm, raw_dmg, cur_sh, absorbed, nh, r_ion, drain, ne;
                             (void)st->v3_vt->set_x(v_mut, st->v3_vt->get_x(v_mut) + dx * imp);
                             (void)st->v3_vt->set_y(v_mut, st->v3_vt->get_y(v_mut) + dy * imp);
                             (void)st->v3_vt->set_z(v_mut, st->v3_vt->get_z(v_mut) + dz * imp);
 
                             tdps = st->aura_vt->get_thermal_dps(e_aura_p);
-                            r_thm = st->res_vt->get_thermal(res_p);
-                            raw_dmg = tdps * atten * SIM_DT * (1.0f - 0.6f * r_thm);
+                            r_therm = st->res_vt->get_thermal(res_p);
+                            raw_dmg = tdps * atten * SIM_DT * (1.0f - 0.6f * r_therm);
                             cur_sh = st->vit_vt->get_shield(vit_p);
                             absorbed = (cur_sh >= raw_dmg) ? raw_dmg : cur_sh;
                             (void)st->vit_vt->set_shield(vit_p, cur_sh - absorbed);

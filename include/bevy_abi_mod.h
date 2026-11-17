@@ -601,7 +601,7 @@ bam_sipround(&st->v0, &st->v1, &st->v2, &st->v3);
 st->v0 ^= m;
 idx += 8u;
 }
-while (idx < len) {
+while (idx < len && st->tail_len < 8u) {
 st->tail[st->tail_len] = bytes[idx];
 st->tail_len += 1u;
 idx += 1u;
