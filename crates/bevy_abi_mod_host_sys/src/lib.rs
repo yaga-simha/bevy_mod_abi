@@ -1,3 +1,4 @@
+#![warn(missing_docs)]
 #![deny(
     improper_ctypes_definitions,
     clippy::undocumented_unsafe_blocks,

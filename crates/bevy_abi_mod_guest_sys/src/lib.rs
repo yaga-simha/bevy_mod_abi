@@ -13,6 +13,7 @@
 //! Mod authors should depend on `bevy_abi_mod_guest` (`#![forbid(unsafe_code)]`) rather than
 //! calling this `-sys` crate directly.
 
+#![warn(missing_docs)]
 #![deny(
     unsafe_op_in_unsafe_fn,
     clippy::undocumented_unsafe_blocks,

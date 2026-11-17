@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version = "1.87"
 license.workspace = true
 authors.workspace = true
+description = "Safe (`#![forbid(unsafe_code)]`), zero-Bevy Rust guest SDK for native `.cdylib` mods targeting `bevy_abi_mod`"
+readme = "README.md"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [lints]
 workspace = true

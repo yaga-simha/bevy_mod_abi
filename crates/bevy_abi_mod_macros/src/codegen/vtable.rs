@@ -92,6 +92,7 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
         #[repr(C)]
         #[derive(Debug, Copy, Clone)]
         pub struct #vtable_ident {
+            /// Wire-level VTable metadata header (`struct_size`, `abi_version`, `uuid`, `size`, `align`).
             pub header: #sys_crate::VTableHeader,
             #(#vtable_fields)*
         }

@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 //! # `bevy_abi_mod_guest`: Safe Idiomatic Rust Guest SDK (`ABI 0.2.0`)
 //!
@@ -16,16 +17,49 @@
 //!   mutable state—loading the same `.cdylib` into multiple Bevy `World`s simultaneously is
 //!   completely isolated.
 //! - **Unified `app.system(...)` Builder:** [`GuestApp::system`] compiles up to
-//!   [`MAX_QUERIES_PER_SYSTEM`] queries, declaration-indexed singleton resources, [`ScheduleId`]
-//!   selection, `.after(...)` / `.before(...)` named ordering, `.main_thread()` pinning, and
-//!   lock-free `.run_if(...)` predicates into a single [`BamSystemDesc`](raw::BamSystemDesc).
-//! - **Verified Zero-Copy Views:** [`Chunk`] validates [`BamColumnInfo`]
+//!   [`MAX_QUERIES_PER_SYSTEM`] queries, declaration-indexed singleton resources ([`GuestRes`] /
+//!   [`GuestResMut`] with [`BamChangeTicks`]), [`ScheduleId`] selection, `.after(...)` /
+//!   `.before(...)` / `.in_set(...)` ordering (including `"host::<name>"` sets),
+//!   `.main_thread()` pinning, and lock-free `.run_if(...)` predicates into a single
+//!   [`BamSystemDesc`](raw::BamSystemDesc).
+//! - **Verified Zero-Copy Views & Parallelism:** [`Chunk`] validates [`BamColumnInfo`]
 //!   (`size`, `align`, `mode`, storage flags, and `ComponentUuid` via [`Chunk::component`]),
-//!   provides indirect sparse-set row views ([`Chunk::rows`] / [`Chunk::rows_mut`]), and supports
-//!   untracked mutable slices paired with [`Chunk::mark_changed_range`].
-//! - **Handle-Based & Batched Commands:** [`GuestCommands`] enqueues zero-steady-state-allocation
-//!   deferred spawns (`spawn_empty`, single-archetype batched `spawn`), `despawn`, `insert`,
-//!   `insert_default`, and `remove` using 1-based [`BamComponent`] handles.
+//!   provides indirect sparse-set row views ([`Chunk::rows`] / [`Chunk::rows_mut`]), supports
+//!   untracked mutable slices paired with [`Chunk::mark_changed_range`], and offers
+//!   work-stealing [`ChunkIter::par_for_each`] (and [`SystemContext::par_chunks`]) iteration.
+//! - **Handle-Based Commands, Messages, & Observers:** [`GuestCommands`] enqueues
+//!   zero-steady-state-allocation deferred spawns (`spawn_empty`, single-archetype batched `spawn`
+//!   with [`FfiChildOf`]), `despawn`, `insert`, `insert_default`, `remove`, and `trigger`
+//!   (`world.trigger()`), alongside batch `Messages<M>` read/write and dynamic `Event` /
+//!   `EntityEvent` observers ([`GuestApp::observe`]).
+//!
+//! ## Quickstart
+//!
+//! ```no_run
+//! use bevy_abi_mod_guest::prelude::*;
+//! use core::ffi::CStr;
+//!
+//! #[derive(Default)]
+//! struct HierarchyMod;
+//!
+//! impl GuestPlugin for HierarchyMod {
+//!     const NAME: &'static CStr = c"hierarchy_mod";
+//!     const VERSION: &'static CStr = c"0.2.0";
+//!
+//!     fn build(&mut self, app: &mut GuestApp<'_>) -> FfiResult {
+//!         app.system(c"inspect_parents")
+//!             .query(|q| q.read::<FfiChildOf>())
+//!             .schedule(ScheduleId::UPDATE)
+//!             .build(|ctx| {
+//!                 while let Some(chunk) = ctx.iter().next_chunk_view() {
+//!                     let _parents = chunk.component::<FfiChildOf>(0);
+//!                 }
+//!             })
+//!     }
+//! }
+//!
+//! export_mod!(plugin: HierarchyMod);
+//! ```
 //!
 //! ## Panic & Unwind Policy: `panic = "unwind"` vs. `panic = "abort"`
 //!

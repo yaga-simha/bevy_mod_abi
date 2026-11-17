@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 //! Safe idiomatic Bevy host crate for `bevy_abi_mod` (`ABI 0.2.0`).
 //!
@@ -8,6 +9,33 @@
 //!
 //! All `unsafe` FFI internals are isolated inside `bevy_abi_mod_host_sys`; this crate enforces
 //! `#![forbid(unsafe_code)]`.
+//!
+//! # Quickstart
+//!
+//! ```no_run
+//! use bevy_abi_mod_host::prelude::*;
+//! use bevy_app::{App, Update};
+//! use bevy_ecs::component::Component;
+//! use bevy_ecs::schedule::SystemSet;
+//!
+//! #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+//! struct PhysicsSet;
+//!
+//! #[repr(C)]
+//! #[derive(Component, Clone, Copy, Default, ModComponent)]
+//! #[mod_component(name = "game::Position")]
+//! struct Position {
+//!     x: f32,
+//!     y: f32,
+//! }
+//!
+//! let mut app = App::new();
+//! app.add_plugins(AbiModPlugin::with_error_policy(ModErrorPolicy::Quarantine));
+//! app.register_mod_component::<Position>(ComponentOptions::new().with_raw_insert().with_default())
+//!     .unwrap();
+//! app.register_mod_visible_set("physics", PhysicsSet);
+//! app.load_mod_with("mods/libmovement.dylib", LoadOptions::default()).unwrap();
+//! ```
 
 pub mod app_ext;
 pub mod commands_ext;

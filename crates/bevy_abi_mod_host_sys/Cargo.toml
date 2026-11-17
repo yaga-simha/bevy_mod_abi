@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+description = "Low-level host FFI engine, CoW registry, chunk/sparse iterators, command arena, and dynamic loader for `bevy_abi_mod`"
+readme = "README.md"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [lints]
 workspace = true

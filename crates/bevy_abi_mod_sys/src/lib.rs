@@ -1,4 +1,5 @@
 #![no_std]
+#![warn(missing_docs)]
 #![deny(clippy::undocumented_unsafe_blocks, clippy::missing_safety_doc)]
 
 //! # `bevy_abi_mod_sys`: Zero-Dependency C-ABI `0.2` Wire Contract for `bevy_abi_mod`

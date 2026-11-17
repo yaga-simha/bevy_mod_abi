@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_abi_mod_host"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bevy_abi_mod_host_sys",
  "bevy_abi_mod_macros",
@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_abi_mod_host_sys"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arc-swap",
  "bevy_abi_mod_sys",
@@ -120,7 +120,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_abi_mod_macros"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_abi_mod_sys"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "bevy_app"

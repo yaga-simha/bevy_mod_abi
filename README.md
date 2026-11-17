@@ -13,6 +13,17 @@
 
 ---
 
+## Core Capabilities (`ABI 0.2.0`)
+
+- **Zero-Copy SoA & Sparse-Set Views + Parallel Chunks:** Guests read/write contiguous Bevy `Table` columns as typed `&[T]` / `&mut [T]` slices (`AbiPod`), batch-iterate `SparseSet` rows (`rows` / `rows_mut`), inspect or defer `Changed` ticks (`mark_changed_range`), and fan out via `par_chunks` (`ComputeTaskPool`).
+- **`EntityWorldMut` Command Fidelity:** Deferred spawns, inserts, removes, and despawns execute via Bevy `EntityWorldMut` (`insert_by_ids` / `remove_by_id`), guaranteeing native `ComponentHooks`, `#[require(...)]` Required Components, and `ChildOf` / `Children` hierarchies (`FfiChildOf`).
+- **Resources, Buffered `Messages<M>`, & `EntityEvent` Observers:** Access host singleton resources (`GuestRes<R>` / `GuestResMut<R>`) with Bevy `BamChangeTicks` (`is_added()`, `is_changed()`), exchange batched `Messages<M>`, emit `world.trigger()` events, and register dynamic global/`EntityEvent` observers.
+- **Bevy `0.20+` Deterministic Scheduling & Host-Visible Sets:** Target built-in or custom `ScheduleId`s and order systems via `.in_set()`, `.before()`, and `.after()` across intra-mod, cross-mod (`"other_mod::step"`), and host-exported `ModVisibleSets` (`register_mod_visible_set` -> `"host::<name>"`).
+- **Runtime Dynamic Components & Destructor Safety:** Mods attach private `#[repr(C)]` state to host entities via `ComponentDescriptor::new_with_layout` (`register_component_with_layout`), optional `on_add`/`on_remove` hooks, and 1,024 wait-free `DROP_SLOTS` trampolines protected by `WorldDropGuard`.
+- **Shadow-Copy Hot Reload, Quarantine & Telemetry:** Core loader shadow-copying prevents OS DLL locks and Apple Silicon `CODESIGNING` faults; `ModQuarantine` isolates panics (`PANIC_CAUGHT`); `save_state` / `restore_state` preserves guest state across `reload_mod`.
+
+---
+
 ## Crate Architecture (`-sys` vs. `#![forbid(unsafe_code)]`)
 
 | Crate | `#![forbid(unsafe_code)]` | `bevy*` Deps | Purpose |

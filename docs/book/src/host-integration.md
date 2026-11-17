@@ -42,28 +42,39 @@ app.register_mod_component::<UnitMetadata>(
 // 3. Singleton Bevy Resource (`AccessMode::RESOURCE_READ` / `RESOURCE_WRITE`)
 app.init_resource::<SimConfig>();
 app.register_mod_resource::<SimConfig>()?;
+
+// 4. Buffered POD Bevy Messages (`Messages<M>`) & Triggerable Events
+app.register_mod_message::<DamageMessage>()?;
+app.register_mod_event::<WaveStarted>()?;
+app.register_mod_entity_event::<HitEntity>()?;
 ```
+
+Because `CommandArena` flushes deferred spawns, inserts, and removals through Bevy's `EntityWorldMut` (`insert_by_ids` / `remove_by_id`), host `ComponentHooks` (`on_add` / `on_insert` / `on_replace` / `on_remove`), `#[require(...)]` Required Components, and `ChildOf` / `Children` relationships automatically stay consistent when mutated by guest mods.
 
 ---
 
-## 3. Built-In & Custom Game Schedules (`ModScheduleMap`)
+## 3. Built-In & Custom Game Schedules (`ModScheduleMap` & `ModVisibleSets`)
 
-Guest systems can target any built-in Bevy schedule (`ScheduleId::STARTUP`, `PRE_UPDATE`, `UPDATE`, `POST_UPDATE`, `FIXED_UPDATE`, `LAST`) or game-defined custom schedules (`id >= ScheduleId::CUSTOM_BASE` = `1024`):
+Guest systems can target any built-in Bevy schedule (`ScheduleId::STARTUP`, `PRE_UPDATE`, `UPDATE`, `POST_UPDATE`, `FIXED_UPDATE`, `LAST`) or game-defined custom schedules (`id >= ScheduleId::CUSTOM_BASE` = `1024`), and constrain execution order relative to host-exported `SystemSet`s (`ModVisibleSets`) under Bevy `0.20+` schedule randomization:
 
 ```rust
-use bevy_ecs::schedule::ScheduleLabel;
+use bevy_ecs::schedule::{ScheduleLabel, SystemSet};
 
 #[derive(ScheduleLabel, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RollbackPhysicsTick;
+
+#[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HostInputSet;
 
 const ROLLBACK_SCHEDULE_ID: ScheduleId = ScheduleId::custom(1024);
 
 app.init_schedule(RollbackPhysicsTick);
 app.register_mod_schedule(ROLLBACK_SCHEDULE_ID, RollbackPhysicsTick)?;
+app.register_mod_visible_set("input", HostInputSet);
 ```
 
 - **Late `Startup` Execution:** If a mod is loaded at runtime *after* Bevy's `Startup` schedule has already run (`StartupCompleted` resource), any `ScheduleId::STARTUP` systems in that mod execute once immediately upon load commit.
-- **Scoped Named Ordering:** Every guest system automatically joins `ModSystemSet(mod_id)` and `ModNamedSystemSet { mod_name, system_name }`. Unqualified `.after("step_a")` orders within the same mod; `"other_mod::step_a"` orders across mods without global name collisions.
+- **Scoped Named Ordering & Host Sets:** Every guest system automatically joins `ModSystemSet(mod_id)` and `ModNamedSystemSet { mod_name, system_name }`. Unqualified `.after("step_a")` orders within the same mod; `"other_mod::step_a"` orders across mods; `"host::input"` orders `.in_set()`, `.before()`, or `.after()` relative to host-exported `ModVisibleSets`.
 - **Main-Thread Affinity:** Guests with thread-affine state set `BAM_SYSTEM_FLAG_MAIN_THREAD` (`.main_thread()` in Rust), mapping to Bevy's `SystemStateFlags::NON_SEND`.
 
 ---

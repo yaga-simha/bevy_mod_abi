@@ -38,7 +38,16 @@ When `world.unload_mod(id)` (or `app.unload_mod(id)`) runs under exclusive `&mut
 
 ---
 
-## 4. Observing Lifecycle & Fault `Messages`
+## 4. State-Preserving Hot Reload (`world.reload_mod`)
+
+`world.reload_mod(id)` (or `app.reload_mod` / `commands.reload_mod`) hot-swaps a mod cleanly while transferring optional internal guest state:
+1. Calls the active guest's optional `GuestPlugin::save_state(&self) -> Result<Vec<u8>, FfiResult>` (`BamManifest::save_state`), streaming bytes across the FFI boundary via `BamStateWriterFn` into a host `Vec<u8>`.
+2. Runs the deterministic 5-step unload sequence above (preserving registered ECS `ComponentId`s and entity data in Bevy storage).
+3. Shadow-copy loads the rebuilt library, runs `GuestPlugin::build`, and passes the saved byte slice to `GuestPlugin::restore_state(&mut self, bytes)` (`BamManifest::restore_state`).
+
+---
+
+## 5. Observing Lifecycle & Fault `Messages`
 
 ```rust
 use bevy_abi_mod::prelude::*;

@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 //! Zero-serialization, asymmetric C-ABI (`ABI 0.2.0`) native modding framework for Bevy ECS (`v0.20+`).
 //!
@@ -16,55 +17,65 @@
 //!    guest mods to be compiled with different `rustc` versions or written in ISO C99, C++17/20,
 //!    or Zig.
 //! 2. **Zero Serialization Overhead:** Host ECS `Table` columns are exposed directly as
-//!    contiguous Structure-of-Arrays (SoA) byte slices (and `SparseSet` columns as batched
-//!    per-row pointer arrays) without JSON, MessagePack, or Bincode serialization.
-//! 3. **Allocator & Lifecycle Isolation:** Host and guest dynamic libraries link independent
-//!    heap allocators. Memory allocated on one side is never freed by the other, and each
-//!    `World` owns isolated mod instances with deterministic unloading.
+//!    contiguous Structure-of-Arrays (SoA) byte slices, `SparseSet` columns as batched per-row
+//!    pointer arrays, and singleton resources with change-detection ticks without JSON, MessagePack,
+//!    or Bincode serialization.
+//! 3. **Allocator & Relational Integrity:** Host and guest dynamic libraries link independent heap
+//!    allocators. Memory allocated on one side is never freed by the other, and all deferred guest
+//!    spawns, inserts, and removals execute through Bevy `EntityWorldMut` paths so
+//!    `ComponentHooks`, `#[require(...)]` Required Components, and `ChildOf` / `Children`
+//!    relationships fire accurately.
 //!
 //! ---
 //!
 //! # Host Integration Guide (Crate Consumers)
 //!
-//! ## 1. Add `AbiModPlugin` and Expose Components
+//! ## 1. Add `AbiModPlugin` and Expose Components, Resources & Sets
 //!
 //! Derive [`ModComponent`] on `#[repr(C)]` Bevy components (or [`AbiPod`] on plain-old-data
-//! types), register them on your `App` via [`ModAppExt`], and add [`AbiModPlugin`]:
+//! types), register them on your `App` via [`ModAppExt`], expose host `SystemSet`s via
+//! [`ModAppExt::register_mod_visible_set`], and add [`AbiModPlugin`]:
 //!
-//! ```ignore
+//! ```no_run
 //! use bevy_abi_mod::prelude::*;
-//! use bevy_app::prelude::*;
-//! use bevy_ecs::prelude::*;
+//! use bevy_app::App;
+//! use bevy_ecs::component::Component;
 //!
-//! #[derive(Component, ModComponent, Clone, Copy)]
 //! #[repr(C)]
+//! #[derive(Component, ModComponent, Clone, Copy, Default)]
+//! #[mod_component(name = "my_game::Health")]
 //! struct Health {
 //!     current: f32,
 //!     max: f32,
 //! }
 //!
 //! fn main() {
-//!     App::new()
-//!         .add_plugins(AbiModPlugin::default())
-//!         .register_mod_component::<Health>()
-//!         .run();
+//!     let mut app = App::new();
+//!     app.add_plugins(AbiModPlugin::with_error_policy(ModErrorPolicy::Quarantine));
+//!     app.register_mod_component::<Health>(
+//!         ComponentOptions::new().with_raw_insert().with_default(),
+//!     )
+//!     .expect("register Health");
+//!     app.load_mod_with("mods/libcombat_mod.dylib", LoadOptions::default())
+//!         .expect("load mod");
+//!     app.run();
 //! }
 //! ```
 //!
-//! ## 2. Load and Unload Native Mods
+//! ## 2. Load, Hot-Reload, and Unload Native Mods
 //!
-//! Mods can be loaded from disk using [`ModWorldExt::load_mod`] (or [`ModCommandsExt`]) with
-//! [`LoadOptions`], and unloaded cleanly via [`ModWorldExt::unload_mod`]. Lifecycle events such
-//! as [`ModLoaded`], [`ModUnloaded`], and [`ModSystemFaulted`] are emitted as Bevy messages.
+//! Mods can be loaded from disk using [`ModWorldExt::load_mod_with`] (or [`ModCommandsExt`]) with
+//! [`LoadOptions`], hot-reloaded with state preservation via [`ModWorldExt::reload_mod`], and
+//! unloaded cleanly via [`ModWorldExt::unload_mod`]. Lifecycle events such as [`ModLoaded`],
+//! [`ModUnloaded`], and [`ModSystemFaulted`] are emitted as Bevy messages.
 //!
-//! ```ignore
+//! ```no_run
 //! use bevy_abi_mod::prelude::*;
-//! use bevy_ecs::prelude::*;
-//! use std::path::Path;
+//! use bevy_ecs::world::World;
 //!
 //! fn load_gameplay_mod(world: &mut World) {
 //!     let mod_id = world
-//!         .load_mod(Path::new("mods/gameplay_mod.dylib"), LoadOptions::default())
+//!         .load_mod_with("mods/libgameplay_mod.dylib", LoadOptions::default())
 //!         .expect("failed to load native mod");
 //!
 //!     // Later, when hot-reloading or shutting down:
@@ -75,34 +86,46 @@
 //! ## 3. Guest Mod Usage (Separate `cdylib` Crate)
 //!
 //! Guest mods depend on `bevy_abi_mod_guest` (which has **no** dependency on `bevy`) and
-//! export their entry points with `export_mod!`:
+//! export their entry points with `export_mod!(plugin: MyMod)`:
 //!
 //! ```ignore
 //! use bevy_abi_mod_guest::prelude::*;
+//! use core::ffi::CStr;
 //!
-//! #[derive(GuestComponent, AbiPod, Clone, Copy)]
 //! #[repr(C)]
+//! #[derive(Clone, Copy, AbiPod)]
 //! struct Health {
 //!     current: f32,
 //!     max: f32,
 //! }
 //!
+//! impl GuestComponent for Health {
+//!     const NAME: &'static CStr = c"my_game::Health";
+//! }
+//!
+//! #[derive(Default)]
 //! struct RegenerateMod;
 //!
 //! impl GuestPlugin for RegenerateMod {
-//!     fn build(&self, app: &mut GuestApp) {
-//!         let health = app.component::<Health>();
-//!         app.system("regenerate", move |mut ctx| {
-//!             for mut chunk in ctx.query().write(health).iter() {
-//!                 for h in chunk.write_slice(health) {
-//!                     h.current = (h.current + 0.1).min(h.max);
+//!     const NAME: &'static CStr = c"regenerate_mod";
+//!
+//!     fn build(&mut self, app: &mut GuestApp<'_>) -> FfiResult {
+//!         app.system(c"regenerate")
+//!             .query(|q| q.write::<Health>())
+//!             .schedule(ScheduleId::UPDATE)
+//!             .build(|ctx| {
+//!                 while let Some(mut chunk) = ctx.iter().next_chunk_view() {
+//!                     if let Some(healths) = chunk.component_mut::<Health>(0) {
+//!                         for h in healths {
+//!                             h.current = (h.current + 0.1).min(h.max);
+//!                         }
+//!                     }
 //!                 }
-//!             }
-//!         });
+//!             })
 //!     }
 //! }
 //!
-//! export_mod!(RegenerateMod);
+//! export_mod!(plugin: RegenerateMod);
 //! ```
 //!
 //! ---

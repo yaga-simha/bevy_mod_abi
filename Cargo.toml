@@ -60,11 +60,14 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 authors = ["bevy_abi_mod authors"]
+repository = "https://github.com/yaga-simha/bevy_mod_abi"
+keywords = ["bevy", "ecs", "ffi", "modding", "plugin"]
+categories = ["game-development", "api-bindings"]
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -81,13 +84,13 @@ redundant_clone = "warn"
 match_same_arms = "warn"
 
 [workspace.dependencies]
-bevy_abi_mod_sys = { version = "0.1.0", path = "crates/bevy_abi_mod_sys" }
-bevy_abi_mod_macros = { version = "0.1.0", path = "crates/bevy_abi_mod_macros" }
-bevy_abi_mod_host_sys = { version = "0.1.0", path = "crates/bevy_abi_mod_host_sys" }
-bevy_abi_mod_host = { version = "0.1.0", path = "crates/bevy_abi_mod_host" }
-bevy_abi_mod_guest_sys = { version = "0.1.0", path = "crates/bevy_abi_mod_guest_sys" }
-bevy_abi_mod_guest = { version = "0.1.0", path = "crates/bevy_abi_mod_guest" }
-bevy_abi_mod = { version = "0.1.0", path = "crates/bevy_abi_mod" }
+bevy_abi_mod_sys = { version = "0.2.0", path = "crates/bevy_abi_mod_sys" }
+bevy_abi_mod_macros = { version = "0.2.0", path = "crates/bevy_abi_mod_macros" }
+bevy_abi_mod_host_sys = { version = "0.2.0", path = "crates/bevy_abi_mod_host_sys" }
+bevy_abi_mod_host = { version = "0.2.0", path = "crates/bevy_abi_mod_host" }
+bevy_abi_mod_guest_sys = { version = "0.2.0", path = "crates/bevy_abi_mod_guest_sys" }
+bevy_abi_mod_guest = { version = "0.2.0", path = "crates/bevy_abi_mod_guest" }
+bevy_abi_mod = { version = "0.2.0", path = "crates/bevy_abi_mod" }
 bevy_ecs = { version = "0.20.1", default-features = false, features = ["std", "async_executor"] }
 bevy_app = { version = "0.20.1", default-features = false, features = ["std"] }
 bevy_platform = { version = "0.20.1", default-features = false, features = ["std"] }

@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+description = "Safe (`#![forbid(unsafe_code)]`) Bevy ECS plugin, extension traits, and lifecycle messages for `bevy_abi_mod`"
+readme = "README.md"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 autotests = false
 
 [lints]

@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 //! # `bevy_abi_mod_macros`: Procedural Macros for `#[derive(ModComponent)]` and `#[derive(AbiPod)]`
 //!

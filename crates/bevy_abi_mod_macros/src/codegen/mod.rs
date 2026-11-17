@@ -245,7 +245,10 @@ impl CodegenState {
                 }
             });
 
+            let vt_slot_doc =
+                format!("Generated C-ABI `{vt_slot_str}` accessor slot for `{struct_ident}`.");
             self.vtable_fields.push(quote! {
+                #[doc = #vt_slot_doc]
                 pub #vt_slot_ident: ::core::option::Option<
                     unsafe extern "C" fn(#recv_param_vt #extra_params_vt) -> #ret_ty
                 >,

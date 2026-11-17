@@ -51,17 +51,18 @@ app.system(c"integrate_velocity")
          .read::<Velocity>()       // term 1: &Velocity
          .with::<ActiveTag>()      // term 2: With<ActiveTag>
          .without::<FrozenTag>()   // term 3: Without<FrozenTag>
-         .res_read::<SimClock>()   // term 4: Res<SimClock>
     })
+    .resource_read::<SimClock>()   // declaration-indexed singleton resource
     .schedule(ScheduleId::FIXED_UPDATE)
+    .in_set(c"host::physics_step")
     .after(c"apply_forces")
     .before(c"other_mod::collision_broadphase")
-    .run_if(|| true)
+    .run_if(|_ctx| true)
     .build(|ctx| {
-        let Some(clock) = ctx.iter().resource::<SimClock>(4) else {
+        let Ok(clock) = ctx.res_with_ticks::<SimClock>(0) else {
             return FfiResult::NULL_POINTER;
         };
-        let dt = clock.dt;
+        let dt = if clock.is_changed() { clock.dt } else { 1.0 / 60.0 };
 
         while let Some(mut chunk) = ctx.iter().next_chunk_view() {
             // Disjoint split borrow of (&[Velocity], &mut [Position])
@@ -78,15 +79,18 @@ app.system(c"integrate_velocity")
     })?;
 ```
 
-### Sparse-Set Columns & Fine-Grained Change Tracking
-- **Sparse-Set Components:** When a component uses `StorageType::SparseSet`, call `chunk.rows::<T>(term_idx)` or `chunk.rows_mut::<T>(term_idx)` to iterate batched indirect row references without falling back to 1-entity FFI calls.
+### Parallel Chunks, Sparse-Set Columns & Change Tracking
+- **Parallel Chunks:** Call `ctx.par_chunks(|mut chunk| { ... })` (or `ctx.iter().par_for_each(...)`) to process matched table/archetype chunks in parallel across Bevy's `ComputeTaskPool`.
+- **Sparse-Set Columns:** When a component uses `StorageType::SparseSet`, call `chunk.rows::<T>(term_idx)` or `chunk.rows_mut::<T>(term_idx)` to iterate batched indirect row references without falling back to 1-entity FFI calls.
 - **Untracked Mutable Slices:** When inspecting a mutable column and modifying only occasional elements, use `chunk.column_mut_untracked::<T>(term_idx)` and call `chunk.mark_changed_range(term_idx, row, 1)` only on mutated rows so downstream `Changed<T>` systems skip untouched rows.
 
 ---
 
-## 4. Handle-Based & Batched Deferred Commands (`GuestCommands`)
+## 4. Handle Commands, Hierarchies, Messages & Observers
 
-Resolve `BamComponent` handles once in `GuestPlugin::build` (`let pos_h = app.resolve_component::<Position>()?;`) and enqueue zero-steady-state-allocation commands inside systems:
+- **Batched Spawns & `FfiChildOf` Hierarchies:** Resolve `BamComponent` handles once in `GuestPlugin::build` (`let pos_h = app.resolve_component::<Position>()?;`), or register private mod-owned components via `app.register_component::<MyState>()` / `app.register_component_with_layout(...)`. Use `GuestCommands::spawn(&entries)` (including `SpawnEntry::new(child_of_h, &FfiChildOf(parent))`) to reserve an `FfiEntity` atomically and place components in a single `EntityWorldMut::insert_by_ids` transition during `apply_deferred`.
+- **Buffered `Messages<M>`:** Declare `.message_read::<M>()` / `.message_write::<M>()` on `SystemBuilder` and drain or emit contiguous batches via `ctx.read_messages::<M>(decl_idx)` and `ctx.send_messages::<M>(decl_idx, &batch)`.
+- **Immediate Triggers & `EntityEvent` Observers:** Emit events via `cmds.trigger(&ev)` / `cmds.trigger_entity(entity, &ev)` and subscribe during `GuestPlugin::build` via `app.observe::<MyEvent, _>("on_wave", |ev, cmds| { ... })` or `app.observe_entity::<HitEntity, _>("on_hit", FfiEntity::NULL, |target, ev, cmds| { ... })`.
 
 ```rust
 let mut cmds = ctx.commands()?;
@@ -95,8 +99,6 @@ let entity = cmds.spawn(&[
     SpawnEntry::new(vel_h, &Velocity { x: 1.0, y: 0.0, z: 0.0 }),
 ])?;
 ```
-
-`cmds.spawn(&entries)` reserves an `FfiEntity` atomically and materializes all components directly into the final Bevy archetype in a single table transition during `apply_deferred`.
 
 ---
 

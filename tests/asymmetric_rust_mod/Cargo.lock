@@ -12,7 +12,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_abi_mod_guest"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bevy_abi_mod_guest_sys",
  "bevy_abi_mod_macros",
@@ -21,14 +21,14 @@ dependencies = [
 
 [[package]]
 name = "bevy_abi_mod_guest_sys"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bevy_abi_mod_sys",
 ]
 
 [[package]]
 name = "bevy_abi_mod_macros"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -38,7 +38,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_abi_mod_sys"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "equivalent"
