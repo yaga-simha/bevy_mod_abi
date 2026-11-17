@@ -1,25 +1,22 @@
-//! Wave 1 FFI regressions (`S-04` padded struct insertion, `S-10` entity bit layout).
+//! Wave 1 FFI regressions (`S-04` padded struct insertion, `S-10` entity bit layout) on ABI v0.2.
 
-use bevy_abi_mod_host::{AbiModPlugin, ModAppExt, ModRegistry};
+use bevy_abi_mod_host::{AbiModPlugin, ComponentOptions, ModAppExt, ModComponent, ModRegistry};
 use bevy_abi_mod_host_sys::{
-    CommandQueueBridge, ModInitContext, host_cmd_insert_component, host_cmd_spawn_empty,
-    host_register_component,
+    HostCommands, HostCommandsStorage, LoadContext, host_cmd_insert, host_cmd_spawn,
+    host_cmd_spawn_empty, host_register_component,
 };
-use bevy_abi_mod_macros::ModExposable;
-use bevy_abi_mod_sys::{
-    ComponentUuid, FfiEntity, FfiResult, ModComponentDescriptor, RawCommandQueue,
-};
+use bevy_abi_mod_sys::{BamComponent, ComponentDesc, ComponentUuid, FfiEntity, FfiResult};
 use bevy_app::App;
 use bevy_ecs::component::Component;
 use bevy_ecs::entity::Entity;
-use bevy_ecs::world::{CommandQueue, World};
-use core::ffi::c_void;
+use bevy_ecs::world::World;
 use core::mem::MaybeUninit;
 use core::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 #[repr(C)]
-#[derive(Component, ModExposable, Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Component, ModComponent, Copy, Clone, Debug, PartialEq, Eq)]
+#[mod_component(name = "ffi_reg::PaddedPair")]
 struct PaddedPair {
     tag: u8,
     // 7 padding bytes at offsets 1..8
@@ -39,114 +36,143 @@ fn regression_s04_padded_struct_insert() {
     let mut raw_slot = MaybeUninit::<PaddedPair>::uninit();
     unsafe {
         let base = raw_slot.as_mut_ptr();
-        core::ptr::addr_of_mut!((*base).tag).write(0x5A);
-        core::ptr::addr_of_mut!((*base).value).write(0xDEAD_BEEF_CAFE_BABEu64);
+        (&raw mut (*base).tag).write(0x5A);
+        (&raw mut (*base).value).write(0xDEAD_BEEF_CAFE_BABEu64);
     }
     let raw_bytes_ptr = raw_slot.as_ptr().cast::<u8>();
 
-    // 1. Static host-registered component insert path
+    // 1. Static host-registered component insert + batched spawn paths
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
-    app.register_mod_component::<PaddedPair>();
+    let padded_handle = app
+        .register_mod_component::<PaddedPair>(ComponentOptions::new())
+        .expect("register PaddedPair");
 
-    let e_static = {
+    let (e_static, e_static_batch) = {
         let world = app.world_mut();
-        let registry = world.resource::<ModRegistry>().clone();
-        let mut queue = CommandQueue::default();
-        let entity_bits = {
-            let mut bridge =
-                CommandQueueBridge::new(&mut queue, world.entity_allocator(), &registry);
-            let bridge_ptr = (&mut bridge as *mut CommandQueueBridge<'_>).cast::<RawCommandQueue>();
-            let e = unsafe { host_cmd_spawn_empty(bridge_ptr) };
-            let rc = unsafe {
-                host_cmd_insert_component(
-                    bridge_ptr,
-                    e,
-                    c"PaddedPair".as_ptr(),
-                    raw_bytes_ptr,
-                    core::mem::size_of::<PaddedPair>(),
-                )
-            };
-            assert_eq!(rc, FfiResult::OK);
-            e
+        let snap = world.resource::<ModRegistry>().snapshot_arc();
+        let mut storage = HostCommandsStorage::new();
+        let (e1, e2) = {
+            let mut cmds = HostCommands::new(&mut storage, world.entity_allocator(), &snap);
+            let cmds_ptr = cmds.as_ffi_ptr();
+
+            let mut e1 = FfiEntity::NULL;
+            assert_eq!(
+                unsafe { host_cmd_spawn_empty(cmds_ptr, &mut e1) },
+                FfiResult::OK
+            );
+            assert_eq!(
+                unsafe {
+                    host_cmd_insert(
+                        cmds_ptr,
+                        e1,
+                        padded_handle,
+                        raw_bytes_ptr,
+                        core::mem::size_of::<PaddedPair>(),
+                    )
+                },
+                FfiResult::OK
+            );
+
+            let comps = [padded_handle];
+            let ptrs = [raw_bytes_ptr];
+            let mut e2 = FfiEntity::NULL;
+            assert_eq!(
+                unsafe { host_cmd_spawn(cmds_ptr, comps.as_ptr(), ptrs.as_ptr(), 1, &mut e2) },
+                FfiResult::OK
+            );
+            (e1, e2)
         };
-        queue.apply(world);
-        Entity::from_bits(entity_bits.to_bits())
+        storage.apply_to_world(world, &snap);
+        (
+            Entity::from_bits(e1.to_bits()),
+            Entity::from_bits(e2.to_bits()),
+        )
     };
 
-    let got = app
-        .world()
-        .get::<PaddedPair>(e_static)
-        .expect("PaddedPair inserted via static command path");
-    assert_eq!(got.tag, 0x5A);
-    assert_eq!(got.value, 0xDEAD_BEEF_CAFE_BABEu64);
+    for ent in [e_static, e_static_batch] {
+        let got = app
+            .world()
+            .get::<PaddedPair>(ent)
+            .expect("PaddedPair inserted via static command path");
+        assert_eq!(got.tag, 0x5A);
+        assert_eq!(got.value, 0xDEAD_BEEF_CAFE_BABEu64);
+    }
 
-    // 2. Dynamic guest-registered component insert path
+    // 2. Dynamic guest-registered component insert + batched spawn paths
+    let mut dyn_handle = BamComponent::INVALID;
     {
         let world = app.world_mut();
-        let reg_arc = Arc::new(world.resource::<ModRegistry>().clone());
+        let reg = world.resource::<ModRegistry>().clone();
         let is_active = Arc::new(AtomicBool::new(true));
-        let mut init_ctx = ModInitContext::with_world(reg_arc, is_active, world as *mut World);
-        let _guard = init_ctx.make_active();
+        let mut load_ctx =
+            LoadContext::with_world_and_mod_id(reg, is_active, world as *mut World, None);
 
-        let desc = ModComponentDescriptor::new(
-            c"DynamicPaddedPair".as_ptr(),
-            ComponentUuid::from_name("DynamicPaddedPair"),
+        let desc = ComponentDesc::new(
+            c"ffi_reg::DynamicPaddedPair".as_ptr(),
+            ComponentUuid::from_parts("ffi_reg::DynamicPaddedPair", 16, 8, 0),
             16,
             8,
         );
-        let rc = unsafe {
-            host_register_component(
-                (&mut init_ctx as *mut ModInitContext).cast::<c_void>(),
-                &desc,
-            )
-        };
+        let rc = unsafe { host_register_component(load_ctx.as_ffi_ptr(), &desc, &mut dyn_handle) };
         assert_eq!(rc, FfiResult::OK);
+        load_ctx.finish_init();
     }
 
     let dyn_comp_id = app
         .world()
         .resource::<ModRegistry>()
-        .get_by_name("DynamicPaddedPair")
+        .get_by_handle(dyn_handle)
         .expect("DynamicPaddedPair registered")
         .component_id;
 
-    let e_dyn = {
+    let (e_dyn, e_dyn_batch) = {
         let world = app.world_mut();
-        let registry = world.resource::<ModRegistry>().clone();
-        let mut queue = CommandQueue::default();
-        let entity_bits = {
-            let mut bridge =
-                CommandQueueBridge::new(&mut queue, world.entity_allocator(), &registry);
-            let bridge_ptr = (&mut bridge as *mut CommandQueueBridge<'_>).cast::<RawCommandQueue>();
-            let e = unsafe { host_cmd_spawn_empty(bridge_ptr) };
-            let rc = unsafe {
-                host_cmd_insert_component(
-                    bridge_ptr,
-                    e,
-                    c"DynamicPaddedPair".as_ptr(),
-                    raw_bytes_ptr,
-                    16,
-                )
-            };
-            assert_eq!(rc, FfiResult::OK);
-            e
+        let snap = world.resource::<ModRegistry>().snapshot_arc();
+        let mut storage = HostCommandsStorage::new();
+        let (e1, e2) = {
+            let mut cmds = HostCommands::new(&mut storage, world.entity_allocator(), &snap);
+            let cmds_ptr = cmds.as_ffi_ptr();
+
+            let mut e1 = FfiEntity::NULL;
+            assert_eq!(
+                unsafe { host_cmd_spawn_empty(cmds_ptr, &mut e1) },
+                FfiResult::OK
+            );
+            assert_eq!(
+                unsafe { host_cmd_insert(cmds_ptr, e1, dyn_handle, raw_bytes_ptr, 16) },
+                FfiResult::OK
+            );
+
+            let comps = [dyn_handle];
+            let ptrs = [raw_bytes_ptr];
+            let mut e2 = FfiEntity::NULL;
+            assert_eq!(
+                unsafe { host_cmd_spawn(cmds_ptr, comps.as_ptr(), ptrs.as_ptr(), 1, &mut e2) },
+                FfiResult::OK
+            );
+            (e1, e2)
         };
-        queue.apply(world);
-        Entity::from_bits(entity_bits.to_bits())
+        storage.apply_to_world(world, &snap);
+        (
+            Entity::from_bits(e1.to_bits()),
+            Entity::from_bits(e2.to_bits()),
+        )
     };
 
-    let entity_ref = app.world().entity(e_dyn);
-    let untyped_ptr = entity_ref
-        .get_by_id(dyn_comp_id)
-        .expect("DynamicPaddedPair present on entity");
-    unsafe {
-        let base = untyped_ptr.as_ptr();
-        assert_eq!(core::ptr::read(base), 0x5A);
-        assert_eq!(
-            core::ptr::read_unaligned(base.add(8).cast::<u64>()),
-            0xDEAD_BEEF_CAFE_BABEu64
-        );
+    for ent in [e_dyn, e_dyn_batch] {
+        let entity_ref = app.world().entity(ent);
+        let untyped_ptr = entity_ref
+            .get_by_id(dyn_comp_id)
+            .expect("DynamicPaddedPair present on entity");
+        unsafe {
+            let base = untyped_ptr.as_ptr();
+            assert_eq!(core::ptr::read(base), 0x5A);
+            assert_eq!(
+                core::ptr::read_unaligned(base.add(8).cast::<u64>()),
+                0xDEAD_BEEF_CAFE_BABEu64
+            );
+        }
     }
 }
 

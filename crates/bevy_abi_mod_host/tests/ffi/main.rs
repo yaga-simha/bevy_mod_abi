@@ -1,5 +1,5 @@
-//! Host FFI boundary, chunk iteration, columns, strides, resources, commands,
-//! alignment/padding, C99 VTable interop, and UUID parity integration tests.
+//! Host FFI boundary, chunk iteration, columns, column info, resources, commands,
+//! alignment/padding, C99 VTable interop, and SipHash-2-4-128 UUID parity integration tests.
 
 #![allow(
     clippy::undocumented_unsafe_blocks,
