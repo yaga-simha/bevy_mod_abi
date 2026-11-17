@@ -1,5 +1,25 @@
 //! Dense chunk and indirect sparse-row query iterator (`HostIter`)
 //! (`C-05`, `C-13`, `P-01..P-04`, `S-08`, `N-02`).
+//!
+//! # Intent
+//! Serializing ECS archetype tables across an FFI boundary on every frame destroys cache
+//! locality and frame budgets. `HostIter` exposes Bevy's underlying `Table` columns directly
+//! as contiguous Structure-of-Arrays (SoA) byte slices—and `SparseSet` columns as batched
+//! per-row pointer arrays—without copying component payloads.
+//!
+//! # How It Works
+//! 1. **Pre-resolved Metadata:** At system registration time, component handles are resolved
+//!    once into [`QueryTermMeta`] entries containing [`ComponentId`], byte size/alignment,
+//!    and storage flags.
+//! 2. **Archetype Planning:** [`QueryPlan`] caches matching [`ArchetypeId`]s and table
+//!    column indices so per-frame iteration avoids string hashing or repeated archetype scans.
+//! 3. **Borrow-Checked `UnsafeWorldCell` Access:** [`HostIter`] holds an `UnsafeWorldCell`
+//!    scoped to the duration of [`GuestSystem`](crate::system::GuestSystem) execution. Because
+//!    `GuestSystem` registers all read/write [`ComponentId`]s in Bevy's `FilteredAccessSet`,
+//!    Bevy's scheduler guarantees that no conflicting system runs concurrently.
+//! 4. **Change Detection:** Mutable column accessors stamp Bevy's `changed` ticks with
+//!    `this_run`, while [`TickFilterTerm`] evaluates `Added<T>` / `Changed<T>` predicates
+//!    against `last_run` and `this_run`.
 
 use crate::handle_header::{HandleHeader, ITER_MAGIC, validate_handle_mut, validate_handle_ref};
 use crate::registry::{MsgReadBatchFn, MsgSendFn};

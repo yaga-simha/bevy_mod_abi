@@ -21,6 +21,13 @@
 //!    resource accessors perform zero string parsing or hashing.
 //! 4. **Nounwind `extern "C"` Boundary:** Unwinding across `extern "C"` is forbidden. Unwinding
 //!    Rust guests catch panics inside their own runtime and return [`FfiResult::PANIC_CAUGHT`].
+//!
+//! ## Why `#![no_std]` and Zero External Dependencies?
+//!
+//! Keeping `bevy_abi_mod_sys` strictly `#![no_std]` with zero external dependencies (no `bevy`,
+//! no `alloc`, no `std`) guarantees that guest mods, proc-macro expansions, and the host engine
+//! share the exact same wire types without pulling in Bevy's ECS internals or coupling to any
+//! specific heap allocator.
 
 mod access;
 mod commands;

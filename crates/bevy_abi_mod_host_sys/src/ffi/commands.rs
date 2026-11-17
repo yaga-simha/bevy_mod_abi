@@ -1,7 +1,15 @@
 //! Per-system bump-allocated deferred command queue (`HostCommands`, `CommandArena`)
 //! (`C-05`, `P-05`, `S-04`, `S-08`, `N-02`).
 //!
-//! Eliminates steady-state heap allocations across frames:
+//! # Intent
+//! During system execution, [`UnsafeWorldCell`](bevy_ecs::world::unsafe_world_cell::UnsafeWorldCell)
+//! cannot perform structural ECS mutations (spawning, despawning, or inserting/removing
+//! components) without invalidating active table/archetype borrows and `HostIter` column
+//! pointers. Buffering mutations into [`HostCommands`] and flushing them during Bevy's
+//! `apply_deferred` phase preserves parallel scheduler guarantees, avoids cross-allocator
+//! `Box`/`Vec` transfers, and eliminates steady-state heap allocations across frames.
+//!
+//! # How It Works
 //! - Component byte payloads are copied as `MaybeUninit<u8>` (never `&[u8]`) into reusable aligned
 //!   slabs inside [`CommandArena`].
 //! - Commands (`SpawnEmpty`, `SpawnBatch`, `Despawn`, `Insert`, `InsertDefault`, `Remove`) are

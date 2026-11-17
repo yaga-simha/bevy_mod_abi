@@ -1,5 +1,20 @@
 //! Synchronous and `World`-backed `FilteredAccessSet` validation and `QueryState` builder
 //! (`C-01`, `C-05`, `P-01..P-03`, `P-08`, `B-08`).
+//!
+//! # Intent
+//! Dynamic C-ABI systems have no Rust type-system `Query<(&mut A, &B)>` signature for Bevy
+//! to inspect at compile time. To enforce Bevy's aliasing rules (multiple readers OR one
+//! writer per component/resource) and enable Bevy's multi-threaded scheduler to run
+//! non-conflicting mod and host systems in parallel, every guest system's declared terms
+//! must be translated into Bevy's [`FilteredAccessSet`].
+//!
+//! # How It Works
+//! 1. **Registration-time validation:** [`validate_system_queries_against_snapshot`] checks
+//!    handle validity, immutability flags, and intra/inter-query `FilteredAccessSet`
+//!    compatibility synchronously during `host_register_system`.
+//! 2. **World initialization:** During [`GuestSystem::initialize`](crate::system::GuestSystem),
+//!    `build_query_groups_in_world` constructs the final `FilteredAccessSet` (returned to Bevy's
+//!    scheduler) alongside pre-planned `QueryPlan`s and `QueryState`s.
 
 use crate::ffi::iter::{QueryPlan, QueryTermMeta};
 use crate::registry::RegistrySnapshot;

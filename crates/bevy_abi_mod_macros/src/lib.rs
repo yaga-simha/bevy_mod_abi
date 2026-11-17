@@ -69,6 +69,13 @@ use syn::{DeriveInput, parse_macro_input};
 /// Derive macro for standalone `#[repr(C)]` / `#[repr(transparent)]` cross-language Plain Old Data
 /// (`AbiPod`) types.
 ///
+/// # Intent
+///
+/// `AbiPod` marks types whose in-memory layout is deterministic across Rust, C99, C++, and Zig
+/// compilers, allowing direct zero-copy slice and column access across the C-ABI boundary.
+///
+/// # Expansion & Compile-Time Checks
+///
 /// Enforces at compile time that:
 /// 1. The target is a non-generic struct annotated with `#[repr(C)]` or `#[repr(transparent)]` (and not `packed`).
 /// 2. Every field implements `AbiPod` via `assert_abi_pod::<FieldTy>()` (`u128`, `i128`, `usize`, `isize`, `bool`, `char`, `String`, `Vec<T>`, enums, and `#[repr(Rust)]` structs are rejected).
@@ -83,6 +90,23 @@ pub fn derive_abi_pod(input: TokenStream) -> TokenStream {
 }
 
 /// Derive macro for `ModComponent` host components and nested sub-structs.
+///
+/// # Intent
+///
+/// Enables Bevy host components (including `#[repr(Rust)]` structs or types containing host-owned
+/// `String` / `Vec<T>` fields) to be inspected and mutated by native guest mods over `extern "C"`
+/// without JSON serialization or cross-allocator freeing.
+///
+/// # Expansion Behavior
+///
+/// Generates:
+/// - A `#[repr(C)]` `<Struct>VTable` prefixed by `VTableHeader` (`struct_size`, `abi_version`,
+///   `uuid`, `size`, `align`) with `Option<unsafe extern "C" fn(...)>` field accessor slots.
+/// - `extern "C"` getter, setter (returning `FfiResult`), and `Vec` push trampolines for each
+///   non-skipped field.
+/// - A `ModComponent` implementation with deterministic 128-bit SipHash-2-4 `ComponentUuid`,
+///   `SymbolEntry` registration metadata (`"bam.v0.<canonical_name>.*"`), and conditional
+///   `RawInsertable` / `AbiPod` implementations when the struct's layout and fields qualify.
 #[proc_macro_derive(ModComponent, attributes(mod_component, mod_field))]
 pub fn derive_mod_component(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
