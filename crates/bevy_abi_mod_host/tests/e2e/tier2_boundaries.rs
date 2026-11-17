@@ -2,9 +2,9 @@
 
 use super::harness::*;
 use bevy_abi_mod_sys::{
-    ABI_VERSION_PACKED, ComponentAccessDesc, ComponentAccessMode, ComponentUuid,
-    DynamicSystemCallback, ExposableComponent, FfiEntity, FfiResult, FfiSlice, HostApi,
-    RawChunkIter, RawCommandQueue, StrView, SystemDescriptor,
+    ABI_VERSION, AccessMode, BamComponent, BamHostApi, BamHostCtx, BamInstance, BamIter,
+    BamLoadCtx, BamQueryDesc, BamSystemCtx, BamSystemDesc, BamTermDesc, ComponentUuid, FfiEntity,
+    FfiResult, FfiSlice, ModComponent, StrView,
 };
 use core::ffi::{CStr, c_char, c_void};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -17,28 +17,29 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 #[test]
 fn t2_f01_01_null_string_resolver_returns_null() {
-    let ptr = unsafe { test_symbol_resolver(core::ptr::null()) };
+    let ptr = unsafe { test_symbol_resolver(core::ptr::null(), core::ptr::null()) };
     assert!(ptr.is_null());
 }
 
 #[test]
 fn t2_f01_02_empty_string_resolver_returns_null() {
-    let empty = b"\0".as_ptr() as *const c_char;
-    let ptr = unsafe { test_symbol_resolver(empty) };
+    let ptr = unsafe { test_symbol_resolver(core::ptr::null(), c"".as_ptr()) };
     assert!(ptr.is_null());
 }
 
 #[test]
 fn t2_f01_03_extremely_long_symbol_name() {
     let long_sym = format!("KinematicsPos_{}\0", "a".repeat(4096));
-    let ptr = unsafe { test_symbol_resolver(long_sym.as_ptr() as *const c_char) };
+    let ptr =
+        unsafe { test_symbol_resolver(core::ptr::null(), long_sym.as_ptr() as *const c_char) };
     assert!(ptr.is_null());
 }
 
 #[test]
 fn t2_f01_04_invalid_utf8_in_symbol_name() {
     let bad_utf8 = [0xFF, 0xFE, 0x00];
-    let ptr = unsafe { test_symbol_resolver(bad_utf8.as_ptr() as *const c_char) };
+    let ptr =
+        unsafe { test_symbol_resolver(core::ptr::null(), bad_utf8.as_ptr() as *const c_char) };
     assert!(ptr.is_null());
 }
 
@@ -48,47 +49,45 @@ fn t2_f01_05_unknown_symbol_returns_none() {
     assert!(KinematicsPos::resolve_symbol("Invalid_Prefix_").is_none());
 }
 
-// --- Feature 2: Dynamic C System (DynamicCSystem) ---
+// --- Feature 2: Dynamic C System (GuestSystem / BamSystemDesc) ---
 
 #[test]
 fn t2_f02_01_zero_query_descriptor() {
-    let name = b"ZeroQuery\0".as_ptr() as *const c_char;
-    let desc = SystemDescriptor {
-        struct_size: core::mem::size_of::<SystemDescriptor>() as u32,
-        name,
-        queries: core::ptr::null(),
-        query_count: 0,
-        callback: dummy_callback,
-        user_data: core::ptr::null_mut(),
-    };
+    let desc = BamSystemDesc::new(
+        c"ZeroQuery".as_ptr(),
+        core::ptr::null(),
+        0,
+        dummy_system_callback,
+        core::ptr::null_mut(),
+    );
     assert_eq!(desc.query_count, 0);
     assert!(desc.queries.is_null());
+    assert_eq!(desc.validate(), FfiResult::OK);
 }
 
 #[test]
 fn t2_f02_02_null_queries_with_non_zero_count() {
-    let name = b"BadQueries\0".as_ptr() as *const c_char;
-    let desc = SystemDescriptor {
-        struct_size: core::mem::size_of::<SystemDescriptor>() as u32,
-        name,
-        queries: core::ptr::null(),
-        query_count: 5,
-        callback: dummy_callback,
-        user_data: core::ptr::null_mut(),
-    };
+    let desc = BamSystemDesc::new(
+        c"BadQueries".as_ptr(),
+        core::ptr::null(),
+        5,
+        dummy_system_callback,
+        core::ptr::null_mut(),
+    );
     assert_eq!(desc.query_count, 5);
+    assert_eq!(desc.validate(), FfiResult::NULL_POINTER);
 }
 
 #[test]
 fn t2_f02_03_smaller_struct_size_rejected() {
-    let desc = SystemDescriptor {
-        struct_size: 10, // Invalid size
-        name: core::ptr::null(),
-        queries: core::ptr::null(),
-        query_count: 0,
-        callback: dummy_callback,
-        user_data: core::ptr::null_mut(),
-    };
+    let mut desc = BamSystemDesc::new(
+        core::ptr::null(),
+        core::ptr::null(),
+        0,
+        dummy_system_callback,
+        core::ptr::null_mut(),
+    );
+    desc.struct_size = 10;
     let res = unsafe { mock_register_system(core::ptr::null_mut(), &desc) };
     assert_eq!(res, FfiResult::INVALID_VERSION);
 }
@@ -101,16 +100,17 @@ fn t2_f02_04_null_descriptor_rejected() {
 
 #[test]
 fn t2_f02_05_large_query_count_descriptor() {
-    let query_array = vec![ComponentAccessDesc::read(KinematicsPos::COMPONENT_CSTR.as_ptr()); 64];
-    let desc = SystemDescriptor {
-        struct_size: core::mem::size_of::<SystemDescriptor>() as u32,
-        name: b"BigQuery\0".as_ptr() as *const c_char,
-        queries: query_array.as_ptr(),
-        query_count: query_array.len(),
-        callback: dummy_callback,
-        user_data: core::ptr::null_mut(),
-    };
+    let query_array = vec![BamQueryDesc::empty(); 64];
+    let desc = BamSystemDesc::new(
+        c"BigQuery".as_ptr(),
+        query_array.as_ptr(),
+        query_array.len(),
+        dummy_system_callback,
+        core::ptr::null_mut(),
+    );
     assert_eq!(desc.query_count, 64);
+    let res = unsafe { mock_register_system(core::ptr::null_mut(), &desc) };
+    assert_eq!(res, FfiResult::CAPACITY_EXCEEDED);
 }
 
 // --- Feature 3: Raw Chunk Iterator (RawChunkIter) ---
@@ -123,9 +123,9 @@ fn t2_f03_01_out_of_bounds_index_usize_max() {
         entities: vec![],
         columns: vec![],
     });
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
     unsafe {
-        mock_iter_next_chunk(iter);
+        mock_step_chunk(iter);
         let ptr = mock_iter_column_readonly(iter, usize::MAX);
         assert!(ptr.is_null());
     }
@@ -134,16 +134,16 @@ fn t2_f03_01_out_of_bounds_index_usize_max() {
 #[test]
 fn t2_f03_02_idempotent_exhaustion() {
     let mut state = MockChunkIterState::new();
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
     for _ in 0..10 {
-        assert_eq!(unsafe { mock_iter_next_chunk(iter) }, 0);
+        assert_eq!(unsafe { mock_step_chunk(iter) }, 0);
     }
 }
 
 #[test]
 fn t2_f03_03_null_iter_pointer_safety() {
     unsafe {
-        assert_eq!(mock_iter_next_chunk(core::ptr::null_mut()), 0);
+        assert_eq!(mock_step_chunk(core::ptr::null_mut()), 0);
         assert!(mock_iter_column_readonly(core::ptr::null(), 0).is_null());
         assert!(mock_iter_column_mutable(core::ptr::null_mut(), 0).is_null());
         assert!(mock_iter_entities(core::ptr::null()).is_null());
@@ -169,11 +169,11 @@ fn t2_f03_04_mark_changed_out_of_bounds_row() {
             changed_flags: vec![false; 5],
         }],
     });
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
     unsafe {
-        mock_iter_next_chunk(iter);
+        mock_step_chunk(iter);
         let res = mock_iter_mark_changed(iter, 0, 99);
-        assert_eq!(res, FfiResult::INTERNAL_ERROR);
+        assert_eq!(res, FfiResult::OUT_OF_RANGE);
     }
 }
 
@@ -185,23 +185,22 @@ fn t2_f03_05_mark_changed_out_of_bounds_column() {
         entities: vec![],
         columns: vec![],
     });
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
     unsafe {
-        mock_iter_next_chunk(iter);
+        mock_step_chunk(iter);
         let res = mock_iter_mark_changed(iter, 10, 0);
-        assert_eq!(res, FfiResult::INVALID_COMPONENT);
+        assert_eq!(res, FfiResult::OUT_OF_RANGE);
     }
 }
 
 // --- Feature 4: Deferred Command Bridge (CommandQueueBridge) ---
 
 #[test]
-#[allow(deprecated)]
-fn t2_f04_01_despawn_placeholder_entity() {
+fn t2_f04_01_despawn_null_entity() {
     let mut q = MockCommandQueueState::new();
-    q.push(MockCommand::Despawn(FfiEntity::PLACEHOLDER));
+    q.push(MockCommand::Despawn(FfiEntity::NULL));
     let flushed = q.flush();
-    assert_eq!(flushed[0], MockCommand::Despawn(FfiEntity::PLACEHOLDER));
+    assert_eq!(flushed[0], MockCommand::Despawn(FfiEntity::NULL));
 }
 
 #[test]
@@ -227,7 +226,7 @@ fn t2_f04_04_insert_empty_component_bytes() {
     let mut q = MockCommandQueueState::new();
     q.push(MockCommand::InsertComponent(
         FfiEntity::from_bits(1),
-        "Marker".to_string(),
+        POS_HANDLE,
         vec![],
     ));
     let flushed = q.flush();
@@ -255,7 +254,7 @@ fn t2_f05_01_kinematics_nan_handling() {
     let vt = KinematicsPos::vtable();
     let ptr = &mut pos as *mut KinematicsPos as *mut c_void;
     unsafe {
-        (vt.set_x)(ptr, 10.0);
+        let _ = (vt.set_x.unwrap())(ptr, 10.0);
     }
     assert_eq!(pos.x, 10.0);
 }
@@ -288,9 +287,7 @@ fn t2_f05_03_kinematics_f32_max() {
 fn t2_f05_04_kinematics_zero_entities() {
     let positions: Vec<KinematicsPos> = vec![];
     assert!(positions.is_empty());
-    for _ in &positions {
-        panic!("should not execute");
-    }
+    assert_eq!(positions.len(), 0);
 }
 
 #[test]
@@ -364,7 +361,13 @@ fn t2_f07_01_null_byte_pointer_with_nonzero_len_rejected() {
     let vt = MetadataTag::vtable();
     let ptr = &mut tag as *mut MetadataTag as *mut c_void;
     unsafe {
-        (vt.set_label)(ptr, core::ptr::null(), 10);
+        let _ = (vt.set_label.unwrap())(
+            ptr,
+            StrView {
+                ptr: core::ptr::null(),
+                len: 10,
+            },
+        );
     }
     assert_eq!(tag.label, "Init");
 }
@@ -378,7 +381,13 @@ fn t2_f07_02_invalid_utf8_rejected() {
     let ptr = &mut tag as *mut MetadataTag as *mut c_void;
     let bad_utf8 = [0xFF, 0xFE, 0xFD];
     unsafe {
-        (vt.set_label)(ptr, bad_utf8.as_ptr(), bad_utf8.len());
+        let _ = (vt.set_label.unwrap())(
+            ptr,
+            StrView {
+                ptr: bad_utf8.as_ptr(),
+                len: bad_utf8.len(),
+            },
+        );
     }
     assert_eq!(tag.label, "Init");
 }
@@ -392,7 +401,13 @@ fn t2_f07_03_empty_string_set_clears() {
     let ptr = &mut tag as *mut MetadataTag as *mut c_void;
     let empty = "";
     unsafe {
-        (vt.set_label)(ptr, empty.as_ptr(), 0);
+        let _ = (vt.set_label.unwrap())(
+            ptr,
+            StrView {
+                ptr: empty.as_ptr(),
+                len: 0,
+            },
+        );
     }
     assert!(tag.label.is_empty());
 }
@@ -406,7 +421,13 @@ fn t2_f07_04_large_string_1mb() {
     let ptr = &mut tag as *mut MetadataTag as *mut c_void;
     let large = "X".repeat(1024 * 1024);
     unsafe {
-        (vt.set_label)(ptr, large.as_ptr(), large.len());
+        let _ = (vt.set_label.unwrap())(
+            ptr,
+            StrView {
+                ptr: large.as_ptr(),
+                len: large.len(),
+            },
+        );
     }
     assert_eq!(tag.label.len(), 1024 * 1024);
 }
@@ -420,7 +441,13 @@ fn t2_f07_05_unicode_multibyte_characters() {
     let ptr = &mut tag as *mut MetadataTag as *mut c_void;
     let unicode = "🦀 Rust & Bevy 🚀 游戏";
     unsafe {
-        (vt.set_label)(ptr, unicode.as_ptr(), unicode.len());
+        let _ = (vt.set_label.unwrap())(
+            ptr,
+            StrView {
+                ptr: unicode.as_ptr(),
+                len: unicode.len(),
+            },
+        );
     }
     assert_eq!(tag.label, unicode);
 }
@@ -435,7 +462,13 @@ fn t2_f08_01_buffer_null_with_nonzero_len_rejected() {
     let vt = BufferScores::vtable();
     let ptr = &mut buf as *mut BufferScores as *mut c_void;
     unsafe {
-        (vt.set_scores)(ptr, core::ptr::null(), 5);
+        let _ = (vt.set_scores.unwrap())(
+            ptr,
+            FfiSlice {
+                ptr: core::ptr::null(),
+                len: 5,
+            },
+        );
     }
     assert_eq!(buf.scores, vec![1, 2, 3]);
 }
@@ -448,7 +481,13 @@ fn t2_f08_02_buffer_zero_len_clears() {
     let vt = BufferScores::vtable();
     let ptr = &mut buf as *mut BufferScores as *mut c_void;
     unsafe {
-        (vt.set_scores)(ptr, core::ptr::null(), 0);
+        let _ = (vt.set_scores.unwrap())(
+            ptr,
+            FfiSlice {
+                ptr: core::ptr::null(),
+                len: 0,
+            },
+        );
     }
     assert!(buf.scores.is_empty());
 }
@@ -460,7 +499,13 @@ fn t2_f08_03_buffer_large_element_count() {
     let ptr = &mut buf as *mut BufferScores as *mut c_void;
     let large: Vec<u32> = (0..50_000).collect();
     unsafe {
-        (vt.set_scores)(ptr, large.as_ptr(), large.len());
+        let _ = (vt.set_scores.unwrap())(
+            ptr,
+            FfiSlice {
+                ptr: large.as_ptr(),
+                len: large.len(),
+            },
+        );
     }
     assert_eq!(buf.scores.len(), 50_000);
 }
@@ -473,11 +518,23 @@ fn t2_f08_04_buffer_toggle_empty_and_full() {
     for _ in 0..10 {
         let data = [1, 2, 3];
         unsafe {
-            (vt.set_scores)(ptr, data.as_ptr(), data.len());
+            let _ = (vt.set_scores.unwrap())(
+                ptr,
+                FfiSlice {
+                    ptr: data.as_ptr(),
+                    len: data.len(),
+                },
+            );
         }
         assert_eq!(buf.scores.len(), 3);
         unsafe {
-            (vt.set_scores)(ptr, core::ptr::null(), 0);
+            let _ = (vt.set_scores.unwrap())(
+                ptr,
+                FfiSlice {
+                    ptr: core::ptr::null(),
+                    len: 0,
+                },
+            );
         }
         assert!(buf.scores.is_empty());
     }
@@ -488,7 +545,7 @@ fn t2_f08_05_buffer_slice_empty_dangling() {
     let buf = BufferScores { scores: vec![] };
     let vt = BufferScores::vtable();
     let ptr = &buf as *const BufferScores as *const c_void;
-    let slice = unsafe { (vt.get_scores)(ptr) };
+    let slice = unsafe { (vt.get_scores.unwrap())(ptr) };
     assert_eq!(slice.len, 0);
     assert!(slice.is_empty());
 }
@@ -568,13 +625,7 @@ fn t2_f09_05_throughput_repeat_determinism() {
 #[test]
 fn t2_f10_01_rapid_callback_loop_stability() {
     for _ in 0..10_000 {
-        let _ = unsafe {
-            dummy_callback(
-                core::ptr::null_mut(),
-                core::ptr::null_mut(),
-                core::ptr::null_mut(),
-            )
-        };
+        let _ = unsafe { dummy_system_callback(core::ptr::null_mut(), core::ptr::null_mut()) };
     }
 }
 
@@ -588,7 +639,7 @@ fn t2_f10_02_vtable_setter_null_ptr_panic_free() {
     };
     let ptr = &mut pos as *mut KinematicsPos as *mut c_void;
     unsafe {
-        (vt.set_x)(ptr, 0.0);
+        let _ = (vt.set_x.unwrap())(ptr, 0.0);
     }
     assert_eq!(pos.x, 0.0);
 }
@@ -596,7 +647,7 @@ fn t2_f10_02_vtable_setter_null_ptr_panic_free() {
 #[test]
 fn t2_f10_03_proc_address_stress() {
     for _ in 0..5_000 {
-        let ptr = KinematicsPos::resolve_symbol("KinematicsPos_vtable");
+        let ptr = KinematicsPos::resolve_symbol("bam.v0.e2e_harness::KinematicsPos.vtable");
         assert!(ptr.is_some());
     }
 }
@@ -611,9 +662,9 @@ fn t2_f10_04_empty_queue_overhead() {
 #[test]
 fn t2_f10_05_mock_iter_next_chunk_exhausted_overhead() {
     let mut state = MockChunkIterState::new();
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
     for _ in 0..1_000 {
-        let count = unsafe { mock_iter_next_chunk(iter) };
+        let count = unsafe { mock_step_chunk(iter) };
         assert_eq!(count, 0);
     }
 }
@@ -677,10 +728,10 @@ fn t2_f12_01_100_tables_with_1_entity() {
             columns: vec![],
         });
     }
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
     let mut total = 0;
     loop {
-        let count = unsafe { mock_iter_next_chunk(iter) };
+        let count = unsafe { mock_step_chunk(iter) };
         if count == 0 {
             break;
         }
@@ -694,7 +745,7 @@ fn t2_f12_02_skewed_archetype_distribution() {
     let mut state = MockChunkIterState::new();
     state.add_table(MockTable {
         entity_count: 9_900,
-        entities: (0..9_900).map(|i| FfiEntity::from_bits(i)).collect(),
+        entities: (0..9_900).map(FfiEntity::from_bits).collect(),
         columns: vec![],
     });
     for i in 0..10 {
@@ -707,10 +758,10 @@ fn t2_f12_02_skewed_archetype_distribution() {
         });
     }
 
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
     let mut total = 0;
     loop {
-        let count = unsafe { mock_iter_next_chunk(iter) };
+        let count = unsafe { mock_step_chunk(iter) };
         if count == 0 {
             break;
         }
@@ -722,8 +773,8 @@ fn t2_f12_02_skewed_archetype_distribution() {
 #[test]
 fn t2_f12_03_zero_matching_archetypes() {
     let mut state = MockChunkIterState::new();
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
-    let count = unsafe { mock_iter_next_chunk(iter) };
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
+    let count = unsafe { mock_step_chunk(iter) };
     assert_eq!(count, 0);
 }
 
@@ -748,9 +799,9 @@ fn t2_f12_05_empty_table_stride_query() {
         entities: vec![],
         columns: vec![],
     });
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
     unsafe {
-        mock_iter_next_chunk(iter);
+        mock_step_chunk(iter);
         let s = mock_iter_column_stride(iter, 0);
         assert_eq!(s, 0);
     }
@@ -834,8 +885,8 @@ fn t2_f14_04_odd_struct_size_stride() {
 #[test]
 fn t2_f14_05_vtable_size_and_align_invariants() {
     let vt = AlignSimd::vtable();
-    assert_eq!(vt.size, 16);
-    assert_eq!(vt.align, 16);
+    assert_eq!(vt.header.size, 16);
+    assert_eq!(vt.header.align, 16);
 }
 
 // --- Feature 15: Chunk Iterator Bounds & Empty Table Guard ---
@@ -843,7 +894,7 @@ fn t2_f14_05_vtable_size_and_align_invariants() {
 #[test]
 fn t2_f15_01_out_of_bounds_entities_on_empty() {
     let mut state = MockChunkIterState::new();
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
     let ents = unsafe { mock_iter_entities(iter) };
     assert!(ents.is_null());
 }
@@ -851,7 +902,7 @@ fn t2_f15_01_out_of_bounds_entities_on_empty() {
 #[test]
 fn t2_f15_02_out_of_bounds_stride_on_empty() {
     let mut state = MockChunkIterState::new();
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
     let stride = unsafe { mock_iter_column_stride(iter, 0) };
     assert_eq!(stride, 0);
 }
@@ -859,9 +910,9 @@ fn t2_f15_02_out_of_bounds_stride_on_empty() {
 #[test]
 fn t2_f15_03_mark_changed_on_empty_table() {
     let mut state = MockChunkIterState::new();
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
     let res = unsafe { mock_iter_mark_changed(iter, 0, 0) };
-    assert_eq!(res, FfiResult::INTERNAL_ERROR);
+    assert_eq!(res, FfiResult::INVALID_STATE);
 }
 
 #[test]
@@ -872,16 +923,16 @@ fn t2_f15_04_single_entity_chunk_next_boundary() {
         entities: vec![FfiEntity::from_bits(42)],
         columns: vec![],
     });
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
-    assert_eq!(unsafe { mock_iter_next_chunk(iter) }, 1);
-    assert_eq!(unsafe { mock_iter_next_chunk(iter) }, 0);
-    assert_eq!(unsafe { mock_iter_next_chunk(iter) }, 0);
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
+    assert_eq!(unsafe { mock_step_chunk(iter) }, 1);
+    assert_eq!(unsafe { mock_step_chunk(iter) }, 0);
+    assert_eq!(unsafe { mock_step_chunk(iter) }, 0);
 }
 
 #[test]
 fn t2_f15_05_column_mutable_on_empty_table() {
     let mut state = MockChunkIterState::new();
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
     let ptr = unsafe { mock_iter_column_mutable(iter, 0) };
     assert!(ptr.is_null());
 }
@@ -898,7 +949,7 @@ fn t2_f16_01_arbitrary_ffi_result_code() {
 
 #[test]
 fn t2_f16_02_arbitrary_access_mode_code() {
-    let invalid_mode = ComponentAccessMode(100);
+    let invalid_mode = AccessMode(100);
     assert!(!invalid_mode.is_valid());
     assert!(!invalid_mode.is_mutable());
     assert!(!invalid_mode.is_filter_only());
@@ -933,11 +984,17 @@ fn t2_f17_01_subslice_middle_overlap() {
     };
     let vt = MetadataTag::vtable();
     let ptr = &mut tag as *mut MetadataTag as *mut c_void;
-    let slice = unsafe { (vt.get_label)(ptr) };
+    let slice = unsafe { (vt.get_label.unwrap())(ptr) };
     // Subslice from offset 4, length 8 ("EFGHIJKL")
     let mid_ptr = unsafe { slice.ptr.add(4) };
     unsafe {
-        (vt.set_label)(ptr, mid_ptr, 8);
+        let _ = (vt.set_label.unwrap())(
+            ptr,
+            StrView {
+                ptr: mid_ptr,
+                len: 8,
+            },
+        );
     }
     assert_eq!(tag.label, "EFGHIJKL");
 }
@@ -949,10 +1006,16 @@ fn t2_f17_02_subslice_end_overlap() {
     };
     let vt = MetadataTag::vtable();
     let ptr = &mut tag as *mut MetadataTag as *mut c_void;
-    let slice = unsafe { (vt.get_label)(ptr) };
+    let slice = unsafe { (vt.get_label.unwrap())(ptr) };
     let end_ptr = unsafe { slice.ptr.add(5) };
     unsafe {
-        (vt.set_label)(ptr, end_ptr, 3);
+        let _ = (vt.set_label.unwrap())(
+            ptr,
+            StrView {
+                ptr: end_ptr,
+                len: 3,
+            },
+        );
     }
     assert_eq!(tag.label, "End");
 }
@@ -965,9 +1028,15 @@ fn t2_f17_03_repeated_self_assign_stability() {
     let vt = MetadataTag::vtable();
     let ptr = &mut tag as *mut MetadataTag as *mut c_void;
     for _ in 0..100 {
-        let slice = unsafe { (vt.get_label)(ptr) };
+        let slice = unsafe { (vt.get_label.unwrap())(ptr) };
         unsafe {
-            (vt.set_label)(ptr, slice.ptr, slice.len);
+            let _ = (vt.set_label.unwrap())(
+                ptr,
+                StrView {
+                    ptr: slice.ptr,
+                    len: slice.len,
+                },
+            );
         }
     }
     assert_eq!(tag.label, "StableContent");
@@ -980,10 +1049,16 @@ fn t2_f17_04_vec_subslice_middle() {
     };
     let vt = BufferScores::vtable();
     let ptr = &mut buf as *mut BufferScores as *mut c_void;
-    let slice = unsafe { (vt.get_scores)(ptr) };
+    let slice = unsafe { (vt.get_scores.unwrap())(ptr) };
     let mid_ptr = unsafe { slice.ptr.add(2) };
     unsafe {
-        (vt.set_scores)(ptr, mid_ptr, 3);
+        let _ = (vt.set_scores.unwrap())(
+            ptr,
+            FfiSlice {
+                ptr: mid_ptr,
+                len: 3,
+            },
+        );
     }
     assert_eq!(buf.scores, vec![3, 4, 5]);
 }
@@ -996,9 +1071,15 @@ fn t2_f17_05_vec_repeated_self_assign_stability() {
     let vt = BufferScores::vtable();
     let ptr = &mut buf as *mut BufferScores as *mut c_void;
     for _ in 0..50 {
-        let slice = unsafe { (vt.get_scores)(ptr) };
+        let slice = unsafe { (vt.get_scores.unwrap())(ptr) };
         unsafe {
-            (vt.set_scores)(ptr, slice.ptr, slice.len);
+            let _ = (vt.set_scores.unwrap())(
+                ptr,
+                FfiSlice {
+                    ptr: slice.ptr,
+                    len: slice.len,
+                },
+            );
         }
     }
     assert_eq!(buf.scores, vec![10, 20, 30]);
@@ -1008,59 +1089,41 @@ fn t2_f17_05_vec_repeated_self_assign_stability() {
 
 #[test]
 fn t2_f18_01_filter_only_with_filter_only() {
-    let pos_name = KinematicsPos::COMPONENT_CSTR.as_ptr();
-    let a = [ComponentAccessDesc::filter_only(pos_name)];
-    let b = [ComponentAccessDesc::filter_only(pos_name)];
+    let a = [BamTermDesc::filter_only(POS_HANDLE)];
+    let b = [BamTermDesc::filter_only(POS_HANDLE)];
     assert!(!check_borrow_conflict(&a, &b));
 }
 
 #[test]
 fn t2_f18_02_empty_access_sets_no_conflict() {
-    let a: [ComponentAccessDesc; 0] = [];
-    let b: [ComponentAccessDesc; 0] = [];
+    let a: [BamTermDesc; 0] = [];
+    let b: [BamTermDesc; 0] = [];
     assert!(!check_borrow_conflict(&a, &b));
 }
 
 #[test]
-fn t2_f18_03_null_component_name_in_query() {
-    let a = [ComponentAccessDesc {
-        name: core::ptr::null(),
-        mode: ComponentAccessMode::WRITE,
-    }];
-    let b = [ComponentAccessDesc {
-        name: core::ptr::null(),
-        mode: ComponentAccessMode::WRITE,
-    }];
+fn t2_f18_03_invalid_component_handle_in_query() {
+    let a = [BamTermDesc::write(BamComponent::INVALID)];
+    let b = [BamTermDesc::write(BamComponent::INVALID)];
     assert!(!check_borrow_conflict(&a, &b));
 }
 
 #[test]
 fn t2_f18_04_multiple_terms_single_conflict() {
-    let pos = KinematicsPos::COMPONENT_CSTR.as_ptr();
-    let vel = KinematicsVel::COMPONENT_CSTR.as_ptr();
-
     let a = [
-        ComponentAccessDesc::read(pos),
-        ComponentAccessDesc::write(vel),
+        BamTermDesc::read(POS_HANDLE),
+        BamTermDesc::write(VEL_HANDLE),
     ];
-    let b = [
-        ComponentAccessDesc::read(pos),
-        ComponentAccessDesc::read(vel),
-    ];
-    // Conflict on vel: a writes, b reads
+    let b = [BamTermDesc::read(POS_HANDLE), BamTermDesc::read(VEL_HANDLE)];
     assert!(check_borrow_conflict(&a, &b));
 }
 
 #[test]
 fn t2_f18_05_multiple_terms_all_disjoint() {
-    let pos = KinematicsPos::COMPONENT_CSTR.as_ptr();
-    let vel = KinematicsVel::COMPONENT_CSTR.as_ptr();
-    let health = CombatHealth::COMPONENT_CSTR.as_ptr();
-
-    let a = [ComponentAccessDesc::write(pos)];
+    let a = [BamTermDesc::write(POS_HANDLE)];
     let b = [
-        ComponentAccessDesc::write(vel),
-        ComponentAccessDesc::write(health),
+        BamTermDesc::write(VEL_HANDLE),
+        BamTermDesc::write(HEALTH_HANDLE),
     ];
     assert!(!check_borrow_conflict(&a, &b));
 }
@@ -1081,9 +1144,9 @@ fn t2_f19_01_readonly_column_mutable_returns_null() {
             changed_flags: vec![false; 2],
         }],
     });
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
     unsafe {
-        mock_iter_next_chunk(iter);
+        mock_step_chunk(iter);
         let ptr = mock_iter_column_mutable(iter, 0);
         assert!(ptr.is_null());
     }
@@ -1103,9 +1166,9 @@ fn t2_f19_02_mark_changed_on_readonly_returns_denied() {
             changed_flags: vec![false; 2],
         }],
     });
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
     unsafe {
-        mock_iter_next_chunk(iter);
+        mock_step_chunk(iter);
         let res = mock_iter_mark_changed(iter, 0, 1);
         assert_eq!(res, FfiResult::PERMISSION_DENIED);
     }
@@ -1119,9 +1182,9 @@ fn t2_f19_03_column_index_bounds_readonly() {
         entities: vec![],
         columns: vec![],
     });
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
     unsafe {
-        mock_iter_next_chunk(iter);
+        mock_step_chunk(iter);
         assert!(mock_iter_column_readonly(iter, 100).is_null());
     }
 }
@@ -1134,9 +1197,9 @@ fn t2_f19_04_column_index_bounds_mutable() {
         entities: vec![],
         columns: vec![],
     });
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
     unsafe {
-        mock_iter_next_chunk(iter);
+        mock_step_chunk(iter);
         assert!(mock_iter_column_mutable(iter, 100).is_null());
     }
 }
@@ -1155,11 +1218,11 @@ fn t2_f19_05_mark_changed_bounds_row() {
             changed_flags: vec![false],
         }],
     });
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
     unsafe {
-        mock_iter_next_chunk(iter);
+        mock_step_chunk(iter);
         let res = mock_iter_mark_changed(iter, 0, 10);
-        assert_eq!(res, FfiResult::INTERNAL_ERROR);
+        assert_eq!(res, FfiResult::OUT_OF_RANGE);
     }
 }
 
@@ -1226,8 +1289,16 @@ fn t2_f21_01_stack_slice_copied_to_host_heap() {
     let vt = MetadataTag::vtable();
     let ptr = &mut tag as *mut MetadataTag as *mut c_void;
     {
-        let stack_buf = [b'S', b't', b'a', b'c', b'k'];
-        let _ = unsafe { (vt.set_label)(ptr, stack_buf.as_ptr(), stack_buf.len()) };
+        let stack_buf = *b"Stack";
+        let _ = unsafe {
+            (vt.set_label.unwrap())(
+                ptr,
+                StrView {
+                    ptr: stack_buf.as_ptr(),
+                    len: stack_buf.len(),
+                },
+            )
+        };
     }
     // stack_buf is out of scope; host string retains copy
     assert_eq!(tag.label, "Stack");
@@ -1241,7 +1312,15 @@ fn t2_f21_02_static_slice_copied_to_host_heap() {
     let vt = MetadataTag::vtable();
     let ptr = &mut tag as *mut MetadataTag as *mut c_void;
     let static_str: &'static str = "StaticLiteral";
-    let _ = unsafe { (vt.set_label)(ptr, static_str.as_ptr(), static_str.len()) };
+    let _ = unsafe {
+        (vt.set_label.unwrap())(
+            ptr,
+            StrView {
+                ptr: static_str.as_ptr(),
+                len: static_str.len(),
+            },
+        )
+    };
     assert_eq!(tag.label, "StaticLiteral");
 }
 
@@ -1252,7 +1331,7 @@ fn t2_f21_03_borrowed_slice_does_not_own() {
     };
     let vt = MetadataTag::vtable();
     let ptr = &tag as *const MetadataTag as *const c_void;
-    let slice = unsafe { (vt.get_label)(ptr) };
+    let slice = unsafe { (vt.get_label.unwrap())(ptr) };
     assert_eq!(slice.len, 9);
     // Slice does not implement Drop, zero free hazard
 }
@@ -1264,7 +1343,7 @@ fn t2_f21_04_vec_borrowed_slice_does_not_own() {
     };
     let vt = BufferScores::vtable();
     let ptr = &buf as *const BufferScores as *const c_void;
-    let slice = unsafe { (vt.get_scores)(ptr) };
+    let slice = unsafe { (vt.get_scores.unwrap())(ptr) };
     assert_eq!(slice.len, 3);
     // Slice does not implement Drop
 }
@@ -1279,64 +1358,59 @@ fn t2_f21_05_realloc_isolation() {
 // --- Feature 22: Mod Unloading & Teardown Hook ---
 
 #[test]
-fn t2_f22_01_shutdown_error_logged() {
-    unsafe extern "C" fn failing_shutdown(_ctx: *mut c_void) -> FfiResult {
-        FfiResult::INTERNAL_ERROR
+fn t2_f22_01_shutdown_handles_non_null_instance_pointer() {
+    static SEEN_NON_NULL: AtomicBool = AtomicBool::new(false);
+    unsafe extern "C" fn inspect_shutdown(instance: *mut BamInstance) {
+        if !instance.is_null() {
+            SEEN_NON_NULL.store(true, Ordering::SeqCst);
+        }
     }
-    let res = unsafe { failing_shutdown(core::ptr::null_mut()) };
-    assert_eq!(res, FfiResult::INTERNAL_ERROR);
+    let dummy = core::ptr::NonNull::<BamInstance>::dangling().as_ptr();
+    unsafe { inspect_shutdown(dummy) };
+    assert!(SEEN_NON_NULL.load(Ordering::SeqCst));
 }
 
 #[test]
 fn t2_f22_02_null_context_in_shutdown() {
-    unsafe extern "C" fn safe_shutdown(ctx: *mut c_void) -> FfiResult {
-        if ctx.is_null() {
-            FfiResult::OK
-        } else {
-            FfiResult::INTERNAL_ERROR
+    static NULL_ACCEPTED: AtomicBool = AtomicBool::new(false);
+    unsafe extern "C" fn safe_shutdown(instance: *mut BamInstance) {
+        if instance.is_null() {
+            NULL_ACCEPTED.store(true, Ordering::SeqCst);
         }
     }
-    assert_eq!(
-        unsafe { safe_shutdown(core::ptr::null_mut()) },
-        FfiResult::OK
-    );
+    unsafe { safe_shutdown(core::ptr::null_mut()) };
+    assert!(NULL_ACCEPTED.load(Ordering::SeqCst));
 }
 
 #[test]
 fn t2_f22_03_double_shutdown_idempotent() {
     static SHUTDOWN_COUNT: AtomicU32 = AtomicU32::new(0);
-    unsafe extern "C" fn count_shutdown(_ctx: *mut c_void) -> FfiResult {
+    unsafe extern "C" fn count_shutdown(_instance: *mut BamInstance) {
         SHUTDOWN_COUNT.fetch_add(1, Ordering::SeqCst);
-        FfiResult::OK
     }
-    let _ = unsafe { count_shutdown(core::ptr::null_mut()) };
-    let _ = unsafe { count_shutdown(core::ptr::null_mut()) };
+    unsafe { count_shutdown(core::ptr::null_mut()) };
+    unsafe { count_shutdown(core::ptr::null_mut()) };
     assert_eq!(SHUTDOWN_COUNT.load(Ordering::SeqCst), 2);
 }
 
 #[test]
 fn t2_f22_04_init_version_mismatch() {
-    let api = HostApi {
-        struct_size: core::mem::size_of::<HostApi>() as u32,
-        abi_version: 0x99_99_99, // Mismatch
-        register_system: mock_register_system,
-        iter_next_chunk: mock_iter_next_chunk,
-        iter_column_readonly: mock_iter_column_readonly,
-        iter_column_mutable: mock_iter_column_mutable,
-        iter_mark_changed: mock_iter_mark_changed,
-        iter_entities: mock_iter_entities,
-        iter_column_stride: mock_iter_column_stride,
-        register_component: mock_register_component,
-    };
-    assert_ne!(api.abi_version, ABI_VERSION_PACKED);
+    let mut api = MOCK_HOST_API;
+    api.abi_version = 0x0001_0000;
+    assert_ne!(api.abi_version, ABI_VERSION);
+    assert_eq!(
+        api.validate_for_guest(ABI_VERSION),
+        FfiResult::INVALID_VERSION
+    );
 }
 
 #[test]
 fn t2_f22_05_host_api_struct_size_check() {
     assert_eq!(
         MOCK_HOST_API.struct_size,
-        core::mem::size_of::<HostApi>() as u32
+        core::mem::size_of::<BamHostApi>() as u32
     );
+    assert_eq!(MOCK_HOST_API.validate_for_guest(ABI_VERSION), FfiResult::OK);
 }
 
 // --- Feature 23: Mod Hot-Reloading ---
@@ -1344,7 +1418,6 @@ fn t2_f22_05_host_api_struct_size_check() {
 #[test]
 fn t2_f23_01_version_upgrade_preserves_count() {
     let mut state = 50;
-    // Upgrade
     state += 100;
     assert_eq!(state, 150);
 }
@@ -1362,9 +1435,8 @@ fn t2_f23_02_hot_reload_callback_replacement() {
 
 #[test]
 fn t2_f23_03_hot_reload_handles_disjoint_access() {
-    let pos = KinematicsPos::COMPONENT_CSTR.as_ptr();
-    let query = ComponentAccessDesc::read(pos);
-    assert_eq!(query.mode, ComponentAccessMode::READ);
+    let query = BamTermDesc::read(POS_HANDLE);
+    assert_eq!(query.mode, AccessMode::READ);
 }
 
 #[test]
@@ -1379,8 +1451,8 @@ fn t2_f23_04_reload_loop_stress() {
 #[test]
 fn t2_f23_05_hot_reload_retains_uuid() {
     assert_eq!(
-        KinematicsPos::UUID,
-        ComponentUuid::from_name("KinematicsPos")
+        MetadataTag::UUID,
+        ComponentUuid::from_canonical_name("e2e_harness::MetadataTag")
     );
 }
 
@@ -1409,10 +1481,9 @@ fn t2_f24_02_alternating_keys_stress() {
 
 #[test]
 fn t2_f24_03_descriptor_array_reuse() {
-    let pos_name = KinematicsPos::COMPONENT_CSTR.as_ptr();
-    let desc = ComponentAccessDesc::read(pos_name);
+    let desc = BamTermDesc::read(POS_HANDLE);
     for _ in 0..50 {
-        assert_eq!(desc.mode, ComponentAccessMode::READ);
+        assert_eq!(desc.mode, AccessMode::READ);
     }
 }
 
@@ -1525,13 +1596,4 @@ fn t2_f26_05_reinitialized_mock_state_clean() {
     let state = MockChunkIterState::new();
     assert_eq!(state.tables.len(), 0);
     assert!(!state.exhausted);
-}
-
-// Helper dummy callback
-unsafe extern "C" fn dummy_callback(
-    _iter: *mut RawChunkIter,
-    _cmds: *mut RawCommandQueue,
-    _ud: *mut c_void,
-) -> FfiResult {
-    FfiResult::OK
 }
