@@ -1,52 +1,59 @@
-//! Multi-archetype chunk iteration, change-detection granularity, and high-volume deferred command queues.
+//! Multi-archetype chunk iteration, change-detection granularity, and high-volume deferred command queues (`ABI 0.2.0`).
 
 mod archetype_and_permission_boundaries {
-    #![allow(unused_imports, dead_code)]
-    use bevy_abi_mod_host::{AbiModPlugin, ModAppExt, ModRegistry};
+    use bevy_abi_mod_host::{AbiModPlugin, ComponentOptions, ModAppExt, ModRegistry};
     use bevy_abi_mod_host_sys::{
-        CommandQueueBridge, DynamicCSystem, HostChunkIter, ModInitContext, QueryColumnDesc,
-        host_cmd_despawn, host_cmd_insert_component, host_cmd_spawn_empty, host_get_proc_address,
-        host_iter_column_mutable, host_iter_column_readonly, host_iter_column_stride,
-        host_iter_entities, host_iter_mark_changed, host_iter_next_chunk, host_register_system,
+        BamQuerySpecOwned, GuestSystem, HostCommands, HostCommandsStorage, HostIter, LoadContext,
+        QueryPlan, QueryTermMeta, host_cmd_despawn, host_cmd_insert, host_cmd_spawn_empty,
+        host_get_proc_address, host_iter_column_info, host_iter_column_mutable,
+        host_iter_column_readonly, host_iter_entities, host_iter_mark_changed_range,
+        host_iter_next_chunk, host_register_system, host_sys_commands, host_sys_query,
     };
-    use bevy_abi_mod_macros::ModExposable;
+    use bevy_abi_mod_macros::ModComponent;
     use bevy_abi_mod_sys::{
-        ComponentAccessDesc, ComponentAccessMode, FfiEntity, FfiResult, RawChunkIter,
-        RawCommandQueue, SystemDescriptor,
+        AccessMode, BamColumnInfo, BamCommands, BamComponent, BamIter, BamQueryDesc, BamSystemCtx,
+        BamSystemDesc, BamTermDesc, ComponentUuid, FfiEntity, FfiResult, MAX_TERMS_PER_QUERY,
+        ScheduleId,
     };
     use bevy_app::{App, Update};
+    use bevy_ecs::change_detection::Tick;
     use bevy_ecs::component::Component;
     use bevy_ecs::prelude::World;
-    use core::ffi::{c_char, c_void};
-    use std::ffi::CString;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use bevy_ecs::system::System;
+    use core::ffi::c_void;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    // Base test component
-    #[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+    #[repr(C)]
+    #[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+    #[mod_component(name = "ffi::chunk_bounds::Position")]
     pub struct Position {
         pub x: f32,
         pub y: f32,
         pub z: f32,
     }
 
-    #[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+    #[repr(C)]
+    #[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+    #[mod_component(name = "ffi::chunk_bounds::Velocity")]
     pub struct Velocity {
         pub x: f32,
         pub y: f32,
         pub z: f32,
     }
 
-    #[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+    #[repr(C)]
+    #[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+    #[mod_component(name = "ffi::chunk_bounds::Armor")]
     pub struct Armor {
         pub defense: i32,
     }
 
-    // 20 distinct tag components for extreme archetype fragmentation stress testing
     macro_rules! define_tags {
-        ($($tag:ident),*) => {
+        ($($tag:ident => $cname:literal),* $(,)?) => {
             $(
-                #[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+                #[repr(C)]
+                #[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+                #[mod_component(name = $cname)]
                 pub struct $tag {
                     pub id: u32,
                 }
@@ -55,30 +62,49 @@ mod archetype_and_permission_boundaries {
     }
 
     define_tags!(
-        Tag01, Tag02, Tag03, Tag04, Tag05, Tag06, Tag07, Tag08, Tag09, Tag10, Tag11, Tag12, Tag13,
-        Tag14, Tag15, Tag16, Tag17, Tag18, Tag19, Tag20
+        Tag01 => "ffi::chunk_bounds::Tag01",
+        Tag02 => "ffi::chunk_bounds::Tag02",
+        Tag03 => "ffi::chunk_bounds::Tag03",
+        Tag04 => "ffi::chunk_bounds::Tag04",
+        Tag05 => "ffi::chunk_bounds::Tag05",
+        Tag06 => "ffi::chunk_bounds::Tag06",
+        Tag07 => "ffi::chunk_bounds::Tag07",
+        Tag08 => "ffi::chunk_bounds::Tag08",
+        Tag09 => "ffi::chunk_bounds::Tag09",
+        Tag10 => "ffi::chunk_bounds::Tag10",
+        Tag11 => "ffi::chunk_bounds::Tag11",
+        Tag12 => "ffi::chunk_bounds::Tag12",
+        Tag13 => "ffi::chunk_bounds::Tag13",
+        Tag14 => "ffi::chunk_bounds::Tag14",
+        Tag15 => "ffi::chunk_bounds::Tag15",
+        Tag16 => "ffi::chunk_bounds::Tag16",
+        Tag17 => "ffi::chunk_bounds::Tag17",
+        Tag18 => "ffi::chunk_bounds::Tag18",
+        Tag19 => "ffi::chunk_bounds::Tag19",
+        Tag20 => "ffi::chunk_bounds::Tag20",
     );
 
-    // ============================================================================
-    // 1. Extreme Table Counts Stress Test (20 Distinct Archetypes)
-    // ============================================================================
-
-    static ENTITY_VISIT_COUNT: AtomicUsize = AtomicUsize::new(0);
-    static TABLE_VISIT_COUNT: AtomicUsize = AtomicUsize::new(0);
+    struct MultiTableCounters {
+        table_visits: AtomicUsize,
+        entity_visits: AtomicUsize,
+    }
 
     unsafe extern "C" fn multi_table_stress_system(
-        iter: *mut RawChunkIter,
-        _commands: *mut RawCommandQueue,
-        _user_data: *mut c_void,
+        sys_ctx: *mut BamSystemCtx,
+        user_data: *mut c_void,
     ) -> FfiResult {
-        let mut local_tables = 0;
-        let mut local_entities = 0;
+        let counters = unsafe { &*(user_data as *const MultiTableCounters) };
+        let mut iter: *mut BamIter = core::ptr::null_mut();
+        let rc = unsafe { host_sys_query(sys_ctx, 0, &mut iter) };
+        if rc.is_err() {
+            return rc;
+        }
 
-        loop {
-            let count = unsafe { host_iter_next_chunk(iter) };
-            if count == 0 {
-                break;
-            }
+        let mut local_tables = 0usize;
+        let mut local_entities = 0usize;
+        let mut count = 0usize;
+
+        while unsafe { host_iter_next_chunk(iter, &mut count) }.get() {
             local_tables += 1;
             local_entities += count;
 
@@ -97,25 +123,32 @@ mod archetype_and_permission_boundaries {
             }
         }
 
-        TABLE_VISIT_COUNT.fetch_add(local_tables, Ordering::SeqCst);
-        ENTITY_VISIT_COUNT.fetch_add(local_entities, Ordering::SeqCst);
+        counters
+            .table_visits
+            .fetch_add(local_tables, Ordering::SeqCst);
+        counters
+            .entity_visits
+            .fetch_add(local_entities, Ordering::SeqCst);
         FfiResult::OK
     }
 
     #[test]
     fn test_extreme_archetype_table_counts() {
-        ENTITY_VISIT_COUNT.store(0, Ordering::SeqCst);
-        TABLE_VISIT_COUNT.store(0, Ordering::SeqCst);
+        let counters = Box::new(MultiTableCounters {
+            table_visits: AtomicUsize::new(0),
+            entity_visits: AtomicUsize::new(0),
+        });
 
         let mut app = App::new();
         app.add_plugins(AbiModPlugin);
-        app.register_mod_component::<Position>();
+        let pos_h = app
+            .register_mod_component::<Position>(ComponentOptions::new())
+            .unwrap();
 
         macro_rules! register_and_spawn {
-            ($($tag:ident, $idx:expr);*) => {
+            ($($tag:ident, $idx:expr);* $(;)?) => {
                 $(
-                    app.register_mod_component::<$tag>();
-                    // Spawn 5 entities for each archetype: (Position, TagNN)
+                    app.register_mod_component::<$tag>(ComponentOptions::new()).unwrap();
                     for i in 0..5 {
                         app.world_mut().spawn((
                             Position { x: i as f32, y: 0.0, z: 0.0 },
@@ -130,47 +163,33 @@ mod archetype_and_permission_boundaries {
             Tag01, 1; Tag02, 2; Tag03, 3; Tag04, 4; Tag05, 5;
             Tag06, 6; Tag07, 7; Tag08, 8; Tag09, 9; Tag10, 10;
             Tag11, 11; Tag12, 12; Tag13, 13; Tag14, 14; Tag15, 15;
-            Tag16, 16; Tag17, 17; Tag18, 18; Tag19, 19; Tag20, 20
+            Tag16, 16; Tag17, 17; Tag18, 18; Tag19, 19; Tag20, 20;
         );
 
-        // Also spawn 10 entities that do NOT match the query (Tag01 + Tag02 without Position)
         for i in 0..10 {
             app.world_mut()
                 .spawn((Tag01 { id: 100 + i }, Tag02 { id: 200 + i }));
         }
 
         let registry = app.world().resource::<ModRegistry>().clone();
-        let query_descs = vec![bevy_abi_mod_host_sys::ComponentAccessDescOwned {
-            name: "Position".to_string(),
-            mode: ComponentAccessMode::WRITE,
-        }];
-
-        let dynamic_sys = DynamicCSystem::new(
-            "multi_table_stress".to_string(),
-            query_descs,
+        let sys = GuestSystem::new(
+            "multi_table_stress",
+            vec![BamQuerySpecOwned::new(vec![BamTermDesc::new(
+                pos_h,
+                AccessMode::WRITE,
+            )])],
             multi_table_stress_system,
-            core::ptr::null_mut(),
-            Arc::new(registry),
+            (&*counters as *const MultiTableCounters)
+                .cast_mut()
+                .cast::<c_void>(),
+            registry,
         );
+        app.add_systems(Update, sys);
 
-        app.add_systems(Update, dynamic_sys);
-
-        // Run first schedule tick
         app.update();
+        assert_eq!(counters.table_visits.load(Ordering::SeqCst), 20);
+        assert_eq!(counters.entity_visits.load(Ordering::SeqCst), 100);
 
-        // 20 distinct archetypes * 5 entities = 100 entities across 20 distinct tables
-        assert_eq!(
-            TABLE_VISIT_COUNT.load(Ordering::SeqCst),
-            20,
-            "Must visit exactly 20 distinct tables"
-        );
-        assert_eq!(
-            ENTITY_VISIT_COUNT.load(Ordering::SeqCst),
-            100,
-            "Must visit all 100 matching entities"
-        );
-
-        // Verify all 100 entities got mutated
         let mut query = app.world_mut().query::<&Position>();
         let mut count = 0;
         for pos in query.iter(app.world()) {
@@ -180,17 +199,12 @@ mod archetype_and_permission_boundaries {
         }
         assert_eq!(count, 100);
 
-        // Second tick: verify steady-state zero reallocation works with same tables
-        TABLE_VISIT_COUNT.store(0, Ordering::SeqCst);
-        ENTITY_VISIT_COUNT.store(0, Ordering::SeqCst);
+        counters.table_visits.store(0, Ordering::SeqCst);
+        counters.entity_visits.store(0, Ordering::SeqCst);
         app.update();
-        assert_eq!(TABLE_VISIT_COUNT.load(Ordering::SeqCst), 20);
-        assert_eq!(ENTITY_VISIT_COUNT.load(Ordering::SeqCst), 100);
+        assert_eq!(counters.table_visits.load(Ordering::SeqCst), 20);
+        assert_eq!(counters.entity_visits.load(Ordering::SeqCst), 100);
     }
-
-    // ============================================================================
-    // 2. Empty Table Iteration Stress Test (Created then Despawned)
-    // ============================================================================
 
     #[test]
     fn test_empty_table_iteration_and_despawn_fragmentation() {
@@ -201,7 +215,6 @@ mod archetype_and_permission_boundaries {
         world.register_component::<Tag02>();
         world.register_component::<Tag03>();
 
-        // Table 1: (Position, Velocity, Tag01) -> 10 entities
         let mut t1_entities = Vec::new();
         for i in 0..10 {
             t1_entities.push(
@@ -223,7 +236,6 @@ mod archetype_and_permission_boundaries {
             );
         }
 
-        // Table 2: (Position, Velocity, Tag02) -> 10 entities
         let mut t2_entities = Vec::new();
         for i in 0..10 {
             t2_entities.push(
@@ -245,7 +257,6 @@ mod archetype_and_permission_boundaries {
             );
         }
 
-        // Table 3: (Position, Velocity, Tag03) -> 10 entities
         let mut t3_entities = Vec::new();
         for i in 0..10 {
             t3_entities.push(
@@ -267,8 +278,6 @@ mod archetype_and_permission_boundaries {
             );
         }
 
-        // Despawn ALL entities in Table 1 and Table 3.
-        // In Bevy ECS, Table 1 and Table 3 remain registered in Tables storage but have entity_count() == 0.
         for e in t1_entities {
             world.despawn(e);
         }
@@ -276,95 +285,89 @@ mod archetype_and_permission_boundaries {
             world.despawn(e);
         }
 
-        let cell = world.as_unsafe_world_cell();
-        let storages = unsafe { cell.storages() };
-
-        let query_columns = vec![
-            QueryColumnDesc {
+        let plan = QueryPlan::from_terms(vec![
+            QueryTermMeta {
+                component: BamComponent::from_raw(1),
                 component_id: pos_id,
-                mode: ComponentAccessMode::WRITE,
-                stride: core::mem::size_of::<Position>(),
+                mode: AccessMode::WRITE,
+                uuid: ComponentUuid::from_canonical_name("ffi::chunk_bounds::Position"),
+                size: core::mem::size_of::<Position>(),
+                align: core::mem::align_of::<Position>(),
+                storage_flags: 0,
             },
-            QueryColumnDesc {
+            QueryTermMeta {
+                component: BamComponent::from_raw(2),
                 component_id: vel_id,
-                mode: ComponentAccessMode::READ,
-                stride: core::mem::size_of::<Velocity>(),
+                mode: AccessMode::READ,
+                uuid: ComponentUuid::from_canonical_name("ffi::chunk_bounds::Velocity"),
+                size: core::mem::size_of::<Velocity>(),
+                align: core::mem::align_of::<Velocity>(),
+                storage_flags: 0,
             },
-        ];
+        ]);
 
         let mut matched_tables = Vec::new();
-        for arch in cell.archetypes().iter() {
-            if arch.contains(pos_id) && arch.contains(vel_id) {
-                let tid = arch.table_id();
-                if !matched_tables.contains(&tid) {
-                    matched_tables.push(tid);
+        {
+            let cell = world.as_unsafe_world_cell();
+            for arch in cell.archetypes().iter() {
+                if arch.contains(pos_id) && arch.contains(vel_id) {
+                    let tid = arch.table_id();
+                    if !matched_tables.contains(&tid) {
+                        matched_tables.push(tid);
+                    }
                 }
             }
+            assert_eq!(matched_tables.len(), 3);
+
+            let storages = unsafe { cell.storages() };
+            let mut host_iter = HostIter::new_dense(
+                &storages.tables,
+                &matched_tables,
+                &plan,
+                Tick::new(0),
+                cell.change_tick(),
+            );
+            let raw_iter = host_iter.as_ffi_ptr();
+
+            let mut chunk1_count = 0usize;
+            assert!(unsafe { host_iter_next_chunk(raw_iter, &mut chunk1_count) }.get());
+            assert_eq!(chunk1_count, 10);
+            assert!(!unsafe { host_iter_entities(raw_iter) }.is_null());
+
+            let mut chunk2_count = 99usize;
+            assert!(!unsafe { host_iter_next_chunk(raw_iter, &mut chunk2_count) }.get());
+            assert_eq!(chunk2_count, 0);
+
+            assert!(!unsafe { host_iter_next_chunk(raw_iter, &mut chunk2_count) }.get());
+            assert_eq!(chunk2_count, 0);
+
+            assert!(unsafe { host_iter_column_readonly(raw_iter, 0) }.is_null());
+            assert!(unsafe { host_iter_column_mutable(raw_iter, 0) }.is_null());
+            assert!(unsafe { host_iter_entities(raw_iter) }.is_null());
         }
-        assert_eq!(
-            matched_tables.len(),
-            3,
-            "3 archetypes/tables exist matching Position + Velocity"
-        );
 
-        let mut host_iter = HostChunkIter::new(
-            &storages.tables,
-            &matched_tables,
-            &query_columns,
-            cell.change_tick(),
-        );
-        let raw_iter = (&mut host_iter as *mut HostChunkIter<'_>).cast::<RawChunkIter>();
-
-        // Next chunk must skip empty Table 1 and immediately yield Table 2 (10 entities)
-        let chunk1_count = unsafe { host_iter_next_chunk(raw_iter) };
-        assert_eq!(
-            chunk1_count, 10,
-            "First yielded chunk must be Table 2 with 10 entities"
-        );
-
-        let entities_ptr = unsafe { host_iter_entities(raw_iter) };
-        assert!(!entities_ptr.is_null());
-
-        // Next chunk must skip empty Table 3 and return 0 (exhausted)
-        let chunk2_count = unsafe { host_iter_next_chunk(raw_iter) };
-        assert_eq!(
-            chunk2_count, 0,
-            "Empty Table 3 must be skipped, reaching end of iteration"
-        );
-
-        // Repeated calls after exhaustion must continue safely returning 0 without panic
-        assert_eq!(unsafe { host_iter_next_chunk(raw_iter) }, 0);
-        assert_eq!(unsafe { host_iter_next_chunk(raw_iter) }, 0);
-
-        // Calling column accessors on exhausted iterator must return null safely
-        assert!(unsafe { host_iter_column_readonly(raw_iter, 0) }.is_null());
-        assert!(unsafe { host_iter_column_mutable(raw_iter, 0) }.is_null());
-        assert!(unsafe { host_iter_entities(raw_iter) }.is_null());
-
-        // Despawn Table 2 as well -> now ALL tables are empty
         for e in t2_entities {
             world.despawn(e);
         }
+
         let cell_all_empty = world.as_unsafe_world_cell();
         let storages_all_empty = unsafe { cell_all_empty.storages() };
-        let mut empty_iter = HostChunkIter::new(
+        let mut empty_iter = HostIter::new_dense(
             &storages_all_empty.tables,
             &matched_tables,
-            &query_columns,
+            &plan,
+            Tick::new(0),
             cell_all_empty.change_tick(),
         );
-        let raw_empty = (&mut empty_iter as *mut HostChunkIter<'_>).cast::<RawChunkIter>();
+        let raw_empty = empty_iter.as_ffi_ptr();
 
-        // When all matching tables have 0 entities, next_chunk returns 0 on first call
-        assert_eq!(unsafe { host_iter_next_chunk(raw_empty) }, 0);
+        let mut empty_len = 99usize;
+        assert!(!unsafe { host_iter_next_chunk(raw_empty, &mut empty_len) }.get());
+        assert_eq!(empty_len, 0);
         assert!(unsafe { host_iter_column_readonly(raw_empty, 0) }.is_null());
         assert!(unsafe { host_iter_column_mutable(raw_empty, 0) }.is_null());
         assert!(unsafe { host_iter_entities(raw_empty) }.is_null());
     }
-
-    // ============================================================================
-    // 3. Permission Enforcement: iter_column_mutable on Read-Only Components
-    // ============================================================================
 
     #[test]
     fn test_permission_enforcement_read_only_and_filter_only_mutation_rejected() {
@@ -390,61 +393,59 @@ mod archetype_and_permission_boundaries {
         let cell = world.as_unsafe_world_cell();
         let storages = unsafe { cell.storages() };
 
-        let query_columns = vec![
-            QueryColumnDesc {
+        let plan = QueryPlan::from_terms(vec![
+            QueryTermMeta {
+                component: BamComponent::from_raw(1),
                 component_id: pos_id,
-                mode: ComponentAccessMode::WRITE,
-                stride: core::mem::size_of::<Position>(),
+                mode: AccessMode::WRITE,
+                uuid: ComponentUuid::from_canonical_name("ffi::chunk_bounds::Position"),
+                size: core::mem::size_of::<Position>(),
+                align: core::mem::align_of::<Position>(),
+                storage_flags: 0,
             },
-            QueryColumnDesc {
+            QueryTermMeta {
+                component: BamComponent::from_raw(2),
                 component_id: vel_id,
-                mode: ComponentAccessMode::READ,
-                stride: core::mem::size_of::<Velocity>(),
+                mode: AccessMode::READ,
+                uuid: ComponentUuid::from_canonical_name("ffi::chunk_bounds::Velocity"),
+                size: core::mem::size_of::<Velocity>(),
+                align: core::mem::align_of::<Velocity>(),
+                storage_flags: 0,
             },
-            QueryColumnDesc {
+            QueryTermMeta {
+                component: BamComponent::from_raw(3),
                 component_id: arm_id,
-                mode: ComponentAccessMode::FILTER_ONLY,
-                stride: core::mem::size_of::<Armor>(),
+                mode: AccessMode::FILTER_ONLY,
+                uuid: ComponentUuid::from_canonical_name("ffi::chunk_bounds::Armor"),
+                size: core::mem::size_of::<Armor>(),
+                align: core::mem::align_of::<Armor>(),
+                storage_flags: 0,
             },
-        ];
+        ]);
 
         let matched_tables = vec![cell.archetypes().iter().last().unwrap().table_id()];
-        let mut host_iter = HostChunkIter::new(
+        let mut host_iter = HostIter::new_dense(
             &storages.tables,
             &matched_tables,
-            &query_columns,
+            &plan,
+            Tick::new(0),
             cell.change_tick(),
         );
-        let raw_iter = (&mut host_iter as *mut HostChunkIter<'_>).cast::<RawChunkIter>();
+        let raw_iter = host_iter.as_ffi_ptr();
 
-        let count = unsafe { host_iter_next_chunk(raw_iter) };
+        let mut count = 0usize;
+        assert!(unsafe { host_iter_next_chunk(raw_iter, &mut count) }.get());
         assert_eq!(count, 1);
 
-        // Column 0: WRITE -> mutable allowed, readonly allowed
         assert!(!unsafe { host_iter_column_mutable(raw_iter, 0) }.is_null());
         assert!(!unsafe { host_iter_column_readonly(raw_iter, 0) }.is_null());
 
-        // Column 1: READ -> mutable MUST return null_mut(), readonly allowed
-        let vel_mut = unsafe { host_iter_column_mutable(raw_iter, 1) };
-        assert!(
-            vel_mut.is_null(),
-            "iter_column_mutable on READ column MUST return null_mut()"
-        );
+        assert!(unsafe { host_iter_column_mutable(raw_iter, 1) }.is_null());
         assert!(!unsafe { host_iter_column_readonly(raw_iter, 1) }.is_null());
 
-        // Column 2: FILTER_ONLY -> mutable MUST return null_mut(), readonly MUST return null()
-        let arm_mut = unsafe { host_iter_column_mutable(raw_iter, 2) };
-        assert!(
-            arm_mut.is_null(),
-            "iter_column_mutable on FILTER_ONLY column MUST return null_mut()"
-        );
-        let arm_ro = unsafe { host_iter_column_readonly(raw_iter, 2) };
-        assert!(
-            arm_ro.is_null(),
-            "iter_column_readonly on FILTER_ONLY column MUST return null()"
-        );
+        assert!(unsafe { host_iter_column_mutable(raw_iter, 2) }.is_null());
+        assert!(unsafe { host_iter_column_readonly(raw_iter, 2) }.is_null());
 
-        // Out of bounds column index: index 3, 100, usize::MAX -> MUST return null_mut()
         assert!(unsafe { host_iter_column_mutable(raw_iter, 3) }.is_null());
         assert!(unsafe { host_iter_column_mutable(raw_iter, 100) }.is_null());
         assert!(unsafe { host_iter_column_mutable(raw_iter, usize::MAX) }.is_null());
@@ -452,25 +453,21 @@ mod archetype_and_permission_boundaries {
         assert!(unsafe { host_iter_column_readonly(raw_iter, 100) }.is_null());
         assert!(unsafe { host_iter_column_readonly(raw_iter, usize::MAX) }.is_null());
 
-        // Calling iter_mark_changed on READ column MUST return PERMISSION_DENIED
-        let mark_ro_res = unsafe { host_iter_mark_changed(raw_iter, 1, 0) };
-        assert_eq!(mark_ro_res, FfiResult::PERMISSION_DENIED);
-
-        // Calling iter_mark_changed on FILTER_ONLY column MUST return PERMISSION_DENIED
-        let mark_filter_res = unsafe { host_iter_mark_changed(raw_iter, 2, 0) };
-        assert_eq!(mark_filter_res, FfiResult::PERMISSION_DENIED);
+        assert_eq!(
+            unsafe { host_iter_mark_changed_range(raw_iter, 1, 0, 1) },
+            FfiResult::PERMISSION_DENIED
+        );
+        assert_eq!(
+            unsafe { host_iter_mark_changed_range(raw_iter, 2, 0, 1) },
+            FfiResult::PERMISSION_DENIED
+        );
     }
-
-    // ============================================================================
-    // 4. Out-of-Bounds Row Index on iter_mark_changed
-    // ============================================================================
 
     #[test]
     fn test_out_of_bounds_row_index_on_iter_mark_changed() {
         let mut world = World::new();
         let pos_id = world.register_component::<Position>();
 
-        // Spawn 5 entities (rows 0, 1, 2, 3, 4)
         for i in 0..5 {
             world.spawn(Position {
                 x: i as f32,
@@ -482,76 +479,70 @@ mod archetype_and_permission_boundaries {
         let cell = world.as_unsafe_world_cell();
         let storages = unsafe { cell.storages() };
 
-        let query_columns = vec![QueryColumnDesc {
+        let plan = QueryPlan::from_terms(vec![QueryTermMeta {
+            component: BamComponent::from_raw(1),
             component_id: pos_id,
-            mode: ComponentAccessMode::WRITE,
-            stride: core::mem::size_of::<Position>(),
-        }];
+            mode: AccessMode::WRITE,
+            uuid: ComponentUuid::from_canonical_name("ffi::chunk_bounds::Position"),
+            size: core::mem::size_of::<Position>(),
+            align: core::mem::align_of::<Position>(),
+            storage_flags: 0,
+        }]);
 
         let matched_tables = vec![cell.archetypes().iter().last().unwrap().table_id()];
-        let mut host_iter = HostChunkIter::new(
+        let mut host_iter = HostIter::new_dense(
             &storages.tables,
             &matched_tables,
-            &query_columns,
+            &plan,
+            Tick::new(0),
             cell.change_tick(),
         );
-        let raw_iter = (&mut host_iter as *mut HostChunkIter<'_>).cast::<RawChunkIter>();
+        let raw_iter = host_iter.as_ffi_ptr();
 
-        let count = unsafe { host_iter_next_chunk(raw_iter) };
+        let mut count = 0usize;
+        assert!(unsafe { host_iter_next_chunk(raw_iter, &mut count) }.get());
         assert_eq!(count, 5);
 
-        // Valid rows: 0 and 4 -> OK
         assert_eq!(
-            unsafe { host_iter_mark_changed(raw_iter, 0, 0) },
+            unsafe { host_iter_mark_changed_range(raw_iter, 0, 0, 1) },
             FfiResult::OK
         );
         assert_eq!(
-            unsafe { host_iter_mark_changed(raw_iter, 0, 4) },
+            unsafe { host_iter_mark_changed_range(raw_iter, 0, 4, 1) },
             FfiResult::OK
         );
 
-        // Off-by-one boundary: row == current_entity_count (row 5) -> MUST return OUT_OF_RANGE
-        let oob_exact = unsafe { host_iter_mark_changed(raw_iter, 0, 5) };
         assert_eq!(
-            oob_exact,
-            FfiResult::OUT_OF_RANGE,
-            "row == count must return OUT_OF_RANGE"
-        );
-
-        // Extreme out-of-bounds rows
-        assert_eq!(
-            unsafe { host_iter_mark_changed(raw_iter, 0, 6) },
+            unsafe { host_iter_mark_changed_range(raw_iter, 0, 5, 1) },
             FfiResult::OUT_OF_RANGE
         );
         assert_eq!(
-            unsafe { host_iter_mark_changed(raw_iter, 0, 1000) },
+            unsafe { host_iter_mark_changed_range(raw_iter, 0, 6, 1) },
             FfiResult::OUT_OF_RANGE
         );
         assert_eq!(
-            unsafe { host_iter_mark_changed(raw_iter, 0, usize::MAX) },
+            unsafe { host_iter_mark_changed_range(raw_iter, 0, 1000, 1) },
+            FfiResult::OUT_OF_RANGE
+        );
+        assert_eq!(
+            unsafe { host_iter_mark_changed_range(raw_iter, 0, usize::MAX, 1) },
             FfiResult::OUT_OF_RANGE
         );
 
-        // Invalid component index
         assert_eq!(
-            unsafe { host_iter_mark_changed(raw_iter, 1, 0) },
-            FfiResult::INVALID_COMPONENT
+            unsafe { host_iter_mark_changed_range(raw_iter, 1, 0, 1) },
+            FfiResult::OUT_OF_RANGE
         );
         assert_eq!(
-            unsafe { host_iter_mark_changed(raw_iter, 999, 0) },
-            FfiResult::INVALID_COMPONENT
+            unsafe { host_iter_mark_changed_range(raw_iter, 999, 0, 1) },
+            FfiResult::OUT_OF_RANGE
         );
 
-        // Null iterator pointer
         assert_eq!(
-            unsafe { host_iter_mark_changed(core::ptr::null_mut(), 0, 0) },
+            unsafe { host_iter_mark_changed_range(core::ptr::null_mut(), 0, 0, 1) },
             FfiResult::NULL_POINTER
         );
     }
-
-    // ============================================================================
-    // 5. High-Throughput Command Queue Bridge Stress Test (10,000 Commands)
-    // ============================================================================
 
     #[test]
     fn test_rapid_command_queue_bridge_10k_commands() {
@@ -559,103 +550,83 @@ mod archetype_and_permission_boundaries {
         let pos_id = world.register_component::<Position>();
 
         let mut registry = ModRegistry::new();
-        registry.register_component::<Position>(pos_id);
-
-        let mut cmd_queue = bevy_ecs::world::CommandQueue::default();
-        let comp_name = CString::new("Position").unwrap();
+        let pos_h = registry
+            .register_component::<Position>(pos_id, ComponentOptions::new())
+            .unwrap();
+        let snapshot = registry.snapshot_arc();
 
         let initial_count = world.entities().len();
-        println!("Entities count right after World::new() + register_component: {initial_count}");
         const CMD_COUNT: usize = 10_000;
         let mut spawned_entities = Vec::with_capacity(CMD_COUNT);
+        let mut storage = HostCommandsStorage::new();
 
-        // 1. Rapidly queue 10,000 entity spawns + component insertions
         {
             let cell = world.as_unsafe_world_cell();
-            let allocator = cell.entity_allocator();
-            let mut bridge = CommandQueueBridge::new(&mut cmd_queue, allocator, &registry);
-            let raw_queue = (&mut bridge as *mut CommandQueueBridge<'_>).cast::<RawCommandQueue>();
+            let mut cmds = HostCommands::new(&mut storage, cell.entity_allocator(), &snapshot);
+            let raw_cmds = cmds.as_ffi_ptr();
 
             for i in 0..CMD_COUNT {
-                let entity = unsafe { host_cmd_spawn_empty(raw_queue) };
-                assert_ne!(entity.0, 0);
+                let mut entity = FfiEntity::NULL;
+                assert_eq!(
+                    unsafe { host_cmd_spawn_empty(raw_cmds, &mut entity) },
+                    FfiResult::OK
+                );
+                assert!(!entity.is_null());
 
                 let pos = Position {
                     x: i as f32,
                     y: (i * 2) as f32,
                     z: (i * 3) as f32,
                 };
-
-                let status = unsafe {
-                    host_cmd_insert_component(
-                        raw_queue,
-                        entity,
-                        comp_name.as_ptr(),
-                        &pos as *const Position as *const u8,
-                        core::mem::size_of::<Position>(),
-                    )
-                };
-                assert_eq!(status, FfiResult::OK);
+                assert_eq!(
+                    unsafe {
+                        host_cmd_insert(
+                            raw_cmds,
+                            entity,
+                            pos_h,
+                            &pos as *const Position as *const u8,
+                            core::mem::size_of::<Position>(),
+                        )
+                    },
+                    FfiResult::OK
+                );
                 spawned_entities.push(entity);
             }
         }
 
         assert_eq!(spawned_entities.len(), CMD_COUNT);
-
-        // Before apply, world has initial_count entities
         assert_eq!(world.entities().len(), initial_count);
 
-        // Flush 20,000 command closures to the Bevy World
-        cmd_queue.apply(&mut world);
+        storage.apply_to_world(&mut world, &snapshot);
 
-        // In Bevy ECS, world.query::<&Position>().iter(&world).count() gives exact count of Position entities
-        let live_pos_count = world.query::<&Position>().iter(&world).count();
-        assert_eq!(live_pos_count, CMD_COUNT);
-
+        assert_eq!(world.query::<&Position>().iter(&world).count(), CMD_COUNT);
         for (i, &ffi_entity) in spawned_entities.iter().enumerate() {
             let bevy_entity = bevy_ecs::entity::Entity::from_bits(ffi_entity.to_bits());
-            let pos = world
-                .get::<Position>(bevy_entity)
-                .expect("Entity must have Position");
+            let pos = world.get::<Position>(bevy_entity).unwrap();
             assert_eq!(pos.x, i as f32);
             assert_eq!(pos.y, (i * 2) as f32);
             assert_eq!(pos.z, (i * 3) as f32);
         }
 
-        // 2. Rapidly queue 10,000 despawns
         {
             let cell = world.as_unsafe_world_cell();
-            let allocator = cell.entity_allocator();
-            let mut bridge = CommandQueueBridge::new(&mut cmd_queue, allocator, &registry);
-            let raw_queue = (&mut bridge as *mut CommandQueueBridge<'_>).cast::<RawCommandQueue>();
-
+            let mut cmds = HostCommands::new(&mut storage, cell.entity_allocator(), &snapshot);
+            let raw_cmds = cmds.as_ffi_ptr();
             for &ffi_entity in &spawned_entities {
-                let res = unsafe { host_cmd_despawn(raw_queue, ffi_entity) };
-                assert_eq!(res, FfiResult::OK);
+                assert_eq!(
+                    unsafe { host_cmd_despawn(raw_cmds, ffi_entity) },
+                    FfiResult::OK
+                );
             }
         }
 
-        // Flush despawn closures
-        cmd_queue.apply(&mut world);
-
-        // Verify all 10,000 entities have been despawned
-        let remaining_pos_count = world.query::<&Position>().iter(&world).count();
-        assert_eq!(
-            remaining_pos_count, 0,
-            "All 10,000 Position entities must be despawned"
-        );
+        storage.apply_to_world(&mut world, &snapshot);
+        assert_eq!(world.query::<&Position>().iter(&world).count(), 0);
         for &ffi_entity in &spawned_entities {
             let bevy_entity = bevy_ecs::entity::Entity::from_bits(ffi_entity.to_bits());
-            assert!(
-                world.get_entity(bevy_entity).is_err(),
-                "Entity must be despawned"
-            );
+            assert!(world.get_entity(bevy_entity).is_err());
         }
     }
-
-    // ============================================================================
-    // 6. Defensive Boundary Torture & Null Pointer Fuzzing
-    // ============================================================================
 
     #[test]
     fn test_defensive_boundary_and_null_pointer_torture() {
@@ -663,240 +634,199 @@ mod archetype_and_permission_boundaries {
         let pos_id = world.register_component::<Position>();
 
         let mut registry = ModRegistry::new();
-        registry.register_component::<Position>(pos_id);
+        let pos_h = registry
+            .register_component::<Position>(pos_id, ComponentOptions::new())
+            .unwrap();
+        let snapshot = registry.snapshot_arc();
 
-        let mut cmd_queue = bevy_ecs::world::CommandQueue::default();
+        let mut storage = HostCommandsStorage::new();
         let cell = world.as_unsafe_world_cell();
-        let mut bridge =
-            CommandQueueBridge::new(&mut cmd_queue, cell.entity_allocator(), &registry);
-        let raw_queue = (&mut bridge as *mut CommandQueueBridge<'_>).cast::<RawCommandQueue>();
+        let mut cmds = HostCommands::new(&mut storage, cell.entity_allocator(), &snapshot);
+        let raw_cmds = cmds.as_ffi_ptr();
 
-        let valid_name = CString::new("Position").unwrap();
         let dummy_pos = Position {
             x: 1.0,
             y: 2.0,
             z: 3.0,
         };
 
-        // --- host_get_proc_address ---
-        assert!(unsafe { host_get_proc_address(core::ptr::null()) }.is_null());
+        assert!(unsafe { host_get_proc_address(core::ptr::null(), core::ptr::null()) }.is_null());
 
-        // --- host_cmd_spawn_empty ---
+        let mut out_ent = FfiEntity::NULL;
         assert_eq!(
-            unsafe { host_cmd_spawn_empty(core::ptr::null_mut()) },
-            FfiEntity(0)
+            unsafe { host_cmd_spawn_empty(core::ptr::null_mut(), &mut out_ent) },
+            FfiResult::NULL_POINTER
         );
-
-        // --- host_cmd_despawn ---
         assert_eq!(
-            unsafe { host_cmd_despawn(core::ptr::null_mut(), FfiEntity(123)) },
+            unsafe { host_cmd_spawn_empty(raw_cmds, core::ptr::null_mut()) },
             FfiResult::NULL_POINTER
         );
 
-        // Entity bit pattern where try_from_bits fails (generation 0) or Entity::PLACEHOLDER
+        let mut valid_entity = FfiEntity::NULL;
         assert_eq!(
-            unsafe { host_cmd_despawn(raw_queue, FfiEntity(0)) },
+            unsafe { host_cmd_spawn_empty(raw_cmds, &mut valid_entity) },
+            FfiResult::OK
+        );
+
+        assert_eq!(
+            unsafe { host_cmd_despawn(core::ptr::null_mut(), valid_entity) },
+            FfiResult::NULL_POINTER
+        );
+        assert_eq!(
+            unsafe { host_cmd_despawn(raw_cmds, FfiEntity::NULL) },
             FfiResult::INVALID_ENTITY
         );
         assert_eq!(
             unsafe {
                 host_cmd_despawn(
-                    raw_queue,
+                    raw_cmds,
                     FfiEntity::from_bits(bevy_ecs::entity::Entity::PLACEHOLDER.to_bits()),
                 )
             },
             FfiResult::INVALID_ENTITY
         );
-
-        // Non-existent entity with valid bits returns OK (queued) and safely no-ops on flush
         assert_eq!(
-            unsafe { host_cmd_despawn(raw_queue, FfiEntity(u64::MAX)) },
+            unsafe { host_cmd_despawn(raw_cmds, FfiEntity::from_bits(u64::MAX)) },
             FfiResult::OK
         );
 
-        // --- host_cmd_insert_component ---
-        // Null queue
         assert_eq!(
             unsafe {
-                host_cmd_insert_component(
+                host_cmd_insert(
                     core::ptr::null_mut(),
-                    FfiEntity(1),
-                    valid_name.as_ptr(),
+                    valid_entity,
+                    pos_h,
                     &dummy_pos as *const Position as *const u8,
                     core::mem::size_of::<Position>(),
                 )
             },
             FfiResult::NULL_POINTER
         );
-
-        // Null component_name
         assert_eq!(
             unsafe {
-                host_cmd_insert_component(
-                    raw_queue,
-                    FfiEntity(1),
-                    core::ptr::null(),
+                host_cmd_insert(
+                    raw_cmds,
+                    valid_entity,
+                    BamComponent::INVALID,
                     &dummy_pos as *const Position as *const u8,
                     core::mem::size_of::<Position>(),
                 )
             },
+            FfiResult::INVALID_COMPONENT
+        );
+        assert_eq!(
+            unsafe { host_cmd_insert(raw_cmds, valid_entity, pos_h, core::ptr::null(), 12) },
             FfiResult::NULL_POINTER
         );
-
-        // Null data when len > 0
         assert_eq!(
             unsafe {
-                host_cmd_insert_component(
-                    raw_queue,
-                    FfiEntity(1),
-                    valid_name.as_ptr(),
-                    core::ptr::null(),
-                    12,
-                )
-            },
-            FfiResult::NULL_POINTER
-        );
-
-        // Invalid UTF-8 in component_name
-        let invalid_utf8_bytes = [0xFF, 0xFE, 0xFD, 0x00];
-        assert_eq!(
-            unsafe {
-                host_cmd_insert_component(
-                    raw_queue,
-                    FfiEntity(1),
-                    invalid_utf8_bytes.as_ptr() as *const c_char,
-                    &dummy_pos as *const Position as *const u8,
-                    core::mem::size_of::<Position>(),
-                )
-            },
-            FfiResult::INVALID_UTF8
-        );
-
-        // Invalid entity bits (generation 0) in insert
-        assert_eq!(
-            unsafe {
-                host_cmd_insert_component(
-                    raw_queue,
-                    FfiEntity(0),
-                    valid_name.as_ptr(),
+                host_cmd_insert(
+                    raw_cmds,
+                    FfiEntity::NULL,
+                    pos_h,
                     &dummy_pos as *const Position as *const u8,
                     core::mem::size_of::<Position>(),
                 )
             },
             FfiResult::INVALID_ENTITY
         );
-
-        // Mismatched size (comp_meta.size != len)
         assert_eq!(
             unsafe {
-                host_cmd_insert_component(
-                    raw_queue,
-                    FfiEntity(1),
-                    valid_name.as_ptr(),
+                host_cmd_insert(
+                    raw_cmds,
+                    valid_entity,
+                    pos_h,
                     &dummy_pos as *const Position as *const u8,
-                    11, // expected 12
+                    11,
                 )
             },
             FfiResult::INVALID_ARGUMENT
         );
 
-        // --- host_iter_* null safety ---
-        assert_eq!(unsafe { host_iter_next_chunk(core::ptr::null_mut()) }, 0);
+        let mut out_len = 0usize;
+        let mut col_info = core::mem::MaybeUninit::<BamColumnInfo>::uninit();
+        assert!(!unsafe { host_iter_next_chunk(core::ptr::null_mut(), &mut out_len) }.get());
         assert!(unsafe { host_iter_column_readonly(core::ptr::null(), 0) }.is_null());
         assert!(unsafe { host_iter_column_mutable(core::ptr::null_mut(), 0) }.is_null());
         assert_eq!(
-            unsafe { host_iter_mark_changed(core::ptr::null_mut(), 0, 0) },
+            unsafe { host_iter_mark_changed_range(core::ptr::null_mut(), 0, 0, 1) },
             FfiResult::NULL_POINTER
         );
         assert!(unsafe { host_iter_entities(core::ptr::null()) }.is_null());
-        assert_eq!(unsafe { host_iter_column_stride(core::ptr::null(), 0) }, 0);
+        assert_eq!(
+            unsafe { host_iter_column_info(core::ptr::null(), 0, col_info.as_mut_ptr()) },
+            FfiResult::NULL_POINTER
+        );
 
-        // --- host_register_system null safety ---
         assert_eq!(
             unsafe { host_register_system(core::ptr::null_mut(), core::ptr::null()) },
             FfiResult::NULL_POINTER
         );
 
-        let mut init_ctx = ModInitContext::new(Arc::new(registry));
-        let _active_guard = init_ctx.make_active();
-        let ctx_ptr = (&mut init_ctx as *mut ModInitContext).cast::<c_void>();
+        let mut load_ctx = LoadContext::new(registry);
+        let load_ptr = load_ctx.as_ffi_ptr();
 
         assert_eq!(
-            unsafe { host_register_system(ctx_ptr, core::ptr::null()) },
-            FfiResult::NULL_POINTER
-        );
-        assert_eq!(
-            unsafe {
-                host_register_system(
-                    core::ptr::null_mut(),
-                    &SystemDescriptor {
-                        struct_size: core::mem::size_of::<SystemDescriptor>() as u32,
-                        name: valid_name.as_ptr(),
-                        query_count: 0,
-                        queries: core::ptr::null(),
-                        callback: multi_table_stress_system,
-                        user_data: core::ptr::null_mut(),
-                    },
-                )
-            },
+            unsafe { host_register_system(load_ptr, core::ptr::null()) },
             FfiResult::NULL_POINTER
         );
 
-        // Descriptor with small struct_size header (ABI mismatch simulation)
-        let bad_desc = SystemDescriptor {
-            struct_size: 16, // smaller than real struct
-            name: valid_name.as_ptr(),
-            query_count: 0,
+        let valid_sys_desc = BamSystemDesc {
+            struct_size: core::mem::size_of::<BamSystemDesc>() as u32,
+            flags: 0,
+            name: c"valid_sys".as_ptr(),
             queries: core::ptr::null(),
-            callback: multi_table_stress_system,
+            query_count: 0,
+            callback: Some(multi_table_stress_system),
             user_data: core::ptr::null_mut(),
+            schedule: ScheduleId::UPDATE,
+            reserved0: 0,
+            after: core::ptr::null(),
+            after_count: 0,
+            before: core::ptr::null(),
+            before_count: 0,
+            run_if: None,
+            run_if_user_data: core::ptr::null_mut(),
         };
         assert_eq!(
-            unsafe { host_register_system(ctx_ptr, &bad_desc) },
+            unsafe { host_register_system(core::ptr::null_mut(), &valid_sys_desc) },
+            FfiResult::NULL_POINTER
+        );
+
+        let mut truncated_desc = valid_sys_desc;
+        truncated_desc.struct_size = 16;
+        assert_eq!(
+            unsafe { host_register_system(load_ptr, &truncated_desc) },
             FfiResult::INVALID_VERSION
         );
 
-        // Descriptor with query_count > 0 but queries == null
-        let null_queries_desc = SystemDescriptor {
-            struct_size: core::mem::size_of::<SystemDescriptor>() as u32,
-            name: valid_name.as_ptr(),
-            query_count: 1,
-            queries: core::ptr::null(),
-            callback: multi_table_stress_system,
-            user_data: core::ptr::null_mut(),
-        };
+        let mut null_queries_desc = valid_sys_desc;
+        null_queries_desc.query_count = 1;
+        null_queries_desc.queries = core::ptr::null();
         assert_eq!(
-            unsafe { host_register_system(ctx_ptr, &null_queries_desc) },
+            unsafe { host_register_system(load_ptr, &null_queries_desc) },
             FfiResult::NULL_POINTER
         );
 
-        // Query descriptor with name == null
-        let null_query_name = ComponentAccessDesc {
-            name: core::ptr::null(),
-            mode: ComponentAccessMode::READ,
-        };
-        let bad_query_name_desc = SystemDescriptor {
-            struct_size: core::mem::size_of::<SystemDescriptor>() as u32,
-            name: valid_name.as_ptr(),
-            query_count: 1,
-            queries: &null_query_name,
-            callback: multi_table_stress_system,
-            user_data: core::ptr::null_mut(),
-        };
+        let bad_term = BamTermDesc::new(BamComponent::INVALID, AccessMode::READ);
+        let bad_q = BamQueryDesc::new(&bad_term, 1);
+        let mut bad_comp_desc = valid_sys_desc;
+        bad_comp_desc.queries = &bad_q;
+        bad_comp_desc.query_count = 1;
         assert_eq!(
-            unsafe { host_register_system(ctx_ptr, &bad_query_name_desc) },
-            FfiResult::NULL_POINTER
+            unsafe { host_register_system(load_ptr, &bad_comp_desc) },
+            FfiResult::INVALID_COMPONENT
         );
     }
-
-    // ============================================================================
-    // 7. MAX_QUERY_COMPONENTS Bounds Stress Test
-    // ============================================================================
 
     #[test]
     fn test_max_query_components_boundary() {
         let mut world = World::new();
         let pos_id = world.register_component::<Position>();
+        let mut registry = ModRegistry::new();
+        let pos_h = registry
+            .register_component::<Position>(pos_id, ComponentOptions::new())
+            .unwrap();
 
         world.spawn(Position {
             x: 10.0,
@@ -904,88 +834,128 @@ mod archetype_and_permission_boundaries {
             z: 30.0,
         });
 
+        let mut terms_34 = Vec::with_capacity(34);
+        for _ in 0..34 {
+            terms_34.push(BamTermDesc::new(pos_h, AccessMode::READ));
+        }
+        let q_over = BamQueryDesc::new(terms_34.as_ptr(), terms_34.len());
+        let sys_over = BamSystemDesc {
+            struct_size: core::mem::size_of::<BamSystemDesc>() as u32,
+            flags: 0,
+            name: c"over_max_terms".as_ptr(),
+            queries: &q_over,
+            query_count: 1,
+            callback: Some(multi_table_stress_system),
+            user_data: core::ptr::null_mut(),
+            schedule: ScheduleId::UPDATE,
+            reserved0: 0,
+            after: core::ptr::null(),
+            after_count: 0,
+            before: core::ptr::null(),
+            before_count: 0,
+            run_if: None,
+            run_if_user_data: core::ptr::null_mut(),
+        };
+        let mut load_ctx = LoadContext::new(registry);
+        assert_eq!(
+            unsafe { host_register_system(load_ctx.as_ffi_ptr(), &sys_over) },
+            FfiResult::CAPACITY_EXCEEDED
+        );
+
         let cell = world.as_unsafe_world_cell();
         let storages = unsafe { cell.storages() };
 
-        // Create a query descriptor array with 34 components (exceeding MAX_QUERY_COMPONENTS = 32)
-        let mut query_columns = Vec::new();
-        for _ in 0..34 {
-            query_columns.push(QueryColumnDesc {
+        let mut max_terms = Vec::with_capacity(MAX_TERMS_PER_QUERY);
+        for i in 0..MAX_TERMS_PER_QUERY {
+            max_terms.push(QueryTermMeta {
+                component: pos_h,
                 component_id: pos_id,
-                mode: ComponentAccessMode::WRITE,
-                stride: core::mem::size_of::<Position>(),
+                mode: if i == 0 {
+                    AccessMode::WRITE
+                } else {
+                    AccessMode::READ
+                },
+                uuid: ComponentUuid::from_canonical_name("ffi::chunk_bounds::Position"),
+                size: core::mem::size_of::<Position>(),
+                align: core::mem::align_of::<Position>(),
+                storage_flags: 0,
             });
         }
+        let plan = QueryPlan::from_terms(max_terms);
 
         let matched_tables = vec![cell.archetypes().iter().last().unwrap().table_id()];
-        let mut host_iter = HostChunkIter::new(
+        let mut host_iter = HostIter::new_dense(
             &storages.tables,
             &matched_tables,
-            &query_columns,
+            &plan,
+            Tick::new(0),
             cell.change_tick(),
         );
-        let raw_iter = (&mut host_iter as *mut HostChunkIter<'_>).cast::<RawChunkIter>();
+        let raw_iter = host_iter.as_ffi_ptr();
 
-        let count = unsafe { host_iter_next_chunk(raw_iter) };
+        let mut count = 0usize;
+        assert!(unsafe { host_iter_next_chunk(raw_iter, &mut count) }.get());
         assert_eq!(count, 1);
 
-        // Indices 0..31 are within MAX_QUERY_COMPONENTS and must succeed
         assert!(!unsafe { host_iter_column_mutable(raw_iter, 0) }.is_null());
-        assert!(!unsafe { host_iter_column_mutable(raw_iter, 31) }.is_null());
-
-        // Index 32 and 33 exceed MAX_QUERY_COMPONENTS: MUST return null_mut() without panic or OOB read
-        assert!(
-            unsafe { host_iter_column_mutable(raw_iter, 32) }.is_null(),
-            "Index 32 (>= MAX_QUERY_COMPONENTS) must return null_mut"
-        );
-        assert!(
-            unsafe { host_iter_column_mutable(raw_iter, 33) }.is_null(),
-            "Index 33 (>= MAX_QUERY_COMPONENTS) must return null_mut"
-        );
-
-        // Read-only accessors at and beyond boundary
         assert!(!unsafe { host_iter_column_readonly(raw_iter, 31) }.is_null());
+
+        assert!(unsafe { host_iter_column_mutable(raw_iter, 32) }.is_null());
+        assert!(unsafe { host_iter_column_mutable(raw_iter, 33) }.is_null());
         assert!(unsafe { host_iter_column_readonly(raw_iter, 32) }.is_null());
         assert!(unsafe { host_iter_column_readonly(raw_iter, 33) }.is_null());
 
-        // iter_mark_changed beyond boundary
         assert_eq!(
-            unsafe { host_iter_mark_changed(raw_iter, 32, 0) },
-            FfiResult::INVALID_COMPONENT
+            unsafe { host_iter_mark_changed_range(raw_iter, 32, 0, 1) },
+            FfiResult::OUT_OF_RANGE
         );
         assert_eq!(
-            unsafe { host_iter_mark_changed(raw_iter, 33, 0) },
-            FfiResult::INVALID_COMPONENT
+            unsafe { host_iter_mark_changed_range(raw_iter, 33, 0, 1) },
+            FfiResult::OUT_OF_RANGE
+        );
+
+        let mut info = core::mem::MaybeUninit::<BamColumnInfo>::uninit();
+        assert_eq!(
+            unsafe { host_iter_column_info(raw_iter, 31, info.as_mut_ptr()) },
+            FfiResult::OK
+        );
+        assert_eq!(
+            unsafe { host_iter_column_info(raw_iter, 32, info.as_mut_ptr()) },
+            FfiResult::OUT_OF_RANGE
         );
     }
 
-    // ============================================================================
-    // 8. Dynamic Archetype Growth Across Consecutive Schedule Ticks
-    // ============================================================================
-
-    static SPAWN_NEW_ARCHETYPES_ONCE: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
-    static TICK2_ENTITY_COUNT: AtomicUsize = AtomicUsize::new(0);
+    struct ArchetypeGrowthCtx {
+        spawned_once: AtomicBool,
+        entity_count: AtomicUsize,
+        pos_h: BamComponent,
+        tag10_h: BamComponent,
+    }
 
     unsafe extern "C" fn dynamic_archetype_growth_system(
-        iter: *mut RawChunkIter,
-        commands: *mut RawCommandQueue,
-        _user_data: *mut c_void,
+        sys_ctx: *mut BamSystemCtx,
+        user_data: *mut c_void,
     ) -> FfiResult {
-        let mut total_entities = 0;
-        loop {
-            let count = unsafe { host_iter_next_chunk(iter) };
-            if count == 0 {
-                break;
-            }
+        let ctx = unsafe { &*(user_data as *const ArchetypeGrowthCtx) };
+        let mut iter: *mut BamIter = core::ptr::null_mut();
+        let rc = unsafe { host_sys_query(sys_ctx, 0, &mut iter) };
+        if rc.is_err() {
+            return rc;
+        }
+
+        let mut total_entities = 0usize;
+        let mut count = 0usize;
+        while unsafe { host_iter_next_chunk(iter, &mut count) }.get() {
             total_entities += count;
         }
-        TICK2_ENTITY_COUNT.store(total_entities, Ordering::SeqCst);
+        ctx.entity_count.store(total_entities, Ordering::SeqCst);
 
-        // On first tick, dynamically queue spawning 10 entities in a new archetype (Tag10)
-        if !SPAWN_NEW_ARCHETYPES_ONCE.swap(true, Ordering::SeqCst) {
-            let tag_name = CString::new("Tag10").unwrap();
-            let pos_name = CString::new("Position").unwrap();
+        if !ctx.spawned_once.swap(true, Ordering::SeqCst) {
+            let mut commands: *mut BamCommands = core::ptr::null_mut();
+            let rc_cmd = unsafe { host_sys_commands(sys_ctx, &mut commands) };
+            if rc_cmd.is_err() {
+                return rc_cmd;
+            }
             let pos_dummy = Position {
                 x: 77.0,
                 y: 88.0,
@@ -994,21 +964,22 @@ mod archetype_and_permission_boundaries {
             let tag_dummy = Tag10 { id: 777 };
 
             for _ in 0..10 {
-                let entity = unsafe { host_cmd_spawn_empty(commands) };
+                let mut entity = FfiEntity::NULL;
+                let _ = unsafe { host_cmd_spawn_empty(commands, &mut entity) };
                 let _ = unsafe {
-                    host_cmd_insert_component(
+                    host_cmd_insert(
                         commands,
                         entity,
-                        pos_name.as_ptr(),
+                        ctx.pos_h,
                         &pos_dummy as *const Position as *const u8,
                         core::mem::size_of::<Position>(),
                     )
                 };
                 let _ = unsafe {
-                    host_cmd_insert_component(
+                    host_cmd_insert(
                         commands,
                         entity,
-                        tag_name.as_ptr(),
+                        ctx.tag10_h,
                         &tag_dummy as *const Tag10 as *const u8,
                         core::mem::size_of::<Tag10>(),
                     )
@@ -1021,16 +992,17 @@ mod archetype_and_permission_boundaries {
 
     #[test]
     fn test_dynamic_archetype_growth_between_ticks() {
-        SPAWN_NEW_ARCHETYPES_ONCE.store(false, Ordering::SeqCst);
-        TICK2_ENTITY_COUNT.store(0, Ordering::SeqCst);
-
         let mut app = App::new();
         app.add_plugins(AbiModPlugin);
-        app.register_mod_component::<Position>();
-        app.register_mod_component::<Tag01>();
-        app.register_mod_component::<Tag10>();
+        let pos_h = app
+            .register_mod_component::<Position>(ComponentOptions::new())
+            .unwrap();
+        app.register_mod_component::<Tag01>(ComponentOptions::new())
+            .unwrap();
+        let tag10_h = app
+            .register_mod_component::<Tag10>(ComponentOptions::new())
+            .unwrap();
 
-        // Initial world: 5 entities in (Position, Tag01)
         for i in 0..5 {
             app.world_mut().spawn((
                 Position {
@@ -1042,58 +1014,41 @@ mod archetype_and_permission_boundaries {
             ));
         }
 
+        let ctx = Box::new(ArchetypeGrowthCtx {
+            spawned_once: AtomicBool::new(false),
+            entity_count: AtomicUsize::new(0),
+            pos_h,
+            tag10_h,
+        });
+
         let registry = app.world().resource::<ModRegistry>().clone();
-        let query_descs = vec![bevy_abi_mod_host_sys::ComponentAccessDescOwned {
-            name: "Position".to_string(),
-            mode: ComponentAccessMode::READ,
-        }];
-
-        let dynamic_sys = DynamicCSystem::new(
-            "growth_system".to_string(),
-            query_descs,
+        let sys = GuestSystem::new(
+            "growth_system",
+            vec![BamQuerySpecOwned::new(vec![BamTermDesc::new(
+                pos_h,
+                AccessMode::READ,
+            )])],
             dynamic_archetype_growth_system,
-            core::ptr::null_mut(),
-            Arc::new(registry),
+            (&*ctx as *const ArchetypeGrowthCtx)
+                .cast_mut()
+                .cast::<c_void>(),
+            registry,
         );
+        app.add_systems(Update, sys);
 
-        app.add_systems(Update, dynamic_sys);
-
-        // Tick 1: processes the 5 initial entities, queues 10 entities in new archetype (Position, Tag10)
         app.update();
-        assert_eq!(TICK2_ENTITY_COUNT.load(Ordering::SeqCst), 5);
+        assert_eq!(ctx.entity_count.load(Ordering::SeqCst), 5);
 
-        // Tick 2: system must detect archetype_generation change, update matched_tables, and process 15 entities!
         app.update();
-        assert_eq!(
-            TICK2_ENTITY_COUNT.load(Ordering::SeqCst),
-            15,
-            "System must dynamically update matched_tables when new archetypes are spawned"
-        );
+        assert_eq!(ctx.entity_count.load(Ordering::SeqCst), 15);
     }
 
-    // ============================================================================
-    // 9. Unregistered Component Graceful Degradation in DynamicCSystem
-    // ============================================================================
-
     unsafe extern "C" fn query_with_unregistered_callback(
-        iter: *mut RawChunkIter,
-        _commands: *mut RawCommandQueue,
-        _user_data: *mut c_void,
+        _sys_ctx: *mut BamSystemCtx,
+        user_data: *mut c_void,
     ) -> FfiResult {
-        loop {
-            let count = unsafe { host_iter_next_chunk(iter) };
-            if count == 0 {
-                break;
-            }
-            // Column 0 was valid (Position), Column 1 was unregistered
-            let col0 = unsafe { host_iter_column_readonly(iter, 0) };
-            assert!(!col0.is_null());
-            let col1 = unsafe { host_iter_column_readonly(iter, 1) };
-            assert!(
-                col1.is_null(),
-                "Unregistered component column must return null"
-            );
-        }
+        let invoked = unsafe { &*(user_data as *const AtomicBool) };
+        invoked.store(true, Ordering::SeqCst);
         FfiResult::OK
     }
 
@@ -1101,7 +1056,9 @@ mod archetype_and_permission_boundaries {
     fn test_unregistered_component_in_dynamic_system() {
         let mut app = App::new();
         app.add_plugins(AbiModPlugin);
-        app.register_mod_component::<Position>();
+        let pos_h = app
+            .register_mod_component::<Position>(ComponentOptions::new())
+            .unwrap();
 
         app.world_mut().spawn(Position {
             x: 1.0,
@@ -1109,44 +1066,41 @@ mod archetype_and_permission_boundaries {
             z: 3.0,
         });
 
+        let invoked = Box::new(AtomicBool::new(false));
         let registry = app.world().resource::<ModRegistry>().clone();
-        let query_descs = vec![
-            bevy_abi_mod_host_sys::ComponentAccessDescOwned {
-                name: "Position".to_string(),
-                mode: ComponentAccessMode::READ,
-            },
-            bevy_abi_mod_host_sys::ComponentAccessDescOwned {
-                name: "UnregisteredGhostComponent".to_string(),
-                mode: ComponentAccessMode::READ,
-            },
-        ];
-
-        let dynamic_sys = DynamicCSystem::new(
-            "ghost_query_system".to_string(),
-            query_descs,
+        let mut ghost_sys = GuestSystem::new(
+            "ghost_query_system",
+            vec![BamQuerySpecOwned::new(vec![
+                BamTermDesc::new(pos_h, AccessMode::READ),
+                BamTermDesc::new(BamComponent::from_raw(999), AccessMode::READ),
+            ])],
             query_with_unregistered_callback,
-            core::ptr::null_mut(),
-            Arc::new(registry),
+            (&*invoked as *const AtomicBool).cast_mut().cast::<c_void>(),
+            registry,
         );
 
-        app.add_systems(Update, dynamic_sys);
+        ghost_sys.initialize(app.world_mut());
+        assert!(ghost_sys.init_error().is_some());
+        assert!(!ghost_sys.is_enabled());
 
-        // Must execute cleanly without crashing or panicking
+        app.add_systems(Update, ghost_sys);
         app.update();
+        assert!(!invoked.load(Ordering::SeqCst));
     }
 }
 
 mod chunk_and_command_bursts {
-    #![allow(unused_imports, dead_code)]
-    use bevy_abi_mod_host::{AbiModPlugin, ModAppExt, ModRegistry};
+    use bevy_abi_mod_host::{AbiModPlugin, ComponentOptions, ModAppExt, ModRegistry};
     use bevy_abi_mod_host_sys::{
-        CommandQueueBridge, DynamicCSystem, host_cmd_despawn, host_cmd_insert_component,
-        host_cmd_spawn_empty, host_iter_column_mutable, host_iter_column_readonly,
-        host_iter_column_stride, host_iter_entities, host_iter_mark_changed, host_iter_next_chunk,
+        BamQuerySpecOwned, GuestSystem, HostCommands, HostCommandsStorage, host_cmd_despawn,
+        host_cmd_insert, host_cmd_spawn_empty, host_iter_column_info, host_iter_column_mutable,
+        host_iter_column_mutable_untracked, host_iter_column_readonly, host_iter_entities,
+        host_iter_mark_changed_range, host_iter_next_chunk, host_sys_commands, host_sys_query,
     };
-    use bevy_abi_mod_macros::ModExposable;
+    use bevy_abi_mod_macros::ModComponent;
     use bevy_abi_mod_sys::{
-        ComponentAccessMode, FfiEntity, FfiResult, RawChunkIter, RawCommandQueue,
+        AccessMode, BamColumnInfo, BamCommands, BamComponent, BamIter, BamSystemCtx, BamTermDesc,
+        FfiEntity, FfiResult,
     };
     use bevy_app::{App, Update};
     use bevy_ecs::component::Component;
@@ -1156,34 +1110,39 @@ mod chunk_and_command_bursts {
     use bevy_ecs::schedule::IntoScheduleConfigs;
     use bevy_ecs::system::Query;
     use core::ffi::c_void;
-    use std::ffi::CString;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    // Test components
-    #[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+    #[repr(C)]
+    #[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+    #[mod_component(name = "ffi::chunk_bursts::Position")]
     pub struct Position {
         pub x: f32,
         pub y: f32,
         pub z: f32,
     }
 
-    #[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+    #[repr(C)]
+    #[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+    #[mod_component(name = "ffi::chunk_bursts::Velocity")]
     pub struct Velocity {
         pub x: f32,
         pub y: f32,
         pub z: f32,
     }
 
-    #[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+    #[repr(C)]
+    #[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+    #[mod_component(name = "ffi::chunk_bursts::Armor")]
     pub struct Armor {
         pub defense: i32,
     }
 
     macro_rules! define_stress_tags {
-        ($($tag:ident),*) => {
+        ($($tag:ident => $cname:literal),* $(,)?) => {
             $(
-                #[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+                #[repr(C)]
+                #[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+                #[mod_component(name = $cname)]
                 pub struct $tag {
                     pub id: u32,
                 }
@@ -1191,11 +1150,13 @@ mod chunk_and_command_bursts {
         };
     }
 
-    define_stress_tags!(TagA, TagB, TagC, TagD, TagE);
-
-    // ============================================================================
-    // SUITE 1: CHUNK ITERATION SCALING & BOUNDARIES (0, 1, 20,000 ENTITIES)
-    // ============================================================================
+    define_stress_tags!(
+        TagA => "ffi::chunk_bursts::TagA",
+        TagB => "ffi::chunk_bursts::TagB",
+        TagC => "ffi::chunk_bursts::TagC",
+        TagD => "ffi::chunk_bursts::TagD",
+        TagE => "ffi::chunk_bursts::TagE",
+    );
 
     struct EmptyTableStats {
         chunks_visited: usize,
@@ -1207,35 +1168,36 @@ mod chunk_and_command_bursts {
     }
 
     unsafe extern "C" fn empty_table_stress_system(
-        iter: *mut RawChunkIter,
-        _commands: *mut RawCommandQueue,
+        sys_ctx: *mut BamSystemCtx,
         user_data: *mut c_void,
     ) -> FfiResult {
         let stats = unsafe { &mut *(user_data as *mut EmptyTableStats) };
+        let mut iter: *mut BamIter = core::ptr::null_mut();
+        let rc = unsafe { host_sys_query(sys_ctx, 0, &mut iter) };
+        if rc.is_err() {
+            return rc;
+        }
 
-        loop {
-            let count = unsafe { host_iter_next_chunk(iter) };
-            if count == 0 {
-                break;
-            }
+        let mut count = 0usize;
+        while unsafe { host_iter_next_chunk(iter, &mut count) }.get() {
             stats.chunks_visited += 1;
             stats.entities_visited += count;
         }
 
-        // Defensive check after exhaustion: calling accessors must safely return null / err
         let ro = unsafe { host_iter_column_readonly(iter, 0) };
         let rw = unsafe { host_iter_column_mutable(iter, 0) };
         let ents = unsafe { host_iter_entities(iter) };
-        let mark_res = unsafe { host_iter_mark_changed(iter, 0, 0) };
+        let mark_res = unsafe { host_iter_mark_changed_range(iter, 0, 0, 1) };
 
         stats.readonly_null_after_exhaust = ro.is_null();
         stats.mutable_null_after_exhaust = rw.is_null();
         stats.entities_null_after_exhaust = ents.is_null();
         stats.mark_err_after_exhaust = mark_res == FfiResult::OUT_OF_RANGE;
 
-        // Repeated next_chunk calls after exhaustion must stay 0
         for _ in 0..5 {
-            assert_eq!(unsafe { host_iter_next_chunk(iter) }, 0);
+            let mut rem = 99usize;
+            assert!(!unsafe { host_iter_next_chunk(iter, &mut rem) }.get());
+            assert_eq!(rem, 0);
         }
 
         FfiResult::OK
@@ -1245,20 +1207,12 @@ mod chunk_and_command_bursts {
     fn test_chunk_iteration_empty_world_and_empty_tables() {
         let mut app = App::new();
         app.add_plugins(AbiModPlugin);
-        app.register_mod_component::<Position>();
-        app.register_mod_component::<Velocity>();
-
-        let registry = app.world().resource::<ModRegistry>().clone();
-        let query_descs = vec![
-            bevy_abi_mod_host_sys::ComponentAccessDescOwned {
-                name: "Position".to_string(),
-                mode: ComponentAccessMode::WRITE,
-            },
-            bevy_abi_mod_host_sys::ComponentAccessDescOwned {
-                name: "Velocity".to_string(),
-                mode: ComponentAccessMode::READ,
-            },
-        ];
+        let pos_h = app
+            .register_mod_component::<Position>(ComponentOptions::new())
+            .unwrap();
+        let vel_h = app
+            .register_mod_component::<Velocity>(ComponentOptions::new())
+            .unwrap();
 
         let mut stats = EmptyTableStats {
             chunks_visited: 0,
@@ -1269,24 +1223,22 @@ mod chunk_and_command_bursts {
             mark_err_after_exhaust: false,
         };
 
-        let dynamic_sys = DynamicCSystem::new(
-            "empty_stress".to_string(),
-            query_descs,
+        let registry = app.world().resource::<ModRegistry>().clone();
+        let sys = GuestSystem::new(
+            "empty_stress",
+            vec![BamQuerySpecOwned::new(vec![
+                BamTermDesc::new(pos_h, AccessMode::WRITE),
+                BamTermDesc::new(vel_h, AccessMode::READ),
+            ])],
             empty_table_stress_system,
-            &mut stats as *mut EmptyTableStats as *mut c_void,
-            Arc::new(registry),
+            (&mut stats as *mut EmptyTableStats).cast::<c_void>(),
+            registry,
         );
-
-        app.add_systems(Update, dynamic_sys);
-
-        // Frame 1: Completely empty world (0 entities)
+        app.add_systems(Update, sys);
         app.update();
 
-        assert_eq!(stats.chunks_visited, 0, "Empty world must yield 0 chunks");
-        assert_eq!(
-            stats.entities_visited, 0,
-            "Empty world must yield 0 entities"
-        );
+        assert_eq!(stats.chunks_visited, 0);
+        assert_eq!(stats.entities_visited, 0);
         assert!(stats.readonly_null_after_exhaust);
         assert!(stats.mutable_null_after_exhaust);
         assert!(stats.entities_null_after_exhaust);
@@ -1297,14 +1249,20 @@ mod chunk_and_command_bursts {
     fn test_chunk_iteration_alternating_empty_and_non_empty_tables() {
         let mut app = App::new();
         app.add_plugins(AbiModPlugin);
-        app.register_mod_component::<Position>();
-        app.register_mod_component::<TagA>();
-        app.register_mod_component::<TagB>();
-        app.register_mod_component::<TagC>();
-        app.register_mod_component::<TagD>();
-        app.register_mod_component::<TagE>();
+        let pos_h = app
+            .register_mod_component::<Position>(ComponentOptions::new())
+            .unwrap();
+        app.register_mod_component::<TagA>(ComponentOptions::new())
+            .unwrap();
+        app.register_mod_component::<TagB>(ComponentOptions::new())
+            .unwrap();
+        app.register_mod_component::<TagC>(ComponentOptions::new())
+            .unwrap();
+        app.register_mod_component::<TagD>(ComponentOptions::new())
+            .unwrap();
+        app.register_mod_component::<TagE>(ComponentOptions::new())
+            .unwrap();
 
-        // Table A: (Position, TagA) -> 10 entities, then despawn all
         let mut t_a_ents = Vec::new();
         for i in 0..10 {
             t_a_ents.push(
@@ -1320,7 +1278,6 @@ mod chunk_and_command_bursts {
                     .id(),
             );
         }
-        // Table B: (Position, TagB) -> 7 entities (KEEP ALIVE)
         for i in 0..7 {
             app.world_mut().spawn((
                 Position {
@@ -1331,7 +1288,6 @@ mod chunk_and_command_bursts {
                 TagB { id: 2 },
             ));
         }
-        // Table C: (Position, TagC) -> 15 entities, then despawn all
         let mut t_c_ents = Vec::new();
         for i in 0..15 {
             t_c_ents.push(
@@ -1347,7 +1303,6 @@ mod chunk_and_command_bursts {
                     .id(),
             );
         }
-        // Table D: (Position, TagD) -> 23 entities (KEEP ALIVE)
         for i in 0..23 {
             app.world_mut().spawn((
                 Position {
@@ -1358,7 +1313,6 @@ mod chunk_and_command_bursts {
                 TagD { id: 4 },
             ));
         }
-        // Table E: (Position, TagE) -> 30 entities, then despawn all
         let mut t_e_ents = Vec::new();
         for i in 0..30 {
             t_e_ents.push(
@@ -1375,14 +1329,7 @@ mod chunk_and_command_bursts {
             );
         }
 
-        // Despawn Tables A, C, and E so they become empty tables in Bevy storage
-        for e in t_a_ents {
-            app.world_mut().despawn(e);
-        }
-        for e in t_c_ents {
-            app.world_mut().despawn(e);
-        }
-        for e in t_e_ents {
+        for e in t_a_ents.into_iter().chain(t_c_ents).chain(t_e_ents) {
             app.world_mut().despawn(e);
         }
 
@@ -1392,16 +1339,17 @@ mod chunk_and_command_bursts {
         }
 
         unsafe extern "C" fn audit_system(
-            iter: *mut RawChunkIter,
-            _commands: *mut RawCommandQueue,
+            sys_ctx: *mut BamSystemCtx,
             user_data: *mut c_void,
         ) -> FfiResult {
             let audit = unsafe { &mut *(user_data as *mut ChunkAudit) };
-            loop {
-                let count = unsafe { host_iter_next_chunk(iter) };
-                if count == 0 {
-                    break;
-                }
+            let mut iter: *mut BamIter = core::ptr::null_mut();
+            let rc = unsafe { host_sys_query(sys_ctx, 0, &mut iter) };
+            if rc.is_err() {
+                return rc;
+            }
+            let mut count = 0usize;
+            while unsafe { host_iter_next_chunk(iter, &mut count) }.get() {
                 audit.chunk_sizes.push(count);
                 audit.total_entities += count;
 
@@ -1422,36 +1370,24 @@ mod chunk_and_command_bursts {
         };
 
         let registry = app.world().resource::<ModRegistry>().clone();
-        let query_descs = vec![bevy_abi_mod_host_sys::ComponentAccessDescOwned {
-            name: "Position".to_string(),
-            mode: ComponentAccessMode::WRITE,
-        }];
-
-        let dynamic_sys = DynamicCSystem::new(
-            "audit_sys".to_string(),
-            query_descs,
+        let sys = GuestSystem::new(
+            "audit_sys",
+            vec![BamQuerySpecOwned::new(vec![BamTermDesc::new(
+                pos_h,
+                AccessMode::WRITE,
+            )])],
             audit_system,
-            &mut audit as *mut ChunkAudit as *mut c_void,
-            Arc::new(registry),
+            (&mut audit as *mut ChunkAudit).cast::<c_void>(),
+            registry,
         );
-
-        app.add_systems(Update, dynamic_sys);
+        app.add_systems(Update, sys);
         app.update();
 
-        // Must have visited exactly 2 non-empty tables: sizes 7 and 23
-        assert_eq!(
-            audit.total_entities, 30,
-            "Must visit exactly 30 living entities"
-        );
-        assert_eq!(
-            audit.chunk_sizes.len(),
-            2,
-            "Must visit exactly 2 non-empty chunks"
-        );
+        assert_eq!(audit.total_entities, 30);
+        assert_eq!(audit.chunk_sizes.len(), 2);
         assert!(audit.chunk_sizes.contains(&7));
         assert!(audit.chunk_sizes.contains(&23));
 
-        // Verify all 30 entities received mutation y == 55.0
         let mut pos_q = app.world_mut().query::<&Position>();
         let mut verified = 0;
         for pos in pos_q.iter(app.world()) {
@@ -1465,8 +1401,12 @@ mod chunk_and_command_bursts {
     fn test_chunk_iteration_single_entity_tables() {
         let mut app = App::new();
         app.add_plugins(AbiModPlugin);
-        app.register_mod_component::<Position>();
-        app.register_mod_component::<Velocity>();
+        let pos_h = app
+            .register_mod_component::<Position>(ComponentOptions::new())
+            .unwrap();
+        let vel_h = app
+            .register_mod_component::<Velocity>(ComponentOptions::new())
+            .unwrap();
 
         let e = app
             .world_mut()
@@ -1484,7 +1424,6 @@ mod chunk_and_command_bursts {
             ))
             .id();
 
-        #[repr(C)]
         struct SingleStats {
             stride_pos: usize,
             stride_vel: usize,
@@ -1494,18 +1433,38 @@ mod chunk_and_command_bursts {
             mark_row1_err: bool,
         }
 
+        struct SingleContext {
+            target_entity: Entity,
+            stats: SingleStats,
+        }
+
         unsafe extern "C" fn single_entity_system(
-            iter: *mut RawChunkIter,
-            _commands: *mut RawCommandQueue,
+            sys_ctx: *mut BamSystemCtx,
             user_data: *mut c_void,
         ) -> FfiResult {
             let ctx = unsafe { &mut *(user_data as *mut SingleContext) };
-            let stats = &mut ctx.stats;
-            stats.stride_pos = unsafe { host_iter_column_stride(iter, 0) };
-            stats.stride_vel = unsafe { host_iter_column_stride(iter, 1) };
+            let mut iter: *mut BamIter = core::ptr::null_mut();
+            let rc = unsafe { host_sys_query(sys_ctx, 0, &mut iter) };
+            if rc.is_err() {
+                return rc;
+            }
 
-            let count = unsafe { host_iter_next_chunk(iter) };
-            stats.count = count;
+            let mut info_pos = core::mem::MaybeUninit::<BamColumnInfo>::uninit();
+            let mut info_vel = core::mem::MaybeUninit::<BamColumnInfo>::uninit();
+            assert_eq!(
+                unsafe { host_iter_column_info(iter, 0, info_pos.as_mut_ptr()) },
+                FfiResult::OK
+            );
+            assert_eq!(
+                unsafe { host_iter_column_info(iter, 1, info_vel.as_mut_ptr()) },
+                FfiResult::OK
+            );
+            ctx.stats.stride_pos = unsafe { info_pos.assume_init() }.size;
+            ctx.stats.stride_vel = unsafe { info_vel.assume_init() }.size;
+
+            let mut count = 0usize;
+            assert!(unsafe { host_iter_next_chunk(iter, &mut count) }.get());
+            ctx.stats.count = count;
             assert_eq!(count, 1);
 
             let ents = unsafe { host_iter_entities(iter) };
@@ -1523,26 +1482,18 @@ mod chunk_and_command_bursts {
                 pos.x += vel.x;
                 pos.y += vel.y;
                 pos.z += vel.z;
-
-                stats.entity_matches = ent_bits == ctx.target_entity.to_bits();
+                ctx.stats.entity_matches = ent_bits == ctx.target_entity.to_bits();
             }
 
-            // Row 0 mark changed must succeed
-            let r0 = unsafe { host_iter_mark_changed(iter, 0, 0) };
-            stats.mark_row0_ok = r0 == FfiResult::OK;
+            ctx.stats.mark_row0_ok =
+                unsafe { host_iter_mark_changed_range(iter, 0, 0, 1) } == FfiResult::OK;
+            ctx.stats.mark_row1_err =
+                unsafe { host_iter_mark_changed_range(iter, 0, 1, 1) } == FfiResult::OUT_OF_RANGE;
 
-            // Row 1 mark changed must fail (chunk size is 1)
-            let r1 = unsafe { host_iter_mark_changed(iter, 0, 1) };
-            stats.mark_row1_err = r1 == FfiResult::OUT_OF_RANGE;
-
-            assert_eq!(unsafe { host_iter_next_chunk(iter) }, 0);
+            let mut rem = 99usize;
+            assert!(!unsafe { host_iter_next_chunk(iter, &mut rem) }.get());
+            assert_eq!(rem, 0);
             FfiResult::OK
-        }
-
-        #[repr(C)]
-        struct SingleContext {
-            target_entity: Entity,
-            stats: SingleStats,
         }
 
         let mut ctx = SingleContext {
@@ -1558,24 +1509,17 @@ mod chunk_and_command_bursts {
         };
 
         let registry = app.world().resource::<ModRegistry>().clone();
-        let dynamic_sys = DynamicCSystem::new(
-            "single_sys".to_string(),
-            vec![
-                bevy_abi_mod_host_sys::ComponentAccessDescOwned {
-                    name: "Position".to_string(),
-                    mode: ComponentAccessMode::WRITE,
-                },
-                bevy_abi_mod_host_sys::ComponentAccessDescOwned {
-                    name: "Velocity".to_string(),
-                    mode: ComponentAccessMode::READ,
-                },
-            ],
+        let sys = GuestSystem::new(
+            "single_sys",
+            vec![BamQuerySpecOwned::new(vec![
+                BamTermDesc::new(pos_h, AccessMode::WRITE),
+                BamTermDesc::new(vel_h, AccessMode::READ),
+            ])],
             single_entity_system,
-            &mut ctx as *mut SingleContext as *mut c_void,
-            Arc::new(registry),
+            (&mut ctx as *mut SingleContext).cast::<c_void>(),
+            registry,
         );
-
-        app.add_systems(Update, dynamic_sys);
+        app.add_systems(Update, sys);
         app.update();
 
         assert_eq!(ctx.stats.count, 1);
@@ -1585,7 +1529,6 @@ mod chunk_and_command_bursts {
         assert!(ctx.stats.mark_row0_ok);
         assert!(ctx.stats.mark_row1_err);
 
-        // Verify entity mutated
         let updated_pos = app.world().get::<Position>(e).unwrap();
         assert_eq!(updated_pos.x, 11.0);
         assert_eq!(updated_pos.y, 22.0);
@@ -1598,11 +1541,15 @@ mod chunk_and_command_bursts {
 
         let mut app = App::new();
         app.add_plugins(AbiModPlugin);
-        app.register_mod_component::<Position>();
-        app.register_mod_component::<Velocity>();
-        app.register_mod_component::<Armor>();
+        let pos_h = app
+            .register_mod_component::<Position>(ComponentOptions::new())
+            .unwrap();
+        let vel_h = app
+            .register_mod_component::<Velocity>(ComponentOptions::new())
+            .unwrap();
+        app.register_mod_component::<Armor>(ComponentOptions::new())
+            .unwrap();
 
-        // 1. Spawn 20,000 entities in monolithic archetype (Position, Velocity, Armor)
         for i in 0..MONOLITHIC_COUNT {
             app.world_mut().spawn((
                 Position {
@@ -1627,21 +1574,37 @@ mod chunk_and_command_bursts {
         }
 
         unsafe extern "C" fn scale_20k_system(
-            iter: *mut RawChunkIter,
-            _commands: *mut RawCommandQueue,
+            sys_ctx: *mut BamSystemCtx,
             user_data: *mut c_void,
         ) -> FfiResult {
             let stats = unsafe { &mut *(user_data as *mut Scale20kStats) };
-            let stride_pos = unsafe { host_iter_column_stride(iter, 0) };
-            let stride_vel = unsafe { host_iter_column_stride(iter, 1) };
-            assert_eq!(stride_pos, core::mem::size_of::<Position>());
-            assert_eq!(stride_vel, core::mem::size_of::<Velocity>());
+            let mut iter: *mut BamIter = core::ptr::null_mut();
+            let rc = unsafe { host_sys_query(sys_ctx, 0, &mut iter) };
+            if rc.is_err() {
+                return rc;
+            }
 
-            loop {
-                let count = unsafe { host_iter_next_chunk(iter) };
-                if count == 0 {
-                    break;
-                }
+            let mut info_pos = core::mem::MaybeUninit::<BamColumnInfo>::uninit();
+            let mut info_vel = core::mem::MaybeUninit::<BamColumnInfo>::uninit();
+            assert_eq!(
+                unsafe { host_iter_column_info(iter, 0, info_pos.as_mut_ptr()) },
+                FfiResult::OK
+            );
+            assert_eq!(
+                unsafe { host_iter_column_info(iter, 1, info_vel.as_mut_ptr()) },
+                FfiResult::OK
+            );
+            assert_eq!(
+                unsafe { info_pos.assume_init() }.size,
+                core::mem::size_of::<Position>()
+            );
+            assert_eq!(
+                unsafe { info_vel.assume_init() }.size,
+                core::mem::size_of::<Velocity>()
+            );
+
+            let mut count = 0usize;
+            while unsafe { host_iter_next_chunk(iter, &mut count) }.get() {
                 stats.chunks += 1;
                 stats.total_entities += count;
 
@@ -1663,7 +1626,6 @@ mod chunk_and_command_bursts {
                     }
                 }
             }
-
             FfiResult::OK
         }
 
@@ -1673,37 +1635,26 @@ mod chunk_and_command_bursts {
         };
 
         let registry = app.world().resource::<ModRegistry>().clone();
-        let dynamic_sys = DynamicCSystem::new(
-            "scale_20k_sys".to_string(),
-            vec![
-                bevy_abi_mod_host_sys::ComponentAccessDescOwned {
-                    name: "Position".to_string(),
-                    mode: ComponentAccessMode::WRITE,
-                },
-                bevy_abi_mod_host_sys::ComponentAccessDescOwned {
-                    name: "Velocity".to_string(),
-                    mode: ComponentAccessMode::READ,
-                },
-            ],
+        let sys = GuestSystem::new(
+            "scale_20k_sys",
+            vec![BamQuerySpecOwned::new(vec![
+                BamTermDesc::new(pos_h, AccessMode::WRITE),
+                BamTermDesc::new(vel_h, AccessMode::READ),
+            ])],
             scale_20k_system,
-            &mut stats as *mut Scale20kStats as *mut c_void,
-            Arc::new(registry),
+            (&mut stats as *mut Scale20kStats).cast::<c_void>(),
+            registry,
         );
-
-        app.add_systems(Update, dynamic_sys);
+        app.add_systems(Update, sys);
         app.update();
 
-        assert_eq!(
-            stats.total_entities, MONOLITHIC_COUNT,
-            "Must process all 20,000 entities"
-        );
-        assert_eq!(stats.chunks, 1, "Monolithic table must be a single chunk");
+        assert_eq!(stats.total_entities, MONOLITHIC_COUNT);
+        assert_eq!(stats.chunks, 1);
 
-        // Oracle verification across all 20,000 entities
         let mut query = app.world_mut().query::<(&Position, &Armor)>();
         let mut verified = 0usize;
         for (pos, armor) in query.iter(app.world()) {
-            let i = pos.x - 1.0; // was i, incremented by v.x (1.0)
+            let i = pos.x - 1.0;
             assert_eq!(pos.y, 2.0);
             assert_eq!(pos.z, 3.0);
             assert_eq!(armor.defense, ((i as usize) % 100) as i32);
@@ -1711,10 +1662,6 @@ mod chunk_and_command_bursts {
         }
         assert_eq!(verified, MONOLITHIC_COUNT);
     }
-
-    // ============================================================================
-    // SUITE 2: CHANGE DETECTION BITMASK EMPIRICAL PRECISION & ISOLATION
-    // ============================================================================
 
     #[derive(Resource, Default)]
     struct ChangedPositionInspector {
@@ -1731,47 +1678,42 @@ mod chunk_and_command_bursts {
     }
 
     struct ChangePrecisionContext {
-        mode: usize, // 0 = clean read, 1 = mark every 10th row, 2 = column_mutable all
+        mode: usize,
         marked_entities: Vec<Entity>,
     }
 
     unsafe extern "C" fn change_precision_system(
-        iter: *mut RawChunkIter,
-        _commands: *mut RawCommandQueue,
+        sys_ctx: *mut BamSystemCtx,
         user_data: *mut c_void,
     ) -> FfiResult {
         let ctx = unsafe { &mut *(user_data as *mut ChangePrecisionContext) };
+        let mut iter: *mut BamIter = core::ptr::null_mut();
+        let rc = unsafe { host_sys_query(sys_ctx, 0, &mut iter) };
+        if rc.is_err() {
+            return rc;
+        }
 
-        loop {
-            let count = unsafe { host_iter_next_chunk(iter) };
-            if count == 0 {
-                break;
-            }
-
+        let mut count = 0usize;
+        while unsafe { host_iter_next_chunk(iter, &mut count) }.get() {
             let ents = unsafe { host_iter_entities(iter) };
             assert!(!ents.is_null());
 
             match ctx.mode {
                 0 => {
-                    // Clean mode: READ-ONLY pointer access. Even with WRITE permission on column 0,
-                    // calling host_iter_column_readonly must NOT mark any change ticks!
                     let _ptr = unsafe { host_iter_column_readonly(iter, 0) };
                 }
                 1 => {
-                    // Selective row marking: mark every 10th row (row % 10 == 0)
-                    let _ptr = unsafe { host_iter_column_readonly(iter, 0) };
+                    let _ptr = unsafe { host_iter_column_mutable_untracked(iter, 0) };
                     for row in 0..count {
                         if row % 10 == 0 {
-                            let res = unsafe { host_iter_mark_changed(iter, 0, row) };
+                            let res = unsafe { host_iter_mark_changed_range(iter, 0, row, 1) };
                             assert_eq!(res, FfiResult::OK);
                             let ent_bits = unsafe { (*ents.add(row)).to_bits() };
-                            let bevy_ent = Entity::from_bits(ent_bits);
-                            ctx.marked_entities.push(bevy_ent);
+                            ctx.marked_entities.push(Entity::from_bits(ent_bits));
                         }
                     }
                 }
                 2 => {
-                    // Chunk-wide mutation: host_iter_column_mutable marks all entities changed
                     let ptr = unsafe { host_iter_column_mutable(iter, 0) as *mut Position };
                     assert!(!ptr.is_null());
                     for row in 0..count {
@@ -1794,84 +1736,65 @@ mod chunk_and_command_bursts {
         let mut app = App::new();
         app.add_plugins(AbiModPlugin);
         app.init_resource::<ChangedPositionInspector>();
-        app.register_mod_component::<Position>();
+        let pos_h = app
+            .register_mod_component::<Position>(ComponentOptions::new())
+            .unwrap();
 
-        let mut all_spawned = Vec::with_capacity(TOTAL_ENTITIES);
         for i in 0..TOTAL_ENTITIES {
-            let e = app
-                .world_mut()
-                .spawn(Position {
-                    x: i as f32,
-                    y: 0.0,
-                    z: 0.0,
-                })
-                .id();
-            all_spawned.push(e);
+            app.world_mut().spawn(Position {
+                x: i as f32,
+                y: 0.0,
+                z: 0.0,
+            });
         }
 
         let mut ctx = Box::new(ChangePrecisionContext {
             mode: 0,
             marked_entities: Vec::new(),
         });
-        let ctx_ptr = &mut *ctx as *mut ChangePrecisionContext as *mut c_void;
+        let ctx_ptr = (&mut *ctx as *mut ChangePrecisionContext).cast::<c_void>();
 
         let registry = app.world().resource::<ModRegistry>().clone();
-        let dynamic_sys = DynamicCSystem::new(
-            "change_precision_sys".to_string(),
-            vec![bevy_abi_mod_host_sys::ComponentAccessDescOwned {
-                name: "Position".to_string(),
-                mode: ComponentAccessMode::WRITE,
-            }],
+        let sys = GuestSystem::new(
+            "change_precision_sys",
+            vec![BamQuerySpecOwned::new(vec![BamTermDesc::new(
+                pos_h,
+                AccessMode::WRITE,
+            )])],
             change_precision_system,
             ctx_ptr,
-            Arc::new(registry),
+            registry,
         );
+        app.add_systems(Update, (sys, inspect_changed_positions).chain());
 
-        app.add_systems(Update, (dynamic_sys, inspect_changed_positions).chain());
-
-        // Frame 1: Flush initial spawns (all 1,000 are newly Added -> detected as Changed)
         app.update();
         assert_eq!(
             app.world()
                 .resource::<ChangedPositionInspector>()
                 .changed_count,
-            TOTAL_ENTITIES,
-            "Spawn tick must report all 1,000 entities as changed"
+            TOTAL_ENTITIES
         );
 
-        // Frame 2: Clean frame (mode = 0). System has WRITE access, but does NOT mutate.
-        // Downstream query MUST observe EXACTLY 0 changed entities!
         ctx.mode = 0;
         app.update();
         assert_eq!(
             app.world()
                 .resource::<ChangedPositionInspector>()
                 .changed_count,
-            0,
-            "Clean frame without mutation must observe exactly 0 Changed<Position> entities"
+            0
         );
 
-        // Frame 3: Selective row marking (mode = 1). Marks rows 0, 10, 20, ..., 990 = 100 entities.
         ctx.mode = 1;
         ctx.marked_entities.clear();
         app.update();
 
         let inspector = app.world().resource::<ChangedPositionInspector>();
-        assert_eq!(
-            inspector.changed_count, 100,
-            "Selective row marking must trigger Changed<Position> on exactly 100 entities"
-        );
+        assert_eq!(inspector.changed_count, 100);
         assert_eq!(ctx.marked_entities.len(), 100);
-
-        // Verify set equivalence: observed changed entities match marked entities exactly
         for expected_ent in &ctx.marked_entities {
-            assert!(
-                inspector.changed_entities.contains(expected_ent),
-                "Marked entity {expected_ent:?} must be present in Changed<Position> results"
-            );
+            assert!(inspector.changed_entities.contains(expected_ent));
         }
 
-        // Frame 4: Clean frame again (mode = 0). Change ticks must have reset.
         ctx.mode = 0;
         ctx.marked_entities.clear();
         app.update();
@@ -1879,30 +1802,25 @@ mod chunk_and_command_bursts {
             app.world()
                 .resource::<ChangedPositionInspector>()
                 .changed_count,
-            0,
-            "Subsequent clean frame must cleanly observe 0 Changed<Position> entities"
+            0
         );
 
-        // Frame 5: Chunk-wide mutation via host_iter_column_mutable (mode = 2).
         ctx.mode = 2;
         app.update();
         assert_eq!(
             app.world()
                 .resource::<ChangedPositionInspector>()
                 .changed_count,
-            TOTAL_ENTITIES,
-            "host_iter_column_mutable must trigger Changed<Position> on all 1,000 entities"
+            TOTAL_ENTITIES
         );
 
-        // Frame 6: Clean frame again.
         ctx.mode = 0;
         app.update();
         assert_eq!(
             app.world()
                 .resource::<ChangedPositionInspector>()
                 .changed_count,
-            0,
-            "Post-mutation clean frame must reset to 0 Changed<Position> entities"
+            0
         );
     }
 
@@ -1911,12 +1829,17 @@ mod chunk_and_command_bursts {
         let mut app = App::new();
         app.add_plugins(AbiModPlugin);
         app.init_resource::<ChangedPositionInspector>();
-        app.register_mod_component::<Position>();
-        app.register_mod_component::<Velocity>();
-        app.register_mod_component::<Armor>();
-        app.register_mod_component::<TagA>();
+        let pos_h = app
+            .register_mod_component::<Position>(ComponentOptions::new())
+            .unwrap();
+        let vel_h = app
+            .register_mod_component::<Velocity>(ComponentOptions::new())
+            .unwrap();
+        app.register_mod_component::<Armor>(ComponentOptions::new())
+            .unwrap();
+        app.register_mod_component::<TagA>(ComponentOptions::new())
+            .unwrap();
 
-        // Archetype 1: (Position, Velocity) -> 300 entities (Target of system)
         let mut arch1_ents = Vec::new();
         for i in 0..300 {
             arch1_ents.push(
@@ -1937,7 +1860,6 @@ mod chunk_and_command_bursts {
             );
         }
 
-        // Archetype 2: (Position, Armor) -> 300 entities (Must NOT be modified)
         let mut arch2_ents = Vec::new();
         for i in 0..300 {
             arch2_ents.push(
@@ -1954,7 +1876,6 @@ mod chunk_and_command_bursts {
             );
         }
 
-        // Archetype 3: (Position, TagA) -> 300 entities (Must NOT be modified)
         let mut arch3_ents = Vec::new();
         for i in 0..300 {
             arch3_ents.push(
@@ -1971,22 +1892,21 @@ mod chunk_and_command_bursts {
             );
         }
 
-        static MUTATE_ACTIVE: AtomicUsize = AtomicUsize::new(0);
-
         unsafe extern "C" fn kinematics_only_system(
-            iter: *mut RawChunkIter,
-            _commands: *mut RawCommandQueue,
-            _user_data: *mut c_void,
+            sys_ctx: *mut BamSystemCtx,
+            user_data: *mut c_void,
         ) -> FfiResult {
-            if MUTATE_ACTIVE.load(Ordering::SeqCst) == 0 {
+            let mutate_active = unsafe { &*(user_data as *const AtomicUsize) };
+            if mutate_active.load(Ordering::SeqCst) == 0 {
                 return FfiResult::OK;
             }
-
-            loop {
-                let count = unsafe { host_iter_next_chunk(iter) };
-                if count == 0 {
-                    break;
-                }
+            let mut iter: *mut BamIter = core::ptr::null_mut();
+            let rc = unsafe { host_sys_query(sys_ctx, 0, &mut iter) };
+            if rc.is_err() {
+                return rc;
+            }
+            let mut count = 0usize;
+            while unsafe { host_iter_next_chunk(iter, &mut count) }.get() {
                 let pos_ptr = unsafe { host_iter_column_mutable(iter, 0) as *mut Position };
                 if !pos_ptr.is_null() {
                     for i in 0..count {
@@ -1999,28 +1919,23 @@ mod chunk_and_command_bursts {
             FfiResult::OK
         }
 
+        let mutate_active = Box::new(AtomicUsize::new(0));
         let registry = app.world().resource::<ModRegistry>().clone();
-        let dynamic_sys = DynamicCSystem::new(
-            "kinematics_only".to_string(),
-            vec![
-                bevy_abi_mod_host_sys::ComponentAccessDescOwned {
-                    name: "Position".to_string(),
-                    mode: ComponentAccessMode::WRITE,
-                },
-                bevy_abi_mod_host_sys::ComponentAccessDescOwned {
-                    name: "Velocity".to_string(),
-                    mode: ComponentAccessMode::READ,
-                },
-            ],
+        let sys = GuestSystem::new(
+            "kinematics_only",
+            vec![BamQuerySpecOwned::new(vec![
+                BamTermDesc::new(pos_h, AccessMode::WRITE),
+                BamTermDesc::new(vel_h, AccessMode::READ),
+            ])],
             kinematics_only_system,
-            core::ptr::null_mut(),
-            Arc::new(registry),
+            (&*mutate_active as *const AtomicUsize)
+                .cast_mut()
+                .cast::<c_void>(),
+            registry,
         );
+        app.add_systems(Update, (sys, inspect_changed_positions).chain());
 
-        app.add_systems(Update, (dynamic_sys, inspect_changed_positions).chain());
-
-        // Frame 1: Flush initial spawns (all 900 entities changed)
-        MUTATE_ACTIVE.store(0, Ordering::SeqCst);
+        mutate_active.store(0, Ordering::SeqCst);
         app.update();
         assert_eq!(
             app.world()
@@ -2029,7 +1944,6 @@ mod chunk_and_command_bursts {
             900
         );
 
-        // Frame 2: Idle frame (0 changed)
         app.update();
         assert_eq!(
             app.world()
@@ -2038,27 +1952,17 @@ mod chunk_and_command_bursts {
             0
         );
 
-        // Frame 3: Activate mutation on (Position, Velocity)
-        MUTATE_ACTIVE.store(1, Ordering::SeqCst);
+        mutate_active.store(1, Ordering::SeqCst);
         app.update();
 
         let inspector = app.world().resource::<ChangedPositionInspector>();
-        assert_eq!(
-            inspector.changed_count, 300,
-            "Exactly 300 entities in Archetype 1 (Position, Velocity) should trigger Changed<Position>"
-        );
-
-        // Validate that every changed entity belongs to Archetype 1, and none to Arch 2 or Arch 3
+        assert_eq!(inspector.changed_count, 300);
         for changed_e in &inspector.changed_entities {
             assert!(arch1_ents.contains(changed_e));
             assert!(!arch2_ents.contains(changed_e));
             assert!(!arch3_ents.contains(changed_e));
         }
     }
-
-    // ============================================================================
-    // SUITE 3: COMMANDQUEUEBRIDGE BURST CONCURRENCY & INTERLEAVED OPS
-    // ============================================================================
 
     #[test]
     fn test_command_queue_bridge_burst_10k_interleaved_ops() {
@@ -2068,35 +1972,33 @@ mod chunk_and_command_bursts {
         let armor_id = world.register_component::<Armor>();
 
         let mut registry = ModRegistry::new();
-        registry.register_component::<Position>(pos_id);
-        registry.register_component::<Velocity>(vel_id);
-        registry.register_component::<Armor>(armor_id);
-
-        let mut cmd_queue = bevy_ecs::world::CommandQueue::default();
-        let pos_name = CString::new("Position").unwrap();
-        let vel_name = CString::new("Velocity").unwrap();
-        let armor_name = CString::new("Armor").unwrap();
+        let pos_h = registry
+            .register_component::<Position>(pos_id, ComponentOptions::new())
+            .unwrap();
+        let vel_h = registry
+            .register_component::<Velocity>(vel_id, ComponentOptions::new())
+            .unwrap();
+        let armor_h = registry
+            .register_component::<Armor>(armor_id, ComponentOptions::new())
+            .unwrap();
+        let snapshot = registry.snapshot_arc();
 
         const BURST_CYCLES: usize = 2_500;
-        // Each cycle performs 4 operations:
-        // 1. Spawn E_survive, insert Position, insert Velocity
-        // 2. Spawn E_die, insert Position, despawn E_die immediately
-        // Total ops = 2,500 * 5 = 12,500 queued operations!
-
         let mut surviving_entities = Vec::with_capacity(BURST_CYCLES);
         let mut dead_entities = Vec::with_capacity(BURST_CYCLES);
+        let mut storage = HostCommandsStorage::new();
 
         {
             let cell = world.as_unsafe_world_cell();
-            let allocator = cell.entity_allocator();
-            let mut bridge = CommandQueueBridge::new(&mut cmd_queue, allocator, &registry);
-            let raw_queue = (&mut bridge as *mut CommandQueueBridge<'_>).cast::<RawCommandQueue>();
+            let mut cmds = HostCommands::new(&mut storage, cell.entity_allocator(), &snapshot);
+            let raw_cmds = cmds.as_ffi_ptr();
 
             for i in 0..BURST_CYCLES {
-                // A. Spawn surviving entity
-                let e_surv = unsafe { host_cmd_spawn_empty(raw_queue) };
-                assert_ne!(e_surv.0, 0);
-
+                let mut e_surv = FfiEntity::NULL;
+                assert_eq!(
+                    unsafe { host_cmd_spawn_empty(raw_cmds, &mut e_surv) },
+                    FfiResult::OK
+                );
                 let pos = Position {
                     x: i as f32,
                     y: (i * 2) as f32,
@@ -2107,73 +2009,71 @@ mod chunk_and_command_bursts {
                     y: 20.0,
                     z: 30.0,
                 };
-
-                let res_p = unsafe {
-                    host_cmd_insert_component(
-                        raw_queue,
-                        e_surv,
-                        pos_name.as_ptr(),
-                        &pos as *const Position as *const u8,
-                        core::mem::size_of::<Position>(),
-                    )
-                };
-                assert_eq!(res_p, FfiResult::OK);
-
-                let res_v = unsafe {
-                    host_cmd_insert_component(
-                        raw_queue,
-                        e_surv,
-                        vel_name.as_ptr(),
-                        &vel as *const Velocity as *const u8,
-                        core::mem::size_of::<Velocity>(),
-                    )
-                };
-                assert_eq!(res_v, FfiResult::OK);
-
+                assert_eq!(
+                    unsafe {
+                        host_cmd_insert(
+                            raw_cmds,
+                            e_surv,
+                            pos_h,
+                            &pos as *const Position as *const u8,
+                            core::mem::size_of::<Position>(),
+                        )
+                    },
+                    FfiResult::OK
+                );
+                assert_eq!(
+                    unsafe {
+                        host_cmd_insert(
+                            raw_cmds,
+                            e_surv,
+                            vel_h,
+                            &vel as *const Velocity as *const u8,
+                            core::mem::size_of::<Velocity>(),
+                        )
+                    },
+                    FfiResult::OK
+                );
                 surviving_entities.push(e_surv);
 
-                // B. Spawn ephemeral entity, insert component, then despawn in same queue
-                let e_die = unsafe { host_cmd_spawn_empty(raw_queue) };
-                assert_ne!(e_die.0, 0);
-
+                let mut e_die = FfiEntity::NULL;
+                assert_eq!(
+                    unsafe { host_cmd_spawn_empty(raw_cmds, &mut e_die) },
+                    FfiResult::OK
+                );
                 let armor = Armor { defense: 999 };
-                let res_a = unsafe {
-                    host_cmd_insert_component(
-                        raw_queue,
-                        e_die,
-                        armor_name.as_ptr(),
-                        &armor as *const Armor as *const u8,
-                        core::mem::size_of::<Armor>(),
-                    )
-                };
-                assert_eq!(res_a, FfiResult::OK);
-
-                let res_d = unsafe { host_cmd_despawn(raw_queue, e_die) };
-                assert_eq!(res_d, FfiResult::OK);
-
+                assert_eq!(
+                    unsafe {
+                        host_cmd_insert(
+                            raw_cmds,
+                            e_die,
+                            armor_h,
+                            &armor as *const Armor as *const u8,
+                            core::mem::size_of::<Armor>(),
+                        )
+                    },
+                    FfiResult::OK
+                );
+                assert_eq!(unsafe { host_cmd_despawn(raw_cmds, e_die) }, FfiResult::OK);
                 dead_entities.push(e_die);
             }
         }
 
-        // Flush 12,500 operations to Bevy World
-        cmd_queue.apply(&mut world);
+        storage.apply_to_world(&mut world, &snapshot);
 
-        // Oracle Verification:
-        // 1. Surviving entities: exactly BURST_CYCLES live entities with Position and Velocity
-        let pos_count = world.query::<&Position>().iter(&world).count();
-        let vel_count = world.query::<&Velocity>().iter(&world).count();
-        assert_eq!(pos_count, BURST_CYCLES);
-        assert_eq!(vel_count, BURST_CYCLES);
+        assert_eq!(
+            world.query::<&Position>().iter(&world).count(),
+            BURST_CYCLES
+        );
+        assert_eq!(
+            world.query::<&Velocity>().iter(&world).count(),
+            BURST_CYCLES
+        );
+        assert_eq!(world.query::<&Armor>().iter(&world).count(), 0);
 
         for (i, &ffi_e) in surviving_entities.iter().enumerate() {
             let bevy_e = Entity::from_bits(ffi_e.to_bits());
-            let pos = world
-                .get::<Position>(bevy_e)
-                .expect("Surviving entity must have Position");
-            let vel = world
-                .get::<Velocity>(bevy_e)
-                .expect("Surviving entity must have Velocity");
-
+            let pos = world.get::<Position>(bevy_e).unwrap();
+            let vel = world.get::<Velocity>(bevy_e).unwrap();
             assert_eq!(pos.x, i as f32);
             assert_eq!(pos.y, (i * 2) as f32);
             assert_eq!(pos.z, (i * 3) as f32);
@@ -2182,19 +2082,9 @@ mod chunk_and_command_bursts {
             assert_eq!(vel.z, 30.0);
         }
 
-        // 2. Dead entities: zero must exist in the world, zero Armor components
-        let armor_count = world.query::<&Armor>().iter(&world).count();
-        assert_eq!(
-            armor_count, 0,
-            "All entities with Armor were despawned; count must be 0"
-        );
-
         for &ffi_e in &dead_entities {
             let bevy_e = Entity::from_bits(ffi_e.to_bits());
-            assert!(
-                world.get_entity(bevy_e).is_err(),
-                "Despawned ephemeral entity {bevy_e:?} must no longer exist in Bevy World"
-            );
+            assert!(world.get_entity(bevy_e).is_err());
         }
     }
 
@@ -2202,84 +2092,93 @@ mod chunk_and_command_bursts {
     fn test_command_queue_bridge_multi_system_schedule_concurrency() {
         let mut app = App::new();
         app.add_plugins(AbiModPlugin);
-        app.register_mod_component::<Position>();
-        app.register_mod_component::<Velocity>();
+        let pos_h = app
+            .register_mod_component::<Position>(ComponentOptions::new())
+            .unwrap();
+        let vel_h = app
+            .register_mod_component::<Velocity>(ComponentOptions::new())
+            .unwrap();
 
-        // System A: Spawns 500 entities with Position each tick
         unsafe extern "C" fn spawner_pos_system(
-            _iter: *mut RawChunkIter,
-            commands: *mut RawCommandQueue,
-            _user_data: *mut c_void,
+            sys_ctx: *mut BamSystemCtx,
+            user_data: *mut c_void,
         ) -> FfiResult {
-            let name = CString::new("Position").unwrap();
+            let pos_h = BamComponent(user_data as usize as u32);
+            let mut commands: *mut BamCommands = core::ptr::null_mut();
+            let rc = unsafe { host_sys_commands(sys_ctx, &mut commands) };
+            if rc.is_err() {
+                return rc;
+            }
             for i in 0..500 {
-                let ent = unsafe { host_cmd_spawn_empty(commands) };
+                let mut ent = FfiEntity::NULL;
+                let _ = unsafe { host_cmd_spawn_empty(commands, &mut ent) };
                 let pos = Position {
                     x: i as f32,
                     y: 1.0,
                     z: 2.0,
                 };
-                unsafe {
-                    host_cmd_insert_component(
+                let _ = unsafe {
+                    host_cmd_insert(
                         commands,
                         ent,
-                        name.as_ptr(),
+                        pos_h,
                         &pos as *const Position as *const u8,
                         core::mem::size_of::<Position>(),
-                    );
-                }
+                    )
+                };
             }
             FfiResult::OK
         }
 
-        // System B: Spawns 500 entities with Velocity each tick
         unsafe extern "C" fn spawner_vel_system(
-            _iter: *mut RawChunkIter,
-            commands: *mut RawCommandQueue,
-            _user_data: *mut c_void,
+            sys_ctx: *mut BamSystemCtx,
+            user_data: *mut c_void,
         ) -> FfiResult {
-            let name = CString::new("Velocity").unwrap();
-            for _i in 0..500 {
-                let ent = unsafe { host_cmd_spawn_empty(commands) };
+            let vel_h = BamComponent(user_data as usize as u32);
+            let mut commands: *mut BamCommands = core::ptr::null_mut();
+            let rc = unsafe { host_sys_commands(sys_ctx, &mut commands) };
+            if rc.is_err() {
+                return rc;
+            }
+            for _ in 0..500 {
+                let mut ent = FfiEntity::NULL;
+                let _ = unsafe { host_cmd_spawn_empty(commands, &mut ent) };
                 let vel = Velocity {
                     x: 5.0,
                     y: 5.0,
                     z: 5.0,
                 };
-                unsafe {
-                    host_cmd_insert_component(
+                let _ = unsafe {
+                    host_cmd_insert(
                         commands,
                         ent,
-                        name.as_ptr(),
+                        vel_h,
                         &vel as *const Velocity as *const u8,
                         core::mem::size_of::<Velocity>(),
-                    );
-                }
+                    )
+                };
             }
             FfiResult::OK
         }
 
         let registry = app.world().resource::<ModRegistry>().clone();
-        let reg_arc = Arc::new(registry);
-
-        let sys_a = DynamicCSystem::new(
-            "sys_a".to_string(),
+        let sys_a = GuestSystem::new(
+            "sys_a",
             Vec::new(),
             spawner_pos_system,
-            core::ptr::null_mut(),
-            Arc::clone(&reg_arc),
+            (pos_h.0 as usize) as *mut c_void,
+            registry.clone(),
         );
-        let sys_b = DynamicCSystem::new(
-            "sys_b".to_string(),
+        let sys_b = GuestSystem::new(
+            "sys_b",
             Vec::new(),
             spawner_vel_system,
-            core::ptr::null_mut(),
-            Arc::clone(&reg_arc),
+            (vel_h.0 as usize) as *mut c_void,
+            registry,
         );
 
         app.add_systems(Update, (sys_a, sys_b));
 
-        // Run 3 ticks: 3 * 500 = 1,500 Position entities, 3 * 500 = 1,500 Velocity entities
         for _ in 1..=3 {
             app.update();
         }
@@ -2305,338 +2204,290 @@ mod chunk_and_command_bursts {
         let pos_id = world.register_component::<Position>();
 
         let mut registry = ModRegistry::new();
-        registry.register_component::<Position>(pos_id);
+        let pos_h = registry
+            .register_component::<Position>(pos_id, ComponentOptions::new())
+            .unwrap();
+        let snapshot = registry.snapshot_arc();
 
-        let mut cmd_queue = bevy_ecs::world::CommandQueue::default();
+        let mut storage = HostCommandsStorage::new();
         let cell = world.as_unsafe_world_cell();
-        let allocator = cell.entity_allocator();
-        let mut bridge = CommandQueueBridge::new(&mut cmd_queue, allocator, &registry);
-        let raw_queue = (&mut bridge as *mut CommandQueueBridge<'_>).cast::<RawCommandQueue>();
+        let mut cmds = HostCommands::new(&mut storage, cell.entity_allocator(), &snapshot);
+        let raw_cmds = cmds.as_ffi_ptr();
 
-        let ent = unsafe { host_cmd_spawn_empty(raw_queue) };
-        let valid_name = CString::new("Position").unwrap();
-        let unreg_name = CString::new("NonExistentComponent").unwrap();
+        let mut ent = FfiEntity::NULL;
+        assert_eq!(
+            unsafe { host_cmd_spawn_empty(raw_cmds, &mut ent) },
+            FfiResult::OK
+        );
         let pos = Position {
             x: 1.0,
             y: 2.0,
             z: 3.0,
         };
 
-        // 1. Null queue
-        let r1 = unsafe {
-            host_cmd_insert_component(
-                core::ptr::null_mut(),
-                ent,
-                valid_name.as_ptr(),
-                &pos as *const Position as *const u8,
-                core::mem::size_of::<Position>(),
-            )
-        };
-        assert_eq!(r1, FfiResult::NULL_POINTER);
+        assert_eq!(
+            unsafe {
+                host_cmd_insert(
+                    core::ptr::null_mut(),
+                    ent,
+                    pos_h,
+                    &pos as *const Position as *const u8,
+                    core::mem::size_of::<Position>(),
+                )
+            },
+            FfiResult::NULL_POINTER
+        );
+        assert_eq!(
+            unsafe { host_cmd_spawn_empty(core::ptr::null_mut(), &mut ent) },
+            FfiResult::NULL_POINTER
+        );
+        assert_eq!(
+            unsafe { host_cmd_despawn(core::ptr::null_mut(), ent) },
+            FfiResult::NULL_POINTER
+        );
 
-        let r_spawn_null = unsafe { host_cmd_spawn_empty(core::ptr::null_mut()) };
-        assert_eq!(r_spawn_null.0, 0);
+        assert_eq!(
+            unsafe {
+                host_cmd_insert(
+                    raw_cmds,
+                    ent,
+                    BamComponent::INVALID,
+                    &pos as *const Position as *const u8,
+                    core::mem::size_of::<Position>(),
+                )
+            },
+            FfiResult::INVALID_COMPONENT
+        );
+        assert_eq!(
+            unsafe {
+                host_cmd_insert(
+                    raw_cmds,
+                    ent,
+                    pos_h,
+                    core::ptr::null(),
+                    core::mem::size_of::<Position>(),
+                )
+            },
+            FfiResult::NULL_POINTER
+        );
+        assert_eq!(
+            unsafe {
+                host_cmd_insert(
+                    raw_cmds,
+                    ent,
+                    BamComponent::from_raw(999),
+                    &pos as *const Position as *const u8,
+                    core::mem::size_of::<Position>(),
+                )
+            },
+            FfiResult::INVALID_COMPONENT
+        );
+        assert_eq!(
+            unsafe {
+                host_cmd_insert(
+                    raw_cmds,
+                    ent,
+                    pos_h,
+                    &pos as *const Position as *const u8,
+                    core::mem::size_of::<Position>() - 1,
+                )
+            },
+            FfiResult::INVALID_ARGUMENT
+        );
 
-        let r_despawn_null = unsafe { host_cmd_despawn(core::ptr::null_mut(), ent) };
-        assert_eq!(r_despawn_null, FfiResult::NULL_POINTER);
+        assert_eq!(
+            unsafe {
+                host_cmd_insert(
+                    raw_cmds,
+                    FfiEntity::NULL,
+                    pos_h,
+                    &pos as *const Position as *const u8,
+                    core::mem::size_of::<Position>(),
+                )
+            },
+            FfiResult::INVALID_ENTITY
+        );
+        assert_eq!(
+            unsafe { host_cmd_despawn(raw_cmds, FfiEntity::NULL) },
+            FfiResult::INVALID_ENTITY
+        );
 
-        // 2. Null component name
-        let r2 = unsafe {
-            host_cmd_insert_component(
-                raw_queue,
-                ent,
-                core::ptr::null(),
-                &pos as *const Position as *const u8,
-                core::mem::size_of::<Position>(),
-            )
-        };
-        assert_eq!(r2, FfiResult::NULL_POINTER);
+        let non_existent_ent =
+            FfiEntity::from_bits(Entity::from_raw_u32(999_999).unwrap().to_bits());
+        assert_eq!(
+            unsafe {
+                host_cmd_insert(
+                    raw_cmds,
+                    non_existent_ent,
+                    pos_h,
+                    &pos as *const Position as *const u8,
+                    core::mem::size_of::<Position>(),
+                )
+            },
+            FfiResult::OK
+        );
+        assert_eq!(
+            unsafe { host_cmd_despawn(raw_cmds, non_existent_ent) },
+            FfiResult::OK
+        );
 
-        // 3. Null data with len > 0
-        let r3 = unsafe {
-            host_cmd_insert_component(
-                raw_queue,
-                ent,
-                valid_name.as_ptr(),
-                core::ptr::null(),
-                core::mem::size_of::<Position>(),
-            )
-        };
-        assert_eq!(r3, FfiResult::NULL_POINTER);
-
-        // 4. Unregistered component name
-        let r4 = unsafe {
-            host_cmd_insert_component(
-                raw_queue,
-                ent,
-                unreg_name.as_ptr(),
-                &pos as *const Position as *const u8,
-                core::mem::size_of::<Position>(),
-            )
-        };
-        assert_eq!(r4, FfiResult::INVALID_COMPONENT);
-
-        // 5. Size mismatch
-        let r5 = unsafe {
-            host_cmd_insert_component(
-                raw_queue,
-                ent,
-                valid_name.as_ptr(),
-                &pos as *const Position as *const u8,
-                core::mem::size_of::<Position>() - 1,
-            )
-        };
-        assert_eq!(r5, FfiResult::INVALID_ARGUMENT);
-
-        // 6. Invalid entity bits (0 returns None from Entity::try_from_bits)
-        let invalid_ent = FfiEntity(0);
-        assert!(Entity::try_from_bits(invalid_ent.0).is_none());
-
-        let r6 = unsafe {
-            host_cmd_insert_component(
-                raw_queue,
-                invalid_ent,
-                valid_name.as_ptr(),
-                &pos as *const Position as *const u8,
-                core::mem::size_of::<Position>(),
-            )
-        };
-        assert_eq!(r6, FfiResult::INVALID_ENTITY);
-
-        let r7 = unsafe { host_cmd_despawn(raw_queue, invalid_ent) };
-        assert_eq!(r7, FfiResult::INVALID_ENTITY);
-
-        // 7. Non-existent entity that has valid bits: queues successfully, safely skips when applied
-        let non_existent_ent = FfiEntity(Entity::from_raw_u32(999_999).unwrap().to_bits());
-        let r8 = unsafe {
-            host_cmd_insert_component(
-                raw_queue,
-                non_existent_ent,
-                valid_name.as_ptr(),
-                &pos as *const Position as *const u8,
-                core::mem::size_of::<Position>(),
-            )
-        };
-        assert_eq!(r8, FfiResult::OK);
-
-        let r9 = unsafe { host_cmd_despawn(raw_queue, non_existent_ent) };
-        assert_eq!(r9, FfiResult::OK);
-
-        // Flush to world: must NOT panic, and non_existent_ent must not exist
-        cmd_queue.apply(&mut world);
-        let bevy_non_existent = Entity::from_bits(non_existent_ent.0);
-        assert!(world.get_entity(bevy_non_existent).is_err());
+        drop(cmds);
+        storage.apply_to_world(&mut world, &snapshot);
+        assert!(
+            world
+                .get_entity(Entity::from_bits(non_existent_ent.to_bits()))
+                .is_err()
+        );
     }
 }
 
 mod high_volume_chunks_and_commands {
-    #![allow(unused_imports, dead_code)]
-    //! Empirical Adversarial Verification & Stress Test Suite for Milestone 5
-    //!
-    //! Rigorous stress testing of:
-    //! 1. Chunk iteration boundary conditions (0 entities, 1 entity, multi-chunk archetypes >16,384 entities).
-    //! 2. Component access permission enforcement (READ vs WRITE vs FILTER_ONLY vs WITHOUT, invalid column indices).
-    //! 3. Change detection granularity (blanket chunk mutation vs selective row-level `host_iter_mark_changed`).
-    //! 4. High-volume deferred commands execution (2,000 rapid spawns, inserts, and 1,000 despawns).
-    //! 5. Command bridge error resilience (null pointers, bad entity bits, mismatched sizes, unregistered components, invalid UTF-8).
-    //! 6. Multi-query safety & nested iteration (self-conflict detection, compatible multi-queries, nested loops with `host_iter_reset`).
-    //! 7. Cross-language binary struct memory layout matching (C99 vs Rust repr(C) byte-for-byte).
-    //! 8. Cross-language concurrent runtime stress (Example 3 C99 + Rust mods running simultaneously under heavy entity loads and dynamic reload cycles).
-
     use crate::support::*;
-    use bevy_abi_mod_host::{AbiModPlugin, ModAppExt, ModRegistry};
+    use bevy_abi_mod_host::{AbiModPlugin, ComponentOptions, ModAppExt, ModRegistry};
     use bevy_abi_mod_host_sys::{
-        CommandQueueBridge, ComponentAccessDescOwned, DynamicCSystem, host_cmd_despawn,
-        host_cmd_insert_component, host_cmd_spawn_empty, host_iter_column_mutable,
-        host_iter_column_readonly, host_iter_entities, host_iter_mark_changed,
-        host_iter_next_chunk, host_iter_reset,
+        BamQuerySpecOwned, GuestSystem, HostCommands, HostCommandsStorage, host_cmd_despawn,
+        host_cmd_insert, host_cmd_spawn_empty, host_iter_column_mutable,
+        host_iter_column_mutable_untracked, host_iter_column_readonly, host_iter_entities,
+        host_iter_mark_changed_range, host_iter_next_chunk, host_iter_reset, host_sys_commands,
+        host_sys_query,
     };
-    use bevy_abi_mod_macros::ModExposable;
     use bevy_abi_mod_sys::{
-        ComponentAccessMode, FfiEntity, FfiResult, RawChunkIter, RawCommandQueue,
+        AccessMode, BamCommands, BamComponent, BamIter, BamSystemCtx, BamTermDesc, FfiEntity,
+        FfiResult,
     };
     use bevy_app::{App, Update};
-    use bevy_ecs::component::Component;
     use bevy_ecs::entity::Entity;
+    use bevy_ecs::prelude::{ResMut, Resource};
     use bevy_ecs::query::Changed;
     use bevy_ecs::schedule::IntoScheduleConfigs;
-    use bevy_ecs::system::{Query, System};
-    use std::ffi::{CString, c_char, c_void};
-    use std::path::PathBuf;
-    use std::process::Command;
-    use std::sync::Arc;
+    use bevy_ecs::system::Query;
+    use core::ffi::c_void;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-    // ==============================================================================
-    // Component Definitions for Challenger Tests
-    // ==============================================================================
-
-    #[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
-    #[repr(C)]
-    pub struct DroneTag {
-        pub squad: u32,
-    }
-
-    #[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
-    #[repr(C)]
-    pub struct PlayerTag {
-        pub id: u32,
-    }
-
-    #[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
-    #[repr(C)]
-    pub struct ColorRgba {
-        pub r: f32,
-        pub g: f32,
-        pub b: f32,
-        pub a: f32,
-    }
-
-    // ==============================================================================
-    // TEST 1: Chunk Iteration Boundaries (0 Entities & 1 Entity)
-    // ==============================================================================
-
-    static ZERO_ENTITY_VISITS: AtomicUsize = AtomicUsize::new(0);
-
     unsafe extern "C" fn zero_entity_callback(
-        iter: *mut RawChunkIter,
-        _commands: *mut RawCommandQueue,
-        _user_data: *mut c_void,
+        sys_ctx: *mut BamSystemCtx,
+        user_data: *mut c_void,
     ) -> FfiResult {
-        ZERO_ENTITY_VISITS.fetch_add(1, Ordering::SeqCst);
+        let visits = unsafe { &*(user_data as *const AtomicUsize) };
+        visits.fetch_add(1, Ordering::SeqCst);
 
-        // With 0 entities, next_chunk must immediately return 0
-        let count = unsafe { host_iter_next_chunk(iter) };
-        assert_eq!(count, 0, "Empty world chunk iteration must return 0");
+        let mut iter: *mut BamIter = core::ptr::null_mut();
+        let rc = unsafe { host_sys_query(sys_ctx, 0, &mut iter) };
+        if rc.is_err() {
+            return rc;
+        }
 
-        // All column pointers and entity pointers must be null
-        let readonly_ptr = unsafe { host_iter_column_readonly(iter, 0) };
-        assert!(
-            readonly_ptr.is_null(),
-            "Readonly column pointer must be null when chunk has 0 entities"
-        );
-
-        let mutable_ptr = unsafe { host_iter_column_mutable(iter, 1) };
-        assert!(
-            mutable_ptr.is_null(),
-            "Mutable column pointer must be null when chunk has 0 entities"
-        );
-
-        let entities_ptr = unsafe { host_iter_entities(iter) };
-        assert!(
-            entities_ptr.is_null(),
-            "Entities pointer must be null when chunk has 0 entities"
-        );
-
-        // Iter reset must succeed cleanly
-        let reset_res = unsafe { host_iter_reset(iter) };
-        assert_eq!(reset_res, FfiResult::OK);
-
-        // Iterating again after reset must still return 0
-        let count_again = unsafe { host_iter_next_chunk(iter) };
-        assert_eq!(count_again, 0);
-
+        let mut count = 99usize;
+        assert!(!unsafe { host_iter_next_chunk(iter, &mut count) }.get());
+        assert_eq!(count, 0);
+        assert!(unsafe { host_iter_entities(iter) }.is_null());
+        assert!(unsafe { host_iter_column_readonly(iter, 0) }.is_null());
+        assert!(unsafe { host_iter_column_mutable(iter, 1) }.is_null());
         FfiResult::OK
     }
 
-    static SINGLE_ENTITY_VISITS: AtomicUsize = AtomicUsize::new(0);
-    static SINGLE_ENTITY_ID_BITS: AtomicU32 = AtomicU32::new(0);
+    struct SingleVisitState {
+        visits: AtomicUsize,
+        low_bits: AtomicU32,
+    }
 
     unsafe extern "C" fn single_entity_callback(
-        iter: *mut RawChunkIter,
-        _commands: *mut RawCommandQueue,
-        _user_data: *mut c_void,
+        sys_ctx: *mut BamSystemCtx,
+        user_data: *mut c_void,
     ) -> FfiResult {
-        SINGLE_ENTITY_VISITS.fetch_add(1, Ordering::SeqCst);
+        let state = unsafe { &*(user_data as *const SingleVisitState) };
+        state.visits.fetch_add(1, Ordering::SeqCst);
 
-        let count = unsafe { host_iter_next_chunk(iter) };
-        assert_eq!(
-            count, 1,
-            "Single entity world chunk iteration must return exactly 1"
-        );
+        let mut iter: *mut BamIter = core::ptr::null_mut();
+        let rc = unsafe { host_sys_query(sys_ctx, 0, &mut iter) };
+        if rc.is_err() {
+            return rc;
+        }
 
-        // Entity pointer must be non-null and valid
+        let mut count = 0usize;
+        assert!(unsafe { host_iter_next_chunk(iter, &mut count) }.get());
+        assert_eq!(count, 1);
+
         let entities_ptr = unsafe { host_iter_entities(iter) };
-        assert!(!entities_ptr.is_null(), "Entities pointer must not be null");
+        assert!(!entities_ptr.is_null());
         let entity = unsafe { *entities_ptr };
-        SINGLE_ENTITY_ID_BITS.store(entity.0 as u32, Ordering::SeqCst);
+        state
+            .low_bits
+            .store(entity.to_bits() as u32, Ordering::SeqCst);
 
-        // Read column 0 (Position)
         let pos_ptr = unsafe { host_iter_column_readonly(iter, 0) } as *const Position;
-        assert!(!pos_ptr.is_null(), "Position pointer must be non-null");
-        let pos = unsafe { *pos_ptr };
+        assert!(!pos_ptr.is_null());
         assert_eq!(
-            pos,
+            unsafe { *pos_ptr },
             Position {
                 x: 42.0,
                 y: 100.0,
-                z: -5.0
+                z: -5.0,
             }
         );
 
-        // Mutate column 1 (Velocity)
         let vel_ptr = unsafe { host_iter_column_mutable(iter, 1) } as *mut Velocity;
-        assert!(!vel_ptr.is_null(), "Velocity pointer must be non-null");
+        assert!(!vel_ptr.is_null());
         unsafe {
             (*vel_ptr).x += 10.0;
             (*vel_ptr).y += 20.0;
             (*vel_ptr).z += 30.0;
         }
 
-        // Exhaust iterator
-        let next_count = unsafe { host_iter_next_chunk(iter) };
-        assert_eq!(
-            next_count, 0,
-            "Single entity world must be exhausted on second next_chunk"
-        );
-
+        let mut next_count = 99usize;
+        assert!(!unsafe { host_iter_next_chunk(iter, &mut next_count) }.get());
+        assert_eq!(next_count, 0);
         FfiResult::OK
     }
 
     #[test]
     fn test_stress_chunk_iteration_zero_and_single_entity() {
-        // --- Part A: Zero entities ---
         {
-            ZERO_ENTITY_VISITS.store(0, Ordering::SeqCst);
+            let zero_visits = Box::new(AtomicUsize::new(0));
             let mut app = App::new();
-            app.add_plugins(AbiModPlugin::default());
-            app.register_mod_component::<Position>();
-            app.register_mod_component::<Velocity>();
+            app.add_plugins(AbiModPlugin);
+            let pos_h = app
+                .register_mod_component::<Position>(ComponentOptions::new())
+                .unwrap();
+            let vel_h = app
+                .register_mod_component::<Velocity>(ComponentOptions::new())
+                .unwrap();
 
             let registry = app.world().resource::<ModRegistry>().clone();
-            let query_descs = vec![
-                ComponentAccessDescOwned {
-                    name: "Position".to_string(),
-                    mode: ComponentAccessMode::READ,
-                },
-                ComponentAccessDescOwned {
-                    name: "Velocity".to_string(),
-                    mode: ComponentAccessMode::WRITE,
-                },
-            ];
-
-            let system = DynamicCSystem::new(
-                "zero_entity_system".to_string(),
-                query_descs,
+            let system = GuestSystem::new(
+                "zero_entity_system",
+                vec![BamQuerySpecOwned::new(vec![
+                    BamTermDesc::new(pos_h, AccessMode::READ),
+                    BamTermDesc::new(vel_h, AccessMode::WRITE),
+                ])],
                 zero_entity_callback,
-                core::ptr::null_mut(),
-                Arc::new(registry),
+                (&*zero_visits as *const AtomicUsize)
+                    .cast_mut()
+                    .cast::<c_void>(),
+                registry,
             );
             app.add_systems(Update, system);
 
             for _ in 0..5 {
                 app.update();
             }
-            assert_eq!(ZERO_ENTITY_VISITS.load(Ordering::SeqCst), 5);
+            assert_eq!(zero_visits.load(Ordering::SeqCst), 5);
         }
 
-        // --- Part B: Single entity ---
         {
-            SINGLE_ENTITY_VISITS.store(0, Ordering::SeqCst);
+            let state = Box::new(SingleVisitState {
+                visits: AtomicUsize::new(0),
+                low_bits: AtomicU32::new(0),
+            });
             let mut app = App::new();
-            app.add_plugins(AbiModPlugin::default());
-            app.register_mod_component::<Position>();
-            app.register_mod_component::<Velocity>();
+            app.add_plugins(AbiModPlugin);
+            let pos_h = app
+                .register_mod_component::<Position>(ComponentOptions::new())
+                .unwrap();
+            let vel_h = app
+                .register_mod_component::<Velocity>(ComponentOptions::new())
+                .unwrap();
 
             let e = app
                 .world_mut()
@@ -2655,30 +2506,24 @@ mod high_volume_chunks_and_commands {
                 .id();
 
             let registry = app.world().resource::<ModRegistry>().clone();
-            let query_descs = vec![
-                ComponentAccessDescOwned {
-                    name: "Position".to_string(),
-                    mode: ComponentAccessMode::READ,
-                },
-                ComponentAccessDescOwned {
-                    name: "Velocity".to_string(),
-                    mode: ComponentAccessMode::WRITE,
-                },
-            ];
-
-            let system = DynamicCSystem::new(
-                "single_entity_system".to_string(),
-                query_descs,
+            let system = GuestSystem::new(
+                "single_entity_system",
+                vec![BamQuerySpecOwned::new(vec![
+                    BamTermDesc::new(pos_h, AccessMode::READ),
+                    BamTermDesc::new(vel_h, AccessMode::WRITE),
+                ])],
                 single_entity_callback,
-                core::ptr::null_mut(),
-                Arc::new(registry),
+                (&*state as *const SingleVisitState)
+                    .cast_mut()
+                    .cast::<c_void>(),
+                registry,
             );
             app.add_systems(Update, system);
 
             app.update();
-            assert_eq!(SINGLE_ENTITY_VISITS.load(Ordering::SeqCst), 1);
+            assert_eq!(state.visits.load(Ordering::SeqCst), 1);
             assert_eq!(
-                SINGLE_ENTITY_ID_BITS.load(Ordering::SeqCst),
+                state.low_bits.load(Ordering::SeqCst),
                 (e.to_bits() & 0xFFFF_FFFF) as u32
             );
 
@@ -2688,32 +2533,33 @@ mod high_volume_chunks_and_commands {
                 Velocity {
                     x: 11.0,
                     y: 22.0,
-                    z: 33.0
+                    z: 33.0,
                 }
             );
         }
     }
 
-    // ==============================================================================
-    // TEST 2: Multi-Chunk Archetypes (>16,384 entities: 25,000 entities across 5 archetypes)
-    // ==============================================================================
-
-    static MULTI_CHUNK_TOTAL_ENTITIES: AtomicUsize = AtomicUsize::new(0);
-    static MULTI_CHUNK_TOTAL_CHUNKS: AtomicUsize = AtomicUsize::new(0);
+    struct MultiChunk25kStats {
+        total_entities: AtomicUsize,
+        total_chunks: AtomicUsize,
+    }
 
     unsafe extern "C" fn multi_chunk_scale_callback(
-        iter: *mut RawChunkIter,
-        _commands: *mut RawCommandQueue,
-        _user_data: *mut c_void,
+        sys_ctx: *mut BamSystemCtx,
+        user_data: *mut c_void,
     ) -> FfiResult {
-        let mut total_entities = 0;
-        let mut chunks = 0;
+        let stats = unsafe { &*(user_data as *const MultiChunk25kStats) };
+        let mut iter: *mut BamIter = core::ptr::null_mut();
+        let rc = unsafe { host_sys_query(sys_ctx, 0, &mut iter) };
+        if rc.is_err() {
+            return rc;
+        }
 
-        loop {
-            let count = unsafe { host_iter_next_chunk(iter) };
-            if count == 0 {
-                break;
-            }
+        let mut total_entities = 0usize;
+        let mut chunks = 0usize;
+        let mut count = 0usize;
+
+        while unsafe { host_iter_next_chunk(iter, &mut count) }.get() {
             chunks += 1;
             total_entities += count;
 
@@ -2728,7 +2574,6 @@ mod high_volume_chunks_and_commands {
             assert!(!vel_ptr.is_null());
             assert_eq!((vel_ptr as usize) % core::mem::align_of::<Velocity>(), 0);
 
-            // Mutate each entity's velocity
             for i in 0..count {
                 let p = unsafe { *pos_ptr.add(i) };
                 let v = unsafe { &mut *vel_ptr.add(i) };
@@ -2737,185 +2582,168 @@ mod high_volume_chunks_and_commands {
             }
         }
 
-        MULTI_CHUNK_TOTAL_ENTITIES.store(total_entities, Ordering::SeqCst);
-        MULTI_CHUNK_TOTAL_CHUNKS.store(chunks, Ordering::SeqCst);
+        stats.total_entities.store(total_entities, Ordering::SeqCst);
+        stats.total_chunks.store(chunks, Ordering::SeqCst);
 
-        // Test iterator reset
-        let reset_status = unsafe { host_iter_reset(iter) };
-        assert_eq!(reset_status, FfiResult::OK);
-
-        let mut re_count = 0;
-        let mut re_chunks = 0;
-        loop {
-            let count = unsafe { host_iter_next_chunk(iter) };
-            if count == 0 {
-                break;
-            }
+        assert_eq!(unsafe { host_iter_reset(iter) }, FfiResult::OK);
+        let mut re_count = 0usize;
+        let mut re_chunks = 0usize;
+        while unsafe { host_iter_next_chunk(iter, &mut count) }.get() {
             re_chunks += 1;
             re_count += count;
         }
-        assert_eq!(
-            re_count, total_entities,
-            "Iterator reset must re-traverse identical entity count"
-        );
-        assert_eq!(
-            re_chunks, chunks,
-            "Iterator reset must re-traverse identical chunk count"
-        );
-
+        assert_eq!(re_count, total_entities);
+        assert_eq!(re_chunks, chunks);
         FfiResult::OK
     }
 
     #[test]
     fn test_stress_chunk_iteration_multi_chunk_archetypes_25k() {
         let mut app = App::new();
-        app.add_plugins(AbiModPlugin::default());
-        app.register_mod_component::<Position>();
-        app.register_mod_component::<Velocity>();
-        app.register_mod_component::<CombatHealth>();
-        app.register_mod_component::<Mass>();
-        app.register_mod_component::<Armor>();
+        app.add_plugins(AbiModPlugin);
+        let pos_h = app
+            .register_mod_component::<Position>(ComponentOptions::new())
+            .unwrap();
+        let vel_h = app
+            .register_mod_component::<Velocity>(ComponentOptions::new())
+            .unwrap();
+        app.register_mod_component::<CombatHealth>(ComponentOptions::new())
+            .unwrap();
+        app.register_mod_component::<Mass>(ComponentOptions::new())
+            .unwrap();
+        app.register_mod_component::<Armor>(ComponentOptions::new())
+            .unwrap();
 
-        // Spawn 25,000 entities partitioned across 5 distinct archetypes (5,000 entities each)
         const PER_ARCH: usize = 5_000;
         let mut spawned_entities = Vec::with_capacity(PER_ARCH * 5);
 
-        // Archetype 1: Position, Velocity
         for i in 0..PER_ARCH {
-            let e = app
-                .world_mut()
-                .spawn((
-                    Position {
-                        x: i as f32,
-                        y: 0.0,
-                        z: 0.0,
-                    },
-                    Velocity {
-                        x: 10.0,
-                        y: 20.0,
-                        z: 30.0,
-                    },
-                ))
-                .id();
-            spawned_entities.push(e);
+            spawned_entities.push(
+                app.world_mut()
+                    .spawn((
+                        Position {
+                            x: i as f32,
+                            y: 0.0,
+                            z: 0.0,
+                        },
+                        Velocity {
+                            x: 10.0,
+                            y: 20.0,
+                            z: 30.0,
+                        },
+                    ))
+                    .id(),
+            );
         }
-        // Archetype 2: Position, Velocity, CombatHealth
         for i in 0..PER_ARCH {
-            let e = app
-                .world_mut()
-                .spawn((
-                    Position {
-                        x: i as f32,
-                        y: 0.0,
-                        z: 0.0,
-                    },
-                    Velocity {
-                        x: 10.0,
-                        y: 20.0,
-                        z: 30.0,
-                    },
-                    CombatHealth {
-                        current: 100,
-                        max: 100,
-                    },
-                ))
-                .id();
-            spawned_entities.push(e);
+            spawned_entities.push(
+                app.world_mut()
+                    .spawn((
+                        Position {
+                            x: i as f32,
+                            y: 0.0,
+                            z: 0.0,
+                        },
+                        Velocity {
+                            x: 10.0,
+                            y: 20.0,
+                            z: 30.0,
+                        },
+                        CombatHealth {
+                            current: 100,
+                            max: 100,
+                        },
+                    ))
+                    .id(),
+            );
         }
-        // Archetype 3: Position, Velocity, Mass
         for i in 0..PER_ARCH {
-            let e = app
-                .world_mut()
-                .spawn((
-                    Position {
-                        x: i as f32,
-                        y: 0.0,
-                        z: 0.0,
-                    },
-                    Velocity {
-                        x: 10.0,
-                        y: 20.0,
-                        z: 30.0,
-                    },
-                    Mass { value: 50.0 },
-                ))
-                .id();
-            spawned_entities.push(e);
+            spawned_entities.push(
+                app.world_mut()
+                    .spawn((
+                        Position {
+                            x: i as f32,
+                            y: 0.0,
+                            z: 0.0,
+                        },
+                        Velocity {
+                            x: 10.0,
+                            y: 20.0,
+                            z: 30.0,
+                        },
+                        Mass { value: 50.0 },
+                    ))
+                    .id(),
+            );
         }
-        // Archetype 4: Position, Velocity, Armor
         for i in 0..PER_ARCH {
-            let e = app
-                .world_mut()
-                .spawn((
-                    Position {
-                        x: i as f32,
-                        y: 0.0,
-                        z: 0.0,
-                    },
-                    Velocity {
-                        x: 10.0,
-                        y: 20.0,
-                        z: 30.0,
-                    },
-                    Armor { defense: 25 },
-                ))
-                .id();
-            spawned_entities.push(e);
+            spawned_entities.push(
+                app.world_mut()
+                    .spawn((
+                        Position {
+                            x: i as f32,
+                            y: 0.0,
+                            z: 0.0,
+                        },
+                        Velocity {
+                            x: 10.0,
+                            y: 20.0,
+                            z: 30.0,
+                        },
+                        Armor { defense: 25 },
+                    ))
+                    .id(),
+            );
         }
-        // Archetype 5: Position, Velocity, CombatHealth, Armor
         for i in 0..PER_ARCH {
-            let e = app
-                .world_mut()
-                .spawn((
-                    Position {
-                        x: i as f32,
-                        y: 0.0,
-                        z: 0.0,
-                    },
-                    Velocity {
-                        x: 10.0,
-                        y: 20.0,
-                        z: 30.0,
-                    },
-                    CombatHealth {
-                        current: 200,
-                        max: 200,
-                    },
-                    Armor { defense: 50 },
-                ))
-                .id();
-            spawned_entities.push(e);
+            spawned_entities.push(
+                app.world_mut()
+                    .spawn((
+                        Position {
+                            x: i as f32,
+                            y: 0.0,
+                            z: 0.0,
+                        },
+                        Velocity {
+                            x: 10.0,
+                            y: 20.0,
+                            z: 30.0,
+                        },
+                        CombatHealth {
+                            current: 200,
+                            max: 200,
+                        },
+                        Armor { defense: 50 },
+                    ))
+                    .id(),
+            );
         }
 
         assert_eq!(spawned_entities.len(), 25_000);
 
+        let stats = Box::new(MultiChunk25kStats {
+            total_entities: AtomicUsize::new(0),
+            total_chunks: AtomicUsize::new(0),
+        });
         let registry = app.world().resource::<ModRegistry>().clone();
-        let query_descs = vec![
-            ComponentAccessDescOwned {
-                name: "Position".to_string(),
-                mode: ComponentAccessMode::READ,
-            },
-            ComponentAccessDescOwned {
-                name: "Velocity".to_string(),
-                mode: ComponentAccessMode::WRITE,
-            },
-        ];
-
-        let system = DynamicCSystem::new(
-            "multi_chunk_25k_system".to_string(),
-            query_descs,
+        let system = GuestSystem::new(
+            "multi_chunk_25k_system",
+            vec![BamQuerySpecOwned::new(vec![
+                BamTermDesc::new(pos_h, AccessMode::READ),
+                BamTermDesc::new(vel_h, AccessMode::WRITE),
+            ])],
             multi_chunk_scale_callback,
-            core::ptr::null_mut(),
-            Arc::new(registry),
+            (&*stats as *const MultiChunk25kStats)
+                .cast_mut()
+                .cast::<c_void>(),
+            registry,
         );
         app.add_systems(Update, system);
-
         app.update();
 
-        assert_eq!(MULTI_CHUNK_TOTAL_ENTITIES.load(Ordering::SeqCst), 25_000);
-        assert_eq!(MULTI_CHUNK_TOTAL_CHUNKS.load(Ordering::SeqCst), 5);
+        assert_eq!(stats.total_entities.load(Ordering::SeqCst), 25_000);
+        assert_eq!(stats.total_chunks.load(Ordering::SeqCst), 5);
 
-        // Verify mutations across sample entities
         for &e in &[
             spawned_entities[0],
             spawned_entities[5000],
@@ -2927,110 +2755,77 @@ mod high_volume_chunks_and_commands {
         }
     }
 
-    // ==============================================================================
-    // TEST 3: Component Access Permission Enforcement
-    // ==============================================================================
-
-    static PERMISSIONS_VERIFIED: AtomicBool = AtomicBool::new(false);
-
     unsafe extern "C" fn access_permissions_callback(
-        iter: *mut RawChunkIter,
-        _commands: *mut RawCommandQueue,
-        _user_data: *mut c_void,
+        sys_ctx: *mut BamSystemCtx,
+        user_data: *mut c_void,
     ) -> FfiResult {
-        let count = unsafe { host_iter_next_chunk(iter) };
-        if count == 0 {
-            return FfiResult::OK;
+        let verified = unsafe { &*(user_data as *const AtomicBool) };
+        let mut iter: *mut BamIter = core::ptr::null_mut();
+        let rc = unsafe { host_sys_query(sys_ctx, 0, &mut iter) };
+        if rc.is_err() {
+            return rc;
         }
 
-        // Col 0: Position (READ)
-        let pos_readonly = unsafe { host_iter_column_readonly(iter, 0) };
-        assert!(
-            !pos_readonly.is_null(),
-            "Readonly access on READ column must succeed"
-        );
-        let pos_mut = unsafe { host_iter_column_mutable(iter, 0) };
-        assert!(
-            pos_mut.is_null(),
-            "Mutable access on READ column must be DENIED (null)"
-        );
-        let pos_mark = unsafe { host_iter_mark_changed(iter, 0, 0) };
+        let mut count = 0usize;
+        if !unsafe { host_iter_next_chunk(iter, &mut count) }.get() {
+            return FfiResult::OK;
+        }
+        assert_eq!(count, 1);
+
+        assert!(!unsafe { host_iter_column_readonly(iter, 0) }.is_null());
+        assert!(unsafe { host_iter_column_mutable(iter, 0) }.is_null());
         assert_eq!(
-            pos_mark,
-            FfiResult::PERMISSION_DENIED,
-            "Mark changed on READ column must return PERMISSION_DENIED"
+            unsafe { host_iter_mark_changed_range(iter, 0, 0, 1) },
+            FfiResult::PERMISSION_DENIED
         );
 
-        // Col 1: Velocity (WRITE)
-        let vel_readonly = unsafe { host_iter_column_readonly(iter, 1) };
-        assert!(
-            !vel_readonly.is_null(),
-            "Readonly access on WRITE column must succeed"
-        );
-        let vel_mut = unsafe { host_iter_column_mutable(iter, 1) };
-        assert!(
-            !vel_mut.is_null(),
-            "Mutable access on WRITE column must succeed"
-        );
-        let vel_mark = unsafe { host_iter_mark_changed(iter, 1, 0) };
+        assert!(!unsafe { host_iter_column_readonly(iter, 1) }.is_null());
+        assert!(!unsafe { host_iter_column_mutable(iter, 1) }.is_null());
         assert_eq!(
-            vel_mark,
-            FfiResult::OK,
-            "Mark changed on WRITE column must succeed"
+            unsafe { host_iter_mark_changed_range(iter, 1, 0, 1) },
+            FfiResult::OK
         );
 
-        // Col 2: CombatHealth (FILTER_ONLY)
-        let health_readonly = unsafe { host_iter_column_readonly(iter, 2) };
-        assert!(
-            health_readonly.is_null(),
-            "Read access on FILTER_ONLY column must return null"
-        );
-        let health_mut = unsafe { host_iter_column_mutable(iter, 2) };
-        assert!(
-            health_mut.is_null(),
-            "Mutable access on FILTER_ONLY column must return null"
-        );
+        assert!(unsafe { host_iter_column_readonly(iter, 2) }.is_null());
+        assert!(unsafe { host_iter_column_mutable(iter, 2) }.is_null());
 
-        // Col 3: Mass (WITHOUT)
-        let mass_readonly = unsafe { host_iter_column_readonly(iter, 3) };
-        assert!(
-            mass_readonly.is_null(),
-            "Read access on WITHOUT column must return null"
+        assert!(unsafe { host_iter_column_readonly(iter, 3) }.is_null());
+        assert!(unsafe { host_iter_column_mutable(iter, 3) }.is_null());
+
+        assert!(unsafe { host_iter_column_readonly(iter, 4) }.is_null());
+        assert!(unsafe { host_iter_column_mutable(iter, 32) }.is_null());
+        assert_eq!(
+            unsafe { host_iter_mark_changed_range(iter, 100, 0, 1) },
+            FfiResult::OUT_OF_RANGE
         );
-        let mass_mut = unsafe { host_iter_column_mutable(iter, 3) };
-        assert!(
-            mass_mut.is_null(),
-            "Mutable access on WITHOUT column must return null"
+        assert_eq!(
+            unsafe { host_iter_mark_changed_range(iter, 1, 999_999, 1) },
+            FfiResult::OUT_OF_RANGE
         );
 
-        // Out of bounds indices
-        let oob_readonly = unsafe { host_iter_column_readonly(iter, 4) };
-        assert!(oob_readonly.is_null());
-        let oob_mut = unsafe { host_iter_column_mutable(iter, 32) };
-        assert!(oob_mut.is_null());
-        let oob_mark = unsafe { host_iter_mark_changed(iter, 100, 0) };
-        assert_eq!(oob_mark, FfiResult::INVALID_COMPONENT);
-
-        // Row out of bounds
-        let row_oob_mark = unsafe { host_iter_mark_changed(iter, 1, 999_999) };
-        assert_eq!(row_oob_mark, FfiResult::OUT_OF_RANGE);
-
-        PERMISSIONS_VERIFIED.store(true, Ordering::SeqCst);
+        verified.store(true, Ordering::SeqCst);
         FfiResult::OK
     }
 
     #[test]
     fn test_stress_component_access_permissions() {
-        PERMISSIONS_VERIFIED.store(false, Ordering::SeqCst);
+        let verified = Box::new(AtomicBool::new(false));
 
         let mut app = App::new();
-        app.add_plugins(AbiModPlugin::default());
-        app.register_mod_component::<Position>();
-        app.register_mod_component::<Velocity>();
-        app.register_mod_component::<CombatHealth>();
-        app.register_mod_component::<Mass>();
+        app.add_plugins(AbiModPlugin);
+        let pos_h = app
+            .register_mod_component::<Position>(ComponentOptions::new())
+            .unwrap();
+        let vel_h = app
+            .register_mod_component::<Velocity>(ComponentOptions::new())
+            .unwrap();
+        let health_h = app
+            .register_mod_component::<CombatHealth>(ComponentOptions::new())
+            .unwrap();
+        let mass_h = app
+            .register_mod_component::<Mass>(ComponentOptions::new())
+            .unwrap();
 
-        // Entity matching: Position, Velocity, CombatHealth (WITHOUT Mass)
         app.world_mut().spawn((
             Position {
                 x: 1.0,
@@ -3047,8 +2842,6 @@ mod high_volume_chunks_and_commands {
                 max: 100,
             },
         ));
-
-        // Entity that must be filtered out because it has Mass
         app.world_mut().spawn((
             Position {
                 x: 99.0,
@@ -3068,52 +2861,49 @@ mod high_volume_chunks_and_commands {
         ));
 
         let registry = app.world().resource::<ModRegistry>().clone();
-        let query_descs = vec![
-            ComponentAccessDescOwned {
-                name: "Position".to_string(),
-                mode: ComponentAccessMode::READ,
-            },
-            ComponentAccessDescOwned {
-                name: "Velocity".to_string(),
-                mode: ComponentAccessMode::WRITE,
-            },
-            ComponentAccessDescOwned {
-                name: "CombatHealth".to_string(),
-                mode: ComponentAccessMode::FILTER_ONLY,
-            },
-            ComponentAccessDescOwned {
-                name: "Mass".to_string(),
-                mode: ComponentAccessMode::WITHOUT,
-            },
-        ];
-
-        let system = DynamicCSystem::new(
-            "access_permissions_system".to_string(),
-            query_descs,
+        let system = GuestSystem::new(
+            "access_permissions_system",
+            vec![BamQuerySpecOwned::new(vec![
+                BamTermDesc::new(pos_h, AccessMode::READ),
+                BamTermDesc::new(vel_h, AccessMode::WRITE),
+                BamTermDesc::new(health_h, AccessMode::FILTER_ONLY),
+                BamTermDesc::new(mass_h, AccessMode::WITHOUT),
+            ])],
             access_permissions_callback,
-            core::ptr::null_mut(),
-            Arc::new(registry),
+            (&*verified as *const AtomicBool)
+                .cast_mut()
+                .cast::<c_void>(),
+            registry,
         );
         app.add_systems(Update, system);
 
         app.update();
-        assert!(PERMISSIONS_VERIFIED.load(Ordering::SeqCst));
+        assert!(verified.load(Ordering::SeqCst));
     }
 
-    // ==============================================================================
-    // TEST 4: Change Detection Granularity (Blanket vs Selective row-level)
-    // ==============================================================================
+    #[derive(Resource, Default)]
+    struct ChangedVelCount(usize);
 
-    static BLANKET_CHANGE_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+    fn count_changed_velocities(
+        query: Query<&Velocity, Changed<Velocity>>,
+        mut out: ResMut<ChangedVelCount>,
+    ) {
+        out.0 = query.iter().count();
+    }
+
+    const TARGET_ROW: usize = 7;
 
     unsafe extern "C" fn blanket_mutation_callback(
-        iter: *mut RawChunkIter,
-        _commands: *mut RawCommandQueue,
+        sys_ctx: *mut BamSystemCtx,
         _user_data: *mut c_void,
     ) -> FfiResult {
-        let count = unsafe { host_iter_next_chunk(iter) };
-        if count > 0 {
-            // Calling column_mutable marks entire chunk as changed
+        let mut iter: *mut BamIter = core::ptr::null_mut();
+        let rc = unsafe { host_sys_query(sys_ctx, 0, &mut iter) };
+        if rc.is_err() {
+            return rc;
+        }
+        let mut count = 0usize;
+        if unsafe { host_iter_next_chunk(iter, &mut count) }.get() {
             let vel_ptr = unsafe { host_iter_column_mutable(iter, 0) } as *mut Velocity;
             assert!(!vel_ptr.is_null());
             for i in 0..count {
@@ -3121,58 +2911,49 @@ mod high_volume_chunks_and_commands {
                     (*vel_ptr.add(i)).x += 1.0;
                 }
             }
-            BLANKET_CHANGE_CALL_COUNT.fetch_add(count, Ordering::SeqCst);
         }
         FfiResult::OK
     }
 
-    static SELECTIVE_CHANGE_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
-    static SELECTIVE_MODE: AtomicUsize = AtomicUsize::new(0); // 0 = no-op, 1 = selective mark row 7
-    const TARGET_ROW: usize = 7;
-
     unsafe extern "C" fn selective_mutation_callback(
-        iter: *mut RawChunkIter,
-        _commands: *mut RawCommandQueue,
-        _user_data: *mut c_void,
+        sys_ctx: *mut BamSystemCtx,
+        user_data: *mut c_void,
     ) -> FfiResult {
-        loop {
-            let count = unsafe { host_iter_next_chunk(iter) };
-            if count == 0 {
-                break;
-            }
-
-            if SELECTIVE_MODE.load(Ordering::SeqCst) == 1 && count > TARGET_ROW {
-                let vel_ptr = unsafe { host_iter_column_readonly(iter, 0) } as *mut Velocity;
+        let mode = unsafe { &*(user_data as *const AtomicUsize) };
+        let mut iter: *mut BamIter = core::ptr::null_mut();
+        let rc = unsafe { host_sys_query(sys_ctx, 0, &mut iter) };
+        if rc.is_err() {
+            return rc;
+        }
+        let mut count = 0usize;
+        while unsafe { host_iter_next_chunk(iter, &mut count) }.get() {
+            if mode.load(Ordering::SeqCst) == 1 && count > TARGET_ROW {
+                let vel_ptr =
+                    unsafe { host_iter_column_mutable_untracked(iter, 0) } as *mut Velocity;
                 assert!(!vel_ptr.is_null());
                 unsafe {
                     (*vel_ptr.add(TARGET_ROW)).x = 999.0;
                 }
-                let res = unsafe { host_iter_mark_changed(iter, 0, TARGET_ROW) };
-                assert_eq!(res, FfiResult::OK);
-                SELECTIVE_CHANGE_CALL_COUNT.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(
+                    unsafe { host_iter_mark_changed_range(iter, 0, TARGET_ROW, 1) },
+                    FfiResult::OK
+                );
             } else {
-                // Readonly access without marking ticks
                 let _ = unsafe { host_iter_column_readonly(iter, 0) };
             }
         }
         FfiResult::OK
     }
 
-    static CHANGED_VELOCITY_DETECTIONS: AtomicUsize = AtomicUsize::new(0);
-
-    fn count_changed_velocities(query: Query<&Velocity, Changed<Velocity>>) {
-        let count = query.iter().count();
-        CHANGED_VELOCITY_DETECTIONS.store(count, Ordering::SeqCst);
-    }
-
     #[test]
     fn test_stress_change_detection_granularity() {
-        // --- Phase 1: Blanket change detection ---
         {
-            CHANGED_VELOCITY_DETECTIONS.store(0, Ordering::SeqCst);
             let mut app = App::new();
-            app.add_plugins(AbiModPlugin::default());
-            app.register_mod_component::<Velocity>();
+            app.add_plugins(AbiModPlugin);
+            app.init_resource::<ChangedVelCount>();
+            let vel_h = app
+                .register_mod_component::<Velocity>(ComponentOptions::new())
+                .unwrap();
 
             for i in 0..50 {
                 app.world_mut().spawn(Velocity {
@@ -3183,179 +2964,173 @@ mod high_volume_chunks_and_commands {
             }
 
             let registry = app.world().resource::<ModRegistry>().clone();
-            let system = DynamicCSystem::new(
-                "blanket_system".to_string(),
-                vec![ComponentAccessDescOwned {
-                    name: "Velocity".to_string(),
-                    mode: ComponentAccessMode::WRITE,
-                }],
+            let system = GuestSystem::new(
+                "blanket_system",
+                vec![BamQuerySpecOwned::new(vec![BamTermDesc::new(
+                    vel_h,
+                    AccessMode::WRITE,
+                )])],
                 blanket_mutation_callback,
                 core::ptr::null_mut(),
-                Arc::new(registry),
-            );
-            app.add_systems(Update, system);
-            app.add_systems(Update, count_changed_velocities);
-
-            // Tick 1: baseline
-            app.update();
-            // Tick 2: mutation via column_mutable -> all 50 entities detected
-            app.update();
-            assert_eq!(CHANGED_VELOCITY_DETECTIONS.load(Ordering::SeqCst), 50);
-        }
-
-        // --- Phase 2: Selective row-level change detection ---
-        {
-            CHANGED_VELOCITY_DETECTIONS.store(0, Ordering::SeqCst);
-            SELECTIVE_MODE.store(0, Ordering::SeqCst);
-            let mut app = App::new();
-            app.add_plugins(AbiModPlugin::default());
-            app.register_mod_component::<Velocity>();
-
-            let mut entities = Vec::new();
-            for i in 0..50 {
-                let e = app
-                    .world_mut()
-                    .spawn(Velocity {
-                        x: i as f32,
-                        y: 0.0,
-                        z: 0.0,
-                    })
-                    .id();
-                entities.push(e);
-            }
-
-            let registry = app.world().resource::<ModRegistry>().clone();
-            let system = DynamicCSystem::new(
-                "selective_system".to_string(),
-                vec![ComponentAccessDescOwned {
-                    name: "Velocity".to_string(),
-                    mode: ComponentAccessMode::WRITE,
-                }],
-                selective_mutation_callback,
-                core::ptr::null_mut(),
-                Arc::new(registry),
+                registry,
             );
             app.add_systems(Update, (system, count_changed_velocities).chain());
 
-            // Frame 1: Initial spawn causes Bevy to detect all 50 entities as added/changed
             app.update();
-            assert_eq!(CHANGED_VELOCITY_DETECTIONS.load(Ordering::SeqCst), 50);
+            app.update();
+            assert_eq!(app.world().resource::<ChangedVelCount>().0, 50);
+        }
 
-            // Frame 2: Mode = 0 (no mutation). Must produce 0 changed entities (clean baseline)
-            app.update();
-            assert_eq!(
-                CHANGED_VELOCITY_DETECTIONS.load(Ordering::SeqCst),
-                0,
-                "Non-mutating frame must produce 0 Changed<Velocity> detections"
+        {
+            let mode = Box::new(AtomicUsize::new(0));
+            let mut app = App::new();
+            app.add_plugins(AbiModPlugin);
+            app.init_resource::<ChangedVelCount>();
+            let vel_h = app
+                .register_mod_component::<Velocity>(ComponentOptions::new())
+                .unwrap();
+
+            let mut entities = Vec::new();
+            for i in 0..50 {
+                entities.push(
+                    app.world_mut()
+                        .spawn(Velocity {
+                            x: i as f32,
+                            y: 0.0,
+                            z: 0.0,
+                        })
+                        .id(),
+                );
+            }
+
+            let registry = app.world().resource::<ModRegistry>().clone();
+            let system = GuestSystem::new(
+                "selective_system",
+                vec![BamQuerySpecOwned::new(vec![BamTermDesc::new(
+                    vel_h,
+                    AccessMode::WRITE,
+                )])],
+                selective_mutation_callback,
+                (&*mode as *const AtomicUsize).cast_mut().cast::<c_void>(),
+                registry,
             );
+            app.add_systems(Update, (system, count_changed_velocities).chain());
 
-            // Frame 3: Mode = 1 (selectively mark ONLY TARGET_ROW changed)
-            SELECTIVE_MODE.store(1, Ordering::SeqCst);
             app.update();
+            assert_eq!(app.world().resource::<ChangedVelCount>().0, 50);
 
-            // Exactly 1 entity must be detected as Changed<Velocity>!
-            assert_eq!(
-                CHANGED_VELOCITY_DETECTIONS.load(Ordering::SeqCst),
-                1,
-                "Selective change detection must flag exactly 1 entity, not the entire chunk"
-            );
+            app.update();
+            assert_eq!(app.world().resource::<ChangedVelCount>().0, 0);
+
+            mode.store(1, Ordering::SeqCst);
+            app.update();
+            assert_eq!(app.world().resource::<ChangedVelCount>().0, 1);
 
             let target_vel = *app.world().get::<Velocity>(entities[TARGET_ROW]).unwrap();
             assert_eq!(target_vel.x, 999.0);
         }
     }
 
-    // ==============================================================================
-    // TEST 5: High-Volume Deferred Commands Execution (2,000 Spawns, Inserts, 1,000 Despawns)
-    // ==============================================================================
-
     const BATCH_SIZE: usize = 2_000;
-    static SPAWNED_FFI_IDS: std::sync::Mutex<Vec<FfiEntity>> = std::sync::Mutex::new(Vec::new());
+
+    struct MassCmdContext {
+        pos_h: BamComponent,
+        health_h: BamComponent,
+        vel_h: BamComponent,
+        spawned_ids: Mutex<Vec<FfiEntity>>,
+    }
 
     unsafe extern "C" fn mass_spawn_callback(
-        _iter: *mut RawChunkIter,
-        commands: *mut RawCommandQueue,
-        _user_data: *mut c_void,
+        sys_ctx: *mut BamSystemCtx,
+        user_data: *mut c_void,
     ) -> FfiResult {
-        assert!(!commands.is_null());
+        let ctx = unsafe { &*(user_data as *const MassCmdContext) };
+        let mut commands: *mut BamCommands = core::ptr::null_mut();
+        let rc = unsafe { host_sys_commands(sys_ctx, &mut commands) };
+        if rc.is_err() {
+            return rc;
+        }
         let mut ids = Vec::with_capacity(BATCH_SIZE);
-
-        let pos_name = CString::new("Position").unwrap();
-        let health_name = CString::new("CombatHealth").unwrap();
-
         for i in 0..BATCH_SIZE {
-            let ffi_ent = unsafe { host_cmd_spawn_empty(commands) };
-            assert_ne!(ffi_ent.0, 0);
-
+            let mut ffi_ent = FfiEntity::NULL;
+            assert_eq!(
+                unsafe { host_cmd_spawn_empty(commands, &mut ffi_ent) },
+                FfiResult::OK
+            );
             let pos = Position {
                 x: i as f32,
                 y: (i * 2) as f32,
                 z: 0.0,
             };
-            let res_pos = unsafe {
-                host_cmd_insert_component(
-                    commands,
-                    ffi_ent,
-                    pos_name.as_ptr(),
-                    &pos as *const Position as *const u8,
-                    core::mem::size_of::<Position>(),
-                )
-            };
-            assert_eq!(res_pos, FfiResult::OK);
-
+            assert_eq!(
+                unsafe {
+                    host_cmd_insert(
+                        commands,
+                        ffi_ent,
+                        ctx.pos_h,
+                        &pos as *const Position as *const u8,
+                        core::mem::size_of::<Position>(),
+                    )
+                },
+                FfiResult::OK
+            );
             let health = CombatHealth {
                 current: 100,
                 max: 100,
             };
-            let res_health = unsafe {
-                host_cmd_insert_component(
-                    commands,
-                    ffi_ent,
-                    health_name.as_ptr(),
-                    &health as *const CombatHealth as *const u8,
-                    core::mem::size_of::<CombatHealth>(),
-                )
-            };
-            assert_eq!(res_health, FfiResult::OK);
-
+            assert_eq!(
+                unsafe {
+                    host_cmd_insert(
+                        commands,
+                        ffi_ent,
+                        ctx.health_h,
+                        &health as *const CombatHealth as *const u8,
+                        core::mem::size_of::<CombatHealth>(),
+                    )
+                },
+                FfiResult::OK
+            );
             ids.push(ffi_ent);
         }
-
-        *SPAWNED_FFI_IDS.lock().unwrap() = ids;
+        *ctx.spawned_ids.lock().unwrap() = ids;
         FfiResult::OK
     }
 
     unsafe extern "C" fn mass_despawn_and_insert_callback(
-        _iter: *mut RawChunkIter,
-        commands: *mut RawCommandQueue,
-        _user_data: *mut c_void,
+        sys_ctx: *mut BamSystemCtx,
+        user_data: *mut c_void,
     ) -> FfiResult {
-        assert!(!commands.is_null());
-        let ids = SPAWNED_FFI_IDS.lock().unwrap().clone();
-        let vel_name = CString::new("Velocity").unwrap();
-
+        let ctx = unsafe { &*(user_data as *const MassCmdContext) };
+        let mut commands: *mut BamCommands = core::ptr::null_mut();
+        let rc = unsafe { host_sys_commands(sys_ctx, &mut commands) };
+        if rc.is_err() {
+            return rc;
+        }
+        let ids = ctx.spawned_ids.lock().unwrap().clone();
         for (idx, &ffi_ent) in ids.iter().enumerate() {
             if idx % 2 == 0 {
-                // Despawn even indices
-                let res = unsafe { host_cmd_despawn(commands, ffi_ent) };
-                assert_eq!(res, FfiResult::OK);
+                assert_eq!(
+                    unsafe { host_cmd_despawn(commands, ffi_ent) },
+                    FfiResult::OK
+                );
             } else {
-                // Insert Velocity on odd indices
                 let vel = Velocity {
                     x: idx as f32,
                     y: -1.0,
                     z: 1.0,
                 };
-                let res = unsafe {
-                    host_cmd_insert_component(
-                        commands,
-                        ffi_ent,
-                        vel_name.as_ptr(),
-                        &vel as *const Velocity as *const u8,
-                        core::mem::size_of::<Velocity>(),
-                    )
-                };
-                assert_eq!(res, FfiResult::OK);
+                assert_eq!(
+                    unsafe {
+                        host_cmd_insert(
+                            commands,
+                            ffi_ent,
+                            ctx.vel_h,
+                            &vel as *const Velocity as *const u8,
+                            core::mem::size_of::<Velocity>(),
+                        )
+                    },
+                    FfiResult::OK
+                );
             }
         }
         FfiResult::OK
@@ -3364,52 +3139,58 @@ mod high_volume_chunks_and_commands {
     #[test]
     fn test_stress_deferred_commands_high_volume() {
         let mut app = App::new();
-        app.add_plugins(AbiModPlugin::default());
-        app.register_mod_component::<Position>();
-        app.register_mod_component::<CombatHealth>();
-        app.register_mod_component::<Velocity>();
+        app.add_plugins(AbiModPlugin);
+        let pos_h = app
+            .register_mod_component::<Position>(ComponentOptions::new())
+            .unwrap();
+        let health_h = app
+            .register_mod_component::<CombatHealth>(ComponentOptions::new())
+            .unwrap();
+        let vel_h = app
+            .register_mod_component::<Velocity>(ComponentOptions::new())
+            .unwrap();
+
+        let ctx = Box::new(MassCmdContext {
+            pos_h,
+            health_h,
+            vel_h,
+            spawned_ids: Mutex::new(Vec::new()),
+        });
 
         let registry = app.world().resource::<ModRegistry>().clone();
-
-        // System 1: Mass spawn
-        let spawn_system = DynamicCSystem::new(
-            "mass_spawn".to_string(),
+        let spawn_system = GuestSystem::new(
+            "mass_spawn",
             Vec::new(),
             mass_spawn_callback,
-            core::ptr::null_mut(),
-            Arc::new(registry),
+            (&*ctx as *const MassCmdContext).cast_mut().cast::<c_void>(),
+            registry,
         );
         app.add_systems(Update, spawn_system);
-
-        // Tick 1: Spawns queued and applied
         app.update();
 
-        let spawned_ids = SPAWNED_FFI_IDS.lock().unwrap().clone();
+        let spawned_ids = ctx.spawned_ids.lock().unwrap().clone();
         assert_eq!(spawned_ids.len(), BATCH_SIZE);
 
-        // Verify all 2,000 entities exist with components
         for (i, &ffi_ent) in spawned_ids.iter().enumerate() {
             let bevy_ent = Entity::try_from_bits(ffi_ent.to_bits()).unwrap();
-            let pos = *app
-                .world()
-                .get::<Position>(bevy_ent)
-                .expect("Entity must have Position");
-            let health = *app
-                .world()
-                .get::<CombatHealth>(bevy_ent)
-                .expect("Entity must have CombatHealth");
+            let pos = *app.world().get::<Position>(bevy_ent).unwrap();
+            let health = *app.world().get::<CombatHealth>(bevy_ent).unwrap();
             assert_eq!(pos.x, i as f32);
             assert_eq!(health.current, 100);
         }
 
-        // Replace system with mass despawn/insert
         let mut app2 = App::new();
-        app2.add_plugins(AbiModPlugin::default());
-        app2.register_mod_component::<Position>();
-        app2.register_mod_component::<CombatHealth>();
-        app2.register_mod_component::<Velocity>();
+        app2.add_plugins(AbiModPlugin);
+        let pos_h2 = app2
+            .register_mod_component::<Position>(ComponentOptions::new())
+            .unwrap();
+        let health_h2 = app2
+            .register_mod_component::<CombatHealth>(ComponentOptions::new())
+            .unwrap();
+        let vel_h2 = app2
+            .register_mod_component::<Velocity>(ComponentOptions::new())
+            .unwrap();
 
-        // Copy world entities over
         for (i, &ffi_ent) in spawned_ids.iter().enumerate() {
             let e = app2
                 .world_mut()
@@ -3428,74 +3209,69 @@ mod high_volume_chunks_and_commands {
             assert_eq!(e.to_bits(), ffi_ent.to_bits());
         }
 
+        let ctx2 = Box::new(MassCmdContext {
+            pos_h: pos_h2,
+            health_h: health_h2,
+            vel_h: vel_h2,
+            spawned_ids: Mutex::new(spawned_ids.clone()),
+        });
         let registry2 = app2.world().resource::<ModRegistry>().clone();
-        let despawn_system = DynamicCSystem::new(
-            "mass_despawn".to_string(),
+        let despawn_system = GuestSystem::new(
+            "mass_despawn",
             Vec::new(),
             mass_despawn_and_insert_callback,
-            core::ptr::null_mut(),
-            Arc::new(registry2),
+            (&*ctx2 as *const MassCmdContext)
+                .cast_mut()
+                .cast::<c_void>(),
+            registry2,
         );
         app2.add_systems(Update, despawn_system);
-
-        // Tick 2: Despawns and inserts queued and applied
         app2.update();
 
-        // Verify results
         for (idx, &ffi_ent) in spawned_ids.iter().enumerate() {
             let bevy_ent = Entity::try_from_bits(ffi_ent.to_bits()).unwrap();
             if idx % 2 == 0 {
-                // Despawned: entity mut should fail
-                assert!(
-                    app2.world().get_entity(bevy_ent).is_err(),
-                    "Even entity {} must be despawned",
-                    idx
-                );
+                assert!(app2.world().get_entity(bevy_ent).is_err());
             } else {
-                // Surviving: must have Position, CombatHealth, and Velocity
                 assert!(app2.world().get::<Position>(bevy_ent).is_some());
                 assert!(app2.world().get::<CombatHealth>(bevy_ent).is_some());
-                let vel = *app2
-                    .world()
-                    .get::<Velocity>(bevy_ent)
-                    .expect("Odd entity must have Velocity");
+                let vel = *app2.world().get::<Velocity>(bevy_ent).unwrap();
                 assert_eq!(vel.x, idx as f32);
             }
         }
     }
 
-    // ==============================================================================
-    // TEST 6: Command Bridge Error Resilience (Adversarial Inputs)
-    // ==============================================================================
-
     #[test]
     fn test_stress_deferred_commands_adversarial_inputs() {
         let mut app = App::new();
-        app.add_plugins(AbiModPlugin::default());
-        app.register_mod_component::<Position>();
+        app.add_plugins(AbiModPlugin);
+        let pos_h = app
+            .register_mod_component::<Position>(ComponentOptions::new())
+            .unwrap();
 
-        let mut queue = bevy_ecs::world::CommandQueue::default();
         let registry = app.world().resource::<ModRegistry>().clone();
+        let snapshot = registry.snapshot_arc();
+        let mut storage = HostCommandsStorage::new();
         let cell = app.world_mut().as_unsafe_world_cell();
+        let mut cmds = HostCommands::new(&mut storage, cell.entity_allocator(), &snapshot);
+        let raw_cmds = cmds.as_ffi_ptr();
 
-        let mut bridge = CommandQueueBridge::new(&mut queue, cell.entity_allocator(), &registry);
-        let raw_queue = (&mut bridge as *mut CommandQueueBridge<'_>).cast::<RawCommandQueue>();
-
-        let valid_entity = unsafe { host_cmd_spawn_empty(raw_queue) };
-        assert_ne!(valid_entity.0, 0);
+        let mut valid_entity = FfiEntity::NULL;
+        assert_eq!(
+            unsafe { host_cmd_spawn_empty(raw_cmds, &mut valid_entity) },
+            FfiResult::OK
+        );
+        assert!(!valid_entity.is_null());
 
         let dummy_pos = Position {
             x: 1.0,
             y: 2.0,
             z: 3.0,
         };
-        let pos_name = CString::new("Position").unwrap();
-        let unknown_name = CString::new("NonExistentComponent").unwrap();
 
-        // 1. Null queue pointer
         assert_eq!(
-            unsafe { host_cmd_spawn_empty(core::ptr::null_mut()) },
-            FfiEntity(0)
+            unsafe { host_cmd_spawn_empty(core::ptr::null_mut(), &mut valid_entity) },
+            FfiResult::NULL_POINTER
         );
         assert_eq!(
             unsafe { host_cmd_despawn(core::ptr::null_mut(), valid_entity) },
@@ -3503,158 +3279,88 @@ mod high_volume_chunks_and_commands {
         );
         assert_eq!(
             unsafe {
-                host_cmd_insert_component(
+                host_cmd_insert(
                     core::ptr::null_mut(),
                     valid_entity,
-                    pos_name.as_ptr(),
+                    pos_h,
                     &dummy_pos as *const Position as *const u8,
                     core::mem::size_of::<Position>(),
                 )
             },
             FfiResult::NULL_POINTER
         );
-
-        // 2. Null component name
         assert_eq!(
             unsafe {
-                host_cmd_insert_component(
-                    raw_queue,
+                host_cmd_insert(
+                    raw_cmds,
                     valid_entity,
-                    core::ptr::null(),
+                    BamComponent::INVALID,
                     &dummy_pos as *const Position as *const u8,
                     core::mem::size_of::<Position>(),
                 )
             },
+            FfiResult::INVALID_COMPONENT
+        );
+        assert_eq!(
+            unsafe { host_cmd_insert(raw_cmds, valid_entity, pos_h, core::ptr::null(), 12) },
             FfiResult::NULL_POINTER
         );
-
-        // 3. Null data pointer with len > 0
         assert_eq!(
             unsafe {
-                host_cmd_insert_component(
-                    raw_queue,
+                host_cmd_insert(
+                    raw_cmds,
                     valid_entity,
-                    pos_name.as_ptr(),
-                    core::ptr::null(),
-                    12,
-                )
-            },
-            FfiResult::NULL_POINTER
-        );
-
-        // 4. Unregistered component name
-        assert_eq!(
-            unsafe {
-                host_cmd_insert_component(
-                    raw_queue,
-                    valid_entity,
-                    unknown_name.as_ptr(),
+                    BamComponent::from_raw(999),
                     &dummy_pos as *const Position as *const u8,
                     12,
                 )
             },
             FfiResult::INVALID_COMPONENT
         );
-
-        // 5. Component size mismatch (len != registered size)
         assert_eq!(
             unsafe {
-                host_cmd_insert_component(
-                    raw_queue,
+                host_cmd_insert(
+                    raw_cmds,
                     valid_entity,
-                    pos_name.as_ptr(),
+                    pos_h,
                     &dummy_pos as *const Position as *const u8,
-                    999, // Expected 12
+                    999,
                 )
             },
             FfiResult::INVALID_ARGUMENT
         );
 
-        // 6. Invalid entity bits on despawn:
-        // Generation 0 and Entity::PLACEHOLDER return INVALID_ENTITY
         assert_eq!(
-            unsafe { host_cmd_despawn(raw_queue, FfiEntity(0)) },
+            unsafe { host_cmd_despawn(raw_cmds, FfiEntity::NULL) },
             FfiResult::INVALID_ENTITY
         );
         assert_eq!(
             unsafe {
                 host_cmd_despawn(
-                    raw_queue,
+                    raw_cmds,
                     FfiEntity::from_bits(Entity::PLACEHOLDER.to_bits()),
                 )
             },
             FfiResult::INVALID_ENTITY
         );
-        // Non-existent entity with non-zero generation returns OK (queued safely) and safely no-ops on flush
         assert_eq!(
-            unsafe { host_cmd_despawn(raw_queue, FfiEntity(u64::MAX)) },
+            unsafe { host_cmd_despawn(raw_cmds, FfiEntity::from_bits(u64::MAX)) },
             FfiResult::OK
-        );
-
-        // 7. Invalid UTF-8 in component name
-        let invalid_utf8_name = [0xFFu8, 0xFEu8, 0x00u8];
-        assert_eq!(
-            unsafe {
-                host_cmd_insert_component(
-                    raw_queue,
-                    valid_entity,
-                    invalid_utf8_name.as_ptr() as *const c_char,
-                    &dummy_pos as *const Position as *const u8,
-                    12,
-                )
-            },
-            FfiResult::INVALID_UTF8
         );
     }
 }
 
 mod command_overwrites_and_stack_scramble {
-    #![allow(unused_imports, dead_code)]
-    //! # Milestone 3 Empirical Challenger Stress Suite
-    //!
-    //! Written by Challenger 2 for Milestone 3: Multi-Language Guest SDK & Mod Implementations.
-    //! Empirical Focus Areas:
-    //! 1. Drop Trampoline Pool Conservation:
-    //!    - Verify POD components (`RustModCustomData`, `CModCustomData`) consume ZERO slots in `DROP_TRAMPOLINE_SLOTS` (64-slot pool).
-    //!    - Verify >64 distinct POD components can be registered without exhausting the pool.
-    //!    - Verify non-POD components consume exactly 1 slot each, and slot 65 exhausts the pool.
-    //!    - Verify slot deduplication / reuse upon component re-registration with identical UUID (mod reload).
-    //!    - Verify panic containment in drop trampolines: catching unwinds cleanly without unwinding into the host or crashing.
-    //! 2. Deferred Command Queue Stress & Host Allocator Isolation (Rule 2):
-    //!    - Repeated rapid insertions and value overwrites on the same entity.
-    //!    - Immediate entity despawning before command queue flush.
-    //!    - Insertion on invalid / dead `FfiEntity`.
-    //!    - Boundary sizes (0 bytes / ZST, 1 byte, 64 KB, power-of-two alignments).
-    //!    - Stack memory scrambling defense (verifying host copy semantics and no dangling guest stack pointers).
-    //! 3. Mod Unload & Lifecycle Stress:
-    //!    - Full multi-language dynamic mod loading (`asymmetric_rust_mod` and `asymmetric_c_mod`).
-    //!    - Continuous updates, clean mod unload, post-unload updates without segfaults or panics.
-    //!    - Post-unload entity despawns.
-    //!    - Repeated mod load/update/unload cycling stress (5 full cycles).
-
-    use crate::support::*;
-    use bevy_abi_mod_host::ModAppExt;
-    use bevy_abi_mod_host::plugin::AbiModPlugin;
-    use bevy_abi_mod_host_sys::registry::ModRegistry;
+    use bevy_abi_mod_host::ModRegistry;
     use bevy_abi_mod_host_sys::{
-        CommandQueueBridge, ModInitContext, host_cmd_despawn, host_cmd_insert_component,
-        host_cmd_spawn_empty, host_register_component, reset_drop_trampolines_for_testing,
+        HostCommands, HostCommandsStorage, LoadContext, host_cmd_despawn, host_cmd_insert,
+        host_cmd_spawn_empty, host_register_component,
     };
-    use bevy_abi_mod_sys::{
-        ComponentUuid, FfiEntity, FfiResult, ModComponentDescriptor, RawCommandQueue,
-    };
-    use bevy_app::App;
+    use bevy_abi_mod_sys::{BamComponent, ComponentDesc, ComponentUuid, FfiEntity, FfiResult};
     use bevy_ecs::entity::Entity;
-    use bevy_ecs::world::{CommandQueue, World};
-    use core::ffi::c_void;
-    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
-
-    static GLOBAL_DROP_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    // ============================================================================
-    // Types for Drop Trampoline Testing
-    // ============================================================================
+    use bevy_ecs::world::World;
+    use core::sync::atomic::AtomicBool;
+    use std::sync::Arc;
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3670,83 +3376,81 @@ mod command_overwrites_and_stack_scramble {
         pub level: i32,
     }
 
-    static NON_POD_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-    unsafe extern "C" fn non_pod_drop_hook(ptr: *mut c_void) {
-        if !ptr.is_null() {
-            NON_POD_DROP_COUNT.fetch_add(1, Ordering::SeqCst);
-        }
+    fn register_dynamic_in_world(
+        world: &mut World,
+        registry: &mut ModRegistry,
+        desc: &ComponentDesc,
+    ) -> BamComponent {
+        let mut load_ctx = LoadContext::with_world_and_mod_id(
+            registry.clone(),
+            Arc::new(AtomicBool::new(true)),
+            world as *mut World,
+            None,
+        );
+        let mut out = BamComponent::INVALID;
+        assert_eq!(
+            unsafe { host_register_component(load_ctx.as_ffi_ptr(), desc, &mut out) },
+            FfiResult::OK
+        );
+        *registry = load_ctx.registry.clone();
+        load_ctx.finish_init();
+        out
     }
-
-    static PANICKING_DROP_INVOKED: AtomicBool = AtomicBool::new(false);
-
-    unsafe extern "C" fn panicking_drop_trampoline_with_catch_unwind(ptr: *mut c_void) {
-        if !ptr.is_null() {
-            PANICKING_DROP_INVOKED.store(true, Ordering::SeqCst);
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                panic!("Simulated non-POD drop hook panic in guest runtime");
-            }));
-        }
-    }
-
-    // ============================================================================
-    // 2. Deferred Command Queue Stress & Host Allocator Isolation (Rule 2)
-    // ============================================================================
 
     #[test]
     fn test_cmd_insert_rapid_overwrites_on_same_entity() {
         let mut world = World::new();
-        let registry = Arc::new(ModRegistry::new());
-        world.insert_resource((*registry).clone());
+        let mut registry = ModRegistry::new();
 
-        let is_active = Arc::new(AtomicBool::new(true));
-        let mut init_ctx = ModInitContext::with_world(
-            Arc::clone(&registry),
-            Arc::clone(&is_active),
-            &mut world as *mut World,
-        );
-        let _guard = init_ctx.make_active();
-
-        let desc = ModComponentDescriptor::new(
-            c"RustModCustomData".as_ptr(),
-            ComponentUuid::from_name("RustModCustomData"),
+        let desc = ComponentDesc::new(
+            c"ffi::overwrites::RustModCustomData".as_ptr(),
+            ComponentUuid::from_parts(
+                "ffi::overwrites::RustModCustomData",
+                core::mem::size_of::<RustModCustomData>(),
+                core::mem::align_of::<RustModCustomData>(),
+                0,
+            ),
             core::mem::size_of::<RustModCustomData>(),
             core::mem::align_of::<RustModCustomData>(),
         );
-        unsafe {
-            host_register_component(&mut init_ctx as *mut ModInitContext as *mut c_void, &desc)
-        };
+        let comp_h = register_dynamic_in_world(&mut world, &mut registry, &desc);
+        let snapshot = registry.snapshot_arc();
+        let comp_id = snapshot.get_by_handle(comp_h).unwrap().component_id;
 
-        let reg = world.resource::<ModRegistry>().clone();
-        let comp_id = reg.get_by_name("RustModCustomData").unwrap().component_id;
+        let mut storage = HostCommandsStorage::new();
+        let mut ffi_e = FfiEntity::NULL;
+        {
+            let cell = world.as_unsafe_world_cell();
+            let mut cmds = HostCommands::new(&mut storage, cell.entity_allocator(), &snapshot);
+            let raw_cmds = cmds.as_ffi_ptr();
+            assert_eq!(
+                unsafe { host_cmd_spawn_empty(raw_cmds, &mut ffi_e) },
+                FfiResult::OK
+            );
 
-        let mut cmd_queue = CommandQueue::default();
-        let mut bridge = CommandQueueBridge::new(&mut cmd_queue, world.entity_allocator(), &reg);
-        let raw_queue = (&mut bridge as *mut CommandQueueBridge<'_>).cast::<RawCommandQueue>();
-
-        let ffi_e = unsafe { host_cmd_spawn_empty(raw_queue) };
-
-        // Issue 5 sequential overwrites
-        for val in [10.0f32, 25.0, 50.0, 75.0, 99.0] {
-            let data = RustModCustomData {
-                power: val,
-                shield: val as u32 * 2,
-            };
-            let status = unsafe {
-                host_cmd_insert_component(
-                    raw_queue,
-                    ffi_e,
-                    c"RustModCustomData".as_ptr(),
-                    &data as *const RustModCustomData as *const u8,
-                    core::mem::size_of::<RustModCustomData>(),
-                )
-            };
-            assert_eq!(status, FfiResult::OK);
+            for val in [10.0f32, 25.0, 50.0, 75.0, 99.0] {
+                let data = RustModCustomData {
+                    power: val,
+                    shield: val as u32 * 2,
+                };
+                assert_eq!(
+                    unsafe {
+                        host_cmd_insert(
+                            raw_cmds,
+                            ffi_e,
+                            comp_h,
+                            &data as *const RustModCustomData as *const u8,
+                            core::mem::size_of::<RustModCustomData>(),
+                        )
+                    },
+                    FfiResult::OK
+                );
+            }
         }
 
-        cmd_queue.apply(&mut world);
+        storage.apply_to_world(&mut world, &snapshot);
 
-        let bevy_entity = Entity::try_from_bits(ffi_e.0).unwrap();
+        let bevy_entity = Entity::try_from_bits(ffi_e.to_bits()).unwrap();
         let entity_ref = world.entity(bevy_entity);
         let final_data = unsafe {
             *(entity_ref.get_by_id(comp_id).unwrap().as_ptr() as *const RustModCustomData)
@@ -3755,208 +3459,169 @@ mod command_overwrites_and_stack_scramble {
             final_data,
             RustModCustomData {
                 power: 99.0,
-                shield: 198
-            },
-            "Final overwrite must be present in archetype table"
+                shield: 198,
+            }
         );
     }
 
     #[test]
     fn test_cmd_insert_and_despawn_before_flush() {
         let mut world = World::new();
-        let registry = Arc::new(ModRegistry::new());
-        world.insert_resource((*registry).clone());
+        let mut registry = ModRegistry::new();
 
-        let is_active = Arc::new(AtomicBool::new(true));
-        let mut init_ctx = ModInitContext::with_world(
-            Arc::clone(&registry),
-            Arc::clone(&is_active),
-            &mut world as *mut World,
-        );
-        let _guard = init_ctx.make_active();
-
-        let desc = ModComponentDescriptor::new(
-            c"CModCustomData".as_ptr(),
-            ComponentUuid::from_name("CModCustomData"),
+        let desc = ComponentDesc::new(
+            c"ffi::overwrites::CModCustomData".as_ptr(),
+            ComponentUuid::from_parts(
+                "ffi::overwrites::CModCustomData",
+                core::mem::size_of::<CModCustomData>(),
+                core::mem::align_of::<CModCustomData>(),
+                0,
+            ),
             core::mem::size_of::<CModCustomData>(),
             core::mem::align_of::<CModCustomData>(),
         );
-        unsafe {
-            host_register_component(&mut init_ctx as *mut ModInitContext as *mut c_void, &desc)
-        };
+        let comp_h = register_dynamic_in_world(&mut world, &mut registry, &desc);
+        let snapshot = registry.snapshot_arc();
 
-        let reg = world.resource::<ModRegistry>().clone();
-        let mut cmd_queue = CommandQueue::default();
-        let mut bridge = CommandQueueBridge::new(&mut cmd_queue, world.entity_allocator(), &reg);
-        let raw_queue = (&mut bridge as *mut CommandQueueBridge<'_>).cast::<RawCommandQueue>();
+        let mut storage = HostCommandsStorage::new();
+        let mut ffi_e = FfiEntity::NULL;
+        {
+            let cell = world.as_unsafe_world_cell();
+            let mut cmds = HostCommands::new(&mut storage, cell.entity_allocator(), &snapshot);
+            let raw_cmds = cmds.as_ffi_ptr();
+            assert_eq!(
+                unsafe { host_cmd_spawn_empty(raw_cmds, &mut ffi_e) },
+                FfiResult::OK
+            );
+            let c_data = CModCustomData {
+                mana: 42.0,
+                level: 7,
+            };
+            assert_eq!(
+                unsafe {
+                    host_cmd_insert(
+                        raw_cmds,
+                        ffi_e,
+                        comp_h,
+                        &c_data as *const CModCustomData as *const u8,
+                        core::mem::size_of::<CModCustomData>(),
+                    )
+                },
+                FfiResult::OK
+            );
+            assert_eq!(unsafe { host_cmd_despawn(raw_cmds, ffi_e) }, FfiResult::OK);
+        }
 
-        let ffi_e = unsafe { host_cmd_spawn_empty(raw_queue) };
-        let c_data = CModCustomData {
-            mana: 123.45,
-            level: 42,
-        };
+        storage.apply_to_world(&mut world, &snapshot);
 
-        let res_insert = unsafe {
-            host_cmd_insert_component(
-                raw_queue,
-                ffi_e,
-                c"CModCustomData".as_ptr(),
-                &c_data as *const CModCustomData as *const u8,
-                core::mem::size_of::<CModCustomData>(),
-            )
-        };
-        assert_eq!(res_insert, FfiResult::OK);
-
-        // Despawn in the same frame BEFORE flushing
-        let res_despawn = unsafe { host_cmd_despawn(raw_queue, ffi_e) };
-        assert_eq!(res_despawn, FfiResult::OK);
-
-        // Applying commands must not panic, and must drop AlignedBuffer cleanly
-        cmd_queue.apply(&mut world);
-
-        let bevy_entity = Entity::try_from_bits(ffi_e.0).unwrap();
-        assert!(
-            world.get_entity(bevy_entity).is_err(),
-            "Entity must be despawned cleanly"
-        );
+        let bevy_entity = Entity::try_from_bits(ffi_e.to_bits()).unwrap();
+        assert!(world.get_entity(bevy_entity).is_err());
     }
 
     #[test]
     fn test_cmd_insert_on_invalid_or_dead_entity() {
         let mut world = World::new();
-        let registry = Arc::new(ModRegistry::new());
-        world.insert_resource((*registry).clone());
+        let mut registry = ModRegistry::new();
 
-        let is_active = Arc::new(AtomicBool::new(true));
-        let mut init_ctx = ModInitContext::with_world(
-            Arc::clone(&registry),
-            Arc::clone(&is_active),
-            &mut world as *mut World,
-        );
-        let _guard = init_ctx.make_active();
-
-        let desc = ModComponentDescriptor::new(
-            c"CModCustomData".as_ptr(),
-            ComponentUuid::from_name("CModCustomData"),
+        let desc = ComponentDesc::new(
+            c"ffi::overwrites::CModCustomDataDead".as_ptr(),
+            ComponentUuid::from_parts(
+                "ffi::overwrites::CModCustomDataDead",
+                core::mem::size_of::<CModCustomData>(),
+                core::mem::align_of::<CModCustomData>(),
+                0,
+            ),
             core::mem::size_of::<CModCustomData>(),
             core::mem::align_of::<CModCustomData>(),
         );
-        unsafe {
-            host_register_component(&mut init_ctx as *mut ModInitContext as *mut c_void, &desc)
-        };
+        let comp_h = register_dynamic_in_world(&mut world, &mut registry, &desc);
+        let snapshot = registry.snapshot_arc();
 
-        let reg = world.resource::<ModRegistry>().clone();
-        let mut cmd_queue = CommandQueue::default();
-        let mut bridge = CommandQueueBridge::new(&mut cmd_queue, world.entity_allocator(), &reg);
-        let raw_queue = (&mut bridge as *mut CommandQueueBridge<'_>).cast::<RawCommandQueue>();
+        let mut storage = HostCommandsStorage::new();
+        {
+            let cell = world.as_unsafe_world_cell();
+            let mut cmds = HostCommands::new(&mut storage, cell.entity_allocator(), &snapshot);
+            let raw_cmds = cmds.as_ffi_ptr();
 
-        // Entity that was never allocated
-        let dead_entity = FfiEntity(0xDEAD_CAFE);
-        let c_data = CModCustomData {
-            mana: 1.0,
-            level: 1,
-        };
-        let res = unsafe {
-            host_cmd_insert_component(
-                raw_queue,
-                dead_entity,
-                c"CModCustomData".as_ptr(),
-                &c_data as *const CModCustomData as *const u8,
-                core::mem::size_of::<CModCustomData>(),
-            )
-        };
-        assert_eq!(res, FfiResult::OK);
+            let dead_entity =
+                FfiEntity::from_bits(Entity::from_raw_u32(777_777).unwrap().to_bits());
+            let c_data = CModCustomData {
+                mana: 1.0,
+                level: 1,
+            };
+            assert_eq!(
+                unsafe {
+                    host_cmd_insert(
+                        raw_cmds,
+                        dead_entity,
+                        comp_h,
+                        &c_data as *const CModCustomData as *const u8,
+                        core::mem::size_of::<CModCustomData>(),
+                    )
+                },
+                FfiResult::OK
+            );
+        }
 
-        // Applying queue must safely skip the non-existent entity without crashing or leaking
-        cmd_queue.apply(&mut world);
+        storage.apply_to_world(&mut world, &snapshot);
     }
 
     #[test]
     fn test_cmd_insert_boundary_sizes_and_alignments() {
         let mut world = World::new();
-        let registry = Arc::new(ModRegistry::new());
-        world.insert_resource((*registry).clone());
+        let mut registry = ModRegistry::new();
 
-        let is_active = Arc::new(AtomicBool::new(true));
-        let mut init_ctx = ModInitContext::with_world(
-            Arc::clone(&registry),
-            Arc::clone(&is_active),
-            &mut world as *mut World,
-        );
-        let _guard = init_ctx.make_active();
-
-        // 1. Zero-Sized Type (ZST)
-        let desc_zst = ModComponentDescriptor::new(
-            c"ZstComponent".as_ptr(),
-            ComponentUuid::from_name("ZstComponent"),
+        let desc_zst = ComponentDesc::new(
+            c"ffi::overwrites::ZstComponent".as_ptr(),
+            ComponentUuid::from_parts("ffi::overwrites::ZstComponent", 0, 1, 0),
             0,
             1,
         );
-        unsafe {
-            host_register_component(
-                &mut init_ctx as *mut ModInitContext as *mut c_void,
-                &desc_zst,
-            )
-        };
+        let zst_h = register_dynamic_in_world(&mut world, &mut registry, &desc_zst);
 
-        // 2. Large 64 KB component
-        const LARGE_SIZE: usize = 65536;
-        let desc_large = ModComponentDescriptor::new(
-            c"LargeComponent".as_ptr(),
-            ComponentUuid::from_name("LargeComponent"),
+        const LARGE_SIZE: usize = 65_536;
+        let desc_large = ComponentDesc::new(
+            c"ffi::overwrites::LargeComponent".as_ptr(),
+            ComponentUuid::from_parts("ffi::overwrites::LargeComponent", LARGE_SIZE, 16, 0),
             LARGE_SIZE,
             16,
         );
-        unsafe {
-            host_register_component(
-                &mut init_ctx as *mut ModInitContext as *mut c_void,
-                &desc_large,
-            )
-        };
+        let large_h = register_dynamic_in_world(&mut world, &mut registry, &desc_large);
 
-        let reg = world.resource::<ModRegistry>().clone();
-        let zst_id = reg.get_by_name("ZstComponent").unwrap().component_id;
-        let large_id = reg.get_by_name("LargeComponent").unwrap().component_id;
+        let snapshot = registry.snapshot_arc();
+        let zst_id = snapshot.get_by_handle(zst_h).unwrap().component_id;
+        let large_id = snapshot.get_by_handle(large_h).unwrap().component_id;
 
-        let mut cmd_queue = CommandQueue::default();
-        let mut bridge = CommandQueueBridge::new(&mut cmd_queue, world.entity_allocator(), &reg);
-        let raw_queue = (&mut bridge as *mut CommandQueueBridge<'_>).cast::<RawCommandQueue>();
+        let mut storage = HostCommandsStorage::new();
+        let mut ffi_e = FfiEntity::NULL;
+        {
+            let cell = world.as_unsafe_world_cell();
+            let mut cmds = HostCommands::new(&mut storage, cell.entity_allocator(), &snapshot);
+            let raw_cmds = cmds.as_ffi_ptr();
+            assert_eq!(
+                unsafe { host_cmd_spawn_empty(raw_cmds, &mut ffi_e) },
+                FfiResult::OK
+            );
+            assert_eq!(
+                unsafe { host_cmd_insert(raw_cmds, ffi_e, zst_h, core::ptr::null(), 0) },
+                FfiResult::OK
+            );
 
-        let ffi_e = unsafe { host_cmd_spawn_empty(raw_queue) };
+            let mut large_buf = vec![0x5Au8; LARGE_SIZE];
+            large_buf[0] = 0x11;
+            large_buf[LARGE_SIZE - 1] = 0x99;
+            assert_eq!(
+                unsafe {
+                    host_cmd_insert(raw_cmds, ffi_e, large_h, large_buf.as_ptr(), LARGE_SIZE)
+                },
+                FfiResult::OK
+            );
+        }
 
-        // Insert ZST (null pointer allowed when len == 0)
-        let res_zst = unsafe {
-            host_cmd_insert_component(
-                raw_queue,
-                ffi_e,
-                c"ZstComponent".as_ptr(),
-                core::ptr::null(),
-                0,
-            )
-        };
-        assert_eq!(res_zst, FfiResult::OK);
+        storage.apply_to_world(&mut world, &snapshot);
 
-        // Insert Large Component with distinct byte pattern
-        let mut large_buf = vec![0x5Au8; LARGE_SIZE];
-        large_buf[0] = 0x11;
-        large_buf[LARGE_SIZE - 1] = 0x99;
-
-        let res_large = unsafe {
-            host_cmd_insert_component(
-                raw_queue,
-                ffi_e,
-                c"LargeComponent".as_ptr(),
-                large_buf.as_ptr(),
-                LARGE_SIZE,
-            )
-        };
-        assert_eq!(res_large, FfiResult::OK);
-
-        cmd_queue.apply(&mut world);
-
-        let bevy_entity = Entity::try_from_bits(ffi_e.0).unwrap();
+        let bevy_entity = Entity::try_from_bits(ffi_e.to_bits()).unwrap();
         let entity_ref = world.entity(bevy_entity);
-
         assert!(entity_ref.contains_id(zst_id));
         assert!(entity_ref.contains_id(large_id));
 
@@ -3970,124 +3635,113 @@ mod command_overwrites_and_stack_scramble {
     #[test]
     fn test_allocator_isolation_stack_memory_scramble_defense() {
         let mut world = World::new();
-        let registry = Arc::new(ModRegistry::new());
-        world.insert_resource((*registry).clone());
+        let mut registry = ModRegistry::new();
 
-        let is_active = Arc::new(AtomicBool::new(true));
-        let mut init_ctx = ModInitContext::with_world(
-            Arc::clone(&registry),
-            Arc::clone(&is_active),
-            &mut world as *mut World,
-        );
-        let _guard = init_ctx.make_active();
-
-        let desc = ModComponentDescriptor::new(
-            c"RustModCustomData".as_ptr(),
-            ComponentUuid::from_name("RustModCustomData"),
+        let desc = ComponentDesc::new(
+            c"ffi::overwrites::StackScrambleData".as_ptr(),
+            ComponentUuid::from_parts(
+                "ffi::overwrites::StackScrambleData",
+                core::mem::size_of::<RustModCustomData>(),
+                core::mem::align_of::<RustModCustomData>(),
+                0,
+            ),
             core::mem::size_of::<RustModCustomData>(),
             core::mem::align_of::<RustModCustomData>(),
         );
-        unsafe {
-            host_register_component(&mut init_ctx as *mut ModInitContext as *mut c_void, &desc)
-        };
+        let comp_h = register_dynamic_in_world(&mut world, &mut registry, &desc);
+        let snapshot = registry.snapshot_arc();
+        let comp_id = snapshot.get_by_handle(comp_h).unwrap().component_id;
 
-        let reg = world.resource::<ModRegistry>().clone();
-        let comp_id = reg.get_by_name("RustModCustomData").unwrap().component_id;
-
-        let mut cmd_queue = CommandQueue::default();
-        let mut bridge = CommandQueueBridge::new(&mut cmd_queue, world.entity_allocator(), &reg);
-        let raw_queue = (&mut bridge as *mut CommandQueueBridge<'_>).cast::<RawCommandQueue>();
-
-        let ffi_e = unsafe { host_cmd_spawn_empty(raw_queue) };
-
-        // Scope stack variable and overwrite it before flush
+        let mut storage = HostCommandsStorage::new();
+        let mut ffi_e = FfiEntity::NULL;
         {
+            let cell = world.as_unsafe_world_cell();
+            let mut cmds = HostCommands::new(&mut storage, cell.entity_allocator(), &snapshot);
+            let raw_cmds = cmds.as_ffi_ptr();
+            assert_eq!(
+                unsafe { host_cmd_spawn_empty(raw_cmds, &mut ffi_e) },
+                FfiResult::OK
+            );
+
             let mut stack_data = RustModCustomData {
                 power: 777.0,
                 shield: 888,
             };
+            assert_eq!(
+                unsafe {
+                    host_cmd_insert(
+                        raw_cmds,
+                        ffi_e,
+                        comp_h,
+                        &stack_data as *const RustModCustomData as *const u8,
+                        core::mem::size_of::<RustModCustomData>(),
+                    )
+                },
+                FfiResult::OK
+            );
 
-            let status = unsafe {
-                host_cmd_insert_component(
-                    raw_queue,
-                    ffi_e,
-                    c"RustModCustomData".as_ptr(),
-                    &stack_data as *const RustModCustomData as *const u8,
-                    core::mem::size_of::<RustModCustomData>(),
-                )
-            };
-            assert_eq!(status, FfiResult::OK);
-
-            // Adversarially scramble stack memory!
             stack_data.power = -9999.0;
-            stack_data.shield = 0xDEADBEEF;
-            assert_eq!(stack_data.shield, 0xDEADBEEF);
+            stack_data.shield = 0xDEAD_BEEF;
+            assert_eq!(stack_data.shield, 0xDEAD_BEEF);
         }
 
-        // Now apply commands to world: host must read from its own host-allocated copy!
-        cmd_queue.apply(&mut world);
+        storage.apply_to_world(&mut world, &snapshot);
 
-        let bevy_entity = Entity::try_from_bits(ffi_e.0).unwrap();
+        let bevy_entity = Entity::try_from_bits(ffi_e.to_bits()).unwrap();
         let entity_ref = world.entity(bevy_entity);
         let read_data = unsafe {
             *(entity_ref.get_by_id(comp_id).unwrap().as_ptr() as *const RustModCustomData)
         };
-
         assert_eq!(
             read_data,
             RustModCustomData {
                 power: 777.0,
-                shield: 888
-            },
-            "Host allocator isolation (Rule 2) verified: host memory was isolated from guest stack mutation"
+                shield: 888,
+            }
         );
     }
 }
 
 mod multi_archetype_scaling_oracle {
-    #![allow(unused_imports, dead_code)]
     use crate::support::*;
-    use bevy_abi_mod_host::{AbiModPlugin, ModAppExt};
+    use bevy_abi_mod_host::{AbiModPlugin, ComponentOptions, LoadOptions, ModAppExt};
     use bevy_app::App;
     use std::collections::HashMap;
 
-    /// Test 1: Extreme multi-archetype scaling (32 distinct archetypes, 13,000+ entities,
-    /// empty table edge cases, single-entity table edge cases, prime entity counts,
-    /// mid-stream dynamic archetype additions, and mathematical arithmetic oracle).
     #[test]
     fn test_extreme_multi_archetype_scaling_and_arithmetic_oracle() {
         let (rust_dylib, c_dylib) = ensure_guest_mods_built();
-        reset_rust_mod_panic(&rust_dylib);
 
         let mut app = App::new();
         app.add_plugins(AbiModPlugin);
 
-        app.register_mod_component::<Position>();
-        app.register_mod_component::<Velocity>();
-        app.register_mod_component::<CombatHealth>();
-        app.register_mod_component::<NameTag>();
-        app.register_mod_component::<MetadataTag>();
-        app.register_mod_component::<Mass>();
-        app.register_mod_component::<Armor>();
+        app.register_mod_component::<Position>(ComponentOptions::new().with_default())
+            .unwrap();
+        app.register_mod_component::<Velocity>(ComponentOptions::new().with_default())
+            .unwrap();
+        app.register_mod_component::<CombatHealth>(ComponentOptions::new().with_default())
+            .unwrap();
+        app.register_mod_component::<NameTag>(ComponentOptions::new().with_default())
+            .unwrap();
+        app.register_mod_component::<MetadataTag>(ComponentOptions::new().with_default())
+            .unwrap();
+        app.register_mod_component::<Mass>(ComponentOptions::new().with_default())
+            .unwrap();
+        app.register_mod_component::<Armor>(ComponentOptions::new().with_default())
+            .unwrap();
 
-        // We will construct 32 distinct archetypes using a 5-bit mask for supplementary components:
-        // Bit 0: Velocity
-        // Bit 1: CombatHealth
-        // Bit 2: NameTag
-        // Bit 3: Mass
-        // Bit 4: Armor
         let mut expected_arithmetic = HashMap::new();
         let mut entity_archetype_mask = HashMap::new();
-        let mut total_spawned = 0;
+        let mut total_spawned = 0usize;
 
         for mask in 0u32..32 {
             let count = match mask {
-                0 => 0,   // Empty table edge case
-                1 => 1,   // Single-entity table edge case
-                2 => 7,   // Prime count edge case
-                3 => 13,  // Prime count edge case
-                4 => 64,  // Power-of-two alignment
-                _ => 500, // Large chunk
+                0 => 0,
+                1 => 1,
+                2 => 7,
+                3 => 13,
+                4 => 64,
+                _ => 500,
             };
 
             for i in 0..count {
@@ -4207,19 +3861,19 @@ mod multi_archetype_scaling_oracle {
             }
         }
 
-        assert!(
-            total_spawned > 13_000,
-            "Spawned entity count must be > 13,000 across 32 archetypes"
-        );
+        assert!(total_spawned > 13_000);
 
-        let r_id = app.load_mod_tracked(&rust_dylib).expect("load rust mod");
-        let c_id = app.load_mod_tracked(&c_dylib).expect("load c mod");
+        let r_id = app
+            .load_mod_with(&rust_dylib, LoadOptions::new().with_shadow_copy(true))
+            .expect("load rust mod");
+        let c_id = app
+            .load_mod_with(&c_dylib, LoadOptions::new().with_shadow_copy(true))
+            .expect("load c mod");
 
         const TICKS: usize = 10;
         for tick in 1..=TICKS {
             app.update();
 
-            // On tick 5: edge condition - mid-stream archetype mutation (dynamic entity additions)
             if tick == 5 {
                 for j in 0..200 {
                     let id = 999_000 + j;
@@ -4259,7 +3913,6 @@ mod multi_archetype_scaling_oracle {
             if mask == 0xFF {
                 continue;
             }
-
             let init = expected_arithmetic[&entity];
             let has_vel = match mask {
                 1 | 5 | 6 => true,
@@ -4273,69 +3926,44 @@ mod multi_archetype_scaling_oracle {
                 expected.y += (TICKS as f32) * 2.0;
             }
             expected.z += (TICKS as f32) * 1.0;
-
             expected_arithmetic.insert(entity, expected);
         }
 
         let world = app.world();
-        let mut verified_count = 0;
-
+        let mut verified_count = 0usize;
         for (&entity, &expected) in &expected_arithmetic {
-            let actual = world
-                .get::<Position>(entity)
-                .expect("Entity must have Position");
-            assert_eq!(
-                actual.x, expected.x,
-                "Entity {:?} (mask {}) x-coord mismatch",
-                entity, entity_archetype_mask[&entity]
-            );
-            assert_eq!(
-                actual.y, expected.y,
-                "Entity {:?} (mask {}) y-coord mismatch",
-                entity, entity_archetype_mask[&entity]
-            );
-            assert_eq!(
-                actual.z, expected.z,
-                "Entity {:?} (mask {}) z-coord mismatch",
-                entity, entity_archetype_mask[&entity]
-            );
+            let actual = world.get::<Position>(entity).unwrap();
+            assert_eq!(actual.x, expected.x);
+            assert_eq!(actual.y, expected.y);
+            assert_eq!(actual.z, expected.z);
             verified_count += 1;
         }
-
-        assert_eq!(
-            verified_count,
-            expected_arithmetic.len(),
-            "All entities must be verified against arithmetic oracle"
-        );
+        assert_eq!(verified_count, expected_arithmetic.len());
 
         app.unload_mod(r_id).unwrap();
         app.unload_mod(c_id).unwrap();
     }
 
-    /// Test 2: Scale stress test across 100,000 entities in 16 fragmented archetypes.
-    /// Tests chunk iteration traversal across 100,000 entities with disjoint query matching:
-    /// 50,000 entities match (Position + Velocity) while 50,000 entities match (Position + Mass without Velocity).
-    /// Verifies that chunk iteration processes all 100k entities without memory corruption or cross-archetype bleed.
     #[test]
     fn test_100k_scale_fragmented_archetype_traversal_and_arithmetic() {
         let (rust_dylib, c_dylib) = ensure_guest_mods_built();
-        reset_rust_mod_panic(&rust_dylib);
 
         let mut app = App::new();
         app.add_plugins(AbiModPlugin);
 
-        app.register_mod_component::<Position>();
-        app.register_mod_component::<Velocity>();
-        app.register_mod_component::<Mass>();
-        app.register_mod_component::<Armor>();
+        app.register_mod_component::<Position>(ComponentOptions::new().with_default())
+            .unwrap();
+        app.register_mod_component::<Velocity>(ComponentOptions::new().with_default())
+            .unwrap();
+        app.register_mod_component::<Mass>(ComponentOptions::new().with_default())
+            .unwrap();
+        app.register_mod_component::<Armor>(ComponentOptions::new().with_default())
+            .unwrap();
 
         const SCALE: usize = 100_000;
         const ARCHETYPES: usize = 16;
         const PER_ARCH: usize = SCALE / ARCHETYPES;
 
-        // Spawn 100,000 entities across 16 archetypes:
-        // Even archetypes (0, 2, 4, ... 14): Position + Velocity + Armor(i) -> 50,000 entities
-        // Odd archetypes (1, 3, 5, ... 15): Position + Mass(i) (NO Velocity) -> 50,000 entities
         for arch in 0..ARCHETYPES {
             let is_kinematic = arch % 2 == 0;
             for i in 0..PER_ARCH {
@@ -4363,46 +3991,37 @@ mod multi_archetype_scaling_oracle {
             }
         }
 
-        let r_id = app.load_mod_tracked(&rust_dylib).unwrap();
-        let c_id = app.load_mod_tracked(&c_dylib).unwrap();
+        let r_id = app
+            .load_mod_with(&rust_dylib, LoadOptions::new().with_shadow_copy(true))
+            .unwrap();
+        let c_id = app
+            .load_mod_with(&c_dylib, LoadOptions::new().with_shadow_copy(true))
+            .unwrap();
 
-        // Run 5 ticks
         for _ in 0..5 {
             app.update();
         }
 
-        // Verify 50,000 kinematic entities:
-        // Rust mod: pos.x += 5 * 1.0 = 5.0, pos.y += 5 * 3.0 = 15.0
-        // C mod: pos.z += 5 * 1.0 = 5.0 (since vz == 0.0)
-        let mut kin_count = 0;
-        let mut non_kin_count = 0;
+        let mut kin_count = 0usize;
+        let mut non_kin_count = 0usize;
 
         let mut query = app
             .world_mut()
             .query::<(&Position, Option<&Velocity>, Option<&Mass>)>();
         for (pos, vel, mass) in query.iter(app.world()) {
             if vel.is_some() {
-                assert_eq!(pos.y, 15.0, "Kinematic entity pos.y must be 15.0");
-                assert_eq!(pos.z, 5.0, "Kinematic entity pos.z must be 5.0");
+                assert_eq!(pos.y, 15.0);
+                assert_eq!(pos.z, 5.0);
                 kin_count += 1;
             } else if mass.is_some() {
-                assert_eq!(pos.y, 0.0, "Non-kinematic entity pos.y must remain 0.0");
-                assert_eq!(
-                    pos.z, 5.0,
-                    "Non-kinematic entity pos.z must be 5.0 from C mod"
-                );
+                assert_eq!(pos.y, 0.0);
+                assert_eq!(pos.z, 5.0);
                 non_kin_count += 1;
             }
         }
 
-        assert_eq!(
-            kin_count, 50_000,
-            "Must have exactly 50,000 kinematic entities"
-        );
-        assert_eq!(
-            non_kin_count, 50_000,
-            "Must have exactly 50,000 non-kinematic entities"
-        );
+        assert_eq!(kin_count, 50_000);
+        assert_eq!(non_kin_count, 50_000);
 
         app.unload_mod(r_id).unwrap();
         app.unload_mod(c_id).unwrap();
@@ -4410,56 +4029,48 @@ mod multi_archetype_scaling_oracle {
 }
 
 mod change_detection_archetype_isolation {
-    #![allow(unused_imports, dead_code)]
-    use bevy_abi_mod_host::{AbiModPlugin, ModAppExt, ModRegistry};
+    use bevy_abi_mod_host::{AbiModPlugin, ComponentOptions, ModAppExt, ModRegistry};
     use bevy_abi_mod_host_sys::{
-        DynamicCSystem, host_iter_column_mutable, host_iter_column_readonly,
-        host_iter_mark_changed, host_iter_next_chunk,
+        BamQuerySpecOwned, GuestSystem, host_iter_column_mutable,
+        host_iter_column_mutable_untracked, host_iter_column_readonly,
+        host_iter_mark_changed_range, host_iter_next_chunk, host_sys_query,
     };
-    use bevy_abi_mod_macros::ModExposable;
-    use bevy_abi_mod_sys::{ComponentAccessMode, FfiResult, RawChunkIter, RawCommandQueue};
+    use bevy_abi_mod_macros::ModComponent;
+    use bevy_abi_mod_sys::{AccessMode, BamIter, BamSystemCtx, BamTermDesc, FfiResult};
     use bevy_app::{App, Update};
     use bevy_ecs::component::Component;
     use bevy_ecs::entity::Entity;
-    use bevy_ecs::prelude::{Resource, World};
+    use bevy_ecs::prelude::Resource;
     use bevy_ecs::query::Changed;
-    use bevy_ecs::schedule::{IntoScheduleConfigs, LogLevel, Schedule, ScheduleBuildSettings};
-    use bevy_ecs::system::{Query, ResMut, System, SystemAccess};
+    use bevy_ecs::schedule::IntoScheduleConfigs;
+    use bevy_ecs::system::{Query, ResMut};
     use core::ffi::c_void;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+    #[repr(C)]
+    #[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+    #[mod_component(name = "ffi::cd_isolation::Position")]
     pub struct Position {
         pub x: f32,
         pub y: f32,
         pub z: f32,
     }
 
-    #[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+    #[repr(C)]
+    #[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+    #[mod_component(name = "ffi::cd_isolation::Velocity")]
     pub struct Velocity {
         pub x: f32,
         pub y: f32,
         pub z: f32,
     }
 
-    #[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+    #[repr(C)]
+    #[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+    #[mod_component(name = "ffi::cd_isolation::Health")]
     pub struct Health {
         pub current: i32,
         pub max: i32,
     }
-
-    unsafe extern "C" fn noop_system(
-        _iter: *mut RawChunkIter,
-        _commands: *mut RawCommandQueue,
-        _user_data: *mut c_void,
-    ) -> FfiResult {
-        FfiResult::OK
-    }
-
-    // ============================================================================
-    // SUITE 3: CHANGE DETECTION RELIABILITY
-    // ============================================================================
 
     #[derive(Resource, Default)]
     struct ChangeTracker {
@@ -4476,24 +4087,23 @@ mod change_detection_archetype_isolation {
     }
 
     struct ChangeSimContext {
-        mode: usize, // 0 = no mutate, 1 = mutate all via column_mutable, 2 = fine-grained mark rows 3 and 7
+        mode: usize,
     }
 
     unsafe extern "C" fn change_sim_callback(
-        iter: *mut RawChunkIter,
-        _commands: *mut RawCommandQueue,
+        sys_ctx: *mut BamSystemCtx,
         user_data: *mut c_void,
     ) -> FfiResult {
         let ctx = unsafe { &*(user_data as *const ChangeSimContext) };
-        loop {
-            let count = unsafe { host_iter_next_chunk(iter) };
-            if count == 0 {
-                break;
-            }
-
+        let mut iter: *mut BamIter = core::ptr::null_mut();
+        let rc = unsafe { host_sys_query(sys_ctx, 0, &mut iter) };
+        if rc.is_err() {
+            return rc;
+        }
+        let mut count = 0usize;
+        while unsafe { host_iter_next_chunk(iter, &mut count) }.get() {
             match ctx.mode {
                 1 => {
-                    // Mutate all via column_mutable
                     let ptr = unsafe { host_iter_column_mutable(iter, 0) as *mut Position };
                     if !ptr.is_null() {
                         for i in 0..count {
@@ -4504,14 +4114,13 @@ mod change_detection_archetype_isolation {
                     }
                 }
                 2 => {
-                    // Fine-grained row marking: only mark row 3 and row 7
+                    let _ = unsafe { host_iter_column_mutable_untracked(iter, 0) };
                     if count > 7 {
-                        let _ = unsafe { host_iter_mark_changed(iter, 0, 3) };
-                        let _ = unsafe { host_iter_mark_changed(iter, 0, 7) };
+                        let _ = unsafe { host_iter_mark_changed_range(iter, 0, 3, 1) };
+                        let _ = unsafe { host_iter_mark_changed_range(iter, 0, 7, 1) };
                     }
                 }
                 _ => {
-                    // Read-only access: no mutation, no tick marking
                     let _ptr = unsafe { host_iter_column_readonly(iter, 0) };
                 }
             }
@@ -4524,9 +4133,10 @@ mod change_detection_archetype_isolation {
         let mut app = App::new();
         app.add_plugins(AbiModPlugin);
         app.init_resource::<ChangeTracker>();
-        app.register_mod_component::<Position>();
+        let pos_h = app
+            .register_mod_component::<Position>(ComponentOptions::new())
+            .unwrap();
 
-        // Spawn 10 entities
         for i in 0..10 {
             app.world_mut().spawn(Position {
                 x: i as f32,
@@ -4536,72 +4146,37 @@ mod change_detection_archetype_isolation {
         }
 
         let registry = app.world().resource::<ModRegistry>().clone();
-        let sim_ctx = Box::into_raw(Box::new(ChangeSimContext { mode: 0 }));
-
-        let dynamic_sys = DynamicCSystem::new(
-            "change_sim".to_string(),
-            vec![bevy_abi_mod_host_sys::ComponentAccessDescOwned {
-                name: "Position".to_string(),
-                mode: ComponentAccessMode::WRITE,
-            }],
+        let mut sim_ctx = Box::new(ChangeSimContext { mode: 0 });
+        let sys = GuestSystem::new(
+            "change_sim",
+            vec![BamQuerySpecOwned::new(vec![BamTermDesc::new(
+                pos_h,
+                AccessMode::WRITE,
+            )])],
             change_sim_callback,
-            sim_ctx as *mut c_void,
-            Arc::new(registry),
+            (&mut *sim_ctx as *mut ChangeSimContext).cast::<c_void>(),
+            registry,
         );
+        app.add_systems(Update, (sys, track_changed_positions).chain());
 
-        app.add_systems(Update, (dynamic_sys, track_changed_positions).chain());
-
-        // Frame 1: Spawned entities are detected as added/changed by Bevy
         app.update();
         assert_eq!(app.world().resource::<ChangeTracker>().changed_count, 10);
 
-        // Frame 2: mode = 0 (no mutation). Downstream query MUST observe 0 changed entities!
-        unsafe {
-            (*sim_ctx).mode = 0;
-        }
+        sim_ctx.mode = 0;
         app.update();
-        assert_eq!(
-            app.world().resource::<ChangeTracker>().changed_count,
-            0,
-            "Frame without mutation must produce 0 Changed<Position> events"
-        );
+        assert_eq!(app.world().resource::<ChangeTracker>().changed_count, 0);
 
-        // Frame 3: mode = 1 (mutate all via host_iter_column_mutable). MUST observe 10 changed entities!
-        unsafe {
-            (*sim_ctx).mode = 1;
-        }
+        sim_ctx.mode = 1;
         app.update();
-        assert_eq!(
-            app.world().resource::<ChangeTracker>().changed_count,
-            10,
-            "Frame with host_iter_column_mutable must trigger Changed<Position> on all 10 entities"
-        );
+        assert_eq!(app.world().resource::<ChangeTracker>().changed_count, 10);
 
-        // Frame 4: mode = 0 (no mutation again). MUST observe 0 changed entities!
-        unsafe {
-            (*sim_ctx).mode = 0;
-        }
+        sim_ctx.mode = 0;
         app.update();
-        assert_eq!(
-            app.world().resource::<ChangeTracker>().changed_count,
-            0,
-            "Subsequent non-mutating frame must cleanly reset Changed<Position> to 0"
-        );
+        assert_eq!(app.world().resource::<ChangeTracker>().changed_count, 0);
 
-        // Frame 5: mode = 2 (fine-grained mark rows 3 and 7 only). MUST observe EXACTLY 2 changed entities!
-        unsafe {
-            (*sim_ctx).mode = 2;
-        }
+        sim_ctx.mode = 2;
         app.update();
-        assert_eq!(
-            app.world().resource::<ChangeTracker>().changed_count,
-            2,
-            "host_iter_mark_changed on rows 3 and 7 must trigger Changed<Position> on exactly 2 entities"
-        );
-
-        unsafe {
-            drop(Box::from_raw(sim_ctx));
-        }
+        assert_eq!(app.world().resource::<ChangeTracker>().changed_count, 2);
     }
 
     #[test]
@@ -4609,11 +4184,15 @@ mod change_detection_archetype_isolation {
         let mut app = App::new();
         app.add_plugins(AbiModPlugin);
         app.init_resource::<ChangeTracker>();
-        app.register_mod_component::<Position>();
-        app.register_mod_component::<Velocity>();
-        app.register_mod_component::<Health>();
+        let pos_h = app
+            .register_mod_component::<Position>(ComponentOptions::new())
+            .unwrap();
+        let vel_h = app
+            .register_mod_component::<Velocity>(ComponentOptions::new())
+            .unwrap();
+        app.register_mod_component::<Health>(ComponentOptions::new())
+            .unwrap();
 
-        // Table A (Position + Velocity): 5 entities
         for i in 0..5 {
             app.world_mut().spawn((
                 Position {
@@ -4628,8 +4207,6 @@ mod change_detection_archetype_isolation {
                 },
             ));
         }
-
-        // Table B (Position + Health): 5 entities
         for i in 0..5 {
             app.world_mut().spawn((
                 Position {
@@ -4645,54 +4222,29 @@ mod change_detection_archetype_isolation {
         }
 
         let registry = app.world().resource::<ModRegistry>().clone();
-        let sim_ctx = Box::into_raw(Box::new(ChangeSimContext { mode: 0 }));
-
-        // System queries Position (WRITE) and Velocity (READ).
-        // MUST match ONLY Table A! Table B must not be matched or modified.
-        let dynamic_sys = DynamicCSystem::new(
-            "kinematics_mutator".to_string(),
-            vec![
-                bevy_abi_mod_host_sys::ComponentAccessDescOwned {
-                    name: "Position".to_string(),
-                    mode: ComponentAccessMode::WRITE,
-                },
-                bevy_abi_mod_host_sys::ComponentAccessDescOwned {
-                    name: "Velocity".to_string(),
-                    mode: ComponentAccessMode::READ,
-                },
-            ],
+        let mut sim_ctx = Box::new(ChangeSimContext { mode: 0 });
+        let sys = GuestSystem::new(
+            "kinematics_mutator",
+            vec![BamQuerySpecOwned::new(vec![
+                BamTermDesc::new(pos_h, AccessMode::WRITE),
+                BamTermDesc::new(vel_h, AccessMode::READ),
+            ])],
             change_sim_callback,
-            sim_ctx as *mut c_void,
-            Arc::new(registry),
+            (&mut *sim_ctx as *mut ChangeSimContext).cast::<c_void>(),
+            registry,
         );
+        app.add_systems(Update, (sys, track_changed_positions).chain());
 
-        app.add_systems(Update, (dynamic_sys, track_changed_positions).chain());
-
-        // Frame 1: Flush initial spawns
         app.update();
         assert_eq!(app.world().resource::<ChangeTracker>().changed_count, 10);
 
-        // Frame 2: Idle frame
-        unsafe {
-            (*sim_ctx).mode = 0;
-        }
+        sim_ctx.mode = 0;
         app.update();
         assert_eq!(app.world().resource::<ChangeTracker>().changed_count, 0);
 
-        // Frame 3: Mutate matched tables (Table A only)
-        unsafe {
-            (*sim_ctx).mode = 1;
-        }
+        sim_ctx.mode = 1;
         app.update();
-        assert_eq!(
-            app.world().resource::<ChangeTracker>().changed_count,
-            5,
-            "Only entities in Table A (Position + Velocity) should trigger Changed<Position>"
-        );
-
-        unsafe {
-            drop(Box::from_raw(sim_ctx));
-        }
+        assert_eq!(app.world().resource::<ChangeTracker>().changed_count, 5);
     }
 
     #[test]
@@ -4700,7 +4252,9 @@ mod change_detection_archetype_isolation {
         let mut app = App::new();
         app.add_plugins(AbiModPlugin);
         app.init_resource::<ChangeTracker>();
-        app.register_mod_component::<Position>();
+        let pos_h = app
+            .register_mod_component::<Position>(ComponentOptions::new())
+            .unwrap();
 
         app.world_mut().spawn(Position {
             x: 10.0,
@@ -4708,61 +4262,43 @@ mod change_detection_archetype_isolation {
             z: 30.0,
         });
 
-        let registry = app.world().resource::<ModRegistry>().clone();
-
-        // Guest callback that attempts to illegally mutate / mark changed on a READ column
         unsafe extern "C" fn illegal_mutator_callback(
-            iter: *mut RawChunkIter,
-            _commands: *mut RawCommandQueue,
+            sys_ctx: *mut BamSystemCtx,
             _user_data: *mut c_void,
         ) -> FfiResult {
-            loop {
-                let count = unsafe { host_iter_next_chunk(iter) };
-                if count == 0 {
-                    break;
-                }
-
-                // Attempt mutable access on READ column: MUST return null
-                let ptr_mut = unsafe { host_iter_column_mutable(iter, 0) };
-                assert!(
-                    ptr_mut.is_null(),
-                    "host_iter_column_mutable must return null on READ column"
-                );
-
-                // Attempt mark changed on READ column: MUST return PERMISSION_DENIED
-                let mark_res = unsafe { host_iter_mark_changed(iter, 0, 0) };
+            let mut iter: *mut BamIter = core::ptr::null_mut();
+            let rc = unsafe { host_sys_query(sys_ctx, 0, &mut iter) };
+            if rc.is_err() {
+                return rc;
+            }
+            let mut count = 0usize;
+            while unsafe { host_iter_next_chunk(iter, &mut count) }.get() {
+                assert!(unsafe { host_iter_column_mutable(iter, 0) }.is_null());
                 assert_eq!(
-                    mark_res,
-                    FfiResult::PERMISSION_DENIED,
-                    "host_iter_mark_changed must return PERMISSION_DENIED on READ column"
+                    unsafe { host_iter_mark_changed_range(iter, 0, 0, 1) },
+                    FfiResult::PERMISSION_DENIED
                 );
             }
             FfiResult::OK
         }
 
-        let dynamic_sys = DynamicCSystem::new(
-            "read_only_sys".to_string(),
-            vec![bevy_abi_mod_host_sys::ComponentAccessDescOwned {
-                name: "Position".to_string(),
-                mode: ComponentAccessMode::READ,
-            }],
+        let registry = app.world().resource::<ModRegistry>().clone();
+        let sys = GuestSystem::new(
+            "read_only_sys",
+            vec![BamQuerySpecOwned::new(vec![BamTermDesc::new(
+                pos_h,
+                AccessMode::READ,
+            )])],
             illegal_mutator_callback,
             core::ptr::null_mut(),
-            Arc::new(registry),
+            registry,
         );
+        app.add_systems(Update, (sys, track_changed_positions).chain());
 
-        app.add_systems(Update, (dynamic_sys, track_changed_positions).chain());
-
-        // Frame 1: Initial spawn
         app.update();
         assert_eq!(app.world().resource::<ChangeTracker>().changed_count, 1);
 
-        // Frame 2: Illegal mutation attempts rejected; Changed<Position> MUST be 0!
         app.update();
-        assert_eq!(
-            app.world().resource::<ChangeTracker>().changed_count,
-            0,
-            "Rejected mutation attempts must not update change ticks"
-        );
+        assert_eq!(app.world().resource::<ChangeTracker>().changed_count, 0);
     }
 }
