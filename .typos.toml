@@ -15,6 +15,8 @@ extend-exclude = [
 [default]
 extend-ignore-re = [
     "0x[0-9a-fA-F_]+",
+    "[-/]Iinclude",
+    "\\bSEH\\b",
 ]
 
 [default.extend-identifiers]

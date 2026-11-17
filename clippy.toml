@@ -8,11 +8,9 @@ doc-valid-idents = [
     "Bevy",
     "ABI",
     "VTable",
-    "FfiLayout",
     "Entity",
     "World",
     "AbiPod",
-    "ModExposable",
     "StrView",
     "C99",
 ]

@@ -90,7 +90,7 @@ impl ModNamedSystemSet {
 }
 
 /// Resource mapping ABI [`ScheduleId`] discriminants (`0..=5` built-in and `>= 1024` custom game
-/// schedules) onto Bevy [`InternedScheduleLabel`]s (ADR 0002).
+/// schedules) onto Bevy [`InternedScheduleLabel`]s.
 #[derive(Resource, Default, Clone, Debug)]
 pub struct ModScheduleMap {
     custom: HashMap<ScheduleId, InternedScheduleLabel>,

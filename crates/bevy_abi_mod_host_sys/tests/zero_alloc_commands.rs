@@ -1,5 +1,5 @@
 //! Counting-allocator proof that `GuestSystem` + `CommandArena` + batched `cmd_spawn` perform
-//! **zero** heap allocations in steady-state frames (ADR 0003).
+//! **zero** heap allocations in steady-state frames.
 
 use bevy_abi_mod_host_sys::{ComponentOptions, GuestSystem, HOST_API, ModRegistry};
 use bevy_abi_mod_sys::{

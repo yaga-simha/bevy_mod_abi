@@ -12,7 +12,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 static NEXT_SHADOW_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Configuration options controlling how `ModWorldExt::load_mod_with` / `ModAppExt::load_mod_with`
-/// opens, validates, and schedules a guest shared library (ADR 0005).
+/// opens, validates, and schedules a guest shared library.
 #[derive(Clone, Debug)]
 pub struct LoadOptions {
     /// When `true` (default in debug builds), copies the `.dll`/`.so`/`.dylib` to a unique

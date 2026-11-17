@@ -1,6 +1,6 @@
-//! Lock-free `ArcSwapOption` per-`World` drop trampolines with slot reclamation (ADR 0001).
+//! Lock-free `ArcSwapOption` per-`World` drop trampolines with slot reclamation.
 //!
-//! Implements the exact ADR 0001 slot lifecycle:
+//! Implements the two-condition slot lifecycle:
 //! - Hot path (`drop_trampoline::<SLOT>`): wait-free `ArcSwapOption::load()` with zero `Mutex`
 //!   acquisition and zero leaked `RetiredSnapshotPtr` allocations.
 //! - Per-`World` RAII ownership (`WorldDropGuard` resource): tracks every slot allocated for a
@@ -97,7 +97,7 @@ fn reclaim_closed_slot(slot: usize) {
 }
 
 /// Staged drop-trampoline mutation recorded during `bevy_abi_mod_init` so [`crate::loader::transaction::LoadTransaction`]
-/// or [`crate::rollback_unscheduled_mod_in_world`] can atomically undo uncommitted bindings (`ADR 0001` §2.4).
+/// or [`crate::rollback_unscheduled_mod_in_world`] can atomically undo uncommitted bindings.
 #[derive(Clone)]
 pub(crate) struct StagedDropBinding {
     uuid: ComponentUuid,
@@ -138,7 +138,7 @@ pub(crate) fn increment_drop_slot_live_values(slot: usize) {
 }
 
 /// Invokes the most recent active foreign drop callback bound to `SLOT`, if any, and participates
-/// in ADR 0001 deferred slot reclamation when `WorldDropGuard` has already closed `SLOT`.
+/// in deferred slot reclamation when `WorldDropGuard` has already closed `SLOT`.
 ///
 /// # Safety
 /// `ptr` must point to a valid component allocation owned by Bevy's storage drop hook.
@@ -478,7 +478,7 @@ pub(crate) fn on_remove_hook_for_slot(slot: usize) -> ComponentHook {
 }
 
 /// Per-`World` RAII resource owning all drop trampoline slots bound to `ComponentDescriptor`s in
-/// that `World` (ADR 0001).
+/// that `World`.
 ///
 /// When the `World` is dropped, `WorldDropGuard::drop` disarms every owned slot (`DROP_SLOTS[slot].store(None)`),
 /// transitions its state to `SLOT_CLOSING`, and immediately returns any slot with `live_values == 0`
@@ -579,7 +579,7 @@ impl WorldDropGuard {
         Some((slot, drop_trampoline_fn_for_slot(slot), staged))
     }
 
-    /// Rolls back uncommitted [`StagedDropBinding`]s in reverse registration order (`ADR 0001` §2.4):
+    /// Rolls back uncommitted [`StagedDropBinding`]s in reverse registration order:
     /// disarms `is_active`, restores `previous_snapshot` on hot-updated slots, and immediately
     /// returns freshly allocated slots (`live_values == 0`) to `FREE_LIST`.
     pub(crate) fn rollback_staged_bindings(&mut self, bindings: &[StagedDropBinding]) {

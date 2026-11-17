@@ -287,7 +287,7 @@ impl HostCommandsStorage {
     }
 
     /// Invokes foreign destructors on any uncommitted dynamic `drop_fn` payloads still held in
-    /// `CommandArena` (`ADR 0003` §2.3, Rule 2) without decrementing `SLOT_LIFECYCLE`.
+    /// `CommandArena` without decrementing `SLOT_LIFECYCLE`.
     fn drop_uncommitted_payloads(&mut self) {
         if self.commands.is_empty() && self.batch_items.is_empty() {
             return;
@@ -341,7 +341,7 @@ impl HostCommandsStorage {
 
     /// Discards all queued commands without applying them to the `World` (used when a guest system
     /// faults mid-invocation), dropping any uncommitted foreign destructor payloads while preserving
-    /// allocated slab and vector capacities (`ADR 0003` §2.3).
+    /// allocated slab and vector capacities.
     #[inline]
     pub fn clear(&mut self) {
         self.drop_uncommitted_payloads();

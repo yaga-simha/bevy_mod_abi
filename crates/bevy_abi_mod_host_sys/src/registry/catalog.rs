@@ -402,8 +402,7 @@ fn insert_default_impl<T: Component + Default>(world: &mut World, entity: Entity
     }
 }
 
-/// Fluent registration options configuring how a host Rust [`Component`] is exposed to guest mods
-/// (ADR 0006).
+/// Fluent registration options configuring how a host Rust [`Component`] is exposed to guest mods.
 ///
 /// By default (`ComponentOptions::default()`), raw byte insertion (`cmd_insert` / `cmd_spawn`) is
 /// enabled automatically when `T::IS_RAW_INSERTABLE && !needs_drop::<T>()`, and disabled otherwise.

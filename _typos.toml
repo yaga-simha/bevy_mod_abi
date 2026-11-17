@@ -1,9 +1,0 @@
-[default]
-extend-ignore-re = [
-  "[-/]Iinclude",
-  "\\bSEH\\b",
-  "[0-9a-fA-F]{4}-[0-9a-fA-FgG]{12}",
-]
-
-[default.extend-words]
-ratatui = "ratatui"

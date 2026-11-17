@@ -173,8 +173,8 @@ impl LoadContext {
         self.host_ctx.header.poison();
     }
 
-    /// Rolls back all drop trampoline bindings and registry mutations recorded in this `LoadContext`
-    /// (`ADR 0001` §2.4), returning freshly allocated trampoline slots to `FREE_LIST` and
+    /// Rolls back all drop trampoline bindings and registry mutations recorded in this `LoadContext`,
+    /// returning freshly allocated trampoline slots to `FREE_LIST` and
     /// restoring the initial `RegistrySnapshot`.
     pub fn rollback(&mut self) {
         self.finish_init();

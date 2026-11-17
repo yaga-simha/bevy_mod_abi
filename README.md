@@ -210,7 +210,7 @@ cargo bench --manifest-path benches/deterministic_gate/Cargo.toml
 - **[Developer Guide (mdBook)](./docs/book/src/SUMMARY.md)** — Quickstart, Rust/C99/C++17/Zig guest authoring, host schedules, shadow-copy hot reload, and performance tuning.
 - **[Wire & Runtime Specification (`spec.md`)](./spec.md)** — Authoritative `ABI 0.2.0` struct layouts, handle lifetimes, and safety proofs.
 - **[Benchmarks (`docs/BENCHMARKS.md`)](./docs/BENCHMARKS.md)** — Apple M4 Pro baselines across all 5 canonical scenarios and the 34-archetype permutation matrix.
-- **[Migration Guide (`0.1` -> `0.2`)](./docs/MIGRATION_0.1_TO_0.2.md)** & **[Architecture Decision Records (`docs/adr/`)](./docs/adr/)**.
+- **[Architecture & Feature Summary (`docs/ARCHITECTURE.md`)](./docs/ARCHITECTURE.md)** — How each subsystem and feature is built across the 7-crate workspace.
 
 ## License
 

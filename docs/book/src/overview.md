@@ -12,7 +12,7 @@ Standard Rust `crate-type = ["dylib"]` plugins share internal `#[repr(Rust)]` la
 - **Allocator Crossover:** Freeing a guest `String` or panic payload on the host's allocator (for example Windows per-DLL `HeapAlloc` or `mimalloc`) corrupts process heaps.
 
 `bevy_abi_mod` solves all three by placing a strict **`#[repr(C)]` wire boundary (`ABI 0.2.0`, `0x0002_0000`)** between host and guest:
-1. **Versioned 27-Slot `BamHostApi` Handshake:** Every core iterator, resource, command, and registration entry point lives in a `struct_size`-extensible `Option<extern "C" fn(...)>` table.
+1. **Versioned 38-Slot `BamHostApi` Handshake:** Every core and extended iterator, resource, message, command, observer, and registration entry point lives in a `struct_size`-extensible `Option<extern "C" fn(...)>` table.
 2. **1-Based `BamComponent(u32)` Handles:** Components and resources resolve by canonical `"<namespace>::<Name>"` + 128-bit `ComponentUuid` (`SipHash-2-4-128`) once during `bevy_abi_mod_init`. Per-frame hot paths perform zero string hashing.
 3. **Direct SoA & Batched Sparse-Set Views:** Dense `Table` columns are borrowed directly as `&[T]` / `&mut [T]` slices (`T: AbiPod`), and `SparseSet` columns yield batched indirect row-pointer slices.
 4. **First-Class Bevy Parallelism:** Each guest system registers a native Bevy `GuestSystem` with exact `FilteredAccessSet` read/write locks, allowing non-conflicting host and mod systems to run concurrently on `ComputeTaskPool`.

@@ -1,4 +1,4 @@
-//! RAII `LoadTransaction` rolling back drop trampolines and `ModRegistry` snapshot before `dlclose` (`ADR 0001` §2.4).
+//! RAII `LoadTransaction` rolling back drop trampolines and `ModRegistry` snapshot before `dlclose`.
 
 use crate::drop_trampoline::{
     StagedDropBinding, StagedHookBinding, WorldDropGuard, prune_drop_trampolines_for_guard,
@@ -99,7 +99,7 @@ impl Drop for LoadTransaction {
         };
 
         // 1. Roll back staged drop & hook bindings in `WorldDropGuard` (returning fresh slots to `FREE_LIST`
-        //    and restoring `previous_snapshot` on hot-updated slots) and restore `ModRegistry` (`ADR 0001` §2.4).
+        //    and restoring `previous_snapshot` on hot-updated slots) and restore `ModRegistry`.
         if !self.world_ptr.is_null() {
             // SAFETY: `self.world_ptr` comes from the exclusive `&mut World` passed into `load_mod_core`
             // and no inner `&mut World` alias is live while `LoadTransaction` drops.
