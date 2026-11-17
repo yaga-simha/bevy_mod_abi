@@ -81,13 +81,13 @@ redundant_clone = "warn"
 match_same_arms = "warn"
 
 [workspace.dependencies]
-bevy_abi_mod_sys = { path = "crates/bevy_abi_mod_sys" }
-bevy_abi_mod_macros = { path = "crates/bevy_abi_mod_macros" }
-bevy_abi_mod_host_sys = { path = "crates/bevy_abi_mod_host_sys" }
-bevy_abi_mod_host = { path = "crates/bevy_abi_mod_host" }
-bevy_abi_mod_guest_sys = { path = "crates/bevy_abi_mod_guest_sys" }
-bevy_abi_mod_guest = { path = "crates/bevy_abi_mod_guest" }
-bevy_abi_mod = { path = "crates/bevy_abi_mod" }
+bevy_abi_mod_sys = { version = "0.1.0", path = "crates/bevy_abi_mod_sys" }
+bevy_abi_mod_macros = { version = "0.1.0", path = "crates/bevy_abi_mod_macros" }
+bevy_abi_mod_host_sys = { version = "0.1.0", path = "crates/bevy_abi_mod_host_sys" }
+bevy_abi_mod_host = { version = "0.1.0", path = "crates/bevy_abi_mod_host" }
+bevy_abi_mod_guest_sys = { version = "0.1.0", path = "crates/bevy_abi_mod_guest_sys" }
+bevy_abi_mod_guest = { version = "0.1.0", path = "crates/bevy_abi_mod_guest" }
+bevy_abi_mod = { version = "0.1.0", path = "crates/bevy_abi_mod" }
 bevy_ecs = { version = "0.20.1", default-features = false, features = ["std", "async_executor"] }
 bevy_app = { version = "0.20.1", default-features = false, features = ["std"] }
 bevy_platform = { version = "0.20.1", default-features = false, features = ["std"] }
