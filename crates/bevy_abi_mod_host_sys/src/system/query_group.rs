@@ -6,6 +6,7 @@ use bevy_ecs::archetype::{ArchetypeGeneration, ArchetypeId};
 use bevy_ecs::query::QueryState;
 use bevy_ecs::storage::TableId;
 use bevy_ecs::world::unsafe_world_cell::UnsafeWorldCell;
+use core::any::Any;
 
 /// Maximum number of concurrent/nested queries supported per [`crate::GuestSystem`] (`8`).
 pub const MAX_SYSTEM_QUERIES: usize = MAX_QUERIES_PER_SYSTEM;
@@ -31,6 +32,7 @@ pub(crate) struct CachedQueryGroup {
     pub(crate) spec: BamQuerySpecOwned,
     pub(crate) plan: QueryPlan,
     pub(crate) sparse_scratch: SparseRowScratch,
+    pub(crate) msg_cursors: Vec<Option<Box<dyn Any + Send + Sync>>>,
     pub(crate) query_state: Option<QueryState<(), ()>>,
     pub(crate) is_dense: bool,
     pub(crate) archetype_generation: ArchetypeGeneration,
@@ -44,6 +46,7 @@ impl CachedQueryGroup {
             spec,
             plan: QueryPlan::default(),
             sparse_scratch: SparseRowScratch::default(),
+            msg_cursors: Vec::new(),
             query_state: None,
             is_dense: true,
             archetype_generation: ArchetypeGeneration::initial(),

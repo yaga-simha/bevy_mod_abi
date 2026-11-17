@@ -1,13 +1,17 @@
 //! Safe query chunk iterator (`ChunkIter`) and singleton resource accessor.
 
+use core::marker::PhantomData;
+
 use bevy_abi_mod_guest_sys::{Host, SparseRows, SparseRowsMut, ValidatedIter};
 use bevy_abi_mod_sys::{AbiPod, BamColumnInfo, BamIter, FfiEntity, FfiResult};
 
 use crate::{
+    app::IntoSystemResult,
     component::{GuestComponent, guest_uuid_filter},
     iter::{
         chunk::Chunk,
         slice::{ChunkSlice, ChunkSliceMut},
+        typed_query::{QueryTuple, TypedChunkIter},
     },
 };
 
@@ -201,6 +205,82 @@ impl<'a> ChunkIter<'a> {
         let filter = guest_uuid_filter::<R>(self.inner.host().manifest_name());
         self.inner
             .resource_mut_checked::<R>(term_index, Some(filter))
+    }
+
+    /// Processes disjoint chunk partitions in parallel on the host `ComputeTaskPool` (`P-07`).
+    ///
+    /// Panics inside `f` are caught per worker task and surfaced as [`FfiResult::PANIC_CAUGHT`]
+    /// without unwinding across `extern "C"`.
+    #[inline]
+    pub fn par_for_each<F>(&mut self, f: F) -> FfiResult
+    where
+        F: Fn(Chunk<'_, '_>) + Sync,
+    {
+        self.inner.par_for_each_chunk(|task_iter| {
+            let len = task_iter.current_len();
+            f(Chunk {
+                iter: task_iter,
+                len,
+            });
+            FfiResult::OK
+        })
+    }
+
+    /// Fallible variant of [`Self::par_for_each`] propagating non-`OK` [`IntoSystemResult`] returns (`P-07`).
+    #[inline]
+    pub fn par_try_for_each<F, R>(&mut self, f: F) -> FfiResult
+    where
+        F: Fn(Chunk<'_, '_>) -> R + Sync,
+        R: IntoSystemResult,
+    {
+        self.inner.par_for_each_chunk(|task_iter| {
+            let len = task_iter.current_len();
+            f(Chunk {
+                iter: task_iter,
+                len,
+            })
+            .into_ffi_result()
+        })
+    }
+
+    /// Wraps this iterator in a [`TypedChunkIter`] for [`QueryTuple`] `Q` (`G-03`).
+    #[inline]
+    pub fn typed<Q: QueryTuple>(&mut self) -> TypedChunkIter<'_, 'a, Q> {
+        TypedChunkIter {
+            iter: self,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Drains unread POD messages (`M: AbiPod`) from `term_index` (`F-02`).
+    #[inline]
+    pub fn read_pod_messages<M: AbiPod>(&mut self, term_index: usize) -> Result<Vec<M>, FfiResult> {
+        self.inner.drain_messages_checked::<M>(term_index, None)
+    }
+
+    /// Drains unread messages (`M: GuestComponent`) from `term_index`, validating `M`'s UUID (`F-02`).
+    #[inline]
+    pub fn read_messages<M: GuestComponent>(
+        &mut self,
+        term_index: usize,
+    ) -> Result<Vec<M>, FfiResult> {
+        let filter = guest_uuid_filter::<M>(self.inner.host().manifest_name());
+        self.inner
+            .drain_messages_checked::<M>(term_index, Some(filter))
+    }
+
+    /// Sends a POD message (`M: AbiPod`) on `term_index` declared with `MESSAGE_WRITE` (`F-02`).
+    #[inline]
+    pub fn send_pod_message<M: AbiPod>(&mut self, term_index: usize, msg: &M) -> FfiResult {
+        self.inner.send_message_checked::<M>(term_index, None, msg)
+    }
+
+    /// Sends a message (`M: GuestComponent`) on `term_index`, validating `M`'s UUID (`F-02`).
+    #[inline]
+    pub fn send_message<M: GuestComponent>(&mut self, term_index: usize, msg: &M) -> FfiResult {
+        let filter = guest_uuid_filter::<M>(self.inner.host().manifest_name());
+        self.inner
+            .send_message_checked::<M>(term_index, Some(filter), msg)
     }
 }
 

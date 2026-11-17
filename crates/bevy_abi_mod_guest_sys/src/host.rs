@@ -9,7 +9,7 @@ use bevy_abi_mod_sys::{
 };
 
 use crate::{
-    component::register_pod_component,
+    component::{PodComponentHooks, register_pod_component, register_pod_component_with_hooks},
     instance::GuestInstance,
     trampoline::{
         PreparedRunIf, SystemRegistrationConfig, ValidatedSystemInvocation, register_system_closure,
@@ -324,6 +324,32 @@ impl<'a> ValidatedLoadCtx<'a> {
         // and `vtable_ptr` is null.
         unsafe {
             register_pod_component::<T>(instance, self.raw, name, uuid, flags, core::ptr::null())
+        }
+    }
+
+    /// Registers a cross-language `T: AbiPod` dynamic component with optional `on_add` / `on_remove`
+    /// hooks (`F-04`) on this validated load context.
+    #[inline]
+    pub fn register_pod_component_with_hooks<T: AbiPod>(
+        &self,
+        instance: &mut GuestInstance,
+        name: &CStr,
+        uuid: ComponentUuid,
+        flags: u32,
+        hooks: PodComponentHooks<T>,
+    ) -> Result<BamComponent, FfiResult> {
+        // SAFETY: `self.raw` was validated as an active `BamLoadCtx` in `ValidatedLoadCtx::from_raw`,
+        // and `vtable_ptr` is null.
+        unsafe {
+            register_pod_component_with_hooks::<T>(
+                instance,
+                self.raw,
+                name,
+                uuid,
+                flags,
+                core::ptr::null(),
+                hooks,
+            )
         }
     }
 

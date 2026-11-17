@@ -50,19 +50,25 @@ impl AccessMode {
     pub const RESOURCE_READ: Self = Self(8);
     /// Exclusive mutable singleton resource access (`ResMut<R>`, C `BAM_ACCESS_RESOURCE_WRITE`).
     pub const RESOURCE_WRITE: Self = Self(9);
+    /// Buffered Bevy `Messages<M>` reader access (`MessageReader<M>`, C `BAM_ACCESS_MESSAGE_READ`).
+    pub const MESSAGE_READ: Self = Self(10);
+    /// Buffered Bevy `Messages<M>` writer/mutator access (`MessageWriter<M>`, C `BAM_ACCESS_MESSAGE_WRITE`).
+    pub const MESSAGE_WRITE: Self = Self(11);
 
-    /// Returns `true` if this mode is one of the recognized variants (`0..=9`).
+    /// Returns `true` if this mode is one of the recognized variants (`0..=11`).
     #[inline]
     pub const fn is_valid(self) -> bool {
-        self.0 <= Self::RESOURCE_WRITE.0
+        self.0 <= Self::MESSAGE_WRITE.0
     }
 
-    /// Returns `true` if this mode requires exclusive mutable access (`WRITE`, `OPTIONAL_WRITE`, or `RESOURCE_WRITE`).
+    /// Returns `true` if this mode requires exclusive mutable access (`WRITE`, `OPTIONAL_WRITE`,
+    /// `RESOURCE_WRITE`, or `MESSAGE_WRITE`).
     #[inline]
     pub const fn is_mutable(self) -> bool {
         self.0 == Self::WRITE.0
             || self.0 == Self::OPTIONAL_WRITE.0
             || self.0 == Self::RESOURCE_WRITE.0
+            || self.0 == Self::MESSAGE_WRITE.0
     }
 
     /// Returns `true` if this mode is an archetype presence filter (`With<T>`).
@@ -93,6 +99,12 @@ impl AccessMode {
     #[inline]
     pub const fn is_resource(self) -> bool {
         self.0 == Self::RESOURCE_READ.0 || self.0 == Self::RESOURCE_WRITE.0
+    }
+
+    /// Returns `true` if this mode targets a buffered Bevy `Messages<M>` stream (`MESSAGE_READ` or `MESSAGE_WRITE`).
+    #[inline]
+    pub const fn is_message(self) -> bool {
+        self.0 == Self::MESSAGE_READ.0 || self.0 == Self::MESSAGE_WRITE.0
     }
 
     /// Returns `true` if this mode reads or writes per-entity component data (`READ`, `WRITE`,
@@ -246,6 +258,18 @@ impl BamTermDesc {
     #[inline]
     pub const fn resource_write(component: BamComponent) -> Self {
         Self::new(component, AccessMode::RESOURCE_WRITE)
+    }
+
+    /// Creates a shared buffered message reader (`MessageReader<M>`) term descriptor (`F-02`).
+    #[inline]
+    pub const fn message_read(component: BamComponent) -> Self {
+        Self::new(component, AccessMode::MESSAGE_READ)
+    }
+
+    /// Creates an exclusive buffered message writer (`MessageWriter<M>`) term descriptor (`F-02`).
+    #[inline]
+    pub const fn message_write(component: BamComponent) -> Self {
+        Self::new(component, AccessMode::MESSAGE_WRITE)
     }
 
     /// Validates `flags`, `component != INVALID`, and `mode` discriminant range.

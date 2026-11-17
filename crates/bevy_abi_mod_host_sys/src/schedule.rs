@@ -4,7 +4,9 @@ use crate::loader::ModId;
 use bevy_abi_mod_sys::ScheduleId;
 use bevy_app::{FixedUpdate, Last, PostUpdate, PreUpdate, Startup, Update};
 use bevy_ecs::prelude::Resource;
-use bevy_ecs::schedule::{InternedScheduleLabel, Schedule, ScheduleLabel, SystemSet};
+use bevy_ecs::schedule::{
+    InternedScheduleLabel, InternedSystemSet, Schedule, ScheduleLabel, SystemSet,
+};
 use bevy_ecs::world::World;
 use bevy_platform::collections::HashMap;
 use std::sync::Arc;
@@ -128,6 +130,48 @@ impl ModScheduleMap {
     #[inline]
     pub fn contains(&self, id: ScheduleId) -> bool {
         id.is_builtin() || self.custom.contains_key(&id)
+    }
+}
+
+/// Resource mapping logical host set names (referenced by guests as `"host::<name>"`) onto Bevy
+/// [`InternedSystemSet`]s so guest systems can order themselves `.after(c"host::physics")` or
+/// `.before(c"host::render")` without risking host-set excision on mod unload (`F-05`).
+#[derive(Resource, Default, Clone, Debug)]
+pub struct ModVisibleSets {
+    sets: HashMap<Arc<str>, InternedSystemSet>,
+}
+
+impl ModVisibleSets {
+    /// Creates an empty [`ModVisibleSets`] map.
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Exposes `set` to guest ordering targets under `"host::<name>"` (accepts either bare `"physics"`
+    /// or `"host::physics"`).
+    ///
+    /// Returns `false` if `name` is empty or contains `"::"` other than a single leading `"host::"`.
+    pub fn register<S: SystemSet>(&mut self, name: &str, set: S) -> bool {
+        let stripped = name.strip_prefix("host::").unwrap_or(name);
+        if stripped.is_empty() || stripped.contains("::") {
+            return false;
+        }
+        self.sets.insert(Arc::from(stripped), set.intern());
+        true
+    }
+
+    /// Resolves a bare host set name (`"physics"`) or prefixed `"host::physics"` to its [`InternedSystemSet`].
+    #[inline]
+    pub fn resolve(&self, name: &str) -> Option<InternedSystemSet> {
+        let stripped = name.strip_prefix("host::").unwrap_or(name);
+        self.sets.get(stripped).copied()
+    }
+
+    /// Returns `true` if `name` (bare or `"host::"`-prefixed) is registered.
+    #[inline]
+    pub fn contains(&self, name: &str) -> bool {
+        self.resolve(name).is_some()
     }
 }
 

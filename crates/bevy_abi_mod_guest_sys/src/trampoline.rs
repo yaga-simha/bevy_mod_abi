@@ -9,9 +9,10 @@ use core::{
 use std::ffi::CString;
 
 use bevy_abi_mod_sys::{
-    AbiPod, BAM_SYSTEM_KNOWN_FLAGS, BamCommands, BamIter, BamLoadCtx, BamQueryDesc, BamRunIfFn,
-    BamSystemCtx, BamSystemDesc, BamSystemFn, BamTermDesc, FfiBool, FfiResult,
-    MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ScheduleId,
+    AbiPod, BAM_SYSTEM_KNOWN_FLAGS, BamCommands, BamHostApi, BamIter, BamLoadCtx, BamQueryDesc,
+    BamRunIfFn, BamSysEntityGetFn, BamSysEntityGetMutFn, BamSystemCtx, BamSystemDesc, BamSystemFn,
+    BamTermDesc, FfiBool, FfiEntity, FfiResult, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY,
+    ScheduleId,
 };
 
 use crate::{
@@ -134,6 +135,15 @@ impl<'a> ValidatedSystemInvocation<'a> {
     #[inline]
     pub const fn as_raw_sys_ctx(&self) -> *mut BamSystemCtx {
         self.sys_ctx
+    }
+
+    /// Returns a validated [`ValidatedSystemRef`] token bound to this active system invocation (`F-03`).
+    #[inline]
+    pub const fn system_ref(&self) -> ValidatedSystemRef<'a> {
+        ValidatedSystemRef {
+            sys_ctx: self.sys_ctx,
+            host: self.host,
+        }
     }
 
     /// Returns the cached [`Host`] table for this mod instance.
@@ -352,6 +362,133 @@ impl<'a> ValidatedSystemInvocation<'a> {
         self.queries[q_idx]
             .as_mut()?
             .resource_mut_checked::<R>(decl_index, expected_uuid)
+    }
+}
+
+/// Validated per-tick `*mut BamSystemCtx` token supporting borrow-checked random per-entity
+/// component lookups (`F-03`).
+#[derive(Clone, Copy)]
+pub struct ValidatedSystemRef<'a> {
+    sys_ctx: *mut BamSystemCtx,
+    host: &'a Host,
+}
+
+impl<'a> ValidatedSystemRef<'a> {
+    /// Returns the raw `*mut BamSystemCtx` pointer.
+    #[inline]
+    pub const fn as_raw_sys_ctx(&self) -> *mut BamSystemCtx {
+        self.sys_ctx
+    }
+
+    /// Returns the cached [`Host`] table for this mod instance.
+    #[inline]
+    pub const fn host(&self) -> &'a Host {
+        self.host
+    }
+
+    /// Looks up a shared `&'b T` component reference for `entity` using declared access on
+    /// `(query_index, term_index)` (`F-03`).
+    pub fn entity_get_checked<'b, T: AbiPod>(
+        &'b self,
+        iter: &'b ValidatedIter<'a>,
+        query_index: usize,
+        term_index: usize,
+        entity: FfiEntity,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Option<&'b T> {
+        if self.sys_ctx.is_null() {
+            return None;
+        }
+        if !self.host.api().covers_slot(
+            core::mem::offset_of!(BamHostApi, sys_entity_get),
+            core::mem::size_of::<Option<BamSysEntityGetFn>>(),
+        ) {
+            return None;
+        }
+        let get_fn = self.host.api().sys_entity_get?;
+        let info = iter.column_info(term_index).ok()?;
+        if !info.mode.has_entity_column_data() || info.is_resource() || info.is_message() {
+            return None;
+        }
+        if info.size != core::mem::size_of::<T>() || info.align != core::mem::align_of::<T>() {
+            return None;
+        }
+        if let Some(filter) = expected_uuid
+            && !filter.matches(info.uuid)
+        {
+            return None;
+        }
+        // SAFETY: `self.sys_ctx` is an active `BamSystemCtx` for `'a`, and `&'b self` + `&'b iter`
+        // prevent concurrent mutable access through this system context for `'b`.
+        let ptr = unsafe { get_fn(self.sys_ctx.cast_const(), query_index, entity, term_index) };
+        if ptr.is_null() {
+            return None;
+        }
+        if core::mem::size_of::<T>() == 0 {
+            // SAFETY: Zero-sized `T: AbiPod` may be referenced via `NonNull::dangling()`.
+            return Some(unsafe { core::ptr::NonNull::<T>::dangling().as_ref() });
+        }
+        if !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+            return None;
+        }
+        // SAFETY: Host verified query membership and declared read/write access; `info` confirmed
+        // `T`'s layout and optional UUID, and `ptr` is non-null and aligned for `'b`.
+        Some(unsafe { &*ptr.cast::<T>() })
+    }
+
+    /// Looks up an exclusive `&'b mut T` component reference for `entity` using declared writable
+    /// access on `(query_index, term_index)`, marking the component changed (`F-03`).
+    pub fn entity_get_mut_checked<'b, T: AbiPod>(
+        &'b mut self,
+        iter: &'b mut ValidatedIter<'a>,
+        query_index: usize,
+        term_index: usize,
+        entity: FfiEntity,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Option<&'b mut T> {
+        if self.sys_ctx.is_null() {
+            return None;
+        }
+        if !self.host.api().covers_slot(
+            core::mem::offset_of!(BamHostApi, sys_entity_get_mut),
+            core::mem::size_of::<Option<BamSysEntityGetMutFn>>(),
+        ) {
+            return None;
+        }
+        let get_mut_fn = self.host.api().sys_entity_get_mut?;
+        let info = iter.column_info(term_index).ok()?;
+        if !info.mode.is_mutable()
+            || !info.mode.has_entity_column_data()
+            || info.is_immutable()
+            || info.is_resource()
+            || info.is_message()
+        {
+            return None;
+        }
+        if info.size != core::mem::size_of::<T>() || info.align != core::mem::align_of::<T>() {
+            return None;
+        }
+        if let Some(filter) = expected_uuid
+            && !filter.matches(info.uuid)
+        {
+            return None;
+        }
+        // SAFETY: `self.sys_ctx` is an active `BamSystemCtx` for `'a`, and `&'b mut self` +
+        // `&'b mut iter` prevent any aliasing borrow on this system context for `'b`.
+        let ptr = unsafe { get_mut_fn(self.sys_ctx, query_index, entity, term_index) };
+        if ptr.is_null() {
+            return None;
+        }
+        if core::mem::size_of::<T>() == 0 {
+            // SAFETY: Zero-sized `T: AbiPod` may be mutably referenced via `NonNull::dangling()`.
+            return Some(unsafe { core::ptr::NonNull::<T>::dangling().as_mut() });
+        }
+        if !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+            return None;
+        }
+        // SAFETY: Host verified query membership, writable `FilteredAccessSet` declaration, and
+        // marked change ticks; `&'b mut self` guarantees exclusive access for `'b`.
+        Some(unsafe { &mut *ptr.cast::<T>() })
     }
 }
 

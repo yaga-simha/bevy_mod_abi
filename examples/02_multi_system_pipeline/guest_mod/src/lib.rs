@@ -1,9 +1,11 @@
 //! Example 2: Multi-System Pipeline Guest Mod (`example_02_guest_mod`).
 //!
-//! Demonstrates three ordered systems built with [`GuestApp::system`], query inclusion/exclusion
-//! filters (`With` / `Without`), disjoint multi-column borrows (`component_read_write`,
-//! `entities_and_component_mut`), pre-resolved [`BamComponent`] handles with single-archetype
-//! batched [`GuestCommands::spawn`], and per-`World` instance state cleanup on unload.
+//! Demonstrates three ordered systems built with [`GuestApp::system`] and typed tuple queries
+//! ([`SystemBuilder::query_typed`], [`SystemContext::single_query`], and
+//! [`SystemContext::single_query_and_commands`]) without magic column index literals (`G-03`),
+//! query inclusion/exclusion filters ([`With`] / [`Without`]), pre-resolved [`BamComponent`]
+//! handles with single-archetype batched [`GuestCommands::spawn`], and per-`World` instance state
+//! cleanup on unload.
 
 use bevy_abi_mod_guest::prelude::*;
 use core::ffi::CStr;
@@ -121,49 +123,42 @@ impl GuestPlugin for MultiSystemPipelineMod {
             Err(err) => return err,
         };
 
-        // 1. KinematicsMovementSystem: Position (WRITE, col 0), Velocity (READ, col 1)
+        // 1. KinematicsMovementSystem: typed tuple query `(&mut Position, &Velocity)` (`G-03`).
         let res1 = app
             .system(c"KinematicsMovementSystem")
-            .query(|q| q.write::<Position>().read::<Velocity>())
+            .query_typed::<(&mut Position, &Velocity)>()
             .schedule(ScheduleId::UPDATE)
             .build(|ctx| {
-                while let Some(mut chunk) = ctx.iter().next_chunk_view() {
-                    let Some((vel, pos)) = chunk.component_read_write::<Velocity, Position>(1, 0)
-                    else {
-                        return FfiResult::TYPE_MISMATCH;
-                    };
-                    for (p, v) in pos.iter_mut().zip(vel.iter()) {
-                        p.x += v.x * 0.1;
-                        p.y += v.y * 0.1;
-                    }
-                }
-                FfiResult::OK
+                ctx.single_query::<(&mut Position, &Velocity)>()
+                    .for_each(|(pos, vel)| {
+                        for (p, v) in pos.iter_mut().zip(vel.iter()) {
+                            p.x += v.x * 0.1;
+                            p.y += v.y * 0.1;
+                        }
+                    })
             });
         if !res1.is_ok() {
             return res1;
         }
 
-        // 2. FleetLifecycleSystem: Health (WRITE, col 0), Position (READ, col 1), Without<PlayerTag>
+        // 2. FleetLifecycleSystem: typed tuple query `(FfiEntity, &mut Health, &Position, Without<PlayerTag>)`.
         //    Captures `PipelineState` inside this world's GuestInstance — freed on `shutdown`.
         let mut state = PipelineState::default();
         let res2 = app
             .system(c"FleetLifecycleSystem")
-            .query(|q| {
-                q.write::<Health>()
-                    .read::<Position>()
-                    .without::<PlayerTag>()
-            })
+            .query_typed::<(FfiEntity, &mut Health, &Position, Without<PlayerTag>)>()
             .schedule(ScheduleId::UPDATE)
             .after(c"KinematicsMovementSystem")
             .build(move |ctx| {
                 state.tick_counter += 1;
-                let (iter, queue) = ctx.iter_and_commands();
+                let (mut query, queue) = ctx.single_query_and_commands::<(
+                    FfiEntity,
+                    &mut Health,
+                    &Position,
+                    Without<PlayerTag>,
+                )>();
 
-                while let Some(mut chunk) = iter.next_chunk_view() {
-                    let Some((entities, healths)) = chunk.entities_and_component_mut::<Health>(0)
-                    else {
-                        return FfiResult::TYPE_MISMATCH;
-                    };
+                let iter_status = query.for_each(|(entities, healths, _positions, ())| {
                     for (&entity, health) in entities.iter().zip(healths.iter_mut()) {
                         let new_health = health.current - 10.0;
                         if new_health <= 0.0 {
@@ -175,6 +170,10 @@ impl GuestPlugin for MultiSystemPipelineMod {
                             health.current = new_health;
                         }
                     }
+                    FfiResult::OK
+                });
+                if !iter_status.is_ok() {
+                    return iter_status;
                 }
 
                 // Spawn reinforcement Drone Gamma on tick 1 in a single batched archetype move.
@@ -211,22 +210,19 @@ impl GuestPlugin for MultiSystemPipelineMod {
             return res2;
         }
 
-        // 3. PlayerRegenSystem: Health (WRITE, col 0), With<PlayerTag>
+        // 3. PlayerRegenSystem: typed tuple query `(&mut Health, With<PlayerTag>)`.
         app.system(c"PlayerRegenSystem")
-            .query(|q| q.write::<Health>().with::<PlayerTag>())
+            .query_typed::<(&mut Health, With<PlayerTag>)>()
             .schedule(ScheduleId::UPDATE)
             .after(c"FleetLifecycleSystem")
             .run_if_fn(|| true)
             .build(|ctx| {
-                while let Some(mut chunk) = ctx.iter().next_chunk_view() {
-                    let Some(healths) = chunk.component_mut::<Health>(0) else {
-                        return FfiResult::TYPE_MISMATCH;
-                    };
-                    for health in healths {
-                        health.current = (health.current + 5.0).min(health.max);
-                    }
-                }
-                FfiResult::OK
+                ctx.single_query::<(&mut Health, With<PlayerTag>)>()
+                    .for_each(|(healths, ())| {
+                        for health in healths {
+                            health.current = (health.current + 5.0).min(health.max);
+                        }
+                    })
             })
     }
 }

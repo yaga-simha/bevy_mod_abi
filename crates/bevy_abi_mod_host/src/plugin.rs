@@ -3,14 +3,15 @@
 pub use crate::app_ext::ModAppExt;
 pub use crate::commands_ext::ModCommandsExt;
 pub use crate::events::{LoadedModInfo, ModLoaded, ModUnloaded};
-pub use crate::schedule_sets::{ModNamedSystemSet, ModScheduleMap};
+pub use crate::schedule_sets::{ModNamedSystemSet, ModScheduleMap, ModVisibleSets};
 pub use crate::world_ext::ModWorldExt;
 
+use crate::commands_ext::{PendingModLifecycleOps, flush_pending_mod_lifecycle_ops};
 use bevy_abi_mod_host_sys::{
     ModErrorPolicy, ModErrorPolicyConfig, ModHost, ModQuarantine, ModRegistry, ModSystemFaulted,
     StartupCompleted, WorldDropGuard, mark_startup_completed,
 };
-use bevy_app::{App, Plugin, PostStartup};
+use bevy_app::{App, Last, Plugin, PostStartup, Update};
 use bevy_ecs::message::Messages;
 
 pub(crate) fn ensure_startup_tracker(app: &mut App) {
@@ -67,7 +68,21 @@ impl Plugin for ConfiguredAbiModPlugin {
         if !app.world().contains_resource::<ModScheduleMap>() {
             app.insert_resource(ModScheduleMap::new());
         }
+        if !app.world().contains_resource::<ModVisibleSets>() {
+            app.insert_resource(ModVisibleSets::new());
+        }
         app.insert_resource(ModErrorPolicyConfig(self.error_policy));
+        app.init_schedule(Update);
+        if !app.world().contains_resource::<PendingModLifecycleOps>() {
+            app.init_resource::<PendingModLifecycleOps>();
+            app.add_systems(Last, flush_pending_mod_lifecycle_ops);
+        }
+
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::diagnostics::ensure_diagnostics_resources(app.world_mut());
+            app.add_systems(Last, crate::diagnostics::flush_mod_diagnostics);
+        }
 
         ensure_startup_tracker(app);
 

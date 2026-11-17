@@ -4,7 +4,7 @@ use core::ffi::{c_char, c_void};
 
 use crate::{
     extensible::ExtensibleStruct,
-    primitives::{ComponentUuid, FfiResult},
+    primitives::{ComponentUuid, FfiEntity, FfiResult},
     version::{ABI_VERSION, abi_version_is_compatible},
 };
 
@@ -15,6 +15,17 @@ use crate::{
 /// - `ptr` must be a non-null, properly aligned pointer to an initialized instance of the component.
 /// - The callback must never unwind across the `extern "C"` boundary.
 pub type ComponentDropFn = unsafe extern "C" fn(ptr: *mut c_void);
+
+/// Lifecycle hook callback (`on_add` / `on_remove`) invoked by the host when a dynamic component
+/// is added to or removed from an entity (`F-04`, `typedef void (*BamComponentHookFn)(BamEntity entity, const void* data_ptr, void* user_data);`).
+///
+/// # Safety
+/// - `data_ptr` points to the entity's component payload while present in Bevy storage (valid only
+///   for the synchronous duration of the hook call).
+/// - `user_data` is the opaque pointer registered in [`ComponentDesc::hook_user_data`].
+/// - The callback must never unwind across the `extern "C"` boundary.
+pub type ComponentHookFn =
+    unsafe extern "C" fn(entity: FfiEntity, data_ptr: *const c_void, user_data: *mut c_void);
 
 /// Register component with `StorageType::SparseSet` instead of `StorageType::Table`.
 pub const BAM_COMPONENT_FLAG_SPARSE_SET: u32 = 1 << 0;
@@ -30,8 +41,8 @@ pub const BAM_COMPONENT_KNOWN_FLAGS: u32 =
 /// Runtime component registration descriptor (`typedef struct BamComponentDesc BamComponentDesc;`).
 ///
 /// Layout:
-/// - 64-bit: `MIN_V0_2_SIZE = 64` bytes, `8`-byte alignment, zero implicit padding.
-/// - 32-bit: `MIN_V0_2_SIZE = 44` bytes, `4`-byte alignment, zero implicit padding.
+/// - 64-bit: `MIN_V0_2_SIZE = 64` bytes (`size_of = 88` bytes with optional hook slots), `8`-byte alignment, zero implicit padding.
+/// - 32-bit: `MIN_V0_2_SIZE = 44` bytes (`size_of = 56` bytes with optional hook slots), `4`-byte alignment, zero implicit padding.
 ///
 /// # Example
 ///
@@ -63,6 +74,12 @@ pub struct ComponentDesc {
     pub drop_fn: Option<ComponentDropFn>,
     /// Optional `VTableHeader`-prefixed static VTable pointer (`offset 56` on 64-bit / `40` on 32-bit).
     pub vtable_ptr: *const c_void,
+    /// Optional guest `on_add` lifecycle hook (`F-04`, `offset 64` on 64-bit / `44` on 32-bit).
+    pub on_add: Option<ComponentHookFn>,
+    /// Optional guest `on_remove` lifecycle hook (`F-04`, `offset 72` on 64-bit / `48` on 32-bit).
+    pub on_remove: Option<ComponentHookFn>,
+    /// Opaque context pointer passed to `on_add` and `on_remove` (`F-04`, `offset 80` on 64-bit / `52` on 32-bit).
+    pub hook_user_data: *mut c_void,
 }
 
 impl ComponentDesc {
@@ -70,8 +87,8 @@ impl ComponentDesc {
     pub const MIN_V0_2_SIZE: usize =
         core::mem::offset_of!(Self, vtable_ptr) + core::mem::size_of::<*const c_void>();
 
-    /// Constructs a Plain Old Data component descriptor with `flags = 0`, `drop_fn = None`, and
-    /// `vtable_ptr = null`.
+    /// Constructs a Plain Old Data component descriptor with `flags = 0`, `drop_fn = None`,
+    /// `vtable_ptr = null`, and no lifecycle hooks.
     #[inline]
     pub const fn new(name: *const c_char, uuid: ComponentUuid, size: usize, align: usize) -> Self {
         Self {
@@ -83,6 +100,18 @@ impl ComponentDesc {
             align,
             drop_fn: None,
             vtable_ptr: core::ptr::null(),
+            on_add: None,
+            on_remove: None,
+            hook_user_data: core::ptr::null_mut(),
+        }
+    }
+
+    /// Returns `true` if `self.struct_size` covers a field of `slot_size` bytes at `slot_offset`.
+    #[inline]
+    pub const fn covers_slot(&self, slot_offset: usize, slot_size: usize) -> bool {
+        match slot_offset.checked_add(slot_size) {
+            Some(end) => (self.struct_size as usize) >= end,
+            None => false,
         }
     }
 
@@ -105,6 +134,40 @@ impl ComponentDesc {
     pub const fn with_vtable(mut self, vtable_ptr: *const c_void) -> Self {
         self.vtable_ptr = vtable_ptr;
         self
+    }
+
+    /// Attaches an `on_add` lifecycle hook callback (`F-04`).
+    #[inline]
+    pub const fn with_on_add(mut self, on_add: ComponentHookFn) -> Self {
+        self.on_add = Some(on_add);
+        self
+    }
+
+    /// Attaches an `on_remove` lifecycle hook callback (`F-04`).
+    #[inline]
+    pub const fn with_on_remove(mut self, on_remove: ComponentHookFn) -> Self {
+        self.on_remove = Some(on_remove);
+        self
+    }
+
+    /// Attaches `on_add` and/or `on_remove` lifecycle hooks with shared `user_data` (`F-04`).
+    #[inline]
+    pub const fn with_hooks(
+        mut self,
+        on_add: Option<ComponentHookFn>,
+        on_remove: Option<ComponentHookFn>,
+        user_data: *mut c_void,
+    ) -> Self {
+        self.on_add = on_add;
+        self.on_remove = on_remove;
+        self.hook_user_data = user_data;
+        self
+    }
+
+    /// Returns `true` if either `on_add` or `on_remove` is set (`F-04`).
+    #[inline]
+    pub const fn has_hooks(&self) -> bool {
+        self.on_add.is_some() || self.on_remove.is_some()
     }
 
     /// Returns `true` if `BAM_COMPONENT_FLAG_SPARSE_SET` is set.
@@ -186,7 +249,7 @@ const _: () = {
     #[cfg(target_pointer_width = "64")]
     {
         assert!(ComponentDesc::MIN_V0_2_SIZE == 64);
-        assert!(core::mem::size_of::<ComponentDesc>() == 64);
+        assert!(core::mem::size_of::<ComponentDesc>() == 88);
         assert!(core::mem::align_of::<ComponentDesc>() == 8);
         assert!(core::mem::offset_of!(ComponentDesc, struct_size) == 0);
         assert!(core::mem::offset_of!(ComponentDesc, flags) == 4);
@@ -196,11 +259,14 @@ const _: () = {
         assert!(core::mem::offset_of!(ComponentDesc, align) == 40);
         assert!(core::mem::offset_of!(ComponentDesc, drop_fn) == 48);
         assert!(core::mem::offset_of!(ComponentDesc, vtable_ptr) == 56);
+        assert!(core::mem::offset_of!(ComponentDesc, on_add) == 64);
+        assert!(core::mem::offset_of!(ComponentDesc, on_remove) == 72);
+        assert!(core::mem::offset_of!(ComponentDesc, hook_user_data) == 80);
     }
     #[cfg(target_pointer_width = "32")]
     {
         assert!(ComponentDesc::MIN_V0_2_SIZE == 44);
-        assert!(core::mem::size_of::<ComponentDesc>() == 44);
+        assert!(core::mem::size_of::<ComponentDesc>() == 56);
         assert!(core::mem::align_of::<ComponentDesc>() == 4);
         assert!(core::mem::offset_of!(ComponentDesc, struct_size) == 0);
         assert!(core::mem::offset_of!(ComponentDesc, flags) == 4);
@@ -210,6 +276,9 @@ const _: () = {
         assert!(core::mem::offset_of!(ComponentDesc, align) == 32);
         assert!(core::mem::offset_of!(ComponentDesc, drop_fn) == 36);
         assert!(core::mem::offset_of!(ComponentDesc, vtable_ptr) == 40);
+        assert!(core::mem::offset_of!(ComponentDesc, on_add) == 44);
+        assert!(core::mem::offset_of!(ComponentDesc, on_remove) == 48);
+        assert!(core::mem::offset_of!(ComponentDesc, hook_user_data) == 52);
     }
 };
 

@@ -1,4 +1,5 @@
 mod bool;
+pub(crate) mod c_decl;
 mod nested;
 mod primitive;
 mod string;
@@ -126,6 +127,7 @@ pub(crate) struct CodegenState {
     pub(crate) component_flags_expr: TokenStream,
     pub(crate) custom_uuid: Option<String>,
     pub(crate) schema_fields: Vec<(String, String, TokenStream)>,
+    pub(crate) decl_fields: Vec<c_decl::DeclFieldInfo>,
     pub(crate) extern_fns: Vec<TokenStream>,
     pub(crate) vtable_fields: Vec<TokenStream>,
     pub(crate) vtable_inits: Vec<TokenStream>,
@@ -389,6 +391,7 @@ pub(crate) fn expand_mod_component_with_crate(
         component_flags_expr,
         custom_uuid: comp_attrs.custom_uuid,
         schema_fields: Vec::new(),
+        decl_fields: Vec::new(),
         extern_fns: Vec::new(),
         vtable_fields: Vec::new(),
         vtable_inits: Vec::new(),
@@ -443,6 +446,11 @@ pub(crate) fn expand_mod_component_with_crate(
                 canonical_field_type_tag(&field.ty),
                 member_tokens.clone(),
             ));
+            if let Some(decl_info) =
+                c_decl::DeclFieldInfo::from_classified(&field_name, &kind, &field.ty)
+            {
+                state.decl_fields.push(decl_info);
+            }
         }
 
         let spec = match kind {

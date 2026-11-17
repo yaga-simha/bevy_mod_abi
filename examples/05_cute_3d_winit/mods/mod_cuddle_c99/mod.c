@@ -40,12 +40,12 @@ typedef struct ModState {
 } ModState;
 
 static const BamManifest MANIFEST = {
-    (uint32_t)sizeof(BamManifest),
-    BAM_ABI_VERSION,
-    "mod_cuddle_c99",
-    "0.2.0",
-    0u,
-    0u
+    .struct_size = (uint32_t)sizeof(BamManifest),
+    .abi_version = BAM_ABI_VERSION,
+    .name = "mod_cuddle_c99",
+    .version = "0.2.0",
+    .flags = 0u,
+    .reserved0 = 0u
 };
 
 static int validate_vec3_vtable(const Vec3VTable* vt) {

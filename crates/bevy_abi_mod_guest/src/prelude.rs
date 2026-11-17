@@ -17,8 +17,11 @@ pub use crate::{
         SystemContext,
     },
     commands::GuestCommands,
-    component::{GuestComponent, guest_component_uuid},
+    component::{GuestComponent, GuestComponentHooks, guest_component_uuid},
     export_mod,
-    iter::{Chunk, ChunkIter, ChunkSlice, ChunkSliceMut, SparseRows, SparseRowsMut},
+    iter::{
+        Added, Changed, Chunk, ChunkIter, ChunkSlice, ChunkSliceMut, QueryTerm, QueryTuple,
+        SparseRows, SparseRowsMut, TypedChunkIter, With, Without,
+    },
     lifecycle::GuestPlugin,
 };

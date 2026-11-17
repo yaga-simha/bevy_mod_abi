@@ -2,7 +2,8 @@
 //! and unified `host_register_system` (`C-01`, `C-04`, `C-05`, `S-08`, `B-07`, `B-08`, `N-02`).
 
 use crate::drop_trampoline::{
-    StagedDropBinding, WorldDropGuard, on_insert_hook_for_slot, prune_drop_trampolines_for_guard,
+    StagedDropBinding, StagedHookBinding, WorldDropGuard, on_add_hook_for_slot,
+    on_insert_hook_for_slot, on_remove_hook_for_slot, prune_drop_trampolines_for_guard,
 };
 use crate::handle_header::{
     HOST_CTX_MAGIC, HandleHeader, HostContext, LOAD_CTX_MAGIC, validate_handle_mut,
@@ -51,6 +52,7 @@ pub struct LoadContext {
     pub manifest_name: Option<Arc<str>>,
     pre_snapshot: Arc<RegistrySnapshot>,
     staged_drop_bindings: Arc<Mutex<Vec<StagedDropBinding>>>,
+    staged_hook_bindings: Arc<Mutex<Vec<StagedHookBinding>>>,
     in_init: bool,
 }
 
@@ -92,17 +94,26 @@ impl LoadContext {
             manifest_name,
             pre_snapshot,
             staged_drop_bindings: Arc::new(Mutex::new(Vec::new())),
+            staged_hook_bindings: Arc::new(Mutex::new(Vec::new())),
             in_init: true,
         }
     }
 
-    /// Shares the transaction's [`StagedDropBinding`] log so `LoadTransaction::drop` automatically
-    /// rolls back every drop-trampoline mutation recorded during `bevy_abi_mod_init`.
+    /// Shares the transaction's [`StagedDropBinding`] and [`StagedHookBinding`] logs so
+    /// `LoadTransaction::drop` automatically rolls back every trampoline mutation recorded during `bevy_abi_mod_init`.
     pub(crate) fn with_staged_drop_bindings(
         mut self,
         staged: Arc<Mutex<Vec<StagedDropBinding>>>,
     ) -> Self {
         self.staged_drop_bindings = staged;
+        self
+    }
+
+    pub(crate) fn with_staged_hook_bindings(
+        mut self,
+        staged_hooks: Arc<Mutex<Vec<StagedHookBinding>>>,
+    ) -> Self {
+        self.staged_hook_bindings = staged_hooks;
         self
     }
 
@@ -137,8 +148,16 @@ impl LoadContext {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             core::mem::take(&mut *guard)
         };
+        let hook_bindings = {
+            let mut guard = self
+                .staged_hook_bindings
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            core::mem::take(&mut *guard)
+        };
         if let Some(mut drop_guard) = self.world_mut().get_resource_mut::<WorldDropGuard>() {
             drop_guard.rollback_staged_bindings(&bindings);
+            drop_guard.rollback_staged_hook_bindings(&hook_bindings);
         }
         prune_drop_trampolines_for_guard(&self.is_active);
         let pre = Arc::clone(&self.pre_snapshot);
@@ -414,12 +433,21 @@ pub unsafe extern "C" fn host_register_component(
         ctx.host_ctx.set_last_error(drop_mismatch.to_string());
         return FfiResult::TYPE_MISMATCH;
     }
+    if let Err(hook_mismatch) = ctx.registry.check_dynamic_hook_compatibility(
+        name_ref,
+        desc.on_add.is_some(),
+        desc.on_remove.is_some(),
+    ) {
+        ctx.host_ctx.set_last_error(hook_mismatch.to_string());
+        return FfiResult::TYPE_MISMATCH;
+    }
 
     let is_active = Arc::clone(&ctx.is_active);
     let owner = ctx.mod_id;
     let staged_log = Arc::clone(&ctx.staged_drop_bindings);
+    let staged_hook_log = Arc::clone(&ctx.staged_hook_bindings);
 
-    let (comp_id, drop_slot): (ComponentId, Option<usize>) = {
+    let (comp_id, drop_slot, hook_slot): (ComponentId, Option<usize>, Option<usize>) = {
         let world = ctx.world_mut();
         if !world.contains_resource::<WorldDropGuard>() {
             world.insert_resource(WorldDropGuard::new());
@@ -428,7 +456,7 @@ pub unsafe extern "C" fn host_register_component(
         let (slot_opt, trampoline_opt) = if let Some(drop_fn) = desc.drop_fn {
             let bound = world
                 .get_resource_mut::<WorldDropGuard>()
-                .and_then(|mut g| g.bind_or_update(desc.uuid, drop_fn, is_active));
+                .and_then(|mut g| g.bind_or_update(desc.uuid, drop_fn, Arc::clone(&is_active)));
             let Some((slot, tramp, staged_binding)) = bound else {
                 ctx.host_ctx.set_last_error(
                     "exhausted MAX_DROP_TRAMPOLINES (1024) foreign destructor slots",
@@ -444,8 +472,34 @@ pub unsafe extern "C" fn host_register_component(
             (None, None)
         };
 
+        let hook_slot_opt = if desc.has_hooks() {
+            let bound_hook = world
+                .get_resource_mut::<WorldDropGuard>()
+                .and_then(|mut g| {
+                    g.bind_or_update_hooks(
+                        desc.uuid,
+                        desc.on_add,
+                        desc.on_remove,
+                        desc.hook_user_data,
+                        Arc::clone(&is_active),
+                    )
+                });
+            let Some((hslot, staged_hook)) = bound_hook else {
+                ctx.host_ctx
+                    .set_last_error("exhausted MAX_DROP_TRAMPOLINES (1024) foreign hook slots");
+                return FfiResult::CAPACITY_EXCEEDED;
+            };
+            staged_hook_log
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(staged_hook);
+            Some(hslot)
+        } else {
+            None
+        };
+
         if let Some(existing_id) = existing_comp_id {
-            (existing_id, slot_opt)
+            (existing_id, slot_opt, hook_slot_opt)
         } else {
             let storage_type = if desc.is_sparse_set() {
                 StorageType::SparseSet
@@ -472,18 +526,28 @@ pub unsafe extern "C" fn host_register_component(
                 )
             };
             let new_id = world.register_component_with_descriptor(bevy_desc);
-            if let Some(slot) = slot_opt
+            if (slot_opt.is_some() || hook_slot_opt.is_some())
                 && let Some(hooks) = world.register_component_hooks_by_id(new_id)
             {
-                hooks.on_insert(on_insert_hook_for_slot(slot));
+                if let Some(slot) = slot_opt {
+                    hooks.on_insert(on_insert_hook_for_slot(slot));
+                }
+                if let Some(hslot) = hook_slot_opt {
+                    if desc.on_add.is_some() {
+                        hooks.on_add(on_add_hook_for_slot(hslot));
+                    }
+                    if desc.on_remove.is_some() {
+                        hooks.on_remove(on_remove_hook_for_slot(hslot));
+                    }
+                }
             }
-            (new_id, slot_opt)
+            (new_id, slot_opt, hook_slot_opt)
         }
     };
 
     let handle = match ctx
         .registry
-        .register_dynamic_component_owned(comp_id, &desc, name_ref, owner, drop_slot)
+        .register_dynamic_component_owned(comp_id, &desc, name_ref, owner, drop_slot, hook_slot)
     {
         Ok(h) => h,
         Err(err) => {

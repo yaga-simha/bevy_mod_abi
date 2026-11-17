@@ -8,14 +8,16 @@
 pub use bevy_abi_mod_sys::*;
 
 pub use bevy_abi_mod_guest_sys::{
-    CUSTOM_SYMBOL_PREFIX, GuestInstance, Host, PreparedRunIf, ReentrantCell, SparseRows,
-    SparseRowsIter, SparseRowsMut, SpawnEntry, SystemRegistrationConfig, UuidFilter,
-    ValidatedCommands, ValidatedIter, ValidatedLoadCtx, ValidatedSlice, ValidatedSliceMut,
-    ValidatedSystemInvocation, allocate_run_if_trampoline, allocate_system_trampoline,
-    catch_guest_bool, catch_guest_result, catch_guest_unit, generic_drop_trampoline,
-    init_guest_instance, register_component_raw, register_dynamic_component_with_drop,
-    register_pod_component, register_system_closure, resolve_component, shutdown_guest_instance,
-    wrap_run_condition, wrap_system_callback,
+    CUSTOM_SYMBOL_PREFIX, ChunkColumnDispenser, GuestInstance, Host, PodComponentHooks,
+    PreparedRunIf, ReentrantCell, SparseRows, SparseRowsIter, SparseRowsMut, SpawnEntry,
+    SystemRegistrationConfig, UuidFilter, ValidatedCommands, ValidatedIter, ValidatedLoadCtx,
+    ValidatedSlice, ValidatedSliceMut, ValidatedSystemInvocation, ValidatedSystemRef,
+    allocate_run_if_trampoline, allocate_system_trampoline, catch_guest_bool, catch_guest_result,
+    catch_guest_unit, generic_drop_trampoline, guest_restore_state_trampoline,
+    guest_save_state_trampoline, init_guest_instance, register_component_raw,
+    register_dynamic_component_with_drop, register_pod_component,
+    register_pod_component_with_hooks, register_system_closure, resolve_component,
+    shutdown_guest_instance, wrap_run_condition, wrap_system_callback,
 };
 
 use crate::{

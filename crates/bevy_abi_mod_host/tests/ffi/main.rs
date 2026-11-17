@@ -24,3 +24,4 @@ mod regressions;
 mod sparse_and_resources;
 mod strides_and_alignment;
 mod uuid_parity;
+mod wave4_features;

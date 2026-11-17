@@ -5,10 +5,13 @@ use bevy_abi_mod_host_sys::{
     GuestSystem, ModHost, ModId, ModLoadError, ModQuarantine, record_mod_named_sets_in_world,
 };
 pub use bevy_abi_mod_host_sys::{
-    ModNamedSystemSet, ModScheduleMap, ModSystemSet, StartupCompleted, resolve_builtin_schedule_id,
+    ModNamedSystemSet, ModScheduleMap, ModSystemSet, ModVisibleSets, StartupCompleted,
+    resolve_builtin_schedule_id,
 };
 use bevy_abi_mod_sys::ScheduleId;
-use bevy_ecs::schedule::{InternedScheduleLabel, IntoScheduleConfigs, Schedule, Schedules};
+use bevy_ecs::schedule::{
+    InternedScheduleLabel, InternedSystemSet, IntoScheduleConfigs, Schedule, Schedules,
+};
 use bevy_ecs::world::World;
 use bevy_platform::collections::HashSet;
 use std::path::Path;
@@ -27,6 +30,13 @@ fn resolve_mod_generation_in_world(world: &World, mod_name: &str) -> u64 {
         .get_resource::<ModHost>()
         .map(|h| h.mod_generation(mod_name))
         .unwrap_or(0)
+}
+
+fn resolve_host_visible_set(world: &World, raw_dep: &str) -> Option<InternedSystemSet> {
+    let stripped = raw_dep.strip_prefix("host::")?;
+    world
+        .get_resource::<ModVisibleSets>()
+        .and_then(|sets| sets.resolve(stripped))
 }
 
 fn target_exists_in_batch_or_world(
@@ -98,6 +108,16 @@ pub(crate) fn prevalidate_mod_schedules_and_ordering(
                 .iter()
                 .chain(sys.before_systems().iter())
             {
+                if dep.starts_with("host::") {
+                    if resolve_host_visible_set(world, dep).is_none() {
+                        return Err(ModLoadError::UnresolvedOrderingTarget {
+                            path: path.to_path_buf(),
+                            system_name: sys.system_name().to_string(),
+                            target: dep.clone(),
+                        });
+                    }
+                    continue;
+                }
                 let Some(parsed) = ModNamedSystemSet::parse_target(dep, mod_name) else {
                     return Err(ModLoadError::UnresolvedOrderingTarget {
                         path: path.to_path_buf(),
@@ -195,6 +215,19 @@ pub(crate) fn schedule_mod_systems_in_world(
         let mut cfg = sys.in_set(own_set);
 
         for dep in after {
+            if dep.starts_with("host::") {
+                if let Some(host_set) = resolve_host_visible_set(world, &dep) {
+                    cfg = IntoScheduleConfigs::after(cfg, host_set);
+                } else {
+                    tracing::warn!(
+                        system = %sys_name,
+                        mod_name = %mod_name,
+                        target = %dep,
+                        "guest system declares `after` on unregistered `host::` set"
+                    );
+                }
+                continue;
+            }
             let Some(parsed) = ModNamedSystemSet::parse_target(&dep, mod_name) else {
                 tracing::warn!(
                     system = %sys_name,
@@ -221,10 +254,23 @@ pub(crate) fn schedule_mod_systems_in_world(
             if target.mod_name.as_ref() == mod_name {
                 recorded_sets.push((interned, target.clone()));
             }
-            cfg = cfg.after(target);
+            cfg = IntoScheduleConfigs::after(cfg, target);
         }
 
         for dep in before {
+            if dep.starts_with("host::") {
+                if let Some(host_set) = resolve_host_visible_set(world, &dep) {
+                    cfg = IntoScheduleConfigs::before(cfg, host_set);
+                } else {
+                    tracing::warn!(
+                        system = %sys_name,
+                        mod_name = %mod_name,
+                        target = %dep,
+                        "guest system declares `before` on unregistered `host::` set"
+                    );
+                }
+                continue;
+            }
             let Some(parsed) = ModNamedSystemSet::parse_target(&dep, mod_name) else {
                 tracing::warn!(
                     system = %sys_name,
@@ -251,7 +297,7 @@ pub(crate) fn schedule_mod_systems_in_world(
             if target.mod_name.as_ref() == mod_name {
                 recorded_sets.push((interned, target.clone()));
             }
-            cfg = cfg.before(target);
+            cfg = IntoScheduleConfigs::before(cfg, target);
         }
 
         if let Some(mut schedules) = world.get_resource_mut::<Schedules>() {
@@ -289,6 +335,12 @@ pub(crate) fn run_late_startup_systems_in_world(
 
         let mut cfg = sys.in_set(own_set);
         for dep in after {
+            if dep.starts_with("host::") {
+                if let Some(host_set) = resolve_host_visible_set(world, &dep) {
+                    cfg = IntoScheduleConfigs::after(cfg, host_set);
+                }
+                continue;
+            }
             let Some(parsed) = ModNamedSystemSet::parse_target(&dep, mod_name) else {
                 tracing::warn!(
                     system = %sys_name,
@@ -314,9 +366,15 @@ pub(crate) fn run_late_startup_systems_in_world(
                     "startup system declares `after` on unresolved startup target"
                 );
             }
-            cfg = cfg.after(target);
+            cfg = IntoScheduleConfigs::after(cfg, target);
         }
         for dep in before {
+            if dep.starts_with("host::") {
+                if let Some(host_set) = resolve_host_visible_set(world, &dep) {
+                    cfg = IntoScheduleConfigs::before(cfg, host_set);
+                }
+                continue;
+            }
             let Some(parsed) = ModNamedSystemSet::parse_target(&dep, mod_name) else {
                 tracing::warn!(
                     system = %sys_name,
@@ -342,7 +400,7 @@ pub(crate) fn run_late_startup_systems_in_world(
                     "startup system declares `before` on unresolved startup target"
                 );
             }
-            cfg = cfg.before(target);
+            cfg = IntoScheduleConfigs::before(cfg, target);
         }
         temp_schedule.add_systems(cfg);
     }

@@ -10,12 +10,12 @@ static void bad_drop_hook(void* ptr) {
 }
 
 static const BamManifest MANIFEST = {
-    (uint32_t)sizeof(BamManifest),
-    BAM_ABI_VERSION,
-    "s06_fail_init",
-    "0.2.0",
-    0u,
-    0u
+    .struct_size = (uint32_t)sizeof(BamManifest),
+    .abi_version = BAM_ABI_VERSION,
+    .name = "s06_fail_init",
+    .version = "0.2.0",
+    .flags = 0u,
+    .reserved0 = 0u
 };
 
 BAM_EXPORT const BamManifest* bevy_abi_mod_manifest(void) {

@@ -1,7 +1,9 @@
 //! `ModHost`, `LoadedMod`, `LoadedModInfo`, lifecycle `Message`s, and `&mut World`-scoped
 //! load/rollback/unload operations (`L-02`, `L-03`, `L-08`, `B-05`, `B-09`).
 
-use crate::drop_trampoline::{StagedDropBinding, WorldDropGuard, prune_drop_trampolines_for_guard};
+use crate::drop_trampoline::{
+    StagedDropBinding, StagedHookBinding, WorldDropGuard, prune_drop_trampolines_for_guard,
+};
 use crate::ffi::host_api::HOST_API;
 use crate::ffi::register::LoadContext;
 use crate::loader::error::{ModLoadError, is_abi_version_compatible};
@@ -14,8 +16,8 @@ use crate::schedule::{ModNamedSystemSet, ModSystemSet};
 use crate::sync_ptr::GuestInstancePtr;
 use crate::system::{GuestSystem, ModQuarantine};
 use bevy_abi_mod_sys::{
-    ABI_VERSION, BamInitFn, BamInstance, BamManifest, BamManifestFn, BamShutdownFn, FfiResult,
-    read_descriptor,
+    ABI_VERSION, BamInitFn, BamInstance, BamManifest, BamManifestFn, BamRestoreStateFn,
+    BamSaveStateFn, BamShutdownFn, FfiResult, read_descriptor,
 };
 use bevy_ecs::component::Component;
 use bevy_ecs::entity::Entity;
@@ -115,8 +117,11 @@ pub struct LoadedMod {
     generation: u64,
     pre_snapshot: Arc<RegistrySnapshot>,
     staged_drop_bindings: Vec<StagedDropBinding>,
+    staged_hook_bindings: Vec<StagedHookBinding>,
     library: LoadedLibrary,
     shutdown_fn: BamShutdownFn,
+    save_state_fn: Option<BamSaveStateFn>,
+    restore_state_fn: Option<BamRestoreStateFn>,
     instance: GuestInstancePtr,
     is_active: Arc<AtomicBool>,
     lib_state: Arc<Mutex<SharedLibState>>,
@@ -313,6 +318,7 @@ impl ModHost {
             // Once scheduled in `World`, fresh slots are live and must only be pruned (never
             // prematurely freed before `WorldDropGuard::drop` + `live_values == 0`) on unload.
             loaded.staged_drop_bindings.clear();
+            loaded.staged_hook_bindings.clear();
         }
     }
 
@@ -460,7 +466,8 @@ impl ModHost {
             Some(mod_id),
             Some(Arc::clone(&manifest_name)),
         )
-        .with_staged_drop_bindings(tx.staged_drop_bindings());
+        .with_staged_drop_bindings(tx.staged_drop_bindings())
+        .with_staged_hook_bindings(tx.staged_hook_bindings());
 
         let mut instance_ptr: *mut BamInstance = core::ptr::null_mut();
         // SAFETY: Invoking guest `bevy_abi_mod_init` with static `HOST_API`, stack-scoped `LoadContext`
@@ -502,7 +509,7 @@ impl ModHost {
             }
         }
 
-        let staged_drop_bindings = tx.commit();
+        let (staged_drop_bindings, staged_hook_bindings) = tx.commit();
         state_guard.active_count += 1;
         drop(state_guard);
 
@@ -524,8 +531,11 @@ impl ModHost {
             generation,
             pre_snapshot,
             staged_drop_bindings,
+            staged_hook_bindings,
             library: loaded_lib,
             shutdown_fn,
+            save_state_fn: manifest.save_state,
+            restore_state_fn: manifest.restore_state,
             instance: GuestInstancePtr::new(instance_ptr),
             is_active,
             lib_state,
@@ -643,17 +653,20 @@ pub fn rollback_unscheduled_mod_in_world(world: &mut World, id: ModId) {
     let rollback_data = world.get_resource_mut::<ModHost>().and_then(|mut h| {
         h.get_mod_mut(id).map(|m| {
             let staged = core::mem::take(&mut m.staged_drop_bindings);
+            let staged_hooks = core::mem::take(&mut m.staged_hook_bindings);
             (
                 staged,
+                staged_hooks,
                 Arc::clone(&m.is_active),
                 Arc::clone(&m.pre_snapshot),
             )
         })
     });
 
-    if let Some((staged, is_active, snap)) = rollback_data {
+    if let Some((staged, staged_hooks, is_active, snap)) = rollback_data {
         if let Some(mut drop_guard) = world.get_resource_mut::<WorldDropGuard>() {
             drop_guard.rollback_staged_bindings(&staged);
+            drop_guard.rollback_staged_hook_bindings(&staged_hooks);
         }
         prune_drop_trampolines_for_guard(&is_active);
         if let Some(mut registry) = world.get_resource_mut::<ModRegistry>() {
@@ -801,4 +814,106 @@ where
             on_each_unloaded(world, id, name, path, removed);
         }
     }
+}
+
+unsafe extern "C" fn host_state_vec_writer(
+    writer_ctx: *mut c_void,
+    bytes: *const u8,
+    len: usize,
+) -> FfiResult {
+    if writer_ctx.is_null() || (len > 0 && bytes.is_null()) {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: `writer_ctx` is a valid stack pointer to `&mut Vec<u8>` owned by `save_mod_state_in_world`.
+    let vec_out = unsafe { &mut *writer_ctx.cast::<Vec<u8>>() };
+    if len > 0 {
+        // SAFETY: `bytes` is non-null and readable for `len` bytes during `BamSaveStateFn`.
+        let slice = unsafe { core::slice::from_raw_parts(bytes, len) };
+        vec_out.extend_from_slice(slice);
+    }
+    FfiResult::OK
+}
+
+/// Snapshots optional hot-reload state (`BamManifest::save_state`) from loaded mod `id` into a
+/// host-owned `Vec<u8>`, returning `(source_path, saved_blob)` (`F-01`).
+///
+/// Returns `Ok((source_path, None))` when the mod did not declare a `save_state` callback.
+pub fn save_mod_state_in_world(
+    world: &World,
+    id: ModId,
+) -> Result<(PathBuf, Option<Vec<u8>>), ModLoadError> {
+    let Some(host) = world.get_resource::<ModHost>() else {
+        return Err(ModLoadError::ModNotFound { id });
+    };
+    let Some(loaded) = host.get_mod(id) else {
+        return Err(ModLoadError::ModNotFound { id });
+    };
+    let source_path = loaded.source_path.clone();
+    let Some(save_fn) = loaded.save_state_fn else {
+        return Ok((source_path, None));
+    };
+
+    let mut blob = Vec::new();
+    let writer_ctx = (&raw mut blob).cast::<c_void>();
+    // SAFETY: `loaded` is active and mapped in memory; `loaded.instance` is this `World`'s
+    // `*mut BamInstance`; `host_state_vec_writer` appends copied bytes into host-owned `blob`.
+    let status = unsafe {
+        save_fn(
+            loaded.instance.as_ptr(),
+            Some(host_state_vec_writer),
+            writer_ctx,
+        )
+    };
+    if status.is_err() {
+        return Err(ModLoadError::StateSaveFailed {
+            id,
+            mod_name: loaded.name.to_string(),
+            status,
+        });
+    }
+    Ok((source_path, Some(blob)))
+}
+
+/// Restores a previously captured state blob (`bytes`) into newly loaded mod `id` via
+/// `BamManifest::restore_state` (`F-01`).
+///
+/// If the new mod does not declare `restore_state`, this is a no-op (`Ok(())`).
+pub fn restore_mod_state_in_world(
+    world: &mut World,
+    id: ModId,
+    bytes: &[u8],
+) -> Result<(), ModLoadError> {
+    let (restore_opt, instance_ptr, mod_name, path) = {
+        let Some(host) = world.get_resource::<ModHost>() else {
+            return Err(ModLoadError::ModNotFound { id });
+        };
+        let Some(loaded) = host.get_mod(id) else {
+            return Err(ModLoadError::ModNotFound { id });
+        };
+        (
+            loaded.restore_state_fn,
+            loaded.instance.as_ptr(),
+            loaded.name.to_string(),
+            loaded.source_path.clone(),
+        )
+    };
+    let Some(restore_fn) = restore_opt else {
+        return Ok(());
+    };
+    let ptr = if bytes.is_empty() {
+        core::ptr::null()
+    } else {
+        bytes.as_ptr()
+    };
+    // SAFETY: `id` was just initialized in `world` and remains mapped; `bytes` is host-owned and
+    // readable for `bytes.len()` bytes across the `restore_fn` call.
+    let status = unsafe { restore_fn(instance_ptr, ptr, bytes.len()) };
+    if status.is_err() {
+        return Err(ModLoadError::StateRestoreFailed {
+            path,
+            mod_name,
+            status,
+        });
+    }
+    Ok(())
 }

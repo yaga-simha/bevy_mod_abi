@@ -23,3 +23,4 @@ mod conflicts_and_faults;
 mod differential_parity;
 mod multi_query_and_conditions;
 mod regressions;
+mod wave4_features;

@@ -737,6 +737,11 @@ pub static MOCK_HOST_API: BamHostApi = BamHostApi {
     cmd_insert: Some(mock_cmd_insert),
     cmd_insert_default: Some(mock_cmd_insert_default),
     cmd_remove: Some(mock_cmd_remove),
+    par_for_each_chunk: None,
+    sys_entity_get: None,
+    sys_entity_get_mut: None,
+    msg_read_batch: None,
+    msg_send: None,
 };
 
 // ============================================================================

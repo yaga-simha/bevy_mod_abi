@@ -27,3 +27,4 @@ mod drop_trampolines;
 mod handshake_and_strict_load;
 mod hot_reload_and_excision;
 mod regressions;
+mod wave4_features;

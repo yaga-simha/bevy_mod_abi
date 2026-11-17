@@ -4,12 +4,12 @@
 #include "bevy_abi_mod.h"
 
 static const BamManifest MANIFEST = {
-    (uint32_t)sizeof(BamManifest),
-    BAM_ABI_VERSION,
-    "l05c_clean_mod",
-    "0.2.0",
-    0u,
-    0u
+    .struct_size = (uint32_t)sizeof(BamManifest),
+    .abi_version = BAM_ABI_VERSION,
+    .name = "l05c_clean_mod",
+    .version = "0.2.0",
+    .flags = 0u,
+    .reserved0 = 0u
 };
 
 static BamResult noop_cb(BamSystemCtx* sys_ctx, void* user_data) {

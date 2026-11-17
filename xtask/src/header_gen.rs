@@ -13,11 +13,11 @@ use bevy_abi_mod_sys::{
     ABI_VERSION, ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PATCH, AccessMode,
     BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_COMPONENT_KNOWN_FLAGS,
     BAM_MANIFEST_KNOWN_FLAGS, BAM_QUERY_KNOWN_FLAGS, BAM_STORAGE_FLAG_IMMUTABLE,
-    BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET, BAM_SYSTEM_FLAG_MAIN_THREAD,
-    BAM_SYSTEM_KNOWN_FLAGS, BAM_TERM_KNOWN_FLAGS, BamColumnInfo, BamComponent, BamHostApi,
-    BamManifest, BamQueryDesc, BamSystemDesc, BamTermDesc, ComponentDesc, ComponentUuid, FfiBool,
-    FfiEntity, FfiResult, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, SIPHASH_KEY_0,
-    SIPHASH_KEY_1, ScheduleId, StrView, VTableHeader,
+    BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET,
+    BAM_SYSTEM_FLAG_MAIN_THREAD, BAM_SYSTEM_KNOWN_FLAGS, BAM_TERM_KNOWN_FLAGS, BamColumnInfo,
+    BamComponent, BamHostApi, BamManifest, BamQueryDesc, BamSystemDesc, BamTermDesc, ComponentDesc,
+    ComponentUuid, FfiBool, FfiEntity, FfiResult, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY,
+    SIPHASH_KEY_0, SIPHASH_KEY_1, ScheduleId, StrView, VTableHeader,
 };
 
 struct FieldLayoutSpec {
@@ -84,9 +84,9 @@ fn wire_struct_specs() -> Vec<StructLayoutSpec> {
         StructLayoutSpec {
             c_name: "BamManifest",
             assert_stem: "bam_manifest",
-            size_64: 32,
+            size_64: 48,
             align_64: 8,
-            size_32: 24,
+            size_32: 32,
             align_32: 4,
             rust_host_size: size_of::<BamManifest>(),
             rust_host_align: align_of::<BamManifest>(),
@@ -126,6 +126,18 @@ fn wire_struct_specs() -> Vec<StructLayoutSpec> {
                     offset_64: 28,
                     offset_32: 20,
                     rust_host_offset: offset_of!(BamManifest, reserved0),
+                },
+                FieldLayoutSpec {
+                    c_name: "save_state",
+                    offset_64: 32,
+                    offset_32: 24,
+                    rust_host_offset: offset_of!(BamManifest, save_state),
+                },
+                FieldLayoutSpec {
+                    c_name: "restore_state",
+                    offset_64: 40,
+                    offset_32: 28,
+                    rust_host_offset: offset_of!(BamManifest, restore_state),
                 },
             ],
         },
@@ -300,9 +312,9 @@ fn wire_struct_specs() -> Vec<StructLayoutSpec> {
         StructLayoutSpec {
             c_name: "BamComponentDesc",
             assert_stem: "bam_component_desc",
-            size_64: 64,
+            size_64: 88,
             align_64: 8,
-            size_32: 44,
+            size_32: 56,
             align_32: 4,
             rust_host_size: size_of::<ComponentDesc>(),
             rust_host_align: align_of::<ComponentDesc>(),
@@ -354,6 +366,24 @@ fn wire_struct_specs() -> Vec<StructLayoutSpec> {
                     offset_64: 56,
                     offset_32: 40,
                     rust_host_offset: offset_of!(ComponentDesc, vtable_ptr),
+                },
+                FieldLayoutSpec {
+                    c_name: "on_add",
+                    offset_64: 64,
+                    offset_32: 44,
+                    rust_host_offset: offset_of!(ComponentDesc, on_add),
+                },
+                FieldLayoutSpec {
+                    c_name: "on_remove",
+                    offset_64: 72,
+                    offset_32: 48,
+                    rust_host_offset: offset_of!(ComponentDesc, on_remove),
+                },
+                FieldLayoutSpec {
+                    c_name: "hook_user_data",
+                    offset_64: 80,
+                    offset_32: 52,
+                    rust_host_offset: offset_of!(ComponentDesc, hook_user_data),
                 },
             ],
         },
@@ -456,9 +486,9 @@ fn wire_struct_specs() -> Vec<StructLayoutSpec> {
         StructLayoutSpec {
             c_name: "BamHostApi",
             assert_stem: "bam_host_api",
-            size_64: 224,
+            size_64: 264,
             align_64: 8,
-            size_32: 116,
+            size_32: 136,
             align_32: 4,
             rust_host_size: size_of::<BamHostApi>(),
             rust_host_align: align_of::<BamHostApi>(),
@@ -636,6 +666,36 @@ fn wire_struct_specs() -> Vec<StructLayoutSpec> {
                     offset_64: 216,
                     offset_32: 112,
                     rust_host_offset: offset_of!(BamHostApi, cmd_remove),
+                },
+                FieldLayoutSpec {
+                    c_name: "par_for_each_chunk",
+                    offset_64: 224,
+                    offset_32: 116,
+                    rust_host_offset: offset_of!(BamHostApi, par_for_each_chunk),
+                },
+                FieldLayoutSpec {
+                    c_name: "sys_entity_get",
+                    offset_64: 232,
+                    offset_32: 120,
+                    rust_host_offset: offset_of!(BamHostApi, sys_entity_get),
+                },
+                FieldLayoutSpec {
+                    c_name: "sys_entity_get_mut",
+                    offset_64: 240,
+                    offset_32: 124,
+                    rust_host_offset: offset_of!(BamHostApi, sys_entity_get_mut),
+                },
+                FieldLayoutSpec {
+                    c_name: "msg_read_batch",
+                    offset_64: 248,
+                    offset_32: 128,
+                    rust_host_offset: offset_of!(BamHostApi, msg_read_batch),
+                },
+                FieldLayoutSpec {
+                    c_name: "msg_send",
+                    offset_64: 256,
+                    offset_32: 132,
+                    rust_host_offset: offset_of!(BamHostApi, msg_send),
                 },
             ],
         },
@@ -843,7 +903,9 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
          #define BAM_ACCESS_CHANGED        ((BamAccessMode){}u)\n\
          #define BAM_ACCESS_ADDED          ((BamAccessMode){}u)\n\
          #define BAM_ACCESS_RESOURCE_READ  ((BamAccessMode){}u)\n\
-         #define BAM_ACCESS_RESOURCE_WRITE ((BamAccessMode){}u)\n\n\
+         #define BAM_ACCESS_RESOURCE_WRITE ((BamAccessMode){}u)\n\
+         #define BAM_ACCESS_MESSAGE_READ   ((BamAccessMode){}u)\n\
+         #define BAM_ACCESS_MESSAGE_WRITE  ((BamAccessMode){}u)\n\n\
          typedef uint32_t BamScheduleId;\n\
          #define BAM_SCHEDULE_UPDATE       ((BamScheduleId){}u)\n\
          #define BAM_SCHEDULE_STARTUP      ((BamScheduleId){}u)\n\
@@ -862,7 +924,8 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
          #define BAM_COMPONENT_KNOWN_FLAGS     0x{BAM_COMPONENT_KNOWN_FLAGS:08X}u\n\
          #define BAM_STORAGE_FLAG_SPARSE_SET   0x{BAM_STORAGE_FLAG_SPARSE_SET:08X}u\n\
          #define BAM_STORAGE_FLAG_IMMUTABLE    0x{BAM_STORAGE_FLAG_IMMUTABLE:08X}u\n\
-         #define BAM_STORAGE_FLAG_RESOURCE     0x{BAM_STORAGE_FLAG_RESOURCE:08X}u\n",
+         #define BAM_STORAGE_FLAG_RESOURCE     0x{BAM_STORAGE_FLAG_RESOURCE:08X}u\n\
+         #define BAM_STORAGE_FLAG_MESSAGE      0x{BAM_STORAGE_FLAG_MESSAGE:08X}u\n",
         FfiBool::FALSE.0,
         FfiBool::TRUE.0,
         BamComponent::INVALID.0,
@@ -894,6 +957,8 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
         AccessMode::ADDED.0,
         AccessMode::RESOURCE_READ.0,
         AccessMode::RESOURCE_WRITE.0,
+        AccessMode::MESSAGE_READ.0,
+        AccessMode::MESSAGE_WRITE.0,
         ScheduleId::UPDATE.0,
         ScheduleId::STARTUP.0,
         ScheduleId::PRE_UPDATE.0,
@@ -923,6 +988,9 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
          typedef struct BamComponentUuid {\n\
              uint8_t bytes[16];\n\
          } BamComponentUuid;\n\n\
+         typedef BamResult (*BamStateWriterFn)(void* ctx, const uint8_t* bytes, size_t len);\n\
+         typedef BamResult (*BamSaveStateFn)(BamInstance* instance, BamStateWriterFn writer, void* writer_ctx);\n\
+         typedef BamResult (*BamRestoreStateFn)(BamInstance* instance, const uint8_t* bytes, size_t len);\n\n\
          typedef struct BamManifest {\n\
              uint32_t    struct_size;\n\
              uint32_t    abi_version;\n\
@@ -930,8 +998,16 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
              const char* version;\n\
              uint32_t    flags;\n\
              uint32_t    reserved0;\n\
+         #if defined(__cplusplus) && (__cplusplus >= 201402L)\n\
+             BamSaveStateFn    save_state    = nullptr;\n\
+             BamRestoreStateFn restore_state = nullptr;\n\
+         #else\n\
+             BamSaveStateFn    save_state;\n\
+             BamRestoreStateFn restore_state;\n\
+         #endif\n\
          } BamManifest;\n\n\
          typedef void      (*BamComponentDropFn)(void* ptr);\n\
+         typedef void      (*BamComponentHookFn)(BamEntity entity, const void* data_ptr, void* user_data);\n\
          typedef BamResult (*BamSystemFn)(BamSystemCtx* sys_ctx, void* user_data);\n\
          typedef BamBool   (*BamRunIfFn)(void* user_data);\n\n\
          typedef struct BamTermDesc {\n\
@@ -971,6 +1047,15 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
              size_t             align;\n\
              BamComponentDropFn drop_fn;\n\
              const void*        vtable_ptr;\n\
+         #if defined(__cplusplus) && (__cplusplus >= 201402L)\n\
+             BamComponentHookFn on_add         = nullptr;\n\
+             BamComponentHookFn on_remove      = nullptr;\n\
+             void*              hook_user_data = nullptr;\n\
+         #else\n\
+             BamComponentHookFn on_add;\n\
+             BamComponentHookFn on_remove;\n\
+             void*              hook_user_data;\n\
+         #endif\n\
          } BamComponentDesc;\n\n\
          typedef struct BamColumnInfo {\n\
              BamComponent     component;\n\
@@ -1029,6 +1114,13 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
          typedef BamResult (*BamCmdInsertFn)(BamCommands* commands, BamEntity entity, BamComponent component, const uint8_t* data_ptr, size_t data_len);\n\
          typedef BamResult (*BamCmdInsertDefaultFn)(BamCommands* commands, BamEntity entity, BamComponent component);\n\
          typedef BamResult (*BamCmdRemoveFn)(BamCommands* commands, BamEntity entity, BamComponent component);\n\n\
+         /* --- 7. Optional Wave 4 Engine Extension Slots (`P-07`, `F-02`, `F-03`) --- */\n\
+         typedef BamResult      (*BamChunkTaskFn)(BamIter* iter, void* user_data);\n\
+         typedef BamResult      (*BamParForEachChunkFn)(BamIter* iter, BamChunkTaskFn chunk_fn, void* user_data);\n\
+         typedef const uint8_t* (*BamSysEntityGetFn)(const BamSystemCtx* sys_ctx, size_t query_index, BamEntity entity, size_t term_index);\n\
+         typedef uint8_t*       (*BamSysEntityGetMutFn)(BamSystemCtx* sys_ctx, size_t query_index, BamEntity entity, size_t term_index);\n\
+         typedef BamResult      (*BamMsgReadBatchFn)(BamIter* iter, size_t term_index, uint8_t* out_buf, size_t max_count, size_t* out_read);\n\
+         typedef BamResult      (*BamMsgSendFn)(BamIter* iter, size_t term_index, const uint8_t* data_ptr, size_t data_len);\n\n\
          struct BamHostApi {\n\
              uint32_t struct_size;\n\
              uint32_t abi_version;\n\n\
@@ -1064,7 +1156,13 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
              BamCmdDespawnFn       cmd_despawn;\n\
              BamCmdInsertFn        cmd_insert;\n\
              BamCmdInsertDefaultFn cmd_insert_default;\n\
-             BamCmdRemoveFn        cmd_remove;\n\
+             BamCmdRemoveFn        cmd_remove;\n\n\
+             /* Optional Wave 4 engine extension slots (appended after `BAM_HOST_API_MIN_V0_2_SIZE`) */\n\
+             BamParForEachChunkFn par_for_each_chunk;\n\
+             BamSysEntityGetFn    sys_entity_get;\n\
+             BamSysEntityGetMutFn sys_entity_get_mut;\n\
+             BamMsgReadBatchFn    msg_read_batch;\n\
+             BamMsgSendFn         msg_send;\n\
          };\n\n\
          #define BAM_MANIFEST_MIN_V0_2_SIZE       (offsetof(BamManifest, reserved0) + sizeof(uint32_t))\n\
          #define BAM_QUERY_DESC_MIN_V0_2_SIZE     (offsetof(BamQueryDesc, term_count) + sizeof(size_t))\n\
@@ -1461,11 +1559,12 @@ mod tests {
         assert!(first.contains("#define BAM_ABI_VERSION 0x00020000u"));
         assert!(first.contains("typedef struct BamHostApi   BamHostApi;"));
         assert!(
-            first.contains("BAM_STATIC_ASSERT(sizeof(BamHostApi) == 224u, bam_host_api_size_64);")
+            first.contains("BAM_STATIC_ASSERT(sizeof(BamHostApi) == 264u, bam_host_api_size_64);")
         );
         assert!(
-            first.contains("BAM_STATIC_ASSERT(sizeof(BamHostApi) == 116u, bam_host_api_size_32);")
+            first.contains("BAM_STATIC_ASSERT(sizeof(BamHostApi) == 136u, bam_host_api_size_32);")
         );
+        assert!(first.contains("BAM_STATIC_ASSERT(BAM_HOST_API_MIN_V0_2_SIZE == 224u"));
         // Verify old v0.1 unprefixed C typedefs are completely absent:
         assert!(!first.contains("typedef struct HostApi"));
         assert!(!first.contains("SystemDescriptor"));

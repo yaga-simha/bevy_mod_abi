@@ -36,12 +36,12 @@ typedef struct ModState {
 } ModState;
 
 static const BamManifest MANIFEST = {
-    (uint32_t)sizeof(BamManifest),
-    BAM_ABI_VERSION,
-    "example_03_c_mod",
-    "0.2.0",
-    0u,
-    0u
+    .struct_size = (uint32_t)sizeof(BamManifest),
+    .abi_version = BAM_ABI_VERSION,
+    .name = "example_03_c_mod",
+    .version = "0.2.0",
+    .flags = 0u,
+    .reserved0 = 0u
 };
 
 static int validate_pos_vtable(const PositionVTable* vt) {

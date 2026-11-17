@@ -61,10 +61,11 @@ pub use bevy_abi_mod_guest_sys::SpawnEntry;
 pub use bevy_abi_mod_sys::{
     ABI_VERSION, ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PATCH, AbiPod, AccessMode,
     BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_IMMUTABLE,
-    BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET, BAM_SYSTEM_FLAG_MAIN_THREAD,
-    BamColumnInfo, BamComponent, BamManifest, BamTermDesc, ComponentDesc, ComponentUuid, FfiBool,
-    FfiEntity, FfiResult, FfiSlice, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent,
-    RawInsertable, ScheduleId, StrView, SymbolEntry, VTableHeader,
+    BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET,
+    BAM_SYSTEM_FLAG_MAIN_THREAD, BamColumnInfo, BamComponent, BamManifest, BamTermDesc,
+    ComponentDesc, ComponentUuid, FfiBool, FfiEntity, FfiResult, FfiSlice, MAX_QUERIES_PER_SYSTEM,
+    MAX_TERMS_PER_QUERY, ModComponent, RawInsertable, ScheduleId, StrView, SymbolEntry,
+    VTableHeader,
 };
 
 #[cfg(feature = "derive")]
@@ -75,9 +76,10 @@ pub use app::{
     SystemBuilder, SystemContext,
 };
 pub use commands::GuestCommands;
-pub use component::{GuestComponent, guest_component_uuid};
+pub use component::{GuestComponent, GuestComponentHooks, guest_component_uuid};
 pub use iter::{
-    Chunk, ChunkIter, ChunkSlice, ChunkSliceMut, SparseRows, SparseRowsIter, SparseRowsMut,
+    Added, Changed, Chunk, ChunkIter, ChunkSlice, ChunkSliceMut, QueryTerm, QueryTuple, SparseRows,
+    SparseRowsIter, SparseRowsMut, TypedChunkIter, With, Without,
 };
 pub use lifecycle::{GuestPlugin, build_guest_fn, build_guest_plugin};
 

@@ -9,21 +9,24 @@ use core::{
 use crate::{
     ABI_VERSION, ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PATCH, AccessMode,
     BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_IMMUTABLE,
-    BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET, BAM_SYSTEM_FLAG_MAIN_THREAD,
-    BamCmdDespawnFn, BamCmdInsertDefaultFn, BamCmdInsertFn, BamCmdRemoveFn, BamCmdSpawnEmptyFn,
-    BamCmdSpawnFn, BamColumnInfo, BamCommands, BamComponent, BamGetProcAddressFn, BamHostApi,
-    BamHostCtx, BamInitFn, BamInstance, BamIter, BamIterColumnInfoFn, BamIterColumnMutableFn,
-    BamIterColumnMutableUntrackedFn, BamIterColumnReadonlyFn, BamIterColumnRowsMutableFn,
-    BamIterColumnRowsReadonlyFn, BamIterEntitiesFn, BamIterMarkChangedRangeFn, BamIterNextChunkFn,
-    BamIterResetFn, BamLastErrorFn, BamLoadCtx, BamManifest, BamManifestFn, BamQueryDesc,
-    BamRegisterComponentFn, BamRegisterSystemFn, BamResMutPtrFn, BamResPtrFn,
-    BamResolveComponentFn, BamRunIfFn, BamShutdownFn, BamSysCommandsFn, BamSysHostCtxFn,
-    BamSysQueryFn, BamSystemCtx, BamSystemDesc, BamSystemFn, BamTermDesc, ComponentDesc,
-    ComponentUuid, ExtensibleStruct, FfiBool, FfiEntity, FfiResult, FfiSlice,
-    MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent, SIPHASH_KEY_0, SIPHASH_KEY_1,
-    ScheduleId, StrView, SymbolEntry, VTableHeader, abi_version_is_compatible, abi_version_major,
-    abi_version_minor, abi_version_patch, assert_abi_pod, assert_raw_insertable, pack_abi_version,
-    read_descriptor, read_extensible_struct, siphash24_128, unpack_abi_version,
+    BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET,
+    BAM_SYSTEM_FLAG_MAIN_THREAD, BamChunkTaskFn, BamCmdDespawnFn, BamCmdInsertDefaultFn,
+    BamCmdInsertFn, BamCmdRemoveFn, BamCmdSpawnEmptyFn, BamCmdSpawnFn, BamColumnInfo, BamCommands,
+    BamComponent, BamGetProcAddressFn, BamHostApi, BamHostCtx, BamInitFn, BamInstance, BamIter,
+    BamIterColumnInfoFn, BamIterColumnMutableFn, BamIterColumnMutableUntrackedFn,
+    BamIterColumnReadonlyFn, BamIterColumnRowsMutableFn, BamIterColumnRowsReadonlyFn,
+    BamIterEntitiesFn, BamIterMarkChangedRangeFn, BamIterNextChunkFn, BamIterResetFn,
+    BamLastErrorFn, BamLoadCtx, BamLoadHostCtxFn, BamManifest, BamManifestFn, BamMsgReadBatchFn,
+    BamMsgSendFn, BamParForEachChunkFn, BamQueryDesc, BamRegisterComponentFn, BamRegisterSystemFn,
+    BamResMutPtrFn, BamResPtrFn, BamResolveComponentFn, BamRestoreStateFn, BamRunIfFn,
+    BamSaveStateFn, BamShutdownFn, BamStateWriterFn, BamSysCommandsFn, BamSysEntityGetFn,
+    BamSysEntityGetMutFn, BamSysHostCtxFn, BamSysQueryFn, BamSystemCtx, BamSystemDesc, BamSystemFn,
+    BamTermDesc, ComponentDesc, ComponentHookFn, ComponentUuid, ExtensibleStruct, FfiBool,
+    FfiEntity, FfiResult, FfiSlice, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent,
+    SIPHASH_KEY_0, SIPHASH_KEY_1, ScheduleId, StrView, SymbolEntry, VTableHeader,
+    abi_version_is_compatible, abi_version_major, abi_version_minor, abi_version_patch,
+    assert_abi_pod, assert_raw_insertable, pack_abi_version, read_descriptor,
+    read_extensible_struct, siphash24_128, unpack_abi_version,
 };
 
 struct StackFmtBuf<const N: usize> {
@@ -297,6 +300,11 @@ fn populated_host_api() -> BamHostApi {
         cmd_insert: Some(stub_cmd_insert),
         cmd_insert_default: Some(stub_cmd_insert_default),
         cmd_remove: Some(stub_cmd_remove),
+        par_for_each_chunk: None,
+        sys_entity_get: None,
+        sys_entity_get_mut: None,
+        msg_read_batch: None,
+        msg_send: None,
     }
 }
 
@@ -356,22 +364,34 @@ fn abi_v0_2_exact_sizes_alignments_and_offsets() {
     assert_eq!(size_of::<Option<BamCmdInsertDefaultFn>>(), ptr_sz);
     assert_eq!(size_of::<Option<BamCmdRemoveFn>>(), ptr_sz);
 
+    assert_eq!(size_of::<Option<BamLoadHostCtxFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamChunkTaskFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamParForEachChunkFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamSysEntityGetFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamSysEntityGetMutFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamMsgReadBatchFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamMsgSendFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamStateWriterFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamSaveStateFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamRestoreStateFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<ComponentHookFn>>(), ptr_sz);
+
     #[cfg(target_pointer_width = "64")]
     {
         assert_eq!(size_of::<StrView>(), 16);
         assert_eq!(align_of::<StrView>(), 8);
-        assert_eq!(size_of::<BamManifest>(), 32);
+        assert_eq!(size_of::<BamManifest>(), 48);
         assert_eq!(BamManifest::MIN_V0_2_SIZE, 32);
         assert_eq!(size_of::<BamQueryDesc>(), 24);
         assert_eq!(BamQueryDesc::MIN_V0_2_SIZE, 24);
         assert_eq!(size_of::<BamSystemDesc>(), 104);
         assert_eq!(BamSystemDesc::MIN_V0_2_SIZE, 104);
-        assert_eq!(size_of::<ComponentDesc>(), 64);
+        assert_eq!(size_of::<ComponentDesc>(), 88);
         assert_eq!(ComponentDesc::MIN_V0_2_SIZE, 64);
         assert_eq!(size_of::<BamColumnInfo>(), 48);
         assert_eq!(size_of::<VTableHeader>(), 40);
         assert_eq!(VTableHeader::MIN_V0_2_SIZE, 40);
-        assert_eq!(size_of::<BamHostApi>(), 224);
+        assert_eq!(size_of::<BamHostApi>(), 264);
         assert_eq!(BamHostApi::MIN_V0_2_SIZE, 224);
     }
 
@@ -379,18 +399,18 @@ fn abi_v0_2_exact_sizes_alignments_and_offsets() {
     {
         assert_eq!(size_of::<StrView>(), 8);
         assert_eq!(align_of::<StrView>(), 4);
-        assert_eq!(size_of::<BamManifest>(), 24);
+        assert_eq!(size_of::<BamManifest>(), 32);
         assert_eq!(BamManifest::MIN_V0_2_SIZE, 24);
         assert_eq!(size_of::<BamQueryDesc>(), 16);
         assert_eq!(BamQueryDesc::MIN_V0_2_SIZE, 16);
         assert_eq!(size_of::<BamSystemDesc>(), 60);
         assert_eq!(BamSystemDesc::MIN_V0_2_SIZE, 60);
-        assert_eq!(size_of::<ComponentDesc>(), 44);
+        assert_eq!(size_of::<ComponentDesc>(), 56);
         assert_eq!(ComponentDesc::MIN_V0_2_SIZE, 44);
         assert_eq!(size_of::<BamColumnInfo>(), 40);
         assert_eq!(size_of::<VTableHeader>(), 32);
         assert_eq!(VTableHeader::MIN_V0_2_SIZE, 32);
-        assert_eq!(size_of::<BamHostApi>(), 116);
+        assert_eq!(size_of::<BamHostApi>(), 136);
         assert_eq!(BamHostApi::MIN_V0_2_SIZE, 116);
     }
 }
@@ -945,6 +965,91 @@ fn regression_c11_m05_traits_vtable_header_and_column_info() {
         ..info
     };
     assert!(res_info.is_resource());
+    assert!(!res_info.is_message());
+
+    let msg_info = BamColumnInfo {
+        storage_flags: BAM_STORAGE_FLAG_MESSAGE,
+        mode: AccessMode::MESSAGE_READ,
+        ..info
+    };
+    assert!(msg_info.is_message());
+    assert!(AccessMode::MESSAGE_READ.is_message());
+    assert!(AccessMode::MESSAGE_WRITE.is_message());
+    assert!(AccessMode::MESSAGE_WRITE.is_mutable());
+    assert!(!AccessMode::MESSAGE_READ.is_mutable());
+}
+
+#[test]
+fn wave4_min_v0_2_backwards_compatibility_for_manifest_component_desc_and_host_api() {
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct Wave3Manifest {
+        struct_size: u32,
+        abi_version: u32,
+        name: *const c_char,
+        version: *const c_char,
+        flags: u32,
+        reserved0: u32,
+    }
+    assert_eq!(size_of::<Wave3Manifest>(), BamManifest::MIN_V0_2_SIZE);
+
+    let legacy_manifest = Wave3Manifest {
+        struct_size: size_of::<Wave3Manifest>() as u32,
+        abi_version: ABI_VERSION,
+        name: c"legacy_wave3_mod".as_ptr(),
+        version: c"0.2.0".as_ptr(),
+        flags: 0,
+        reserved0: 0,
+    };
+    // SAFETY: `legacy_manifest` is initialized on the local stack with `MIN_V0_2_SIZE` bytes.
+    let widened_manifest =
+        unsafe { read_descriptor::<BamManifest>((&raw const legacy_manifest).cast::<c_void>()) }
+            .expect("Wave 3 MIN_V0_2_SIZE BamManifest must be accepted");
+    assert_eq!(widened_manifest.validate(), FfiResult::OK);
+    assert!(widened_manifest.save_state.is_none());
+    assert!(widened_manifest.restore_state.is_none());
+    assert!(!widened_manifest.covers_slot(
+        offset_of!(BamManifest, save_state),
+        size_of::<Option<BamSaveStateFn>>(),
+    ));
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct Wave3ComponentDesc {
+        struct_size: u32,
+        flags: u32,
+        name: *const c_char,
+        uuid: ComponentUuid,
+        size: usize,
+        align: usize,
+        drop_fn: Option<crate::ComponentDropFn>,
+        vtable_ptr: *const c_void,
+    }
+    assert_eq!(
+        size_of::<Wave3ComponentDesc>(),
+        ComponentDesc::MIN_V0_2_SIZE
+    );
+
+    let legacy_comp = Wave3ComponentDesc {
+        struct_size: size_of::<Wave3ComponentDesc>() as u32,
+        flags: 0,
+        name: c"legacy::Comp".as_ptr(),
+        uuid: ComponentUuid::from_parts("legacy::Comp", 4, 4, 0),
+        size: 4,
+        align: 4,
+        drop_fn: None,
+        vtable_ptr: core::ptr::null(),
+    };
+    // SAFETY: `legacy_comp` is initialized on the local stack with `MIN_V0_2_SIZE` bytes.
+    let widened_comp =
+        unsafe { read_descriptor::<ComponentDesc>((&raw const legacy_comp).cast::<c_void>()) }
+            .expect("Wave 3 MIN_V0_2_SIZE ComponentDesc must be accepted");
+    assert_eq!(widened_comp.validate(), FfiResult::OK);
+    assert!(!widened_comp.has_hooks());
+    assert!(!widened_comp.covers_slot(
+        offset_of!(ComponentDesc, on_add),
+        size_of::<Option<ComponentHookFn>>(),
+    ));
 }
 
 #[test]

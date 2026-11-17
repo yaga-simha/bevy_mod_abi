@@ -1,6 +1,9 @@
 //! Opaque query iterator handle, column/resource introspection, and iteration FFI function types.
 
-use core::marker::{PhantomData, PhantomPinned};
+use core::{
+    ffi::c_void,
+    marker::{PhantomData, PhantomPinned},
+};
 
 use crate::{
     access::AccessMode,
@@ -22,6 +25,9 @@ pub const BAM_STORAGE_FLAG_IMMUTABLE: u32 = 1 << 1;
 
 /// Term refers to a singleton Bevy `Resource` rather than a per-entity component column.
 pub const BAM_STORAGE_FLAG_RESOURCE: u32 = 1 << 2;
+
+/// Term refers to a buffered Bevy `Messages<M>` stream (`F-02`).
+pub const BAM_STORAGE_FLAG_MESSAGE: u32 = 1 << 3;
 
 /// Metadata returned by [`BamIterColumnInfoFn`] (`iter_column_info`) for guest type-confusion checks.
 ///
@@ -64,6 +70,12 @@ impl BamColumnInfo {
     #[inline]
     pub const fn is_resource(&self) -> bool {
         (self.storage_flags & BAM_STORAGE_FLAG_RESOURCE) != 0
+    }
+
+    /// Returns `true` if `BAM_STORAGE_FLAG_MESSAGE` is set (`F-02`).
+    #[inline]
+    pub const fn is_message(&self) -> bool {
+        (self.storage_flags & BAM_STORAGE_FLAG_MESSAGE) != 0
     }
 
     /// Returns `true` if `(uuid, size, align)` match the expected guest type metadata.
@@ -201,3 +213,57 @@ pub type BamResPtrFn = unsafe extern "C" fn(iter: *const BamIter, term_index: us
 /// `iter` must point to an active [`BamIter`] belonging to the running system invocation, and
 /// the caller must not create aliasing references to the resource.
 pub type BamResMutPtrFn = unsafe extern "C" fn(iter: *mut BamIter, term_index: usize) -> *mut u8;
+
+/// Task callback invoked on worker threads by [`BamParForEachChunkFn`] (`P-07`).
+///
+/// Each task receives an isolated sub-range [`BamIter`] whose `iter_next_chunk` yields only the
+/// disjoint chunks assigned to that task.
+///
+/// # Safety
+/// - `iter` is valid strictly for the duration of the task callback invocation on that worker thread.
+/// - The callback must be thread-safe (`Sync` over shared `user_data`) and must never unwind across `extern "C"`.
+pub type BamChunkTaskFn =
+    unsafe extern "C" fn(iter: *mut BamIter, user_data: *mut c_void) -> FfiResult;
+
+/// Partitions matched tables/archetype runs of `iter` across the host `ComputeTaskPool`, invoking
+/// `chunk_fn(sub_iter, user_data)` on disjoint sub-range iterators in parallel (`P-07`).
+///
+/// # Safety
+/// - `iter` must point to an active top-level [`BamIter`] belonging to the running system invocation.
+/// - `chunk_fn` and `user_data` must be safe to invoke concurrently across worker threads.
+pub type BamParForEachChunkFn = unsafe extern "C" fn(
+    iter: *mut BamIter,
+    chunk_fn: Option<BamChunkTaskFn>,
+    user_data: *mut c_void,
+) -> FfiResult;
+
+/// Reads up to `max_count` unread POD messages from the Bevy `Messages<M>` stream declared at
+/// `term_index` (`MESSAGE_READ` or `MESSAGE_WRITE`) into `out_buf` (`max_count * size_of::<M>()`
+/// writable bytes), advancing the running system's per-term message cursor and writing the count
+/// of messages copied into `*out_read` (`F-02`).
+///
+/// # Safety
+/// - `iter` must point to an active [`BamIter`] belonging to the running system invocation.
+/// - `out_read` must point to writable `usize` storage.
+/// - When `max_count > 0` and element size `> 0`, `out_buf` must point to at least
+///   `max_count * elem_size` writable bytes.
+pub type BamMsgReadBatchFn = unsafe extern "C" fn(
+    iter: *mut BamIter,
+    term_index: usize,
+    out_buf: *mut u8,
+    max_count: usize,
+    out_read: *mut usize,
+) -> FfiResult;
+
+/// Writes one POD message payload (`data_ptr[0..data_len]`) into the Bevy `Messages<M>` stream
+/// declared with `MESSAGE_WRITE` at `term_index` (`F-02`).
+///
+/// # Safety
+/// - `iter` must point to an active [`BamIter`] belonging to the running system invocation.
+/// - When `data_len > 0`, `data_ptr` must point to `data_len` readable bytes representing a valid `M`.
+pub type BamMsgSendFn = unsafe extern "C" fn(
+    iter: *mut BamIter,
+    term_index: usize,
+    data_ptr: *const u8,
+    data_len: usize,
+) -> FfiResult;

@@ -8,6 +8,7 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+bevy_abi_mod_macros = { workspace = true }
 bevy_abi_mod_sys = { workspace = true }
 
 [lints]

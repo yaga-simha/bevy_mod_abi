@@ -78,7 +78,9 @@ pub(crate) fn validate_system_queries_against_snapshot(
                     ),
                 ));
             };
-            if term.mode.is_resource() != reg.is_resource() {
+            if term.mode.is_resource() != reg.is_resource()
+                || term.mode.is_message() != reg.is_message()
+            {
                 return Err((
                     FfiResult::INVALID_COMPONENT,
                     format!(
@@ -132,22 +134,22 @@ pub(crate) fn validate_system_queries_against_snapshot(
                 | AccessMode::ADDED => {
                     has_entity_terms = true;
                 }
-                AccessMode::RESOURCE_READ => {
+                AccessMode::RESOURCE_READ | AccessMode::MESSAGE_READ => {
                     if system_res_writes.contains(&comp_id) {
                         return Err((
                             FfiResult::ACCESS_CONFLICT,
-                            format!("conflicting resource read/write on '{}'", reg.name),
+                            format!("conflicting resource/message read/write on '{}'", reg.name),
                         ));
                     }
                     if system_res_reads.insert(comp_id) {
                         system_res_order.push((comp_id, Arc::clone(&reg.name)));
                     }
                 }
-                AccessMode::RESOURCE_WRITE => {
+                AccessMode::RESOURCE_WRITE | AccessMode::MESSAGE_WRITE => {
                     if system_res_reads.contains(&comp_id) || system_res_writes.contains(&comp_id) {
                         return Err((
                             FfiResult::ACCESS_CONFLICT,
-                            format!("conflicting resource write on '{}'", reg.name),
+                            format!("conflicting resource/message write on '{}'", reg.name),
                         ));
                     }
                     system_res_writes.insert(comp_id);
@@ -270,13 +272,16 @@ pub(crate) fn initialize_query_groups_in_world(
                     term.component.0
                 )));
             };
-            if term.mode.is_resource() != reg.is_resource() {
+            if term.mode.is_resource() != reg.is_resource()
+                || term.mode.is_message() != reg.is_message()
+            {
                 return Err(SystemInitError::KindMismatch(reg.name.to_string()));
             }
 
             let comp_id = reg.component_id;
             let mut storage_flags = reg.storage_flags;
             if !reg.is_resource()
+                && !reg.is_message()
                 && let Some(info) = world.components().get_info(comp_id)
             {
                 if info.storage_type() == StorageType::SparseSet {
@@ -321,7 +326,7 @@ pub(crate) fn initialize_query_groups_in_world(
                 | AccessMode::ADDED => {
                     has_entity_terms = true;
                 }
-                AccessMode::RESOURCE_READ => {
+                AccessMode::RESOURCE_READ | AccessMode::MESSAGE_READ => {
                     if system_res_writes.contains(&comp_id) {
                         return Err(SystemInitError::SelfConflict {
                             a: reg.name.to_string(),
@@ -332,7 +337,7 @@ pub(crate) fn initialize_query_groups_in_world(
                         system_res_order.push((comp_id, Arc::clone(&reg.name)));
                     }
                 }
-                AccessMode::RESOURCE_WRITE => {
+                AccessMode::RESOURCE_WRITE | AccessMode::MESSAGE_WRITE => {
                     if system_res_reads.contains(&comp_id) || system_res_writes.contains(&comp_id) {
                         return Err(SystemInitError::SelfConflict {
                             a: reg.name.to_string(),
@@ -347,6 +352,19 @@ pub(crate) fn initialize_query_groups_in_world(
                 }
             }
 
+            if group.msg_cursors.len() <= col_idx {
+                group.msg_cursors.resize_with(col_idx + 1, || None);
+            }
+            if term.mode.is_message() {
+                if group.msg_cursors[col_idx].is_none()
+                    && let Some(create_fn) = reg.create_msg_cursor_fn
+                {
+                    group.msg_cursors[col_idx] = Some(create_fn());
+                }
+            } else {
+                group.msg_cursors[col_idx] = None;
+            }
+
             term_metas.push(QueryTermMeta {
                 component: reg.handle,
                 component_id: comp_id,
@@ -355,6 +373,8 @@ pub(crate) fn initialize_query_groups_in_world(
                 size: reg.size,
                 align: reg.align,
                 storage_flags,
+                msg_read_batch_fn: reg.msg_read_batch_fn,
+                msg_send_fn: reg.msg_send_fn,
             });
         }
 

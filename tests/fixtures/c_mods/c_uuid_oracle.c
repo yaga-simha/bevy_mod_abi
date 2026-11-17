@@ -4,12 +4,12 @@
 #include "bevy_abi_mod.h"
 
 static const BamManifest MANIFEST = {
-    (uint32_t)sizeof(BamManifest),
-    BAM_ABI_VERSION,
-    "c_uuid_oracle",
-    "0.2.0",
-    0u,
-    0u
+    .struct_size = (uint32_t)sizeof(BamManifest),
+    .abi_version = BAM_ABI_VERSION,
+    .name = "c_uuid_oracle",
+    .version = "0.2.0",
+    .flags = 0u,
+    .reserved0 = 0u
 };
 
 BAM_EXPORT const BamManifest* bevy_abi_mod_manifest(void) {
