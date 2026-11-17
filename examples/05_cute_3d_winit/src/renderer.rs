@@ -7,8 +7,7 @@ use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
-use crate::components::{ColorRgba, CuteSpirit, Position, Scale3D};
-use crate::mod_manager::{ActiveMod, ModStatusResource};
+use crate::components::{ActiveMod, ColorRgba, CuteSpirit, ModStatusResource, Position, Scale3D};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const MAX_INSTANCES: usize = 32768;

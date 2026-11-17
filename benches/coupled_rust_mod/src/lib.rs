@@ -1,21 +1,14 @@
-#![allow(
-    clippy::undocumented_unsafe_blocks,
-    clippy::ptr_as_ptr,
-    clippy::cast_ptr_alignment,
-    clippy::transmute_ptr_to_ptr,
-    unreachable_pub
-)]
 #![deny(unsafe_op_in_unsafe_fn)]
-#![allow(clippy::type_complexity)]
+#![allow(clippy::type_complexity, unreachable_pub)]
 
 //! Coupled Rust `dylib` Mod (`bevy_dynamic_plugin` style).
 //!
 //! Shares unstable Rust ABI, `TypeId`s, heap allocator, and `bevy_ecs::system::Query` directly
 //! with the host binary via `shared_scenario` (`crate-type = ["dylib"]`).
 //! Demonstrates:
-//! 1. Near-native steady-state execution speed (direct struct offsets, no C-ABI VTable calls).
-//! 2. OS dynamic-linker (`dlopen`) overhead of resolving hundreds of mangled Rust/Bevy symbols.
-//! 3. Strict compiler & profile lock-in (cannot load a `debug` Rust `dylib` into a `release` Host!).
+//! 1. Steady-state execution speed with direct struct offsets and no C-ABI VTable calls.
+//! 2. OS dynamic-linker (`dlopen`) overhead of resolving mangled Rust and Bevy symbols.
+//! 3. Strict compiler and profile lock-in (cannot load a `debug` Rust `dylib` into a `release` host).
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use shared_scenario::bevy_app::{App, Update};
@@ -35,6 +28,7 @@ pub extern "C" fn coupled_rust_mod_set_variant(variant: u32) {
     COUPLED_VARIANT.store(variant, Ordering::Release);
 }
 
+/// Coupled Rust `dylib` direct entity-nested query system.
 pub fn coupled_nested_aura_combat_system(
     mut units: Query<
         (
@@ -162,6 +156,7 @@ pub fn coupled_nested_aura_combat_system(
     }
 }
 
+/// Coupled Rust `dylib` pre-cached SoA nested query system.
 pub fn coupled_cached_soa_nested_aura_combat_system(
     mut cached_emitters: Local<Vec<CachedNativeEmitter>>,
     mut units: Query<
@@ -318,6 +313,7 @@ pub extern "Rust" fn coupled_rust_mod_register(app: &mut App) {
     }
 }
 
+/// Deactivates coupled systems prior to dropping `App`.
 #[unsafe(no_mangle)]
 pub extern "C" fn coupled_rust_mod_shutdown() {
     ACTIVE.store(false, Ordering::Release);

@@ -14,7 +14,7 @@ else
     LDFLAGS = -shared -fPIC -lm
 endif
 
-BASE_CFLAGS = -std=c99 -Wall -Wextra -Werror -I../../include
+BASE_CFLAGS = -std=c99 -Wall -Wextra -Wpedantic -Werror -I../../include
 
 all: $(TARGET_DEBUG) $(TARGET_RELEASE)
 

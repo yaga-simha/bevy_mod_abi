@@ -1,37 +1,43 @@
-#![allow(
-    clippy::undocumented_unsafe_blocks,
-    clippy::ptr_as_ptr,
-    clippy::cast_ptr_alignment,
-    clippy::transmute_ptr_to_ptr,
-    unreachable_pub
-)]
-//! Microbenchmark: Chunk Iteration Throughput
-//! Compares Native Bevy ECS, Static `#[derive(ModExposable)]` C-ABI VTable access,
-//! and Runtime-Registered Dynamic Components (Rust `.cdylib` & C99 `.dylib`).
+//! Microbenchmark: Chunk Iteration Throughput (`ABI 0.2.0`).
+//!
+//! Compares Native Bevy ECS, Static `#[derive(ModComponent)]` C-ABI VTable access,
+//! and Runtime-Registered Dynamic Components (Rust `.cdylib` and C99 `.dylib`).
 //! Standard library `Instant` based, zero external benchmark harness dependencies.
 
 #![deny(unsafe_op_in_unsafe_fn)]
+#![allow(clippy::cast_ptr_alignment, unreachable_pub)]
 
-use bevy_abi_mod_host::{AbiModPlugin, ModAppExt, ModRegistry};
-use bevy_abi_mod_macros::ModExposable;
+use bevy_abi_mod_host::{AbiModPlugin, ComponentOptions, ModAppExt, ModComponent, ModRegistry};
 use bevy_app::{App, Update};
-use bevy_ecs::component::Component;
+use bevy_ecs::component::{Component, ComponentId};
 use bevy_ecs::ptr::OwningPtr;
 use bevy_ecs::system::Query;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+/// Host 3D position component exposed to guest mods via `#[derive(ModComponent)]`.
+#[repr(C)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+#[mod_component(name = "testbed::Position")]
 pub struct Position {
+    /// X coordinate.
     pub x: f32,
+    /// Y coordinate.
     pub y: f32,
+    /// Z coordinate.
     pub z: f32,
 }
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+/// Host 3D velocity component exposed to guest mods via `#[derive(ModComponent)]`.
+#[repr(C)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+#[mod_component(name = "testbed::Velocity")]
 pub struct Velocity {
+    /// X velocity.
     pub x: f32,
+    /// Y velocity.
     pub y: f32,
+    /// Z velocity.
     pub z: f32,
 }
 
@@ -51,7 +57,9 @@ struct FragTagD(u32);
 #[derive(Component, Debug, Clone, Copy, PartialEq)]
 #[repr(C)]
 pub struct NativeCustomData {
+    /// Primary floating-point stat.
     pub power: f32,
+    /// Secondary integer stat.
     pub shield: u32,
 }
 
@@ -65,18 +73,34 @@ struct RawRuntimePayload {
 }
 
 fn native_custom_system(mut query: Query<&mut NativeCustomData>) {
-    for mut item in query.iter_mut() {
+    for mut item in &mut query {
         item.power += 10.0;
         item.shield += 1;
     }
 }
 
 fn native_kinematics_system(mut query: Query<(&mut Position, &Velocity)>) {
-    for (mut pos, vel) in query.iter_mut() {
+    for (mut pos, vel) in &mut query {
         pos.x += vel.x;
         pos.y += vel.y;
         pos.z += vel.z;
     }
+}
+
+fn lookup_dynamic_component_id(reg: &ModRegistry, qualified: &str, short: &str) -> ComponentId {
+    if let Some(meta) = reg.get_by_name(qualified) {
+        return meta.component_id;
+    }
+    if let Some(meta) = reg.get_by_name(short) {
+        return meta.component_id;
+    }
+    let suffix = format!("::{short}");
+    reg.snapshot()
+        .entries()
+        .iter()
+        .find(|entry| entry.name.ends_with(&suffix))
+        .unwrap_or_else(|| panic!("runtime component '{qualified}' / '{short}' not found"))
+        .component_id
 }
 
 fn get_dylib_paths() -> (PathBuf, PathBuf) {
@@ -140,18 +164,16 @@ fn measure_app_rounds(
 
 fn main() {
     let (rust_dylib, c_dylib) = get_dylib_paths();
-    if !rust_dylib.exists() {
-        panic!(
-            "Fixture missing at {} — run 'cargo xtask fixtures' before 'cargo bench'",
-            rust_dylib.display()
-        );
-    }
-    if !c_dylib.exists() {
-        panic!(
-            "Fixture missing at {} — run 'cargo xtask fixtures' before 'cargo bench'",
-            c_dylib.display()
-        );
-    }
+    assert!(
+        rust_dylib.exists(),
+        "Fixture missing at {} — run 'cargo xtask fixtures' before 'cargo bench'",
+        rust_dylib.display()
+    );
+    assert!(
+        c_dylib.exists(),
+        "Fixture missing at {} — run 'cargo xtask fixtures' before 'cargo bench'",
+        c_dylib.display()
+    );
 
     const WARMUP: usize = 5;
     const ROUNDS: usize = 30;
@@ -161,7 +183,7 @@ fn main() {
         "=========================================================================================="
     );
     println!(
-        " MICROBENCHMARK: Runtime-Registered vs. Static ModExposable vs. Native Bevy Throughput"
+        " MICROBENCHMARK: Runtime-Registered vs. Static ModComponent vs. Native Bevy Throughput"
     );
     println!(
         "=========================================================================================="
@@ -217,12 +239,18 @@ fn main() {
             measure_app_rounds(&mut app, WARMUP, ROUNDS, entity_count)
         };
 
-        // 3. Static `#[derive(ModExposable)]` C-ABI VTable Access (Position + Velocity)
+        // 3. Static `#[derive(ModComponent)]` C-ABI Access (Position + Velocity)
         let (stat_med_ms, stat_tput, stat_ns) = {
             let mut app = App::new();
             app.add_plugins(AbiModPlugin);
-            app.register_mod_component::<Position>();
-            app.register_mod_component::<Velocity>();
+            app.register_mod_component::<Position>(
+                ComponentOptions::new().with_raw_insert().with_default(),
+            )
+            .expect("register Position");
+            app.register_mod_component::<Velocity>(
+                ComponentOptions::new().with_raw_insert().with_default(),
+            )
+            .expect("register Velocity");
             for i in 0..entity_count {
                 app.world_mut().spawn((
                     Position {
@@ -237,7 +265,7 @@ fn main() {
                     },
                 ));
             }
-            let mod_id = app.load_mod_tracked(&rust_dylib).expect("load rust mod");
+            let mod_id = app.load_mod(&rust_dylib).expect("load rust mod");
             let res = measure_app_rounds(&mut app, WARMUP, ROUNDS, entity_count);
             app.unload_mod(mod_id).expect("unload rust mod");
             res
@@ -247,13 +275,12 @@ fn main() {
         let (rt_rust_med_ms, rt_rust_tput, rt_rust_ns) = {
             let mut app = App::new();
             app.add_plugins(AbiModPlugin);
-            let mod_id = app.load_mod_tracked(&rust_dylib).expect("load rust mod");
-            let comp_id = app
-                .world()
-                .resource::<ModRegistry>()
-                .get_by_name("RustModCustomData")
-                .expect("RustModCustomData registered at runtime")
-                .component_id;
+            let mod_id = app.load_mod(&rust_dylib).expect("load rust mod");
+            let comp_id = lookup_dynamic_component_id(
+                app.world().resource::<ModRegistry>(),
+                "asymmetric_rust_mod::RustModCustomData",
+                "RustModCustomData",
+            );
 
             let mut e0 = None;
             for i in 0..entity_count {
@@ -277,7 +304,7 @@ fn main() {
             let res = measure_app_rounds(&mut app, WARMUP, ROUNDS, entity_count);
             let ptr = app.world().entity(e0.unwrap()).get_by_id(comp_id).unwrap();
             // SAFETY: Bytes stored under `comp_id` have layout `(f32, u32)`.
-            let d0 = unsafe { *(ptr.as_ptr() as *const RawRuntimePayload) };
+            let d0 = unsafe { *(ptr.as_ptr().cast::<RawRuntimePayload>()) };
             assert_eq!(d0.secondary, 1 + TOTAL_TICKS as u32);
 
             app.unload_mod(mod_id).expect("unload rust mod");
@@ -288,13 +315,12 @@ fn main() {
         let (rt_c_med_ms, rt_c_tput, rt_c_ns) = {
             let mut app = App::new();
             app.add_plugins(AbiModPlugin);
-            let mod_id = app.load_mod_tracked(&c_dylib).expect("load c99 mod");
-            let comp_id = app
-                .world()
-                .resource::<ModRegistry>()
-                .get_by_name("CModCustomData")
-                .expect("CModCustomData registered at runtime")
-                .component_id;
+            let mod_id = app.load_mod(&c_dylib).expect("load c99 mod");
+            let comp_id = lookup_dynamic_component_id(
+                app.world().resource::<ModRegistry>(),
+                "asymmetric_c_mod::CModCustomData",
+                "CModCustomData",
+            );
 
             let mut e0 = None;
             for i in 0..entity_count {
@@ -318,7 +344,7 @@ fn main() {
             let res = measure_app_rounds(&mut app, WARMUP, ROUNDS, entity_count);
             let ptr = app.world().entity(e0.unwrap()).get_by_id(comp_id).unwrap();
             // SAFETY: Bytes stored under `comp_id` have layout `(f32, i32)`.
-            let d0 = unsafe { *(ptr.as_ptr() as *const RawRuntimePayload) };
+            let d0 = unsafe { *(ptr.as_ptr().cast::<RawRuntimePayload>()) };
             assert_eq!(d0.secondary, 1 + TOTAL_TICKS as u32);
 
             app.unload_mod(mod_id).expect("unload c99 mod");
@@ -329,13 +355,21 @@ fn main() {
         let (rt_par_med_ms, rt_par_tput, rt_par_ns) = {
             let mut app = App::new();
             app.add_plugins(AbiModPlugin);
-            let r_id = app.load_mod_tracked(&rust_dylib).expect("load rust mod");
-            let c_id = app.load_mod_tracked(&c_dylib).expect("load c99 mod");
+            let r_id = app.load_mod(&rust_dylib).expect("load rust mod");
+            let c_id = app.load_mod(&c_dylib).expect("load c99 mod");
             let (rust_comp_id, c_comp_id) = {
                 let reg = app.world().resource::<ModRegistry>();
                 (
-                    reg.get_by_name("RustModCustomData").unwrap().component_id,
-                    reg.get_by_name("CModCustomData").unwrap().component_id,
+                    lookup_dynamic_component_id(
+                        reg,
+                        "asymmetric_rust_mod::RustModCustomData",
+                        "RustModCustomData",
+                    ),
+                    lookup_dynamic_component_id(
+                        reg,
+                        "asymmetric_c_mod::CModCustomData",
+                        "CModCustomData",
+                    ),
                 )
             };
 
@@ -391,7 +425,7 @@ fn main() {
             nat_kin_med_ms, nat_kin_tput, nat_kin_ns
         );
         println!(
-            "  Static ModExposable VTable     | Median: {:>7.4} ms | {:>13.2} ent/s | {:>6.2} ns/ent",
+            "  Static ModComponent VTable     | Median: {:>7.4} ms | {:>13.2} ent/s | {:>6.2} ns/ent",
             stat_med_ms, stat_tput, stat_ns
         );
     }
@@ -400,8 +434,14 @@ fn main() {
     for &num_archetypes in &[1_usize, 4, 16] {
         let mut app = App::new();
         app.add_plugins(AbiModPlugin);
-        app.register_mod_component::<Position>();
-        app.register_mod_component::<Velocity>();
+        app.register_mod_component::<Position>(
+            ComponentOptions::new().with_raw_insert().with_default(),
+        )
+        .expect("register Position");
+        app.register_mod_component::<Velocity>(
+            ComponentOptions::new().with_raw_insert().with_default(),
+        )
+        .expect("register Velocity");
         for i in 0..10_000_usize {
             let bucket = i % num_archetypes;
             let mut emut = app.world_mut().spawn((
@@ -429,7 +469,7 @@ fn main() {
                 emut.insert(FragTagD(i as u32));
             }
         }
-        let mod_id = app.load_mod_tracked(&rust_dylib).expect("load rust mod");
+        let mod_id = app.load_mod(&rust_dylib).expect("load rust mod");
         let (frag_med_ms, frag_tput, frag_ns) =
             measure_app_rounds(&mut app, WARMUP, ROUNDS, 10_000);
         app.unload_mod(mod_id).expect("unload rust mod");

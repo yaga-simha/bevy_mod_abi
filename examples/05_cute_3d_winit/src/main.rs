@@ -1,29 +1,21 @@
-#![allow(
-    clippy::undocumented_unsafe_blocks,
-    clippy::ptr_as_ptr,
-    clippy::cast_ptr_alignment,
-    clippy::transmute_ptr_to_ptr,
-    unreachable_pub
-)]
-//! Stage 5 Example: Cute 3D Slime Meadow with Dynamic Mod Loading (`winit` + `wgpu`)
+#![allow(unreachable_pub)]
+
+//! Example 05: Cute 3D Slime Meadow (`winit` + `wgpu` + `avian3d`, `ABI 0.2.0`).
 //!
-//! Replaces the 2D terminal TUI with an interactive, toy-diorama 3D window powered by `winit`
-//! and `wgpu`, featuring kawaii pastel bunny-slimes on a floating mushroom island!
-//!
-//! Dynamically loads, hot-reloads, and unloads zero-serialization C-ABI mods (both Rust `.cdylib`
-//! and pure ISO C99 `.dylib`/`.so`/`.dll`) at runtime:
-//! - `[1]` **Jelly Boing Hop** (`mod_boing` — Rust): Bouncy 3D hops, volume-preserving squash & stretch, ear flop!
-//! - `[2]` **Pastel Carousel Waltz** (`mod_carousel` — Rust): Two-ring counter-rotating 3D merry-go-round & macaron rainbow hues!
-//! - `[3]` **Cozy Cuddle Huddle** (`mod_cuddle_c99` — Pure C99): Sunflower cuddle pile around the giant mushroom with rosy blushes!
-//! - `[R]` Hot-reload active mod via shadow copy | `[U]` Unload mod | `[Space]` Pause | `[Drag/Scroll]` Orbit 3D Camera.
+//! Demonstrates driving a custom `winit` + `wgpu` 3D rendering loop and `avian3d` physics world
+//! with live-swappable Rust (`.cdylib`) and ISO C99 (`.dylib`/`.so`/`.dll`) mods using the core
+//! loader's `LoadOptions { shadow_copy: true, .. }`.
 
 mod components;
 mod meadow;
-mod mod_manager;
 mod renderer;
 
 use bevy_abi_mod::prelude::*;
 use bevy_app::{App, PostUpdate};
+use bevy_ecs::message::MessageReader;
+use bevy_ecs::system::ResMut;
+use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
@@ -33,9 +25,10 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-use components::{ColorRgba, CuteSpirit, Position, Scale3D, Velocity};
+use components::{
+    ActiveMod, ColorRgba, CuteSpirit, HomeStyle, ModStatusResource, Position, Scale3D, Velocity,
+};
 use meadow::{MeadowClock, host_meadow_post_physics, spawn_slimes};
-use mod_manager::{ActiveMod, ModManager, ModStatusResource};
 use renderer::{CuteRenderer, OrbitCamera, SlimeRenderData};
 
 struct CliArgs {
@@ -96,7 +89,7 @@ impl CliArgs {
                            --test-mode       Run automated headless 3D ECS + C-ABI mod verification\n  \
                            --headless        Run simulation without opening a winit 3D window\n  \
                            --ticks <N>       Ticks per verification phase (default: 40)\n  \
-                           --slimes <N>      Number of cute 3D bunny-slimes (default: 32)\n  \
+                           --slimes <N>      Number of 3D bunny-slimes (default: 32)\n  \
                            --mod <name>      Initial mod: boing (default), carousel, cuddle, or none\n  \
                            -h, --help        Show this help message\n\n\
                          Interactive 3D Window Controls:\n  \
@@ -126,10 +119,217 @@ impl CliArgs {
     }
 }
 
+/// Resolves a compiled 3D mod shared library on disk across workspace and crate working directories.
+fn resolve_mod_binary(kind: ActiveMod) -> Option<PathBuf> {
+    let stem = kind.binary_stem()?;
+    let (prefix, ext) = if cfg!(target_os = "windows") {
+        ("", "dll")
+    } else if cfg!(target_os = "macos") {
+        ("lib", "dylib")
+    } else {
+        ("lib", "so")
+    };
+
+    let filename = format!("{prefix}{stem}.{ext}");
+    let candidates = match kind {
+        ActiveMod::None => return None,
+        ActiveMod::Boing | ActiveMod::Carousel => vec![
+            PathBuf::from(format!(
+                "examples/05_cute_3d_winit/mods/{stem}/target/release/{filename}"
+            )),
+            PathBuf::from(format!("mods/{stem}/target/release/{filename}")),
+            PathBuf::from(format!(
+                "examples/05_cute_3d_winit/mods/{stem}/target/debug/{filename}"
+            )),
+            PathBuf::from(format!("mods/{stem}/target/debug/{filename}")),
+        ],
+        ActiveMod::CuddleC99 => vec![
+            PathBuf::from(format!(
+                "examples/05_cute_3d_winit/mods/mod_cuddle_c99/{filename}"
+            )),
+            PathBuf::from(format!("mods/mod_cuddle_c99/{filename}")),
+        ],
+    };
+
+    candidates.into_iter().find(|p| p.exists())
+}
+
+/// Ensures the requested Rust `.cdylib` or ISO C99 shared library is compiled on disk.
+fn ensure_mod_binary_built(kind: ActiveMod) -> Result<PathBuf, String> {
+    if let Some(existing) = resolve_mod_binary(kind) {
+        return Ok(existing);
+    }
+
+    match kind {
+        ActiveMod::None => return Err("Cannot build ActiveMod::None".to_string()),
+        ActiveMod::Boing | ActiveMod::Carousel => {
+            let stem = kind.binary_stem().unwrap();
+            let manifest_candidates = [
+                PathBuf::from(format!("examples/05_cute_3d_winit/mods/{stem}/Cargo.toml")),
+                PathBuf::from(format!("mods/{stem}/Cargo.toml")),
+            ];
+            let manifest = manifest_candidates
+                .into_iter()
+                .find(|p| p.exists())
+                .ok_or_else(|| format!("Cargo.toml not found for {stem}"))?;
+
+            println!("[Host] Building {stem} Rust cdylib on demand...");
+            let status = Command::new("cargo")
+                .args(["build", "--manifest-path"])
+                .arg(&manifest)
+                .arg("--release")
+                .status()
+                .map_err(|e| format!("Failed to invoke cargo build for {stem}: {e}"))?;
+
+            if !status.success() {
+                return Err(format!("cargo build failed for {stem}"));
+            }
+        }
+        ActiveMod::CuddleC99 => {
+            let dir_candidates = [
+                PathBuf::from("examples/05_cute_3d_winit/mods/mod_cuddle_c99"),
+                PathBuf::from("mods/mod_cuddle_c99"),
+            ];
+            let c_dir = dir_candidates
+                .into_iter()
+                .find(|p| p.join("Makefile").exists())
+                .ok_or_else(|| "Makefile not found for mod_cuddle_c99".to_string())?;
+
+            println!("[Host] Compiling mod_cuddle_c99 (ISO C99) on demand...");
+            let status = Command::new("make")
+                .arg("-C")
+                .arg(&c_dir)
+                .status()
+                .map_err(|e| format!("Failed to invoke make for mod_cuddle_c99: {e}"))?;
+
+            if !status.success() {
+                return Err("make failed for mod_cuddle_c99".to_string());
+            }
+        }
+    }
+
+    resolve_mod_binary(kind).ok_or_else(|| format!("Binary for {kind:?} missing after build"))
+}
+
+/// Drains lifecycle and fault `Message`s emitted by `AbiModPlugin` (`B-09`).
+fn observe_mod_lifecycle_messages(
+    mut loaded: MessageReader<ModLoaded>,
+    mut unloaded: MessageReader<ModUnloaded>,
+    mut faulted: MessageReader<ModSystemFaulted>,
+    mut status: ResMut<ModStatusResource>,
+) {
+    for msg in loaded.read() {
+        let _ = (&msg.name, &msg.version, msg.system_count);
+    }
+    for msg in unloaded.read() {
+        let _ = (&msg.name, msg.removed_systems);
+    }
+    for fault in faulted.read() {
+        status.fault_count += 1;
+        status.status_message = format!(
+            "System '{}' faulted ({})",
+            fault.system_name,
+            fault.status.name()
+        );
+    }
+}
+
+/// Loads or switches to `target` using core `LoadOptions { shadow_copy: true, .. }` (`L-03`).
+fn switch_mod(app: &mut App, target: ActiveMod) -> Result<(), String> {
+    if target == ActiveMod::None {
+        return unload_active_mod(app);
+    }
+
+    let current = app.world().resource::<ModStatusResource>().active_mod;
+    if current == target {
+        return reload_active_mod(app);
+    }
+    if current != ActiveMod::None {
+        unload_active_mod(app)?;
+    }
+
+    let binary_path = ensure_mod_binary_built(target)?;
+    let mod_id = app
+        .load_mod_with(&binary_path, LoadOptions::new().with_shadow_copy(true))
+        .map_err(|err| format!("Failed to load 3D mod {}: {err}", target.name()))?;
+
+    let mut status = app.world_mut().resource_mut::<ModStatusResource>();
+    status.active_mod = target;
+    status.mod_id = Some(mod_id);
+    status.reload_count = 0;
+    status.status_message = format!("Loaded {} ({mod_id:?})", target.name());
+    Ok(())
+}
+
+/// Unloads the active 3D mod via `ModAppExt::unload_mod` and restores each slime's `HomeStyle`.
+fn unload_active_mod(app: &mut App) -> Result<(), String> {
+    let (prev_mod, prev_id) = {
+        let status = app.world().resource::<ModStatusResource>();
+        (status.active_mod, status.mod_id)
+    };
+
+    if prev_mod == ActiveMod::None {
+        app.world_mut()
+            .resource_mut::<ModStatusResource>()
+            .status_message = "Already in peaceful Meadow Stroll.".to_string();
+        return Ok(());
+    }
+
+    if let Some(mod_id) = prev_id {
+        app.unload_mod(mod_id)
+            .map_err(|err| format!("Failed to unload {}: {err}", prev_mod.name()))?;
+    }
+
+    {
+        let mut query = app
+            .world_mut()
+            .query::<(&mut ColorRgba, &mut Scale3D, &mut CuteSpirit, &HomeStyle)>();
+        for (mut col, mut scale, mut spirit, home) in query.iter_mut(app.world_mut()) {
+            *col = home.base_color;
+            *scale = Scale3D::uniform(1.0);
+            spirit.blush = 0.42;
+            spirit.ear_wiggle = 0.0;
+        }
+    }
+
+    let mut status = app.world_mut().resource_mut::<ModStatusResource>();
+    status.active_mod = ActiveMod::None;
+    status.mod_id = None;
+    status.reload_count = 0;
+    status.status_message = format!("Unloaded {}. Slimes back to cozy stroll.", prev_mod.name());
+    Ok(())
+}
+
+/// Hot-reloads the active 3D mod from disk via a fresh core shadow copy (`L-03`).
+fn reload_active_mod(app: &mut App) -> Result<(), String> {
+    let (target, prev_reloads) = {
+        let status = app.world().resource::<ModStatusResource>();
+        (status.active_mod, status.reload_count)
+    };
+
+    if target == ActiveMod::None {
+        app.world_mut()
+            .resource_mut::<ModStatusResource>()
+            .status_message = "No active mod to hot-reload. Press 1, 2, or 3.".to_string();
+        return Ok(());
+    }
+
+    unload_active_mod(app)?;
+    switch_mod(app, target)?;
+
+    let mut status = app.world_mut().resource_mut::<ModStatusResource>();
+    status.reload_count = prev_reloads + 1;
+    status.status_message = format!(
+        "Hot-reloaded {} (Reload #{})",
+        target.name(),
+        status.reload_count
+    );
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = CliArgs::parse();
 
-    // 1. Initialize Bevy ECS App with AbiModPlugin and 3D ModExposable components
     let mut app = App::new();
     app.add_plugins(bevy_app::TaskPoolPlugin::default());
     app.add_plugins(bevy_time::TimePlugin);
@@ -138,33 +338,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.insert_resource(avian3d::prelude::SubstepCount(2));
     app.add_plugins(AbiModPlugin);
     app.init_resource::<MeadowClock>();
-    app.register_mod_component::<Position>();
-    app.register_mod_component::<Velocity>();
-    app.register_mod_component::<Scale3D>();
-    app.register_mod_component::<ColorRgba>();
-    app.register_mod_component::<CuteSpirit>();
-    app.add_systems(PostUpdate, host_meadow_post_physics);
+    app.init_resource::<ModStatusResource>();
+    app.register_mod_component::<Position>(
+        ComponentOptions::new().with_raw_insert().with_default(),
+    )?;
+    app.register_mod_component::<Velocity>(
+        ComponentOptions::new().with_raw_insert().with_default(),
+    )?;
+    app.register_mod_component::<Scale3D>(
+        ComponentOptions::new().with_raw_insert().with_default(),
+    )?;
+    app.register_mod_component::<ColorRgba>(
+        ComponentOptions::new().with_raw_insert().with_default(),
+    )?;
+    app.register_mod_component::<CuteSpirit>(
+        ComponentOptions::new().with_raw_insert().with_default(),
+    )?;
+    app.add_systems(
+        PostUpdate,
+        (host_meadow_post_physics, observe_mod_lifecycle_messages),
+    );
 
-    // Finalize plugins (initializes Avian collision tree diagnostics & resources)
     app.finish();
     app.cleanup();
 
-    // 2. Spawn static colliders and cute pastel bunny-slimes onto the floating 3D meadow
     meadow::spawn_meadow_colliders(app.world_mut().commands());
     spawn_slimes(app.world_mut().commands(), args.slime_count);
     app.update();
 
-    // 3. Initialize Dynamic ModManager (Rust cdylib + Pure C99 mods)
-    let mut mod_manager = ModManager::new()?;
-    mod_manager.sync_resource(&mut app);
-
     if let Some(initial) = args.initial_mod {
-        mod_manager.load_mod(&mut app, initial)?;
+        switch_mod(&mut app, initial)?;
     }
 
-    // 4. Headless verification or Interactive 3D Winit Window
     if args.test_mode {
-        run_headless_3d_verification(&mut app, &mut mod_manager, args.ticks_per_phase)?;
+        run_headless_3d_verification(&mut app, args.ticks_per_phase)?;
     } else if args.headless {
         for _ in 0..args.ticks_per_phase * 3 {
             app.update();
@@ -172,10 +379,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "[HEADLESS 3D] Completed {} ticks with active mod: {}",
             args.ticks_per_phase * 3,
-            mod_manager.active_mod().name()
+            app.world()
+                .resource::<ModStatusResource>()
+                .active_mod
+                .name()
         );
     } else {
-        run_winit_3d_meadow(app, mod_manager)?;
+        run_winit_3d_meadow(app)?;
     }
 
     Ok(())
@@ -187,7 +397,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 struct CuteMeadowWinitApp {
     ecs_app: App,
-    mod_manager: ModManager,
     window: Option<Arc<Window>>,
     renderer: Option<CuteRenderer>,
     camera: OrbitCamera,
@@ -202,11 +411,10 @@ struct CuteMeadowWinitApp {
 }
 
 impl CuteMeadowWinitApp {
-    fn new(ecs_app: App, mod_manager: ModManager) -> Self {
+    fn new(ecs_app: App) -> Self {
         let now = Instant::now();
         Self {
             ecs_app,
-            mod_manager,
             window: None,
             renderer: None,
             camera: OrbitCamera::default(),
@@ -223,7 +431,7 @@ impl CuteMeadowWinitApp {
 
     fn log_mod_status(&self) {
         if let Some(status) = self.ecs_app.world().get_resource::<ModStatusResource>() {
-            println!("✨ [CuteMeadow] {}", status.status_message);
+            println!("[CuteMeadow] {}", status.status_message);
         }
     }
 
@@ -237,7 +445,7 @@ impl CuteMeadowWinitApp {
                 .unwrap_or_default();
             let pause_str = if self.paused { " [PAUSED]" } else { "" };
             win.set_title(&format!(
-                "✨ Cute 3D Slime Meadow — {} (Reloads: {}){} | [1] Boing [2] Carousel [3] C99 Cuddle [R] Reload [U] Unload",
+                "Cute 3D Slime Meadow — {} (Reloads: {}){} | [1] Boing [2] Carousel [3] C99 Cuddle [R] Reload [U] Unload",
                 status.active_mod.name(),
                 status.reload_count,
                 pause_str
@@ -258,10 +466,7 @@ impl CuteMeadowWinitApp {
         }
         self.ecs_app.update();
         let total = self.query_slime_count();
-        println!(
-            "✨ [CuteMeadow] Spawned +{} slimes! Total: {}",
-            count, total
-        );
+        println!("[CuteMeadow] Spawned +{count} slimes. Total: {total}");
         self.refresh_window_title();
     }
 
@@ -284,7 +489,7 @@ impl CuteMeadowWinitApp {
         }
         self.ecs_app.update();
         let total = self.query_slime_count();
-        println!("✨ [CuteMeadow] Removed slimes. Total: {}", total);
+        println!("[CuteMeadow] Removed slimes. Total: {total}");
         self.refresh_window_title();
     }
 
@@ -312,7 +517,7 @@ impl ApplicationHandler for CuteMeadowWinitApp {
         }
 
         let attrs = Window::default_attributes()
-            .with_title("✨ Cute 3D Slime Meadow — bevy_abi_mod (winit + wgpu)")
+            .with_title("Cute 3D Slime Meadow — bevy_abi_mod v0.2 (winit + wgpu)")
             .with_inner_size(LogicalSize::new(1180.0, 760.0));
 
         let window = match event_loop.create_window(attrs) {
@@ -329,7 +534,7 @@ impl ApplicationHandler for CuteMeadowWinitApp {
                 self.window = Some(window);
                 self.renderer = Some(renderer);
                 self.refresh_window_title();
-                println!("=== ✨ Cute 3D Slime Meadow Running! ===");
+                println!("=== Cute 3D Slime Meadow Running ===");
                 println!("  [1] Jelly Boing Hop (Rust cdylib)");
                 println!("  [2] Pastel Carousel Waltz (Rust cdylib)");
                 println!("  [3] Cozy Cuddle Huddle (Pure C99)");
@@ -352,7 +557,7 @@ impl ApplicationHandler for CuteMeadowWinitApp {
     ) {
         match event {
             WindowEvent::CloseRequested => {
-                let _ = self.mod_manager.unload_mod(&mut self.ecs_app);
+                let _ = unload_active_mod(&mut self.ecs_app);
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
@@ -367,45 +572,36 @@ impl ApplicationHandler for CuteMeadowWinitApp {
                 {
                     match code {
                         KeyCode::Digit1 | KeyCode::Numpad1 => {
-                            match self
-                                .mod_manager
-                                .load_mod(&mut self.ecs_app, ActiveMod::Boing)
-                            {
+                            match switch_mod(&mut self.ecs_app, ActiveMod::Boing) {
                                 Ok(()) => self.log_mod_status(),
-                                Err(e) => eprintln!("[ModManager] {e}"),
+                                Err(e) => eprintln!("[Host] {e}"),
                             }
                             self.refresh_window_title();
                         }
                         KeyCode::Digit2 | KeyCode::Numpad2 => {
-                            match self
-                                .mod_manager
-                                .load_mod(&mut self.ecs_app, ActiveMod::Carousel)
-                            {
+                            match switch_mod(&mut self.ecs_app, ActiveMod::Carousel) {
                                 Ok(()) => self.log_mod_status(),
-                                Err(e) => eprintln!("[ModManager] {e}"),
+                                Err(e) => eprintln!("[Host] {e}"),
                             }
                             self.refresh_window_title();
                         }
                         KeyCode::Digit3 | KeyCode::Numpad3 => {
-                            match self
-                                .mod_manager
-                                .load_mod(&mut self.ecs_app, ActiveMod::CuddleC99)
-                            {
+                            match switch_mod(&mut self.ecs_app, ActiveMod::CuddleC99) {
                                 Ok(()) => self.log_mod_status(),
-                                Err(e) => eprintln!("[ModManager] {e}"),
+                                Err(e) => eprintln!("[Host] {e}"),
                             }
                             self.refresh_window_title();
                         }
                         KeyCode::KeyU | KeyCode::Digit0 => {
-                            if self.mod_manager.unload_mod(&mut self.ecs_app).is_ok() {
+                            if unload_active_mod(&mut self.ecs_app).is_ok() {
                                 self.log_mod_status();
                             }
                             self.refresh_window_title();
                         }
                         KeyCode::KeyR => {
-                            match self.mod_manager.reload_mod(&mut self.ecs_app) {
+                            match reload_active_mod(&mut self.ecs_app) {
                                 Ok(()) => self.log_mod_status(),
-                                Err(e) => eprintln!("[ModManager] {e}"),
+                                Err(e) => eprintln!("[Host] {e}"),
                             }
                             self.refresh_window_title();
                         }
@@ -437,7 +633,7 @@ impl ApplicationHandler for CuteMeadowWinitApp {
                             self.camera.pitch = (self.camera.pitch - 0.08).clamp(0.12, 1.35);
                         }
                         KeyCode::Escape | KeyCode::KeyQ => {
-                            let _ = self.mod_manager.unload_mod(&mut self.ecs_app);
+                            let _ = unload_active_mod(&mut self.ecs_app);
                             event_loop.exit();
                         }
                         _ => {}
@@ -484,7 +680,6 @@ impl ApplicationHandler for CuteMeadowWinitApp {
                     self.camera.yaw += (dt_frame as f32) * 0.16;
                 }
 
-                // Fixed-rate ~60Hz ECS simulation stepping
                 let sim_elapsed = now.duration_since(self.last_sim_step).as_secs_f32();
                 if sim_elapsed >= (1.0 / 65.0) {
                     self.last_sim_step = now;
@@ -527,12 +722,9 @@ impl ApplicationHandler for CuteMeadowWinitApp {
     }
 }
 
-fn run_winit_3d_meadow(
-    app: App,
-    mod_manager: ModManager,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn run_winit_3d_meadow(app: App) -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoop::new()?;
-    let mut handler = CuteMeadowWinitApp::new(app, mod_manager);
+    let mut handler = CuteMeadowWinitApp::new(app);
     event_loop.run_app(&mut handler)?;
     Ok(())
 }
@@ -543,12 +735,10 @@ fn run_winit_3d_meadow(
 
 fn run_headless_3d_verification(
     app: &mut App,
-    mod_manager: &mut ModManager,
     ticks: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== Stage 5 Automated Cute 3D Modding Verification ===");
+    println!("=== Example 05 Automated Cute 3D Modding Verification ===");
 
-    // Phase 1: Baseline Cozy Meadow Stroll
     println!("[TEST] Phase 1: Baseline Cozy Meadow Stroll ({ticks} ticks)...");
     for _ in 0..ticks {
         app.update();
@@ -560,10 +750,12 @@ fn run_headless_3d_verification(
     );
     println!("  -> PASS: Baseline 3D meadow stroll verified.");
 
-    // Phase 2: Mod 1 — Jelly Boing Hop (Rust cdylib)
     println!("[TEST] Phase 2: Loading Mod 1 — Jelly Boing Hop (Rust cdylib) ({ticks} ticks)...");
-    mod_manager.load_mod(app, ActiveMod::Boing)?;
-    assert_eq!(mod_manager.active_mod(), ActiveMod::Boing);
+    switch_mod(app, ActiveMod::Boing)?;
+    assert_eq!(
+        app.world().resource::<ModStatusResource>().active_mod,
+        ActiveMod::Boing
+    );
 
     let mut max_hop_y = 0.0_f32;
     let mut saw_squash_stretch = false;
@@ -588,13 +780,15 @@ fn run_headless_3d_verification(
     );
     println!("  -> PASS: 3D hopping (max_y={max_hop_y:.2}) and jelly squash-stretch verified.");
 
-    // Phase 3: Mod 2 — Pastel Carousel Waltz (Rust cdylib)
     println!(
         "[TEST] Phase 3: Switching to Mod 2 — Pastel Carousel Waltz (Rust cdylib) ({ticks} ticks)..."
     );
     let colors_before = query_colors(app);
-    mod_manager.load_mod(app, ActiveMod::Carousel)?;
-    assert_eq!(mod_manager.active_mod(), ActiveMod::Carousel);
+    switch_mod(app, ActiveMod::Carousel)?;
+    assert_eq!(
+        app.world().resource::<ModStatusResource>().active_mod,
+        ActiveMod::Carousel
+    );
 
     for _ in 0..ticks {
         app.update();
@@ -610,13 +804,15 @@ fn run_headless_3d_verification(
     );
     println!("  -> PASS: 3D carousel orbital waltz and macaron color animation verified.");
 
-    // Phase 4: Mod 3 — Cozy Cuddle Huddle (Pure ISO C99)
     println!(
         "[TEST] Phase 4: Switching to Mod 3 — Cozy Cuddle Huddle (Pure C99) ({ticks} ticks)..."
     );
     let dist_before = avg_xz_radius(app);
-    mod_manager.load_mod(app, ActiveMod::CuddleC99)?;
-    assert_eq!(mod_manager.active_mod(), ActiveMod::CuddleC99);
+    switch_mod(app, ActiveMod::CuddleC99)?;
+    assert_eq!(
+        app.world().resource::<ModStatusResource>().active_mod,
+        ActiveMod::CuddleC99
+    );
 
     for _ in 0..ticks {
         app.update();
@@ -629,29 +825,28 @@ fn run_headless_3d_verification(
         "C99 Cozy Cuddle mod must give slimes warm rosy blushes"
     );
     println!(
-        "  -> PASS: Pure C99 cuddle huddle verified (avg radius {:.2} -> {:.2}).",
-        dist_before, dist_after
+        "  -> PASS: Pure C99 cuddle huddle verified (avg radius {dist_before:.2} -> {dist_after:.2})."
     );
 
-    // Phase 5: Hot-Reload C99 Mod
     println!("[TEST] Phase 5: Hot-Reloading Active 3D Mod ({ticks} ticks)...");
-    mod_manager.reload_mod(app)?;
-    assert_eq!(mod_manager.reload_count(), 1);
+    reload_active_mod(app)?;
+    assert_eq!(app.world().resource::<ModStatusResource>().reload_count, 1);
     for _ in 0..ticks {
         app.update();
     }
-    println!("  -> PASS: Shadow-copy hot-reload (#1) verified cleanly.");
+    println!("  -> PASS: Core shadow-copy hot-reload (#1) verified.");
 
-    // Phase 6: Unload back to Baseline Meadow Stroll
     println!("[TEST] Phase 6: Unloading Mod back to Cozy Stroll ({ticks} ticks)...");
-    mod_manager.unload_mod(app)?;
-    assert_eq!(mod_manager.active_mod(), ActiveMod::None);
+    unload_active_mod(app)?;
+    assert_eq!(
+        app.world().resource::<ModStatusResource>().active_mod,
+        ActiveMod::None
+    );
     for _ in 0..ticks {
         app.update();
     }
     println!("  -> PASS: Clean dlclose unload and baseline restoration verified.");
 
-    // Phase 7: Dynamic Slime Population Scaling & Jelly Collision Bouncing
     println!("[TEST] Phase 7: Dynamic Population Scaling & Collision Bouncing ({ticks} ticks)...");
     let count_before = query_positions(app).len();
     {
@@ -666,43 +861,43 @@ fn run_headless_3d_verification(
         "Spawning additional slimes must increase total entity count"
     );
 
-    // Spawn two slimes on a direct head-on collision path to verify elastic bounce & blush
     let col_entity_a = {
         let mut commands = app.world_mut().commands();
         let e = meadow::spawn_single_slime(
             &mut commands,
-            Position::new(-0.4, 0.0, 0.0),
+            Position::new(2.5, 0.0, 0.0),
             Velocity::new(3.0, 0.0, 0.0),
             Scale3D::uniform(1.0),
             ColorRgba::new(1.0, 0.5, 0.5, 1.0),
             CuteSpirit::new(0.0, 0.0, 0.2),
-            components::HomeStyle {
+            HomeStyle {
                 base_color: ColorRgba::new(1.0, 0.5, 0.5, 1.0),
                 phase_offset: 0.0,
             },
         );
         meadow::spawn_single_slime(
             &mut commands,
-            Position::new(0.4, 0.0, 0.0),
+            Position::new(3.1, 0.0, 0.0),
             Velocity::new(-3.0, 0.0, 0.0),
             Scale3D::uniform(1.0),
             ColorRgba::new(0.5, 0.5, 1.0, 1.0),
             CuteSpirit::new(0.0, 0.0, 0.2),
-            components::HomeStyle {
+            HomeStyle {
                 base_color: ColorRgba::new(0.5, 0.5, 1.0, 1.0),
                 phase_offset: 0.0,
             },
         );
         e
     };
-    app.update(); // Step collision and bounce
+    app.world_mut().flush();
+    app.update();
 
     let bounced_pos = app.world().get::<Position>(col_entity_a).unwrap();
     let bounced_vel = app.world().get::<Velocity>(col_entity_a).unwrap();
     let bounced_spirit = app.world().get::<CuteSpirit>(col_entity_a).unwrap();
 
     assert!(
-        bounced_vel.x < 0.0 || bounced_pos.x < -0.4,
+        bounced_vel.x < 0.0 || bounced_pos.x < 2.5,
         "Colliding slimes must bounce and reverse direction upon collision"
     );
     assert_eq!(
@@ -714,7 +909,7 @@ fn run_headless_3d_verification(
     );
 
     println!(
-        "\n[TEST_MODE] SUCCESS: All 3 cute 3D mods, hot-reload, dynamic population, and collision bouncing verified!"
+        "\n[TEST_MODE] SUCCESS: All 3 3D mods, shadow-copy hot-reload, dynamic population, and collision bouncing verified."
     );
 
     Ok(())

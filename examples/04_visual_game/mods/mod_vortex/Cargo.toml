@@ -1,6 +1,6 @@
 [package]
 name = "mod_vortex"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.87"
 publish = false
@@ -12,4 +12,3 @@ crate-type = ["cdylib"]
 
 [dependencies]
 bevy_abi_mod_guest = { path = "../../../../crates/bevy_abi_mod_guest", features = ["derive"] }
-bevy_abi_mod_sys = { path = "../../../../crates/bevy_abi_mod_sys" }
