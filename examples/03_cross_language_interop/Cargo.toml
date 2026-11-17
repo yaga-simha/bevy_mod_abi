@@ -3,6 +3,7 @@ name = "example_03_cross_language_interop"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 publish = false
 
 [dependencies]

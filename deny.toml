@@ -8,7 +8,10 @@ exclude-dev = false
 [advisories]
 version = 2
 yanked = "warn"
-ignore = []
+ignore = [
+    # Transitive via `ratatui 0.29.0` (`example_04_visual_game`); no safe upstream upgrade exists.
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 version = 2
@@ -35,6 +38,7 @@ allow = [
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+allow-wildcard-paths = true
 highlight = "all"
 
 # Strictly forbid duplicate `bevy*` versions across the workspace graph (`CI-04`).
