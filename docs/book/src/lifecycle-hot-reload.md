@@ -38,7 +38,7 @@ When `world.unload_mod(id)` (or `app.unload_mod(id)`) runs under exclusive `&mut
 
 ---
 
-## 4.Observing Lifecycle & Fault `Messages`
+## 4. Observing Lifecycle & Fault `Messages`
 
 ```rust
 use bevy_abi_mod::prelude::*;

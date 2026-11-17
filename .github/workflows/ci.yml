@@ -170,7 +170,7 @@ jobs:
         with:
           key: asym-rust-${{ matrix.guest_toolchain }}-o${{ matrix.opt_level }}-${{ matrix.panic_mode }}
 
-      - name: Stage base fixtures with stable host, then rebuild `asymmetric_rust_mod` asymmetrically
+      - name: Stage base fixtures with stable host, then rebuild asymmetric Rust guests
         env:
           CARGO_PROFILE_RELEASE_OPT_LEVEL: ${{ matrix.opt_level }}
           CARGO_PROFILE_RELEASE_PANIC: ${{ matrix.panic_mode }}
@@ -181,6 +181,13 @@ jobs:
             --release
           cp tests/asymmetric_rust_mod/target/release/libasymmetric_rust_mod.so \
              target/fixtures/libasymmetric_rust_mod.so
+          if [ "${{ matrix.panic_mode }}" = "abort" ]; then
+            cargo "+${{ matrix.guest_toolchain }}" build \
+              --manifest-path tests/fixtures/panic_abort_mod/Cargo.toml \
+              --release
+            cp tests/fixtures/panic_abort_mod/target/release/libpanic_abort_mod.so \
+               target/fixtures/libpanic_abort_mod.so
+          fi
 
       - name: Load asymmetric guest into stable host & execute integration suites
         env:
@@ -189,9 +196,11 @@ jobs:
           if [ "${{ matrix.panic_mode }}" = "unwind" ]; then
             cargo +stable test -p bevy_abi_mod_host
           else
-            # Under `panic=abort`, run non-panicking FFI/scheduling/lifecycle suites + dedicated G-05 abort subprocess test
-            cargo +stable test -p bevy_abi_mod_host --test ffi --test scheduling
-            cargo +stable test -p bevy_abi_mod_host --test e2e panic_abort
+            # Under `panic=abort`, skip the in-process `test_cross_runtime_panic_containment` unwind test
+            # and verify deterministic subprocess abort via `regression_g05_panic_abort`.
+            cargo +stable test -p bevy_abi_mod_host --test ffi
+            cargo +stable test -p bevy_abi_mod_host --test scheduling -- --skip test_cross_runtime_panic_containment
+            cargo +stable test -p bevy_abi_mod_host --test lifecycle regression_g05_panic_abort
           fi
 
   asymmetry-polyglot:

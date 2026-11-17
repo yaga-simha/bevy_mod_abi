@@ -15,9 +15,9 @@ app.add_plugins(AbiModPlugin::with_error_policy(ModErrorPolicy::Quarantine));
 ```
 
 Available [`ModErrorPolicy`] modes when a guest system returns a non-`OK` `FfiResult` (including `PANIC_CAUGHT`):
-- **`ModErrorPolicy::Quarantine` *(Default)*:** Disables only the faulting guest system via an atomic flag, discards uncommitted commands from that invocation, emits `Messages<ModSystemFaulted>`, and keeps the rest of the mod and game running. Quarantined systems can be re-enabled at runtime via `world.resource::<ModQuarantine>().reenable(mod_id, "system_name")`.
-- **`ModErrorPolicy::Log`:** Logs the fault via `tracing::warn!`, emits `Messages<ModSystemFaulted>`, and lets the system run again on future ticks.
-- **`ModErrorPolicy::ReportToBevy`:** Forwards a `ModSystemError` into Bevy's native `Result<(), BevyError>` error handler pipeline.
+- **`ModErrorPolicy::Quarantine` *(Default)*:** Quarantines the faulting guest system (`enabled = false`), discards uncommitted commands from that invocation, logs via `tracing::warn!`, emits `Messages<ModSystemFaulted>`, and returns `Ok(())` so the rest of the mod and game keep running. Quarantined systems can be re-enabled at runtime via `world.resource::<ModQuarantine>().reenable(mod_id, "system_name")`.
+- **`ModErrorPolicy::Log`:** Quarantines the faulting guest system (`enabled = false`), discards uncommitted commands, escalates logging to `tracing::error!`, emits `Messages<ModSystemFaulted>`, and returns `Ok(())` (also re-enableable via `ModQuarantine::reenable`).
+- **`ModErrorPolicy::ReportToBevy`:** Quarantines the faulting guest system, logs via `tracing::error!`, emits `Messages<ModSystemFaulted>`, and forwards `ModSystemError` via `Err(RunSystemError::from(...))` into Bevy's native error handler pipeline.
 
 ---
 
