@@ -1,14 +1,14 @@
-//! Wave 4 Host FFI Feature Tests (`P-07`, `F-02`, `F-03`, `M-07`):
-//! - `P-07`: `HOST_API.par_for_each_chunk` parallel chunk iteration over dense 10k-row tables,
+//! Host FFI Feature Tests:
+//! - `HOST_API.par_for_each_chunk` parallel chunk iteration over dense 10k-row tables,
 //!   multi-table archetypes, and sparse-set components, verifying sequential parity, error
 //!   propagation, and non-reentrant `ACCESS_CONFLICT` safety.
-//! - `F-02`: `register_mod_message::<M>()` with `AccessMode::MESSAGE_READ` / `MESSAGE_WRITE`,
+//! - `register_mod_message::<M>()` with `AccessMode::MESSAGE_READ` / `MESSAGE_WRITE`,
 //!   `HOST_API.msg_read_batch` / `msg_send`, independent per-system `MessageCursor<M>`s, and
 //!   scheduler conflict enforcement.
-//! - `F-03`: `HOST_API.sys_entity_get` / `sys_entity_get_mut` random per-entity access strictly
+//! - `HOST_API.sys_entity_get` / `sys_entity_get_mut` random per-entity access strictly
 //!   enforcing declared `FilteredAccessSet` permissions and archetype/tick query filters while
 //!   updating Bevy `Changed<T>` ticks.
-//! - `M-07`: `ModComponent::C_DECL` and `ModComponent::ZIG_DECL` emission checks.
+//! - `ModComponent::C_DECL` and `ModComponent::ZIG_DECL` declaration emission checks.
 
 use crate::support::{NameTag, Position, Velocity};
 use bevy_abi_mod_host::prelude::*;
@@ -43,28 +43,28 @@ use std::sync::{Arc, Mutex};
 #[repr(C)]
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, ModComponent)]
 #[component(storage = "SparseSet")]
-#[mod_component(name = "w4_ffi::SparseBoost")]
+#[mod_component(name = "ext_ffi::SparseBoost")]
 struct SparseBoost {
     factor: f32,
 }
 
 #[repr(C)]
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, ModComponent)]
-#[mod_component(name = "w4_ffi::ActiveUnit")]
+#[mod_component(name = "ext_ffi::ActiveUnit")]
 struct ActiveUnit {
     squad: u32,
 }
 
 #[repr(C)]
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, ModComponent)]
-#[mod_component(name = "w4_ffi::FrozenUnit")]
+#[mod_component(name = "ext_ffi::FrozenUnit")]
 struct FrozenUnit {
     reason: u32,
 }
 
 #[repr(C)]
 #[derive(Message, Clone, Copy, Debug, Default, PartialEq, Eq, ModComponent)]
-#[mod_component(name = "w4_ffi::CombatHit")]
+#[mod_component(name = "ext_ffi::CombatHit")]
 struct CombatHit {
     entity_bits: u64,
     damage: i32,
@@ -72,7 +72,7 @@ struct CombatHit {
 }
 
 #[test]
-fn wave4_m07_mod_component_emits_c_and_zig_declarations() {
+fn mod_component_emits_c_and_zig_declarations() {
     assert!(Position::C_DECL.contains("typedef struct PositionVTable"));
     assert!(Position::C_DECL.contains("BAM_STATIC_ASSERT"));
     assert!(Position::ZIG_DECL.contains("pub const Position = extern struct"));
@@ -176,7 +176,7 @@ unsafe extern "C" fn par_sparse_sys_cb(
 }
 
 #[test]
-fn wave4_p07_par_for_each_chunk_dense_and_sparse_parity_and_error_propagation() {
+fn par_for_each_chunk_dense_and_sparse_parity_and_error_propagation() {
     const TOTAL_ENTITIES: usize = 10_000;
 
     let mut par_app = App::new();
@@ -442,7 +442,7 @@ unsafe extern "C" fn msg_reader_cb(
 }
 
 #[test]
-fn wave4_f02_messages_read_write_by_handle_and_independent_cursors() {
+fn messages_read_write_by_handle_and_independent_cursors() {
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
     let hit_h = app.register_mod_message::<CombatHit>().unwrap();
@@ -582,7 +582,7 @@ unsafe extern "C" fn random_access_cb(
 }
 
 #[test]
-fn wave4_f03_random_entity_access_enforces_access_and_filters_and_marks_changed() {
+fn random_entity_access_enforces_access_and_filters_and_marks_changed() {
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
     let pos_h = app
@@ -734,13 +734,13 @@ fn turret_on_remove(_world: DeferredWorld<'_>, ctx: HookContext) {
 #[derive(Component, Clone, Copy, Default, Debug, PartialEq, ModComponent)]
 #[require(PowerGridTag)]
 #[component(on_add = turret_on_add, on_remove = turret_on_remove)]
-#[mod_component(name = "wave5::Turret")]
+#[mod_component(name = "hierarchy::Turret")]
 struct Turret {
     range: f32,
 }
 
 #[test]
-fn wave5_req1_entity_world_mut_hooks_required_and_child_of_hierarchy() {
+fn entity_world_mut_hooks_required_and_child_of_hierarchy() {
     TURRET_ADD_EVENTS.lock().unwrap().clear();
     TURRET_REMOVE_EVENTS.lock().unwrap().clear();
 
@@ -769,7 +769,7 @@ fn wave5_req1_entity_world_mut_hooks_required_and_child_of_hierarchy() {
         child_of_h: BamComponent,
         spawned_a: AtomicU64,
         spawned_b: AtomicU64,
-        phase: AtomicUsize,
+        tick_step: AtomicUsize,
     }
 
     unsafe extern "C" fn hierarchy_cmd_sys(
@@ -783,8 +783,8 @@ fn wave5_req1_entity_world_mut_hooks_required_and_child_of_hierarchy() {
             FfiResult::OK
         );
 
-        let phase = ctx.phase.fetch_add(1, Ordering::SeqCst);
-        if phase == 0 {
+        let tick_step = ctx.tick_step.fetch_add(1, Ordering::SeqCst);
+        if tick_step == 0 {
             // 1. Validate null/invalid ChildOf payload rejection on both spawn and insert.
             let bad_child = FfiChildOf::new(FfiEntity::NULL);
             let t = Turret { range: 15.0 };
@@ -856,7 +856,7 @@ fn wave5_req1_entity_world_mut_hooks_required_and_child_of_hierarchy() {
                 FfiResult::OK
             );
             ctx.spawned_b.store(child_b.to_bits(), Ordering::SeqCst);
-        } else if phase == 1 {
+        } else if tick_step == 1 {
             let child_a = FfiEntity::from_bits(ctx.spawned_a.load(Ordering::SeqCst));
             assert_eq!(
                 unsafe { host_cmd_remove(cmds, child_a, ctx.child_of_h) },
@@ -876,7 +876,7 @@ fn wave5_req1_entity_world_mut_hooks_required_and_child_of_hierarchy() {
         child_of_h,
         spawned_a: AtomicU64::new(0),
         spawned_b: AtomicU64::new(0),
-        phase: AtomicUsize::new(0),
+        tick_step: AtomicUsize::new(0),
     });
 
     let sys = GuestSystem::new(
@@ -911,7 +911,7 @@ fn wave5_req1_entity_world_mut_hooks_required_and_child_of_hierarchy() {
         vec![child_a.to_bits(), child_b.to_bits()]
     );
 
-    // Phase 1: remove ChildOf & Turret on child_a via host_cmd_remove -> EntityWorldMut cleanup hooks fire.
+    // Step 1: remove ChildOf & Turret on child_a via host_cmd_remove -> EntityWorldMut cleanup hooks fire.
     app.update();
     assert!(!app.world().entity(child_a).contains::<Turret>());
     assert!(!app.world().entity(child_a).contains::<ChildOf>());
@@ -926,14 +926,14 @@ fn wave5_req1_entity_world_mut_hooks_required_and_child_of_hierarchy() {
 
 #[repr(C)]
 #[derive(Resource, Clone, Copy, Default, Debug, PartialEq, ModComponent)]
-#[mod_component(name = "wave5::SimClock")]
+#[mod_component(name = "clock::SimClock")]
 struct SimClock {
     elapsed: f32,
     frame: u32,
 }
 
 #[test]
-fn wave5_req2_resource_lookup_by_handle_ticks_and_parallel_access() {
+fn resource_lookup_by_handle_ticks_and_parallel_access() {
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
     app.insert_resource(SimClock {
@@ -1143,7 +1143,7 @@ fn wave5_req2_resource_lookup_by_handle_ticks_and_parallel_access() {
 
 #[repr(C)]
 #[derive(Message, Clone, Copy, Debug, PartialEq, Eq, ModComponent)]
-#[mod_component(name = "wave5::TelemetryMsg")]
+#[mod_component(name = "events::TelemetryMsg")]
 struct TelemetryMsg {
     code: u32,
     val: i32,
@@ -1151,14 +1151,14 @@ struct TelemetryMsg {
 
 #[repr(C)]
 #[derive(Event, Clone, Copy, Debug, PartialEq, Eq, ModComponent)]
-#[mod_component(name = "wave5::WavePing")]
-struct WavePing {
-    wave: u32,
+#[mod_component(name = "events::PingEvent")]
+struct PingEvent {
+    seq: u32,
 }
 
 #[repr(C)]
 #[derive(EntityEvent, Clone, Copy, Debug, PartialEq, ModComponent)]
-#[mod_component(name = "wave5::DamageApplied")]
+#[mod_component(name = "events::DamageApplied")]
 struct DamageApplied {
     #[event_target]
     entity: TargetEntity,
@@ -1166,11 +1166,11 @@ struct DamageApplied {
 }
 
 #[test]
-fn wave5_req5_messages_batch_write_and_cmd_trigger_entity_events() {
+fn messages_batch_write_and_cmd_trigger_entity_events() {
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
     let msg_h = app.register_mod_message::<TelemetryMsg>().unwrap();
-    let ping_h = app.register_mod_event::<WavePing>().unwrap();
+    let ping_h = app.register_mod_event::<PingEvent>().unwrap();
     let dmg_h = app.register_mod_entity_event::<DamageApplied>().unwrap();
 
     let e_watched = app.world_mut().spawn_empty().id();
@@ -1178,8 +1178,8 @@ fn wave5_req5_messages_batch_write_and_cmd_trigger_entity_events() {
 
     let observed_log: Arc<Mutex<Vec<(u32, u64, i32)>>> = Arc::new(Mutex::new(Vec::new()));
     let log_ping = Arc::clone(&observed_log);
-    app.world_mut().add_observer(move |on: On<WavePing>| {
-        log_ping.lock().unwrap().push((1, 0, on.wave as i32));
+    app.world_mut().add_observer(move |on: On<PingEvent>| {
+        log_ping.lock().unwrap().push((1, 0, on.seq as i32));
     });
 
     let log_dmg = Arc::clone(&observed_log);
@@ -1225,7 +1225,7 @@ fn wave5_req5_messages_batch_write_and_cmd_trigger_entity_events() {
             unsafe { host_sys_commands(sys_ctx, &mut cmds) },
             FfiResult::OK
         );
-        let ping = WavePing { wave: 7 };
+        let ping = PingEvent { seq: 7 };
         assert_eq!(
             unsafe {
                 host_cmd_trigger(
@@ -1233,7 +1233,7 @@ fn wave5_req5_messages_batch_write_and_cmd_trigger_entity_events() {
                     state.ping_h,
                     FfiEntity::NULL,
                     core::ptr::from_ref(&ping).cast::<u8>(),
-                    core::mem::size_of::<WavePing>(),
+                    core::mem::size_of::<PingEvent>(),
                 )
             },
             FfiResult::OK

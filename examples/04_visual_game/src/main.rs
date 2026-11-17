@@ -4,7 +4,7 @@
 //! Example 04: 2D Visual Kinetic Arena with Runtime Hot-Reloading (`ABI 0.2.0`).
 //!
 //! Demonstrates interactive runtime loading, hot-reloading, and unloading of native C-ABI mods
-//! using the core host loader's `LoadOptions { shadow_copy: true, .. }` (`L-03`) and lifecycle
+//! using the core host loader's `LoadOptions { shadow_copy: true, .. }` and lifecycle
 //! `Message` streams (`ModLoaded`, `ModUnloaded`, `ModSystemFaulted`).
 
 mod arena;
@@ -80,7 +80,7 @@ impl CliArgs {
                          Options:\n  \
                            --test-mode       Run automated headless verification sequence\n  \
                            --headless        Bypass terminal GUI (stdout only)\n  \
-                           --ticks <N>       Ticks per test phase (default: 30)\n  \
+                           --ticks <N>       Ticks per test step (default: 30)\n  \
                            --particles <N>   Number of entities (default: 80)\n  \
                            --mod <name>      Preload mod (gravity, rainbow, vortex)\n  \
                            -h, --help        Show this help message\n\n\
@@ -166,7 +166,7 @@ fn ensure_mod_binary_built(kind: ActiveMod) -> Result<PathBuf, String> {
         .ok_or_else(|| format!("Binary {crate_name} not found after cargo build"))
 }
 
-/// Drains lifecycle and fault `Message`s emitted by `AbiModPlugin` (`B-09`).
+/// Drains lifecycle and fault `Message`s emitted by `AbiModPlugin`.
 fn observe_mod_lifecycle_messages(
     mut loaded: MessageReader<ModLoaded>,
     mut unloaded: MessageReader<ModUnloaded>,
@@ -189,7 +189,7 @@ fn observe_mod_lifecycle_messages(
     }
 }
 
-/// Loads or switches to `target` using core `LoadOptions { shadow_copy: true, .. }` (`L-03`).
+/// Loads or switches to `target` using core `LoadOptions { shadow_copy: true, .. }`.
 fn switch_mod(app: &mut App, target: ActiveMod) -> Result<(), String> {
     if target == ActiveMod::None {
         return unload_active_mod(app);
@@ -256,7 +256,7 @@ fn unload_active_mod(app: &mut App) -> Result<(), String> {
     Ok(())
 }
 
-/// Hot-reloads the active mod from disk via a fresh core shadow copy (`L-03`).
+/// Hot-reloads the active mod from disk via a fresh core shadow copy.
 fn reload_active_mod(app: &mut App) -> Result<(), String> {
     let (target, prev_reloads) = {
         let status = app.world().resource::<ModStatusResource>();
@@ -323,7 +323,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_headless_test_sequence(app: &mut App, ticks: u64) -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Example 04 Automated Test Mode ===");
-    println!("[TEST] Phase 1: Baseline Kinematics ({ticks} ticks)...");
+    println!("[TEST] Step 1: Baseline Kinematics ({ticks} ticks)...");
 
     let initial_pos = query_positions(app);
     for _ in 0..ticks {
@@ -340,7 +340,7 @@ fn run_headless_test_sequence(app: &mut App, ticks: u64) -> Result<(), Box<dyn s
     );
     println!("  -> PASS: Baseline movement verified.");
 
-    println!("[TEST] Phase 2: Loading Mod 1 (Gravity) ({ticks} ticks)...");
+    println!("[TEST] Step 2: Loading Mod 1 (Gravity) ({ticks} ticks)...");
     switch_mod(app, ActiveMod::Gravity)?;
     assert_eq!(
         app.world().resource::<ModStatusResource>().active_mod,
@@ -364,7 +364,7 @@ fn run_headless_test_sequence(app: &mut App, ticks: u64) -> Result<(), Box<dyn s
     );
     println!("  -> PASS: Gravity mod downward acceleration verified.");
 
-    println!("[TEST] Phase 3: Switching to Mod 2 (Rainbow) ({ticks} ticks)...");
+    println!("[TEST] Step 3: Switching to Mod 2 (Rainbow) ({ticks} ticks)...");
     switch_mod(app, ActiveMod::Rainbow)?;
     assert_eq!(
         app.world().resource::<ModStatusResource>().active_mod,
@@ -384,7 +384,7 @@ fn run_headless_test_sequence(app: &mut App, ticks: u64) -> Result<(), Box<dyn s
     );
     println!("  -> PASS: Rainbow dynamic color mutations verified.");
 
-    println!("[TEST] Phase 4: Switching to Mod 3 (Vortex) ({ticks} ticks)...");
+    println!("[TEST] Step 4: Switching to Mod 3 (Vortex) ({ticks} ticks)...");
     switch_mod(app, ActiveMod::Vortex)?;
     assert_eq!(
         app.world().resource::<ModStatusResource>().active_mod,
@@ -412,7 +412,7 @@ fn run_headless_test_sequence(app: &mut App, ticks: u64) -> Result<(), Box<dyn s
     println!("  -> Distance to center: pre={pre_vortex_dist:.2}, post={post_vortex_dist:.2}");
     println!("  -> PASS: Vortex mod centripetal orbital swirling verified.");
 
-    println!("[TEST] Phase 5: Hot-Reloading Mod 3 (Vortex) ({ticks} ticks)...");
+    println!("[TEST] Step 5: Hot-Reloading Mod 3 (Vortex) ({ticks} ticks)...");
     reload_active_mod(app)?;
     assert_eq!(
         app.world().resource::<ModStatusResource>().active_mod,
@@ -427,7 +427,7 @@ fn run_headless_test_sequence(app: &mut App, ticks: u64) -> Result<(), Box<dyn s
         "  -> PASS: Hot-reload completed via LoadOptions::with_shadow_copy(true) with reload_count=1."
     );
 
-    println!("[TEST] Phase 6: Unloading Mod to Baseline ({ticks} ticks)...");
+    println!("[TEST] Step 6: Unloading Mod to Baseline ({ticks} ticks)...");
     unload_active_mod(app)?;
     assert_eq!(
         app.world().resource::<ModStatusResource>().active_mod,

@@ -1,4 +1,4 @@
-//! Schedule mapping (`ModScheduleMap`), system sets, and startup tracking (`B-06`).
+//! Schedule mapping (`ModScheduleMap`), system sets, and startup tracking.
 
 use crate::loader::ModId;
 use bevy_abi_mod_sys::ScheduleId;
@@ -90,7 +90,7 @@ impl ModNamedSystemSet {
 }
 
 /// Resource mapping ABI [`ScheduleId`] discriminants (`0..=5` built-in and `>= 1024` custom game
-/// schedules) onto Bevy [`InternedScheduleLabel`]s (`B-06`, ADR 0002).
+/// schedules) onto Bevy [`InternedScheduleLabel`]s (ADR 0002).
 #[derive(Resource, Default, Clone, Debug)]
 pub struct ModScheduleMap {
     custom: HashMap<ScheduleId, InternedScheduleLabel>,
@@ -135,7 +135,7 @@ impl ModScheduleMap {
 
 /// Resource mapping logical host set names (referenced by guests as `"host::<name>"`) onto Bevy
 /// [`InternedSystemSet`]s so guest systems can order themselves `.after(c"host::physics")` or
-/// `.before(c"host::render")` without risking host-set excision on mod unload (`F-05`).
+/// `.before(c"host::render")` without risking host-set excision on mod unload.
 #[derive(Resource, Default, Clone, Debug)]
 pub struct ModVisibleSets {
     sets: HashMap<Arc<str>, InternedSystemSet>,

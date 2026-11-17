@@ -1,5 +1,5 @@
 //! [`ModWorldExt`] exclusive `&mut World` API for registering components/resources/messages/schedules
-//! and loading, reloading, or unloading native mods (`B-01`, `B-05`, `B-06`, `B-08`, `B-09`, `L-03`, `L-04`, `F-01`, `F-02`, `F-05`).
+//! and loading, reloading, or unloading native mods.
 
 #[cfg(feature = "diagnostics")]
 use crate::diagnostics::{ensure_diagnostics_resources, register_mod_diagnostics_in_world};
@@ -231,7 +231,7 @@ fn load_mod_with_optional_state(
 }
 
 /// Exclusive `&mut World` extension trait for exposing Bevy ECS types and managing native C-ABI
-/// mods at startup or inside exclusive Bevy systems (`B-01`, `L-04`, `F-01`, `F-02`, `F-05`).
+/// mods at startup or inside exclusive Bevy systems.
 pub trait ModWorldExt {
     /// Registers a Bevy [`Component`] implementing [`ModComponent`] with [`ComponentOptions`],
     /// returning its 1-based [`BamComponent`] handle.
@@ -247,7 +247,7 @@ pub trait ModWorldExt {
     ) -> Result<BamComponent, ComponentCollisionError>;
 
     /// Registers a buffered POD Bevy [`Message`] type (`Messages<M>`), initializing `Messages<M>`
-    /// if absent and returning its 1-based [`BamComponent`] handle (`F-02`).
+    /// if absent and returning its 1-based [`BamComponent`] handle.
     fn register_mod_message<M: Message + ModComponent + AbiPod>(
         &mut self,
     ) -> Result<BamComponent, ComponentCollisionError>;
@@ -270,7 +270,7 @@ pub trait ModWorldExt {
     fn register_mod_type<T: ModComponent>(&mut self) -> &mut Self;
 
     /// Maps a game-defined custom [`ScheduleId`] (`id.0 >= ScheduleId::CUSTOM_BASE` = `1024`) to a
-    /// Bevy [`ScheduleLabel`] in [`ModScheduleMap`] (`B-06`).
+    /// Bevy [`ScheduleLabel`] in [`ModScheduleMap`].
     fn register_mod_schedule<S: ScheduleLabel>(
         &mut self,
         id: ScheduleId,
@@ -278,7 +278,7 @@ pub trait ModWorldExt {
     ) -> Result<(), ModLoadError>;
 
     /// Exposes a host [`SystemSet`] under `"host::<name>"` in [`ModVisibleSets`] so guest systems
-    /// can declare `.after(c"host::<name>")` or `.before(c"host::<name>")` (`F-05`).
+    /// can declare `.after(c"host::<name>")` or `.before(c"host::<name>")`.
     fn register_mod_visible_set<S: SystemSet>(&mut self, name: &str, set: S) -> bool;
 
     /// Sets the default [`ModErrorPolicy`] applied to newly initialized guest systems in this [`World`].
@@ -306,15 +306,15 @@ pub trait ModWorldExt {
 
     /// Hot-reloads `id` from its original source path with shadow-copying enabled, snapshotting
     /// optional `BamManifest::save_state` bytes before `shutdown` and invoking `restore_state`
-    /// on the new instance (`F-01`).
+    /// on the new instance.
     fn reload_mod(&mut self, id: ModId) -> Result<ModId, ModLoadError>;
 
     /// Hot-reloads `id` from its original source path with explicit [`LoadOptions`], transferring
-    /// optional `save_state` / `restore_state` bytes (`F-01`).
+    /// optional `save_state` / `restore_state` bytes.
     fn reload_mod_with(&mut self, id: ModId, options: LoadOptions) -> Result<ModId, ModLoadError>;
 
     /// Hot-reloads `id` from a replacement shared-library `path` with explicit [`LoadOptions`],
-    /// transferring optional `save_state` / `restore_state` bytes (`F-01`).
+    /// transferring optional `save_state` / `restore_state` bytes.
     fn reload_mod_from<P: AsRef<Path>>(
         &mut self,
         id: ModId,

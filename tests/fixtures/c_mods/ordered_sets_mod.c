@@ -3,20 +3,20 @@
 #include <string.h>
 #include "bevy_abi_mod.h"
 
-static BamVTableHeader g_bad_vtable;
-
-static void bad_drop_hook(void* ptr) {
-    (void)ptr;
-}
-
 static const BamManifest MANIFEST = {
     .struct_size = (uint32_t)sizeof(BamManifest),
     .abi_version = BAM_ABI_VERSION,
-    .name = "s06_fail_init",
+    .name = "ordered_sets_mod",
     .version = "0.2.0",
     .flags = 0u,
     .reserved0 = 0u
 };
+
+static BamResult noop_cb(BamSystemCtx* sys_ctx, void* user_data) {
+    (void)sys_ctx;
+    (void)user_data;
+    return BAM_RESULT_OK;
+}
 
 BAM_EXPORT const BamManifest* bevy_abi_mod_manifest(void) {
     return &MANIFEST;
@@ -27,9 +27,10 @@ BAM_EXPORT BamResult bevy_abi_mod_init(
     BamLoadCtx* load_ctx,
     BamInstance** instance_out
 ) {
+    static const char* const AFTER_FIRST_PASS[] = { "first_pass" };
     BamHostApi local_api;
-    BamComponentDesc desc;
-    BamComponent out_comp = BAM_COMPONENT_INVALID;
+    BamSystemDesc d1;
+    BamSystemDesc d2;
     BamResult rc;
 
     if (load_ctx == NULL || instance_out == NULL) {
@@ -42,28 +43,24 @@ BAM_EXPORT BamResult bevy_abi_mod_init(
         return rc;
     }
 
-    g_bad_vtable.struct_size = (uint32_t)sizeof(BamVTableHeader);
-    g_bad_vtable.abi_version = BAM_ABI_VERSION;
-    g_bad_vtable.uuid = bam_uuid_from_parts("s06_fail_init::S06RollbackComp", 8u, 8u, 0ull);
-    g_bad_vtable.size = 8u;
-    g_bad_vtable.align = 8u;
-
-    memset(&desc, 0, sizeof(desc));
-    desc.struct_size = (uint32_t)sizeof(BamComponentDesc);
-    desc.flags = 0u;
-    desc.name = "S06RollbackComp";
-    desc.uuid = g_bad_vtable.uuid;
-    desc.size = 8u;
-    desc.align = 8u;
-    desc.drop_fn = bad_drop_hook;
-    desc.vtable_ptr = (const void*)&g_bad_vtable;
-
-    rc = local_api.register_component(load_ctx, &desc, &out_comp);
+    memset(&d1, 0, sizeof(d1));
+    d1.struct_size = (uint32_t)sizeof(BamSystemDesc);
+    d1.name = "first_pass";
+    d1.callback = noop_cb;
+    d1.schedule = BAM_SCHEDULE_UPDATE;
+    rc = local_api.register_system(load_ctx, &d1);
     if (rc != BAM_RESULT_OK) {
         return rc;
     }
 
-    return BAM_RESULT_INVALID_ARGUMENT;
+    memset(&d2, 0, sizeof(d2));
+    d2.struct_size = (uint32_t)sizeof(BamSystemDesc);
+    d2.name = "second_pass";
+    d2.callback = noop_cb;
+    d2.schedule = BAM_SCHEDULE_UPDATE;
+    d2.after = AFTER_FIRST_PASS;
+    d2.after_count = 1u;
+    return local_api.register_system(load_ctx, &d2);
 }
 
 BAM_EXPORT void bevy_abi_mod_shutdown(BamInstance* instance) {

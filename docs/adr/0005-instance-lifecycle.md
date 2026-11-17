@@ -2,7 +2,6 @@
 
 - **Status:** Accepted
 - **Date:** 2026-11-11
-- **Tracking Items:** `L-02`, `L-03`, `L-04`, `L-05` (cross-references: `L-07`, `L-08`, `S-05`, `S-06`, `T-03`)
 - **Target Crates:** `bevy_abi_mod_sys`, `bevy_abi_mod_host_sys`, `bevy_abi_mod_host`, `bevy_abi_mod_guest_sys`, `bevy_abi_mod_guest`
 
 ---
@@ -11,10 +10,10 @@
 
 In v0.1, mod loading, instance storage, hot-reload file handling, unloading, and system-set ordering each assumed a single `World` loading each `.cdylib` at most once:
 
-1. **Process-global guest state (`L-02`):** `guest_sdk` stored every boxed system closure, `run_if` predicate, and `GuestPlugin` inside a process-global `static GUEST_ALLOCATIONS: Mutex<Vec<GuestAllocation>>`, and `ModHost` called `bevy_abi_mod_shutdown()` (taking zero arguments) **only** when `SharedLibState`'s OS library refcount reached zero. Loading the same `.cdylib` into two Bevy `World`s (e.g., dedicated server + client preview, or parallel integration tests `T-03`) entangled both Worlds' closures in a single `Vec` and broke per-World teardown.
-2. **File locking & `dlopen` inode caching on hot-reload (`L-03`):** Only `examples/hot_reload_demo` copied `.dll`/`.dylib`/`.so` files before loading. Core `ModHost::load_mod` opened the compiler output path directly — locking the `.dll` against `cargo build` on Windows (`ERROR_SHARING_VIOLATION`) and returning the stale cached image on macOS/Linux when `dlopen` matched an already-mapped `(dev, inode)` or path.
-3. **Unsound partial unload via `&mut ModHost` (`L-04`, `S-05`):** `ModHost::unload_mod(&mut self, id)` was `pub` (as were fields of `LoadedMod`). Calling `mod_host.unload_mod(id)` directly from a system with `ResMut<ModHost>` unmapped the shared library (`dlclose`) while its `DynamicCSystem` nodes remained live in Bevy's `Schedules` and its `vtable_ptr` remained live in `ModRegistry` (`S-05`) — causing an immediate segfault on the next frame!
-4. **Global, conditional, leaked `ModNamedSystemSet` (`L-05`):**
+1. **Process-global guest state:** `guest_sdk` stored every boxed system closure, `run_if` predicate, and `GuestPlugin` inside a process-global `static GUEST_ALLOCATIONS: Mutex<Vec<GuestAllocation>>`, and `ModHost` called `bevy_abi_mod_shutdown()` (taking zero arguments) **only** when `SharedLibState`'s OS library refcount reached zero. Loading the same `.cdylib` into two Bevy `World`s (e.g., dedicated server + client preview, or parallel integration tests) entangled both Worlds' closures in a single `Vec` and broke per-World teardown.
+2. **File locking & `dlopen` inode caching on hot-reload:** Only `examples/hot_reload_demo` copied `.dll`/`.dylib`/`.so` files before loading. Core `ModHost::load_mod` opened the compiler output path directly — locking the `.dll` against `cargo build` on Windows (`ERROR_SHARING_VIOLATION`) and returning the stale cached image on macOS/Linux when `dlopen` matched an already-mapped `(dev, inode)` or path.
+3. **Unsound partial unload via `&mut ModHost`:** `ModHost::unload_mod(&mut self, id)` was `pub` (as were fields of `LoadedMod`). Calling `mod_host.unload_mod(id)` directly from a system with `ResMut<ModHost>` unmapped the shared library (`dlclose`) while its `DynamicCSystem` nodes remained live in Bevy's `Schedules` and its `vtable_ptr` remained live in `ModRegistry` — causing an immediate segfault on the next frame!
+4. **Global, conditional, leaked `ModNamedSystemSet`:**
    - `ModNamedSystemSet(String)` shared a flat global namespace across all mods (two mods' `"movement"` systems silently coupled).
    - Systems were added to `ModNamedSystemSet` **only** if `has_ordering` was true within the same load batch, so a later mod declaring `.after("movement")` silently ordered against an empty set.
    - Named sets were never removed on unload, leaking schedule graph nodes on every hot-reload.
@@ -23,7 +22,7 @@ In v0.1, mod loading, instance storage, hot-reload file handling, unloading, and
 
 ## 2. Decision
 
-### 2.1 Symmetric Per-World `BamInstance` Init & Shutdown (`L-02`)
+### 2.1 Symmetric Per-World `BamInstance` Init & Shutdown
 
 #### Wire Contract (`bevy_abi_mod_sys` & `include/bevy_abi_mod.h`)
 
@@ -85,7 +84,7 @@ pub struct GuestInstance {
 
 ---
 
-### 2.2 Core Loader Shadow-Copy Hot-Reload (`L-03`)
+### 2.2 Core Loader Shadow-Copy Hot-Reload
 
 Shadow copying moves out of demo code directly into `bevy_abi_mod_host_sys`'s loader, controlled by `LoadOptions`:
 
@@ -101,7 +100,7 @@ pub struct LoadOptions {
     /// Optional directory for shadow copies. Defaults to `std::env::temp_dir().join("bevy_abi_mod")`.
     pub shadow_dir: Option<std::path::PathBuf>,
     /// Reject mods that register neither components nor systems (`ModLoadError::EmptyMod`),
-    /// and treat unresolved `before`/`after` ordering targets as hard errors (`L-05`).
+    /// and treat unresolved `before`/`after` ordering targets as hard errors.
     pub strict: bool,
     /// Optional default schedule override applied when a system specifies `ScheduleId::UPDATE` (`0`).
     pub schedule_override: Option<ScheduleId>,
@@ -147,7 +146,7 @@ Because Rust guarantees struct fields drop in declaration order, `libloading::Li
 
 ---
 
-### 2.3 Exclusive `&mut World` Load/Unload Enforcement & Symbol Cleanup (`L-04`, `S-05`)
+### 2.3 Exclusive `&mut World` Load/Unload Enforcement & Symbol Cleanup
 
 #### Encapsulation Boundary
 1. `ModHost` methods that mutate loaded mods (`load_internal`, `unload_internal`, `reload_internal`) are **`pub(crate)` inside `bevy_abi_mod_host_sys`** — never `pub`. Public methods on `ModHost` are strictly read-only inspection (`loaded_mods(&self) -> impl Iterator<Item = &LoadedModInfo>`, `is_loaded(&self, id: ModId) -> bool`).
@@ -165,16 +164,16 @@ Because Rust guarantees struct fields drop in declaration order, `libloading::Li
 Because `&mut World` proves zero systems are currently executing on `world`:
 1. **Remove Schedules & Sets:** For every `(schedule_id, set)` recorded for `id`, remove `ModSystemSet(id)` and every owned `ModNamedSystemSet` from `Schedules` via `schedule.remove_systems_in_set(set, world, ScheduleCleanupPolicy::RemoveSetAndSystems)`.
 2. **Disarm Drop Trampolines (`ADR 0001`):** Flip `entry.is_active.store(false, Ordering::Release)` and publish pruned `DropSlotSnapshot`s without `id`.
-3. **Purge Dynamic Symbols & VTables (`S-05`, `L-07`):** Mutate `ModRegistry` CoW snapshot (`Arc::make_mut`) to null out `vtable_ptr` on components registered by `id` and remove all `"bam.v0.*"` symbols owned by `id`, bumping `ModRegistry.generation += 1`.
-4. **Guest Instance Shutdown (`L-02`):** Call `(loaded_mod.shutdown_fn)(loaded_mod.instance)` so the guest frees its per-World `GuestInstance` allocations while `.text` and `.rodata` are still mapped.
-5. **Unmap & Unlink (`L-03`):** Drop `LoadedLibrary` (`Library::drop` -> `ShadowFileGuard::drop`).
+3. **Purge Dynamic Symbols & VTables:** Mutate `ModRegistry` CoW snapshot (`Arc::make_mut`) to null out `vtable_ptr` on components registered by `id` and remove all `"bam.v0.*"` symbols owned by `id`, bumping `ModRegistry.generation += 1`.
+4. **Guest Instance Shutdown:** Call `(loaded_mod.shutdown_fn)(loaded_mod.instance)` so the guest frees its per-World `GuestInstance` allocations while `.text` and `.rodata` are still mapped.
+5. **Unmap & Unlink:** Drop `LoadedLibrary` (`Library::drop` -> `ShadowFileGuard::drop`).
 6. **Emit Lifecycle Message:** Write `ModUnloaded { info }` to `Messages<ModUnloaded>`.
 
 Also, `ModHost::drop` (when `World` itself is dropped without explicit `unload_mod` calls) executes Steps 2, 4, and 5 for every remaining `LoadedMod` in reverse load order so guest instances and shadow files never leak on `App` exit!
 
 ---
 
-### 2.4 Mod-Scoped `ModNamedSystemSet` & Cross-Mod Ordering (`L-05`)
+### 2.4 Mod-Scoped `ModNamedSystemSet` & Cross-Mod Ordering
 
 #### Exact Type Definition (`bevy_abi_mod_host` / `bevy_abi_mod_host_sys`)
 
@@ -244,10 +243,10 @@ impl ModNamedSystemSet {
 
 ## 4. Consequences & Verification Criteria
 
-1. **Multi-World isolation test (`L-02`, `T-03`):** Load the same `.cdylib` simultaneously into `World A` and `World B`; unload it from `World A`; verify `World A`'s `GuestPlugin::on_shutdown` ran once while `World B` continues executing its systems without error, then drop `World B` and verify the second `on_shutdown` runs cleanly.
-2. **Shadow-copy reload test (`L-03`):** Load a fixture mod with `LoadOptions { shadow_copy: true, .. }`, overwrite the original `.dylib`/`.so`/`.dll` on disk while loaded, call `world.reload_mod(id)`, verify the updated code executes and the old `<stem>.<pid>.<seq>.<ext>` shadow file no longer exists on disk.
-3. **Compile-fail / API surface check (`L-04`, `S-05`):** Verify `ModHost` exposes no public `unload_mod` method (`cargo public-api`), `world.unload_mod(id)` removes systems + nulls VTable symbols (`get_proc_address` returns `NULL` after unload), and `commands.queue_unload_mod(id)` unloads cleanly at end-of-schedule.
-4. **Three ordering regression tests (`L-05`):**
+1. **Multi-World isolation test:** Load the same `.cdylib` simultaneously into `World A` and `World B`; unload it from `World A`; verify `World A`'s `GuestPlugin::on_shutdown` ran once while `World B` continues executing its systems without error, then drop `World B` and verify the second `on_shutdown` runs cleanly.
+2. **Shadow-copy reload test:** Load a fixture mod with `LoadOptions { shadow_copy: true, .. }`, overwrite the original `.dylib`/`.so`/`.dll` on disk while loaded, call `world.reload_mod(id)`, verify the updated code executes and the old `<stem>.<pid>.<seq>.<ext>` shadow file no longer exists on disk.
+3. **Compile-fail / API surface check:** Verify `ModHost` exposes no public `unload_mod` method (`cargo public-api`), `world.unload_mod(id)` removes systems + nulls VTable symbols (`get_proc_address` returns `NULL` after unload), and `commands.queue_unload_mod(id)` unloads cleanly at end-of-schedule.
+4. **Three ordering regression tests:**
    - Two mods defining `"step"` do not couple unless qualified (`"mod_a::step"`).
    - Mod B loaded *after* Mod A (where Mod A had zero ordering constraints) orders `.after("mod_a::produce")` deterministically.
    - Unloading and reloading Mod B 1,000 times leaves schedule node/set count constant.

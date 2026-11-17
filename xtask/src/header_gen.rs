@@ -1301,7 +1301,7 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
          typedef BamResult (*BamCmdInsertFn)(BamCommands* commands, BamEntity entity, BamComponent component, const uint8_t* data_ptr, size_t data_len);\n\
          typedef BamResult (*BamCmdInsertDefaultFn)(BamCommands* commands, BamEntity entity, BamComponent component);\n\
          typedef BamResult (*BamCmdRemoveFn)(BamCommands* commands, BamEntity entity, BamComponent component);\n\n\
-         /* --- 7. Optional Wave 4 Engine Extension Slots (`P-07`, `F-02`, `F-03`) --- */\n\
+         /* --- 7. Optional Extended Engine Slots --- */\n\
          typedef BamResult      (*BamChunkTaskFn)(BamIter* iter, void* user_data);\n\
          typedef BamResult      (*BamParForEachChunkFn)(BamIter* iter, BamChunkTaskFn chunk_fn, void* user_data);\n\
          typedef const uint8_t* (*BamSysEntityGetFn)(const BamSystemCtx* sys_ctx, size_t query_index, BamEntity entity, size_t term_index);\n\
@@ -1350,7 +1350,7 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
              BamCmdInsertFn        cmd_insert;\n\
              BamCmdInsertDefaultFn cmd_insert_default;\n\
              BamCmdRemoveFn        cmd_remove;\n\n\
-             /* Optional Wave 4 engine extension slots (appended after `BAM_HOST_API_MIN_V0_2_SIZE`) */\n\
+             /* Optional extended engine slots (appended after `BAM_HOST_API_MIN_V0_2_SIZE`) */\n\
              BamParForEachChunkFn  par_for_each_chunk;\n\
              BamSysEntityGetFn     sys_entity_get;\n\
              BamSysEntityGetMutFn  sys_entity_get_mut;\n\

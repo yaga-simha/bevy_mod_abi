@@ -1,5 +1,5 @@
 //! Slice bounds, alignment, ZST, `isize::MAX` overflow, and raw dynamic component destructor
-//! edge-case tests (`G-07`, `N-03`).
+//! edge-case tests.
 
 mod common;
 

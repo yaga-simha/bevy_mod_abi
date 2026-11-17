@@ -87,29 +87,29 @@ clippy: ## Run Clippy linter with strict warning checks
 	cargo clippy --workspace --all-targets -- -D warnings
 
 .PHONY: example-1 example-2 example-3 example-4 game example-4-test example-5 game-3d example-5-test examples
-example-1: build-example-mods ## Run Stage 1 Minimal Handshake
+example-1: build-example-mods ## Run Example 1: Minimal Handshake
 	cargo run --manifest-path examples/01_minimal_handshake/Cargo.toml
 
-example-2: build-example-mods ## Run Stage 2 Multi-System Pipeline
+example-2: build-example-mods ## Run Example 2: Multi-System Pipeline
 	cargo run --manifest-path examples/02_multi_system_pipeline/Cargo.toml
 
-example-3: build-example-mods ## Run Stage 3 Cross-Language C99 + Rust Interop
+example-3: build-example-mods ## Run Example 3: Cross-Language C99 + Rust Interop
 	cargo run --manifest-path examples/03_cross_language_interop/Cargo.toml
 
-example-4: build-example-mods ## Run Stage 4 2D Visual Game
+example-4: build-example-mods ## Run Example 4: 2D Visual Game
 	cargo run --manifest-path examples/04_visual_game/Cargo.toml
 
 game: example-4 ## Alias for example-4
 
-example-4-test: build-example-mods ## Run Stage 4 Visual Game in headless test mode
+example-4-test: build-example-mods ## Run Example 4: Visual Game in headless test mode
 	cargo run --manifest-path examples/04_visual_game/Cargo.toml -- --test-mode --ticks 30
 
-example-5: build-example-mods ## Run Stage 5 Cute 3D Slime Meadow (winit + wgpu)
+example-5: build-example-mods ## Run Example 5: Cute 3D Slime Meadow (winit + wgpu)
 	cargo run --manifest-path examples/05_cute_3d_winit/Cargo.toml --release
 
 game-3d: example-5 ## Alias for example-5
 
-example-5-test: build-example-mods ## Run Stage 5 Cute 3D Slime Meadow in headless test mode
+example-5-test: build-example-mods ## Run Example 5: Cute 3D Slime Meadow in headless test mode
 	cargo run --manifest-path examples/05_cute_3d_winit/Cargo.toml --release -- --test-mode --ticks 45
 
 examples: example-1 example-2 example-3 example-4-test example-5-test ## Run progression examples sequentially

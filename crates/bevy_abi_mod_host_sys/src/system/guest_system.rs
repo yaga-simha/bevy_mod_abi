@@ -1,5 +1,5 @@
 //! `GuestSystem` implementation of Bevy's `System` trait and `HostSystemCtx` (`BamSystemCtx`)
-//! (`C-01`, `C-03`, `C-04`, `L-07`, `P-05`, `P-09`, `B-05`, `B-07`, `B-09`, `S-08`, `N-02`).
+//!.
 
 use crate::ffi::commands::{HostCommands, HostCommandsStorage};
 use crate::ffi::iter::{HostIter, QueryPlan};
@@ -37,7 +37,7 @@ use std::sync::Arc;
 #[cfg(feature = "diagnostics")]
 use std::sync::Mutex;
 
-/// Snapshot of a single guest system execution recorded when the `diagnostics` feature is enabled (`E-01`).
+/// Snapshot of a single guest system execution recorded when the `diagnostics` feature is enabled.
 #[cfg(feature = "diagnostics")]
 #[derive(Clone, Debug)]
 pub struct ModDiagnosticsSample {
@@ -56,7 +56,7 @@ pub struct ModDiagnosticsSample {
 }
 
 /// World resource buffering [`ModDiagnosticsSample`]s from parallel [`GuestSystem`] executions
-/// until flushed into Bevy's `DiagnosticsStore` (`E-01`).
+/// until flushed into Bevy's `DiagnosticsStore`.
 #[cfg(feature = "diagnostics")]
 #[derive(Resource, Default)]
 pub struct ModDiagnosticsCollector {
@@ -96,7 +96,7 @@ pub(crate) struct RandomQueryView<'w> {
     pub(crate) has_query_state: bool,
 }
 
-/// Concrete `#[repr(C)]` system invocation context backing opaque [`BamSystemCtx`] (`S-08`, `C-01`).
+/// Concrete `#[repr(C)]` system invocation context backing opaque [`BamSystemCtx`].
 #[repr(C)]
 pub struct HostSystemCtx<'w> {
     /// Leading handle validation header (`SYS_CTX_MAGIC`) at byte offset `0`.
@@ -304,7 +304,7 @@ fn entity_matches_random_query_view<'w>(
 }
 
 /// Random `O(1)` read-only component lookup on `entity` using the access declared by
-/// `(query_index, term_index)` in `FilteredAccessSet` (`F-03`).
+/// `(query_index, term_index)` in `FilteredAccessSet`.
 ///
 /// Strictly verifies both that `term_index` declared component data read/write access and that
 /// `entity`'s archetype matches `query_index`'s `With`/`Without`/tick filters so Bevy's parallel
@@ -360,7 +360,7 @@ pub unsafe extern "C" fn host_sys_entity_get(
 }
 
 /// Random `O(1)` mutable component lookup on `entity` using the `WRITE` / `OPTIONAL_WRITE` access
-/// declared by `(query_index, term_index)` in `FilteredAccessSet` (`F-03`), marking `entity`'s
+/// declared by `(query_index, term_index)` in `FilteredAccessSet`, marking `entity`'s
 /// component change tick on success.
 ///
 /// # Safety
@@ -565,7 +565,7 @@ pub unsafe extern "C" fn host_sys_res_mut_ptr(
     mut_untyped.into_inner().as_ptr()
 }
 
-/// Host-side Bevy [`System`] wrapping a unified ABI v0.2 [`BamSystemFn`] callback (`N-02`).
+/// Host-side Bevy [`System`] wrapping a unified ABI v0.2 [`BamSystemFn`] callback.
 pub struct GuestSystem {
     name: Arc<str>,
     debug_name: DebugName,
@@ -780,13 +780,13 @@ impl GuestSystem {
         self.is_main_thread
     }
 
-    /// Pins or unpins this system onto Bevy's main thread (`B-07`).
+    /// Pins or unpins this system onto Bevy's main thread.
     #[inline]
     pub fn set_main_thread(&mut self, main_thread: bool) {
         self.is_main_thread = main_thread;
     }
 
-    /// Builder helper to pin this system onto Bevy's main thread (`B-07`).
+    /// Builder helper to pin this system onto Bevy's main thread.
     #[inline]
     pub const fn with_main_thread(mut self, main_thread: bool) -> Self {
         self.is_main_thread = main_thread;
@@ -1060,7 +1060,7 @@ impl System for GuestSystem {
             return Ok(());
         }
 
-        // L-07: Refresh cached `Arc<RegistrySnapshot>` in O(1) only if `ModRegistry` generation advanced.
+        // Refresh cached `Arc<RegistrySnapshot>` in O(1) only if `ModRegistry` generation advanced.
         let latest_gen = self.registry.latest_generation();
         if latest_gen != self.cached_registry_gen {
             self.snapshot = self.registry.latest_snapshot_arc();

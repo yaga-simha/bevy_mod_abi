@@ -2,7 +2,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(improper_ctypes_definitions)]
 
-//! `panic = "abort"` Rust guest fixture (`G-05`).
+//! `panic = "abort"` Rust guest fixture.
 //!
 //! When compiled with `panic = "abort"`, `std::panic::catch_unwind` inside
 //! `bevy_abi_mod_guest_sys` is a no-op and any panic inside `abort_panic_sys`
@@ -35,7 +35,7 @@ pub unsafe extern "C" fn panic_abort_mod_healthy_ticks() -> u32 {
 fn setup(app: &mut GuestApp<'_>) -> FfiResult {
     app.system(c"abort_panic_sys").build(|_ctx| {
         if ARM_PANIC.load(Ordering::SeqCst) {
-            panic!("intentional G-05 panic inside panic=abort guest fixture");
+            panic!("intentional panic inside panic=abort guest fixture");
         }
         HEALTHY_TICKS.fetch_add(1, Ordering::SeqCst);
         FfiResult::OK

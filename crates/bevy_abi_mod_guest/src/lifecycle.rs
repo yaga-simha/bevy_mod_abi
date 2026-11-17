@@ -1,4 +1,4 @@
-//! Per-instance `GuestPlugin` trait and `GuestApp` initialization helpers (`L-02`, `L-08`, `F-01`).
+//! Per-instance `GuestPlugin` trait and `GuestApp` initialization helpers.
 
 use core::ffi::CStr;
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use crate::app::GuestApp;
 ///
 /// Each Bevy `World` that loads your `.cdylib` instantiates a fresh `Self::default()` inside its
 /// heap-allocated [`GuestInstance`], invokes [`Self::build`], optionally transfers state across
-/// hot-reloads via [`Self::save_state`] and [`Self::restore_state`] (`F-01`), and invokes
+/// hot-reloads via [`Self::save_state`] and [`Self::restore_state`], and invokes
 /// [`Self::on_shutdown`] when that specific load session unloads—sharing zero process-global
 /// mutable state across worlds.
 pub trait GuestPlugin: Default + Send + 'static {
@@ -36,7 +36,7 @@ pub trait GuestPlugin: Default + Send + 'static {
     /// Registers components, systems, and per-instance hooks on `app`.
     fn build(&mut self, app: &mut GuestApp<'_>) -> FfiResult;
 
-    /// Optional hot-reload state snapshot callback invoked prior to `bevy_abi_mod_shutdown` (`F-01`).
+    /// Optional hot-reload state snapshot callback invoked prior to `bevy_abi_mod_shutdown`.
     ///
     /// Return serialized bytes to transfer into the replacement instance's [`Self::restore_state`].
     fn save_state(&self) -> Result<Vec<u8>, FfiResult> {
@@ -44,7 +44,7 @@ pub trait GuestPlugin: Default + Send + 'static {
     }
 
     /// Optional hot-reload state restoration callback invoked immediately after [`Self::build`]
-    /// during `reload_mod` (`F-01`).
+    /// during `reload_mod`.
     fn restore_state(&mut self, _bytes: &[u8]) -> FfiResult {
         FfiResult::OK
     }

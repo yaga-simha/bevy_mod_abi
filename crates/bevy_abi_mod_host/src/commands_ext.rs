@@ -1,4 +1,4 @@
-//! Deferred [`ModCommandsExt`] helpers on Bevy [`Commands`] for parallel systems (`B-02`, `F-01`).
+//! Deferred [`ModCommandsExt`] helpers on Bevy [`Commands`] for parallel systems.
 
 use crate::world_ext::ModWorldExt;
 use bevy_abi_mod_host_sys::{LoadOptions, ModId};
@@ -46,7 +46,7 @@ where
     op(world);
 }
 
-/// Deferred mod load, unload, and reload commands usable from any normal parallel Bevy system (`B-02`, `F-01`).
+/// Deferred mod load, unload, and reload commands usable from any normal parallel Bevy system.
 ///
 /// Queued operations execute during an exclusive `&mut World` point once active schedules are
 /// resident in [`Schedules`], preserving the safety invariant that shared libraries are never
@@ -61,10 +61,10 @@ pub trait ModCommandsExt {
     /// Queues a deferred [`ModWorldExt::unload_mod`] operation for `id`.
     fn unload_mod(&mut self, id: ModId);
 
-    /// Queues a deferred [`ModWorldExt::reload_mod`] operation for `id` (`F-01`).
+    /// Queues a deferred [`ModWorldExt::reload_mod`] operation for `id`.
     fn reload_mod(&mut self, id: ModId);
 
-    /// Queues a deferred [`ModWorldExt::reload_mod_with`] operation for `id` (`F-01`).
+    /// Queues a deferred [`ModWorldExt::reload_mod_with`] operation for `id`.
     fn reload_mod_with(&mut self, id: ModId, options: LoadOptions);
 }
 

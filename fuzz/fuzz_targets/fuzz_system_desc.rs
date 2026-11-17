@@ -1,7 +1,7 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//! `T-06` Fuzz Target 2: `BamSystemDesc` & `BamQueryDesc` validation + `host_register_system`
+//! Fuzz Target 2: `BamSystemDesc` & `BamQueryDesc` validation + `host_register_system`
 //! host parser across arbitrary query counts, term counts, access modes, schedules, flags,
 //! resource/component kind mismatches, self-conflicts, and poisoned `LoadContext` states.
 

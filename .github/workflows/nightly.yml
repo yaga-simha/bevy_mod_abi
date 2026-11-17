@@ -10,7 +10,7 @@ env:
 
 jobs:
   # ============================================================================
-  # 1. `T-06`: Continuous `cargo-fuzz` (`10` minutes per target over committed corpus)
+  # 1. Continuous `cargo-fuzz` (`10` minutes per target over committed corpus)
   # ============================================================================
   fuzz:
     name: cargo-fuzz (${{ matrix.target }})
@@ -41,14 +41,14 @@ jobs:
           workspaces: fuzz
           key: fuzz-${{ matrix.target }}
 
-      - name: Fuzz `${{ matrix.target }}` for 600 seconds (`T-06`)
+      - name: Fuzz `${{ matrix.target }}` for 600 seconds
         run: |
           cargo +nightly fuzz run "${{ matrix.target }}" \
             "fuzz/corpus/${{ matrix.target }}" \
             -- -max_total_time=600
 
   # ============================================================================
-  # 2. `T-07`: ThreadSanitizer (`-Zsanitizer=thread -Zbuild-std`) + `loom` Concurrency Model
+  # 2. ThreadSanitizer (`-Zsanitizer=thread -Zbuild-std`) + `loom` Concurrency Model
   # ============================================================================
   tsan-and-loom:
     name: ThreadSanitizer & Loom Concurrency Verification
@@ -67,13 +67,13 @@ jobs:
         with:
           key: tsan-loom
 
-      - name: Run `loom` drop-trampoline publish/reclaim model tests (`T-07`)
+      - name: Run `loom` drop-trampoline publish/reclaim model tests
         run: cargo +nightly test -p bevy_abi_mod_host_sys --test loom_drop_trampoline --release
 
       - name: Stage hermetic fixtures (uninstrumented foreign mods)
         run: cargo +nightly xtask fixtures
 
-      - name: Run multi-threaded scheduler & lifecycle suites under ThreadSanitizer (`T-07`)
+      - name: Run multi-threaded scheduler & lifecycle suites under ThreadSanitizer
         env:
           RUSTFLAGS: "-Zsanitizer=thread"
           TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
@@ -86,7 +86,7 @@ jobs:
             --test scheduling --test lifecycle
 
   # ============================================================================
-  # 3. `S-10` & `T-10`: Big-Endian (`s390x-unknown-linux-gnu`) Cross-Target Miri
+  # 3. Big-Endian (`s390x-unknown-linux-gnu`) Cross-Target Miri
   # ============================================================================
   miri-big-endian:
     name: Miri Big-Endian (s390x-unknown-linux-gnu)
@@ -118,7 +118,7 @@ jobs:
             -p bevy_abi_mod_host_sys --lib
 
   # ============================================================================
-  # 4. Randomized Rust Struct Layout (`-Zrandomize-layout`) + Long Proptest Parity (`T-05`)
+  # 4. Randomized Rust Struct Layout (`-Zrandomize-layout`) + Long Proptest Parity
   # ============================================================================
   randomize-layout-and-proptest:
     name: Randomized Rust Layout & Extended Differential Proptest

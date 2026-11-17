@@ -10,7 +10,7 @@ env:
 
 jobs:
   # ============================================================================
-  # 1. Core Static Quality, Docs, SemVer, Deny, Typos & 32-bit/Wasm Wire Checks (`CI-04`, `T-10`)
+  # 1. Core Static Quality, Docs, SemVer, Deny, Typos & 32-bit/Wasm Wire Checks
   # ============================================================================
   quality-gates:
     name: Quality, Docs, Deny, Typos & Wire Targets
@@ -45,23 +45,23 @@ jobs:
           cargo clippy --workspace --all-targets -- -D warnings
           cargo clippy --manifest-path fuzz/Cargo.toml --bins -- -D warnings
 
-      - name: Strict rustdoc warnings check (`CI-04`, `D-05`)
+      - name: Strict rustdoc warnings check
         env:
           RUSTDOCFLAGS: "-D warnings"
         run: cargo doc --workspace --no-deps
 
-      - name: 32-bit (`i686`) & `wasm32` ABI contract layout checks (`T-10`)
+      - name: 32-bit (`i686`) & `wasm32` ABI contract layout checks
         run: |
           cargo check -p bevy_abi_mod_sys --target i686-unknown-linux-gnu
           cargo check -p bevy_abi_mod_sys --target wasm32-unknown-unknown
 
-      - name: SemVer compatibility check on `bevy_abi_mod_sys` (`CI-04`)
+      - name: SemVer compatibility check on `bevy_abi_mod_sys`
         uses: obi1kenobi/cargo-semver-checks-action@v2
         with:
           package: bevy_abi_mod_sys
           baseline-rev: ${{ github.event.pull_request.base.sha || 'HEAD~1' }}
 
-      - name: Build mdBook developer guide (`D-06`)
+      - name: Build mdBook developer guide
         uses: peaceiris/actions-mdbook@v2
         with:
           mdbook-version: "0.4.48"
@@ -69,7 +69,7 @@ jobs:
         run: mdbook build docs/book
 
   # ============================================================================
-  # 2. Cross-Platform Default Workspace Parallel Test Matrix (`T-03`, `CI-05`)
+  # 2. Cross-Platform Default Workspace Parallel Test Matrix
   # ============================================================================
   test-matrix:
     name: Test Matrix (${{ matrix.os }})
@@ -96,7 +96,7 @@ jobs:
           cargo test --doc
 
   # ============================================================================
-  # 3. Heavy GUI / 3D Examples (`04_visual_game`, `05_cute_3d_winit`) (`CI-04`, `H-06`)
+  # 3. Heavy GUI / 3D Examples (`04_visual_game`, `05_cute_3d_winit`)
   # ============================================================================
   heavy-examples:
     name: Heavy GUI & 3D Examples
@@ -129,7 +129,7 @@ jobs:
             cargo test -p example_04_visual_game -p example_05_cute_3d_winit
 
   # ============================================================================
-  # 4. True Asymmetry Matrix: MSRV / Stable / Nightly + O0/O3 + panic=abort + C99 + C++17 + Zig (`T-08`, `X-02`)
+  # 4. True Asymmetry Matrix: MSRV / Stable / Nightly + O0/O3 + panic=abort + C99 + C++17 + Zig
   # ============================================================================
   asymmetry-rust:
     name: Asymmetric Rust Guest (${{ matrix.guest_toolchain }}, opt=${{ matrix.opt_level }}, panic=${{ matrix.panic_mode }})
@@ -197,10 +197,10 @@ jobs:
             cargo +stable test -p bevy_abi_mod_host
           else
             # Under `panic=abort`, skip the in-process `test_cross_runtime_panic_containment` unwind test
-            # and verify deterministic subprocess abort via `regression_g05_panic_abort`.
+            # and verify deterministic subprocess abort via `panic_abort_guest_terminates_subprocess`.
             cargo +stable test -p bevy_abi_mod_host --test ffi
             cargo +stable test -p bevy_abi_mod_host --test scheduling -- --skip test_cross_runtime_panic_containment
-            cargo +stable test -p bevy_abi_mod_host --test lifecycle regression_g05_panic_abort
+            cargo +stable test -p bevy_abi_mod_host --test lifecycle panic_abort_guest_terminates_subprocess
           fi
 
   asymmetry-polyglot:
@@ -242,7 +242,7 @@ jobs:
           cargo run -p example_08_zig_guest
 
   # ============================================================================
-  # 5. Deterministic Benchmark Gate (`iai-callgrind` + Smoke Bench) (`X-03`)
+  # 5. Deterministic Benchmark Gate (`iai-callgrind` + Smoke Bench)
   # ============================================================================
   benchmark-gate:
     name: Deterministic Callgrind & Benchmark Gate
@@ -273,7 +273,7 @@ jobs:
             cargo bench -p bevy_abi_mod_host --bench chunk_throughput -- --test
 
   # ============================================================================
-  # 6. Line Coverage Gate (`>= 85%` on `ffi/` and `system/`) (`T-12`)
+  # 6. Line Coverage Gate (`>= 85%` on `ffi/` and `system/`)
   # ============================================================================
   coverage:
     name: Coverage Gate (>=85% ffi/ & system/)
@@ -307,7 +307,7 @@ jobs:
             --fail-under-lines 85
 
   # ============================================================================
-  # 7. Miri Soundness, Tree Borrows & ASan/UBSan (`CI-06`)
+  # 7. Miri Soundness, Tree Borrows & ASan/UBSan
   # ============================================================================
   miri:
     name: Miri (-Zmiri-tree-borrows)

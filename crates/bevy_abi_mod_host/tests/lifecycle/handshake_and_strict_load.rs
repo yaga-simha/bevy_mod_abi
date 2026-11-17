@@ -1,5 +1,5 @@
 //! ABI `0.2.0` SemVer handshake compatibility, `LoadOptions` strict validation,
-//! single-path lifecycle `Message`s (`B-09`), truncated descriptors, and invalid lifecycle operations.
+//! single-path lifecycle `Message`s, truncated descriptors, and invalid lifecycle operations.
 
 use crate::DROP_SLOT_POOL_RWLOCK;
 use crate::support::{Position, Velocity, ensure_guest_mods_built, fixture_dylib};
@@ -16,7 +16,7 @@ fn semver_abi_compatibility_and_typed_mod_load_error_work() {
         (maj << 24) | (min << 16) | patch
     }
 
-    // Host is `0.2.0` (`ABI_VERSION = 0x0002_0000`): pre-1.0 requires exact minor match (`C-06`).
+    // Host is `0.2.0` (`ABI_VERSION = 0x0002_0000`): pre-1.0 requires exact minor match.
     assert!(is_abi_version_compatible(ABI_VERSION, ABI_VERSION));
     assert!(is_abi_version_compatible(ABI_VERSION, pack_ver(0, 2, 99)));
     assert!(!is_abi_version_compatible(ABI_VERSION, pack_ver(0, 0, 9)));
@@ -45,10 +45,7 @@ fn semver_abi_compatibility_and_typed_mod_load_error_work() {
             )
             .expect_err("Missing dylib without shadow-copy must return ModLoadError::DlOpen");
         assert!(matches!(err, ModLoadError::DlOpen { .. }));
-        assert!(
-            err.source().is_some(),
-            "E-02: DlOpen must preserve source()"
-        );
+        assert!(err.source().is_some(), "DlOpen must preserve source()");
         assert!(err.to_string().contains("missing_mod.dylib"));
 
         let shadow_err = app
@@ -60,7 +57,7 @@ fn semver_abi_compatibility_and_typed_mod_load_error_work() {
         assert!(matches!(shadow_err, ModLoadError::ShadowCopy { .. }));
         assert!(
             shadow_err.source().is_some(),
-            "E-02: ShadowCopy must preserve io::Error source()"
+            "ShadowCopy must preserve io::Error source()"
         );
     }
 
@@ -75,7 +72,7 @@ fn real_dylib_loaded_mod_entity_lifecycle_messages_and_strict_validation_work() 
         .read()
         .unwrap_or_else(|e| e.into_inner());
     let (_rust_dylib, c_dylib) = ensure_guest_mods_built();
-    let strict_fail_dylib = fixture_dylib("s06_strict_fail");
+    let strict_fail_dylib = fixture_dylib("unresolved_ordering_mod");
 
     // 1. Strict mode validation (`LoadOptions::new().strict()`): rejects unresolved
     // ordering targets and rolls back the module cleanly (`ModHost` remains empty).
@@ -99,8 +96,8 @@ fn real_dylib_loaded_mod_entity_lifecycle_messages_and_strict_validation_work() 
         );
     }
 
-    // 2. Load C99 mod and verify `LoadedModInfo` ECS entity (populated from `BamManifest`, `L-08`)
-    // and single-path `Messages<ModLoaded>` / `Messages<ModUnloaded>` (`B-09`).
+    // 2. Load C99 mod and verify `LoadedModInfo` ECS entity (populated from `BamManifest`)
+    // and single-path `Messages<ModLoaded>` / `Messages<ModUnloaded>`.
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
     app.register_mod_component::<Position>(ComponentOptions::new().with_default())

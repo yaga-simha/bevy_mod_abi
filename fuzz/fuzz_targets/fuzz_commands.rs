@@ -1,7 +1,7 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//! `T-06` Fuzz Target 3: `host_cmd_*` FFI entry points (`spawn_empty`, `spawn`, `despawn`,
+//! Fuzz Target 3: `host_cmd_*` FFI entry points (`spawn_empty`, `spawn`, `despawn`,
 //! `insert`, `insert_default`, `remove`) with arbitrary component handles, forged/placeholder/null
 //! entities, mismatched sizes, padded byte payloads, duplicate batch IDs, type-confused handles,
 //! and alternating commit (`apply_to_world`) vs. fault rollback (`clear`).

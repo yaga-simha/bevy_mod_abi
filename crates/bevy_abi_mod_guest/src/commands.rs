@@ -76,7 +76,7 @@ impl<'a> GuestCommands<'a> {
         self.inner.spawn_empty()
     }
 
-    /// Reserves a fresh entity and batch-inserts `entries` in a single archetype transition (`P-05`).
+    /// Reserves a fresh entity and batch-inserts `entries` in a single archetype transition.
     #[inline]
     pub fn spawn(&mut self, entries: &[SpawnEntry<'_>]) -> Result<FfiEntity, FfiResult> {
         self.inner.spawn(entries)
@@ -89,7 +89,7 @@ impl<'a> GuestCommands<'a> {
     }
 
     /// Queues deferred insertion of `value` (`T: AbiPod`) onto `entity` using pre-resolved
-    /// [`BamComponent`] handle (`C-05`).
+    /// [`BamComponent`] handle.
     #[inline]
     pub fn insert<T: AbiPod>(
         &mut self,
@@ -101,19 +101,19 @@ impl<'a> GuestCommands<'a> {
     }
 
     /// Queues deferred insertion of host-constructed `T::default()` for pre-resolved `component`
-    /// onto `entity` (`C-05`).
+    /// onto `entity`.
     #[inline]
     pub fn insert_default(&mut self, entity: FfiEntity, component: BamComponent) -> FfiResult {
         self.inner.insert_default(entity, component)
     }
 
-    /// Queues deferred removal of pre-resolved `component` from `entity` (`C-05`).
+    /// Queues deferred removal of pre-resolved `component` from `entity`.
     #[inline]
     pub fn remove(&mut self, entity: FfiEntity, component: BamComponent) -> FfiResult {
         self.inner.remove(entity, component)
     }
 
-    /// Convenience helper resolving `T: GuestComponent` (including manifest-qualified `C-10` names)
+    /// Convenience helper resolving `T: GuestComponent` (including manifest-qualified names)
     /// and inserting `value`.
     ///
     /// Prefer pre-resolving [`BamComponent`] handles at mod init for hot per-frame loops.
@@ -130,7 +130,7 @@ impl<'a> GuestCommands<'a> {
         }
     }
 
-    /// Convenience helper resolving `T: GuestComponent` (including manifest-qualified `C-10` names)
+    /// Convenience helper resolving `T: GuestComponent` (including manifest-qualified names)
     /// and inserting `T::default()` on the host.
     #[inline]
     pub fn insert_component_default<T: GuestComponent>(&mut self, entity: FfiEntity) -> FfiResult {
@@ -141,7 +141,7 @@ impl<'a> GuestCommands<'a> {
         }
     }
 
-    /// Convenience helper resolving `T: GuestComponent` (including manifest-qualified `C-10` names)
+    /// Convenience helper resolving `T: GuestComponent` (including manifest-qualified names)
     /// and removing `T` from `entity`.
     #[inline]
     pub fn remove_component<T: GuestComponent>(&mut self, entity: FfiEntity) -> FfiResult {

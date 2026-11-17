@@ -1,4 +1,4 @@
-//! Entry-point export macros (`export_mod!`) for guest `.cdylib` mods (`L-02`, `L-08`).
+//! Entry-point export macros (`export_mod!`) for guest `.cdylib` mods.
 
 /// Exports a guest mod's mandatory ABI `0.2` C entry points (`bevy_abi_mod_manifest`,
 /// `bevy_abi_mod_init`, and `bevy_abi_mod_shutdown`) backed by per-World

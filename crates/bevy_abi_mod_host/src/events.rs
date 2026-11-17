@@ -1,6 +1,6 @@
-//! ECS lifecycle components and buffered `Message`s for native mods (`B-05`, `B-09`, `L-08`).
+//! ECS lifecycle components and buffered `Message`s for native mods.
 //!
-//! Per `B-09`, lifecycle and fault notifications (`ModLoaded`, `ModUnloaded`, `ModSystemFaulted`)
+//! Lifecycle and fault notifications (`ModLoaded`, `ModUnloaded`, `ModSystemFaulted`)
 //! emit once via Bevy [`Message`](bevy_ecs::message::Message) queues (`MessageReader<M>`) without
 //! duplicate `Observer`/`Event` double-writes.
 

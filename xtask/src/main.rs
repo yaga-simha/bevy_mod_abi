@@ -362,17 +362,6 @@ fn write_manifest(fixtures_dir: &Path, built: &[BuiltFixture]) -> Result<PathBuf
     Ok(manifest_path)
 }
 
-fn example_mod_is_v0_2_ready(root: &Path, source_rel: &str) -> bool {
-    let Ok(content) = fs::read_to_string(root.join(source_rel)) else {
-        return false;
-    };
-    !content.contains("ComponentAccessDesc")
-        && !content.contains("BEVY_ABI_MOD_EXPORT")
-        && !content.contains(".add_system(")
-        && !content.contains(".add_system_if(")
-        && !content.contains(".add_multi_query_system")
-}
-
 fn build_fixtures_internal(
     root: &Path,
     include_examples: bool,
@@ -384,7 +373,7 @@ fn build_fixtures_internal(
 
     let mut built = Vec::new();
 
-    // 1. Core asymmetric test fixtures + `panic = "abort"` Rust guest fixture (`G-05`)
+    // 1. Core asymmetric test fixtures + `panic = "abort"` Rust guest fixture
     let rust_mod = build_rust_cdylib(
         root,
         "tests/asymmetric_rust_mod/Cargo.toml",
@@ -438,16 +427,16 @@ fn build_fixtures_internal(
     // 2. Hermetic C99 integration test fixtures (`tests/fixtures/c_mods/*.c`)
     let c_test_fixtures: &[&str] = &[
         "c_uuid_oracle",
-        "s05_vtable_mod",
-        "s06_fail_init",
-        "s06_strict_fail",
-        "l01_late_startup",
+        "vtable_eviction_mod",
+        "init_rollback_mod",
+        "unresolved_ordering_mod",
+        "late_startup_mod",
         "mod_alpha",
         "mod_beta",
         "mod_producer",
         "mod_consumer",
-        "l05c_clean_mod",
-        "w4_ext_mod",
+        "ordered_sets_mod",
+        "state_hooks_and_observers_mod",
     ];
     for &stem in c_test_fixtures {
         let compiled = build_c99_test_fixture(root, stem)?;
@@ -458,72 +447,58 @@ fn build_fixtures_internal(
     }
 
     // 3. Lightweight Bevy-free example 01..04 guest mods exercised by host E2E tests
-    let test_rust_examples: &[(&str, &str, &str, &str, &str)] = &[
+    let test_rust_examples: &[(&str, &str, &str, &str)] = &[
         (
             "example_01_guest_mod",
             "examples/01_minimal_handshake/guest_mod/Cargo.toml",
-            "examples/01_minimal_handshake/guest_mod/src/lib.rs",
             "minimal_guest_mod",
             "minimal_guest_mod",
         ),
         (
             "example_02_guest_mod",
             "examples/02_multi_system_pipeline/guest_mod/Cargo.toml",
-            "examples/02_multi_system_pipeline/guest_mod/src/lib.rs",
             "example_02_guest_mod",
             "example_02_guest_mod",
         ),
         (
             "example_03_rust_mod",
             "examples/03_cross_language_interop/rust_mod/Cargo.toml",
-            "examples/03_cross_language_interop/rust_mod/src/lib.rs",
             "rust_mod",
             "example_03_rust_mod",
         ),
         (
             "mod_gravity",
             "examples/04_visual_game/mods/mod_gravity/Cargo.toml",
-            "examples/04_visual_game/mods/mod_gravity/src/lib.rs",
             "mod_gravity",
             "mod_gravity",
         ),
         (
             "mod_rainbow",
             "examples/04_visual_game/mods/mod_rainbow/Cargo.toml",
-            "examples/04_visual_game/mods/mod_rainbow/src/lib.rs",
             "mod_rainbow",
             "mod_rainbow",
         ),
         (
             "mod_vortex",
             "examples/04_visual_game/mods/mod_vortex/Cargo.toml",
-            "examples/04_visual_game/mods/mod_vortex/src/lib.rs",
             "mod_vortex",
             "mod_vortex",
         ),
         (
             "mod_shield_emitter",
             "examples/06_cross_mod_components/mods/mod_shield_emitter/Cargo.toml",
-            "examples/06_cross_mod_components/mods/mod_shield_emitter/src/lib.rs",
             "mod_shield_emitter",
             "mod_shield_emitter",
         ),
         (
             "mod_overcharge_siphon",
             "examples/06_cross_mod_components/mods/mod_overcharge_siphon/Cargo.toml",
-            "examples/06_cross_mod_components/mods/mod_overcharge_siphon/src/lib.rs",
             "mod_overcharge_siphon",
             "mod_overcharge_siphon",
         ),
     ];
 
-    for &(key, manifest_rel, source_rel, crate_stem, dest_stem) in test_rust_examples {
-        if !include_examples && !example_mod_is_v0_2_ready(root, source_rel) {
-            println!(
-                "==> [Notice] Skipping unported example fixture `{key}` ({source_rel}); pass `--examples` to require"
-            );
-            continue;
-        }
+    for &(key, manifest_rel, crate_stem, dest_stem) in test_rust_examples {
         let src = build_rust_cdylib(root, manifest_rel, crate_stem, true)?;
         built.push(stage_fixture(
             root,
@@ -536,31 +511,23 @@ fn build_fixtures_internal(
         )?);
     }
 
-    if include_examples
-        || example_mod_is_v0_2_ready(root, "examples/03_cross_language_interop/c_mod/mod.c")
-    {
-        let ex3_c = build_c99_mod(
-            root,
-            "examples/03_cross_language_interop/c_mod",
-            "mod.c",
-            "c_mod",
-            "-O3",
-            false,
-        )?;
-        built.push(stage_fixture(
-            root,
-            &fixtures_dir,
-            "example_03_c_mod",
-            "c99",
-            "release",
-            &ex3_c,
-            "example_03_c_mod",
-        )?);
-    } else {
-        println!(
-            "==> [Notice] Skipping unported example fixture `example_03_c_mod`; pass `--examples` to require"
-        );
-    }
+    let ex3_c = build_c99_mod(
+        root,
+        "examples/03_cross_language_interop/c_mod",
+        "mod.c",
+        "c_mod",
+        "-O3",
+        false,
+    )?;
+    built.push(stage_fixture(
+        root,
+        &fixtures_dir,
+        "example_03_c_mod",
+        "c99",
+        "release",
+        &ex3_c,
+        "example_03_c_mod",
+    )?);
 
     // 4. Additional optional GUI/3D example guest mods (Example 05)
     if include_examples {

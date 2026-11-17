@@ -62,9 +62,9 @@ app.init_schedule(RollbackPhysicsTick);
 app.register_mod_schedule(ROLLBACK_SCHEDULE_ID, RollbackPhysicsTick)?;
 ```
 
-- **Late `Startup` Execution (`L-01`):** If a mod is loaded at runtime *after* Bevy's `Startup` schedule has already run (`StartupCompleted` resource), any `ScheduleId::STARTUP` systems in that mod execute once immediately upon load commit.
-- **Scoped Named Ordering (`L-05`):** Every guest system automatically joins `ModSystemSet(mod_id)` and `ModNamedSystemSet { mod_name, system_name }`. Unqualified `.after("step_a")` orders within the same mod; `"other_mod::step_a"` orders across mods without global name collisions.
-- **Main-Thread Affinity (`B-07`):** Guests with thread-affine state set `BAM_SYSTEM_FLAG_MAIN_THREAD` (`.main_thread()` in Rust), mapping to Bevy's `SystemStateFlags::NON_SEND`.
+- **Late `Startup` Execution:** If a mod is loaded at runtime *after* Bevy's `Startup` schedule has already run (`StartupCompleted` resource), any `ScheduleId::STARTUP` systems in that mod execute once immediately upon load commit.
+- **Scoped Named Ordering:** Every guest system automatically joins `ModSystemSet(mod_id)` and `ModNamedSystemSet { mod_name, system_name }`. Unqualified `.after("step_a")` orders within the same mod; `"other_mod::step_a"` orders across mods without global name collisions.
+- **Main-Thread Affinity:** Guests with thread-affine state set `BAM_SYSTEM_FLAG_MAIN_THREAD` (`.main_thread()` in Rust), mapping to Bevy's `SystemStateFlags::NON_SEND`.
 
 ---
 

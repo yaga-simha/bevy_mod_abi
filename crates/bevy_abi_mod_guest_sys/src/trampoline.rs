@@ -138,7 +138,7 @@ impl<'a> ValidatedSystemInvocation<'a> {
         self.sys_ctx
     }
 
-    /// Returns a validated [`ValidatedSystemRef`] token bound to this active system invocation (`F-03`).
+    /// Returns a validated [`ValidatedSystemRef`] token bound to this active system invocation.
     #[inline]
     pub const fn system_ref(&self) -> ValidatedSystemRef<'a> {
         ValidatedSystemRef {
@@ -367,7 +367,7 @@ impl<'a> ValidatedSystemInvocation<'a> {
 }
 
 /// Validated per-tick `*mut BamSystemCtx` token supporting borrow-checked random per-entity
-/// component lookups (`F-03`).
+/// component lookups.
 #[derive(Clone, Copy)]
 pub struct ValidatedSystemRef<'a> {
     sys_ctx: *mut BamSystemCtx,
@@ -388,7 +388,7 @@ impl<'a> ValidatedSystemRef<'a> {
     }
 
     /// Looks up a shared `&'b T` component reference for `entity` using declared access on
-    /// `(query_index, term_index)` (`F-03`).
+    /// `(query_index, term_index)`.
     pub fn entity_get_checked<'b, T: AbiPod>(
         &'b self,
         iter: &'b ValidatedIter<'a>,
@@ -438,7 +438,7 @@ impl<'a> ValidatedSystemRef<'a> {
     }
 
     /// Looks up an exclusive `&'b mut T` component reference for `entity` using declared writable
-    /// access on `(query_index, term_index)`, marking the component changed (`F-03`).
+    /// access on `(query_index, term_index)`, marking the component changed.
     pub fn entity_get_mut_checked<'b, T: AbiPod>(
         &'b mut self,
         iter: &'b mut ValidatedIter<'a>,

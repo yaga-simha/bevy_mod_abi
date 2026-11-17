@@ -1,5 +1,5 @@
 //! Synchronous and `World`-backed `FilteredAccessSet` validation and `QueryState` builder
-//! (`C-01`, `C-05`, `P-01..P-03`, `P-08`, `B-08`).
+//!.
 //!
 //! # Intent
 //! Dynamic C-ABI systems have no Rust type-system `Query<(&mut A, &B)>` signature for Bevy

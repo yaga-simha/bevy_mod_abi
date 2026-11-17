@@ -1,4 +1,4 @@
-//! Handle-based and batched command queue stress & edge-case tests (`C-05`, `P-05`).
+//! Handle-based and batched command queue stress & edge-case tests.
 
 #![deny(unsafe_code)]
 
@@ -83,7 +83,7 @@ fn handle_commands_and_batched_spawn_fast_and_heap_paths() {
     let bulk_clone = bulk_handles.clone();
     let inst = world
         .load_fn(c"cmd_stress_mod", move |app| {
-            // Pre-resolve handles once at init (`C-05` O(1) pattern):
+            // Pre-resolve handles once at init ($O(1)$ lookup pattern):
             let resolved_padded = app
                 .resolve_component::<PaddedPayload>()
                 .expect("resolve PaddedPayload");
@@ -120,7 +120,7 @@ fn handle_commands_and_batched_spawn_fast_and_heap_paths() {
                 // 3. Batched `spawn(&[])` (0 entries -> routes cleanly):
                 let e_empty_batch = cmds.spawn(&[]).expect("empty batch spawn");
 
-                // 4. Batched `spawn` fast stack path (`<= 16` entries, zero heap allocation `P-05`):
+                // 4. Batched `spawn` fast stack path (`<= 16` entries, zero heap allocation):
                 let def_val = WithDefault { hp: 99.5 };
                 let e_small = cmds
                     .spawn(&[

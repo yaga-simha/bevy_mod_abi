@@ -862,7 +862,7 @@ static BamResult mock_observer_cb(BamEntity target_entity, const void* event_dat
     return BAM_RESULT_OK;
 }
 
-static void test_wave4_5_extensions(void) {
+static void test_hierarchy_ticks_layout_and_observer_descriptors(void) {
     BamChildOf child_of;
     BamChangeTicks ticks;
     BamComponentDesc dyn_desc;
@@ -948,7 +948,7 @@ int main(void) {
     test_cross_language_siphash_uuids();
     test_extensible_host_api_copy_bounded();
     test_end_to_end_c99_lifecycle_and_vtable();
-    test_wave4_5_extensions();
+    test_hierarchy_ticks_layout_and_observer_descriptors();
 
     printf("All ABI v0.2.0 ISO C99 conformance & layout checks passed.\n");
     return 0;

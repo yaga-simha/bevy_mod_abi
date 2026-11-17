@@ -5,7 +5,7 @@
 #include "../../../include/bevy_abi_mod.h"
 #include <stdlib.h>
 
-/* C99 VTable mirrors prefixed at byte offset 0 by BamVTableHeader (M-04, M-05). */
+/* C99 VTable mirrors prefixed at byte offset 0 by BamVTableHeader. */
 typedef struct PositionVTable {
     BamVTableHeader header;
     float     (*get_x)(const void* ptr);
@@ -26,7 +26,7 @@ typedef struct VelocityVTable {
     BamResult (*set_z)(void* ptr, float val);
 } VelocityVTable;
 
-/* Per-World instance state owned by the guest heap; zero process globals (L-02). */
+/* Per-World instance state owned by the guest heap; zero process globals. */
 typedef struct ModState {
     BamHostApi            api;
     BamComponent          pos_comp;

@@ -90,7 +90,7 @@ fn test_cross_mod_component_query_and_access() {
         ..Default::default()
     };
 
-    // Phase 1: Load Mod A (Introducer / Spawner)
+    // Step 1: Load Mod A (Introducer / Spawner)
     let mod_a_id = app
         .load_mod_with(&mod_a_dylib, load_opts.clone())
         .expect("Load mod_shield_emitter");
@@ -106,13 +106,13 @@ fn test_cross_mod_component_query_and_access() {
         comp.component_id
     };
 
-    // Phase 2: Load Mod B (Consumer / Siphoner)
+    // Step 2: Load Mod B (Consumer / Siphoner)
     let mod_b_id = app
         .load_mod_with(&mod_b_dylib, load_opts)
         .expect("Load mod_overcharge_siphon");
     assert_eq!(app.world().resource::<Messages<ModLoaded>>().len(), 2);
 
-    // Phase 3: Run 5 schedule ticks
+    // Step 3: Run 5 schedule ticks
     for _ in 1..=5 {
         app.update();
     }
@@ -121,7 +121,7 @@ fn test_cross_mod_component_query_and_access() {
         0
     );
 
-    // Phase 4: Verify entities spawned by Mod A were queried and mutated by Mod B
+    // Step 4: Verify entities spawned by Mod A were queried and mutated by Mod B
     let mut drone_shields = Vec::new();
     for entity in app.world().iter_entities() {
         if let Ok(comp_ref) = entity.get_by_id(shield_comp_id) {
@@ -155,7 +155,7 @@ fn test_cross_mod_component_query_and_access() {
         );
     }
 
-    // Phase 5: Unload both mods cleanly
+    // Step 5: Unload both mods cleanly
     app.unload_mod(mod_b_id).expect("Unload Mod B");
     app.unload_mod(mod_a_id).expect("Unload Mod A");
     assert_eq!(app.world().resource::<Messages<ModUnloaded>>().len(), 2);

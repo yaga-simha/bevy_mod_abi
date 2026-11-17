@@ -163,7 +163,7 @@ When resolving `"bam.v0.my_game::UnitLabel.vtable"` via `resolve_vtable` (or `ge
 
 ---
 
-## 3. Panic & Unwind Policy: `panic = "unwind"` vs. `panic = "abort"` (`G-05`, `S-09`)
+## 3. Panic & Unwind Policy: `panic = "unwind"` vs. `panic = "abort"`
 
 Every callback across `bevy_abi_mod` uses `extern "C"` (`nounwind` since Rust 1.81), **never** `extern "C-unwind"`. The host never wraps foreign `extern "C"` calls in `std::panic::catch_unwind` because catching a foreign `.cdylib` panic across independent Rust runtimes would free guest-allocated `Box<dyn Any>` payloads on the host allocator (heap corruption) and rely on unstable unwind ABI internals.
 
@@ -327,8 +327,8 @@ cl /LD /O2 /W4 /WX /I..\..\include mod.c /Fe:c_elevation_mod.dll
 
 ## 5. Threading, Handle Lifetimes & Safety Checklist
 
-- **Worker-Thread Safety (`S-11`, `B-07`):** Registered systems run on Bevy's multi-threaded `ComputeTaskPool` worker threads by default. Never mutate unsynchronized C `static` globals across parallel systems; store mutable state inside `BamInstance` / `user_data` or pass `BAM_SYSTEM_FLAG_MAIN_THREAD` (`.main_thread()` in Rust) to pin execution to Bevy's main thread.
-- **Scoped Handle Lifetimes (`S-08`):** `BamLoadCtx*` is valid only inside `bevy_abi_mod_init`. `BamSystemCtx*`, `BamIter*`, and `BamCommands*` are valid strictly during the active `BamSystemFn` call (enforced by host `{ magic, generation }` handle headers in debug / `strict-ffi-checks` builds). Column pointers are invalidated on the next `iter_next_chunk` or `iter_reset`.
+- **Worker-Thread Safety:** Registered systems run on Bevy's multi-threaded `ComputeTaskPool` worker threads by default. Never mutate unsynchronized C `static` globals across parallel systems; store mutable state inside `BamInstance` / `user_data` or pass `BAM_SYSTEM_FLAG_MAIN_THREAD` (`.main_thread()` in Rust) to pin execution to Bevy's main thread.
+- **Scoped Handle Lifetimes:** `BamLoadCtx*` is valid only inside `bevy_abi_mod_init`. `BamSystemCtx*`, `BamIter*`, and `BamCommands*` are valid strictly during the active `BamSystemFn` call (enforced by host `{ magic, generation }` handle headers in debug / `strict-ffi-checks` builds). Column pointers are invalidated on the next `iter_next_chunk` or `iter_reset`.
 - **Null Entity Sentinel:** Use `FfiEntity::NULL` / `BAM_ENTITY_NULL` (`0ULL`) as the invalid entity sentinel (`u64::MAX` is a valid Bevy 0.20+ entity).
 - **Inspect Host Error Messages:** In C/C++/Zig mods, call `api.last_error(host_ctx, buf, sizeof(buf))` whenever an API call returns a non-`OK` `BamResult` to retrieve the exact human-readable host diagnostic.
 

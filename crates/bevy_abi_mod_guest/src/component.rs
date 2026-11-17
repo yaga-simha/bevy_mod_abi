@@ -6,7 +6,7 @@ use std::ffi::CString;
 use bevy_abi_mod_guest_sys::{Host, PodComponentHooks, UuidFilter, resolve_component};
 use bevy_abi_mod_sys::{AbiPod, BamComponent, ComponentUuid, FfiEntity, FfiResult};
 
-/// Safe builder for optional `on_add` and `on_remove` dynamic component hooks (`F-04`).
+/// Safe builder for optional `on_add` and `on_remove` dynamic component hooks.
 pub struct GuestComponentHooks<T: AbiPod> {
     pub(crate) inner: PodComponentHooks<T>,
 }
@@ -26,7 +26,7 @@ impl<T: AbiPod> GuestComponentHooks<T> {
         }
     }
 
-    /// Attaches an `on_add` hook invoked whenever `T` is inserted onto an entity (`F-04`).
+    /// Attaches an `on_add` hook invoked whenever `T` is inserted onto an entity.
     #[inline]
     pub fn on_add<F>(mut self, callback: F) -> Self
     where
@@ -36,7 +36,7 @@ impl<T: AbiPod> GuestComponentHooks<T> {
         self
     }
 
-    /// Attaches an `on_remove` hook invoked immediately before `T` is removed from an entity (`F-04`).
+    /// Attaches an `on_remove` hook invoked immediately before `T` is removed from an entity.
     #[inline]
     pub fn on_remove<F>(mut self, callback: F) -> Self
     where
@@ -113,7 +113,7 @@ pub trait GuestComponent: AbiPod {
     const FLAGS: u32 = 0;
 
     /// Deterministic 128-bit identity ([`ComponentUuid`]) verified on handle resolution and column
-    /// introspection (`C-13`).
+    /// introspection.
     const UUID: ComponentUuid = match Self::NAME.to_str() {
         Ok(name_str) => ComponentUuid::from_parts(
             name_str,
@@ -188,7 +188,7 @@ pub(crate) fn resolve_guest_component<T: GuestComponent>(
     }
 }
 
-/// Computes the expected [`UuidFilter`] for runtime `C-13` column and resource validation of
+/// Computes the expected [`UuidFilter`] for runtime column and resource validation of
 /// `T: GuestComponent` inside a mod whose manifest name is `manifest_name`.
 ///
 /// When `T::NAME` is already namespaced (`contains("::")`), `manifest_name` is empty, or `T`

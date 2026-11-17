@@ -1,4 +1,4 @@
-//! Lock-free `ArcSwapOption` per-`World` drop trampolines with slot reclamation (`L-06`, ADR 0001).
+//! Lock-free `ArcSwapOption` per-`World` drop trampolines with slot reclamation (ADR 0001).
 //!
 //! Implements the exact ADR 0001 slot lifecycle:
 //! - Hot path (`drop_trampoline::<SLOT>`): wait-free `ArcSwapOption::load()` with zero `Mutex`
@@ -297,7 +297,7 @@ pub(crate) fn on_insert_hook_for_slot(slot: usize) -> ComponentHook {
 }
 
 // ============================================================================
-// Guest Dynamic Component Lifecycle Hooks (`on_add` / `on_remove`, `F-04`)
+// Guest Dynamic Component Lifecycle Hooks (`on_add` / `on_remove`)
 // ============================================================================
 
 #[derive(Clone)]
@@ -328,7 +328,7 @@ static HOOK_CONTROL: LazyLock<Mutex<HookControlPlane>> = LazyLock::new(|| {
 });
 
 /// Staged dynamic component hook mutation recorded during `bevy_abi_mod_init` so `LoadTransaction`
-/// or `rollback_unscheduled_mod_in_world` can atomically undo uncommitted hook bindings (`F-04`).
+/// or `rollback_unscheduled_mod_in_world` can atomically undo uncommitted hook bindings.
 #[derive(Clone)]
 pub(crate) struct StagedHookBinding {
     uuid: ComponentUuid,
@@ -478,7 +478,7 @@ pub(crate) fn on_remove_hook_for_slot(slot: usize) -> ComponentHook {
 }
 
 /// Per-`World` RAII resource owning all drop trampoline slots bound to `ComponentDescriptor`s in
-/// that `World` (`L-06`, ADR 0001).
+/// that `World` (ADR 0001).
 ///
 /// When the `World` is dropped, `WorldDropGuard::drop` disarms every owned slot (`DROP_SLOTS[slot].store(None)`),
 /// transitions its state to `SLOT_CLOSING`, and immediately returns any slot with `live_values == 0`
@@ -616,7 +616,7 @@ impl WorldDropGuard {
         self.guards.retain(|g| g.load(Ordering::Acquire));
     }
 
-    /// Allocates or updates a dynamic component `on_add` / `on_remove` hook slot for `uuid` (`F-04`).
+    /// Allocates or updates a dynamic component `on_add` / `on_remove` hook slot for `uuid`.
     pub(crate) fn bind_or_update_hooks(
         &mut self,
         uuid: ComponentUuid,
@@ -695,7 +695,7 @@ impl WorldDropGuard {
         ))
     }
 
-    /// Rolls back uncommitted [`StagedHookBinding`]s in reverse registration order (`F-04`).
+    /// Rolls back uncommitted [`StagedHookBinding`]s in reverse registration order.
     pub(crate) fn rollback_staged_hook_bindings(&mut self, bindings: &[StagedHookBinding]) {
         if bindings.is_empty() {
             return;

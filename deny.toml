@@ -1,4 +1,4 @@
-# cargo-deny configuration for `bevy_abi_mod` (`CI-04`)
+# cargo-deny configuration for `bevy_abi_mod`
 # Validates security advisories, SPDX licenses, duplicate crate bans (including Bevy), and registries.
 
 [graph]
@@ -41,7 +41,7 @@ wildcards = "deny"
 allow-wildcard-paths = true
 highlight = "all"
 
-# Strictly forbid duplicate `bevy*` versions across the workspace graph (`CI-04`).
+# Strictly forbid duplicate `bevy*` versions across the workspace graph.
 deny = [
     { crate = "bevy", deny-multiple-versions = true },
     { crate = "bevy_app", deny-multiple-versions = true },

@@ -18,7 +18,7 @@ static BamResult noop_sys(BamSystemCtx* sys_ctx, void* user_data) {
 static const BamManifest MANIFEST = {
     .struct_size = (uint32_t)sizeof(BamManifest),
     .abi_version = BAM_ABI_VERSION,
-    .name = "s06_strict_fail",
+    .name = "unresolved_ordering_mod",
     .version = "0.2.0",
     .flags = 0u,
     .reserved0 = 0u
@@ -52,14 +52,14 @@ BAM_EXPORT BamResult bevy_abi_mod_init(
 
     g_strict_vt.struct_size = (uint32_t)sizeof(BamVTableHeader);
     g_strict_vt.abi_version = BAM_ABI_VERSION;
-    g_strict_vt.uuid = bam_uuid_from_parts("s06_strict_fail::S06StrictTempComp", 8u, 8u, 0ull);
+    g_strict_vt.uuid = bam_uuid_from_parts("unresolved_ordering_mod::StrictTempComp", 8u, 8u, 0ull);
     g_strict_vt.size = 8u;
     g_strict_vt.align = 8u;
 
     memset(&cdesc, 0, sizeof(cdesc));
     cdesc.struct_size = (uint32_t)sizeof(BamComponentDesc);
     cdesc.flags = 0u;
-    cdesc.name = "S06StrictTempComp";
+    cdesc.name = "StrictTempComp";
     cdesc.uuid = g_strict_vt.uuid;
     cdesc.size = 8u;
     cdesc.align = 8u;
@@ -74,7 +74,7 @@ BAM_EXPORT BamResult bevy_abi_mod_init(
     /*
      * Register a system whose `after` target is syntactically valid (`init` succeeds),
      * so `LoadOptions::new().with_strict(true)` rejects it post-`init` with
-     * `ModLoadError::UnresolvedOrderingTarget` and exercises post-init rollback (`S-06`).
+     * `ModLoadError::UnresolvedOrderingTarget` and exercises post-init rollback.
      */
     memset(&sdesc, 0, sizeof(sdesc));
     sdesc.struct_size = (uint32_t)sizeof(BamSystemDesc);

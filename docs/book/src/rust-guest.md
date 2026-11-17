@@ -79,8 +79,8 @@ app.system(c"integrate_velocity")
 ```
 
 ### Sparse-Set Columns & Fine-Grained Change Tracking
-- **Sparse-Set Components (`P-02`):** When a component uses `StorageType::SparseSet`, call `chunk.rows::<T>(term_idx)` or `chunk.rows_mut::<T>(term_idx)` to iterate batched indirect row references without falling back to 1-entity FFI calls.
-- **Untracked Mutable Slices (`P-04`):** When inspecting a mutable column and modifying only occasional elements, use `chunk.column_mut_untracked::<T>(term_idx)` and call `chunk.mark_changed_range(term_idx, row, 1)` only on mutated rows so downstream `Changed<T>` systems skip untouched rows.
+- **Sparse-Set Components:** When a component uses `StorageType::SparseSet`, call `chunk.rows::<T>(term_idx)` or `chunk.rows_mut::<T>(term_idx)` to iterate batched indirect row references without falling back to 1-entity FFI calls.
+- **Untracked Mutable Slices:** When inspecting a mutable column and modifying only occasional elements, use `chunk.column_mut_untracked::<T>(term_idx)` and call `chunk.mark_changed_range(term_idx, row, 1)` only on mutated rows so downstream `Changed<T>` systems skip untouched rows.
 
 ---
 

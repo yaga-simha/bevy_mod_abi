@@ -1,7 +1,7 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//! `T-06` Fuzz Target 4: C-string / `after` / `before` ordering array & UTF-8 parsing across
+//! Fuzz Target 4: C-string / `after` / `before` ordering array & UTF-8 parsing across
 //! `host_register_system`, `host_get_proc_address`, `host_resolve_component`, `host_last_error`,
 //! and `ModNamedSystemSet::parse_target`.
 

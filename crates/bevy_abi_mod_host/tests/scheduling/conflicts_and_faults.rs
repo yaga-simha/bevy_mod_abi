@@ -951,7 +951,7 @@ fn test_multi_system_fault_isolation_healthy_survives() {
 #[test]
 fn test_cross_runtime_panic_containment() {
     let (rust_dylib, _c_dylib) = ensure_guest_mods_built();
-    // T-03: Use an isolated `TempDylibCopy` without `shadow_copy` so `Library::new` below resolves
+    // Use an isolated `TempDylibCopy` without `shadow_copy` so `Library::new` below resolves
     // `asymmetric_rust_mod_trigger_panic` in the exact `.bss` image mapped by `app.load_mod_with`,
     // without touching any shared `.bss` across concurrent parallel tests!
     let isolated_rust_dylib = TempDylibCopy::new(&rust_dylib, "sched_panic_containment");
@@ -1014,7 +1014,7 @@ fn test_cross_runtime_panic_containment() {
         assert_eq!(pos.y, 10.0);
     }
 
-    // B-09: Verify single-path `Messages<ModSystemFaulted>` recorded `panicked == true`.
+    // Verify single-path `Messages<ModSystemFaulted>` recorded `panicked == true`.
     {
         let msgs = app.world().resource::<Messages<ModSystemFaulted>>();
         let mut cursor = msgs.get_cursor();
@@ -1026,7 +1026,7 @@ fn test_cross_runtime_panic_containment() {
         assert!(faults[0].panicked);
     }
 
-    // B-05: Re-enabling `rust_panicking` via `ModQuarantine::reenable` lets it run cleanly again
+    // Re-enabling `rust_panicking` via `ModQuarantine::reenable` lets it run cleanly again
     // (since `PANIC_TRIGGER.swap(false)` already cleared the trigger on the faulting tick).
     assert!(
         app.world()
@@ -1061,7 +1061,7 @@ unsafe extern "C" fn dynamic_unwinding_callback(
 ) -> FfiResult {
     let flag = unsafe { &*(user_data as *const AtomicBool) };
     if flag.load(Ordering::SeqCst) {
-        // Simulates guest-side `catch_unwind` inside a Rust guest `.cdylib` (`S-09`).
+        // Simulates guest-side `catch_unwind` inside a Rust guest `.cdylib`.
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             panic!("Simulated guest-side unwinding panic caught inside callback");
         }));
@@ -1235,7 +1235,7 @@ fn mod_schedule_startup_error_policy_report_to_bevy_and_fault_messages_work() {
     assert!(run_res.is_err());
     assert!(run_res.unwrap_err().to_string().contains("faulting_sys"));
 
-    // B-09: Emitted once through `Messages<ModSystemFaulted>` (no duplicate observer `Event` write).
+    // Emitted once through `Messages<ModSystemFaulted>` (no duplicate observer `Event` write).
     let msgs = app.world().resource::<Messages<ModSystemFaulted>>();
     assert_eq!(msgs.len(), 1);
     let mut cursor = msgs.get_cursor();

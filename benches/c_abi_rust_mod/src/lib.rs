@@ -19,7 +19,7 @@ const SIM_DT: f32 = 0.016_f32;
 const MAX_CACHED_EMITTERS: usize = 512;
 
 // ============================================================================
-// 1. VTable Mirrors Matching Host `#[derive(ModComponent)]` Layouts (`M-04`, `M-05`)
+// 1. VTable Mirrors Matching Host `#[derive(ModComponent)]` Layouts
 // ============================================================================
 
 /// C-ABI VTable mirror for `shared_scenario::Vec3f`.
@@ -164,7 +164,7 @@ pub struct FactionVTable {
 }
 
 // ============================================================================
-// 2. Per-Instance VTable Bundle (`L-02`) & Pre-Load Variant Selector
+// 2. Per-Instance VTable Bundle & Pre-Load Variant Selector
 // ============================================================================
 
 static BENCH_VARIANT: AtomicU32 = AtomicU32::new(0);

@@ -549,7 +549,7 @@ fn test_cross_language_c99_and_rust_concurrency_and_asymmetric_unload() {
 }
 
 // ==============================================================================
-// 4. Visual Game Multi-Mod Switching & Core Shadow-Copy Oracles (`L-03`)
+// 4. Visual Game Multi-Mod Switching & Core Shadow-Copy Oracles
 // ==============================================================================
 
 #[test]
@@ -598,11 +598,11 @@ fn test_visual_game_rapid_mod_cycling_50_cycles() {
         app.update();
         app.unload_mod(v_id).expect("unload vortex");
 
-        let v2_id = app
+        let reloaded_id = app
             .load_mod_with(&vort_dylib, shadow_opts())
             .expect("reload vortex");
         app.update();
-        app.unload_mod(v2_id).expect("unload reloaded vortex");
+        app.unload_mod(reloaded_id).expect("unload reloaded vortex");
 
         app.update();
     }
@@ -671,7 +671,7 @@ fn test_visual_game_shadow_copying_and_file_lock_bypass() {
     let vy_gravity = app.world().get::<Velocity>(e).unwrap().y;
     assert!(vy_gravity < -0.5);
 
-    // Overwrite `dev_mod_path` in place while `mod_id_1` is still loaded (`L-03`)
+    // Overwrite `dev_mod_path` in place while `mod_id_1` is still loaded
     let overwrite_res = fs::copy(&vort_dylib, &dev_mod_path);
     assert!(overwrite_res.is_ok());
 

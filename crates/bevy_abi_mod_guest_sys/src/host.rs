@@ -332,7 +332,7 @@ impl<'a> ValidatedLoadCtx<'a> {
     }
 
     /// Registers a cross-language `T: AbiPod` dynamic component with optional `on_add` / `on_remove`
-    /// hooks (`F-04`) on this validated load context.
+    /// hooks on this validated load context.
     #[inline]
     pub fn register_pod_component_with_hooks<T: AbiPod>(
         &self,

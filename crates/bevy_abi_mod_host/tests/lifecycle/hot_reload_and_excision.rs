@@ -1,4 +1,4 @@
-//! Hot-reload cycling, schedule system-set excision, shadow-copy loader (`L-03`),
+//! Hot-reload cycling, schedule system-set excision, shadow-copy loader,
 //! asymmetric unload interleaving, post-unload execution/churn safety, and concurrent multi-App lifecycle stress.
 
 use crate::support::{
@@ -209,7 +209,7 @@ fn test_post_unload_execution_safety() {
 #[test]
 fn test_world_consistency_after_guest_failure() {
     let (shared_rust_dylib, c_dylib) = ensure_guest_mods_built();
-    // Private copy so mutating `PANIC_TRIGGER` never races with parallel tests (`T-03`).
+    // Private copy so mutating `PANIC_TRIGGER` never races with parallel tests.
     let isolated_rust = TempDylibCopy::new(&shared_rust_dylib, "world_consistency_panic");
 
     let mut app = App::new();
@@ -426,7 +426,7 @@ fn test_asymmetric_unload_interleaving_and_unload_all() {
 #[test]
 fn test_cdylib_panic_containment_and_continued_execution() {
     let (shared_rust_dylib, c_dylib) = ensure_guest_mods_built();
-    // Private copy so `trigger_panic` is 100% isolated under parallel `cargo test` (`T-03`).
+    // Private copy so `trigger_panic` is 100% isolated under parallel `cargo test`.
     let isolated_rust = TempDylibCopy::new(&shared_rust_dylib, "cdylib_panic_containment");
 
     let mut app = App::new();
@@ -634,7 +634,7 @@ fn test_concurrent_multi_app_threads_load_tick_unload() {
             }
 
             // Intentionally loads WITHOUT shadow copy across all 8 concurrent OS threads to stress
-            // per-World `BamInstance` isolation (`L-02`) and refcounted `dlopen`/`dlclose` mutexing!
+            // per-World `BamInstance` isolation and refcounted `dlopen`/`dlclose` mutexing!
             let no_shadow = LoadOptions::new().with_shadow_copy(false);
             let r_id = app
                 .load_mod_with(&r_path, no_shadow.clone())

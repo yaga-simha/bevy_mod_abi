@@ -1,5 +1,5 @@
 //! Per-system bump-allocated deferred command queue (`HostCommands`, `CommandArena`)
-//! (`C-05`, `P-05`, `S-04`, `S-08`, `N-02`).
+//!.
 //!
 //! # Intent
 //! During system execution, [`UnsafeWorldCell`](bevy_ecs::world::unsafe_world_cell::UnsafeWorldCell)
@@ -99,7 +99,7 @@ struct ArenaSlice {
     align: usize,
 }
 
-/// Reusable multi-slab aligned bump arena storing `MaybeUninit<u8>` component payloads (`P-05`).
+/// Reusable multi-slab aligned bump arena storing `MaybeUninit<u8>` component payloads.
 #[derive(Default)]
 pub struct CommandArena {
     slabs: Vec<ArenaSlab>,
@@ -253,7 +253,7 @@ struct BatchItem {
 }
 
 /// Persistent per-system command buffer storage reused across frames with zero steady-state heap
-/// allocations (`P-05`).
+/// allocations.
 #[derive(Default)]
 pub struct HostCommandsStorage {
     arena: CommandArena,
@@ -572,7 +572,7 @@ impl Drop for HostCommandsStorage {
     }
 }
 
-/// Concrete `#[repr(C)]` command context backing opaque [`BamCommands`] (`S-08`, `N-02`).
+/// Concrete `#[repr(C)]` command context backing opaque [`BamCommands`].
 #[repr(C)]
 pub struct HostCommands<'a> {
     /// Leading handle validation header (`COMMANDS_MAGIC`) at byte offset `0`.
@@ -675,7 +675,7 @@ pub unsafe extern "C" fn host_cmd_spawn_empty(
     FfiResult::OK
 }
 
-/// Reserves a fresh entity and queues a batched `count`-component spawn (`P-05`, `C-05`).
+/// Reserves a fresh entity and queues a batched `count`-component spawn.
 ///
 /// # Safety
 /// - `commands` must point to an active [`HostCommands`] cast to [`BamCommands`], or null.
@@ -841,7 +841,7 @@ pub unsafe extern "C" fn host_cmd_despawn(
     FfiResult::OK
 }
 
-/// Queues deferred raw byte insertion of pre-resolved `component` onto `entity` (`C-05`, `P-05`).
+/// Queues deferred raw byte insertion of pre-resolved `component` onto `entity`.
 ///
 /// # Safety
 /// - `commands` must point to an active [`HostCommands`] cast to [`BamCommands`], or null.

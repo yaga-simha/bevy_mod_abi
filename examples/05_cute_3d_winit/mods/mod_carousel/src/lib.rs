@@ -3,7 +3,7 @@
 //! Mod 2: Pastel Starlight Carousel (`mod_carousel`, `ABI 0.2.0`).
 //!
 //! Guides slime spirits onto two counter-rotating 3D carousel rings with bobbing waves,
-//! pastel hue cycling, and synchronized ear wiggles using per-World closure state (`L-02`).
+//! pastel hue cycling, and synchronized ear wiggles using per-World closure state.
 
 use bevy_abi_mod_guest::prelude::*;
 use core::ffi::CStr;

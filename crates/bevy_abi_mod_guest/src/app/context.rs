@@ -60,7 +60,7 @@ impl<'a> RunConditionContext<'a> {
         resolve_component(self.host, name, uuid)
     }
 
-    /// Resolves `T: GuestComponent` (including manifest-qualified `C-10` names) on this world.
+    /// Resolves `T: GuestComponent` (including manifest-qualified names) on this world.
     #[inline]
     pub fn resolve_guest_component<T: GuestComponent>(&self) -> Result<BamComponent, FfiResult> {
         resolve_guest_component::<T>(self.host, self.host.manifest_name())
@@ -322,7 +322,7 @@ impl<'a> SystemContext<'a> {
         }
     }
 
-    /// Borrows singleton resource `R` (`R: AbiPod`) by declaration index `decl_index` (`C-05`).
+    /// Borrows singleton resource `R` (`R: AbiPod`) by declaration index `decl_index`.
     ///
     /// Routes to the system-level resource bundle when `.resource_read` / `.resource_write` was
     /// called on [`SystemBuilder`](crate::SystemBuilder), or to query `0` when resources were
@@ -337,7 +337,7 @@ impl<'a> SystemContext<'a> {
     }
 
     /// Borrows singleton resource `R` (`R: GuestComponent`) by declaration index `decl_index`,
-    /// validating `R::UUID` (`C-05` + `C-13`).
+    /// validating `R::UUID`.
     #[inline]
     pub fn component_resource<R: GuestComponent>(&self, decl_index: usize) -> Option<&R> {
         if let Some(ref res_q) = self.resource_query {
@@ -351,7 +351,7 @@ impl<'a> SystemContext<'a> {
     }
 
     /// Mutably borrows singleton resource `R` (`R: AbiPod`) declared with `RESOURCE_WRITE` at
-    /// `decl_index` (`C-05`).
+    /// `decl_index`.
     #[inline]
     pub fn resource_mut<R: AbiPod>(&mut self, decl_index: usize) -> Option<&mut R> {
         if let Some(ref mut res_q) = self.resource_query {
@@ -365,7 +365,7 @@ impl<'a> SystemContext<'a> {
     }
 
     /// Mutably borrows singleton resource `R` (`R: GuestComponent`) at `decl_index`, validating
-    /// `R::UUID` (`C-05` + `C-13`).
+    /// `R::UUID`.
     #[inline]
     pub fn component_resource_mut<R: GuestComponent>(
         &mut self,
@@ -453,7 +453,7 @@ impl<'a> SystemContext<'a> {
         }
     }
 
-    /// Processes primary query `0` chunks in parallel across the host `ComputeTaskPool` (`P-07`).
+    /// Processes primary query `0` chunks in parallel across the host `ComputeTaskPool`.
     #[inline]
     pub fn par_chunks<F>(&mut self, f: F) -> FfiResult
     where
@@ -462,7 +462,7 @@ impl<'a> SystemContext<'a> {
         self.iter().par_for_each(f)
     }
 
-    /// Fallible variant of [`Self::par_chunks`] propagating non-`OK` [`IntoSystemResult`] returns (`P-07`).
+    /// Fallible variant of [`Self::par_chunks`] propagating non-`OK` [`IntoSystemResult`] returns.
     #[inline]
     pub fn par_try_chunks<F, R>(&mut self, f: F) -> FfiResult
     where
@@ -473,13 +473,13 @@ impl<'a> SystemContext<'a> {
     }
 
     /// Borrows primary query `0` as a [`TypedChunkIter`] for [`QueryTuple`] `Q` without magic
-    /// column index literals (`G-03`).
+    /// column index literals.
     #[inline]
     pub fn single_query<Q: QueryTuple>(&mut self) -> TypedChunkIter<'_, 'a, Q> {
         self.iter().typed::<Q>()
     }
 
-    /// Simultaneously borrows primary query `0` as a [`TypedChunkIter`] alongside [`GuestCommands`] (`G-03`).
+    /// Simultaneously borrows primary query `0` as a [`TypedChunkIter`] alongside [`GuestCommands`].
     #[inline]
     pub fn single_query_and_commands<Q: QueryTuple>(
         &mut self,
@@ -488,7 +488,7 @@ impl<'a> SystemContext<'a> {
         (iter.typed::<Q>(), cmds)
     }
 
-    /// Borrows declared query `index` (`0..query_count()`) as a [`TypedChunkIter`] for [`QueryTuple`] `Q` (`G-03`).
+    /// Borrows declared query `index` (`0..query_count()`) as a [`TypedChunkIter`] for [`QueryTuple`] `Q`.
     #[inline]
     pub fn query_typed<Q: QueryTuple>(
         &mut self,
@@ -497,7 +497,7 @@ impl<'a> SystemContext<'a> {
         Some(self.query_mut(index)?.typed::<Q>())
     }
 
-    /// Simultaneously borrows two distinct queries as [`TypedChunkIter`]s (`G-03`).
+    /// Simultaneously borrows two distinct queries as [`TypedChunkIter`]s.
     #[inline]
     pub fn queries_2_typed<Q1: QueryTuple, Q2: QueryTuple>(
         &mut self,
@@ -509,7 +509,7 @@ impl<'a> SystemContext<'a> {
     }
 
     /// Looks up a shared `&T` (`T: GuestComponent`) on `entity` using declared access on
-    /// `(query_index, term_index)`, verifying `T`'s UUID (`F-03`).
+    /// `(query_index, term_index)`, verifying `T`'s UUID.
     #[inline]
     pub fn get<T: GuestComponent>(
         &self,
@@ -532,7 +532,7 @@ impl<'a> SystemContext<'a> {
     }
 
     /// Looks up an exclusive `&mut T` (`T: GuestComponent`) on `entity` using declared writable
-    /// access on `(query_index, term_index)`, marking Bevy change ticks and verifying `T`'s UUID (`F-03`).
+    /// access on `(query_index, term_index)`, marking Bevy change ticks and verifying `T`'s UUID.
     #[inline]
     pub fn get_mut<T: GuestComponent>(
         &mut self,
@@ -555,7 +555,7 @@ impl<'a> SystemContext<'a> {
     }
 
     /// Looks up a shared `&T` (`T: AbiPod`) on `entity` using declared access on
-    /// `(query_index, term_index)` (`F-03`).
+    /// `(query_index, term_index)`.
     #[inline]
     pub fn get_pod<T: AbiPod>(
         &self,
@@ -572,7 +572,7 @@ impl<'a> SystemContext<'a> {
     }
 
     /// Looks up an exclusive `&mut T` (`T: AbiPod`) on `entity` using declared writable access on
-    /// `(query_index, term_index)` (`F-03`).
+    /// `(query_index, term_index)`.
     #[inline]
     pub fn get_pod_mut<T: AbiPod>(
         &mut self,
@@ -593,7 +593,7 @@ impl<'a> SystemContext<'a> {
         )
     }
 
-    /// Drains unread messages (`M: GuestComponent`) declared at `decl_index`, validating `M`'s UUID (`F-02`).
+    /// Drains unread messages (`M: GuestComponent`) declared at `decl_index`, validating `M`'s UUID.
     #[inline]
     pub fn read_messages<M: GuestComponent>(
         &mut self,
@@ -610,7 +610,7 @@ impl<'a> SystemContext<'a> {
         }
     }
 
-    /// Drains unread POD messages (`M: AbiPod`) declared at `decl_index` (`F-02`).
+    /// Drains unread POD messages (`M: AbiPod`) declared at `decl_index`.
     #[inline]
     pub fn read_pod_messages<M: AbiPod>(&mut self, decl_index: usize) -> Result<Vec<M>, FfiResult> {
         if let Some(ref mut res_q) = self.resource_query {
@@ -625,7 +625,7 @@ impl<'a> SystemContext<'a> {
     }
 
     /// Appends a message (`M: GuestComponent`) to the stream declared with `MESSAGE_WRITE` at
-    /// `decl_index`, validating `M`'s UUID (`F-02`).
+    /// `decl_index`, validating `M`'s UUID.
     #[inline]
     pub fn send_message<M: GuestComponent>(&mut self, decl_index: usize, msg: &M) -> FfiResult {
         if let Some(ref mut res_q) = self.resource_query {
@@ -639,7 +639,7 @@ impl<'a> SystemContext<'a> {
     }
 
     /// Appends a POD message (`M: AbiPod`) to the stream declared with `MESSAGE_WRITE` at
-    /// `decl_index` (`F-02`).
+    /// `decl_index`.
     #[inline]
     pub fn send_pod_message<M: AbiPod>(&mut self, decl_index: usize, msg: &M) -> FfiResult {
         if let Some(ref mut res_q) = self.resource_query {

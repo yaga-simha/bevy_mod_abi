@@ -1,8 +1,8 @@
-//! Wave 4 Host Scheduling & Observability Tests (`F-05`, `E-01`):
-//! - `F-05`: `ModVisibleSets` (`register_mod_visible_set("physics", PhysicsSet)`) ordering guest
+//! Host Scheduling, Visible Sets & Observability Tests (`ABI 0.2.0`):
+//! - `ModVisibleSets` (`register_mod_visible_set("physics", PhysicsSet)`) ordering guest
 //!   systems via `"host::physics"` / `"host::render"`, strict rejection of unknown `"host::*"`
 //!   sets, and preserving host `SystemSet`s across mod unload.
-//! - `E-01`: `tracing::debug_span!("bam_guest_system", ...)` recording `mod_name`, `system`,
+//! - `tracing::debug_span!("bam_guest_system", ...)` recording `mod_name`, `system`,
 //!   `chunks`, `entities`, and `commands`, plus optional `diagnostics` Cargo feature integration
 //!   with `bevy_diagnostic::DiagnosticsStore`.
 
@@ -32,8 +32,8 @@ struct StepOrderLog(Vec<&'static str>);
 
 #[repr(C)]
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq, ModComponent)]
-#[mod_component(name = "w4::StateProbe")]
-struct W4StateProbe {
+#[mod_component(name = "ext::ReloadStateProbe")]
+struct ReloadStateProbe {
     reload_epoch: u64,
     accumulated_ticks: u64,
     fail_next_save: u32,
@@ -42,37 +42,40 @@ struct W4StateProbe {
 
 #[repr(C)]
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq, ModComponent)]
-#[mod_component(name = "w4::OrderHostSets")]
-struct W4OrderHostSets {
+#[mod_component(name = "ext::OrderHostSets")]
+struct OrderHostSets {
     enabled: u32,
 }
 
-fn host_physics_step(mut log: ResMut<'_, StepOrderLog>, probe: ResMut<'_, W4StateProbe>) {
-    // Touch `W4StateProbe` so Bevy's parallel scheduler cannot reorder without `SystemSet` edges!
+fn host_physics_step(mut log: ResMut<'_, StepOrderLog>, probe: ResMut<'_, ReloadStateProbe>) {
+    // Touch `ReloadStateProbe` so Bevy's parallel scheduler cannot reorder without `SystemSet` edges!
     let _ = probe.accumulated_ticks;
     log.0.push("host::physics");
 }
 
-fn host_render_step(mut log: ResMut<'_, StepOrderLog>, probe: ResMut<'_, W4StateProbe>) {
+fn host_render_step(mut log: ResMut<'_, StepOrderLog>, probe: ResMut<'_, ReloadStateProbe>) {
     let _ = probe.accumulated_ticks;
     log.0.push("host::render");
 }
 
 #[test]
-fn wave4_f05_ordering_against_host_visible_sets_and_preservation_on_unload() {
-    let w4_dylib = TempDylibCopy::new(&fixture_dylib("w4_ext_mod"), "f05_order");
+fn ordering_against_host_visible_sets_and_preservation_on_unload() {
+    let ext_dylib = TempDylibCopy::new(
+        &fixture_dylib("state_hooks_and_observers_mod"),
+        "visible_set_order",
+    );
 
     // 1. Strict mode MUST reject `"host::physics"` when not registered in `ModVisibleSets`!
     {
         let mut bad_app = App::new();
         bad_app.add_plugins(AbiModPlugin);
-        bad_app.insert_resource(W4StateProbe::default());
-        bad_app.insert_resource(W4OrderHostSets { enabled: 1 });
-        bad_app.register_mod_resource::<W4StateProbe>().unwrap();
-        bad_app.register_mod_resource::<W4OrderHostSets>().unwrap();
+        bad_app.insert_resource(ReloadStateProbe::default());
+        bad_app.insert_resource(OrderHostSets { enabled: 1 });
+        bad_app.register_mod_resource::<ReloadStateProbe>().unwrap();
+        bad_app.register_mod_resource::<OrderHostSets>().unwrap();
 
         let err = bad_app
-            .load_mod_with(w4_dylib.path(), LoadOptions::new().strict())
+            .load_mod_with(ext_dylib.path(), LoadOptions::new().strict())
             .expect_err("unregistered host::physics must fail strict load");
         assert!(
             matches!(err, ModLoadError::UnresolvedOrderingTarget { ref target, .. } if target == "host::physics"),
@@ -80,14 +83,14 @@ fn wave4_f05_ordering_against_host_visible_sets_and_preservation_on_unload() {
         );
     }
 
-    // 2. Registering `"physics"` and `"render"` wires `w4_state_tick` deterministically between them!
+    // 2. Registering `"physics"` and `"render"` wires `ext_state_tick` deterministically between them!
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
     app.init_resource::<StepOrderLog>();
-    app.insert_resource(W4StateProbe::default());
-    app.insert_resource(W4OrderHostSets { enabled: 1 });
-    app.register_mod_resource::<W4StateProbe>().unwrap();
-    app.register_mod_resource::<W4OrderHostSets>().unwrap();
+    app.insert_resource(ReloadStateProbe::default());
+    app.insert_resource(OrderHostSets { enabled: 1 });
+    app.register_mod_resource::<ReloadStateProbe>().unwrap();
+    app.register_mod_resource::<OrderHostSets>().unwrap();
     app.register_mod_visible_set("physics", HostPhysicsSet);
     app.register_mod_visible_set("render", HostRenderSet);
 
@@ -97,18 +100,20 @@ fn wave4_f05_ordering_against_host_visible_sets_and_preservation_on_unload() {
 
     let mod_id = app
         .load_mod_with(
-            w4_dylib.path(),
+            ext_dylib.path(),
             LoadOptions::new().strict().with_shadow_copy(true),
         )
-        .expect("load w4_ext_mod ordered against host::physics and host::render");
+        .expect(
+            "load state_hooks_and_observers_mod ordered against host::physics and host::render",
+        );
 
-    // Wrap a post-physics / pre-render verification: `w4_state_tick` increments `accumulated_ticks`
+    // Wrap a post-physics / pre-render verification: `ext_state_tick` increments `accumulated_ticks`
     // strictly after `host::physics` (saw 0 on tick 1) and strictly before `host::render` (saw 1 on tick 1)!
     let observed_in_render = Arc::new(AtomicU64::new(0));
     let obs_clone = Arc::clone(&observed_in_render);
     app.add_systems(
         Update,
-        (move |probe: bevy_ecs::prelude::Res<'_, W4StateProbe>| {
+        (move |probe: bevy_ecs::prelude::Res<'_, ReloadStateProbe>| {
             obs_clone.store(probe.accumulated_ticks, Ordering::SeqCst);
         })
         .in_set(HostRenderSet),
@@ -122,7 +127,8 @@ fn wave4_f05_ordering_against_host_visible_sets_and_preservation_on_unload() {
     );
 
     // 3. Unloading the mod excises the guest system while keeping `HostPhysicsSet` and `HostRenderSet` intact!
-    app.unload_mod(mod_id).expect("unload w4_ext_mod");
+    app.unload_mod(mod_id)
+        .expect("unload state_hooks_and_observers_mod");
     app.world_mut().resource_mut::<StepOrderLog>().0.clear();
     app.update();
     assert_eq!(
@@ -274,7 +280,7 @@ impl tracing::Subscriber for ThreadLocalSpanRouter {
 }
 
 #[test]
-fn wave4_e01_tracing_span_records_mod_system_chunks_entities_and_commands() {
+fn tracing_span_records_mod_system_chunks_entities_and_commands() {
     static INIT_ROUTER: std::sync::Once = std::sync::Once::new();
     INIT_ROUTER.call_once(|| {
         let _ = tracing::subscriber::set_global_default(ThreadLocalSpanRouter);
@@ -343,7 +349,7 @@ fn wave4_e01_tracing_span_records_mod_system_chunks_entities_and_commands() {
 
 #[cfg(feature = "diagnostics")]
 #[test]
-fn wave4_e01_bevy_diagnostic_store_records_per_mod_and_aggregate_metrics() {
+fn bevy_diagnostic_store_records_per_mod_and_aggregate_metrics() {
     use bevy_abi_mod_host::diagnostics::{
         TOTAL_COMMANDS_QUEUED_PATH, TOTAL_CPU_TIME_US_PATH, TOTAL_FAULT_COUNT_PATH,
         mod_commands_queued_path, mod_cpu_time_path, mod_fault_count_path,
@@ -431,20 +437,20 @@ fn wave4_e01_bevy_diagnostic_store_records_per_mod_and_aggregate_metrics() {
 }
 
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
-enum Wave5Phase {
+enum UpdateScheduleBracket {
     Input,
     Logic,
     Output,
 }
 
 #[test]
-fn wave5_req3_schedule_labels_and_in_set_ordering_under_randomization() {
+fn schedule_labels_and_in_set_ordering_under_randomization() {
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
     app.init_resource::<StepOrderLog>();
-    app.register_mod_visible_set("input", Wave5Phase::Input);
-    app.register_mod_visible_set("logic", Wave5Phase::Logic);
-    app.register_mod_visible_set("output", Wave5Phase::Output);
+    app.register_mod_visible_set("input", UpdateScheduleBracket::Input);
+    app.register_mod_visible_set("logic", UpdateScheduleBracket::Logic);
+    app.register_mod_visible_set("output", UpdateScheduleBracket::Output);
 
     // Enable Bevy schedule ambiguity checks / build settings alongside chained sets to prove
     // `.in_set("host::logic")` + `.before(...)`/`.after(...)` produce deterministic ordering.
@@ -461,13 +467,18 @@ fn wave5_req3_schedule_labels_and_in_set_ordering_under_randomization() {
 
     app.configure_sets(
         Update,
-        (Wave5Phase::Input, Wave5Phase::Logic, Wave5Phase::Output).chain(),
+        (
+            UpdateScheduleBracket::Input,
+            UpdateScheduleBracket::Logic,
+            UpdateScheduleBracket::Output,
+        )
+            .chain(),
     );
     app.add_systems(
         Update,
         (
-            host_input.in_set(Wave5Phase::Input),
-            host_output.in_set(Wave5Phase::Output),
+            host_input.in_set(UpdateScheduleBracket::Input),
+            host_output.in_set(UpdateScheduleBracket::Output),
         ),
     );
 
@@ -492,7 +503,7 @@ fn wave5_req3_schedule_labels_and_in_set_ordering_under_randomization() {
     app.add_systems(
         Update,
         sync_host_to_shared
-            .in_set(Wave5Phase::Input)
+            .in_set(UpdateScheduleBracket::Input)
             .before(host_input),
     );
 
@@ -577,21 +588,22 @@ fn wave5_req3_schedule_labels_and_in_set_ordering_under_randomization() {
     assert_eq!(sys_fixed.schedule(), ScheduleId::FIXED_UPDATE);
     assert_eq!(sys_post.schedule(), ScheduleId::POST_UPDATE);
 
-    // Record host steps + guest steps together by wrapping host log at end of each phase.
+    // Record host steps + guest steps together by wrapping host log at end of each bracket.
     let log_for_host_in = Arc::clone(&log_shared);
     let log_for_host_out = Arc::clone(&log_shared);
     app.add_systems(
         Update,
         (
-            (move || log_for_host_in.lock().unwrap().push("host::input")).in_set(Wave5Phase::Input),
+            (move || log_for_host_in.lock().unwrap().push("host::input"))
+                .in_set(UpdateScheduleBracket::Input),
             sys_logic_a
-                .in_set(Wave5Phase::Logic)
+                .in_set(UpdateScheduleBracket::Logic)
                 .in_set(GuestLogicAMarker),
             sys_logic_b
-                .in_set(Wave5Phase::Logic)
+                .in_set(UpdateScheduleBracket::Logic)
                 .after(GuestLogicAMarker),
             (move || log_for_host_out.lock().unwrap().push("host::output"))
-                .in_set(Wave5Phase::Output),
+                .in_set(UpdateScheduleBracket::Output),
         ),
     );
     app.add_systems(Startup, sys_startup);

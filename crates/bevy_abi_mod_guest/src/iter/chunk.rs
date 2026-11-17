@@ -80,7 +80,7 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
     }
 
     /// Borrows dense column `col` as `&[T]` (`T: GuestComponent`), validating `T`'s UUID (including
-    /// manifest-qualified `C-10` names) in addition to `(size, align, mode, storage)` (`C-13`).
+    /// manifest-qualified names) in addition to `(size, align, mode, storage)`.
     /// Returns `None` on UUID or layout mismatch.
     #[inline]
     pub fn component<T: GuestComponent>(&self, col: usize) -> Option<&[T]> {
@@ -109,7 +109,7 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
     }
 
     /// Mutably borrows dense column `col` as `&mut [T]` (`T: GuestComponent`), validating `T`'s
-    /// UUID in addition to `(size, align, mode, storage)` (`C-13`) and marking chunk rows changed.
+    /// UUID in addition to `(size, align, mode, storage)` and marking chunk rows changed.
     #[inline]
     pub fn component_mut<T: GuestComponent>(&mut self, col: usize) -> Option<&mut [T]> {
         let filter = guest_uuid_filter::<T>(self.iter.host().manifest_name());
@@ -129,14 +129,14 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
     }
 
     /// Mutably borrows dense column `col` as `&mut [T]` (`T: AbiPod`) **without** automatically
-    /// marking Bevy change ticks (`P-04`). Pair with [`Self::mark_changed_range`] or
+    /// marking Bevy change ticks. Pair with [`Self::mark_changed_range`] or
     /// [`Self::mark_changed`] after selectively modifying rows.
     #[inline]
     pub fn column_mut_untracked<T: AbiPod>(&mut self, col: usize) -> Option<&mut [T]> {
         self.iter.column_mut_untracked_checked::<T>(col, None)
     }
 
-    /// Untracked mutable column slice for `T: GuestComponent`, validating `T`'s UUID (`C-13` + `P-04`).
+    /// Untracked mutable column slice for `T: GuestComponent`, validating `T`'s UUID.
     #[inline]
     pub fn component_mut_untracked<T: GuestComponent>(&mut self, col: usize) -> Option<&mut [T]> {
         let filter = guest_uuid_filter::<T>(self.iter.host().manifest_name());
@@ -144,7 +144,7 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
             .column_mut_untracked_checked::<T>(col, Some(filter))
     }
 
-    /// Marks rows `start_row..start_row + row_count` on writable column `col` as changed (`P-04`).
+    /// Marks rows `start_row..start_row + row_count` on writable column `col` as changed.
     #[inline]
     pub fn mark_changed_range(
         &mut self,
@@ -155,7 +155,7 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
         self.iter.mark_changed_range(col, start_row, row_count)
     }
 
-    /// Marks single row `row` on writable column `col` as changed (`P-04`).
+    /// Marks single row `row` on writable column `col` as changed.
     #[inline]
     pub fn mark_changed(&mut self, col: usize, row: usize) -> FfiResult {
         self.iter.mark_changed(col, row)
@@ -174,7 +174,7 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
     }
 
     /// Simultaneously borrows read-only dense column `read_col` and disjoint mutable dense column
-    /// `write_col`, verifying both `R`'s and `W`'s UUIDs (`C-13`).
+    /// `write_col`, verifying both `R`'s and `W`'s UUIDs.
     #[inline]
     pub fn component_read_write<R: GuestComponent, W: GuestComponent>(
         &mut self,
@@ -200,7 +200,7 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
     }
 
     /// Simultaneously borrows two disjoint mutable dense columns (`col_a` and `col_b`), verifying
-    /// `W1`'s and `W2`'s UUIDs (`C-13`).
+    /// `W1`'s and `W2`'s UUIDs.
     #[inline]
     pub fn component_write_2<W1: GuestComponent, W2: GuestComponent>(
         &mut self,
@@ -225,7 +225,7 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
     }
 
     /// Simultaneously borrows `[FfiEntity; len]` and mutable dense column `write_col`, verifying
-    /// `W`'s UUID (`C-13`).
+    /// `W`'s UUID.
     #[inline]
     pub fn entities_and_component_mut<W: GuestComponent>(
         &mut self,
@@ -249,7 +249,7 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
     }
 
     /// Simultaneously borrows `[FfiEntity; len]`, read-only dense column `read_col`, and disjoint
-    /// mutable dense column `write_col`, verifying `R`'s and `W`'s UUIDs (`C-13`).
+    /// mutable dense column `write_col`, verifying `R`'s and `W`'s UUIDs.
     #[inline]
     pub fn entities_and_component_read_write<R: GuestComponent, W: GuestComponent>(
         &mut self,
@@ -268,14 +268,14 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
     }
 
     /// Materializes indirect read-only sparse-set row pointers `[ *const u8; len ]` for column `col`
-    /// (`P-02`).
+    ///.
     #[inline]
     pub fn rows<T: AbiPod>(&mut self, col: usize) -> Option<SparseRows<'_, T>> {
         self.iter.rows_checked::<T>(col, None)
     }
 
     /// Materializes indirect read-only sparse-set row pointers for `T: GuestComponent`, validating
-    /// `T`'s UUID (`C-13` + `P-02`).
+    /// `T`'s UUID.
     #[inline]
     pub fn component_rows<T: GuestComponent>(&mut self, col: usize) -> Option<SparseRows<'_, T>> {
         let filter = guest_uuid_filter::<T>(self.iter.host().manifest_name());
@@ -283,14 +283,14 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
     }
 
     /// Materializes indirect mutable sparse-set row pointers `[ *mut u8; len ]` for column `col`
-    /// (`P-02`), marking matched rows changed.
+    ///, marking matched rows changed.
     #[inline]
     pub fn rows_mut<T: AbiPod>(&mut self, col: usize) -> Option<SparseRowsMut<'_, T>> {
         self.iter.rows_mut_checked::<T>(col, None)
     }
 
     /// Materializes indirect mutable sparse-set row pointers for `T: GuestComponent`, validating
-    /// `T`'s UUID (`C-13` + `P-02`).
+    /// `T`'s UUID.
     #[inline]
     pub fn component_rows_mut<T: GuestComponent>(
         &mut self,
@@ -313,7 +313,7 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
         ChunkSliceMut::from_validated(self.iter.mutable_slice(col))
     }
 
-    /// Returns an untracked [`ChunkSliceMut`] view over dense write column `col` (`P-04`).
+    /// Returns an untracked [`ChunkSliceMut`] view over dense write column `col`.
     #[inline]
     pub fn mutable_slice_untracked(&mut self, col: usize) -> ChunkSliceMut<'_> {
         ChunkSliceMut::from_validated(self.iter.mutable_slice_untracked(col))
@@ -326,7 +326,7 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
     }
 
     /// Borrows singleton resource `R` (`R: GuestComponent`) declared at `term_index`, validating
-    /// `R`'s UUID (`C-13`).
+    /// `R`'s UUID.
     #[inline]
     pub fn component_resource<R: GuestComponent>(&self, term_index: usize) -> Option<&R> {
         let filter = guest_uuid_filter::<R>(self.iter.host().manifest_name());
@@ -340,7 +340,7 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
     }
 
     /// Mutably borrows singleton resource `R` (`R: GuestComponent`) at `term_index`, validating
-    /// `R`'s UUID (`C-13`).
+    /// `R`'s UUID.
     #[inline]
     pub fn component_resource_mut<R: GuestComponent>(
         &mut self,
@@ -352,20 +352,20 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
     }
 
     /// Dispenses all column slices declared by [`QueryTuple`] `Q` from this chunk without magic
-    /// column index literals (`G-03`).
+    /// column index literals.
     #[inline]
     pub fn typed<Q: QueryTuple>(&mut self) -> Result<Q::Slices<'_>, FfiResult> {
         let mut dispenser = ChunkColumnDispenser::new(self.iter);
         Q::fetch_slices(&mut dispenser)
     }
 
-    /// Drains unread POD messages (`M: AbiPod`) from `term_index` (`F-02`).
+    /// Drains unread POD messages (`M: AbiPod`) from `term_index`.
     #[inline]
     pub fn read_pod_messages<M: AbiPod>(&mut self, term_index: usize) -> Result<Vec<M>, FfiResult> {
         self.iter.drain_messages_checked::<M>(term_index, None)
     }
 
-    /// Drains unread messages (`M: GuestComponent`) from `term_index`, validating `M`'s UUID (`F-02`).
+    /// Drains unread messages (`M: GuestComponent`) from `term_index`, validating `M`'s UUID.
     #[inline]
     pub fn read_messages<M: GuestComponent>(
         &mut self,
@@ -376,13 +376,13 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
             .drain_messages_checked::<M>(term_index, Some(filter))
     }
 
-    /// Sends a POD message (`M: AbiPod`) on `term_index` declared with `MESSAGE_WRITE` (`F-02`).
+    /// Sends a POD message (`M: AbiPod`) on `term_index` declared with `MESSAGE_WRITE`.
     #[inline]
     pub fn send_pod_message<M: AbiPod>(&mut self, term_index: usize, msg: &M) -> FfiResult {
         self.iter.send_message_checked::<M>(term_index, None, msg)
     }
 
-    /// Sends a message (`M: GuestComponent`) on `term_index`, validating `M`'s UUID (`F-02`).
+    /// Sends a message (`M: GuestComponent`) on `term_index`, validating `M`'s UUID.
     #[inline]
     pub fn send_message<M: GuestComponent>(&mut self, term_index: usize, msg: &M) -> FfiResult {
         let filter = guest_uuid_filter::<M>(self.iter.host().manifest_name());

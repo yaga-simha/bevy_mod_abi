@@ -1,4 +1,4 @@
-//! Per-query-group descriptor ownership and `QueryState`-backed archetype/table caching (`P-09`).
+//! Per-query-group descriptor ownership and `QueryState`-backed archetype/table caching.
 
 use crate::ffi::iter::{QueryPlan, SparseRowScratch};
 use bevy_abi_mod_sys::{BamTermDesc, MAX_QUERIES_PER_SYSTEM};
@@ -62,7 +62,7 @@ impl CachedQueryGroup {
     }
 
     /// Incrementally updates `QueryState` against newly created archetypes and copies matched
-    /// table/archetype IDs directly from Bevy's `FixedBitSet` cache (`P-09`).
+    /// table/archetype IDs directly from Bevy's `FixedBitSet` cache.
     pub(crate) fn update_archetypes(&mut self, world: UnsafeWorldCell<'_>) {
         let new_gen = world.archetypes().generation();
         if self.archetype_generation == new_gen {

@@ -97,7 +97,7 @@ fn main() {
             danger_level: 0.85,
         })
         .id();
-    println!("[HOST] Phase 1: Engine Initialization");
+    println!("[HOST] Step 1: Engine Initialization");
     println!("  - Registered `example::FleetSector` and spawned Flagship {flagship:?}");
     println!(
         "  - Host has no compile-time component registration for `mod_shield_emitter::EnergyShield`\n"
@@ -109,7 +109,7 @@ fn main() {
         ..Default::default()
     };
 
-    println!("[HOST] Phase 2: Loading Mod A (`mod_shield_emitter`)");
+    println!("[HOST] Step 2: Loading Mod A (`mod_shield_emitter`)");
     let mod_a_id = app
         .load_mod_with(&mod_a_dylib, load_opts.clone())
         .expect("Failed to load mod_shield_emitter");
@@ -136,7 +136,7 @@ fn main() {
         comp_meta.component_id
     };
 
-    println!("[HOST] Phase 3: Loading Mod B (`mod_overcharge_siphon`)");
+    println!("[HOST] Step 3: Loading Mod B (`mod_overcharge_siphon`)");
     let mod_b_id = app
         .load_mod_with(&mod_b_dylib, load_opts)
         .expect("Failed to load mod_overcharge_siphon");
@@ -145,7 +145,7 @@ fn main() {
     );
     assert_eq!(app.world().resource::<Messages<ModLoaded>>().len(), 2);
 
-    println!("[HOST] Phase 4: Simulating 5 Engine Ticks");
+    println!("[HOST] Step 4: Simulating 5 Engine Ticks");
     println!("--------------------------------------------------------------------------------");
 
     for frame in 1..=5 {
@@ -183,7 +183,7 @@ fn main() {
         0
     );
 
-    println!("[HOST] Phase 5: Verification & Telemetry Summary");
+    println!("[HOST] Step 5: Verification & Telemetry Summary");
     let mut final_shields = Vec::new();
     for entity in app.world().iter_entities() {
         if let Ok(comp_ref) = entity.get_by_id(shield_comp_id) {

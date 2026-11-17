@@ -1,5 +1,4 @@
-//! Wave 1–3 scheduling, ordering, schedule-map, main-thread, and initialization regressions
-//! (`L-01`, `L-05a/b/c`, `B-04`, `B-05`, `B-06`, `B-07`, `B-08`, `B-09`).
+//! Scheduling, ordering, schedule-map, main-thread, quarantine, and initialization tests.
 
 use crate::support::fixture_dylib;
 use bevy_abi_mod_host::{
@@ -55,12 +54,12 @@ unsafe extern "C" fn noop_cb(_sys_ctx: *mut BamSystemCtx, _user_data: *mut c_voi
 }
 
 // ============================================================================
-// L-01: Runtime-loaded Startup systems execute immediately once
+// Runtime-loaded Startup systems execute immediately once
 // ============================================================================
 
 #[test]
-fn regression_l01_runtime_loaded_startup_runs_once() {
-    let dylib_path = fixture_dylib("l01_late_startup");
+fn runtime_loaded_startup_runs_once() {
+    let dylib_path = fixture_dylib("late_startup_mod");
 
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
@@ -112,11 +111,11 @@ fn regression_l01_runtime_loaded_startup_runs_once() {
 }
 
 // ============================================================================
-// L-05a: Cross-mod system name isolation
+// Cross-mod system name isolation
 // ============================================================================
 
 #[test]
-fn regression_l05a_cross_mod_name_isolation() {
+fn cross_mod_name_isolation() {
     let path_a = fixture_dylib("mod_alpha");
     let path_b = fixture_dylib("mod_beta");
 
@@ -177,12 +176,12 @@ fn regression_l05a_cross_mod_name_isolation() {
 }
 
 // ============================================================================
-// L-05b: Later mod ordering `after("earlier_mod::produce")` works when earlier
+// Later mod ordering `after("earlier_mod::produce")` works when earlier
 //        mod registered zero ordering constraints of its own
 // ============================================================================
 
 #[test]
-fn regression_l05b_later_mod_after_earlier_system() {
+fn later_mod_after_earlier_system() {
     let path_p = fixture_dylib("mod_producer");
     let path_c = fixture_dylib("mod_consumer");
 
@@ -216,22 +215,22 @@ fn regression_l05b_later_mod_after_earlier_system() {
 }
 
 // ============================================================================
-// L-05c: Named sets are removed from Bevy's ScheduleGraph on unload
+// Named sets are removed from Bevy's ScheduleGraph on unload
 // ============================================================================
 
 #[test]
-fn regression_l05c_named_sets_removed_on_unload() {
-    let dylib_path = fixture_dylib("l05c_clean_mod");
+fn named_sets_removed_on_unload() {
+    let dylib_path = fixture_dylib("ordered_sets_mod");
 
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
     let mod_id = app
         .load_mod_with(&dylib_path, LoadOptions::new().with_shadow_copy(true))
-        .expect("load l05c_clean_mod");
+        .expect("load ordered_sets_mod");
     app.update();
 
-    let set1 = ModNamedSystemSet::new("l05c_clean_mod", "stage_one");
-    let set2 = ModNamedSystemSet::new("l05c_clean_mod", "stage_two");
+    let set1 = ModNamedSystemSet::new("ordered_sets_mod", "first_pass");
+    let set2 = ModNamedSystemSet::new("ordered_sets_mod", "second_pass");
     {
         let schedules = app.world().resource::<Schedules>();
         let update = schedules.get(Update.intern()).expect("Update schedule");
@@ -239,28 +238,28 @@ fn regression_l05c_named_sets_removed_on_unload() {
         assert!(set2.is_present_in(update));
     }
 
-    app.unload_mod(mod_id).expect("unload l05c_clean_mod");
+    app.unload_mod(mod_id).expect("unload ordered_sets_mod");
 
     {
         let schedules = app.world().resource::<Schedules>();
         let update = schedules.get(Update.intern()).expect("Update schedule");
         assert!(
             !set1.is_present_in(update),
-            "stage_one ModNamedSystemSet must be removed on unload"
+            "first_pass ModNamedSystemSet must be removed on unload"
         );
         assert!(
             !set2.is_present_in(update),
-            "stage_two ModNamedSystemSet must be removed on unload"
+            "second_pass ModNamedSystemSet must be removed on unload"
         );
     }
 }
 
 // ============================================================================
-// B-04: Explicit SystemInitError variants (synchronous + ModSystemFaulted)
+// Explicit SystemInitError variants (synchronous + ModSystemFaulted)
 // ============================================================================
 
 #[test]
-fn regression_b04_too_many_terms() {
+fn rejects_query_with_too_many_terms() {
     let mut world = World::new();
     let reg = ModRegistry::new();
     let active = Arc::new(AtomicBool::new(true));
@@ -278,7 +277,7 @@ fn regression_b04_too_many_terms() {
         core::ptr::null_mut(),
     );
 
-    // 1. Synchronous rejection at registration time -> CAPACITY_EXCEEDED (`C-07`)
+    // 1. Synchronous rejection at registration time -> CAPACITY_EXCEEDED
     let rc = unsafe { host_register_system(ctx.as_ffi_ptr(), &desc) };
     assert_eq!(rc, FfiResult::CAPACITY_EXCEEDED);
 
@@ -311,7 +310,7 @@ fn regression_b04_too_many_terms() {
 }
 
 #[test]
-fn regression_b04_invalid_mode() {
+fn rejects_query_with_invalid_mode() {
     let mut world = World::new();
     let pair_id = world.register_component::<PaddedPair>();
     let res_id = world.register_component::<CounterRes>();
@@ -361,7 +360,7 @@ fn regression_b04_invalid_mode() {
 }
 
 #[test]
-fn regression_b04_unknown_component() {
+fn rejects_query_with_unknown_component() {
     let mut app = App::new();
     app.add_plugins(AbiModPlugin::with_error_policy(ModErrorPolicy::Quarantine));
 
@@ -395,7 +394,7 @@ fn regression_b04_unknown_component() {
 }
 
 #[test]
-fn regression_b04_kind_mismatch() {
+fn rejects_query_with_kind_mismatch() {
     let mut app = App::new();
     app.add_plugins(AbiModPlugin::with_error_policy(ModErrorPolicy::Quarantine));
     let pair_h = app
@@ -445,7 +444,7 @@ fn regression_b04_kind_mismatch() {
 }
 
 #[test]
-fn regression_b04_self_conflict() {
+fn rejects_query_with_self_conflict() {
     let mut world = World::new();
     let comp_id = world.register_component::<PaddedPair>();
     let res_id = world.register_component::<CounterRes>();
@@ -511,7 +510,7 @@ fn regression_b04_self_conflict() {
 }
 
 // ============================================================================
-// B-06 & B-07 & B-05: Custom `ScheduleId >= 1024`, `BAM_SYSTEM_FLAG_MAIN_THREAD`,
+// Custom `ScheduleId >= 1024`, `BAM_SYSTEM_FLAG_MAIN_THREAD`,
 //                     and `ModQuarantine::reenable`
 // ============================================================================
 
@@ -519,7 +518,7 @@ fn regression_b04_self_conflict() {
 struct CustomPhysicsSchedule;
 
 #[test]
-fn regression_b06_b07_b05_custom_schedule_main_thread_pinning_and_quarantine_reenable() {
+fn custom_schedule_main_thread_pinning_and_quarantine_reenable() {
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
     app.register_mod_resource::<CounterRes>()
@@ -540,8 +539,8 @@ fn regression_b06_b07_b05_custom_schedule_main_thread_pinning_and_quarantine_ree
     app.register_mod_schedule(custom_sched_id, CustomPhysicsSchedule)
         .expect("register custom schedule 1024");
 
-    // Load `l01_late_startup` overriding its schedule to our custom `CustomPhysicsSchedule`.
-    let dylib_path = fixture_dylib("l01_late_startup");
+    // Load `late_startup_mod` overriding its schedule to our custom `CustomPhysicsSchedule`.
+    let dylib_path = fixture_dylib("late_startup_mod");
     let mod_id = app
         .load_mod_with(
             &dylib_path,
@@ -572,7 +571,7 @@ fn regression_b06_b07_b05_custom_schedule_main_thread_pinning_and_quarantine_ree
     );
     app.unload_mod(mod_id).expect("unload custom-scheduled mod");
 
-    // B-07: Verify `BAM_SYSTEM_FLAG_MAIN_THREAD` sets `SystemStateFlags::NON_SEND` and executes
+    // Verify `BAM_SYSTEM_FLAG_MAIN_THREAD` sets `SystemStateFlags::NON_SEND` and executes
     // exclusively on the main thread inside `MultiThreadedExecutor`.
     let main_thread_id = std::thread::current().id();
     let observed_threads: Arc<Mutex<Vec<std::thread::ThreadId>>> = Arc::new(Mutex::new(Vec::new()));
@@ -653,7 +652,7 @@ fn regression_b06_b07_b05_custom_schedule_main_thread_pinning_and_quarantine_ree
         "BAM_SYSTEM_FLAG_MAIN_THREAD system must run strictly on the main thread"
     );
 
-    // B-05 + B-09: Trigger a fault, verify quarantine + single `Messages<ModSystemFaulted>`, then re-enable.
+    // Trigger a fault, verify quarantine + single `Messages<ModSystemFaulted>`, then re-enable.
     probe.fail_next.store(true, Ordering::SeqCst);
     mt_schedule.run(app.world_mut());
     assert_eq!(probe.runs.load(Ordering::SeqCst), 6);

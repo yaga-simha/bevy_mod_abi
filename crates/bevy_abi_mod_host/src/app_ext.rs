@@ -1,4 +1,4 @@
-//! [`ModAppExt`] extension methods on Bevy [`App`], delegating to [`ModWorldExt`] (`B-01`, `F-01`, `F-02`, `F-05`).
+//! [`ModAppExt`] extension methods on Bevy [`App`], delegating to [`ModWorldExt`].
 
 use crate::plugin::ensure_startup_tracker;
 use crate::world_ext::ModWorldExt;
@@ -15,7 +15,7 @@ use bevy_ecs::schedule::{ScheduleLabel, SystemSet};
 use std::path::Path;
 
 /// Extension methods on Bevy [`App`] for exposing components/resources/messages/schedules/sets and
-/// loading, reloading, or unloading native C-ABI mods (`B-01`, `F-01`, `F-02`, `F-05`).
+/// loading, reloading, or unloading native C-ABI mods.
 ///
 /// Loading and unloading shared libraries require exclusive [`World`](bevy_ecs::world::World) or
 /// [`App`] access (or deferred [`ModCommandsExt`](crate::ModCommandsExt)) so guest code cannot be
@@ -45,7 +45,7 @@ pub trait ModAppExt {
     ) -> Result<BamComponent, ComponentCollisionError>;
 
     /// Registers a buffered POD Bevy [`Message`] type (`Messages<M>`), adding `Messages<M>` frame
-    /// maintenance to this [`App`] and returning its 1-based [`BamComponent`] handle (`F-02`).
+    /// maintenance to this [`App`] and returning its 1-based [`BamComponent`] handle.
     fn register_mod_message<M: Message + ModComponent + AbiPod>(
         &mut self,
     ) -> Result<BamComponent, ComponentCollisionError>;
@@ -75,7 +75,7 @@ pub trait ModAppExt {
     ) -> Result<(), ModLoadError>;
 
     /// Exposes a host [`SystemSet`] under `"host::<name>"` in [`crate::ModVisibleSets`] so guest
-    /// systems can declare `.after(c"host::<name>")` or `.before(c"host::<name>")` (`F-05`).
+    /// systems can declare `.after(c"host::<name>")` or `.before(c"host::<name>")`.
     fn register_mod_visible_set<S: SystemSet>(&mut self, name: &str, set: S) -> &mut Self;
 
     /// Sets the default [`ModErrorPolicy`] for guest systems in this [`App`].
@@ -98,15 +98,15 @@ pub trait ModAppExt {
     fn unload_all_mods(&mut self) -> &mut Self;
 
     /// Hot-reloads `id` from its original source path with shadow-copying enabled, transferring
-    /// optional `save_state` / `restore_state` bytes (`F-01`).
+    /// optional `save_state` / `restore_state` bytes.
     fn reload_mod(&mut self, id: ModId) -> Result<ModId, ModLoadError>;
 
     /// Hot-reloads `id` from its original source path with explicit [`LoadOptions`], transferring
-    /// optional `save_state` / `restore_state` bytes (`F-01`).
+    /// optional `save_state` / `restore_state` bytes.
     fn reload_mod_with(&mut self, id: ModId, options: LoadOptions) -> Result<ModId, ModLoadError>;
 
     /// Hot-reloads `id` from a replacement shared-library `path` with explicit [`LoadOptions`],
-    /// transferring optional `save_state` / `restore_state` bytes (`F-01`).
+    /// transferring optional `save_state` / `restore_state` bytes.
     fn reload_mod_from<P: AsRef<Path>>(
         &mut self,
         id: ModId,

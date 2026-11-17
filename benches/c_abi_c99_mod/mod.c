@@ -6,7 +6,7 @@
 #define MAX_STACK_EMITTERS 512
 
 /* ============================================================================
- * 1. VTable Mirror Structs Matching `#[derive(ModComponent)]` (`M-04`, `M-05`)
+ * 1. VTable Mirror Structs Matching `#[derive(ModComponent)]`
  * ============================================================================ */
 
 typedef struct Vec3fVTable {
@@ -84,7 +84,7 @@ typedef struct FactionVTable {
 } FactionVTable;
 
 /* ============================================================================
- * 2. Per-Instance `ModState` (`L-02`) & Pre-Load Variant Selector
+ * 2. Per-Instance `ModState` & Pre-Load Variant Selector
  * ============================================================================ */
 
 static uint32_t g_variant = 0u;
@@ -659,7 +659,7 @@ static BamResult c99_sys_naive_chatty_ffi(BamSystemCtx* sys_ctx, void* user_data
 }
 
 /* ============================================================================
- * Mandatory ABI 0.2 Lifecycle Entry Points (`L-02`, `L-08`)
+ * Mandatory ABI 0.2 Lifecycle Entry Points
  * ============================================================================ */
 
 BAM_EXPORT const BamManifest* bevy_abi_mod_manifest(void) {

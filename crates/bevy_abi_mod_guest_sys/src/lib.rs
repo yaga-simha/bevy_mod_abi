@@ -402,7 +402,7 @@ mod tests {
     }
 
     #[test]
-    fn regression_p06_reentrant_trampoline_conflict() {
+    fn reentrant_trampoline_conflict() {
         let api = make_mock_api();
         let mut world = MockWorldCtx {
             error_msg: b"diagnostic ok",

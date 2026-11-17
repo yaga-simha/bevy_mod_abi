@@ -11,10 +11,10 @@ use bevy_abi_mod_sys::{
 
 use crate::{host::Host, panic::catch_guest_result};
 
-/// Expected [`ComponentUuid`] predicate for `C-13` typed column and resource introspection.
+/// Expected [`ComponentUuid`] predicate for typed column and resource introspection.
 ///
 /// Supports either a single exact UUID or a primary manifest-qualified UUID with an unqualified
-/// fallback (matching `C-10` auto-namespaced `GuestComponent` resolution).
+/// fallback (matching `auto-namespaced `GuestComponent` resolution).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UuidFilter {
     primary: ComponentUuid,
@@ -311,7 +311,7 @@ impl<'a> ValidatedSlice<'a> {
         }
     }
 
-    /// Stamps this slice with the owning mod instance's `manifest_name` for `C-10` auto-namespaced
+    /// Stamps this slice with the owning mod instance's `manifest_name` for auto-namespaced
     /// `GuestComponent` UUID matching.
     #[inline]
     pub const fn with_manifest_name(mut self, manifest_name: &'a str) -> Self {
@@ -498,7 +498,7 @@ impl<'a> ValidatedSliceMut<'a> {
         }
     }
 
-    /// Stamps this slice with the owning mod instance's `manifest_name` for `C-10` auto-namespaced
+    /// Stamps this slice with the owning mod instance's `manifest_name` for auto-namespaced
     /// `GuestComponent` UUID matching.
     #[inline]
     pub const fn with_manifest_name(mut self, manifest_name: &'a str) -> Self {
@@ -1753,7 +1753,7 @@ impl<'a> ValidatedIter<'a> {
     }
 
     /// Executes `f` in parallel across disjoint sub-range chunks on the host `ComputeTaskPool`
-    /// (`P-07`), catching panics per task so unwinding never crosses `extern "C"`.
+    ///, catching panics per task so unwinding never crosses `extern "C"`.
     pub fn par_for_each_chunk<F>(&mut self, f: F) -> FfiResult
     where
         F: Fn(&mut ValidatedIter<'_>) -> FfiResult + Sync,
@@ -1788,7 +1788,7 @@ impl<'a> ValidatedIter<'a> {
     }
 
     /// Reads up to `max_count` unread POD messages from `term_index` (`MESSAGE_READ` or
-    /// `MESSAGE_WRITE`), advancing the running system's per-term message cursor (`F-02`).
+    /// `MESSAGE_WRITE`), advancing the running system's per-term message cursor.
     pub fn read_messages_batch_checked<M: AbiPod>(
         &mut self,
         term_index: usize,
@@ -1840,7 +1840,7 @@ impl<'a> ValidatedIter<'a> {
         Ok(out)
     }
 
-    /// Drains all currently unread POD messages from `term_index` (`F-02`).
+    /// Drains all currently unread POD messages from `term_index`.
     pub fn drain_messages_checked<M: AbiPod>(
         &mut self,
         term_index: usize,
@@ -1861,7 +1861,7 @@ impl<'a> ValidatedIter<'a> {
     }
 
     /// Appends a POD message `msg` to the Bevy `Messages<M>` stream declared with `MESSAGE_WRITE`
-    /// at `term_index` (`F-02`).
+    /// at `term_index`.
     pub fn send_message_checked<M: AbiPod>(
         &mut self,
         term_index: usize,
@@ -2026,7 +2026,7 @@ struct DispensedBorrow {
 }
 
 /// Sequential per-chunk column dispenser verifying disjoint borrows across up to
-/// [`MAX_TERMS_PER_QUERY`] tuple terms (`G-03`) so safe `bevy_abi_mod_guest` tuple queries require
+/// [`MAX_TERMS_PER_QUERY`] tuple terms so safe `bevy_abi_mod_guest` tuple queries require
 /// zero `unsafe` code.
 pub struct ChunkColumnDispenser<'chunk, 'ctx> {
     iter: &'chunk mut ValidatedIter<'ctx>,
@@ -2115,7 +2115,7 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
     }
 
     /// Dispenses the contiguous `[FfiEntity; len]` slice for the active chunk without consuming a
-    /// `BamTermDesc` index (`G-03`).
+    /// `BamTermDesc` index.
     pub fn entities(&mut self) -> Result<&'chunk [FfiEntity], FfiResult> {
         let len = self.iter.current_len();
         if len == 0 {
@@ -2324,7 +2324,7 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
         }))
     }
 
-    /// Validates and advances past a pure filter term (`FILTER_ONLY` / `WITHOUT`) (`G-03`).
+    /// Validates and advances past a pure filter term (`FILTER_ONLY` / `WITHOUT`).
     pub fn next_filter<T: AbiPod>(
         &mut self,
         expected_mode: AccessMode,

@@ -1,4 +1,4 @@
-//! Typed tuple queries without magic column indices (`G-03`).
+//! Typed tuple queries without magic column indices.
 //!
 //! Sealed over tuples of arity 1 through 8 (as well as single-term queries) covering `&T`,
 //! `&mut T`, `Option<&T>`, `Option<&mut T>`, [`With<T>`], [`Without<T>`], [`Changed<T>`],
@@ -20,16 +20,16 @@ mod private {
     pub trait TupleSealed {}
 }
 
-/// Archetype inclusion filter marker (`AccessMode::FILTER_ONLY`) for [`QueryTuple`] (`G-03`).
+/// Archetype inclusion filter marker (`AccessMode::FILTER_ONLY`) for [`QueryTuple`].
 pub struct With<T>(PhantomData<fn() -> T>);
 
-/// Archetype exclusion filter marker (`AccessMode::WITHOUT`) for [`QueryTuple`] (`G-03`).
+/// Archetype exclusion filter marker (`AccessMode::WITHOUT`) for [`QueryTuple`].
 pub struct Without<T>(PhantomData<fn() -> T>);
 
-/// Row-level change-tick filter with read-only slice access (`AccessMode::CHANGED`) for [`QueryTuple`] (`G-03`).
+/// Row-level change-tick filter with read-only slice access (`AccessMode::CHANGED`) for [`QueryTuple`].
 pub struct Changed<T>(PhantomData<fn() -> T>);
 
-/// Row-level added-tick filter with read-only slice access (`AccessMode::ADDED`) for [`QueryTuple`] (`G-03`).
+/// Row-level added-tick filter with read-only slice access (`AccessMode::ADDED`) for [`QueryTuple`].
 pub struct Added<T>(PhantomData<fn() -> T>);
 
 #[inline]
@@ -263,7 +263,7 @@ impl<T: GuestComponent> QueryTerm for Added<T> {
     }
 }
 
-/// Sealed tuple trait over 1..=8 [`QueryTerm`] items (plus single-item shorthand) (`G-03`).
+/// Sealed tuple trait over 1..=8 [`QueryTerm`] items (plus single-item shorthand).
 pub trait QueryTuple: private::TupleSealed {
     /// Tuple (or single item) of chunk slices yielded per chunk.
     type Slices<'chunk>;
@@ -369,7 +369,7 @@ impl_query_tuple!(6 => T0, T1, T2, T3, T4, T5);
 impl_query_tuple!(7 => T0, T1, T2, T3, T4, T5, T6);
 impl_query_tuple!(8 => T0, T1, T2, T3, T4, T5, T6, T7);
 
-/// Typed chunk iterator over a declared [`QueryTuple`] `Q` (`G-03`), dispensing borrow-checked,
+/// Typed chunk iterator over a declared [`QueryTuple`] `Q`, dispensing borrow-checked,
 /// UUID-verified column slices without magic column index literals.
 pub struct TypedChunkIter<'iter, 'ctx, Q: QueryTuple> {
     pub(crate) iter: &'iter mut ChunkIter<'ctx>,
@@ -400,7 +400,7 @@ impl<'iter, 'ctx, Q: QueryTuple> TypedChunkIter<'iter, 'ctx, Q> {
     }
 
     /// Iterates sequentially over all chunks, propagating any `TYPE_MISMATCH` / `ACCESS_CONFLICT`
-    /// or callback error (`G-03`).
+    /// or callback error.
     pub fn for_each<F, R>(&mut self, mut f: F) -> FfiResult
     where
         F: FnMut(Q::Slices<'_>) -> R,
@@ -420,7 +420,7 @@ impl<'iter, 'ctx, Q: QueryTuple> TypedChunkIter<'iter, 'ctx, Q> {
     }
 
     /// Iterates in parallel over disjoint chunk partitions on the host `ComputeTaskPool`, yielding
-    /// typed `Q::Slices<'_>` to `f` (`P-07` + `G-03`).
+    /// typed `Q::Slices<'_>` to `f`.
     pub fn par_for_each<F, R>(&mut self, f: F) -> FfiResult
     where
         F: Fn(Q::Slices<'_>) -> R + Sync,

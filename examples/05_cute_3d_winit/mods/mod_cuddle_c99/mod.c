@@ -2,7 +2,7 @@
  * mod.c — Pure ISO C99 Guest Mod: Cozy Cuddle Huddle (`mod_cuddle_c99`, ABI 0.2.0)
  *
  * Demonstrates multi-language C-ABI modding in 3D with per-World `BamInstance`
- * heap state (`L-02`, `L-08`), `BamVTableHeader` (`M-05`), and `BamResult` setters (`M-04`).
+ * heap state, `BamVTableHeader`, and `BamResult` setters.
  * ============================================================================ */
 
 #include "bevy_abi_mod.h"

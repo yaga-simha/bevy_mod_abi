@@ -1,5 +1,5 @@
-//! SparseSet columns (`P-02`), Optional/Changed/Added filters (`P-01`), ECS resources (`C-05`),
-//! opaque VTables (`M-04`, `M-05`), and component collisions (`C-10`).
+//! SparseSet columns, Optional/Changed/Added filters, ECS resources,
+//! opaque VTables, and component collisions.
 
 mod sparse_soundness_and_clone_semantics {
     use crate::support::{NameTag, Position, Velocity};
@@ -78,7 +78,7 @@ mod sparse_soundness_and_clone_semantics {
     }
 
     #[test]
-    fn d1_without_sparse_filter_does_not_touch_sparse_entities_in_shared_table() {
+    fn without_sparse_filter_does_not_touch_sparse_entities_in_shared_table() {
         let mut app = App::new();
         app.add_plugins(AbiModPlugin);
         let pos_h = app
@@ -218,7 +218,7 @@ mod sparse_soundness_and_clone_semantics {
     }
 
     // ============================================================================
-    // 2. D2: SparseSet Data Columns (`rows_readonly` / `rows_mutable`, `P-02`) + Change Detection
+    // 2. SparseSet Data Columns (`rows_readonly` / `rows_mutable`) + Change Detection
     // ============================================================================
 
     struct SparseRwState {
@@ -273,7 +273,7 @@ mod sparse_soundness_and_clone_semantics {
     }
 
     #[test]
-    fn d2_sparse_set_read_write_columns_and_changed_ticks_work_end_to_end() {
+    fn sparse_set_read_write_columns_and_changed_ticks_work_end_to_end() {
         let mut app = App::new();
         app.add_plugins(AbiModPlugin);
         let pos_h = app
@@ -450,11 +450,11 @@ mod sparse_soundness_and_clone_semantics {
     }
 
     // ============================================================================
-    // 4. D3 & D7 Soundness Guards
+    // 4. Raw Byte Insertion & Droppable Component Soundness Guards
     // ============================================================================
 
     #[test]
-    fn d3_forbids_raw_byte_insertion_on_heap_owning_and_opaque_components() {
+    fn forbids_raw_byte_insertion_on_heap_owning_and_opaque_components() {
         const {
             assert!(!NameTag::IS_RAW_INSERTABLE);
             assert!(!FlaggedComp::IS_RAW_INSERTABLE);
@@ -523,7 +523,7 @@ mod sparse_soundness_and_clone_semantics {
                 FfiResult::PERMISSION_DENIED
             );
 
-            // Also verify `host_cmd_spawn` rejects all three with `PERMISSION_DENIED` (`P-05`)
+            // Also verify `host_cmd_spawn` rejects all three with `PERMISSION_DENIED`
             let mut out_spawned = FfiEntity::NULL;
             for (h, ptr) in [
                 (nametag_h, forged_name.as_ptr()),
@@ -548,13 +548,13 @@ mod sparse_soundness_and_clone_semantics {
     }
 
     #[test]
-    fn d7_droppable_dynamic_component_uses_clone_ignore_preventing_double_free() {
-        static D7_CLONE_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
-        unsafe extern "C" fn d7_drop_counter(_ptr: *mut c_void) {
-            D7_CLONE_DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+    fn droppable_dynamic_component_uses_clone_ignore_preventing_double_free() {
+        static DROPPABLE_CLONE_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn droppable_drop_counter(_ptr: *mut c_void) {
+            DROPPABLE_CLONE_DROP_COUNT.fetch_add(1, Ordering::SeqCst);
         }
 
-        D7_CLONE_DROP_COUNT.store(0, Ordering::SeqCst);
+        DROPPABLE_CLONE_DROP_COUNT.store(0, Ordering::SeqCst);
         let mut world = World::new();
         let registry = ModRegistry::new();
         world.insert_resource(registry.clone());
@@ -569,7 +569,7 @@ mod sparse_soundness_and_clone_semantics {
             8,
             8,
         )
-        .with_drop(d7_drop_counter);
+        .with_drop(droppable_drop_counter);
 
         let mut handle = BamComponent::INVALID;
         assert_eq!(
@@ -616,7 +616,7 @@ mod sparse_soundness_and_clone_semantics {
         world.despawn(cloned_entity);
         world.despawn(src_entity);
         assert_eq!(
-            D7_CLONE_DROP_COUNT.load(Ordering::SeqCst),
+            DROPPABLE_CLONE_DROP_COUNT.load(Ordering::SeqCst),
             1,
             "Foreign destructor must run exactly once (no double-free from entity clone)"
         );
@@ -815,7 +815,7 @@ mod optional_changed_resources_and_collisions {
 
                 let pos_ptr = unsafe { host_iter_column_mutable(iter, 0) } as *mut Pos3;
                 let opt_vel_ptr = unsafe { host_iter_column_readonly(iter, 1) } as *const Vel3;
-                // Column 2 is OPTIONAL_WRITE `SparseBoost` (`SparseSet` -> `rows_mutable`, `P-02`)
+                // Column 2 is OPTIONAL_WRITE `SparseBoost` (`SparseSet` -> `rows_mutable`)
                 let opt_boost_rows = unsafe { host_iter_column_rows_mutable(iter, 2) };
                 assert!(!pos_ptr.is_null());
 
@@ -1177,7 +1177,7 @@ mod optional_changed_resources_and_collisions {
     }
 
     // ============================================================================
-    // 3. ECS Resources (POD + Opaque VTable, Change Ticks, & Permissions, `C-05`)
+    // 3. ECS Resources (POD + Opaque VTable, Change Ticks, & Permissions)
     // ============================================================================
 
     #[repr(C)]
@@ -1526,7 +1526,7 @@ mod optional_changed_resources_and_collisions {
     }
 
     // ============================================================================
-    // 5. Component UUID & Metadata Collision Detection (`C-10`)
+    // 5. Component UUID & Metadata Collision Detection
     // ============================================================================
 
     #[repr(C)]
@@ -1643,7 +1643,7 @@ mod optional_changed_resources_and_collisions {
             ComponentCollisionError::MetadataMismatch { .. }
         ));
 
-        // 5. Dynamic `host_register_component` C-ABI collision guard (`TYPE_MISMATCH`, `C-10`)
+        // 5. Dynamic `host_register_component` C-ABI collision guard (`TYPE_MISMATCH`)
         let registry = app.world().resource::<ModRegistry>().clone();
         let mut load_ctx = LoadContext::with_world_and_mod_id(
             registry,

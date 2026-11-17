@@ -2,7 +2,6 @@
 
 - **Status:** Accepted
 - **Date:** 2026-11-11
-- **Tracking Items:** `C-05`, `P-05`, `L-07` (cross-references: `S-04`, `C-10`, `C-13`)
 - **Target Crates:** `bevy_abi_mod_sys`, `bevy_abi_mod_host_sys` (`src/registry/`, `src/commands.rs`, `src/ffi/`), `bevy_abi_mod_guest_sys`, `bevy_abi_mod_guest`
 
 ---
@@ -11,7 +10,7 @@
 
 `spec.md` §5 specifies a **zero-allocation hot path** across the host/guest boundary. While dense chunk column iteration (`iter_next_chunk` + `iter_column_*`) met that goal in v0.1, three other per-frame paths violated it severely:
 
-### 1.1 Per-Call String Validation & SipHash Lookups (`C-05`)
+### 1.1 Per-Call String Validation & SipHash Lookups
 In v0.1, both deferred commands and singleton resource accessors took `StrView` component/resource names on **every invocation**:
 - `host_cmd_insert_component(queue, entity, component_name: StrView, data_ptr, data_len)`
 - `host_cmd_insert_default(queue, entity, component_name: StrView)`
@@ -21,20 +20,20 @@ In v0.1, both deferred commands and singleton resource accessors took `StrView` 
 
 Every call ran `core::str::from_utf8` over the entire name string followed by a `HashMap<String, RegisteredComponent>` SipHash-1-3 lookup (and linear verification against the system's declared resource list). Inserting 3 components across 10,000 spawned projectiles performed **30,000 UTF-8 scans + 30,000 `HashMap` lookups per frame**.
 
-### 1.2 Per-Command Heap Allocations & `K` Archetype Moves (`P-05`, `S-04`)
+### 1.2 Per-Command Heap Allocations & `K` Archetype Moves
 In v0.1 `commands.rs`:
 1. Every `cmd_insert_component` allocated a fresh heap buffer (`AlignedBuffer` via `std::alloc::alloc` or `Vec<u8>`) for that single component value, **and** pushed a boxed trait-object command (`CommandQueue::push`) onto Bevy's `CommandQueue`.
-2. Worse, copying the payload first called `core::slice::from_raw_parts(data_ptr, data_len)` (`&[u8]`), which is **immediate Undefined Behavior in Rust (`S-04`)** if a C struct contains any uninitialized padding byte.
+2. Worse, copying the payload first called `core::slice::from_raw_parts(data_ptr, data_len)` (`&[u8]`), which is **immediate Undefined Behavior in Rust** if a C struct contains any uninitialized padding byte.
 3. Because v0.1 provided only `cmd_spawn_empty` + single-component `cmd_insert_component`, spawning an entity with `K` components triggered **`K` sequential archetype graph transitions and table-row moves** during `apply_deferred` (`() -> (A,) -> (A, B) -> ... -> (A, B, ..., K)`).
 
-### 1.3 Duplicated Registry Clones Across Systems (`L-07`)
+### 1.3 Duplicated Registry Clones Across Systems
 In v0.1, `ModInitContext`, `ModHost`, and every `DynamicCSystem::initialize` performed deep clones of `ModRegistry` (`HashMap<String, RegisteredComponent>` + `HashMap<String, usize>`), copying thousands of heap-allocated `String` keys per system.
 
 ---
 
 ## 2. Decision
 
-### 2.1 1-Based `BamComponent(u32)` Handles & CoW `RegistrySnapshot` (`C-05`, `L-07`)
+### 2.1 1-Based `BamComponent(u32)` Handles & CoW `RegistrySnapshot`
 
 #### `BamComponent` Wire Handle
 Components and resources share Bevy's unified `ComponentId` space and are represented on the ABI wire by a 1-based 32-bit integer handle:
@@ -52,7 +51,7 @@ impl BamComponent {
 - `0` (`BAM_COMPONENT_INVALID`) is reserved as the null/uninitialized sentinel so zero-initialized C globals (`static BamComponent g_pos;`) fail fast with `FfiResult::INVALID_COMPONENT` (`1`) if used before `init`.
 - Valid handles are monotonically assigned per `World` starting at `1`, mapping directly to `0`-based index `(handle.0 as usize) - 1` inside `RegistrySnapshot::entries`.
 
-#### Single Source of Truth: Copy-on-Write `ModRegistry` (`L-07`)
+#### Single Source of Truth: Copy-on-Write `ModRegistry`
 
 ```rust
 use std::collections::HashMap;
@@ -80,7 +79,7 @@ pub struct RegistrySnapshot {
     pub by_name: HashMap<Arc<str>, BamComponent>,
     pub by_uuid: HashMap<ComponentUuid, BamComponent>,
     /// Custom game symbols + component VTables (`"bam.v0.<name>"`).
-    /// VTable entries carry `mod_id: Option<u64>` so unload (`S-05`) removes/nulls them cleanly.
+    /// VTable entries carry `mod_id: Option<u64>` so unload removes/nulls them cleanly.
     pub symbols: HashMap<Arc<str>, SymbolEntry>,
 }
 
@@ -91,12 +90,12 @@ pub struct ModRegistry {
 }
 ```
 
-1. **CoW Mutation Protocol (`L-07`):**
-   - Registering a host component (`app.register_mod_component::<T>()`), committing a `LoadTransaction` (`ADR 0001`), or unloading a mod (`S-05`) calls `Arc::make_mut(&mut self.snapshot)` (cloning the `RegistrySnapshot` metadata once per load/unload event, sharing all `Arc<str>` names) and increments `self.generation += 1`.
+1. **CoW Mutation Protocol:**
+   - Registering a host component (`app.register_mod_component::<T>()`), committing a `LoadTransaction` (`ADR 0001`), or unloading a mod calls `Arc::make_mut(&mut self.snapshot)` (cloning the `RegistrySnapshot` metadata once per load/unload event, sharing all `Arc<str>` names) and increments `self.generation += 1`.
    - Each `GuestSystem` caches `(cached_generation: u64, cached_snapshot: Arc<RegistrySnapshot>)`. At the start of `GuestSystem::run_unsafe` / `initialize`, it compares `world_registry.generation != self.cached_generation` (`1` integer load) and clones only the `Arc` pointer when a load/unload actually occurred.
 2. **Init-Time Resolution (`resolve_component`) vs. Hot-Path Lookup (`O(1)` Slice Index):**
    - During `bevy_abi_mod_init`, guests call `api.resolve_component(host_ctx, name_cstr, optional_uuid_ptr, &mut handle)` (or `api.register_component(load_ctx, &desc, &mut handle)`).
-   - When both `name != NULL` and `uuid != NULL` are passed (the default for Rust `GuestApp::resolve_component::<T: GuestComponent>()`), the host looks up `name` in `by_name` and **verifies `entry.uuid == *uuid`** at load time, returning `FfiResult::TYPE_MISMATCH` (`15`) immediately if the guest's `T` layout disagrees with the host's `T` (`C-10`).
+   - When both `name != NULL` and `uuid != NULL` are passed (the default for Rust `GuestApp::resolve_component::<T: GuestComponent>()`), the host looks up `name` in `by_name` and **verifies `entry.uuid == *uuid`** at load time, returning `FfiResult::TYPE_MISMATCH` (`15`) immediately if the guest's `T` layout disagrees with the host's `T`.
    - On every hot-path call (`cmd_insert`, `cmd_spawn`, `cmd_insert_default`, `cmd_remove`), handle lookup is a single bounds-checked slice index:
 
 ```rust
@@ -111,7 +110,7 @@ pub(crate) fn get_by_handle(&self, handle: BamComponent) -> Result<&RegisteredCo
 
 ---
 
-### 2.2 Query-Declaration-Indexed Resource Access (`C-05`)
+### 2.2 Query-Declaration-Indexed Resource Access
 
 Resources are declared inside `BamQueryDesc::terms` using `AccessMode::RESOURCE_READ` (`8`) or `AccessMode::RESOURCE_WRITE` (`9`), alongside or independent of entity terms:
 
@@ -132,17 +131,17 @@ GameScore* score     = (GameScore*)api->res_mut_ptr(iter, 3);
 ```
 
 #### Host Validation & Concurrency Invariants (`HostIter`)
-1. **Scheduler Registration (`Rule 3`):** During `GuestSystem::initialize`, every term with `RESOURCE_READ` calls `filtered_access.add_resource_read(component_id)` (and `component_access_set.add_unfiltered_resource_read`), and every `RESOURCE_WRITE` calls `add_resource_write` (rejecting intra-query / cross-query write aliases with `FfiResult::ACCESS_CONFLICT`, `S-07`).
+1. **Scheduler Registration (`Rule 3`):** During `GuestSystem::initialize`, every term with `RESOURCE_READ` calls `filtered_access.add_resource_read(component_id)` (and `component_access_set.add_unfiltered_resource_read`), and every `RESOURCE_WRITE` calls `add_resource_write` (rejecting intra-query / cross-query write aliases with `FfiResult::ACCESS_CONFLICT`).
 2. **Pre-Resolved Pointers per Invocation:** When `GuestSystem::run_unsafe` prepares `HostIter` for a query, each resource term's pointer (`UnsafeWorldCell::get_resource_by_id` / `get_resource_mut_by_id`) is resolved by `ComponentId` (`usize` array index inside Bevy's `Storages::resources`) — **zero strings, zero hashing**.
 3. **Strict Mode Checking:**
    - `res_ptr(iter, term_index)` returns `*const u8` if `term_index < term_count` and `mode` is `RESOURCE_READ` or `RESOURCE_WRITE` (and the resource exists in the `World`); otherwise returns `core::ptr::null()`.
    - `res_mut_ptr(iter, term_index)` returns `*mut u8` **only** if `mode == RESOURCE_WRITE`, marking the resource's Bevy change tick (`Tick`) on first mutable fetch in that run; calling `res_mut_ptr` on a `RESOURCE_READ` or entity column term returns `core::ptr::null()`.
 4. **Resource-Only Queries:** If **every** term in `BamQueryDesc` has `mode` in `{RESOURCE_READ, RESOURCE_WRITE}`, `HostIter` represents a singleton resource bundle: `res_ptr` / `res_mut_ptr` are immediately valid upon `sys_query(sys_ctx, query_idx, &mut iter)` without calling `iter_next_chunk` (`iter_next_chunk` returns `FfiBool::FALSE`).
-5. **Type-Confusion Introspection (`C-13`, `S-03`):** `iter_column_info(iter, term_index, &mut info)` works uniformly for both entity component terms and resource terms (setting `BAM_STORAGE_FLAG_RESOURCE` in `info.storage_flags`), allowing `bevy_abi_mod_guest` to assert `info.uuid == R::UUID` (`R: AbiPod + GuestComponent`) before casting `*const u8` to `&R`.
+5. **Type-Confusion Introspection:** `iter_column_info(iter, term_index, &mut info)` works uniformly for both entity component terms and resource terms (setting `BAM_STORAGE_FLAG_RESOURCE` in `info.storage_flags`), allowing `bevy_abi_mod_guest` to assert `info.uuid == R::UUID` (`R: AbiPod + GuestComponent`) before casting `*const u8` to `&R`.
 
 ---
 
-### 2.3 Per-System Bump Arena & Batched `cmd_spawn` (`P-05`, `S-04`)
+### 2.3 Per-System Bump Arena & Batched `cmd_spawn`
 
 #### 1. Per-System Reusable `CommandArena` & Flat Command Tape
 
@@ -160,7 +159,7 @@ pub(crate) struct CommandArena {
 
 impl CommandArena {
     /// Allocates `size` bytes aligned to `align` (`align` power of two) and copies `size` raw bytes
-    /// directly from `src` into `MaybeUninit<u8>` storage WITHOUT forming `&[u8]` (`S-04`).
+    /// directly from `src` into `MaybeUninit<u8>` storage WITHOUT forming `&[u8]`.
     ///
     /// # Safety
     /// If `size > 0`, `src` must be valid for reading `size` bytes (which MAY include uninitialized
@@ -169,7 +168,7 @@ impl CommandArena {
         let dst: *mut MaybeUninit<u8> = self.alloc_aligned(size, align);
         if size > 0 {
             // SAFETY: `MaybeUninit<u8>` permits copying arbitrary initialized + padding bytes
-            // without violating Rust slice validity invariants (`S-04`).
+            // without violating Rust slice validity invariants.
             unsafe {
                 core::ptr::copy_nonoverlapping(src.cast::<MaybeUninit<u8>>(), dst, size);
             }
@@ -247,7 +246,7 @@ BamResult cmd_spawn(
 | `HashMap` SipHash lookups per frame | 30,000 | **0** (`3` array bounds checks per spawn) |
 | Heap allocations (`malloc`/`free`) per frame | 60,000 (`30k` buffers + `30k` commands) | **0** (steady-state `CommandArena` reuse) |
 | Bevy archetype table moves per frame | 30,000 (`() -> A -> AB -> ABC`) | **10,000** (`1` direct `insert_by_ids` placement per entity) |
-| Uninitialized struct padding safety (`S-04`) | UB (`slice::from_raw_parts::<u8>`) | **Sound** (`MaybeUninit<u8>` raw `copy_nonoverlapping`) |
+| Uninitialized struct padding safety | UB (`slice::from_raw_parts::<u8>`) | **Sound** (`MaybeUninit<u8>` raw `copy_nonoverlapping`) |
 
 ---
 
@@ -264,7 +263,7 @@ BamResult cmd_spawn(
 ## 5. Consequences & Verification Criteria
 
 1. **Encapsulation invariant:** Forging an out-of-bounds or zero `BamComponent` returns `FfiResult::INVALID_COMPONENT` and can never address unexposed Bevy components/resources.
-2. **Benchmark gates (`C-05`, `P-05`, `L-07`):**
-   - Criterion benchmark `commands/10k_inserts_per_frame` achieves **>= 2×** throughput over v0.1 (`C-05`) and **0 steady-state heap allocations** verified by a counting global allocator (`P-05`).
-   - Criterion benchmark `system_init/1k_registered_components` shows `O(1)` `Arc` clone cost on `GuestSystem::initialize` (`L-07`).
-3. **Miri verification (`S-04`, `T-02`):** Passing a `#[repr(C)]` struct `(u8, u64)` with 7 uninitialized padding bytes through `cmd_insert` and `cmd_spawn` passes `cargo +nightly miri test` cleanly.
+2. **Benchmark gates:**
+   - Criterion benchmark `commands/10k_inserts_per_frame` achieves **>= 2×** throughput over v0.1 and **0 steady-state heap allocations** verified by a counting global allocator.
+   - Criterion benchmark `system_init/1k_registered_components` shows `O(1)` `Arc` clone cost on `GuestSystem::initialize`.
+3. **Miri verification:** Passing a `#[repr(C)]` struct `(u8, u64)` with 7 uninitialized padding bytes through `cmd_insert` and `cmd_spawn` passes `cargo +nightly miri test` cleanly.

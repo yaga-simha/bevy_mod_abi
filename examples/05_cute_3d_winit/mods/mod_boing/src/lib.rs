@@ -3,7 +3,7 @@
 //! Mod 1: Jelly Boing Hop (`mod_boing`, `ABI 0.2.0`).
 //!
 //! Applies 3D gravity and rhythmic ground hops, squash-and-stretch `Scale3D` deformation,
-//! floppy ear motion, and landing blush using per-World closure state (`L-02`).
+//! floppy ear motion, and landing blush using per-World closure state.
 
 use bevy_abi_mod_guest::prelude::*;
 use core::ffi::CStr;

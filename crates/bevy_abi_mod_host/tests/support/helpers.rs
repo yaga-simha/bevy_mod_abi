@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // ============================================================================
-// 1. Canonical Namespaced `ModComponent` & `AbiPod` Definitions (`C-10`)
+// 1. Canonical Namespaced `ModComponent` & `AbiPod` Definitions
 // ============================================================================
 
 /// Canonical dynamic component name registered by `asymmetric_rust_mod`.
@@ -90,8 +90,8 @@ pub struct CModCustomData {
 
 #[repr(C)]
 #[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
-#[mod_component(name = "testbed::Phase4Transform")]
-pub struct Phase4Transform {
+#[mod_component(name = "testbed::FilteredTransform")]
+pub struct FilteredTransform {
     pub x: f32,
     pub y: f32,
     pub z: f32,
@@ -99,8 +99,8 @@ pub struct Phase4Transform {
 
 #[repr(C)]
 #[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
-#[mod_component(name = "testbed::Phase4CTransform")]
-pub struct Phase4CTransform {
+#[mod_component(name = "testbed::CFilteredTransform")]
+pub struct CFilteredTransform {
     pub x: f32,
     pub y: f32,
     pub z: f32,
@@ -108,50 +108,50 @@ pub struct Phase4CTransform {
 
 #[repr(C)]
 #[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
-#[mod_component(name = "testbed::Phase4Sensor")]
-pub struct Phase4Sensor {
+#[mod_component(name = "testbed::ChangeSensor")]
+pub struct ChangeSensor {
     pub val: u32,
 }
 
 #[repr(C)]
 #[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
-#[mod_component(name = "testbed::Phase4CSensor")]
-pub struct Phase4CSensor {
+#[mod_component(name = "testbed::CChangeSensor")]
+pub struct CChangeSensor {
     pub val: u32,
 }
 
 #[repr(C)]
 #[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
-#[mod_component(name = "testbed::Phase4FreshTag")]
-pub struct Phase4FreshTag {
+#[mod_component(name = "testbed::FreshSpawnTag")]
+pub struct FreshSpawnTag {
     pub code: u32,
 }
 
 #[repr(C)]
 #[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
-#[mod_component(name = "testbed::Phase4CFreshTag")]
-pub struct Phase4CFreshTag {
+#[mod_component(name = "testbed::CFreshSpawnTag")]
+pub struct CFreshSpawnTag {
     pub code: u32,
 }
 
 #[repr(C)]
 #[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
-#[mod_component(name = "testbed::Phase4Removable")]
-pub struct Phase4Removable {
+#[mod_component(name = "testbed::TransientMarker")]
+pub struct TransientMarker {
     pub dummy: u32,
 }
 
 #[repr(C)]
 #[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
-#[mod_component(name = "testbed::Phase4CRemovable")]
-pub struct Phase4CRemovable {
+#[mod_component(name = "testbed::CTransientMarker")]
+pub struct CTransientMarker {
     pub dummy: u32,
 }
 
 #[repr(C)]
 #[derive(Resource, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
-#[mod_component(name = "testbed::Phase4RustRes")]
-pub struct Phase4RustRes {
+#[mod_component(name = "testbed::RustFilterTelemetry")]
+pub struct RustFilterTelemetry {
     pub scale: f32,
     pub matched_rows: u32,
     pub optional_vel_hits: u32,
@@ -160,8 +160,8 @@ pub struct Phase4RustRes {
 
 #[repr(C)]
 #[derive(Resource, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
-#[mod_component(name = "testbed::Phase4CRes")]
-pub struct Phase4CRes {
+#[mod_component(name = "testbed::CFilterTelemetry")]
+pub struct CFilterTelemetry {
     pub scale: f32,
     pub matched_rows: u32,
     pub optional_vel_hits: u32,

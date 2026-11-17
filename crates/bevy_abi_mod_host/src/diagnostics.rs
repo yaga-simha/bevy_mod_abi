@@ -1,4 +1,4 @@
-//! Optional `bevy_diagnostic` integration for guest mod CPU time, fault counts, and queued commands (`E-01`).
+//! Optional `bevy_diagnostic` integration for guest mod CPU time, fault counts, and queued commands.
 
 use bevy_abi_mod_host_sys::{ModDiagnosticsCollector, ModHost};
 use bevy_diagnostic::{Diagnostic, DiagnosticMeasurement, DiagnosticPath, DiagnosticsStore};

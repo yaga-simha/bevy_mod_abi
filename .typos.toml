@@ -1,4 +1,4 @@
-# `typos` spellchecker configuration for `bevy_abi_mod` (`CI-04`)
+# `typos` spellchecker configuration for `bevy_abi_mod`
 
 [files]
 extend-exclude = [

@@ -83,7 +83,7 @@ impl<'a> ChunkSlice<'a> {
     }
 
     /// Casts this column view to `&[T]` (`T: GuestComponent`), validating `T`'s UUID (including
-    /// manifest-qualified `C-10` names), size, and alignment.
+    /// manifest-qualified names), size, and alignment.
     #[inline]
     pub fn as_component_slice<T: GuestComponent>(&self) -> Option<&'a [T]> {
         let filter = guest_uuid_filter::<T>(self.inner.manifest_name());

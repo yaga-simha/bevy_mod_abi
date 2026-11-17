@@ -1,5 +1,5 @@
 //! Transactional `LoadContext` (`BamLoadCtx`), `host_register_component`, `host_resolve_component`,
-//! and unified `host_register_system` (`C-01`, `C-04`, `C-05`, `S-08`, `B-07`, `B-08`, `N-02`).
+//! and unified `host_register_system`.
 
 use crate::drop_trampoline::{
     StagedDropBinding, StagedHookBinding, WorldDropGuard, on_add_hook_for_slot,
@@ -58,10 +58,10 @@ pub struct GuestObserverBinding {
     pub mod_id: Option<ModId>,
 }
 
-/// Concrete `#[repr(C)]` initialization context backing opaque [`BamLoadCtx`] (`N-02`, `S-08`).
+/// Concrete `#[repr(C)]` initialization context backing opaque [`BamLoadCtx`].
 ///
 /// Valid strictly for the duration of `bevy_abi_mod_init`; poisoned automatically on `finish_init`
-/// and `Drop` without any thread-local global state (`C-04`).
+/// and `Drop` without any thread-local global state.
 #[repr(C)]
 pub struct LoadContext {
     /// Leading handle validation header (`LOAD_CTX_MAGIC`) at byte offset `0`.
@@ -84,7 +84,7 @@ pub struct LoadContext {
     standalone_world: Option<Box<World>>,
     /// Assigned [`ModId`] for this load session.
     pub mod_id: Option<ModId>,
-    /// Optional manifest module name used to prefix unqualified guest component names (`C-10`).
+    /// Optional manifest module name used to prefix unqualified guest component names.
     pub manifest_name: Option<Arc<str>>,
     pre_snapshot: Arc<RegistrySnapshot>,
     staged_drop_bindings: Arc<Mutex<Vec<StagedDropBinding>>>,
@@ -165,7 +165,7 @@ impl LoadContext {
     }
 
     /// Ends the active initialization window, poisoning both `LoadContext` and its embedded
-    /// `HostContext` so any stashed FFI pointers fail validation immediately (`S-08`).
+    /// `HostContext` so any stashed FFI pointers fail validation immediately.
     #[inline]
     pub fn finish_init(&mut self) {
         self.in_init = false;
@@ -174,7 +174,7 @@ impl LoadContext {
     }
 
     /// Rolls back all drop trampoline bindings and registry mutations recorded in this `LoadContext`
-    /// (`ADR 0001` §2.4, `S-06`), returning freshly allocated trampoline slots to `FREE_LIST` and
+    /// (`ADR 0001` §2.4), returning freshly allocated trampoline slots to `FREE_LIST` and
     /// restoring the initial `RegistrySnapshot`.
     pub fn rollback(&mut self) {
         self.finish_init();
@@ -266,7 +266,7 @@ pub unsafe extern "C" fn host_load_host_ctx(load_ctx: *const BamLoadCtx) -> *con
     ctx.host_ctx.as_ffi_ptr()
 }
 
-/// Resolves an existing component or resource by canonical `name`, `uuid`, or both (`C-05`).
+/// Resolves an existing component or resource by canonical `name`, `uuid`, or both.
 ///
 /// # Safety
 /// - `ctx` must point to an active [`HostContext`] cast to [`BamHostCtx`], or null.
@@ -380,7 +380,7 @@ pub unsafe extern "C" fn host_resolve_component(
 }
 
 /// Registers a dynamic component described by `desc_ptr` inside `load_ctx` and writes its 1-based
-/// [`BamComponent`] handle into `*out_component` (`C-05`, `L-06`, `B-08`).
+/// [`BamComponent`] handle into `*out_component`.
 ///
 /// # Safety
 /// - `load_ctx` must point to the active [`LoadContext`] cast to [`BamLoadCtx`], or null.
@@ -435,7 +435,7 @@ pub unsafe extern "C" fn host_register_component(
         return FfiResult::INVALID_ARGUMENT;
     }
 
-    // C-10: Prefix unqualified dynamic component names with `"<manifest.name>::<Name>"` unless
+    // Prefix unqualified dynamic component names with `"<manifest.name>::<Name>"` unless
     // an unqualified entry of that exact name was already registered on the host.
     let canonical_name: std::borrow::Cow<'_, str> =
         if !name_str.contains("::") && ctx.registry.get_by_name(name_str).is_none() {
@@ -549,7 +549,7 @@ pub unsafe extern "C" fn host_register_component(
                 ComponentCloneBehavior::Default
             };
             // SAFETY: `layout` was verified by `desc.layout()`; `trampoline_opt` follows Bevy's
-            // `OwningPtr` drop contract; `storage_type` and mutability match `desc.flags` (`B-08`).
+            // `OwningPtr` drop contract; `storage_type` and mutability match `desc.flags`.
             let bevy_desc = unsafe {
                 ComponentDescriptor::new_with_layout(
                     name_ref.to_string(),
@@ -654,7 +654,7 @@ unsafe fn parse_ordering_targets(
     Ok(out)
 }
 
-/// Registers a unified [`BamSystemDesc`] inside `load_ctx` (`C-01`, `B-07`, `B-08`).
+/// Registers a unified [`BamSystemDesc`] inside `load_ctx`.
 ///
 /// # Safety
 /// - `load_ctx` must point to the active [`LoadContext`] cast to [`BamLoadCtx`], or null.

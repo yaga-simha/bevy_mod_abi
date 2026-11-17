@@ -1,5 +1,5 @@
 //! Split-borrow, multi-query nested iteration, and per-World `GuestPlugin` / `export_mod!`
-//! lifecycle isolation tests (`L-02`, `L-08`, `G-02`).
+//! lifecycle isolation tests.
 
 mod common;
 
@@ -78,12 +78,12 @@ struct WrongCounter {
 impl_pod_no_derive!(Pos, Vel, Accel, LocalCounter, WrongCounter);
 
 impl GuestComponent for LocalCounter {
-    // Unqualified name: must auto-prefix with `<manifest_name>::LocalCounter` (`C-10`)!
+    // Unqualified name: must auto-prefix with `<manifest_name>::LocalCounter`!
     const NAME: &'static CStr = c"LocalCounter";
 }
 
 impl GuestComponent for WrongCounter {
-    // Identical `u32` layout, different unqualified name: `C-13` must still reject!
+    // Identical `u32` layout, different unqualified name: UUID mismatch must still reject!
     const NAME: &'static CStr = c"WrongCounter";
 }
 
@@ -124,7 +124,7 @@ impl GuestPlugin for IsolatedPlugin {
                 let run_idx = ticks.fetch_add(1, Ordering::SeqCst);
                 let (iter, cmds) = ctx.iter_and_commands();
                 while let Some(mut chunk) = iter.next_chunk_view() {
-                    // `C-10` + `C-13`: auto-prefixed `LocalCounter` succeeds on both `Chunk` and
+                    // Auto-prefixed `LocalCounter` succeeds on both `Chunk` and
                     // `ChunkSlice` `component*` views, while `WrongCounter` (same layout) returns `None`!
                     assert!(chunk.component::<LocalCounter>(0).is_some());
                     assert!(chunk.component::<WrongCounter>(0).is_none());
@@ -204,7 +204,7 @@ impl GuestPlugin for IsolatedPlugin {
     }
 }
 
-// Export real ABI v0.2 C entry points in this integration test binary (`L-02`, `L-08`).
+// Export real ABI v0.2 C entry points in this integration test binary.
 export_mod!(plugin: IsolatedPlugin);
 
 #[test]
@@ -212,7 +212,7 @@ fn export_mod_manifest_and_multi_world_instance_isolation() {
     SHUTDOWN_EVENTS.lock().unwrap().clear();
     NEXT_WORLD_TAG.store(1, Ordering::SeqCst);
 
-    // 1. Validate `bevy_abi_mod_manifest()` metadata (`L-08`).
+    // 1. Validate `bevy_abi_mod_manifest()` metadata.
     // SAFETY: `bevy_abi_mod_manifest` is side-effect free and returns a valid static `BamManifest`.
     let manifest_ptr = unsafe { bevy_abi_mod_manifest() };
     assert!(!manifest_ptr.is_null());
@@ -226,7 +226,7 @@ fn export_mod_manifest_and_multi_world_instance_isolation() {
     assert_eq!(name_cstr, c"isolated_plugin");
     assert_eq!(ver_cstr, c"0.2.0");
 
-    // 2. Load the SAME exported `.cdylib` entry points into TWO independent `MockHostWorld`s simultaneously (`L-02`).
+    // 2. Load the SAME exported `.cdylib` entry points into TWO independent `MockHostWorld`s simultaneously.
     let mut world_a = MockHostWorld::new();
     let mut world_b = MockHostWorld::new();
 
@@ -245,7 +245,7 @@ fn export_mod_manifest_and_multi_world_instance_isolation() {
     assert!(!inst_b.is_null());
     assert_ne!(inst_a, inst_b);
 
-    // Verify auto-qualified dynamic component name (`isolated_plugin::LocalCounter`, `C-10`):
+    // Verify auto-qualified dynamic component name (`isolated_plugin::LocalCounter`):
     let comp_a = world_a.name_to_handle["isolated_plugin::LocalCounter"];
     let comp_b = world_b.name_to_handle["isolated_plugin::LocalCounter"];
 
@@ -405,7 +405,7 @@ fn split_borrows_and_multi_query_nested_reset_enforce_disjointness() {
 }
 
 #[test]
-fn regression_c10_c13_unqualified_guest_component_sparse_resource_and_cross_mod_rejection() {
+fn unqualified_guest_component_sparse_resource_and_cross_mod_rejection() {
     use bevy_abi_mod_guest::raw::BAM_COMPONENT_FLAG_SPARSE_SET;
 
     let mut world = MockHostWorld::new();

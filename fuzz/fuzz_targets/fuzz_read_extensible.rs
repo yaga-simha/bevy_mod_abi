@@ -1,7 +1,7 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//! `T-06` Fuzz Target 1: `read_extensible_struct::<T>` & `read_descriptor::<T>` across all six
+//! Fuzz Target 1: `read_extensible_struct::<T>` & `read_descriptor::<T>` across all six
 //! extensible `#[repr(C)]` ABI `0.2.0` wire descriptors (`BamManifest`, `BamHostApi`,
 //! `BamQueryDesc`, `BamSystemDesc`, `ComponentDesc`, `VTableHeader`), including misaligned buffers,
 //! truncated headers, oversized `struct_size` prefixes, and flag/version validation.

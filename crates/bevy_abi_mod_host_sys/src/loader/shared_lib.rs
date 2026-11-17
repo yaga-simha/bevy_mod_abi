@@ -1,4 +1,4 @@
-//! Shadow-copy hot-reload file management (`L-03`), `LoadOptions`, and per-OS-image `dlclose` ordering (`L-02`).
+//! Shadow-copy hot-reload file management, `LoadOptions`, and per-OS-image `dlclose` ordering.
 
 use crate::loader::error::ModLoadError;
 use crate::system::ModErrorPolicy;
@@ -12,7 +12,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 static NEXT_SHADOW_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Configuration options controlling how `ModWorldExt::load_mod_with` / `ModAppExt::load_mod_with`
-/// opens, validates, and schedules a guest shared library (`L-03`, ADR 0005).
+/// opens, validates, and schedules a guest shared library (ADR 0005).
 #[derive(Clone, Debug)]
 pub struct LoadOptions {
     /// When `true` (default in debug builds), copies the `.dll`/`.so`/`.dylib` to a unique
@@ -49,14 +49,14 @@ impl LoadOptions {
         Self::default()
     }
 
-    /// Enables or disables shadow-copy loading (`L-03`).
+    /// Enables or disables shadow-copy loading.
     #[inline]
     pub fn with_shadow_copy(mut self, enabled: bool) -> Self {
         self.shadow_copy = enabled;
         self
     }
 
-    /// Configures a custom directory for shadow-copied shared libraries (`L-03`).
+    /// Configures a custom directory for shadow-copied shared libraries.
     #[inline]
     pub fn with_shadow_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.shadow_dir = Some(dir.into());
@@ -85,7 +85,7 @@ impl LoadOptions {
     }
 }
 
-/// RAII file guard that unlinks a temporary shadow-copied shared library on `Drop` (`L-03`).
+/// RAII file guard that unlinks a temporary shadow-copied shared library on `Drop`.
 pub(crate) struct ShadowFileGuard {
     path: PathBuf,
 }
@@ -107,7 +107,7 @@ impl Drop for ShadowFileGuard {
 ///
 /// Field declaration order is load-bearing: Rust drops struct fields in declaration order, so
 /// `library` (`dlclose` / `FreeLibrary`) runs **strictly before** `_shadow_guard` unlinks the
-/// temporary file on Windows, macOS, and Linux (`L-03`).
+/// temporary file on Windows, macOS, and Linux.
 pub(crate) struct LoadedLibrary {
     pub(crate) library: Library,
     _shadow_guard: Option<ShadowFileGuard>,
@@ -228,7 +228,7 @@ impl SharedLibKey {
     }
 }
 
-/// Per-OS-image reference counter used solely to serialize `dlopen` / `dlclose` across worlds (`L-02`).
+/// Per-OS-image reference counter used solely to serialize `dlopen` / `dlclose` across worlds.
 #[derive(Default)]
 pub(crate) struct SharedLibState {
     pub(crate) active_count: usize,

@@ -55,7 +55,7 @@ struct LoadRecord {
 
 #[derive(Clone, Debug)]
 struct ExecRecord {
-    tier_label: String,
+    scale_label: String,
     architecture: String,
     access_pattern: String,
     host_profile: String,
@@ -546,7 +546,7 @@ fn measure_loading_permutations(
 
 fn summarize_durations(
     mut durs_ns: Vec<u128>,
-    tier_label: &str,
+    scale_label: &str,
     architecture: &str,
     access_pattern: &str,
     host_profile: &str,
@@ -572,7 +572,7 @@ fn summarize_durations(
     let pairs_per_sec = (pairs as f64) / (median_ns * 1.0e-9);
 
     ExecRecord {
-        tier_label: tier_label.to_string(),
+        scale_label: scale_label.to_string(),
         architecture: architecture.to_string(),
         access_pattern: access_pattern.to_string(),
         host_profile: host_profile.to_string(),
@@ -877,7 +877,7 @@ fn serialize_worker_payload(loads: &[LoadRecord], execs: &[ExecRecord]) -> Strin
     for e in execs {
         out.push_str(&format!(
             "EXEC\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.4}\t{:.4}\t{:.2}\t{}\n",
-            e.tier_label,
+            e.scale_label,
             e.architecture,
             e.access_pattern,
             e.host_profile,
@@ -924,7 +924,7 @@ fn parse_worker_payload(text: &str, loads: &mut Vec<LoadRecord>, execs: &mut Vec
             }
             "EXEC" if parts.len() >= 20 => {
                 execs.push(ExecRecord {
-                    tier_label: parts[1].to_string(),
+                    scale_label: parts[1].to_string(),
                     architecture: parts[2].to_string(),
                     access_pattern: parts[3].to_string(),
                     host_profile: parts[4].to_string(),
@@ -1035,7 +1035,7 @@ fn format_full_json_report(
         j.push_str("    {\n");
         j.push_str(&format!(
             "      \"benchmark_name\": \"{}\",\n",
-            escape_json(&e.tier_label)
+            escape_json(&e.scale_label)
         ));
         j.push_str(&format!(
             "      \"architecture\": \"{}\",\n",
@@ -1259,7 +1259,7 @@ fn print_comprehensive_report(loads: &[LoadRecord], execs: &[ExecRecord]) -> (f6
         );
     }
 
-    // Table 3: High-Scale Stress Tier (Release Host, 294,912 Pairs/Frame)
+    // Table 3: High-Scale Stress Workload (Release Host, 294,912 Pairs/Frame)
     let mut heavy_execs: Vec<&ExecRecord> = execs
         .iter()
         .filter(|e| e.scale_name == "heavy_295k_pairs")
@@ -1268,7 +1268,7 @@ fn print_comprehensive_report(loads: &[LoadRecord], execs: &[ExecRecord]) -> (f6
 
     if !heavy_execs.is_empty() {
         println!(
-            "\n[3] HIGH-SCALE STRESS TIER — RELEASE HOST (3,072 Units x 96 Emitters = 294,912 Pairs/Frame across 34 Archetypes)"
+            "\n[3] HIGH-SCALE STRESS WORKLOAD — RELEASE HOST (3,072 Units x 96 Emitters = 294,912 Pairs/Frame across 34 Archetypes)"
         );
         println!(
             "--------------------------------------------------------------------------------------------------------------------------------"
@@ -1450,10 +1450,10 @@ fn run_worker(out_tsv: &Path) {
         true,
     );
 
-    // 4. In Release Host, also run High-Scale Stress Tier (3,072 units x 96 emitters = 294,912 pairs/frame)
+    // 4. In Release Host, also run High-Scale Stress Workload (3,072 units x 96 emitters = 294,912 pairs/frame)
     if host_prof == "release" {
         eprintln!(
-            "  [worker:{host_prof}] Step D: measuring heavy-scale stress tier (294,912 pairs/frame)..."
+            "  [worker:{host_prof}] Step D: measuring heavy-scale stress workload (294,912 pairs/frame)..."
         );
         let heavy_execs = measure_execution_suite_at_scale(
             &mods,

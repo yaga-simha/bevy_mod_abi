@@ -17,7 +17,7 @@ Enabling `LoadOptions { shadow_copy: true, shadow_dir: None, .. }` solves all th
 
 ---
 
-## 2. Transactional Init Rollback (`LoadTransaction`, `S-06`)
+## 2. Transactional Init Rollback (`LoadTransaction`)
 
 If `bevy_abi_mod_init` returns a non-`OK` `FfiResult`—or if `LoadOptions::strict == true` rejects an unresolved schedule or ordering target—`LoadTransaction::drop` atomically:
 1. Marks the session's `is_active` tombstone `false` (`Ordering::Release`).
@@ -32,8 +32,8 @@ If `bevy_abi_mod_init` returns a non-`OK` `FfiResult`—or if `LoadOptions::stri
 When `world.unload_mod(id)` (or `app.unload_mod(id)`) runs under exclusive `&mut World` access:
 1. **Schedule Excision:** Removes `ModSystemSet(id)` and every `ModNamedSystemSet` owned by `id` from Bevy `Schedules` (`ScheduleCleanupPolicy::RemoveSetAndSystems`).
 2. **Drop-Trampoline Disarm:** Sets `is_active = false` and prunes `id`'s foreign `ComponentDropFn` pointer from `DROP_SLOTS` (`ArcSwapOption`), while **preserving** the Bevy `ComponentId` and existing entity table columns so a reloaded version of the mod seamlessly rebinds to live entities!
-3. **Symbol & VTable Purge (`S-05`):** Publishes a new CoW `RegistrySnapshot` that nulls guest-owned `vtable_ptr`s and removes `"bam.v0.*"` symbols owned by `id`, preventing stale pointers into unmapped `.rodata`.
-4. **Per-Instance Guest Shutdown (`L-02`):** Invokes `bevy_abi_mod_shutdown(instance)` while `.text` and `.rodata` are still mapped so the guest frees its closures and heap state on its own allocator.
+3. **Symbol & VTable Purge:** Publishes a new CoW `RegistrySnapshot` that nulls guest-owned `vtable_ptr`s and removes `"bam.v0.*"` symbols owned by `id`, preventing stale pointers into unmapped `.rodata`.
+4. **Per-Instance Guest Shutdown:** Invokes `bevy_abi_mod_shutdown(instance)` while `.text` and `.rodata` are still mapped so the guest frees its closures and heap state on its own allocator.
 5. **Library Unmap & Telemetry:** Drops `LoadedLibrary` (`dlclose` + shadow unlink), despawns the `LoadedModInfo` entity, and emits `Messages<ModUnloaded>`.
 
 ---

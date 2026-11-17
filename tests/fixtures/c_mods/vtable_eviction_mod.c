@@ -12,7 +12,7 @@ static void guest_drop_hook(void* ptr) {
 static const BamManifest MANIFEST = {
     .struct_size = (uint32_t)sizeof(BamManifest),
     .abi_version = BAM_ABI_VERSION,
-    .name = "s05_vtable_mod",
+    .name = "vtable_eviction_mod",
     .version = "0.2.0",
     .flags = 0u,
     .reserved0 = 0u
@@ -44,14 +44,14 @@ BAM_EXPORT BamResult bevy_abi_mod_init(
 
     g_dummy_vtable.struct_size = (uint32_t)sizeof(BamVTableHeader);
     g_dummy_vtable.abi_version = BAM_ABI_VERSION;
-    g_dummy_vtable.uuid = bam_uuid_from_parts("s05_vtable_mod::S05GuestComp", 8u, 8u, 0ull);
+    g_dummy_vtable.uuid = bam_uuid_from_parts("vtable_eviction_mod::GuestVTableComp", 8u, 8u, 0ull);
     g_dummy_vtable.size = 8u;
     g_dummy_vtable.align = 8u;
 
     memset(&desc, 0, sizeof(desc));
     desc.struct_size = (uint32_t)sizeof(BamComponentDesc);
     desc.flags = 0u;
-    desc.name = "S05GuestComp";
+    desc.name = "GuestVTableComp";
     desc.uuid = g_dummy_vtable.uuid;
     desc.size = 8u;
     desc.align = 8u;

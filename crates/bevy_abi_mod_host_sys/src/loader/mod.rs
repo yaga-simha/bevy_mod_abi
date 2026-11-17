@@ -1,5 +1,5 @@
 //! Dynamic shared-library loader, shadow-copying (`LoadOptions`), RAII rollback transactions,
-//! and `World`-scoped unload (`L-02`, `L-03`, `L-08`).
+//! and `World`-scoped unload.
 
 pub mod error;
 pub mod mod_host;

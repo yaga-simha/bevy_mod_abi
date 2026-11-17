@@ -1,5 +1,5 @@
 //! `loom` exhaustive concurrency model tests for ADR 0001 drop trampoline publication,
-//! lock-free reader execution, and single-word (`SLOT_CLOSING_BIT | live_values`) slot reclamation (`L-06`, `T-07`).
+//! lock-free reader execution, and single-word (`SLOT_CLOSING_BIT | live_values`) slot reclamation.
 
 use bevy_abi_mod_host_sys::drop_trampoline::{
     SLOT_CLOSING_BIT, SLOT_FREE, SLOT_IN_USE, SLOT_IN_USE_BIT, SLOT_LIVE_COUNT_MASK,

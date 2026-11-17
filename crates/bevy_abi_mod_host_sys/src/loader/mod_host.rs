@@ -1,5 +1,5 @@
 //! `ModHost`, `LoadedMod`, `LoadedModInfo`, lifecycle `Message`s, and `&mut World`-scoped
-//! load/rollback/unload operations (`L-02`, `L-03`, `L-08`, `B-05`, `B-09`).
+//! load/rollback/unload operations.
 
 use crate::drop_trampoline::{
     StagedDropBinding, StagedHookBinding, WorldDropGuard, prune_drop_trampolines_for_guard,
@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 
 static NEXT_MOD_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Monotonic 64-bit identifier assigned to each loaded mod instance (`L-08`).
+/// Monotonic 64-bit identifier assigned to each loaded mod instance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ModId(pub u64);
 
@@ -48,7 +48,7 @@ impl ModId {
     }
 }
 
-/// ECS [`Component`] attached to the entity spawned for each active native mod (`B-05`, `L-08`).
+/// ECS [`Component`] attached to the entity spawned for each active native mod.
 #[derive(Component, Debug, Clone, PartialEq, Eq)]
 pub struct LoadedModInfo {
     /// Assigned monotonic [`ModId`].
@@ -61,11 +61,11 @@ pub struct LoadedModInfo {
     pub path: PathBuf,
     /// Number of guest systems registered by this mod.
     pub system_count: usize,
-    /// Cumulative number of runtime or initialization faults recorded for this mod (`B-05`).
+    /// Cumulative number of runtime or initialization faults recorded for this mod.
     pub fault_count: usize,
 }
 
-/// Buffered Bevy [`Message`] emitted once whenever a native mod is loaded (`B-09`).
+/// Buffered Bevy [`Message`] emitted once whenever a native mod is loaded.
 #[derive(Message, Debug, Clone, PartialEq, Eq)]
 pub struct ModLoaded {
     /// Assigned [`ModId`].
@@ -82,7 +82,7 @@ pub struct ModLoaded {
     pub system_count: usize,
 }
 
-/// Buffered Bevy [`Message`] emitted once whenever a native mod is unloaded (`B-09`).
+/// Buffered Bevy [`Message`] emitted once whenever a native mod is unloaded.
 #[derive(Message, Debug, Clone, PartialEq, Eq)]
 pub struct ModUnloaded {
     /// Unloaded [`ModId`].
@@ -95,7 +95,7 @@ pub struct ModUnloaded {
     pub removed_systems: usize,
 }
 
-/// Read-only descriptor of an active loaded mod managed by [`ModHost`] (`L-02`, `L-08`, `B-05`).
+/// Read-only descriptor of an active loaded mod managed by [`ModHost`].
 ///
 /// Internal OS library and guest instance handles remain private so systems borrowing `Res<ModHost>`
 /// can inspect loaded modules without triggering `dlclose` during parallel schedule execution.
@@ -112,7 +112,7 @@ pub struct LoadedMod {
     pub loaded_path: PathBuf,
     /// Number of systems registered by this mod.
     pub system_count: usize,
-    /// Cumulative fault count for this mod (`B-05`).
+    /// Cumulative fault count for this mod.
     pub fault_count: usize,
     /// Associated [`LoadedModInfo`] entity in the `World`, once spawned.
     pub entity: Option<Entity>,
@@ -257,7 +257,7 @@ impl LoadedMod {
         self.system_count
     }
 
-    /// Returns the cumulative number of faults recorded for this mod (`B-05`).
+    /// Returns the cumulative number of faults recorded for this mod.
     #[inline]
     pub const fn fault_count(&self) -> usize {
         self.fault_count
@@ -271,7 +271,7 @@ impl LoadedMod {
 }
 
 /// Disarms `loaded`, invokes `bevy_abi_mod_shutdown(instance)` for this `World` instance, and
-/// drops `LoadedLibrary` (`dlclose` followed by shadow-file unlink) under `lib_state` (`L-02`, `L-03`).
+/// drops `LoadedLibrary` (`dlclose` followed by shadow-file unlink) under `lib_state`.
 ///
 /// # Safety
 /// Caller must ensure no guest systems or foreign drop hooks from this module are concurrently
@@ -285,7 +285,7 @@ unsafe fn unload_loaded_mod(loaded: LoadedMod, invoke_shutdown: bool) {
 
     if invoke_shutdown {
         // SAFETY: `loaded.library` is still mapped in memory and `loaded.instance` is the exact
-        // `*mut BamInstance` written by this session's `bevy_abi_mod_init` (`L-02`).
+        // `*mut BamInstance` written by this session's `bevy_abi_mod_init`.
         unsafe {
             (loaded.shutdown_fn)(loaded.instance.as_ptr());
         }
@@ -367,7 +367,7 @@ impl ModHost {
         loaded.entity
     }
 
-    /// Increments both `LoadedMod::fault_count` and the `LoadedModInfo::fault_count` ECS component (`B-05`).
+    /// Increments both `LoadedMod::fault_count` and the `LoadedModInfo::fault_count` ECS component.
     pub(crate) fn record_fault_in_world(world: &mut World, id: ModId) {
         let entity_opt = world
             .get_resource_mut::<Self>()
@@ -425,7 +425,7 @@ impl ModHost {
         // (disarming drop trampolines and restoring `pre_snapshot`) *before* `dlclose` + shadow unlink.
         let tx = LoadTransaction::new(world_ptr, Arc::clone(&is_active), Arc::clone(&pre_snapshot));
 
-        // 1. Mandatory `bevy_abi_mod_manifest` (`L-08`).
+        // 1. Mandatory `bevy_abi_mod_manifest`.
         // SAFETY: Resolving mandatory `bevy_abi_mod_manifest` symbol with signature `extern "C" fn() -> *const BamManifest`.
         let manifest_fn: Symbol<BamManifestFn> = unsafe {
             loaded_lib
@@ -508,7 +508,7 @@ impl ModHost {
         let manifest_name: Arc<str> = Arc::from(manifest_name_str);
         let manifest_version: Arc<str> = Arc::from(manifest_version_str);
 
-        // 2. Mandatory `bevy_abi_mod_init` and `bevy_abi_mod_shutdown` (`L-02`).
+        // 2. Mandatory `bevy_abi_mod_init` and `bevy_abi_mod_shutdown`.
         // SAFETY: Resolving `bevy_abi_mod_init`.
         let init_fn: Symbol<BamInitFn> = unsafe {
             loaded_lib
@@ -943,7 +943,7 @@ unsafe extern "C" fn host_state_vec_writer(
 }
 
 /// Snapshots optional hot-reload state (`BamManifest::save_state`) from loaded mod `id` into a
-/// host-owned `Vec<u8>`, returning `(source_path, saved_blob)` (`F-01`).
+/// host-owned `Vec<u8>`, returning `(source_path, saved_blob)`.
 ///
 /// Returns `Ok((source_path, None))` when the mod did not declare a `save_state` callback.
 pub fn save_mod_state_in_world(
@@ -983,7 +983,7 @@ pub fn save_mod_state_in_world(
 }
 
 /// Restores a previously captured state blob (`bytes`) into newly loaded mod `id` via
-/// `BamManifest::restore_state` (`F-01`).
+/// `BamManifest::restore_state`.
 ///
 /// If the new mod does not declare `restore_state`, this is a no-op (`Ok(())`).
 pub fn restore_mod_state_in_world(

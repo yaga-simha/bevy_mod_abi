@@ -1,11 +1,11 @@
-//! Unit and integration tests for `bevy_abi_mod_host_sys` (`ABI 0.2.0`):
-//! - `C-01`, `C-03`, `C-04`, `C-05`, `C-13` (27-slot `HOST_API`, context-scoped symbols & `last_error`,
-//!   1-based `BamComponent` handles, `iter_column_info`, `res_ptr`/`res_mut_ptr`)
-//! - `S-08` (`{ magic, generation }` handle headers + poison-on-drop)
-//! - `P-01..P-04`, `P-08`, `P-09` (dense tick skip, batched sparse rows, `marked_changed_mask`,
-//!   untracked mutable + `iter_mark_changed_range`)
-//! - `L-06`, `L-07`, `B-07`, `B-08` (`WorldDropGuard` reclamation & `CAPACITY_EXCEEDED`, CoW
-//!   `ModRegistry`, `BAM_SYSTEM_FLAG_MAIN_THREAD`, `SPARSE_SET` & `IMMUTABLE` dynamic components)
+//! Integration tests for `bevy_abi_mod_host_sys` (`ABI 0.2.0`):
+//! - 27-slot `HOST_API`, context-scoped symbols & `last_error`, 1-based `BamComponent`
+//!   handles, `iter_column_info`, `res_ptr`/`res_mut_ptr`
+//! - `{ magic, generation }` handle headers + poison-on-drop
+//! - dense tick skip, batched sparse rows, `marked_changed_mask`, untracked mutable +
+//!   `iter_mark_changed_range`
+//! - `WorldDropGuard` reclamation & `CAPACITY_EXCEEDED`, CoW `ModRegistry`,
+//!   `BAM_SYSTEM_FLAG_MAIN_THREAD`, `SPARSE_SET` & `IMMUTABLE` dynamic components
 
 use bevy_abi_mod_host_sys::drop_trampoline::{
     MAX_DROP_TRAMPOLINES, available_drop_trampoline_slots,
@@ -161,7 +161,7 @@ fn context_scoped_symbols_and_last_error_are_isolated_per_world() {
     assert_eq!(resolved_a, (&SYM_A as *const u8).cast::<c_void>());
     assert_eq!(resolved_b, (&SYM_B as *const u8).cast::<c_void>());
 
-    // Non-"bam.v0." names must always return null (`C-04`).
+    // Non-"bam.v0." names must always return null.
     // SAFETY: Valid `ctx_a` and C string.
     let bad_ns = unsafe { host_get_proc_address(ctx_a, c"host_register_system".as_ptr()) };
     assert!(bad_ns.is_null());
@@ -232,7 +232,7 @@ fn handle_headers_reject_mismatched_and_poisoned_handles() {
         );
     }
 
-    // 2. Cross-handle type confusion inside an active `GuestSystem` callback (`S-08`).
+    // 2. Cross-handle type confusion inside an active `GuestSystem` callback.
     unsafe extern "C" fn cross_handle_check_cb(
         sys_ctx: *mut BamSystemCtx,
         _ud: *mut c_void,
@@ -330,7 +330,7 @@ fn sparse_set_batching_untracked_mutation_tick_skip_resources_and_column_info() 
             FfiResult::OK
         );
 
-        // Unqualified `"Shield"` resolves inside `test_mod`'s `HostContext` (`C-10`).
+        // Unqualified `"Shield"` resolves inside `test_mod`'s `HostContext`.
         let hctx = host_load_host_ctx(load_ctx.as_ffi_ptr());
         let mut resolved = BamComponent::INVALID;
         assert_eq!(
@@ -345,7 +345,7 @@ fn sparse_set_batching_untracked_mutation_tick_skip_resources_and_column_info() 
             FfiResult::TYPE_MISMATCH
         );
 
-        // Attempting to register a system that writes to an `IMMUTABLE` component fails with `PERMISSION_DENIED` (`B-08`).
+        // Attempting to register a system that writes to an `IMMUTABLE` component fails with `PERMISSION_DENIED`.
         let bad_term = BamTermDesc {
             component: team_comp,
             mode: AccessMode::WRITE,
@@ -398,8 +398,8 @@ fn sparse_set_batching_untracked_mutation_tick_skip_resources_and_column_info() 
         }
     }
 
-    // System 1: Tests `P-02` sparse batching (`chunk_len == 4`), `C-13` `iter_column_info`,
-    // `C-05` `res_ptr`/`res_mut_ptr`, and `P-04` `iter_column_mutable_untracked` + `iter_mark_changed_range`
+    // System 1: Tests sparse batching (`chunk_len == 4`), `iter_column_info`,
+    // `res_ptr`/`res_mut_ptr`, and `iter_column_mutable_untracked` + `iter_mark_changed_range`
     // marking ONLY row 2 of `Vel` changed!
     static OBSERVED_SPARSE_CHUNK_LEN: AtomicUsize = AtomicUsize::new(0);
 
@@ -411,7 +411,7 @@ fn sparse_set_batching_untracked_mutation_tick_skip_resources_and_column_info() 
             assert_eq!(host_sys_query(sys_ctx, 0, &mut iter), FfiResult::OK);
             assert!(!host_sys_host_ctx(sys_ctx).is_null());
 
-            // Check `BamColumnInfo` (`C-13`) on all 4 terms.
+            // Check `BamColumnInfo` on all 4 terms.
             let mut info = core::mem::MaybeUninit::<BamColumnInfo>::uninit();
             assert_eq!(
                 host_iter_column_info(iter, 0, info.as_mut_ptr()),
@@ -460,7 +460,7 @@ fn sparse_set_batching_untracked_mutation_tick_skip_resources_and_column_info() 
                 (*vel_ptr.add(2)).vy = 99.0;
                 assert_eq!(host_iter_mark_changed_range(iter, 0, 2, 1), FfiResult::OK);
 
-                // Indirect sparse-set mutable rows (`term_index == 1`, `P-02`).
+                // Indirect sparse-set mutable rows (`term_index == 1`).
                 let shield_rows = host_iter_column_rows_mutable(iter, 1);
                 assert!(!shield_rows.is_null());
                 for r in 0..len {
@@ -481,7 +481,7 @@ fn sparse_set_batching_untracked_mutation_tick_skip_resources_and_column_info() 
         FfiResult::OK
     }
 
-    // System 2: `AccessMode::CHANGED` reader on `Vel` (`P-01` + `P-04` verification).
+    // System 2: `AccessMode::CHANGED` reader on `Vel` (`verification).
     static CHANGED_ROW_COUNT: AtomicUsize = AtomicUsize::new(0);
     unsafe extern "C" fn changed_vel_reader_cb(
         sys_ctx: *mut BamSystemCtx,
@@ -519,11 +519,11 @@ fn sparse_set_batching_untracked_mutation_tick_skip_resources_and_column_info() 
     // Initial run consumes initial spawn ticks (all 4 entities).
     changed_sys.run((), &mut world).unwrap();
     assert_eq!(CHANGED_ROW_COUNT.load(Ordering::SeqCst), 4);
-    // Second run with zero mutations skips the entire table via `P-01` summary tick check -> 0 rows!
+    // Second run with zero mutations skips the entire table via summary tick check -> 0 rows!
     changed_sys.run((), &mut world).unwrap();
     assert_eq!(CHANGED_ROW_COUNT.load(Ordering::SeqCst), 0);
 
-    // Run `writer_sys` (also verify `BAM_SYSTEM_FLAG_MAIN_THREAD` -> `NON_SEND` flag `B-07`).
+    // Run `writer_sys` (also verify `BAM_SYSTEM_FLAG_MAIN_THREAD` -> `NON_SEND` flag).
     let mut writer_sys = GuestSystem::new(
         "writer_sys",
         vec![BamQuerySpecOwned {
@@ -560,11 +560,11 @@ fn sparse_set_batching_untracked_mutation_tick_skip_resources_and_column_info() 
     writer_sys.initialize(&mut world);
     writer_sys.run((), &mut world).unwrap();
 
-    // `P-02`: All 4 sparse entities in the same archetype were batched into a SINGLE chunk of length 4!
+    // All 4 sparse entities in the same archetype were batched into a SINGLE chunk of length 4!
     assert_eq!(OBSERVED_SPARSE_CHUNK_LEN.load(Ordering::SeqCst), 4);
     assert_eq!(world.resource::<SimClock>().frame, 11);
 
-    // `P-04`: Because `writer_sys` used `iter_column_mutable_untracked` + `iter_mark_changed_range(0, 2, 1)`,
+    // Because `writer_sys` used `iter_column_mutable_untracked` + `iter_mark_changed_range(0, 2, 1)`,
     // `changed_sys` sees ONLY the 1 modified row (not all 4 rows)!
     changed_sys.run((), &mut world).unwrap();
     assert_eq!(CHANGED_ROW_COUNT.load(Ordering::SeqCst), 1);
@@ -717,7 +717,7 @@ fn mod_load_error_preserves_thiserror_sources() {
 }
 
 #[test]
-fn regression_uncommitted_dynamic_drop_payloads_cleaned_on_fault_missing_entity_and_storage_drop() {
+fn uncommitted_dynamic_drop_payloads_cleaned_on_fault_missing_entity_and_storage_drop() {
     let _serial = DROP_POOL_TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -886,7 +886,7 @@ fn regression_uncommitted_dynamic_drop_payloads_cleaned_on_fault_missing_entity_
 }
 
 #[test]
-fn regression_reregister_component_rejects_mismatched_drop_fn_presence() {
+fn reregister_component_rejects_mismatched_drop_fn_presence() {
     let _serial = DROP_POOL_TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -973,20 +973,20 @@ fn regression_reregister_component_rejects_mismatched_drop_fn_presence() {
 }
 
 #[test]
-fn regression_failed_load_rollback_reclaims_fresh_slots_and_restores_hot_updated_snapshots() {
+fn failed_load_rollback_reclaims_fresh_slots_and_restores_hot_updated_snapshots() {
     let _serial = DROP_POOL_TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    static V1_DROPS: AtomicUsize = AtomicUsize::new(0);
-    static V2_DROPS: AtomicUsize = AtomicUsize::new(0);
-    V1_DROPS.store(0, Ordering::SeqCst);
-    V2_DROPS.store(0, Ordering::SeqCst);
+    static INITIAL_DROPS: AtomicUsize = AtomicUsize::new(0);
+    static RELOADED_DROPS: AtomicUsize = AtomicUsize::new(0);
+    INITIAL_DROPS.store(0, Ordering::SeqCst);
+    RELOADED_DROPS.store(0, Ordering::SeqCst);
 
-    unsafe extern "C" fn v1_drop(_ptr: *mut c_void) {
-        V1_DROPS.fetch_add(1, Ordering::SeqCst);
+    unsafe extern "C" fn initial_drop(_ptr: *mut c_void) {
+        INITIAL_DROPS.fetch_add(1, Ordering::SeqCst);
     }
-    unsafe extern "C" fn v2_drop(_ptr: *mut c_void) {
-        V2_DROPS.fetch_add(1, Ordering::SeqCst);
+    unsafe extern "C" fn reloaded_drop(_ptr: *mut c_void) {
+        RELOADED_DROPS.fetch_add(1, Ordering::SeqCst);
     }
 
     let baseline_free = available_drop_trampoline_slots();
@@ -1006,7 +1006,7 @@ fn regression_failed_load_rollback_reclaims_fresh_slots_and_restores_hot_updated
 
             let cname = std::ffi::CString::new(format!("rollback_test::Fresh{idx}")).unwrap();
             let uuid = ComponentUuid::from_parts(cname.to_str().unwrap(), 4, 4, idx as u64);
-            let desc = ComponentDesc::new(cname.as_ptr(), uuid, 4, 4).with_drop(v1_drop);
+            let desc = ComponentDesc::new(cname.as_ptr(), uuid, 4, 4).with_drop(initial_drop);
 
             let mut out = BamComponent::INVALID;
             // SAFETY: Valid `load_ctx`, `desc`, and `out`.
@@ -1023,28 +1023,32 @@ fn regression_failed_load_rollback_reclaims_fresh_slots_and_restores_hot_updated
         assert_eq!(world.resource::<WorldDropGuard>().len(), 0);
         assert_eq!(available_drop_trampoline_slots(), baseline_free);
 
-        // 2. Commit `v1` with a live entity, then simulate a failed `v2` hot-reload that updates
-        //    the same UUID with `v2_drop` and rolls back: `v1_drop` must be restored!
+        // 2. Commit initial version with a live entity, then simulate a failed reload that updates
+        //    the same UUID with `reloaded_drop` and rolls back: `initial_drop` must be restored!
         let shared_uuid = ComponentUuid::from_parts("rollback_test::Shared", 4, 4, 77);
-        let v1_guard = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(true));
-        let mut v1_ctx = LoadContext::with_world_and_mod_id(
+        let initial_guard = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(true));
+        let mut initial_ctx = LoadContext::with_world_and_mod_id(
             world.resource::<ModRegistry>().clone(),
-            std::sync::Arc::clone(&v1_guard),
+            std::sync::Arc::clone(&initial_guard),
             &mut world as *mut World,
             None,
         );
-        let v1_desc = ComponentDesc::new(c"rollback_test::Shared".as_ptr(), shared_uuid, 4, 4)
-            .with_drop(v1_drop);
+        let initial_desc = ComponentDesc::new(c"rollback_test::Shared".as_ptr(), shared_uuid, 4, 4)
+            .with_drop(initial_drop);
         let mut comp_h = BamComponent::INVALID;
-        // SAFETY: Valid `v1_ctx`, `v1_desc`, and `comp_h`.
+        // SAFETY: Valid `initial_ctx`, `initial_desc`, and `comp_h`.
         unsafe {
             assert_eq!(
-                host_register_component(v1_ctx.as_ffi_ptr(), &v1_desc, &mut comp_h),
+                host_register_component(initial_ctx.as_ffi_ptr(), &initial_desc, &mut comp_h),
                 FfiResult::OK
             );
         }
-        let comp_id = v1_ctx.registry.get_by_handle(comp_h).unwrap().component_id;
-        v1_ctx.finish_init();
+        let comp_id = initial_ctx
+            .registry
+            .get_by_handle(comp_h)
+            .unwrap()
+            .component_id;
+        initial_ctx.finish_init();
 
         let val: u32 = 42;
         let mut ent1 = world.spawn_empty();
@@ -1064,32 +1068,33 @@ fn regression_failed_load_rollback_reclaims_fresh_slots_and_restores_hot_updated
             });
         }
 
-        // Failed `v2` hot-reload updates `shared_uuid` to `v2_drop`, then aborts via `rollback()`.
-        let v2_guard = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(true));
-        let mut v2_ctx = LoadContext::with_world_and_mod_id(
+        // Failed hot-reload updates `shared_uuid` to `reloaded_drop`, then aborts via `rollback()`.
+        let reloaded_guard = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(true));
+        let mut reloaded_ctx = LoadContext::with_world_and_mod_id(
             world.resource::<ModRegistry>().clone(),
-            v2_guard,
+            reloaded_guard,
             &mut world as *mut World,
             None,
         );
-        let v2_desc = ComponentDesc::new(c"rollback_test::Shared".as_ptr(), shared_uuid, 4, 4)
-            .with_drop(v2_drop);
-        // SAFETY: Valid `v2_ctx` and `v2_desc`.
+        let reloaded_desc =
+            ComponentDesc::new(c"rollback_test::Shared".as_ptr(), shared_uuid, 4, 4)
+                .with_drop(reloaded_drop);
+        // SAFETY: Valid `reloaded_ctx` and `reloaded_desc`.
         unsafe {
             assert_eq!(
-                host_register_component(v2_ctx.as_ffi_ptr(), &v2_desc, &mut comp_h),
+                host_register_component(reloaded_ctx.as_ffi_ptr(), &reloaded_desc, &mut comp_h),
                 FfiResult::OK
             );
         }
-        v2_ctx.rollback();
+        reloaded_ctx.rollback();
 
-        // Despawning `ent1` in the live `World` must invoke restored `v1_drop` (not rolled-back `v2_drop`),
+        // Despawning `ent1` in the live `World` must invoke restored `initial_drop` (not rolled-back `reloaded_drop`),
         // while leaving `ent2` alive exercises deferred slot reclamation across `World::drop`.
         world.despawn(ent1_id);
-        assert_eq!(V1_DROPS.load(Ordering::SeqCst), 1);
-        assert_eq!(V2_DROPS.load(Ordering::SeqCst), 0);
+        assert_eq!(INITIAL_DROPS.load(Ordering::SeqCst), 1);
+        assert_eq!(RELOADED_DROPS.load(Ordering::SeqCst), 0);
     }
 
-    assert_eq!(V2_DROPS.load(Ordering::SeqCst), 0);
+    assert_eq!(RELOADED_DROPS.load(Ordering::SeqCst), 0);
     assert_eq!(available_drop_trampoline_slots(), baseline_free);
 }

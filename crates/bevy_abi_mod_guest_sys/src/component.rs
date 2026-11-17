@@ -14,7 +14,7 @@ use crate::{
 
 type PodHookCallback<T> = Box<dyn FnMut(FfiEntity, &T) + Send + 'static>;
 
-/// Optional `on_add` and `on_remove` lifecycle callbacks for a dynamic POD component (`F-04`).
+/// Optional `on_add` and `on_remove` lifecycle callbacks for a dynamic POD component.
 pub struct PodComponentHooks<T: AbiPod> {
     /// Optional callback invoked when `T` is added to an entity.
     pub on_add: Option<PodHookCallback<T>>,
@@ -199,7 +199,7 @@ pub unsafe fn register_pod_component<T: AbiPod>(
 }
 
 /// Registers a cross-language `T: AbiPod` dynamic component with optional `on_add` and `on_remove`
-/// hooks (`F-04`), storing both `name` and the panic-safe hook state inside `instance`.
+/// hooks, storing both `name` and the panic-safe hook state inside `instance`.
 ///
 /// # Safety
 /// - `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance`.

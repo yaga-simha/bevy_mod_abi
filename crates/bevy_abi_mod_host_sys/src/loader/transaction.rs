@@ -1,4 +1,4 @@
-//! RAII `LoadTransaction` rolling back drop trampolines and `ModRegistry` snapshot before `dlclose` (`S-06`, `ADR 0001` §2.4).
+//! RAII `LoadTransaction` rolling back drop trampolines and `ModRegistry` snapshot before `dlclose` (`ADR 0001` §2.4).
 
 use crate::drop_trampoline::{
     StagedDropBinding, StagedHookBinding, WorldDropGuard, prune_drop_trampolines_for_guard,

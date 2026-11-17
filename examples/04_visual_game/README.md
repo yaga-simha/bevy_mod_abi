@@ -8,9 +8,9 @@
 
 A 2D kinetic particle simulation running inside Bevy ECS (`#![forbid(unsafe_code)]`) and rendered in a terminal Braille canvas via `ratatui` and `crossterm`. Three standalone Rust guest `.cdylib` mods (`#![forbid(unsafe_code)]`, zero `bevy` dependencies) can be loaded, hot-reloaded from disk while recompiling, and unloaded cleanly at runtime:
 
-- **Core Shadow-Copy Loader (`L-03`):** Passing `LoadOptions::new().with_shadow_copy(true)` copies each `.dll`/`.so`/`.dylib` to an isolated temporary file prior to `dlopen` / `LoadLibraryW` and unlinks it automatically after `dlclose`, avoiding OS file locks and inode caching without custom host file-management boilerplate.
+- **Core Shadow-Copy Loader:** Passing `LoadOptions::new().with_shadow_copy(true)` copies each `.dll`/`.so`/`.dylib` to an isolated temporary file prior to `dlopen` / `LoadLibraryW` and unlinks it automatically after `dlclose`, avoiding OS file locks and inode caching without custom host file-management boilerplate.
 - **Schedule Phasing:** Guest systems run in `Update`; host integration and wall reflections run in `PostUpdate`.
-- **Per-World Guest State (`L-02`):** Each guest mod uses `GuestPlugin` + `export_mod!(plugin: ...)` and `app.system(...)`, keeping frame counters inside its per-`World` `GuestInstance` with zero process globals.
+- **Per-World Guest State:** Each guest mod uses `GuestPlugin` + `export_mod!(plugin: ...)` and `app.system(...)`, keeping frame counters inside its per-`World` `GuestInstance` with zero process globals.
 
 ---
 

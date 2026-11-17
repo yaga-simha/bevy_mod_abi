@@ -1,4 +1,4 @@
-//! Differential Native-vs-Dynamic Bevy ECS Parity, `T-05` Proptest Suite & Multi-World Isolation (`ABI 0.2.0`).
+//! Differential Native-vs-Dynamic Bevy ECS Parity, `proptest!` Suite & Multi-World Isolation (`ABI 0.2.0`).
 
 use bevy_abi_mod_host::{AbiModPlugin, ComponentOptions, ModAppExt, ModRegistry};
 use bevy_abi_mod_host_sys::{
@@ -595,7 +595,7 @@ unsafe extern "C" fn dyn_stage2_sparse_data_rw(
     );
     let mut count = 0usize;
     while unsafe { host_iter_next_chunk(iter, &mut count) }.get() {
-        // P-02: `SparseEnergy` uses indirect per-row mutable pointers!
+        // `SparseEnergy` uses indirect per-row mutable pointers!
         let se_rows = unsafe { host_iter_column_rows_mutable(iter, 0) };
         let dv_ptr = unsafe { host_iter_column_readonly(iter, 1) } as *const DenseVec;
         assert!(!se_rows.is_null() && !dv_ptr.is_null());
@@ -685,7 +685,7 @@ unsafe extern "C" fn dyn_stage4_commands(
         }
     }
 
-    // P-05: Batched `host_cmd_spawn` placing `(DenseVec, OverAligned32, Aligned16Zst)` in a single archetype transition!
+    // Batched `host_cmd_spawn` placing `(DenseVec, OverAligned32, Aligned16Zst)` in a single archetype transition!
     let dv = DenseVec {
         x: 10 + frame,
         y: 20 - frame,
@@ -1279,7 +1279,7 @@ fn differential_hierarchy_child_of_despawn_and_entity_cloner_drop_parity() {
     assert_eq!(HIERARCHY_DYN_DROPS.load(Ordering::SeqCst), 5);
 
     // Clear remaining entities while active (`7` total drops across doomed + survivors), then
-    // verify `WorldDropGuard` cleanly disarms and reclaims the slot when `app_dynamic` drops (`L-06`).
+    // verify `WorldDropGuard` cleanly disarms and reclaims the slot when `app_dynamic` drops.
     app_dynamic.world_mut().clear_entities();
     assert_eq!(HIERARCHY_DYN_DROPS.load(Ordering::SeqCst), 7);
     drop(app_dynamic);
@@ -1891,10 +1891,10 @@ fn runtime_get_proc_address_on_executor_is_isolated_to_current_world_registry() 
 }
 
 // ============================================================================
-// T-05: Comprehensive `proptest!` Differential Parity Suite
+// Comprehensive `proptest!` Differential Parity Suite
 // ============================================================================
 
-mod proptest_t05 {
+mod proptest_differential_parity {
     use super::*;
 
     fn proptest_cases() -> u32 {
@@ -1937,9 +1937,9 @@ mod proptest_t05 {
 
     #[derive(Clone, Copy, Debug)]
     enum WriteStyle {
-        /// Blanket chunk-level `iter_column_mutable` / `iter_column_rows_mutable` (`P-04`).
+        /// Blanket chunk-level `iter_column_mutable` / `iter_column_rows_mutable`.
         BlanketMutable,
-        /// Selective row-level `iter_column_mutable_untracked` + `iter_mark_changed_range` (`P-04`).
+        /// Selective row-level `iter_column_mutable_untracked` + `iter_mark_changed_range`.
         SelectiveOddRows,
     }
 
@@ -2535,12 +2535,12 @@ mod proptest_t05 {
             ..ProptestConfig::default()
         })]
 
-        /// T-05 (Part A): Differential `FilteredAccessSet` self-conflict and pairwise compatibility
+        /// Differential `FilteredAccessSet` self-conflict and pairwise compatibility
         /// parity across generated multi-query term sets (`READ`, `WRITE`, `FILTER_ONLY`, `WITHOUT`,
         /// `OPTIONAL_READ`, `OPTIONAL_WRITE`, `CHANGED`, `ADDED`, `RESOURCE_READ`, `RESOURCE_WRITE`)
         /// over dense `Table` (including ZST + 32B over-aligned) and `SparseSet` components.
         #[test]
-        fn proptest_t05_access_compatibility_and_self_conflict_parity(
+        fn access_compatibility_and_self_conflict_parity(
             raw_groups_a in prop::collection::vec(arb_query_group(), 1..=3),
             raw_groups_b in prop::collection::vec(arb_query_group(), 1..=3),
         ) {
@@ -2601,12 +2601,12 @@ mod proptest_t05 {
             }
         }
 
-        /// T-05 (Part B): Differential iteration & change-tick parity comparing `GuestSystem` +
-        /// `HostIter` (`P-01` dense tick skip, `P-02` indirect sparse batching, `P-04` blanket vs
+        /// Differential iteration & change-tick parity comparing `GuestSystem` +
+        /// `HostIter` (dense tick skip, indirect sparse batching, blanket vs
         /// selective `iter_mark_changed_range`) against native Bevy `QueryBuilder` across random
         /// multi-archetype entity populations and multi-step mutation histories.
         #[test]
-        fn proptest_t05_iteration_order_and_change_tick_parity(
+        fn iteration_order_and_change_tick_parity(
             archetype_masks in prop::collection::vec(any::<u8>(), 1..=16),
             choices in prop::collection::vec(arb_term_choice(), 1..=6),
             mutations_frame1 in prop::collection::vec(arb_mutation_step(), 0..=4),

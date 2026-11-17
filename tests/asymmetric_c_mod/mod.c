@@ -6,8 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-BAM_STATIC_ASSERT(sizeof(Phase4CRes) == 24u, phase4_c_res_size);
-BAM_STATIC_ASSERT(BAM_ALIGNOF(Phase4CRes) == 8u, phase4_c_res_align);
+BAM_STATIC_ASSERT(sizeof(CFilterTelemetry) == 24u, c_filter_telemetry_size);
+BAM_STATIC_ASSERT(BAM_ALIGNOF(CFilterTelemetry) == 8u, c_filter_telemetry_align);
 
 /* Dynamic Component Definition */
 typedef struct CModCustomData {
@@ -21,7 +21,7 @@ BAM_STATIC_ASSERT(offsetof(CModCustomData, mana) == 0u, c_mod_custom_data_mana_o
 BAM_STATIC_ASSERT(offsetof(CModCustomData, level) == 4u, c_mod_custom_data_level_off);
 
 /* ============================================================================
- * Per-World Instance State (`L-02`) & Test Harness Flags
+ * Per-World Instance State & Test Harness Flags
  * ============================================================================ */
 
 struct BamInstance {
@@ -36,16 +36,16 @@ struct BamInstance {
     const MetadataTagVTable*  tag_vt;
     BamComponent              nametag_comp;
     BamComponent              custom_comp;
-    BamComponent              p4_tf_comp;
-    const PositionVTable*     p4_tf_vt;
-    BamComponent              p4_sensor_comp;
-    BamComponent              p4_fresh_comp;
-    BamComponent              p4_removable_comp;
-    BamComponent              p4_res_comp;
+    BamComponent              cond_tf_comp;
+    const PositionVTable*     cond_tf_vt;
+    BamComponent              cond_sensor_comp;
+    BamComponent              cond_fresh_comp;
+    BamComponent              cond_transient_comp;
+    BamComponent              cond_res_comp;
 };
 
 static volatile BamBool g_c_mod_shutdown_called = BAM_FALSE;
-static volatile BamBool g_c_phase4_run_enabled = BAM_TRUE;
+static volatile BamBool g_c_conditional_run_enabled = BAM_TRUE;
 
 static const BamManifest MANIFEST = {
     .struct_size = (uint32_t)sizeof(BamManifest),
@@ -333,22 +333,22 @@ static BamResult c_custom_data_system(BamSystemCtx* sys_ctx, void* user_data) {
  * Scenario 6: Optional Columns, Changed/Added Row Filters, Resources, `run_if`,
  * `cmd_remove`, and `cmd_insert_default`.
  */
-static BamBool c_phase4_run_if(void* user_data) {
+static BamBool c_conditional_run_if(void* user_data) {
     (void)user_data;
-    return g_c_phase4_run_enabled;
+    return g_c_conditional_run_enabled;
 }
 
-static BamResult c_phase4_ecs_system(BamSystemCtx* sys_ctx, void* user_data) {
+static BamResult c_conditional_filter_system(BamSystemCtx* sys_ctx, void* user_data) {
     BamInstance* st = (BamInstance*)user_data;
     BamIter* iter = NULL;
     BamCommands* commands = NULL;
-    Phase4CRes* res;
+    CFilterTelemetry* res;
     BamColumnInfo tf_info;
     BamColumnInfo vel_info;
     size_t count = 0u;
     BamResult rc;
 
-    if (st == NULL || st->p4_tf_vt == NULL) {
+    if (st == NULL || st->cond_tf_vt == NULL) {
         return BAM_RESULT_INTERNAL_ERROR;
     }
     rc = st->api.sys_query(sys_ctx, 0u, &iter);
@@ -360,7 +360,7 @@ static BamResult c_phase4_ecs_system(BamSystemCtx* sys_ctx, void* user_data) {
         return rc;
     }
 
-    res = (Phase4CRes*)(void*)st->api.res_mut_ptr(iter, 4u);
+    res = (CFilterTelemetry*)(void*)st->api.res_mut_ptr(iter, 4u);
     if (res == NULL) {
         return BAM_RESULT_INVALID_COMPONENT;
     }
@@ -393,23 +393,23 @@ static BamResult c_phase4_ecs_system(BamSystemCtx* sys_ctx, void* user_data) {
         }
         for (i = 0u; i < count; ++i) {
             void* p_ptr = (void*)(pos_base + (i * tf_info.size));
-            float py = st->p4_tf_vt->get_y(p_ptr);
+            float py = st->cond_tf_vt->get_y(p_ptr);
             BamResult sres;
             if (opt_vel_base != NULL && st->vel_vt != NULL) {
                 const void* v_ptr = (const void*)(opt_vel_base + (i * vel_info.size));
                 float vy = st->vel_vt->get_y(v_ptr);
-                sres = st->p4_tf_vt->set_y(p_ptr, py + (vy * res->scale));
+                sres = st->cond_tf_vt->set_y(p_ptr, py + (vy * res->scale));
                 res->optional_vel_hits += 1u;
             } else {
-                sres = st->p4_tf_vt->set_y(p_ptr, py + (1.0f * res->scale));
+                sres = st->cond_tf_vt->set_y(p_ptr, py + (1.0f * res->scale));
             }
             if (sres != BAM_RESULT_OK) {
                 return sres;
             }
             res->matched_rows += 1u;
 
-            if (commands != NULL && entities != NULL && bam_component_is_valid(st->p4_removable_comp)) {
-                st->api.cmd_remove(commands, entities[i], st->p4_removable_comp);
+            if (commands != NULL && entities != NULL && bam_component_is_valid(st->cond_transient_comp)) {
+                st->api.cmd_remove(commands, entities[i], st->cond_transient_comp);
             }
         }
     }
@@ -429,8 +429,8 @@ BAM_EXPORT bool asymmetric_c_mod_was_shutdown(void) {
     return g_c_mod_shutdown_called != BAM_FALSE;
 }
 
-BAM_EXPORT void asymmetric_c_mod_set_phase4_enabled(BamBool enabled) {
-    g_c_phase4_run_enabled = (enabled != BAM_FALSE) ? BAM_TRUE : BAM_FALSE;
+BAM_EXPORT void asymmetric_c_mod_set_conditional_enabled(BamBool enabled) {
+    g_c_conditional_run_enabled = (enabled != BAM_FALSE) ? BAM_TRUE : BAM_FALSE;
 }
 
 static BamResult register_single_query_system(
@@ -497,33 +497,22 @@ BAM_EXPORT BamResult bevy_abi_mod_init(
     static const char* const NAMETAG_NAMES[] = {
         "testbed::NameTag",
         "e2e::asymmetric_mods::NameTag",
-        "ffi::sparse_and_resources::p4_resources_and_optional::NameTag",
         "NameTag"
     };
-    static const char* const P4_TF_VT_CANDIDATES[] = {
-        "bam.v0.testbed::Phase4CTransform.vtable",
-        "bam.v0.e2e::asymmetric_mods::Phase4CTransform.vtable",
-        "bam.v0.ffi::sparse_and_resources::p4_resources_and_optional::Phase4CTransform.vtable"
+    static const char* const COND_TF_VT_CANDIDATES[] = {
+        "bam.v0.testbed::CFilteredTransform.vtable"
     };
-    static const char* const P4_SENSOR_NAMES[] = {
-        "testbed::Phase4CSensor",
-        "e2e::asymmetric_mods::Phase4CSensor",
-        "ffi::sparse_and_resources::p4_resources_and_optional::Phase4CSensor"
+    static const char* const COND_SENSOR_NAMES[] = {
+        "testbed::CChangeSensor"
     };
-    static const char* const P4_FRESH_NAMES[] = {
-        "testbed::Phase4CFreshTag",
-        "e2e::asymmetric_mods::Phase4CFreshTag",
-        "ffi::sparse_and_resources::p4_resources_and_optional::Phase4CFreshTag"
+    static const char* const COND_FRESH_NAMES[] = {
+        "testbed::CFreshSpawnTag"
     };
-    static const char* const P4_REM_NAMES[] = {
-        "testbed::Phase4CRemovable",
-        "e2e::asymmetric_mods::Phase4CRemovable",
-        "ffi::sparse_and_resources::p4_resources_and_optional::Phase4CRemovable"
+    static const char* const COND_TRANSIENT_NAMES[] = {
+        "testbed::CTransientMarker"
     };
-    static const char* const P4_RES_NAMES[] = {
-        "testbed::Phase4CRes",
-        "e2e::asymmetric_mods::Phase4CRes",
-        "ffi::sparse_and_resources::p4_resources_and_optional::Phase4CRes"
+    static const char* const COND_RES_NAMES[] = {
+        "testbed::CFilterTelemetry"
     };
 
     BamHostApi local_api;
@@ -563,7 +552,7 @@ BAM_EXPORT BamResult bevy_abi_mod_init(
     st->tag_vt = (const MetadataTagVTable*)resolve_any_vtable_and_comp(
         &st->api, host_ctx, TAG_VT_CANDIDATES, 4u, sizeof(MetadataTagVTable), &st->tag_comp
     );
-    st->nametag_comp = resolve_any_comp_by_name(&st->api, host_ctx, NAMETAG_NAMES, 4u);
+    st->nametag_comp = resolve_any_comp_by_name(&st->api, host_ctx, NAMETAG_NAMES, 3u);
 
     /* 1. Register Kinematics System if Position is exposed */
     if (st->pos_vt != NULL && bam_component_is_valid(st->pos_comp)) {
@@ -652,30 +641,30 @@ BAM_EXPORT BamResult bevy_abi_mod_init(
         }
     }
 
-    /* 6. Register Phase 4 Conditional System when Phase4C* components & resource exist */
-    st->p4_tf_vt = (const PositionVTable*)resolve_any_vtable_and_comp(
-        &st->api, host_ctx, P4_TF_VT_CANDIDATES, 3u, sizeof(PositionVTable), &st->p4_tf_comp
+    /* 6. Register Conditional Filter System when CFiltered* components & resource exist */
+    st->cond_tf_vt = (const PositionVTable*)resolve_any_vtable_and_comp(
+        &st->api, host_ctx, COND_TF_VT_CANDIDATES, 1u, sizeof(PositionVTable), &st->cond_tf_comp
     );
-    st->p4_sensor_comp = resolve_any_comp_by_name(&st->api, host_ctx, P4_SENSOR_NAMES, 3u);
-    st->p4_fresh_comp = resolve_any_comp_by_name(&st->api, host_ctx, P4_FRESH_NAMES, 3u);
-    st->p4_removable_comp = resolve_any_comp_by_name(&st->api, host_ctx, P4_REM_NAMES, 3u);
-    st->p4_res_comp = resolve_any_comp_by_name(&st->api, host_ctx, P4_RES_NAMES, 3u);
+    st->cond_sensor_comp = resolve_any_comp_by_name(&st->api, host_ctx, COND_SENSOR_NAMES, 1u);
+    st->cond_fresh_comp = resolve_any_comp_by_name(&st->api, host_ctx, COND_FRESH_NAMES, 1u);
+    st->cond_transient_comp = resolve_any_comp_by_name(&st->api, host_ctx, COND_TRANSIENT_NAMES, 1u);
+    st->cond_res_comp = resolve_any_comp_by_name(&st->api, host_ctx, COND_RES_NAMES, 1u);
 
-    if (st->p4_tf_vt != NULL &&
-        bam_component_is_valid(st->p4_tf_comp) &&
+    if (st->cond_tf_vt != NULL &&
+        bam_component_is_valid(st->cond_tf_comp) &&
         bam_component_is_valid(st->vel_comp) &&
-        bam_component_is_valid(st->p4_sensor_comp) &&
-        bam_component_is_valid(st->p4_fresh_comp) &&
-        bam_component_is_valid(st->p4_res_comp)) {
+        bam_component_is_valid(st->cond_sensor_comp) &&
+        bam_component_is_valid(st->cond_fresh_comp) &&
+        bam_component_is_valid(st->cond_res_comp)) {
         BamTermDesc terms[5];
-        terms[0] = bam_term_desc(st->p4_tf_comp, BAM_ACCESS_WRITE, 0u);
+        terms[0] = bam_term_desc(st->cond_tf_comp, BAM_ACCESS_WRITE, 0u);
         terms[1] = bam_term_desc(st->vel_comp, BAM_ACCESS_OPTIONAL_READ, 0u);
-        terms[2] = bam_term_desc(st->p4_sensor_comp, BAM_ACCESS_CHANGED, 0u);
-        terms[3] = bam_term_desc(st->p4_fresh_comp, BAM_ACCESS_ADDED, 0u);
-        terms[4] = bam_term_desc(st->p4_res_comp, BAM_ACCESS_RESOURCE_WRITE, 0u);
+        terms[2] = bam_term_desc(st->cond_sensor_comp, BAM_ACCESS_CHANGED, 0u);
+        terms[3] = bam_term_desc(st->cond_fresh_comp, BAM_ACCESS_ADDED, 0u);
+        terms[4] = bam_term_desc(st->cond_res_comp, BAM_ACCESS_RESOURCE_WRITE, 0u);
 
         rc = register_single_query_system(
-            st, load_ctx, "c_phase4_ecs_system", terms, 5u, c_phase4_ecs_system, c_phase4_run_if
+            st, load_ctx, "c_conditional_filter_system", terms, 5u, c_conditional_filter_system, c_conditional_run_if
         );
         if (rc != BAM_RESULT_OK) {
             free(st);
@@ -689,7 +678,7 @@ BAM_EXPORT BamResult bevy_abi_mod_init(
 
 BAM_EXPORT void bevy_abi_mod_shutdown(BamInstance* instance) {
     g_c_mod_shutdown_called = BAM_TRUE;
-    g_c_phase4_run_enabled = BAM_TRUE;
+    g_c_conditional_run_enabled = BAM_TRUE;
     if (instance != NULL) {
         free(instance);
     }

@@ -393,14 +393,14 @@ fn test_run_if_condition_skips_execution_preserves_changed_ticks_and_contains_pa
         observed: Arc::clone(&observed_changed),
     });
 
-    // S-09: Guest `run_if` trampolines in `bevy_abi_mod_guest_sys` catch panics on the guest side
+    // Guest `run_if` trampolines in `bevy_abi_mod_guest_sys` catch panics on the guest side
     // and return `FfiBool::FALSE` across the `extern "C"` boundary without unwinding.
     unsafe extern "C" fn test_run_if(user_data: *mut c_void) -> FfiBool {
         let ctx = unsafe { &*(user_data as *const CondCtx) };
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             match ctx.mode.load(Ordering::SeqCst) {
                 0 => FfiBool::FALSE,
-                // Non-zero byte (`42`) verifies `FfiBool` accepts any non-zero C truthy value (`C-12`).
+                // Non-zero byte (`42`) verifies `FfiBool` accepts any non-zero C truthy value.
                 1 => FfiBool(42),
                 _ => panic!("simulated panic caught inside guest run_if trampoline"),
             }
@@ -667,7 +667,7 @@ fn test_concurrent_dual_mod_schedule_stress() {
     app.register_mod_component::<Velocity>(ComponentOptions::new().with_default())
         .unwrap();
 
-    // T-03 + L-03: Load both mods with `shadow_copy: true` so parallel tests never share `.bss`.
+    // Load both mods with `shadow_copy: true` so parallel tests never share `.bss`.
     let rust_mod_id = app
         .load_mod_with(&rust_dylib, LoadOptions::new().with_shadow_copy(true))
         .expect("load rust mod");

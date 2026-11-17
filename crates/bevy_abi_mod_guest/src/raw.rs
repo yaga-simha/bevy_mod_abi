@@ -1,5 +1,5 @@
 //! Raw ABI `0.2` descriptors, `BamHostApi` table, and low-level `bevy_abi_mod_guest_sys` escape
-//! hatches (`G-01`).
+//! hatches.
 //!
 //! Exposes the entirety of [`bevy_abi_mod_sys`] (`bevy_abi_mod_guest::raw::*`) alongside
 //! `bevy_abi_mod_guest_sys` validation/lifecycle helpers for VTable callers, custom `"bam.v0.*"`

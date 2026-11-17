@@ -99,7 +99,7 @@ pub(crate) struct SlotSpec {
     pub(crate) valid_body: TokenStream,
 }
 
-/// Unified code-generation specification for one struct field (`M-03`).
+/// Unified code-generation specification for one struct field.
 pub(crate) struct AccessorSpec {
     /// Human-readable category name for duplicate-slot diagnostics.
     pub(crate) collision_label: &'static str,

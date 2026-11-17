@@ -35,11 +35,11 @@
    - [4.1 Dynamic Library Loading (`load_mod_tracked`)](#41-dynamic-library-loading-load_mod_tracked)
    - [4.2 Mod Identification & Tracking (`ModId` and `LoadedMod`)](#42-mod-identification--tracking-modid-and-loadedmod)
    - [4.3 Safe Unloading & The Atomic Tombstone Pattern](#43-safe-unloading--the-atomic-tombstone-pattern)
-   - [4.4 The 4-Phase Shutdown Sequence](#44-the-4-phase-shutdown-sequence)
+   - [4.4 The Four-Step Shutdown Sequence](#44-the-four-step-shutdown-sequence)
    - [4.5 Hot-Reloading Patterns Without OS File Locking](#45-hot-reloading-patterns-without-os-file-locking)
 5. [Fault Tolerance & Panic Containment](#5-fault-tolerance--panic-containment)
    - [5.1 Cross-Runtime Unwinding Panic Hazards](#51-cross-runtime-unwinding-panic-hazards)
-   - [5.2 Two-Tier Panic Containment & `FfiResult::PANIC_CAUGHT`](#52-two-tier-panic-containment--ffiresultpanic_caught)
+   - [5.2 Two-Layer Panic Containment & `FfiResult::PANIC_CAUGHT`](#52-two-layer-panic-containment--ffiresultpanic_caught)
    - [5.3 Automatic System Disabling & World Protection](#53-automatic-system-disabling--world-protection)
    - [5.4 Memory & Allocator Boundary Isolation (The Owner-Frees Rule)](#54-memory--allocator-boundary-isolation-the-owner-frees-rule)
 6. [Complete, Working Code Examples](#6-complete-working-code-examples)
@@ -386,12 +386,12 @@ Dropping `libloading::Library` issues an OS-level `dlclose()`, unmapping the sha
 1. **Schedule Graph Excision (`remove_systems_in_set`):** Removes all systems belonging to `ModSystemSet::Mod(mod_id)` from tracked Bevy schedules (`ScheduleCleanupPolicy::RemoveSystemsOnly`), preventing schedule node accumulation across thousands of hot-reload cycles.
 2. **Atomic Tombstone & Drop-Trampoline Deactivation:** Stores `is_active.store(false, Ordering::Release)` and updates the per-`(WorldId, ComponentUuid)` atomic drop-trampoline pool (`MAX_DROP_TRAMPOLINES = 1024`), guaranteeing that any surviving system reference or unmapped foreign `ComponentDropFn` becomes an immediate safe no-op.
 
-### 4.4 The Shutdown Sequence
+### 4.4 The Four-Step Shutdown Sequence
 `ModHost::try_unload_mod` (and `unload_all` in LIFO reverse load order) executes in strict order:
-- **Phase 1: Tombstone & Drop-Slot Deactivation:** `is_active.store(false, Ordering::Release)` and per-`(WorldId, ComponentUuid)` drop-trampoline snapshot update.
-- **Phase 2: Schedule Excision & ECS Cleanup:** Excises `ModSystemSet::Mod(mod_id)` from schedules, despawns `LoadedModInfo`, and emits `ModUnloaded`.
-- **Phase 3: Guest Teardown Hook:** When the per-inode `SharedLibState` active count transitions `1 -> 0`, calls `bevy_abi_mod_shutdown` **while `.text` is still mapped** so guest closures and heap allocations are freed cleanly.
-- **Phase 4: Dynamic Unmapping:** Drops `libloading::Library` (`dlclose` / `FreeLibrary`).
+- **Step 1: Tombstone & Drop-Slot Deactivation:** `is_active.store(false, Ordering::Release)` and per-`(WorldId, ComponentUuid)` drop-trampoline snapshot update.
+- **Step 2: Schedule Excision & ECS Cleanup:** Excises `ModSystemSet::Mod(mod_id)` from schedules, despawns `LoadedModInfo`, and emits `ModUnloaded`.
+- **Step 3: Guest Teardown Hook:** When the per-inode `SharedLibState` active count transitions `1 -> 0`, calls `bevy_abi_mod_shutdown` **while `.text` is still mapped** so guest closures and heap allocations are freed cleanly.
+- **Step 4: Dynamic Unmapping:** Drops `libloading::Library` (`dlclose` / `FreeLibrary`).
 
 ### 4.5 Hot-Reloading Patterns Without OS File Locking
 To support seamless runtime hot-reloading without Windows `.dll` locks or Unix `ETXTBSY`:
@@ -406,9 +406,9 @@ To support seamless runtime hot-reloading without Windows `.dll` locks or Unix `
 ### 5.1 Cross-Runtime Unwinding Panic Hazards
 Standalone `.cdylib` mods link an isolated Rust `std` runtime; unwinding across `extern "C"` into the host is undefined behavior.
 
-### 5.2 Two-Tier Panic Containment & `FfiResult::PANIC_CAUGHT`
-- **Tier 1 (Guest-Side Containment):** `guest_sdk` (`export_mod!`, `GuestApp::add_system`, `wrap_system_callback!`) wraps guest callbacks in `std::panic::catch_unwind` inside the guest runtime and returns `FfiResult::PANIC_CAUGHT`.
-- **Tier 2 (Host-Side Defense):** `DynamicCSystem::run_unsafe` also guards callbacks with `catch_unwind`.
+### 5.2 Two-Layer Panic Containment & `FfiResult::PANIC_CAUGHT`
+- **Layer 1 (Guest-Side Containment):** `guest_sdk` (`export_mod!`, `GuestApp::add_system`, `wrap_system_callback!`) wraps guest callbacks in `std::panic::catch_unwind` inside the guest runtime and returns `FfiResult::PANIC_CAUGHT`.
+- **Layer 2 (Host-Side Defense):** `DynamicCSystem::run_unsafe` also guards callbacks with `catch_unwind`.
 
 ### 5.3 Configurable `ModErrorPolicy` & `ModSystemFaulted`
 When a system returns an error `FfiResult` or `PANIC_CAUGHT`, `DynamicCSystem` emits a `ModSystemFaulted` event/message and applies the configured `ModErrorPolicy`:

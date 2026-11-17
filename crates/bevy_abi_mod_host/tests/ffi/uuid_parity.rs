@@ -1,4 +1,4 @@
-//! Cross-language SipHash-2-4-128 `ComponentUuid` parity between Rust and ISO C99 (`C-10`).
+//! Cross-language SipHash-2-4-128 `ComponentUuid` parity between Rust and ISO C99.
 
 use bevy_abi_mod_sys::ComponentUuid;
 use core::ffi::c_char;
@@ -34,7 +34,7 @@ fn test_cross_language_uuid_parity_matrix() {
     };
 
     let test_cases = [
-        // 1. Standard namespaced ECS names (`C-10`)
+        // 1. Standard namespaced ECS names
         "testbed::Position",
         "testbed::Velocity",
         "testbed::CombatHealth",

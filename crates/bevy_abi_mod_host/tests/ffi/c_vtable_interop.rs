@@ -1,4 +1,4 @@
-//! Cross-language C99 shared-library VTable mutation interop test (`M-04`, `M-05`, `C-04`).
+//! Cross-language C99 shared-library VTable mutation interop test.
 
 use bevy_abi_mod_host::{AbiModPlugin, LoadOptions, ModAppExt, ModComponent, ModRegistry};
 use bevy_abi_mod_host_sys::{LoadContext, host_get_proc_address, host_load_host_ctx};

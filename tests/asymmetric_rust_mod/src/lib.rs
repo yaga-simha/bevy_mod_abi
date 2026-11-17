@@ -77,7 +77,7 @@ impl GuestComponent for RustModCustomData {
 /// POD resource layout mirrored in the Rust guest mod.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, AbiPod)]
-pub struct Phase4RustRes {
+pub struct RustFilterTelemetry {
     pub scale: f32,
     pub matched_rows: u32,
     pub optional_vel_hits: u32,
@@ -98,7 +98,7 @@ struct RawPos {
 
 static PANIC_TRIGGER: AtomicBool = AtomicBool::new(false);
 static SHUTDOWN_CALLED: AtomicBool = AtomicBool::new(false);
-static PHASE4_RUST_RUN_ENABLED: AtomicBool = AtomicBool::new(true);
+static CONDITIONAL_RUST_RUN_ENABLED: AtomicBool = AtomicBool::new(true);
 
 /// Triggers a simulated panic during the next execution of `rust_panicking`.
 ///
@@ -127,13 +127,13 @@ pub unsafe extern "C" fn asymmetric_rust_mod_was_shutdown() -> bool {
     SHUTDOWN_CALLED.load(Ordering::SeqCst)
 }
 
-/// Toggles the Phase 4 conditional system `run_if` predicate in `asymmetric_rust_mod`.
+/// Toggles the conditional filter system `run_if` predicate in `asymmetric_rust_mod`.
 ///
 /// # Safety
 /// Caller must ensure the dynamic library remains loaded during the call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn asymmetric_rust_mod_set_phase4_enabled(enabled: FfiBool) {
-    PHASE4_RUST_RUN_ENABLED.store(enabled.get(), Ordering::SeqCst);
+pub unsafe extern "C" fn asymmetric_rust_mod_set_conditional_enabled(enabled: FfiBool) {
+    CONDITIONAL_RUST_RUN_ENABLED.store(enabled.get(), Ordering::SeqCst);
 }
 
 // ============================================================================
@@ -182,17 +182,17 @@ fn resolve_any_named(app: &GuestApp<'_>, candidates: &[&CStr]) -> Option<BamComp
 }
 
 // ============================================================================
-// 5. Per-World `setup` (`L-02`, `L-08`, `G-02`)
+// 5. Per-World `setup`
 // ============================================================================
 
 fn setup(app: &mut GuestApp<'_>) -> FfiResult {
     app.on_shutdown(|| {
         SHUTDOWN_CALLED.store(true, Ordering::SeqCst);
         PANIC_TRIGGER.store(false, Ordering::SeqCst);
-        PHASE4_RUST_RUN_ENABLED.store(true, Ordering::SeqCst);
+        CONDITIONAL_RUST_RUN_ENABLED.store(true, Ordering::SeqCst);
     });
 
-    // Register `asymmetric_rust_mod::RustModCustomData` dynamically (`C-10`, `G-07`).
+    // Register `asymmetric_rust_mod::RustModCustomData` dynamically.
     let custom_comp = match app.register_component::<RustModCustomData>() {
         Ok(h) => h,
         Err(err) => return err,
@@ -464,87 +464,44 @@ fn setup(app: &mut GuestApp<'_>) -> FfiResult {
         }
     }
 
-    // 6. Phase 4 Conditional System (`Optional` + `Changed` + `Added` + `Resource` + `run_if`)
-    // SAFETY: `PositionVTable` matches the `x, y, z: f32` VTable layout of `Phase4Transform`.
-    let p4_tf_resolved = unsafe {
-        resolve_vtable_and_handle::<PositionVTable>(
-            &host,
-            &[
-                c"bam.v0.testbed::Phase4Transform.vtable",
-                c"bam.v0.e2e::asymmetric_mods::Phase4Transform.vtable",
-                c"bam.v0.ffi::sparse_and_resources::p4_resources_and_optional::Phase4Transform.vtable",
-            ],
-        )
+    // 6. Conditional Filter System (`Optional` + `Changed` + `Added` + `Resource` + `run_if`)
+    // SAFETY: `PositionVTable` matches the `x, y, z: f32` VTable layout of `FilteredTransform`.
+    let cond_tf_resolved = unsafe {
+        resolve_vtable_and_handle::<PositionVTable>(&host, &[c"bam.v0.testbed::FilteredTransform.vtable"])
     };
-    let p4_sensor = resolve_any_named(
-        app,
-        &[
-            c"testbed::Phase4Sensor",
-            c"e2e::asymmetric_mods::Phase4Sensor",
-            c"ffi::sparse_and_resources::p4_resources_and_optional::Phase4Sensor",
-        ],
-    );
-    let p4_fresh = resolve_any_named(
-        app,
-        &[
-            c"testbed::Phase4FreshTag",
-            c"e2e::asymmetric_mods::Phase4FreshTag",
-            c"ffi::sparse_and_resources::p4_resources_and_optional::Phase4FreshTag",
-        ],
-    );
-    let p4_removable = resolve_any_named(
-        app,
-        &[
-            c"testbed::Phase4Removable",
-            c"e2e::asymmetric_mods::Phase4Removable",
-            c"ffi::sparse_and_resources::p4_resources_and_optional::Phase4Removable",
-        ],
-    );
-    let p4_res = resolve_any_named(
-        app,
-        &[
-            c"testbed::Phase4RustRes",
-            c"e2e::asymmetric_mods::Phase4RustRes",
-            c"ffi::sparse_and_resources::p4_resources_and_optional::Phase4RustRes",
-        ],
-    );
-    let nametag_comp = resolve_any_named(
-        app,
-        &[
-            c"testbed::NameTag",
-            c"e2e::asymmetric_mods::NameTag",
-            c"ffi::sparse_and_resources::p4_resources_and_optional::NameTag",
-            c"NameTag",
-        ],
-    );
+    let cond_sensor = resolve_any_named(app, &[c"testbed::ChangeSensor"]);
+    let cond_fresh = resolve_any_named(app, &[c"testbed::FreshSpawnTag"]);
+    let cond_transient = resolve_any_named(app, &[c"testbed::TransientMarker"]);
+    let cond_res = resolve_any_named(app, &[c"testbed::RustFilterTelemetry"]);
+    let nametag_comp = resolve_any_named(app, &[c"testbed::NameTag", c"NameTag"]);
 
     if let (
-        Some((&p4_tf_vt, p4_tf_comp)),
+        Some((&cond_tf_vt, cond_tf_comp)),
         Some((&vel_vt, vel_comp)),
         Some(sensor_comp),
         Some(fresh_comp),
         Some(res_comp),
-    ) = (p4_tf_resolved, vel_resolved, p4_sensor, p4_fresh, p4_res)
+    ) = (cond_tf_resolved, vel_resolved, cond_sensor, cond_fresh, cond_res)
     {
         let status = app
-            .system(c"rust_phase4_ecs_system")
+            .system(c"rust_conditional_filter_system")
             .query(|q| {
-                q.write_handle(p4_tf_comp)
+                q.write_handle(cond_tf_comp)
                     .optional_read_handle(vel_comp)
                     .changed_handle(sensor_comp)
                     .added_handle(fresh_comp)
             })
             .resource_write_handle(res_comp)
-            .run_if_fn(|| PHASE4_RUST_RUN_ENABLED.load(Ordering::SeqCst))
+            .run_if_fn(|| CONDITIONAL_RUST_RUN_ENABLED.load(Ordering::SeqCst))
             .build(move |ctx| {
                 let (Some(get_px), Some(set_px), Some(get_vx)) =
-                    (p4_tf_vt.get_x, p4_tf_vt.set_x, vel_vt.get_x)
+                    (cond_tf_vt.get_x, cond_tf_vt.set_x, vel_vt.get_x)
                 else {
                     return FfiResult::NULL_POINTER;
                 };
 
                 let (scale, need_spawn_default) = {
-                    let Some(res) = ctx.resource::<Phase4RustRes>(0) else {
+                    let Some(res) = ctx.resource::<RustFilterTelemetry>(0) else {
                         return FfiResult::INVALID_COMPONENT;
                     };
                     (res.scale, res.spawned_default_entity == 0)
@@ -585,12 +542,12 @@ fn setup(app: &mut GuestApp<'_>) -> FfiResult {
 
                         let mut pos_slice = chunk.mutable_slice(0);
                         for row in 0..count {
-                            let Some(p_raw) = pos_slice.get_mut_ptr(row, p4_tf_vt.header.size)
+                            let Some(p_raw) = pos_slice.get_mut_ptr(row, cond_tf_vt.header.size)
                             else {
                                 return FfiResult::NULL_POINTER;
                             };
                             let p_ptr = p_raw.cast::<c_void>();
-                            // SAFETY: `p_ptr` points to a valid `Phase4Transform` element.
+                            // SAFETY: `p_ptr` points to a valid `FilteredTransform` element.
                             let px = unsafe { get_px(p_ptr) };
                             if let Some(ref v_vec) = vel_ptrs {
                                 // SAFETY: `v_vec[row]` points to a valid `Velocity` element.
@@ -610,7 +567,7 @@ fn setup(app: &mut GuestApp<'_>) -> FfiResult {
                             }
                             matched_delta += 1;
 
-                            if let Some(rem_comp) = p4_removable {
+                            if let Some(rem_comp) = cond_transient {
                                 let _ = cmds.remove(entities_copy[row], rem_comp);
                             }
                         }
@@ -618,7 +575,7 @@ fn setup(app: &mut GuestApp<'_>) -> FfiResult {
                 }
 
                 if spawned_id != 0 || matched_delta > 0 || opt_vel_delta > 0 {
-                    let Some(res_mut) = ctx.resource_mut::<Phase4RustRes>(0) else {
+                    let Some(res_mut) = ctx.resource_mut::<RustFilterTelemetry>(0) else {
                         return FfiResult::INVALID_COMPONENT;
                     };
                     if spawned_id != 0 {

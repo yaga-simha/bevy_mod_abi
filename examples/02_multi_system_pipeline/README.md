@@ -6,9 +6,9 @@
 
 ## What It Shows
 
-1. **Declarative multi-system builder (`G-02`):** Registers `KinematicsMovementSystem`, `FleetLifecycleSystem` (`.after(c"KinematicsMovementSystem")`), and `PlayerRegenSystem` (`.after(c"FleetLifecycleSystem").run_if_fn(...)`).
+1. **Declarative multi-system builder:** Registers `KinematicsMovementSystem`, `FleetLifecycleSystem` (`.after(c"KinematicsMovementSystem")`), and `PlayerRegenSystem` (`.after(c"FleetLifecycleSystem").run_if_fn(...)`).
 2. **Archetype inclusion & exclusion filters:** Uses `.without::<PlayerTag>()` to apply drone attrition without damaging the player ship, and `.with::<PlayerTag>()` to regenerate only player entities.
-3. **Handle-based batched spawning (`C-05`, `P-05`):** Resolves `BamComponent` handles once at `GuestPlugin::build` time and spawns reinforcement drones in one archetype transition via `GuestCommands::spawn(&[SpawnEntry::new(...), ...])` alongside `GuestCommands::despawn`.
+3. **Handle-based batched spawning:** Resolves `BamComponent` handles once at `GuestPlugin::build` time and spawns reinforcement drones in one archetype transition via `GuestCommands::spawn(&[SpawnEntry::new(...), ...])` alongside `GuestCommands::despawn`.
 4. **Change-tick propagation:** Disjoint mutable borrows (`Chunk::component_read_write`, `Chunk::entities_and_component_mut`) mark Bevy change ticks once per chunk so host `Changed<Position>` and `Changed<Health>` queries observe guest mutations.
 
 ## Commands

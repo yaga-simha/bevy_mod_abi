@@ -15,7 +15,7 @@ use crate::{
     },
 };
 
-/// Safe query chunk iterator wrapping an active [`BamIter`] handle (`N-02`).
+/// Safe query chunk iterator wrapping an active [`BamIter`] handle.
 ///
 /// Constructing a `ChunkIter` directly from raw C pointers in safe Rust is rejected at compile time:
 ///
@@ -122,13 +122,13 @@ impl<'a> ChunkIter<'a> {
         ChunkSliceMut::from_validated(self.inner.mutable_slice(col))
     }
 
-    /// Returns an untracked [`ChunkSliceMut`] view over dense write column `col` (`P-04`).
+    /// Returns an untracked [`ChunkSliceMut`] view over dense write column `col`.
     #[inline]
     pub fn mutable_slice_untracked(&mut self, col: usize) -> ChunkSliceMut<'_> {
         ChunkSliceMut::from_validated(self.inner.mutable_slice_untracked(col))
     }
 
-    /// Marks rows `start_row..start_row + row_count` in writable column `col` as changed (`P-04`).
+    /// Marks rows `start_row..start_row + row_count` in writable column `col` as changed.
     #[inline]
     pub fn mark_changed_range(
         &mut self,
@@ -139,32 +139,32 @@ impl<'a> ChunkIter<'a> {
         self.inner.mark_changed_range(col, start_row, row_count)
     }
 
-    /// Marks single row `row` in writable column `col` as changed (`P-04`).
+    /// Marks single row `row` in writable column `col` as changed.
     #[inline]
     pub fn mark_changed(&mut self, col: usize, row: usize) -> FfiResult {
         self.inner.mark_changed(col, row)
     }
 
-    /// Materializes indirect read-only sparse-set row pointers `[ *const u8; current_len ]` (`P-02`).
+    /// Materializes indirect read-only sparse-set row pointers `[ *const u8; current_len ]`.
     #[inline]
     pub fn rows<T: AbiPod>(&mut self, col: usize) -> Option<SparseRows<'_, T>> {
         self.inner.rows_checked::<T>(col, None)
     }
 
-    /// Materializes indirect read-only sparse-set row pointers for `T: GuestComponent` (`C-13` + `P-02`).
+    /// Materializes indirect read-only sparse-set row pointers for `T: GuestComponent`.
     #[inline]
     pub fn component_rows<T: GuestComponent>(&mut self, col: usize) -> Option<SparseRows<'_, T>> {
         let filter = guest_uuid_filter::<T>(self.inner.host().manifest_name());
         self.inner.rows_checked::<T>(col, Some(filter))
     }
 
-    /// Materializes indirect mutable sparse-set row pointers `[ *mut u8; current_len ]` (`P-02`).
+    /// Materializes indirect mutable sparse-set row pointers `[ *mut u8; current_len ]`.
     #[inline]
     pub fn rows_mut<T: AbiPod>(&mut self, col: usize) -> Option<SparseRowsMut<'_, T>> {
         self.inner.rows_mut_checked::<T>(col, None)
     }
 
-    /// Materializes indirect mutable sparse-set row pointers for `T: GuestComponent` (`C-13` + `P-02`).
+    /// Materializes indirect mutable sparse-set row pointers for `T: GuestComponent`.
     #[inline]
     pub fn component_rows_mut<T: GuestComponent>(
         &mut self,
@@ -174,14 +174,14 @@ impl<'a> ChunkIter<'a> {
         self.inner.rows_mut_checked::<T>(col, Some(filter))
     }
 
-    /// Borrows singleton resource `R` (`R: AbiPod`) declared at `term_index` in this query (`C-05`).
+    /// Borrows singleton resource `R` (`R: AbiPod`) declared at `term_index` in this query.
     #[inline]
     pub fn resource<R: AbiPod>(&self, term_index: usize) -> Option<&R> {
         self.inner.resource_checked::<R>(term_index, None)
     }
 
     /// Borrows singleton resource `R` (`R: GuestComponent`) declared at `term_index`, validating
-    /// `R`'s UUID (`C-05` + `C-13`).
+    /// `R`'s UUID.
     #[inline]
     pub fn component_resource<R: GuestComponent>(&self, term_index: usize) -> Option<&R> {
         let filter = guest_uuid_filter::<R>(self.inner.host().manifest_name());
@@ -189,14 +189,14 @@ impl<'a> ChunkIter<'a> {
     }
 
     /// Mutably borrows singleton resource `R` (`R: AbiPod`) declared with `RESOURCE_WRITE` at
-    /// `term_index` (`C-05`).
+    /// `term_index`.
     #[inline]
     pub fn resource_mut<R: AbiPod>(&mut self, term_index: usize) -> Option<&mut R> {
         self.inner.resource_mut_checked::<R>(term_index, None)
     }
 
     /// Mutably borrows singleton resource `R` (`R: GuestComponent`) declared at `term_index`,
-    /// validating `R`'s UUID (`C-05` + `C-13`).
+    /// validating `R`'s UUID.
     #[inline]
     pub fn component_resource_mut<R: GuestComponent>(
         &mut self,
@@ -240,7 +240,7 @@ impl<'a> ChunkIter<'a> {
             .ok_or(FfiResult::NOT_FOUND)
     }
 
-    /// Processes disjoint chunk partitions in parallel on the host `ComputeTaskPool` (`P-07`).
+    /// Processes disjoint chunk partitions in parallel on the host `ComputeTaskPool`.
     ///
     /// Panics inside `f` are caught per worker task and surfaced as [`FfiResult::PANIC_CAUGHT`]
     /// without unwinding across `extern "C"`.
@@ -259,7 +259,7 @@ impl<'a> ChunkIter<'a> {
         })
     }
 
-    /// Fallible variant of [`Self::par_for_each`] propagating non-`OK` [`IntoSystemResult`] returns (`P-07`).
+    /// Fallible variant of [`Self::par_for_each`] propagating non-`OK` [`IntoSystemResult`] returns.
     #[inline]
     pub fn par_try_for_each<F, R>(&mut self, f: F) -> FfiResult
     where
@@ -276,7 +276,7 @@ impl<'a> ChunkIter<'a> {
         })
     }
 
-    /// Wraps this iterator in a [`TypedChunkIter`] for [`QueryTuple`] `Q` (`G-03`).
+    /// Wraps this iterator in a [`TypedChunkIter`] for [`QueryTuple`] `Q`.
     #[inline]
     pub fn typed<Q: QueryTuple>(&mut self) -> TypedChunkIter<'_, 'a, Q> {
         TypedChunkIter {
@@ -285,13 +285,13 @@ impl<'a> ChunkIter<'a> {
         }
     }
 
-    /// Drains unread POD messages (`M: AbiPod`) from `term_index` (`F-02`).
+    /// Drains unread POD messages (`M: AbiPod`) from `term_index`.
     #[inline]
     pub fn read_pod_messages<M: AbiPod>(&mut self, term_index: usize) -> Result<Vec<M>, FfiResult> {
         self.inner.drain_messages_checked::<M>(term_index, None)
     }
 
-    /// Drains unread messages (`M: GuestComponent`) from `term_index`, validating `M`'s UUID (`F-02`).
+    /// Drains unread messages (`M: GuestComponent`) from `term_index`, validating `M`'s UUID.
     #[inline]
     pub fn read_messages<M: GuestComponent>(
         &mut self,
@@ -302,13 +302,13 @@ impl<'a> ChunkIter<'a> {
             .drain_messages_checked::<M>(term_index, Some(filter))
     }
 
-    /// Sends a POD message (`M: AbiPod`) on `term_index` declared with `MESSAGE_WRITE` (`F-02`).
+    /// Sends a POD message (`M: AbiPod`) on `term_index` declared with `MESSAGE_WRITE`.
     #[inline]
     pub fn send_pod_message<M: AbiPod>(&mut self, term_index: usize, msg: &M) -> FfiResult {
         self.inner.send_message_checked::<M>(term_index, None, msg)
     }
 
-    /// Sends a message (`M: GuestComponent`) on `term_index`, validating `M`'s UUID (`F-02`).
+    /// Sends a message (`M: GuestComponent`) on `term_index`, validating `M`'s UUID.
     #[inline]
     pub fn send_message<M: GuestComponent>(&mut self, term_index: usize, msg: &M) -> FfiResult {
         let filter = guest_uuid_filter::<M>(self.inner.host().manifest_name());

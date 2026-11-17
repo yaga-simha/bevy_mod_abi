@@ -1,4 +1,4 @@
-//! `#[repr(C)]` magic + generation handle headers (`S-08`) and `HostContext` (`BamHostCtx`).
+//! `#[repr(C)]` magic + generation handle headers and `HostContext` (`BamHostCtx`).
 //!
 //! Every concrete host struct cast to/from an opaque C-ABI handle (`HostContext`, `LoadContext`,
 //! `HostSystemCtx`, `HostIter`, and `HostCommands`) begins at byte offset `0` with [`HandleHeader`]:
@@ -165,7 +165,7 @@ pub(crate) unsafe fn validate_handle_mut<'a, T>(
     Ok(unsafe { &mut *ptr.cast::<T>() })
 }
 
-/// Concrete world-scoped registry and diagnostic context backing opaque [`BamHostCtx`] (`C-04`, `C-07`).
+/// Concrete world-scoped registry and diagnostic context backing opaque [`BamHostCtx`].
 ///
 /// Embedded inside `LoadContext` during `bevy_abi_mod_init` and inside `HostSystemCtx` during
 /// `GuestSystem::run_unsafe`. Never shared concurrently across threads.
@@ -230,7 +230,7 @@ impl HostContext {
         self.snapshot = snapshot;
     }
 
-    /// Records a human-readable UTF-8 diagnostic message on this context (`C-07`).
+    /// Records a human-readable UTF-8 diagnostic message on this context.
     #[inline]
     pub fn set_last_error(&self, message: impl AsRef<str>) {
         if let Ok(mut buf) = self.last_error.try_borrow_mut() {

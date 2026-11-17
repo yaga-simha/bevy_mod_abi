@@ -1,4 +1,4 @@
-//! Deterministic CI Regression Gate (`X-03`).
+//! Deterministic CI Regression Gate.
 //!
 //! - On **Linux** (`cfg(target_os = "linux")`): Runs under `iai-callgrind` (`Valgrind` Callgrind)
 //!   to enforce deterministic instruction-count and cache-access regression gates across PRs
@@ -188,7 +188,7 @@ unsafe extern "C" fn sparse_cb(sys_ctx: *mut BamSystemCtx, ud: *mut c_void) -> F
     let _ = unsafe { host_sys_query(sys_ctx, 0, &mut iter) };
     let mut chunks = 0usize;
     let mut len = 0usize;
-    // SAFETY: Indirect sparse row iteration (`P-02`).
+    // SAFETY: Indirect sparse row iteration.
     while unsafe { host_iter_next_chunk(iter, &mut len) } != FfiBool::FALSE {
         chunks += 1;
         let p = unsafe { host_iter_column_mutable(iter, 0) }.cast::<Position>();
@@ -415,7 +415,7 @@ pub fn run_sparse_batching_gate() {
     app.update();
     assert_eq!(
         *chunks_seen, 1,
-        "1,000 entities in one sparse archetype must batch into 1 indirect chunk (P-02)"
+        "1,000 entities in one sparse archetype must batch into 1 indirect chunk"
     );
 }
 
@@ -517,7 +517,7 @@ fn main() {
     run_command_arena_zero_alloc_gate();
     println!("  [PASS] command_arena_1k: 0 steady-state heap allocations for 1,000 cmd_inserts");
     run_sparse_batching_gate();
-    println!("  [PASS] sparse_1k: 1,000 sparse entities batched into 1 FFI chunk (P-02)");
+    println!("  [PASS] sparse_1k: 1,000 sparse entities batched into 1 FFI chunk");
     run_batched_spawn4_gate();
     println!("  [PASS] batched_spawn4: 256 4-component entities spawned in single archetype move");
 }

@@ -1,4 +1,4 @@
-//! Lifecycle & safety regressions (`S-05`, `S-06`, `S-07`, `L-02`, `G-05`).
+//! Lifecycle, symbol eviction, load-context guard, isolation & panic-abort safety tests.
 
 use crate::DROP_SLOT_POOL_RWLOCK;
 use crate::support::{Position, TempDylibCopy, Velocity, ensure_guest_mods_built, fixture_dylib};
@@ -22,21 +22,21 @@ unsafe extern "C" fn noop_sys_cb(_ctx: *mut BamSystemCtx, _user_data: *mut c_voi
 }
 
 // ============================================================================
-// S-05: Clear guest VTables & symbols on unload with zero global symbol state
+// Clear guest VTables & symbols on unload with zero global symbol state
 // ============================================================================
 
 #[test]
-fn regression_s05_stale_vtable_after_unload() {
+fn stale_vtable_and_symbols_evicted_on_unload() {
     let _pool_guard = DROP_SLOT_POOL_RWLOCK
         .read()
         .unwrap_or_else(|e| e.into_inner());
-    let dylib_path = fixture_dylib("s05_vtable_mod");
+    let dylib_path = fixture_dylib("vtable_eviction_mod");
 
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
     let mod_id = app
         .load_mod_with(&dylib_path, LoadOptions::new().with_shadow_copy(true))
-        .expect("load s05_vtable_mod succeeds");
+        .expect("load vtable_eviction_mod succeeds");
 
     let sentinel_word: u64 = 0xABCD;
     // SAFETY: `sentinel_word` outlives `mod_id`, which is unloaded before `sentinel_word` drops.
@@ -44,7 +44,7 @@ fn regression_s05_stale_vtable_after_unload() {
         app.world_mut()
             .resource_mut::<ModRegistry>()
             .register_mod_symbol(
-                "s05_custom_fn",
+                "custom_vtable_fn",
                 (&sentinel_word as *const u64).cast::<c_void>(),
                 mod_id,
             );
@@ -54,23 +54,23 @@ fn regression_s05_stale_vtable_after_unload() {
         let reg = app.world().resource::<ModRegistry>();
         let comp = reg
             .snapshot()
-            .get_by_name("s05_vtable_mod::S05GuestComp")
-            .expect("s05_vtable_mod::S05GuestComp registered");
+            .get_by_name("vtable_eviction_mod::GuestVTableComp")
+            .expect("vtable_eviction_mod::GuestVTableComp registered");
         assert!(!comp.vtable_ptr.is_null());
         assert!(comp.drop_fn.is_some());
         assert_eq!(comp.owner, Some(mod_id));
         assert!(
             reg.snapshot()
-                .resolve_symbol("bam.v0.s05_vtable_mod::S05GuestComp.vtable")
+                .resolve_symbol("bam.v0.vtable_eviction_mod::GuestVTableComp.vtable")
                 .is_some()
         );
         assert!(
             reg.snapshot()
-                .resolve_symbol("bam.v0.s05_custom_fn")
+                .resolve_symbol("bam.v0.custom_vtable_fn")
                 .is_some()
         );
 
-        // Separate empty world registry has zero access to `app`'s symbols (`C-04` per-world isolation).
+        // Separate empty world registry has zero access to `app`'s symbols (per-world isolation).
         let mut other_load = LoadContext::new(ModRegistry::new());
         // SAFETY: Valid active `other_load`.
         let other_hctx = unsafe { host_load_host_ctx(other_load.as_ffi_ptr()) };
@@ -78,7 +78,7 @@ fn regression_s05_stale_vtable_after_unload() {
         let isolated_lookup = unsafe {
             host_get_proc_address(
                 other_hctx,
-                c"bam.v0.s05_vtable_mod::S05GuestComp.vtable".as_ptr(),
+                c"bam.v0.vtable_eviction_mod::GuestVTableComp.vtable".as_ptr(),
             )
         };
         assert!(
@@ -95,7 +95,7 @@ fn regression_s05_stale_vtable_after_unload() {
         let active_sym = unsafe {
             host_get_proc_address(
                 active_hctx,
-                c"bam.v0.s05_vtable_mod::S05GuestComp.vtable".as_ptr(),
+                c"bam.v0.vtable_eviction_mod::GuestVTableComp.vtable".as_ptr(),
             )
         };
         assert!(!active_sym.is_null());
@@ -106,13 +106,13 @@ fn regression_s05_stale_vtable_after_unload() {
 
     // Unload the mod (`dlclose`).
     app.unload_mod(mod_id)
-        .expect("unload s05_vtable_mod succeeds");
+        .expect("unload vtable_eviction_mod succeeds");
 
     {
         let reg = app.world().resource::<ModRegistry>();
         let comp = reg
             .snapshot()
-            .get_by_name("s05_vtable_mod::S05GuestComp")
+            .get_by_name("vtable_eviction_mod::GuestVTableComp")
             .expect("ComponentId binding preserved across unload for hot-reload");
         assert_eq!(comp.component_id, comp_id_before);
         assert!(
@@ -123,13 +123,13 @@ fn regression_s05_stale_vtable_after_unload() {
         assert!(comp.owner.is_none(), "owner must be cleared on unload");
         assert!(
             reg.snapshot()
-                .resolve_symbol("bam.v0.s05_vtable_mod::S05GuestComp.vtable")
+                .resolve_symbol("bam.v0.vtable_eviction_mod::GuestVTableComp.vtable")
                 .is_none(),
             "guest VTable symbol must be evicted on unload"
         );
         assert!(
             reg.snapshot()
-                .resolve_symbol("bam.v0.s05_custom_fn")
+                .resolve_symbol("bam.v0.custom_vtable_fn")
                 .is_none(),
             "mod-owned custom symbol must be evicted on unload"
         );
@@ -137,16 +137,16 @@ fn regression_s05_stale_vtable_after_unload() {
 }
 
 // ============================================================================
-// S-06: Failed init / strict validation rolls back before dlclose
+// Failed init / strict validation rolls back before dlclose
 // ============================================================================
 
 #[test]
-fn regression_s06_init_failure_rolls_back() {
+fn init_or_strict_validation_failure_rolls_back() {
     let _pool_guard = DROP_SLOT_POOL_RWLOCK
         .write()
         .unwrap_or_else(|e| e.into_inner());
-    let dylib_fail = fixture_dylib("s06_fail_init");
-    let dylib_strict = fixture_dylib("s06_strict_fail");
+    let dylib_fail = fixture_dylib("init_rollback_mod");
+    let dylib_strict = fixture_dylib("unresolved_ordering_mod");
 
     let baseline_slots = available_drop_trampoline_slots();
 
@@ -167,13 +167,13 @@ fn regression_s06_init_failure_rolls_back() {
     let reg = app.world().resource::<ModRegistry>();
     assert!(
         reg.snapshot()
-            .get_by_name("s06_fail_init::S06RollbackComp")
+            .get_by_name("init_rollback_mod::RollbackComp")
             .is_none(),
         "LoadTransaction must roll back newly registered dynamic component before dlclose"
     );
     assert!(
         reg.snapshot()
-            .resolve_symbol("bam.v0.s06_fail_init::S06RollbackComp.vtable")
+            .resolve_symbol("bam.v0.init_rollback_mod::RollbackComp.vtable")
             .is_none()
     );
     assert!(app.world().resource::<ModHost>().is_empty());
@@ -199,36 +199,36 @@ fn regression_s06_init_failure_rolls_back() {
     assert!(
         reg_after
             .snapshot()
-            .get_by_name("s06_strict_fail::S06StrictTempComp")
+            .get_by_name("unresolved_ordering_mod::StrictTempComp")
             .is_none()
     );
     assert!(
         reg_after
             .snapshot()
-            .resolve_symbol("bam.v0.s06_strict_fail::S06StrictTempComp.vtable")
+            .resolve_symbol("bam.v0.unresolved_ordering_mod::StrictTempComp.vtable")
             .is_none()
     );
     assert!(app.world().resource::<ModHost>().is_empty());
 }
 
 // ============================================================================
-// S-07 & S-08: LoadContext magic + generation + active-scope validation
+// LoadContext magic + generation + active-scope validation
 // ============================================================================
 
 #[test]
-fn regression_s07_register_outside_init_rejected() {
+fn register_outside_init_context_rejected() {
     let mut world = World::new();
     let reg = ModRegistry::new();
     let active = Arc::new(AtomicBool::new(true));
 
     let comp_desc = ComponentDesc::new(
-        c"s07::Dyn".as_ptr(),
-        ComponentUuid::from_parts("s07::Dyn", 4, 4, 0),
+        c"scope_guard::Dyn".as_ptr(),
+        ComponentUuid::from_parts("scope_guard::Dyn", 4, 4, 0),
         4,
         4,
     );
     let sys_desc = BamSystemDesc::new(
-        c"s07_sys".as_ptr(),
+        c"scope_guard_sys".as_ptr(),
         core::ptr::null(),
         0,
         noop_sys_cb,
@@ -293,7 +293,7 @@ fn regression_s07_register_outside_init_rejected() {
             assert_eq!(
                 host_resolve_component(
                     host_ptr,
-                    c"s07::Dyn".as_ptr(),
+                    c"scope_guard::Dyn".as_ptr(),
                     core::ptr::null(),
                     &mut out_comp,
                 ),
@@ -327,11 +327,11 @@ fn regression_s07_register_outside_init_rejected() {
 }
 
 // ============================================================================
-// L-02: Per-World `BamInstance` isolation across simultaneous multi-World loads
+// Per-World `BamInstance` isolation across simultaneous multi-World loads
 // ============================================================================
 
 #[test]
-fn regression_l02_multi_world_per_instance_isolation() {
+fn multi_world_per_instance_isolation() {
     let (rust_dylib, c_dylib) = ensure_guest_mods_built();
 
     let mut app_a = App::new();
@@ -453,30 +453,30 @@ fn regression_l02_multi_world_per_instance_isolation() {
 }
 
 // ============================================================================
-// G-05: `panic = "abort"` Rust guest fixture deterministically aborts subprocess
+// `panic = "abort"` Rust guest fixture deterministically aborts subprocess
 // ============================================================================
 
 #[test]
 #[cfg(not(miri))]
-fn regression_g05_panic_abort_guest_terminates_subprocess() {
+fn panic_abort_guest_terminates_subprocess() {
     let fixture_root = crate::support::fixture_dir();
     let _ = fixture_dylib("panic_abort_mod");
 
     rusty_fork::fork(
-        "regressions::regression_g05_panic_abort_guest_terminates_subprocess",
+        "isolation_and_rollback::panic_abort_guest_terminates_subprocess",
         rusty_fork::rusty_fork_id!(),
         |cmd| {
             cmd.env("BAM_FIXTURE_DIR", &fixture_root);
         },
         |child, file| {
-            let status = child.wait().expect("wait on G-05 forked child process");
-            file.rewind().expect("rewind G-05 child captured output");
+            let status = child.wait().expect("wait on forked panic-abort child process");
+            file.rewind().expect("rewind child captured output");
             let mut output = String::new();
             file.read_to_string(&mut output)
-                .expect("read G-05 child captured output");
+                .expect("read child captured output");
 
             assert!(
-                output.contains("G05_ARMED_OK"),
+                output.contains("PANIC_ABORT_ARMED_OK"),
                 "child must load panic_abort_mod and complete 1 healthy tick before aborting; output={output}"
             );
             assert!(
@@ -493,7 +493,7 @@ fn regression_g05_panic_abort_guest_terminates_subprocess() {
             }
         },
         || {
-            let abort_dylib = TempDylibCopy::new(&fixture_dylib("panic_abort_mod"), "g05_abort");
+            let abort_dylib = TempDylibCopy::new(&fixture_dylib("panic_abort_mod"), "panic_abort");
             let mut app = App::new();
             app.add_plugins(AbiModPlugin);
 
@@ -521,7 +521,7 @@ fn regression_g05_panic_abort_guest_terminates_subprocess() {
                 arm_fn();
             }
 
-            println!("G05_ARMED_OK");
+            println!("PANIC_ABORT_ARMED_OK");
             let _ = std::io::stdout().flush();
 
             // 2. Next tick triggers `panic!(...)` inside the `panic = "abort"` guest `.cdylib`,
@@ -531,5 +531,5 @@ fn regression_g05_panic_abort_guest_terminates_subprocess() {
             unreachable!("process must have aborted inside panic=abort guest callback");
         },
     )
-    .expect("rusty_fork G-05 child fork execution");
+    .expect("rusty_fork child fork execution");
 }

@@ -1,5 +1,5 @@
 //! Counting-allocator proof that `GuestSystem` + `CommandArena` + batched `cmd_spawn` perform
-//! **zero** heap allocations in steady-state frames (`P-05`, `S-04`, ADR 0003).
+//! **zero** heap allocations in steady-state frames (ADR 0003).
 
 use bevy_abi_mod_host_sys::{ComponentOptions, GuestSystem, HOST_API, ModRegistry};
 use bevy_abi_mod_sys::{
@@ -83,7 +83,7 @@ impl ModComponent for Pos {
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
 struct PaddedPayload {
     tag: u8,
-    // 7 bytes of natural C inter-field alignment padding (`S-04` `MaybeUninit<u8>` copy test).
+    // 7 bytes of natural C inter-field alignment padding (``MaybeUninit<u8>` copy test).
     value: u64,
 }
 

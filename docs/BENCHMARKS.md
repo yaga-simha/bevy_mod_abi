@@ -1,6 +1,6 @@
 # Benchmarks & Deterministic Regression Gates (`ABI 0.2.0`)
 
-This document records the **canonical benchmark scenarios (`X-03`)**, **deterministic CI regression gates (`iai-callgrind` + counting allocator)**, **reference hardware baselines**, and the **full 5-dimensional permutation matrix** for `bevy_abi_mod` (`ABI 0.2.0`).
+This document records the **canonical benchmark scenarios**, **deterministic CI regression gates (`iai-callgrind` + counting allocator)**, **reference hardware baselines**, and the **full 5-dimensional permutation matrix** for `bevy_abi_mod` (`ABI 0.2.0`).
 
 ```bash
 # 1. Run all 5 canonical host benchmark scenarios (stages Rust & C99 fixtures automatically)
@@ -36,7 +36,7 @@ All baseline measurements below were recorded on the same local Apple Silicon wo
 
 ## 2. Canonical Benchmark Suite (`crates/bevy_abi_mod_host/benches/chunk_throughput.rs`)
 
-`chunk_throughput.rs` unifies the five core `ABI 0.2.0` runtime paths into a single reproducible suite (`X-03`).
+`chunk_throughput.rs` unifies the five core `ABI 0.2.0` runtime paths into a single reproducible suite.
 
 ### 2.1 Scenario 1: Dense SoA Chunk Iteration (`1k` / `10k` / `100k` Entities)
 Compares native Bevy `Query<(&mut Position, &Velocity)>`, direct C-ABI `GuestSystem` contiguous SoA slice iteration (`host_iter_column_mutable` + `host_iter_column_readonly`), and loaded `.cdylib`/`.dylib` dynamic components (`RustModCustomData` and `CModCustomData`):
@@ -56,23 +56,23 @@ Compares native Bevy `Query<(&mut Position, &Velocity)>`, direct C-ABI `GuestSys
 | **`100,000`** | Asymmetric Rust `.cdylib` (Dynamic) | **`0.0148 ms`** | `0.0149 ms` | **`6.75B ent/s`** | **`0.15 ns`** |
 | **`100,000`** | Asymmetric ISO C99 `.dylib` (Dynamic) | `0.0334 ms` | `0.0370 ms` | `2.97B ent/s` | `0.33 ns` |
 
-> **Why SoA Chunk Slices Beat Per-Row Native `Query` Iteration:** Native `for (mut p, v) in &mut query` constructs a `Mut<Position>` wrapper and updates individual row change ticks inside the scalar loop, inhibiting NEON auto-vectorization. `host_iter_column_mutable` marks the table chunk's change ticks once (`P-04`) and hands LLVM a contiguous `&mut [Position]` slice that vectorizes into 128-bit NEON SIMD loads/stores.
+> **Why SoA Chunk Slices Beat Per-Row Native `Query` Iteration:** Native `for (mut p, v) in &mut query` constructs a `Mut<Position>` wrapper and updates individual row change ticks inside the scalar loop, inhibiting NEON auto-vectorization. `host_iter_column_mutable` marks the table chunk's change ticks once and hands LLVM a contiguous `&mut [Position]` slice that vectorizes into 128-bit NEON SIMD loads/stores.
 
-### 2.2 Scenario 2: `Changed<Position>` Tick Filter (`100,000` Entities @ `1%`, `50%`, `100%`, `P-01`)
-Validates `P-01` (once-per-table `ComponentTicks` resolution, summary-tick whole-table skipping, and branch-light contiguous run coalescing):
+### 2.2 Scenario 2: `Changed<Position>` Tick Filter (`100,000` Entities @ `1%`, `50%`, `100%`)
+Validates summary-tick optimization (once-per-table `ComponentTicks` resolution, summary-tick whole-table skipping, and branch-light contiguous run coalescing):
 
 | Mutation Rate (`100k` Entities) | Implementation | Median Frame | p95 Frame | Effective Scan Rate | `ns / entity` |
 |---|---|---:|---:|---:|---:|
 | **`1%` (`1,000` changed)** | Native Bevy `Changed<Position>` | `0.0247 ms` | `0.0371 ms` | `3.73B ent/s` | `0.25 ns` |
-| **`1%` (`1,000` changed)** | **C-ABI `AccessMode::CHANGED` (`P-01`)** | **`0.0646 ms`** | `0.0771 ms` | **`1.52B ent/s`** | **`0.65 ns`** |
+| **`1%` (`1,000` changed)** | **C-ABI `AccessMode::CHANGED`** | **`0.0646 ms`** | `0.0771 ms` | **`1.52B ent/s`** | **`0.65 ns`** |
 | **`50%` (`50,000` changed)** | Native Bevy `Changed<Position>` | `0.0412 ms` | `0.0512 ms` | `2.41B ent/s` | `0.41 ns` |
-| **`50%` (`50,000` changed)** | **C-ABI `AccessMode::CHANGED` (`P-01`)** | `0.5374 ms` | `0.6884 ms` | `182M ent/s` | `5.37 ns` |
+| **`50%` (`50,000` changed)** | **C-ABI `AccessMode::CHANGED`** | `0.5374 ms` | `0.6884 ms` | `182M ent/s` | `5.37 ns` |
 | **`100%` (`100,000` changed)** | Native Bevy `Changed<Position>` | `0.0714 ms` | `0.0761 ms` | `1.45B ent/s` | `0.71 ns` |
-| **`100%` (`100,000` changed)** | **C-ABI `AccessMode::CHANGED` (`P-01`)** | **`0.1132 ms`** | `0.2021 ms` | **`854M ent/s`** | **`1.13 ns`** |
+| **`100%` (`100,000` changed)** | **C-ABI `AccessMode::CHANGED`** | **`0.1132 ms`** | `0.2021 ms` | **`854M ent/s`** | **`1.13 ns`** |
 
-> At `1%` sparse mutations, `P-01` completes a full `100,000`-entity scan + mutation pass in **`0.065 ms`** (`< 0.4%` of a 60 Hz frame), and at `50%` alternating odd/even rows (`50,000` distinct 1-row runs) stays well below `0.6 ms`. When `0%` of a table changed since `last_run`, the summary-tick check skips the entire table in $O(1)$.
+> At `1%` sparse mutations, completes a full `100,000`-entity scan + mutation pass in **`0.065 ms`** (`< 0.4%` of a 60 Hz frame), and at `50%` alternating odd/even rows (`50,000` distinct 1-row runs) stays well below `0.6 ms`. When `0%` of a table changed since `last_run`, the summary-tick check skips the entire table in $O(1)$.
 
-### 2.3 Scenario 3: Deferred Command Burst (`10,000` `cmd_insert`s / Frame, `C-05` + `P-05`)
+### 2.3 Scenario 3: Deferred Command Burst (`10,000` `cmd_insert`s / Frame)
 Compares native `Commands::entity(e).insert(Armor)` against pre-resolved `BamComponent` handle writes into per-system `CommandArena` (`MaybeUninit<u8>` bump slabs reused across frames with `0` steady-state heap allocations):
 
 | Workload (`10,000` Writes/Frame) | Median Frame | p95 Frame | Throughput (`cmd/s`) | `ns / cmd` | Steady-State Heap Allocs |
@@ -80,15 +80,15 @@ Compares native `Commands::entity(e).insert(Armor)` against pre-resolved `BamCom
 | Native Bevy `Commands::insert` | `0.1676 ms` | `0.1780 ms` | `59.4M cmd/s` | `16.76 ns` | `0` (reused `CommandQueue`) |
 | **C-ABI `host_cmd_insert` (`CommandArena`)** | **`0.1964 ms`** | `0.2143 ms` | **`51.0M cmd/s`** | **`19.64 ns`** | **`0` (verified by gate)** |
 
-### 2.4 Scenario 4: Batched Sparse-Set Query Iteration (`10,000` Entities, `P-02`)
-Validates `P-02` indirect row-pointer batching (`host_iter_column_rows_mutable` yielding whole archetype runs instead of 1-entity FFI chunks):
+### 2.4 Scenario 4: Batched Sparse-Set Query Iteration (`10,000` Entities)
+Validates indirect row-pointer batching (`host_iter_column_rows_mutable` yielding whole archetype runs instead of 1-entity FFI chunks):
 
 | Workload (`10,000` `SparseSet` Entities) | Median Frame | p95 Frame | Throughput (`ent/s`) | `ns / entity` | Chunks Emitted |
 |---|---:|---:|---:|---:|---:|
 | Native Bevy `Query<(&mut Pos, &mut SparseBuff)>` | `0.0119 ms` | `0.0131 ms` | `825M ent/s` | `1.19 ns` | N/A |
-| **C-ABI Indirect Sparse Rows (`P-02`)** | **`0.0267 ms`** | `0.0269 ms` | **`375M ent/s`** | **`2.67 ns`** | **`1` chunk (`10,000` rows)** |
+| **C-ABI Indirect Sparse Rows** | **`0.0267 ms`** | `0.0269 ms` | **`375M ent/s`** | **`2.67 ns`** | **`1` chunk (`10,000` rows)** |
 
-### 2.5 Scenario 5: Batched `cmd_spawn` (4 Components) vs. Sequential Spawn+Insert (`P-05`)
+### 2.5 Scenario 5: Batched `cmd_spawn` (4 Components) vs. Sequential Spawn+Insert
 Spawns `2,500` 4-component entities (`Position`, `Velocity`, `Vitality`, `Armor`) per frame, comparing `host_cmd_spawn` (`EntityWorldMut::insert_by_ids` single target archetype transition) against `host_cmd_spawn_empty` + `4x host_cmd_insert` (4 intermediate table moves):
 
 | Workload (`2,500` Spawns/Frame) | Median Frame | p95 Frame | Throughput (`ent/s`) | `ns / spawn` | Relative Speed |
@@ -105,7 +105,7 @@ Wall-clock microbenchmarks on shared cloud CI runners exhibit 15–40% noisy-nei
 1. **Linux CI (`cfg(target_os = "linux")`):** Uses `iai-callgrind` (`Valgrind` Callgrind) to record deterministic CPU instruction counts, L1/LL cache hits, and estimated cycles across `bench_gate_dense_1k`, `bench_gate_changed_1pct`, `bench_gate_command_arena_1k`, `bench_gate_sparse_1k`, and `bench_gate_spawn4_256`.
 2. **All Platforms (`CountingAlloc` + Step Invariants):** Wraps `std::alloc::System` in a global atomic `CountingAlloc` and asserts:
    - **`0` heap allocations** during steady-state dense chunk iteration (`run_dense_1k_gate`).
-   - **`0` entities visited** on unmutated tables (`P-01` summary-tick skip) and exact `10` entities visited at `1%` mutation (`run_changed_1pct_gate`).
+   - **`0` entities visited** on unmutated tables (`summary-tick skip) and exact `10` entities visited at `1%` mutation (`run_changed_1pct_gate`).
    - **`0` heap allocations** during steady-state `1,000`-command `host_cmd_insert` bursts (`run_command_arena_zero_alloc_gate`).
    - **`1` batched FFI chunk** emitted for `1,000` `SparseSet` entities (`run_sparse_batching_gate`).
    - **`256` 4-component entities** materialized in one deferred flush (`run_batched_spawn4_gate`).
@@ -114,7 +114,7 @@ Wall-clock microbenchmarks on shared cloud CI runners exhibit 15–40% noisy-nei
 
 ## 4. Full 34-Archetype Permutation Matrix (`benches/permutation_bench`)
 
-Beyond single-query microbenchmarks, `permutation_bench` evaluates a **34-archetype nested spatial combat simulation** (`1,024` units × `48` emitters = `49,152` pair evaluations/frame, and `3,072` × `96` = `294,912` pairs/frame in the high-scale tier) across **5 execution architectures × 5 FFI access patterns × Debug/Release host & guest profiles**, guarded by a bit-accurate floating-point `OracleDigest`.
+Beyond single-query microbenchmarks, `permutation_bench` evaluates a **34-archetype nested spatial combat simulation** (`1,024` units × `48` emitters = `49,152` pair evaluations/frame, and `3,072` × `96` = `294,912` pairs/frame in the high-scale workload) across **5 execution architectures × 5 FFI access patterns × Debug/Release host & guest profiles**, guarded by a bit-accurate floating-point `OracleDigest`.
 
 ### 4.1 Mod Loading, Handshake & `dlclose` Lifecycle Summary
 
@@ -129,7 +129,7 @@ Beyond single-query microbenchmarks, `permutation_bench` evaluates a **34-archet
 
 ### 4.2 Access Pattern Degradation Ladder (`49,152` Pairwise 3D Evaluations/Frame)
 
-| Access Tier | Architecture | Host / Mod | Median Frame | `ns / pair` | vs. Native Ceiling | 60 Hz Budget |
+| Access Pattern | Architecture | Host / Mod | Median Frame | `ns / pair` | vs. Native Ceiling | 60 Hz Budget |
 |---|---|---|---:|---:|---:|---:|
 | **1. `ChunkOptimized` ($O(U+E)$ FFI)** | C-ABI C99 Mod | `release` / `-O3` | **`0.1856 ms`** | `3.78 ns` | **`1.00x`** | `1.1%` |
 | **2. Pre-Cached SoA Baseline** | Pure Native Bevy | `release` / `static` | **`0.1863 ms`** | `3.79 ns` | **`1.00x`** | `1.1%` |

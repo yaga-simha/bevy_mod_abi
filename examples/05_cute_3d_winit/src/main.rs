@@ -88,7 +88,7 @@ impl CliArgs {
                          Options:\n  \
                            --test-mode       Run automated headless 3D ECS + C-ABI mod verification\n  \
                            --headless        Run simulation without opening a winit 3D window\n  \
-                           --ticks <N>       Ticks per verification phase (default: 40)\n  \
+                           --ticks <N>       Ticks per verification step (default: 40)\n  \
                            --slimes <N>      Number of 3D bunny-slimes (default: 32)\n  \
                            --mod <name>      Initial mod: boing (default), carousel, cuddle, or none\n  \
                            -h, --help        Show this help message\n\n\
@@ -211,7 +211,7 @@ fn ensure_mod_binary_built(kind: ActiveMod) -> Result<PathBuf, String> {
     resolve_mod_binary(kind).ok_or_else(|| format!("Binary for {kind:?} missing after build"))
 }
 
-/// Drains lifecycle and fault `Message`s emitted by `AbiModPlugin` (`B-09`).
+/// Drains lifecycle and fault `Message`s emitted by `AbiModPlugin`.
 fn observe_mod_lifecycle_messages(
     mut loaded: MessageReader<ModLoaded>,
     mut unloaded: MessageReader<ModUnloaded>,
@@ -234,7 +234,7 @@ fn observe_mod_lifecycle_messages(
     }
 }
 
-/// Loads or switches to `target` using core `LoadOptions { shadow_copy: true, .. }` (`L-03`).
+/// Loads or switches to `target` using core `LoadOptions { shadow_copy: true, .. }`.
 fn switch_mod(app: &mut App, target: ActiveMod) -> Result<(), String> {
     if target == ActiveMod::None {
         return unload_active_mod(app);
@@ -300,7 +300,7 @@ fn unload_active_mod(app: &mut App) -> Result<(), String> {
     Ok(())
 }
 
-/// Hot-reloads the active 3D mod from disk via a fresh core shadow copy (`L-03`).
+/// Hot-reloads the active 3D mod from disk via a fresh core shadow copy.
 fn reload_active_mod(app: &mut App) -> Result<(), String> {
     let (target, prev_reloads) = {
         let status = app.world().resource::<ModStatusResource>();
@@ -739,7 +739,7 @@ fn run_headless_3d_verification(
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Example 05 Automated Cute 3D Modding Verification ===");
 
-    println!("[TEST] Phase 1: Baseline Cozy Meadow Stroll ({ticks} ticks)...");
+    println!("[TEST] Step 1: Baseline Cozy Meadow Stroll ({ticks} ticks)...");
     for _ in 0..ticks {
         app.update();
     }
@@ -750,7 +750,7 @@ fn run_headless_3d_verification(
     );
     println!("  -> PASS: Baseline 3D meadow stroll verified.");
 
-    println!("[TEST] Phase 2: Loading Mod 1 — Jelly Boing Hop (Rust cdylib) ({ticks} ticks)...");
+    println!("[TEST] Step 2: Loading Mod 1 — Jelly Boing Hop (Rust cdylib) ({ticks} ticks)...");
     switch_mod(app, ActiveMod::Boing)?;
     assert_eq!(
         app.world().resource::<ModStatusResource>().active_mod,
@@ -781,7 +781,7 @@ fn run_headless_3d_verification(
     println!("  -> PASS: 3D hopping (max_y={max_hop_y:.2}) and jelly squash-stretch verified.");
 
     println!(
-        "[TEST] Phase 3: Switching to Mod 2 — Pastel Carousel Waltz (Rust cdylib) ({ticks} ticks)..."
+        "[TEST] Step 3: Switching to Mod 2 — Pastel Carousel Waltz (Rust cdylib) ({ticks} ticks)..."
     );
     let colors_before = query_colors(app);
     switch_mod(app, ActiveMod::Carousel)?;
@@ -805,7 +805,7 @@ fn run_headless_3d_verification(
     println!("  -> PASS: 3D carousel orbital waltz and macaron color animation verified.");
 
     println!(
-        "[TEST] Phase 4: Switching to Mod 3 — Cozy Cuddle Huddle (Pure C99) ({ticks} ticks)..."
+        "[TEST] Step 4: Switching to Mod 3 — Cozy Cuddle Huddle (Pure C99) ({ticks} ticks)..."
     );
     let dist_before = avg_xz_radius(app);
     switch_mod(app, ActiveMod::CuddleC99)?;
@@ -828,7 +828,7 @@ fn run_headless_3d_verification(
         "  -> PASS: Pure C99 cuddle huddle verified (avg radius {dist_before:.2} -> {dist_after:.2})."
     );
 
-    println!("[TEST] Phase 5: Hot-Reloading Active 3D Mod ({ticks} ticks)...");
+    println!("[TEST] Step 5: Hot-Reloading Active 3D Mod ({ticks} ticks)...");
     reload_active_mod(app)?;
     assert_eq!(app.world().resource::<ModStatusResource>().reload_count, 1);
     for _ in 0..ticks {
@@ -836,7 +836,7 @@ fn run_headless_3d_verification(
     }
     println!("  -> PASS: Core shadow-copy hot-reload (#1) verified.");
 
-    println!("[TEST] Phase 6: Unloading Mod back to Cozy Stroll ({ticks} ticks)...");
+    println!("[TEST] Step 6: Unloading Mod back to Cozy Stroll ({ticks} ticks)...");
     unload_active_mod(app)?;
     assert_eq!(
         app.world().resource::<ModStatusResource>().active_mod,
@@ -847,7 +847,7 @@ fn run_headless_3d_verification(
     }
     println!("  -> PASS: Clean dlclose unload and baseline restoration verified.");
 
-    println!("[TEST] Phase 7: Dynamic Population Scaling & Collision Bouncing ({ticks} ticks)...");
+    println!("[TEST] Step 7: Dynamic Population Scaling & Collision Bouncing ({ticks} ticks)...");
     let count_before = query_positions(app).len();
     {
         let mut commands = app.world_mut().commands();

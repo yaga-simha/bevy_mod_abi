@@ -41,8 +41,8 @@ fn remove_shadow_copy_and_parent(path: &std::path::Path) {
 #[test]
 fn test_asymmetric_mods_concurrency_fault_isolation_and_lifecycle() {
     let (shared_rust_dylib, shared_c_dylib) = ensure_guest_mods_built();
-    let rust_dylib = create_shadow_copy(&shared_rust_dylib, "vg3_isolated_rust");
-    let c_dylib = create_shadow_copy(&shared_c_dylib, "vg3_isolated_c");
+    let rust_dylib = create_shadow_copy(&shared_rust_dylib, "fault_isolated_rust");
+    let c_dylib = create_shadow_copy(&shared_c_dylib, "fault_isolated_c");
 
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
@@ -1532,13 +1532,13 @@ fn test_hot_unload_reload_and_tombstone_lifecycle_safety() {
     )
     .unwrap();
 
-    // Phase 1: Initial Mod Load
+    // Initial mod load
     let rust_mod_id_1 = app
         .load_mod_with(&rust_dylib, shadow_load_options())
-        .expect("Load Rust mod (phase 1)");
+        .expect("Load Rust mod (initial)");
     let c_mod_id_1 = app
         .load_mod_with(&c_dylib, shadow_load_options())
-        .expect("Load C mod (phase 1)");
+        .expect("Load C mod (initial)");
 
     let (rust_comp_id, c_comp_id) = {
         let reg = app.world().resource::<ModRegistry>();
@@ -1685,7 +1685,7 @@ fn test_hot_unload_reload_and_tombstone_lifecycle_safety() {
         assert_eq!(c_data.level, 10);
     }
 
-    // Phase 2: Asymmetric Unload (Unload Rust mod only)
+    // Asymmetric unload (unload Rust mod only)
     app.unload_mod(rust_mod_id_1).expect("Unload Rust mod");
 
     for _ in 0..5 {
@@ -1716,7 +1716,7 @@ fn test_hot_unload_reload_and_tombstone_lifecycle_safety() {
         assert_eq!(c_data.level, 15);
     }
 
-    // Phase 3: Unload C Mod
+    // Unload C mod
     app.unload_mod(c_mod_id_1).expect("Unload C mod");
 
     for _ in 0..5 {
@@ -1739,7 +1739,7 @@ fn test_hot_unload_reload_and_tombstone_lifecycle_safety() {
         assert_eq!(c_data.mana, 150.0);
     }
 
-    // Phase 4: Post-Unload Despawn Safety
+    // Post-unload despawn safety
     for e in rust_only_entities.drain(50..) {
         app.world_mut().despawn(e);
     }
@@ -1758,13 +1758,13 @@ fn test_hot_unload_reload_and_tombstone_lifecycle_safety() {
         "Foreign drop hook must NOT be invoked after mod unload (averting unmapped execution)"
     );
 
-    // Phase 5: Reload Both Mods
+    // Reload both mods
     let rust_mod_id_2 = app
         .load_mod_with(&rust_dylib, shadow_load_options())
-        .expect("Reload Rust mod (phase 5)");
+        .expect("Reload Rust mod");
     let c_mod_id_2 = app
         .load_mod_with(&c_dylib, shadow_load_options())
-        .expect("Reload C mod (phase 5)");
+        .expect("Reload C mod");
 
     {
         let reg = app.world().resource::<ModRegistry>();
@@ -1803,7 +1803,7 @@ fn test_hot_unload_reload_and_tombstone_lifecycle_safety() {
         new_entities.push(e);
     }
 
-    // Phase 6: Resume Simulation across both surviving entities and new entities
+    // Resume simulation across both surviving entities and new entities
     for _ in 0..5 {
         app.update();
     }
@@ -1871,8 +1871,8 @@ pub struct ColorRgbaLayout {
 #[test]
 fn test_end_to_end_asymmetric_rust_and_c99_optional_changed_resources_and_commands() {
     let (shared_rust_dylib, shared_c_dylib) = ensure_guest_mods_built();
-    let rust_dylib = create_shadow_copy(&shared_rust_dylib, "phase4_isolated_rust");
-    let c_dylib = create_shadow_copy(&shared_c_dylib, "phase4_isolated_c");
+    let rust_dylib = create_shadow_copy(&shared_rust_dylib, "cond_isolated_rust");
+    let c_dylib = create_shadow_copy(&shared_c_dylib, "cond_isolated_c");
 
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
@@ -1888,48 +1888,48 @@ fn test_end_to_end_asymmetric_rust_and_c99_optional_changed_resources_and_comman
     app.register_mod_component::<NameTag>(ComponentOptions::new().with_default())
         .unwrap();
 
-    app.register_mod_component::<Phase4Transform>(
+    app.register_mod_component::<FilteredTransform>(
         ComponentOptions::new().with_raw_insert().with_default(),
     )
     .unwrap();
-    app.register_mod_component::<Phase4Sensor>(
+    app.register_mod_component::<ChangeSensor>(
         ComponentOptions::new().with_raw_insert().with_default(),
     )
     .unwrap();
-    app.register_mod_component::<Phase4FreshTag>(
+    app.register_mod_component::<FreshSpawnTag>(
         ComponentOptions::new().with_raw_insert().with_default(),
     )
     .unwrap();
-    app.register_mod_component::<Phase4Removable>(
+    app.register_mod_component::<TransientMarker>(
         ComponentOptions::new().with_raw_insert().with_default(),
     )
     .unwrap();
-    app.register_mod_resource::<Phase4RustRes>().unwrap();
-    app.insert_resource(Phase4RustRes {
+    app.register_mod_resource::<RustFilterTelemetry>().unwrap();
+    app.insert_resource(RustFilterTelemetry {
         scale: 2.0,
         matched_rows: 0,
         optional_vel_hits: 0,
         spawned_default_entity: 0,
     });
 
-    app.register_mod_component::<Phase4CTransform>(
+    app.register_mod_component::<CFilteredTransform>(
         ComponentOptions::new().with_raw_insert().with_default(),
     )
     .unwrap();
-    app.register_mod_component::<Phase4CSensor>(
+    app.register_mod_component::<CChangeSensor>(
         ComponentOptions::new().with_raw_insert().with_default(),
     )
     .unwrap();
-    app.register_mod_component::<Phase4CFreshTag>(
+    app.register_mod_component::<CFreshSpawnTag>(
         ComponentOptions::new().with_raw_insert().with_default(),
     )
     .unwrap();
-    app.register_mod_component::<Phase4CRemovable>(
+    app.register_mod_component::<CTransientMarker>(
         ComponentOptions::new().with_raw_insert().with_default(),
     )
     .unwrap();
-    app.register_mod_resource::<Phase4CRes>().unwrap();
-    app.insert_resource(Phase4CRes {
+    app.register_mod_resource::<CFilterTelemetry>().unwrap();
+    app.insert_resource(CFilterTelemetry {
         scale: 3.0,
         matched_rows: 0,
         optional_vel_hits: 0,
@@ -1953,11 +1953,14 @@ fn test_end_to_end_asymmetric_rust_and_c99_optional_changed_resources_and_comman
     let c_lib = unsafe { Library::new(&c_dylib).unwrap() };
     let set_rust_enabled: Symbol<unsafe extern "C" fn(FfiBool)> = unsafe {
         rust_lib
-            .get(b"asymmetric_rust_mod_set_phase4_enabled\0")
+            .get(b"asymmetric_rust_mod_set_conditional_enabled\0")
             .unwrap()
     };
-    let set_c_enabled: Symbol<unsafe extern "C" fn(FfiBool)> =
-        unsafe { c_lib.get(b"asymmetric_c_mod_set_phase4_enabled\0").unwrap() };
+    let set_c_enabled: Symbol<unsafe extern "C" fn(FfiBool)> = unsafe {
+        c_lib
+            .get(b"asymmetric_c_mod_set_conditional_enabled\0")
+            .unwrap()
+    };
     unsafe {
         set_rust_enabled(FfiBool::TRUE);
         set_c_enabled(FfiBool::TRUE);
@@ -1966,7 +1969,7 @@ fn test_end_to_end_asymmetric_rust_and_c99_optional_changed_resources_and_comman
     let r_with_vel = app
         .world_mut()
         .spawn((
-            Phase4Transform {
+            FilteredTransform {
                 x: 1.0,
                 y: 0.0,
                 z: 0.0,
@@ -1976,29 +1979,29 @@ fn test_end_to_end_asymmetric_rust_and_c99_optional_changed_resources_and_comman
                 y: 0.0,
                 z: 0.0,
             },
-            Phase4Sensor { val: 1 },
-            Phase4FreshTag { code: 1 },
-            Phase4Removable { dummy: 9 },
+            ChangeSensor { val: 1 },
+            FreshSpawnTag { code: 1 },
+            TransientMarker { dummy: 9 },
         ))
         .id();
     let r_no_vel = app
         .world_mut()
         .spawn((
-            Phase4Transform {
+            FilteredTransform {
                 x: 100.0,
                 y: 0.0,
                 z: 0.0,
             },
-            Phase4Sensor { val: 2 },
-            Phase4FreshTag { code: 1 },
-            Phase4Removable { dummy: 9 },
+            ChangeSensor { val: 2 },
+            FreshSpawnTag { code: 1 },
+            TransientMarker { dummy: 9 },
         ))
         .id();
 
     let c_with_vel = app
         .world_mut()
         .spawn((
-            Phase4CTransform {
+            CFilteredTransform {
                 x: 0.0,
                 y: 2.0,
                 z: 0.0,
@@ -2008,22 +2011,22 @@ fn test_end_to_end_asymmetric_rust_and_c99_optional_changed_resources_and_comman
                 y: 5.0,
                 z: 0.0,
             },
-            Phase4CSensor { val: 1 },
-            Phase4CFreshTag { code: 1 },
-            Phase4CRemovable { dummy: 9 },
+            CChangeSensor { val: 1 },
+            CFreshSpawnTag { code: 1 },
+            CTransientMarker { dummy: 9 },
         ))
         .id();
     let c_no_vel = app
         .world_mut()
         .spawn((
-            Phase4CTransform {
+            CFilteredTransform {
                 x: 0.0,
                 y: 200.0,
                 z: 0.0,
             },
-            Phase4CSensor { val: 2 },
-            Phase4CFreshTag { code: 1 },
-            Phase4CRemovable { dummy: 9 },
+            CChangeSensor { val: 2 },
+            CFreshSpawnTag { code: 1 },
+            CTransientMarker { dummy: 9 },
         ))
         .id();
 
@@ -2031,24 +2034,24 @@ fn test_end_to_end_asymmetric_rust_and_c99_optional_changed_resources_and_comman
 
     {
         let w = app.world();
-        assert_eq!(w.get::<Phase4Transform>(r_with_vel).unwrap().x, 21.0);
-        assert_eq!(w.get::<Phase4Transform>(r_no_vel).unwrap().x, 102.0);
-        assert!(w.get::<Phase4Removable>(r_with_vel).is_none());
-        assert!(w.get::<Phase4Removable>(r_no_vel).is_none());
+        assert_eq!(w.get::<FilteredTransform>(r_with_vel).unwrap().x, 21.0);
+        assert_eq!(w.get::<FilteredTransform>(r_no_vel).unwrap().x, 102.0);
+        assert!(w.get::<TransientMarker>(r_with_vel).is_none());
+        assert!(w.get::<TransientMarker>(r_no_vel).is_none());
 
-        let r_res = w.resource::<Phase4RustRes>();
+        let r_res = w.resource::<RustFilterTelemetry>();
         assert_eq!(r_res.matched_rows, 2);
         assert_eq!(r_res.optional_vel_hits, 1);
         assert_ne!(r_res.spawned_default_entity, 0);
         let r_spawned = Entity::from_bits(r_res.spawned_default_entity);
         assert!(w.get::<NameTag>(r_spawned).is_some());
 
-        assert_eq!(w.get::<Phase4CTransform>(c_with_vel).unwrap().y, 17.0);
-        assert_eq!(w.get::<Phase4CTransform>(c_no_vel).unwrap().y, 203.0);
-        assert!(w.get::<Phase4CRemovable>(c_with_vel).is_none());
-        assert!(w.get::<Phase4CRemovable>(c_no_vel).is_none());
+        assert_eq!(w.get::<CFilteredTransform>(c_with_vel).unwrap().y, 17.0);
+        assert_eq!(w.get::<CFilteredTransform>(c_no_vel).unwrap().y, 203.0);
+        assert!(w.get::<CTransientMarker>(c_with_vel).is_none());
+        assert!(w.get::<CTransientMarker>(c_no_vel).is_none());
 
-        let c_res = w.resource::<Phase4CRes>();
+        let c_res = w.resource::<CFilterTelemetry>();
         assert_eq!(c_res.matched_rows, 2);
         assert_eq!(c_res.optional_vel_hits, 1);
         assert_ne!(c_res.spawned_default_entity, 0);
@@ -2057,16 +2060,19 @@ fn test_end_to_end_asymmetric_rust_and_c99_optional_changed_resources_and_comman
     }
 
     app.world_mut()
-        .get_mut::<Phase4Sensor>(r_with_vel)
+        .get_mut::<ChangeSensor>(r_with_vel)
         .unwrap()
         .val = 77;
     app.world_mut()
-        .get_mut::<Phase4CSensor>(c_with_vel)
+        .get_mut::<CChangeSensor>(c_with_vel)
         .unwrap()
         .val = 77;
     app.update();
-    assert_eq!(app.world().resource::<Phase4RustRes>().matched_rows, 2);
-    assert_eq!(app.world().resource::<Phase4CRes>().matched_rows, 2);
+    assert_eq!(
+        app.world().resource::<RustFilterTelemetry>().matched_rows,
+        2
+    );
+    assert_eq!(app.world().resource::<CFilterTelemetry>().matched_rows, 2);
 
     unsafe {
         set_rust_enabled(FfiBool::FALSE);
@@ -2075,37 +2081,40 @@ fn test_end_to_end_asymmetric_rust_and_c99_optional_changed_resources_and_comman
     let r_delayed = app
         .world_mut()
         .spawn((
-            Phase4Transform {
+            FilteredTransform {
                 x: 50.0,
                 y: 0.0,
                 z: 0.0,
             },
-            Phase4Sensor { val: 5 },
-            Phase4FreshTag { code: 5 },
+            ChangeSensor { val: 5 },
+            FreshSpawnTag { code: 5 },
         ))
         .id();
     let c_delayed = app
         .world_mut()
         .spawn((
-            Phase4CTransform {
+            CFilteredTransform {
                 x: 0.0,
                 y: 60.0,
                 z: 0.0,
             },
-            Phase4CSensor { val: 5 },
-            Phase4CFreshTag { code: 5 },
+            CChangeSensor { val: 5 },
+            CFreshSpawnTag { code: 5 },
         ))
         .id();
 
     app.update();
-    assert_eq!(app.world().resource::<Phase4RustRes>().matched_rows, 2);
-    assert_eq!(app.world().resource::<Phase4CRes>().matched_rows, 2);
     assert_eq!(
-        app.world().get::<Phase4Transform>(r_delayed).unwrap().x,
+        app.world().resource::<RustFilterTelemetry>().matched_rows,
+        2
+    );
+    assert_eq!(app.world().resource::<CFilterTelemetry>().matched_rows, 2);
+    assert_eq!(
+        app.world().get::<FilteredTransform>(r_delayed).unwrap().x,
         50.0
     );
     assert_eq!(
-        app.world().get::<Phase4CTransform>(c_delayed).unwrap().y,
+        app.world().get::<CFilteredTransform>(c_delayed).unwrap().y,
         60.0
     );
 
@@ -2114,14 +2123,17 @@ fn test_end_to_end_asymmetric_rust_and_c99_optional_changed_resources_and_comman
         set_c_enabled(FfiBool::TRUE);
     }
     app.update();
-    assert_eq!(app.world().resource::<Phase4RustRes>().matched_rows, 3);
-    assert_eq!(app.world().resource::<Phase4CRes>().matched_rows, 3);
     assert_eq!(
-        app.world().get::<Phase4Transform>(r_delayed).unwrap().x,
+        app.world().resource::<RustFilterTelemetry>().matched_rows,
+        3
+    );
+    assert_eq!(app.world().resource::<CFilterTelemetry>().matched_rows, 3);
+    assert_eq!(
+        app.world().get::<FilteredTransform>(r_delayed).unwrap().x,
         52.0
     );
     assert_eq!(
-        app.world().get::<Phase4CTransform>(c_delayed).unwrap().y,
+        app.world().get::<CFilteredTransform>(c_delayed).unwrap().y,
         63.0
     );
 

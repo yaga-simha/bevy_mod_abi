@@ -260,13 +260,13 @@ impl BamTermDesc {
         Self::new(component, AccessMode::RESOURCE_WRITE)
     }
 
-    /// Creates a shared buffered message reader (`MessageReader<M>`) term descriptor (`F-02`).
+    /// Creates a shared buffered message reader (`MessageReader<M>`) term descriptor.
     #[inline]
     pub const fn message_read(component: BamComponent) -> Self {
         Self::new(component, AccessMode::MESSAGE_READ)
     }
 
-    /// Creates an exclusive buffered message writer (`MessageWriter<M>`) term descriptor (`F-02`).
+    /// Creates an exclusive buffered message writer (`MessageWriter<M>`) term descriptor.
     #[inline]
     pub const fn message_write(component: BamComponent) -> Self {
         Self::new(component, AccessMode::MESSAGE_WRITE)

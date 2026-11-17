@@ -26,7 +26,7 @@ pub const BAM_STORAGE_FLAG_IMMUTABLE: u32 = 1 << 1;
 /// Term refers to a singleton Bevy `Resource` rather than a per-entity component column.
 pub const BAM_STORAGE_FLAG_RESOURCE: u32 = 1 << 2;
 
-/// Term refers to a buffered Bevy `Messages<M>` stream (`F-02`).
+/// Term refers to a buffered Bevy `Messages<M>` stream.
 pub const BAM_STORAGE_FLAG_MESSAGE: u32 = 1 << 3;
 
 /// Registered type is a triggerable Bevy `Event` (`world.trigger` / dynamic observer).
@@ -140,7 +140,7 @@ impl BamColumnInfo {
         (self.storage_flags & BAM_STORAGE_FLAG_RESOURCE) != 0
     }
 
-    /// Returns `true` if `BAM_STORAGE_FLAG_MESSAGE` is set (`F-02`).
+    /// Returns `true` if `BAM_STORAGE_FLAG_MESSAGE` is set.
     #[inline]
     pub const fn is_message(&self) -> bool {
         (self.storage_flags & BAM_STORAGE_FLAG_MESSAGE) != 0
@@ -294,7 +294,7 @@ pub type BamResPtrFn = unsafe extern "C" fn(iter: *const BamIter, term_index: us
 /// the caller must not create aliasing references to the resource.
 pub type BamResMutPtrFn = unsafe extern "C" fn(iter: *mut BamIter, term_index: usize) -> *mut u8;
 
-/// Task callback invoked on worker threads by [`BamParForEachChunkFn`] (`P-07`).
+/// Task callback invoked on worker threads by [`BamParForEachChunkFn`].
 ///
 /// Each task receives an isolated sub-range [`BamIter`] whose `iter_next_chunk` yields only the
 /// disjoint chunks assigned to that task.
@@ -306,7 +306,7 @@ pub type BamChunkTaskFn =
     unsafe extern "C" fn(iter: *mut BamIter, user_data: *mut c_void) -> FfiResult;
 
 /// Partitions matched tables/archetype runs of `iter` across the host `ComputeTaskPool`, invoking
-/// `chunk_fn(sub_iter, user_data)` on disjoint sub-range iterators in parallel (`P-07`).
+/// `chunk_fn(sub_iter, user_data)` on disjoint sub-range iterators in parallel.
 ///
 /// # Safety
 /// - `iter` must point to an active top-level [`BamIter`] belonging to the running system invocation.
@@ -320,7 +320,7 @@ pub type BamParForEachChunkFn = unsafe extern "C" fn(
 /// Reads up to `max_count` unread POD messages from the Bevy `Messages<M>` stream declared at
 /// `term_index` (`MESSAGE_READ` or `MESSAGE_WRITE`) into `out_buf` (`max_count * size_of::<M>()`
 /// writable bytes), advancing the running system's per-term message cursor and writing the count
-/// of messages copied into `*out_read` (`F-02`).
+/// of messages copied into `*out_read`.
 ///
 /// # Safety
 /// - `iter` must point to an active [`BamIter`] belonging to the running system invocation.
@@ -336,7 +336,7 @@ pub type BamMsgReadBatchFn = unsafe extern "C" fn(
 ) -> FfiResult;
 
 /// Writes one POD message payload (`data_ptr[0..data_len]`) into the Bevy `Messages<M>` stream
-/// declared with `MESSAGE_WRITE` at `term_index` (`F-02`).
+/// declared with `MESSAGE_WRITE` at `term_index`.
 ///
 /// # Safety
 /// - `iter` must point to an active [`BamIter`] belonging to the running system invocation.

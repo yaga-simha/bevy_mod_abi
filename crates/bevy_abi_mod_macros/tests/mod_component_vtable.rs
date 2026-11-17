@@ -68,7 +68,7 @@ fn vtable_header_and_error_returning_setters() {
     let vt = MixedComponent::vtable();
     let vec3_vt = Vec3::vtable();
 
-    // 1. Verify M-05 VTableHeader at offset 0 and ExtensibleStruct descriptor reading
+    // 1. Verify VTableHeader at offset 0 and ExtensibleStruct descriptor reading
     assert_eq!(core::mem::offset_of!(MixedComponentVTable, header), 0);
     assert_eq!(
         vt.header.struct_size as usize,
@@ -229,7 +229,7 @@ fn vtable_header_and_error_returning_setters() {
         assert_eq!(comp.scores, vec![1, 1, 2, 3, 5, 8, 13]);
     }
 
-    // 6. Verify M-04 NULL_POINTER and INVALID_ARGUMENT checks across all setters & getters
+    // 6. Verify NULL_POINTER and INVALID_ARGUMENT checks across all setters & getters
     let unaligned_mut = core::ptr::without_provenance_mut::<c_void>(1);
     let unaligned_const = core::ptr::without_provenance::<c_void>(1);
     unsafe {
@@ -441,7 +441,7 @@ fn namespaced_canonical_names_symbols_and_uuid_fingerprints() {
     assert!(ui::Position::resolve_symbol("bam.v0.ui::Position.vtable").is_some());
     assert!(ui::Position::resolve_symbol("bam.v0.ui::Position.get_left").is_some());
 
-    // C-10 field schema hash: identical canonical name, size (8), and align (4),
+    // Field schema hash: identical canonical name, size (8), and align (4),
     // yet changing field types (`f32` -> `i32`) or field order (`(x, y)` -> `(y, x)`) changes UUID!
     let expected_schema = ComponentUuid::hash_field_schema(
         ComponentUuid::hash_field_schema(0, "x", "f32", 0),
@@ -614,7 +614,7 @@ fn pod_vs_raw_insertable_vs_opaque_traits() {
         assert!(!Vec3::IS_ABI_POD);
         assert!(Vec3::IS_RAW_INSERTABLE);
 
-        // `usize` / `u128` in `#[repr(C)]` ModComponent: RawInsertable, not AbiPod (`C-11`)
+        // `usize` / `u128` in `#[repr(C)]` ModComponent: RawInsertable, not AbiPod
         assert!(!HostPlatformIndex::IS_ABI_POD);
         assert!(HostPlatformIndex::IS_RAW_INSERTABLE);
 
@@ -683,7 +683,7 @@ mod m06_qualified_paths_and_aliases {
     pub type HealthPoints = i32;
     pub type ActiveFlag = bool;
 
-    /// User-defined type named `String` exposed intentionally via `#[mod_field(nested)]` (`M-06`).
+    /// User-defined type named `String` exposed intentionally via `#[mod_field(nested)]`.
     #[repr(C)]
     #[derive(Debug, Copy, Clone, PartialEq, ModComponent)]
     pub struct String {
@@ -757,7 +757,7 @@ fn m06_qualified_std_types_aliases_and_explicit_mod_field_override() {
     assert_eq!(item.custom_string_struct.code, 99);
 }
 
-mod m01_facade_scope {
+mod facade_scope {
     pub mod facade {
         pub mod bevy_abi_mod_sys {
             pub use ::bevy_abi_mod_sys::*;
@@ -782,15 +782,15 @@ mod m01_facade_scope {
 }
 
 #[test]
-fn regression_m01_crate_override_and_facade_reexport() {
-    require_abi_pod::<m01_facade_scope::FacadePod>();
+fn crate_override_and_facade_reexport() {
+    require_abi_pod::<facade_scope::FacadePod>();
 
-    let mut comp = m01_facade_scope::FacadeComponent {
-        pod: m01_facade_scope::FacadePod { x: 3.5, y: -1.5 },
+    let mut comp = facade_scope::FacadeComponent {
+        pod: facade_scope::FacadePod { x: 3.5, y: -1.5 },
         label: String::from("facade"),
         active: false,
     };
-    let vt = m01_facade_scope::FacadeComponent::vtable();
+    let vt = facade_scope::FacadeComponent::vtable();
     let ptr = (&raw mut comp).cast::<c_void>();
     unsafe {
         assert_eq!((vt.set_active.unwrap())(ptr, FfiBool::TRUE), FfiResult::OK);
@@ -832,7 +832,7 @@ mod m02_submodules {
 }
 
 #[test]
-fn regression_m02_duplicate_struct_names_in_submodules() {
+fn duplicate_struct_names_in_submodules() {
     assert_eq!(m02_submodules::scene_a::DuplicateItem_get_x(), 42);
     assert_ne!(
         m02_submodules::scene_a::DuplicateItem::UUID,
@@ -869,7 +869,7 @@ fn regression_m02_duplicate_struct_names_in_submodules() {
 }
 
 #[test]
-fn wave4_m07_emits_c_decl_and_zig_decl_for_pod_and_non_pod_components() {
+fn emits_c_decl_and_zig_decl_for_pod_and_non_pod_components() {
     // 1. `#[repr(C)]` `AbiPod` struct emits full C struct + VTable + static layout assertions,
     //    and Zig `extern struct` + `callconv(.c)` VTable.
     let pod_c = PodPosition::C_DECL;

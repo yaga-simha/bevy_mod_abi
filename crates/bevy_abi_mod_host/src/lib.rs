@@ -195,7 +195,7 @@ mod tests {
             .register_system(mod_id, sys.system_name_arc(), sys.enabled_flag());
         app.add_systems(Update, sys);
 
-        // Frame 1: runs and faults -> quarantined; emits exactly ONE `ModSystemFaulted` message (`B-09`).
+        // Frame 1: runs and faults -> quarantined; emits exactly ONE `ModSystemFaulted` message.
         app.update();
         assert_eq!(CALL_COUNT.load(Ordering::SeqCst), 1);
         assert!(
@@ -212,7 +212,7 @@ mod tests {
         app.update();
         assert_eq!(CALL_COUNT.load(Ordering::SeqCst), 1);
 
-        // Re-enable via `ModQuarantine::reenable` (`B-05`) -> Frame 3 executes cleanly!
+        // Re-enable via `ModQuarantine::reenable` -> Frame 3 executes cleanly!
         assert!(
             app.world()
                 .resource::<ModQuarantine>()

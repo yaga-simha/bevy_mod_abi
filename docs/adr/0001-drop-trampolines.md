@@ -2,14 +2,13 @@
 
 - **Status:** Accepted
 - **Date:** 2026-11-11
-- **Tracking Items:** `L-06`, `S-06` (cross-references: `B-08`, `C-07`, `T-07`)
 - **Target Crates:** `bevy_abi_mod_host_sys` (`src/drop_trampoline.rs`, `src/loader/`), `bevy_abi_mod_sys`
 
 ---
 
 ## 1. Context & Problem Statement
 
-Mods written in Rust, C99, C++, or Zig can register runtime ECS components whose values own guest-allocated resources (for example, a guest-side `Vec`, arena handle, or C `malloc` buffer) via `register_component(ctx, &ComponentDesc)` (`B-08`, `N-02`). Under **Rule 2 (Memory & Allocator Isolation)**, guest-allocated memory inside a component instance must be released by invoking the guest-supplied destructor:
+Mods written in Rust, C99, C++, or Zig can register runtime ECS components whose values own guest-allocated resources (for example, a guest-side `Vec`, arena handle, or C `malloc` buffer) via `register_component(ctx, &ComponentDesc)`. Under **Rule 2 (Memory & Allocator Isolation)**, guest-allocated memory inside a component instance must be released by invoking the guest-supplied destructor:
 
 ```rust
 pub type ComponentDropFn = unsafe extern "C" fn(ptr: *mut core::ffi::c_void);
@@ -36,17 +35,17 @@ Because `unsafe fn(OwningPtr<'_>)` carries zero closure state (`sizeof(fn) == si
 1. **Calling convention mismatch:** `unsafe fn(OwningPtr<'_>)` uses the unstable Rust ABI, whereas guest destructors use `unsafe extern "C" fn(*mut c_void)`.
 2. **Hot-unload / reload safety (`dlclose`):** Once a `ComponentId` is registered in a Bevy `World`, its `ComponentInfo` (including its `drop` pointer in `BlobArray` / `SparseSet`) is immutable for the lifetime of that `World`. If a guest `.cdylib`/`.so`/`.dll` is unloaded while entities in the `World` still carry that component, jumping directly into a `ComponentDropFn` inside unmapped `.text` pages causes an immediate `SIGSEGV` / `STATUS_ACCESS_VIOLATION`.
 
-### 1.2 Defects in the v0.1 Pool (`S-06`, `L-06`)
+### 1.2 Defects in the v0.1 Pool
 
 Auditing the v0.1 trampoline implementation (`dynamic_system.rs`) identified four production hazards:
 
-1. **Failed-init use-after-`dlclose` (`S-06`, P0 Soundness):**
+1. **Failed-init use-after-`dlclose` (P0 Soundness):**
    During `bevy_abi_mod_init`, `host_register_component` allocates a trampoline slot and publishes `(drop_fn, is_active = true)` into `DROP_SLOT_SNAPSHOTS[slot]`. If `bevy_abi_mod_init` subsequently returns an error (or fails `strict` validation), `ModHost` drops `libloading::Library` (`dlclose`) without disarming `is_active` or rolling back `ModRegistry`. Any later component removal or `World::drop` calls the unmapped `drop_fn`.
-2. **Unbounded snapshot memory leak (`L-06`):**
+2. **Unbounded snapshot memory leak:**
    Every hot-reload copy-on-write update pushes the previous `*mut DropSlotSnapshot` into `DropPool::retired: Vec<*mut DropSlotSnapshot>`, intentionally leaking every retired snapshot for the lifetime of the process because lock-free readers (`drop_trampoline::<SLOT>`) have no epoch or reference-counted guard.
-3. **Permanent slot exhaustion across `World` lifecycles (`L-06`):**
-   The `MAX_DROP_TRAMPOLINES = 1024` pool is process-global (`next_slot` monotonically increments `0..1024`) and never returns slots when a `World` drops. Creating and dropping 33 test `World`s that each register 32 drop-bearing components permanently exhausts the pool across the entire process (`T-03`).
-4. **Opaque error code on exhaustion (`L-06`, `C-07`):**
+3. **Permanent slot exhaustion across `World` lifecycles:**
+   The `MAX_DROP_TRAMPOLINES = 1024` pool is process-global (`next_slot` monotonically increments `0..1024`) and never returns slots when a `World` drops. Creating and dropping 33 test `World`s that each register 32 drop-bearing components permanently exhausts the pool across the entire process.
+4. **Opaque error code on exhaustion:**
    Exhausting the pool returns `FfiResult::INTERNAL_ERROR` (`99`) instead of `FfiResult::CAPACITY_EXCEEDED` (`13`).
 
 ---
@@ -59,7 +58,7 @@ We retain compile-time monomorphized static Rust functions `unsafe fn drop_tramp
 
 Each slot index `SLOT` acts as the implicit compile-time "closure environment" mapping `OwningPtr<'_>` to `DROP_SLOTS[SLOT]`.
 
-### 2.2 Lock-Free Read Path & Bounded Reclamation via `ArcSwapOption` (`L-06`)
+### 2.2 Lock-Free Read Path & Bounded Reclamation via `ArcSwapOption`
 
 We replace raw `AtomicPtr<DropSlotSnapshot>` + leaked `retired: Vec<*mut DropSlotSnapshot>` with `arc_swap::ArcSwapOption<DropSlotSnapshot>`:
 
@@ -130,7 +129,7 @@ unsafe fn drop_trampoline<const SLOT: usize>(owning_ptr: OwningPtr<'_>) {
         for entry in snapshot.entries.iter().rev() {
             if entry.is_active.load(Ordering::Acquire) {
                 // SAFETY: `is_active` is disarmed (`Release`) strictly BEFORE `Library::drop`
-                // under exclusive `&mut World` unload or rollback (`L-04`, `S-06`), so no
+                // under exclusive `&mut World` unload or rollback, so no
                 // concurrent `dlclose` can race with an in-flight `World` mutation/drop.
                 unsafe { (entry.drop_fn)(raw_ptr) };
                 break;
@@ -145,7 +144,7 @@ unsafe fn drop_trampoline<const SLOT: usize>(owning_ptr: OwningPtr<'_>) {
     if prev == 1 {
         // Pair `SeqCst` fence on the final element drop (zero `SeqCst` cost when `prev > 1`)
         // with `SeqCst` store + load in `WorldDropSlotGuard::drop` to prevent Dekker
-        // store-buffering reordering under weak memory models (`T-07` loom check).
+        // store-buffering reordering under weak memory models (`loom check).
         std::sync::atomic::fence(Ordering::SeqCst);
         if DROP_META[SLOT].state.load(Ordering::SeqCst) == SLOT_CLOSING {
             reclaim_closed_slot(SLOT);
@@ -158,7 +157,7 @@ unsafe fn drop_trampoline<const SLOT: usize>(owning_ptr: OwningPtr<'_>) {
 - `arc-swap` (`~1.5k` LoC, zero transitive bloat) provides **wait-free** `load()` via thread-local debt slots with automatic fallback to `Arc` refcounting, keeping RSS flat across 10,000+ reload cycles without pinning global epoch garbage queues if a thread parks.
 - Snapshots are small (`Arc<[DropSlotEntry]>`, typically length 1 because unloaded mod entries are pruned on CoW update) and updated only during load/unload/rollback.
 
-### 2.3 Two-Condition World-Scoped Slot Reclamation (`L-06` + `bevy_ecs` Drop-Order Proof)
+### 2.3 Two-Condition World-Scoped Slot Reclamation (`bevy_ecs` Drop-Order Proof)
 
 A subtle soundness hazard arises when reclaiming slots during `bevy_ecs::world::World::drop`:
 
@@ -179,7 +178,7 @@ To eliminate this race unconditionally, slot reclamation uses a **two-condition 
    For each `slot` owned by the `World`:
    - Disarms all `is_active` flags (`Ordering::Release`) and calls `DROP_SLOTS[slot].store(None)` so remaining `tables[M]` drops become safe no-ops rather than calling into `dlclose`d code (`ModHost` also disarms before dropping `Library`).
    - Sets `DROP_META[slot].state.store(SLOT_CLOSING, Ordering::SeqCst)` (cold teardown path).
-   - Reads `DROP_META[slot].live_values.load(Ordering::SeqCst)` (paired with `drop_trampoline::<SLOT>`'s `prev == 1` `fence(Ordering::SeqCst)` + `state.load(Ordering::SeqCst)` so Dekker store-buffering reordering is impossible under `T-07` `loom`):
+   - Reads `DROP_META[slot].live_values.load(Ordering::SeqCst)` (paired with `drop_trampoline::<SLOT>`'s `prev == 1` `fence(Ordering::SeqCst)` + `state.load(Ordering::SeqCst)` so Dekker store-buffering reordering is impossible under `loom`):
      - If `live_values == 0`, no `tables[M]` holds any instance for `slot`, so `reclaim_closed_slot(slot)` transitions `SLOT_CLOSING -> SLOT_FREE` and pushes `slot` back to `DropSlotFreeList` immediately.
      - If `live_values > 0`, `WorldDropSlotGuard::drop` leaves `slot` in `SLOT_CLOSING`. Seconds or nanoseconds later within the same `World::drop`, `Storages` drops `tables[M]`, invoking `drop_trampoline::<SLOT>` for the remaining instances; the final decrement (`prev == 1`) observes `SLOT_CLOSING` and calls `reclaim_closed_slot(slot)`.
 
@@ -197,7 +196,7 @@ fn reclaim_closed_slot(slot: usize) {
 }
 ```
 
-### 2.4 `LoadTransaction` Rollback on Failed Init (`S-06`)
+### 2.4 `LoadTransaction` Rollback on Failed Init
 
 All mutations performed during `bevy_abi_mod_init` are staged through an RAII `LoadTransaction<'w>` rather than mutating `ModRegistry` and `DROP_SLOTS` irreversibly:
 
@@ -227,9 +226,9 @@ pub(crate) struct LoadTransaction<'w> {
      1. `binding.is_active.store(false, Ordering::Release);`
      2. `DROP_SLOTS[binding.slot].store(binding.previous_snapshot.clone());`
      3. If `binding.fresh_slot_allocated` (no prior generation existed for this component in this `World`), remove `binding.slot` from `WorldDropSlotGuard`, set `DROP_META[binding.slot].state.store(SLOT_FREE, Ordering::Release)`, and push `binding.slot` back to `FREE_LIST` (safe because no system ran during failed `init`, so `live_values == 0`).
-   - Restore `ModRegistry.snapshot = self.base_registry_snapshot` (`L-07`), discarding any uncommitted component entries or dynamic VTable symbols.
+   - Restore `ModRegistry.snapshot = self.base_registry_snapshot`, discarding any uncommitted component entries or dynamic VTable symbols.
    - **Ordering guarantee:** `LoadTransaction` drops strictly **before** `libloading::Library` drops in `ModHost::load_internal`, guaranteeing no live function pointer into the unmapped library ever remains reachable from `DROP_SLOTS` or `ModRegistry`.
-3. **Pruning on Unload:** When a mod cleanly unloads (`L-04`), `ModHost` sets `entry.is_active.store(false, Ordering::Release)` and publishes a new `DropSlotSnapshot` with that `mod_id`'s `DropSlotEntry` removed from `entries` (preventing `entries` from growing across reloads of the same component).
+3. **Pruning on Unload:** When a mod cleanly unloads, `ModHost` sets `entry.is_active.store(false, Ordering::Release)` and publishes a new `DropSlotSnapshot` with that `mod_id`'s `DropSlotEntry` removed from `entries` (preventing `entries` from growing across reloads of the same component).
 
 ---
 
@@ -254,19 +253,19 @@ pub type ComponentDropHook = for<'a> unsafe fn(OwningPtr<'a>, ComponentId);
 | **Runtime JIT Trampolines (`libffi` closures / `mmap` + `PROT_WRITE \| PROT_EXEC`)** | Violates W^X / hardened runtime policies on macOS Apple Silicon (requires `MAP_JIT` entitlement + `pthread_jit_write_protect_np`), iOS, consoles, and SELinux `execmem`-restricted Linux hosts. |
 | **`crossbeam-epoch` Garbage Collection** | Adds `crossbeam-epoch` + `crossbeam-utils` machinery when updates happen only at load/unload frequency. `arc-swap` provides wait-free reads and immediate debt-bounded reclamation with a tiny dependency footprint. |
 | **Reclaiming Slots Immediately in `WorldDropSlotGuard::drop` Without `live_values`** | Unsound in `bevy_ecs 0.20`: resource tables created at plugin init drop *before* entity tables created later in `Storages::drop`, creating a cross-`World` slot-reuse race window. |
-| **Leaking Slots Per `World`** | Fails multi-World server instances and parallel integration tests (`T-03`) once total drop-bearing component registrations across `World` lifecycles exceed `1024`. |
+| **Leaking Slots Per `World`** | Fails multi-World server instances and parallel integration tests once total drop-bearing component registrations across `World` lifecycles exceed `1024`. |
 
 ---
 
 ## 5. Consequences & Verification Criteria
 
 ### Positive Consequences
-- **Zero use-after-`dlclose` on failed load (`S-06`):** `LoadTransaction` atomically disarms and restores `DROP_SLOTS` and `ModRegistry` before `Library` unmaps.
-- **Flat memory under continuous hot-reload (`L-06`):** `ArcSwapOption` reclaims retired `DropSlotSnapshot` allocations automatically and prunes unloaded `DropSlotEntry` items.
-- **Full cross-World slot reuse (`L-06`):** Dropping a `World` returns 100% of its drop slots to `FREE_LIST` once its component tables finish dropping.
-- **Explicit capacity error (`C-07`):** Registering a 1025th simultaneous live drop-bearing `(World, Component)` returns `FfiResult::CAPACITY_EXCEEDED` (`13`).
+- **Zero use-after-`dlclose` on failed load:** `LoadTransaction` atomically disarms and restores `DROP_SLOTS` and `ModRegistry` before `Library` unmaps.
+- **Flat memory under continuous hot-reload:** `ArcSwapOption` reclaims retired `DropSlotSnapshot` allocations automatically and prunes unloaded `DropSlotEntry` items.
+- **Full cross-World slot reuse:** Dropping a `World` returns 100% of its drop slots to `FREE_LIST` once its component tables finish dropping.
+- **Explicit capacity error:** Registering a 1025th simultaneous live drop-bearing `(World, Component)` returns `FfiResult::CAPACITY_EXCEEDED` (`13`).
 
-### Required Verification (`Wave 1` & `Wave 3`)
-1. **`S-06` Regression Test:** Guest mod registers a component with `drop_fn`, spawns/leaves state or fails mid-`bevy_abi_mod_init` (returning `FfiResult::INVALID_STATE`); host verifies `ModLoadError`, drops `World`, and confirms zero segfaults and full slot reclamation.
-2. **`T-07` `loom` Model Check:** Exhaustive interleaving test of `(publish snapshot || drop_trampoline read || WorldDropSlotGuard::drop + final element drop)` verifying no double-push to `FREE_LIST`, no premature reclamation while `live_values > 0`, and no call to a disarmed `drop_fn`.
-3. **`L-06` 10,000-Reload Soak Test:** Counting-allocator test running 10,000 load → spawn → despawn → unload cycles and 50 sequential `World` lifecycles × 64 drop-bearing components (`3,200 > 1,024` total registrations), proving flat heap allocation and zero slot leaks.
+### Required Verification
+1. **Rollback Test:** Guest mod registers a component with `drop_fn`, spawns/leaves state or fails mid-`bevy_abi_mod_init` (returning `FfiResult::INVALID_STATE`); host verifies `ModLoadError`, drops `World`, and confirms zero segfaults and full slot reclamation.
+2. **`loom` Model Check:** Exhaustive interleaving test of `(publish snapshot || drop_trampoline read || WorldDropSlotGuard::drop + final element drop)` verifying no double-push to `FREE_LIST`, no premature reclamation while `live_values > 0`, and no call to a disarmed `drop_fn`.
+3. **10,000-Reload Soak Test:** Counting-allocator test running 10,000 load → spawn → despawn → unload cycles and 50 sequential `World` lifecycles × 64 drop-bearing components (`3,200 > 1,024` total registrations), proving flat heap allocation and zero slot leaks.

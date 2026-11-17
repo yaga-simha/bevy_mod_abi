@@ -1,5 +1,5 @@
-//! Adversarial ABI v0.2 boundary validation, extensible struct-size negotiation (`C-02`, `C-08`),
-//! flag/reserved-word rejection (`C-09`), descriptor layout, and SplitMix64 fuzz matrices.
+//! Adversarial ABI v0.2 boundary validation, extensible struct-size negotiation,
+//! flag/reserved-word rejection, descriptor layout, and SplitMix64 fuzz matrices.
 
 mod fuzz_boundaries {
     //! Adversarial / Fuzz-Style C-ABI `0.2.0` Boundary Verification Suite.
@@ -267,14 +267,14 @@ mod fuzz_boundaries {
                     assert_eq!(res, FfiResult::NULL_POINTER, "step {step}");
                 }
                 2 => {
-                    // Unknown `BamSystemDesc::flags` bit (`C-09`) -> `UNSUPPORTED`
+                    // Unknown `BamSystemDesc::flags` bit -> `UNSUPPORTED`
                     let bad_flag = 1u32 << (1 + rng.range(31));
                     let desc = valid_base.with_flags(bad_flag);
                     let res = unsafe { host_register_system(ctx_ptr, &desc) };
                     assert_eq!(res, FfiResult::UNSUPPORTED, "step {step}");
                 }
                 3 => {
-                    // Non-zero `BamSystemDesc::reserved0` (`C-09`) -> `INVALID_ARGUMENT`
+                    // Non-zero `BamSystemDesc::reserved0` -> `INVALID_ARGUMENT`
                     let mut desc = valid_base;
                     desc.reserved0 = 1 + (rng.next_u32() % 1000);
                     let res = unsafe { host_register_system(ctx_ptr, &desc) };
@@ -329,7 +329,7 @@ mod fuzz_boundaries {
                     assert_eq!(res, FfiResult::UNSUPPORTED, "step {step}");
                 }
                 6 => {
-                    // Null / empty / non-UTF-8 system `name` rejected cleanly (`C-01`)
+                    // Null / empty / non-UTF-8 system `name` rejected cleanly
                     let bad_sys_name = rng.invalid_utf8_cstring();
                     let mut desc = valid_base;
                     let expected = match rng.range(3) {
@@ -350,7 +350,7 @@ mod fuzz_boundaries {
                     assert_eq!(res, expected, "step {step}");
                 }
                 7 => {
-                    // Reserved `ScheduleId(6..1024)` rejected (`B-06`), while custom `>= 1024` accepted!
+                    // Reserved `ScheduleId(6..1024)` rejected, while custom `>= 1024` accepted!
                     if rng.gen_bool() {
                         let reserved_sched = 6 + (rng.next_u32() % (1024 - 6));
                         let desc = valid_base.with_schedule(ScheduleId(reserved_sched));
@@ -657,7 +657,7 @@ mod fuzz_boundaries {
                     );
                 }
                 6 => {
-                    // Write to `BAM_COMPONENT_FLAG_IMMUTABLE` component (`B-08`) -> `PERMISSION_DENIED`
+                    // Write to `BAM_COMPONENT_FLAG_IMMUTABLE` component -> `PERMISSION_DENIED`
                     let bad_term = if rng.gen_bool() {
                         BamTermDesc::write(immut_h)
                     } else {
@@ -810,7 +810,7 @@ mod fuzz_boundaries {
             }
             load_ctx.finish_init();
 
-            // Poisoned `LoadContext` after `finish_init()` MUST return `INVALID_STATE` (`S-08`)
+            // Poisoned `LoadContext` after `finish_init()` MUST return `INVALID_STATE`
             assert_eq!(
                 unsafe { host_register_component(ctx_ptr, &template_desc, &mut out) },
                 FfiResult::INVALID_STATE
@@ -893,7 +893,7 @@ mod fuzz_boundaries {
                     );
                 }
                 5 => {
-                    // Conflicting re-registration of `fuzz::SeededDynComp` -> `TYPE_MISMATCH` (`C-10`)
+                    // Conflicting re-registration of `fuzz::SeededDynComp` -> `TYPE_MISMATCH`
                     let (bad_size, bad_align, bad_uuid) = match rng.range(3) {
                         0 => (32, 8, seeded_uuid),
                         1 => (16, 16, seeded_uuid),
@@ -925,7 +925,7 @@ mod fuzz_boundaries {
                     assert_eq!(out, seeded_handle);
                 }
                 7 => {
-                    // Fuzz `host_resolve_component` (`C-05`)
+                    // Fuzz `host_resolve_component`
                     match rng.range(4) {
                         0 => {
                             assert_eq!(
@@ -1377,7 +1377,7 @@ mod fuzz_boundaries {
                         live_entities.push(e);
                     }
                     1 => {
-                        // Batched `host_cmd_spawn` (`P-05`): valid vs duplicate component vs `count > 64`
+                        // Batched `host_cmd_spawn`: valid vs duplicate component vs `count > 64`
                         let mut e = FfiEntity::NULL;
                         match rng.range(3) {
                             0 => {
@@ -1653,7 +1653,7 @@ mod fuzz_boundaries {
                         }
                     }
                     _ => {
-                        // Fuzz `host_get_proc_address` + `host_last_error` (`C-04`)
+                        // Fuzz `host_get_proc_address` + `host_last_error`
                         match rng.range(3) {
                             0 => {
                                 let sym = unsafe {
@@ -1757,7 +1757,7 @@ mod host_api_boundary_and_proc_address {
             assert_eq!(BamHostApi::MIN_V0_2_SIZE, 224);
             assert_eq!(core::mem::align_of::<BamHostApi>(), 8);
         }
-        // SemVer pre-1.0 vs post-1.0 rules (`C-06`)
+        // SemVer pre-1.0 vs post-1.0 rules
         assert!(abi_version_is_compatible(
             pack_abi_version(0, 2, 0),
             pack_abi_version(0, 2, 5)
@@ -1779,7 +1779,7 @@ mod host_api_boundary_and_proc_address {
     #[test]
     fn test_legacy_mod_on_newer_72_byte_host() {
         // Verify a v0.2 guest safely reads an extended future `ExtendedFutureHostApi` (`240` bytes > `224`)
-        // via bounded `read_extensible_struct::<BamHostApi>` (`C-02`, `C-08`).
+        // via bounded `read_extensible_struct::<BamHostApi>`.
         let mut future_api = ExtendedFutureHostApi {
             base: HOST_API,
             future_slot_0: 0xDEAD_BEEF,
@@ -2384,7 +2384,7 @@ mod query_limits_and_placeholder_entities {
     }
 
     #[test]
-    fn d8_rejects_query_count_exceeding_max_query_components() {
+    fn rejects_query_count_exceeding_max_query_components() {
         let mut load_ctx = LoadContext::new(ModRegistry::new());
         let ctx_ptr = load_ctx.as_ffi_ptr();
 
@@ -2425,7 +2425,7 @@ mod query_limits_and_placeholder_entities {
     }
 
     #[test]
-    fn d9_and_d10_null_placeholder_entities_rejected_and_overaligned_zst_succeeds() {
+    fn null_placeholder_entities_rejected_and_overaligned_zst_succeeds() {
         let mut world = World::new();
         let mut reg = ModRegistry::new();
         let pos_id = world.register_component::<Position>();
@@ -2443,8 +2443,8 @@ mod query_limits_and_placeholder_entities {
                 None,
             );
             let zst_desc = ComponentDesc::new(
-                c"d10::Aligned64Zst".as_ptr(),
-                ComponentUuid::from_parts("d10::Aligned64Zst", 0, 64, 0),
+                c"layout_test::Aligned64Zst".as_ptr(),
+                ComponentUuid::from_parts("layout_test::Aligned64Zst", 0, 64, 0),
                 0,
                 64,
             );
@@ -2458,7 +2458,7 @@ mod query_limits_and_placeholder_entities {
         let snap = world.resource::<ModRegistry>().snapshot_arc();
         let zst_id = snap.get_by_handle(zst_h).unwrap().component_id;
 
-        // D9: null queue returns `NULL_POINTER`
+        // Null command queue returns `NULL_POINTER`
         let mut out_ent = FfiEntity::NULL;
         assert_eq!(
             unsafe { host_cmd_spawn_empty(core::ptr::null_mut(), &mut out_ent) },
@@ -2494,7 +2494,7 @@ mod query_limits_and_placeholder_entities {
                 );
             }
 
-            // D10: Insert 64-byte-aligned ZST onto spawned entities via both `cmd_insert` and `cmd_spawn`!
+            // Insert 64-byte-aligned ZST onto spawned entities via both `cmd_insert` and `cmd_spawn`!
             let mut e1 = FfiEntity::NULL;
             assert_eq!(
                 unsafe { host_cmd_spawn_empty(raw_q, &mut e1) },

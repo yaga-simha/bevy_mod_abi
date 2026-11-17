@@ -10,24 +10,24 @@
 //! `#![forbid(unsafe_code)]` unconditionally.
 //!
 //! ## Core Capabilities
-//! - **Per-World Instance Isolation (`L-02`, `L-08`):** [`export_mod!`] exports
+//! - **Per-World Instance Isolation:** [`export_mod!`] exports
 //!   `bevy_abi_mod_manifest`, `bevy_abi_mod_init`, and `bevy_abi_mod_shutdown` backed by a
 //!   heap-allocated per-World [`GuestInstance`](raw::GuestInstance) with **zero** process-global
 //!   mutable state—loading the same `.cdylib` into multiple Bevy `World`s simultaneously is
 //!   completely isolated.
-//! - **Unified `app.system(...)` Builder (`G-02`):** [`GuestApp::system`] compiles up to
+//! - **Unified `app.system(...)` Builder:** [`GuestApp::system`] compiles up to
 //!   [`MAX_QUERIES_PER_SYSTEM`] queries, declaration-indexed singleton resources, [`ScheduleId`]
 //!   selection, `.after(...)` / `.before(...)` named ordering, `.main_thread()` pinning, and
 //!   lock-free `.run_if(...)` predicates into a single [`BamSystemDesc`](raw::BamSystemDesc).
-//! - **Verified Zero-Copy Views (`C-13`, `P-02`, `P-04`):** [`Chunk`] validates [`BamColumnInfo`]
+//! - **Verified Zero-Copy Views:** [`Chunk`] validates [`BamColumnInfo`]
 //!   (`size`, `align`, `mode`, storage flags, and `ComponentUuid` via [`Chunk::component`]),
 //!   provides indirect sparse-set row views ([`Chunk::rows`] / [`Chunk::rows_mut`]), and supports
 //!   untracked mutable slices paired with [`Chunk::mark_changed_range`].
-//! - **Handle-Based & Batched Commands (`C-05`, `P-05`):** [`GuestCommands`] enqueues zero-steady-state-allocation
+//! - **Handle-Based & Batched Commands:** [`GuestCommands`] enqueues zero-steady-state-allocation
 //!   deferred spawns (`spawn_empty`, single-archetype batched `spawn`), `despawn`, `insert`,
 //!   `insert_default`, and `remove` using 1-based [`BamComponent`] handles.
 //!
-//! ## Panic & Unwind Policy: `panic = "unwind"` vs. `panic = "abort"` (`G-05`, `S-09`)
+//! ## Panic & Unwind Policy: `panic = "unwind"` vs. `panic = "abort"`
 //!
 //! Every function pointer across `bevy_abi_mod` uses `extern "C"` (`nounwind`), never
 //! `extern "C-unwind"`. Unwinding across an `extern "C"` boundary is Undefined Behavior, and the

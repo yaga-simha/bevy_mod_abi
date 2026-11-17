@@ -1,4 +1,4 @@
-//! Static 32-slot `HOST_API: BamHostApi` function table passed to `bevy_abi_mod_init` (`C-03`, Wave 4).
+//! Static 38-slot `HOST_API: BamHostApi` function table passed to `bevy_abi_mod_init`.
 
 use crate::ffi::commands::{
     host_cmd_despawn, host_cmd_insert, host_cmd_insert_default, host_cmd_remove, host_cmd_spawn,
@@ -23,7 +23,7 @@ use crate::system::{
 };
 use bevy_abi_mod_sys::{ABI_VERSION, BamHostApi};
 
-/// Global immutable 32-slot C-ABI v0.2 host function table (`C-03`, `P-07`, `F-02`, `F-03`).
+/// Global immutable 38-slot C-ABI v0.2 host function table.
 pub static HOST_API: BamHostApi = BamHostApi {
     struct_size: core::mem::size_of::<BamHostApi>() as u32,
     abi_version: ABI_VERSION,
@@ -67,7 +67,7 @@ pub static HOST_API: BamHostApi = BamHostApi {
     cmd_insert_default: Some(host_cmd_insert_default),
     cmd_remove: Some(host_cmd_remove),
 
-    // Appended Wave 4 optional slots (`P-07`, `F-03`, `F-02`)
+    // Extended parallel iteration, entity lookups, and messaging slots
     par_for_each_chunk: Some(host_par_for_each_chunk),
     sys_entity_get: Some(host_sys_entity_get),
     sys_entity_get_mut: Some(host_sys_entity_get_mut),
@@ -84,4 +84,4 @@ pub static HOST_API: BamHostApi = BamHostApi {
 };
 
 const _: () = assert!(HOST_API.has_all_v0_2_slots());
-const _: () = assert!(HOST_API.has_all_wave4_slots());
+const _: () = assert!(HOST_API.has_all_slots());

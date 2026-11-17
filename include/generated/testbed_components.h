@@ -146,14 +146,14 @@ BAM_STATIC_ASSERT(sizeof(ArmorVTable) == 56u, armorvtable_size64);
 BAM_STATIC_ASSERT(sizeof(ArmorVTable) == 40u, armorvtable_size32);
 #endif
 
-/* Component: `testbed::Phase4Transform` (IS_ABI_POD = true) */
-typedef struct Phase4Transform {
+/* Component: `testbed::FilteredTransform` (IS_ABI_POD = true) */
+typedef struct FilteredTransform {
     float x;
     float y;
     float z;
-} Phase4Transform;
+} FilteredTransform;
 
-typedef struct Phase4TransformVTable {
+typedef struct FilteredTransformVTable {
     BamVTableHeader header;
     float (*get_x)(const void* ptr);
     BamResult (*set_x)(void* ptr, float val);
@@ -161,22 +161,22 @@ typedef struct Phase4TransformVTable {
     BamResult (*set_y)(void* ptr, float val);
     float (*get_z)(const void* ptr);
     BamResult (*set_z)(void* ptr, float val);
-} Phase4TransformVTable;
-BAM_STATIC_ASSERT(offsetof(Phase4TransformVTable, header) == 0u, phase4transformvtable_header_off);
+} FilteredTransformVTable;
+BAM_STATIC_ASSERT(offsetof(FilteredTransformVTable, header) == 0u, filteredtransformvtable_header_off);
 #if UINTPTR_MAX == UINT64_MAX
-BAM_STATIC_ASSERT(sizeof(Phase4TransformVTable) == 88u, phase4transformvtable_size64);
+BAM_STATIC_ASSERT(sizeof(FilteredTransformVTable) == 88u, filteredtransformvtable_size64);
 #elif UINTPTR_MAX == UINT32_MAX
-BAM_STATIC_ASSERT(sizeof(Phase4TransformVTable) == 56u, phase4transformvtable_size32);
+BAM_STATIC_ASSERT(sizeof(FilteredTransformVTable) == 56u, filteredtransformvtable_size32);
 #endif
 
-/* Component: `testbed::Phase4CTransform` (IS_ABI_POD = true) */
-typedef struct Phase4CTransform {
+/* Component: `testbed::CFilteredTransform` (IS_ABI_POD = true) */
+typedef struct CFilteredTransform {
     float x;
     float y;
     float z;
-} Phase4CTransform;
+} CFilteredTransform;
 
-typedef struct Phase4CTransformVTable {
+typedef struct CFilteredTransformVTable {
     BamVTableHeader header;
     float (*get_x)(const void* ptr);
     BamResult (*set_x)(void* ptr, float val);
@@ -184,125 +184,125 @@ typedef struct Phase4CTransformVTable {
     BamResult (*set_y)(void* ptr, float val);
     float (*get_z)(const void* ptr);
     BamResult (*set_z)(void* ptr, float val);
-} Phase4CTransformVTable;
-BAM_STATIC_ASSERT(offsetof(Phase4CTransformVTable, header) == 0u, phase4ctransformvtable_header_off);
+} CFilteredTransformVTable;
+BAM_STATIC_ASSERT(offsetof(CFilteredTransformVTable, header) == 0u, cfilteredtransformvtable_header_off);
 #if UINTPTR_MAX == UINT64_MAX
-BAM_STATIC_ASSERT(sizeof(Phase4CTransformVTable) == 88u, phase4ctransformvtable_size64);
+BAM_STATIC_ASSERT(sizeof(CFilteredTransformVTable) == 88u, cfilteredtransformvtable_size64);
 #elif UINTPTR_MAX == UINT32_MAX
-BAM_STATIC_ASSERT(sizeof(Phase4CTransformVTable) == 56u, phase4ctransformvtable_size32);
+BAM_STATIC_ASSERT(sizeof(CFilteredTransformVTable) == 56u, cfilteredtransformvtable_size32);
 #endif
 
-/* Component: `testbed::Phase4Sensor` (IS_ABI_POD = true) */
-typedef struct Phase4Sensor {
+/* Component: `testbed::ChangeSensor` (IS_ABI_POD = true) */
+typedef struct ChangeSensor {
     uint32_t val;
-} Phase4Sensor;
+} ChangeSensor;
 
-typedef struct Phase4SensorVTable {
+typedef struct ChangeSensorVTable {
     BamVTableHeader header;
     uint32_t (*get_val)(const void* ptr);
     BamResult (*set_val)(void* ptr, uint32_t val);
-} Phase4SensorVTable;
-BAM_STATIC_ASSERT(offsetof(Phase4SensorVTable, header) == 0u, phase4sensorvtable_header_off);
+} ChangeSensorVTable;
+BAM_STATIC_ASSERT(offsetof(ChangeSensorVTable, header) == 0u, changesensorvtable_header_off);
 #if UINTPTR_MAX == UINT64_MAX
-BAM_STATIC_ASSERT(sizeof(Phase4SensorVTable) == 56u, phase4sensorvtable_size64);
+BAM_STATIC_ASSERT(sizeof(ChangeSensorVTable) == 56u, changesensorvtable_size64);
 #elif UINTPTR_MAX == UINT32_MAX
-BAM_STATIC_ASSERT(sizeof(Phase4SensorVTable) == 40u, phase4sensorvtable_size32);
+BAM_STATIC_ASSERT(sizeof(ChangeSensorVTable) == 40u, changesensorvtable_size32);
 #endif
 
-/* Component: `testbed::Phase4CSensor` (IS_ABI_POD = true) */
-typedef struct Phase4CSensor {
+/* Component: `testbed::CChangeSensor` (IS_ABI_POD = true) */
+typedef struct CChangeSensor {
     uint32_t val;
-} Phase4CSensor;
+} CChangeSensor;
 
-typedef struct Phase4CSensorVTable {
+typedef struct CChangeSensorVTable {
     BamVTableHeader header;
     uint32_t (*get_val)(const void* ptr);
     BamResult (*set_val)(void* ptr, uint32_t val);
-} Phase4CSensorVTable;
-BAM_STATIC_ASSERT(offsetof(Phase4CSensorVTable, header) == 0u, phase4csensorvtable_header_off);
+} CChangeSensorVTable;
+BAM_STATIC_ASSERT(offsetof(CChangeSensorVTable, header) == 0u, cchangesensorvtable_header_off);
 #if UINTPTR_MAX == UINT64_MAX
-BAM_STATIC_ASSERT(sizeof(Phase4CSensorVTable) == 56u, phase4csensorvtable_size64);
+BAM_STATIC_ASSERT(sizeof(CChangeSensorVTable) == 56u, cchangesensorvtable_size64);
 #elif UINTPTR_MAX == UINT32_MAX
-BAM_STATIC_ASSERT(sizeof(Phase4CSensorVTable) == 40u, phase4csensorvtable_size32);
+BAM_STATIC_ASSERT(sizeof(CChangeSensorVTable) == 40u, cchangesensorvtable_size32);
 #endif
 
-/* Component: `testbed::Phase4FreshTag` (IS_ABI_POD = true) */
-typedef struct Phase4FreshTag {
+/* Component: `testbed::FreshSpawnTag` (IS_ABI_POD = true) */
+typedef struct FreshSpawnTag {
     uint32_t code;
-} Phase4FreshTag;
+} FreshSpawnTag;
 
-typedef struct Phase4FreshTagVTable {
+typedef struct FreshSpawnTagVTable {
     BamVTableHeader header;
     uint32_t (*get_code)(const void* ptr);
     BamResult (*set_code)(void* ptr, uint32_t val);
-} Phase4FreshTagVTable;
-BAM_STATIC_ASSERT(offsetof(Phase4FreshTagVTable, header) == 0u, phase4freshtagvtable_header_off);
+} FreshSpawnTagVTable;
+BAM_STATIC_ASSERT(offsetof(FreshSpawnTagVTable, header) == 0u, freshspawntagvtable_header_off);
 #if UINTPTR_MAX == UINT64_MAX
-BAM_STATIC_ASSERT(sizeof(Phase4FreshTagVTable) == 56u, phase4freshtagvtable_size64);
+BAM_STATIC_ASSERT(sizeof(FreshSpawnTagVTable) == 56u, freshspawntagvtable_size64);
 #elif UINTPTR_MAX == UINT32_MAX
-BAM_STATIC_ASSERT(sizeof(Phase4FreshTagVTable) == 40u, phase4freshtagvtable_size32);
+BAM_STATIC_ASSERT(sizeof(FreshSpawnTagVTable) == 40u, freshspawntagvtable_size32);
 #endif
 
-/* Component: `testbed::Phase4CFreshTag` (IS_ABI_POD = true) */
-typedef struct Phase4CFreshTag {
+/* Component: `testbed::CFreshSpawnTag` (IS_ABI_POD = true) */
+typedef struct CFreshSpawnTag {
     uint32_t code;
-} Phase4CFreshTag;
+} CFreshSpawnTag;
 
-typedef struct Phase4CFreshTagVTable {
+typedef struct CFreshSpawnTagVTable {
     BamVTableHeader header;
     uint32_t (*get_code)(const void* ptr);
     BamResult (*set_code)(void* ptr, uint32_t val);
-} Phase4CFreshTagVTable;
-BAM_STATIC_ASSERT(offsetof(Phase4CFreshTagVTable, header) == 0u, phase4cfreshtagvtable_header_off);
+} CFreshSpawnTagVTable;
+BAM_STATIC_ASSERT(offsetof(CFreshSpawnTagVTable, header) == 0u, cfreshspawntagvtable_header_off);
 #if UINTPTR_MAX == UINT64_MAX
-BAM_STATIC_ASSERT(sizeof(Phase4CFreshTagVTable) == 56u, phase4cfreshtagvtable_size64);
+BAM_STATIC_ASSERT(sizeof(CFreshSpawnTagVTable) == 56u, cfreshspawntagvtable_size64);
 #elif UINTPTR_MAX == UINT32_MAX
-BAM_STATIC_ASSERT(sizeof(Phase4CFreshTagVTable) == 40u, phase4cfreshtagvtable_size32);
+BAM_STATIC_ASSERT(sizeof(CFreshSpawnTagVTable) == 40u, cfreshspawntagvtable_size32);
 #endif
 
-/* Component: `testbed::Phase4Removable` (IS_ABI_POD = true) */
-typedef struct Phase4Removable {
+/* Component: `testbed::TransientMarker` (IS_ABI_POD = true) */
+typedef struct TransientMarker {
     uint32_t dummy;
-} Phase4Removable;
+} TransientMarker;
 
-typedef struct Phase4RemovableVTable {
+typedef struct TransientMarkerVTable {
     BamVTableHeader header;
     uint32_t (*get_dummy)(const void* ptr);
     BamResult (*set_dummy)(void* ptr, uint32_t val);
-} Phase4RemovableVTable;
-BAM_STATIC_ASSERT(offsetof(Phase4RemovableVTable, header) == 0u, phase4removablevtable_header_off);
+} TransientMarkerVTable;
+BAM_STATIC_ASSERT(offsetof(TransientMarkerVTable, header) == 0u, transientmarkervtable_header_off);
 #if UINTPTR_MAX == UINT64_MAX
-BAM_STATIC_ASSERT(sizeof(Phase4RemovableVTable) == 56u, phase4removablevtable_size64);
+BAM_STATIC_ASSERT(sizeof(TransientMarkerVTable) == 56u, transientmarkervtable_size64);
 #elif UINTPTR_MAX == UINT32_MAX
-BAM_STATIC_ASSERT(sizeof(Phase4RemovableVTable) == 40u, phase4removablevtable_size32);
+BAM_STATIC_ASSERT(sizeof(TransientMarkerVTable) == 40u, transientmarkervtable_size32);
 #endif
 
-/* Component: `testbed::Phase4CRemovable` (IS_ABI_POD = true) */
-typedef struct Phase4CRemovable {
+/* Component: `testbed::CTransientMarker` (IS_ABI_POD = true) */
+typedef struct CTransientMarker {
     uint32_t dummy;
-} Phase4CRemovable;
+} CTransientMarker;
 
-typedef struct Phase4CRemovableVTable {
+typedef struct CTransientMarkerVTable {
     BamVTableHeader header;
     uint32_t (*get_dummy)(const void* ptr);
     BamResult (*set_dummy)(void* ptr, uint32_t val);
-} Phase4CRemovableVTable;
-BAM_STATIC_ASSERT(offsetof(Phase4CRemovableVTable, header) == 0u, phase4cremovablevtable_header_off);
+} CTransientMarkerVTable;
+BAM_STATIC_ASSERT(offsetof(CTransientMarkerVTable, header) == 0u, ctransientmarkervtable_header_off);
 #if UINTPTR_MAX == UINT64_MAX
-BAM_STATIC_ASSERT(sizeof(Phase4CRemovableVTable) == 56u, phase4cremovablevtable_size64);
+BAM_STATIC_ASSERT(sizeof(CTransientMarkerVTable) == 56u, ctransientmarkervtable_size64);
 #elif UINTPTR_MAX == UINT32_MAX
-BAM_STATIC_ASSERT(sizeof(Phase4CRemovableVTable) == 40u, phase4cremovablevtable_size32);
+BAM_STATIC_ASSERT(sizeof(CTransientMarkerVTable) == 40u, ctransientmarkervtable_size32);
 #endif
 
-/* Component: `testbed::Phase4RustRes` (IS_ABI_POD = true) */
-typedef struct Phase4RustRes {
+/* Component: `testbed::RustFilterTelemetry` (IS_ABI_POD = true) */
+typedef struct RustFilterTelemetry {
     float scale;
     uint32_t matched_rows;
     uint32_t optional_vel_hits;
     uint64_t spawned_default_entity;
-} Phase4RustRes;
+} RustFilterTelemetry;
 
-typedef struct Phase4RustResVTable {
+typedef struct RustFilterTelemetryVTable {
     BamVTableHeader header;
     float (*get_scale)(const void* ptr);
     BamResult (*set_scale)(void* ptr, float val);
@@ -312,23 +312,23 @@ typedef struct Phase4RustResVTable {
     BamResult (*set_optional_vel_hits)(void* ptr, uint32_t val);
     uint64_t (*get_spawned_default_entity)(const void* ptr);
     BamResult (*set_spawned_default_entity)(void* ptr, uint64_t val);
-} Phase4RustResVTable;
-BAM_STATIC_ASSERT(offsetof(Phase4RustResVTable, header) == 0u, phase4rustresvtable_header_off);
+} RustFilterTelemetryVTable;
+BAM_STATIC_ASSERT(offsetof(RustFilterTelemetryVTable, header) == 0u, rustfiltertelemetryvtable_header_off);
 #if UINTPTR_MAX == UINT64_MAX
-BAM_STATIC_ASSERT(sizeof(Phase4RustResVTable) == 104u, phase4rustresvtable_size64);
+BAM_STATIC_ASSERT(sizeof(RustFilterTelemetryVTable) == 104u, rustfiltertelemetryvtable_size64);
 #elif UINTPTR_MAX == UINT32_MAX
-BAM_STATIC_ASSERT(sizeof(Phase4RustResVTable) == 64u, phase4rustresvtable_size32);
+BAM_STATIC_ASSERT(sizeof(RustFilterTelemetryVTable) == 64u, rustfiltertelemetryvtable_size32);
 #endif
 
-/* Component: `testbed::Phase4CRes` (IS_ABI_POD = true) */
-typedef struct Phase4CRes {
+/* Component: `testbed::CFilterTelemetry` (IS_ABI_POD = true) */
+typedef struct CFilterTelemetry {
     float scale;
     uint32_t matched_rows;
     uint32_t optional_vel_hits;
     uint64_t spawned_default_entity;
-} Phase4CRes;
+} CFilterTelemetry;
 
-typedef struct Phase4CResVTable {
+typedef struct CFilterTelemetryVTable {
     BamVTableHeader header;
     float (*get_scale)(const void* ptr);
     BamResult (*set_scale)(void* ptr, float val);
@@ -338,12 +338,12 @@ typedef struct Phase4CResVTable {
     BamResult (*set_optional_vel_hits)(void* ptr, uint32_t val);
     uint64_t (*get_spawned_default_entity)(const void* ptr);
     BamResult (*set_spawned_default_entity)(void* ptr, uint64_t val);
-} Phase4CResVTable;
-BAM_STATIC_ASSERT(offsetof(Phase4CResVTable, header) == 0u, phase4cresvtable_header_off);
+} CFilterTelemetryVTable;
+BAM_STATIC_ASSERT(offsetof(CFilterTelemetryVTable, header) == 0u, cfiltertelemetryvtable_header_off);
 #if UINTPTR_MAX == UINT64_MAX
-BAM_STATIC_ASSERT(sizeof(Phase4CResVTable) == 104u, phase4cresvtable_size64);
+BAM_STATIC_ASSERT(sizeof(CFilterTelemetryVTable) == 104u, cfiltertelemetryvtable_size64);
 #elif UINTPTR_MAX == UINT32_MAX
-BAM_STATIC_ASSERT(sizeof(Phase4CResVTable) == 64u, phase4cresvtable_size32);
+BAM_STATIC_ASSERT(sizeof(CFilterTelemetryVTable) == 64u, cfiltertelemetryvtable_size32);
 #endif
 
 /* Component: `c_interop::Vec3` (IS_ABI_POD = true) */

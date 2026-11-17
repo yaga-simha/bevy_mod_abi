@@ -4,7 +4,7 @@
 //! `ModQuarantine::reenable`, single-path `Messages<ModSystemFaulted>`, unified `BamSystemDesc`
 //! multi-query scoping, `run_if` condition callbacks, custom `ScheduleId >= 1024`,
 //! `BAM_SYSTEM_FLAG_MAIN_THREAD`, `ModNamedSystemSet` ordering, runtime `Startup` execution,
-//! and `T-05` `proptest!` native-vs-dynamic differential Bevy ECS parity.
+//! and `proptest!` native-vs-dynamic differential Bevy ECS parity.
 
 #![allow(
     clippy::undocumented_unsafe_blocks,
@@ -22,5 +22,5 @@ mod support;
 mod conflicts_and_faults;
 mod differential_parity;
 mod multi_query_and_conditions;
-mod regressions;
-mod wave4_features;
+mod ordering_and_validation;
+mod sets_and_diagnostics;

@@ -103,7 +103,7 @@ mod registry_and_command_bridge {
             .expect("Position found by UUID");
         assert_eq!(pos_by_uuid.component_id, pos_id);
 
-        // `"bam.v0.*"` symbol resolution (`C-04`)
+        // `"bam.v0.*"` symbol resolution
         let snap = registry.snapshot();
         assert_eq!(
             snap.resolve_symbol("bam.v0.bridge::Position.vtable"),
@@ -133,7 +133,7 @@ mod registry_and_command_bridge {
         let mut load_b = LoadContext::new(registry_b);
 
         // 1. Scoped `BamHostCtx` lookup on `load_a` resolves `"bam.v0.*"` symbols, while `load_b`
-        //    stays completely isolated (zero process-global symbol table in ABI v0.2, `C-04`).
+        //    stays completely isolated (zero process-global symbol table in ABI v0.2).
         unsafe {
             let ctx_a = host_load_host_ctx(load_a.as_ffi_ptr());
             let ctx_b = host_load_host_ctx(load_b.as_ffi_ptr());
@@ -158,7 +158,7 @@ mod registry_and_command_bridge {
             );
         }
 
-        // 2. Poisoning `load_a` via `finish_init` immediately invalidates `ctx_a` (`S-08`).
+        // 2. Poisoning `load_a` via `finish_init` immediately invalidates `ctx_a`.
         let stale_ctx_a = unsafe { host_load_host_ctx(load_a.as_ffi_ptr()) };
         load_a.finish_init();
         load_b.finish_init();
@@ -199,7 +199,7 @@ mod registry_and_command_bridge {
             z: 3.0,
         };
 
-        // 1. Queue `spawn_empty` + `insert` AND single-archetype `spawn` batch (`P-05`)
+        // 1. Queue `spawn_empty` + `insert` AND single-archetype `spawn` batch
         let (ffi_entity, batched_entity) = {
             let mut cmds = HostCommands::new(&mut storage, world.entity_allocator(), &snap);
             let raw_cmds = cmds.as_ffi_ptr();
@@ -452,7 +452,7 @@ mod registry_and_command_bridge {
             let entities_ptr = unsafe { host_iter_entities(raw_iter) };
             assert!(!entities_ptr.is_null());
 
-            // Check column 0 (`Position`: `WRITE`) + `iter_column_info` (`C-13`)
+            // Check column 0 (`Position`: `WRITE`) + `iter_column_info`
             let pos_mut = unsafe { host_iter_column_mutable(raw_iter, 0) };
             assert!(!pos_mut.is_null());
             let mut info_0 = MaybeUninit::<BamColumnInfo>::uninit();
@@ -791,14 +791,14 @@ mod registry_and_command_bridge {
             FfiResult::OK
         );
 
-        // 5. Unknown flags rejected (`C-09`)
+        // 5. Unknown flags rejected
         let bad_flags_desc = valid_desc.with_flags(1 << 31);
         assert_eq!(
             unsafe { call_register_component_fresh(&bad_flags_desc) },
             FfiResult::UNSUPPORTED
         );
 
-        // 6. Known flags (`SPARSE_SET | IMMUTABLE`) accepted (`B-08`)
+        // 6. Known flags (`SPARSE_SET | IMMUTABLE`) accepted
         let flagged_desc =
             valid_desc.with_flags(BAM_COMPONENT_FLAG_SPARSE_SET | BAM_COMPONENT_FLAG_IMMUTABLE);
         assert_eq!(
@@ -860,7 +860,7 @@ mod registry_and_command_bridge {
 
     #[test]
     fn test_host_get_proc_address_resolves_register_component() {
-        // In ABI v0.2 (`C-03`, `C-04`), all 27 core host APIs live directly on `HOST_API`,
+        // In ABI v0.2, all 27 core host APIs live directly on `HOST_API`,
         // `ModRegistry::new()` registers zero built-in function symbols, and `host_get_proc_address`
         // strictly serves `"bam.v0.*"` custom symbols and component VTables.
         assert!(HOST_API.register_component.is_some());
@@ -1132,7 +1132,7 @@ mod runtime_10k_soa_pipeline {
             FfiResult::OK
         );
 
-        // 1. Verify column sizes via `host_iter_column_info` (`C-13`)
+        // 1. Verify column sizes via `host_iter_column_info`
         let mut info0 = MaybeUninit::<BamColumnInfo>::uninit();
         let mut info1 = MaybeUninit::<BamColumnInfo>::uninit();
         let mut info2 = MaybeUninit::<BamColumnInfo>::uninit();
@@ -1188,7 +1188,7 @@ mod runtime_10k_soa_pipeline {
             total_processed += count;
         }
 
-        // 2. Queue deferred operations using pre-resolved `BamComponent` handle (`C-05`)
+        // 2. Queue deferred operations using pre-resolved `BamComponent` handle
         let mut spawned_entity = FfiEntity::NULL;
         assert_eq!(
             unsafe { host_cmd_spawn_empty(commands, &mut spawned_entity) },

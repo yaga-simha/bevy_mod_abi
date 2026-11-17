@@ -438,7 +438,7 @@ fn abi_v0_2_exact_sizes_alignments_and_offsets() {
 }
 
 #[test]
-fn regression_c06_zero_major_and_post_one_semver_handshake() {
+fn zero_major_and_post_one_semver_handshake() {
     assert_eq!(ABI_VERSION_MAJOR, 0);
     assert_eq!(ABI_VERSION_MINOR, 2);
     assert_eq!(ABI_VERSION_PATCH, 0);
@@ -488,7 +488,7 @@ fn pack_abi_version_rejects_patch_overflow() {
 }
 
 #[test]
-fn regression_c07_ffi_result_taxonomy_and_display() {
+fn ffi_result_taxonomy_and_display() {
     let expected = [
         (FfiResult::OK, 0, "OK"),
         (FfiResult::INVALID_COMPONENT, 1, "INVALID_COMPONENT"),
@@ -529,7 +529,7 @@ fn regression_c07_ffi_result_taxonomy_and_display() {
 }
 
 #[test]
-fn regression_c02_and_c08_extensible_struct_zero_extension_and_truncation() {
+fn extensible_struct_zero_extension_and_truncation() {
     type FutureSlotFn = unsafe extern "C" fn(ctx: *const BamHostCtx) -> FfiResult;
 
     #[repr(C)]
@@ -619,7 +619,7 @@ fn regression_c02_and_c08_extensible_struct_zero_extension_and_truncation() {
 }
 
 #[test]
-fn regression_c09_unknown_flags_and_nonzero_reserved_rejected() {
+fn unknown_flags_and_nonzero_reserved_rejected() {
     // BamManifest
     let manifest = BamManifest::new(c"combat_mod".as_ptr(), c"0.2.0".as_ptr());
     assert_eq!(manifest.validate(), FfiResult::OK);
@@ -662,7 +662,7 @@ fn regression_c09_unknown_flags_and_nonzero_reserved_rejected() {
         FfiResult::CAPACITY_EXCEEDED
     );
 
-    // BamSystemDesc (`B-06` custom schedule + `B-07` main thread + `C-09` flags/reserved)
+    // BamSystemDesc (`custom schedule + `main thread + `flags/reserved)
     let after_names = [c"input_set".as_ptr()];
     let before_names = [c"render_set".as_ptr()];
     let sys = BamSystemDesc::new(
@@ -693,7 +693,7 @@ fn regression_c09_unknown_flags_and_nonzero_reserved_rejected() {
     bad_sys.reserved0 = 42;
     assert_eq!(bad_sys.validate(), FfiResult::INVALID_ARGUMENT);
 
-    // Reserved schedule IDs 6..1024 -> INVALID_ARGUMENT (`B-06`)
+    // Reserved schedule IDs 6..1024 -> INVALID_ARGUMENT
     for reserved_sched in [6u32, 42, 1023] {
         assert!(!ScheduleId(reserved_sched).is_valid());
         assert_eq!(
@@ -710,7 +710,7 @@ fn regression_c09_unknown_flags_and_nonzero_reserved_rejected() {
     too_many_queries.query_count = MAX_QUERIES_PER_SYSTEM + 1;
     assert_eq!(too_many_queries.validate(), FfiResult::CAPACITY_EXCEEDED);
 
-    // ComponentDesc (`B-08` sparse-set + immutable + `C-09` unknown flag)
+    // ComponentDesc (`sparse-set + immutable + `unknown flag)
     let uuid = ComponentUuid::from_parts("combat_mod::Health", 4, 4, 0);
     let comp_desc = ComponentDesc::new(c"combat_mod::Health".as_ptr(), uuid, 4, 4)
         .with_flags(BAM_COMPONENT_FLAG_SPARSE_SET | BAM_COMPONENT_FLAG_IMMUTABLE)
@@ -760,7 +760,7 @@ fn regression_c09_unknown_flags_and_nonzero_reserved_rejected() {
 }
 
 #[test]
-fn regression_c10_siphash24_128_vectors_and_component_uuid() {
+fn siphash24_128_vectors_and_component_uuid() {
     // Official Aumasson & Bernstein SipHash-2-4-128 test vectors for key 000102..0f:
     let k0 = 0x0706_0504_0302_0100u64;
     let k1 = 0x0f0e_0d0c_0b0a_0908u64;
@@ -830,7 +830,7 @@ fn regression_c10_siphash24_128_vectors_and_component_uuid() {
         siphash24_128(&flat, SIPHASH_KEY_0, SIPHASH_KEY_1)
     );
 
-    // Cross-mod namespace isolation & layout sensitivity (`C-10`):
+    // Cross-mod namespace isolation & layout sensitivity:
     let mod_a_health = ComponentUuid::from_parts("mod_a::Health", 4, 4, 0);
     let mod_b_health = ComponentUuid::from_parts("mod_b::Health", 4, 4, 0);
     let mod_a_health_wide = ComponentUuid::from_parts("mod_a::Health", 8, 8, 0);
@@ -862,7 +862,7 @@ fn regression_c10_siphash24_128_vectors_and_component_uuid() {
 }
 
 #[test]
-fn regression_c11_m05_traits_vtable_header_and_column_info() {
+fn abi_pod_and_vtable_header_and_column_info() {
     // Permitted cross-language `AbiPod` primitives & newtypes:
     assert_abi_pod::<u8>();
     assert_abi_pod::<i8>();
@@ -887,7 +887,7 @@ fn regression_c11_m05_traits_vtable_header_and_column_info() {
     assert_raw_insertable::<isize>();
     assert_raw_insertable::<[u128; 2]>();
 
-    // Mock `ModComponent` with `VTableHeader` at offset 0 (`M-05`, `N-02`):
+    // Mock `ModComponent` with `VTableHeader` at offset 0:
     #[repr(C)]
     #[derive(Copy, Clone)]
     struct MockPos {
@@ -966,7 +966,7 @@ fn regression_c11_m05_traits_vtable_header_and_column_info() {
     let x = unsafe { (MockPos::vtable().get_x.unwrap())(&raw const pos) };
     assert_eq!(x, 12.5);
 
-    // `BamColumnInfo` flags & layout helpers (`C-13`):
+    // `BamColumnInfo` flags & layout helpers:
     let info = BamColumnInfo {
         component: BamComponent::from_raw(3),
         mode: AccessMode::READ,
@@ -1050,10 +1050,10 @@ fn regression_c11_m05_traits_vtable_header_and_column_info() {
 }
 
 #[test]
-fn wave4_min_v0_2_backwards_compatibility_for_manifest_component_desc_and_host_api() {
+fn min_v0_2_backwards_compatibility_for_manifest_component_desc_and_host_api() {
     #[repr(C)]
     #[derive(Copy, Clone)]
-    struct Wave3Manifest {
+    struct MinimalV02Manifest {
         struct_size: u32,
         abi_version: u32,
         name: *const c_char,
@@ -1061,12 +1061,12 @@ fn wave4_min_v0_2_backwards_compatibility_for_manifest_component_desc_and_host_a
         flags: u32,
         reserved0: u32,
     }
-    assert_eq!(size_of::<Wave3Manifest>(), BamManifest::MIN_V0_2_SIZE);
+    assert_eq!(size_of::<MinimalV02Manifest>(), BamManifest::MIN_V0_2_SIZE);
 
-    let legacy_manifest = Wave3Manifest {
-        struct_size: size_of::<Wave3Manifest>() as u32,
+    let legacy_manifest = MinimalV02Manifest {
+        struct_size: size_of::<MinimalV02Manifest>() as u32,
         abi_version: ABI_VERSION,
-        name: c"legacy_wave3_mod".as_ptr(),
+        name: c"legacy_min_v0_2_mod".as_ptr(),
         version: c"0.2.0".as_ptr(),
         flags: 0,
         reserved0: 0,
@@ -1074,7 +1074,7 @@ fn wave4_min_v0_2_backwards_compatibility_for_manifest_component_desc_and_host_a
     // SAFETY: `legacy_manifest` is initialized on the local stack with `MIN_V0_2_SIZE` bytes.
     let widened_manifest =
         unsafe { read_descriptor::<BamManifest>((&raw const legacy_manifest).cast::<c_void>()) }
-            .expect("Wave 3 MIN_V0_2_SIZE BamManifest must be accepted");
+            .expect("MIN_V0_2_SIZE BamManifest must be accepted");
     assert_eq!(widened_manifest.validate(), FfiResult::OK);
     assert!(widened_manifest.save_state.is_none());
     assert!(widened_manifest.restore_state.is_none());
@@ -1085,7 +1085,7 @@ fn wave4_min_v0_2_backwards_compatibility_for_manifest_component_desc_and_host_a
 
     #[repr(C)]
     #[derive(Copy, Clone)]
-    struct Wave3ComponentDesc {
+    struct MinimalV02ComponentDesc {
         struct_size: u32,
         flags: u32,
         name: *const c_char,
@@ -1096,12 +1096,12 @@ fn wave4_min_v0_2_backwards_compatibility_for_manifest_component_desc_and_host_a
         vtable_ptr: *const c_void,
     }
     assert_eq!(
-        size_of::<Wave3ComponentDesc>(),
+        size_of::<MinimalV02ComponentDesc>(),
         ComponentDesc::MIN_V0_2_SIZE
     );
 
-    let legacy_comp = Wave3ComponentDesc {
-        struct_size: size_of::<Wave3ComponentDesc>() as u32,
+    let legacy_comp = MinimalV02ComponentDesc {
+        struct_size: size_of::<MinimalV02ComponentDesc>() as u32,
         flags: 0,
         name: c"legacy::Comp".as_ptr(),
         uuid: ComponentUuid::from_parts("legacy::Comp", 4, 4, 0),
@@ -1113,7 +1113,7 @@ fn wave4_min_v0_2_backwards_compatibility_for_manifest_component_desc_and_host_a
     // SAFETY: `legacy_comp` is initialized on the local stack with `MIN_V0_2_SIZE` bytes.
     let widened_comp =
         unsafe { read_descriptor::<ComponentDesc>((&raw const legacy_comp).cast::<c_void>()) }
-            .expect("Wave 3 MIN_V0_2_SIZE ComponentDesc must be accepted");
+            .expect("MIN_V0_2_SIZE ComponentDesc must be accepted");
     assert_eq!(widened_comp.validate(), FfiResult::OK);
     assert!(!widened_comp.has_hooks());
     assert!(!widened_comp.covers_slot(

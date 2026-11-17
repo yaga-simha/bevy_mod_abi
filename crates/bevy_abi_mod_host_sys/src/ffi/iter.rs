@@ -1,5 +1,5 @@
 //! Dense chunk and indirect sparse-row query iterator (`HostIter`)
-//! (`C-05`, `C-13`, `P-01..P-04`, `S-08`, `N-02`).
+//!.
 //!
 //! # Intent
 //! Serializing ECS archetype tables across an FFI boundary on every frame destroys cache
@@ -64,11 +64,11 @@ pub struct QueryTermMeta {
     pub align: usize,
     /// Bitmask of `BAM_STORAGE_FLAG_*`.
     pub storage_flags: u32,
-    /// Optional monomorphized batch message reader (`F-02`).
+    /// Optional monomorphized batch message reader.
     pub msg_read_batch_fn: Option<MsgReadBatchFn>,
-    /// Optional monomorphized message sender (`F-02`).
+    /// Optional monomorphized message sender.
     pub msg_send_fn: Option<MsgSendFn>,
-    /// Optional monomorphized batch message writer (`F-02`).
+    /// Optional monomorphized batch message writer.
     pub msg_write_batch_fn: Option<MsgWriteBatchFn>,
 }
 
@@ -91,14 +91,14 @@ impl QueryTermMeta {
         (self.storage_flags & BAM_STORAGE_FLAG_RESOURCE) != 0
     }
 
-    /// Returns `true` if this term refers to a buffered Bevy `Messages<M>` stream (`F-02`).
+    /// Returns `true` if this term refers to a buffered Bevy `Messages<M>` stream.
     #[inline]
     pub const fn is_message(&self) -> bool {
         (self.storage_flags & BAM_STORAGE_FLAG_MESSAGE) != 0
     }
 }
 
-/// Precomputed tick-filter term (`Changed<T>` or `Added<T>`) resolved at `GuestSystem::initialize` (`P-01`).
+/// Precomputed tick-filter term (`Changed<T>` or `Added<T>`) resolved at `GuestSystem::initialize`.
 #[derive(Clone, Copy, Debug)]
 pub struct TickFilterTerm {
     /// Target Bevy [`ComponentId`].
@@ -109,18 +109,18 @@ pub struct TickFilterTerm {
     pub is_sparse: bool,
 }
 
-/// Precomputed static layout and term plan for a `BamQueryDesc` (`P-01`, `P-02`, `P-03`).
+/// Precomputed static layout and term plan for a `BamQueryDesc`.
 #[derive(Clone, Debug, Default)]
 pub struct QueryPlan {
     /// Term metadata in declaration order (`0..term_count`).
     pub terms: Vec<QueryTermMeta>,
-    /// Precomputed indices (`0..term_count`) of dense `Table` data columns (`P-03`).
+    /// Precomputed indices (`0..term_count`) of dense `Table` data columns.
     pub dense_data_indices: Vec<u8>,
     /// Bitmask of `term_index`es backed by `StorageType::SparseSet` with entity column data.
     pub sparse_data_mask: u32,
     /// Bitmask of `term_index`es backed by `StorageType::Table` with entity column data.
     pub dense_data_mask: u32,
-    /// Precomputed `Changed<T>` / `Added<T>` filter terms (`P-01`).
+    /// Precomputed `Changed<T>` / `Added<T>` filter terms.
     pub tick_filters: Vec<TickFilterTerm>,
     /// `true` when `terms.is_empty()` or at least one term is an entity term (`!mode.is_resource()`).
     pub has_entity_terms: bool,
@@ -184,7 +184,7 @@ impl QueryPlan {
     }
 }
 
-/// Per-query-group reusable scratch storage for indirect sparse-set row pointer batching (`P-02`).
+/// Per-query-group reusable scratch storage for indirect sparse-set row pointer batching.
 #[derive(Default)]
 pub struct SparseRowScratch {
     entities: Vec<FfiEntity>,
@@ -236,7 +236,7 @@ enum IterBacking<'w> {
     },
 }
 
-/// Concrete `#[repr(C)]` host chunk and resource iterator backing opaque [`BamIter`] (`S-08`, `N-02`).
+/// Concrete `#[repr(C)]` host chunk and resource iterator backing opaque [`BamIter`].
 #[repr(C)]
 pub struct HostIter<'w> {
     /// Leading handle validation header (`ITER_MAGIC`) at byte offset `0`.
@@ -255,9 +255,9 @@ pub struct HostIter<'w> {
 
     current_entities_ptr: *const FfiEntity,
     current_entity_count: usize,
-    /// Bitmask tracking which writable terms have already marked ticks in the current chunk (`P-04`).
+    /// Bitmask tracking which writable terms have already marked ticks in the current chunk.
     marked_changed_mask: u32,
-    /// Bitmask tracking which sparse terms have materialized indirect row pointers in the current chunk (`P-02`).
+    /// Bitmask tracking which sparse terms have materialized indirect row pointers in the current chunk.
     materialized_sparse_mask: u32,
     /// Bitmask tracking which sparse terms are actually present on the current archetype.
     present_sparse_mask: u32,
@@ -267,7 +267,7 @@ pub struct HostIter<'w> {
 const _: () = assert!(core::mem::offset_of!(HostIter<'_>, header) == 0);
 
 impl<'w> HostIter<'w> {
-    /// Constructs a dense `Table` chunk iterator (`P-01`, `P-03`, `P-04`).
+    /// Constructs a dense `Table` chunk iterator.
     pub fn new_dense(
         tables: &'w Tables,
         matched_tables: &'w [TableId],
@@ -307,7 +307,7 @@ impl<'w> HostIter<'w> {
         }
     }
 
-    /// Constructs an archetype-aware iterator supporting indirect `SparseSet` row batching (`P-02`).
+    /// Constructs an archetype-aware iterator supporting indirect `SparseSet` row batching.
     #[allow(clippy::too_many_arguments)]
     pub fn new_archetypal(
         tables: &'w Tables,
@@ -368,7 +368,7 @@ impl<'w> HostIter<'w> {
         self
     }
 
-    /// Attaches per-system `MessageCursor` state for `MESSAGE_READ` terms (`F-02`).
+    /// Attaches per-system `MessageCursor` state for `MESSAGE_READ` terms.
     #[inline]
     pub fn with_msg_cursors(
         mut self,
@@ -378,7 +378,7 @@ impl<'w> HostIter<'w> {
         self
     }
 
-    /// Returns `(chunks_yielded, entities_yielded)` accumulated during this iterator's lifetime (`E-01`).
+    /// Returns `(chunks_yielded, entities_yielded)` accumulated during this iterator's lifetime.
     #[inline]
     pub const fn stats(&self) -> (usize, usize) {
         (self.chunks_yielded, self.entities_yielded)
@@ -509,7 +509,7 @@ impl<'w> HostIter<'w> {
                         return run_len;
                     }
 
-                    // P-01: Resolve all tick-filter slices ONCE per table, and skip the entire
+                    // Resolve all tick-filter slices ONCE per table, and skip the entire
                     // table in O(1) if any `Changed<T>` summary tick is not newer than `last_run`.
                     let mut filter_slices: [&[UnsafeCell<Tick>]; MAX_TERMS_PER_QUERY] =
                         [&[]; MAX_TERMS_PER_QUERY];
@@ -700,7 +700,7 @@ impl<'w> HostIter<'w> {
                     let start_row_idx = first.table_row().index();
                     let mut contiguous_table_rows = true;
 
-                    // P-02: Batch multi-entity runs even when `sparse_data_mask != 0`!
+                    // Batch multi-entity runs even when `sparse_data_mask != 0`!
                     let mut run_len = 1usize;
                     while start_entity_idx + run_len < limit_entities {
                         let next_ent = &arch_entities[start_entity_idx + run_len];
@@ -765,7 +765,7 @@ impl<'w> HostIter<'w> {
                     }
 
                     // Eagerly materialize sparse row pointers for declared sparse data columns into
-                    // reused scratch buffers (`P-02`) so `iter_column_rows_readonly`/`mutable` are O(1).
+                    // reused scratch buffers so `iter_column_rows_readonly`/`mutable` are O(1).
                     if plan.sparse_data_mask != 0
                         && let Some(ref mut scratch) = self.sparse_scratch
                     {
@@ -848,7 +848,7 @@ impl<'w> HostIter<'w> {
         self.clear_active_chunk();
     }
 
-    /// Clears only the active prefix `0..term_count` (`P-03`) and resets per-chunk bitmasks (`P-04`).
+    /// Clears only the active prefix `0..term_count` and resets per-chunk bitmasks.
     #[inline]
     fn clear_active_chunk(&mut self) {
         self.current_entities_ptr = core::ptr::null();
@@ -893,7 +893,7 @@ impl<'w> HostIter<'w> {
         };
         let start_row = TableRow::new(start_nonmax);
 
-        // P-03: Iterate ONLY precomputed dense data-column indices!
+        // Iterate ONLY precomputed dense data-column indices!
         for &raw_idx in &self.plan.dense_data_indices {
             let idx = raw_idx as usize;
             let term = &self.plan.terms[idx];
@@ -1012,7 +1012,7 @@ pub unsafe extern "C" fn host_iter_column_readonly(
 }
 
 /// Returns a mutable byte pointer to dense `Table` column `term_index`, marking chunk change ticks
-/// at most once per chunk (`P-04`).
+/// at most once per chunk.
 ///
 /// # Safety
 /// `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
@@ -1059,7 +1059,7 @@ pub unsafe extern "C" fn host_iter_column_mutable(
     col.data_ptr
 }
 
-/// Returns a mutable byte pointer to dense `Table` column `term_index` without marking change ticks (`P-04`).
+/// Returns a mutable byte pointer to dense `Table` column `term_index` without marking change ticks.
 ///
 /// # Safety
 /// `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
@@ -1089,7 +1089,7 @@ pub unsafe extern "C" fn host_iter_column_mutable_untracked(
     }
 }
 
-/// Marks rows `start_row..start_row + row_count` in writable column `term_index` as changed (`P-04`).
+/// Marks rows `start_row..start_row + row_count` in writable column `term_index` as changed.
 ///
 /// # Safety
 /// `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
@@ -1174,7 +1174,7 @@ pub unsafe extern "C" fn host_iter_mark_changed_range(
 }
 
 /// Returns `[ *const u8; chunk_len ]` of indirect per-row pointers for `StorageType::SparseSet`
-/// columns (`P-02`), or null if out of bounds, absent on an optional term, or not sparse-set stored.
+/// columns, or null if out of bounds, absent on an optional term, or not sparse-set stored.
 ///
 /// # Safety
 /// `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
@@ -1206,7 +1206,7 @@ pub unsafe extern "C" fn host_iter_column_rows_readonly(
 }
 
 /// Returns `[ *mut u8; chunk_len ]` of indirect per-row mutable pointers for `StorageType::SparseSet`
-/// columns (`P-02`), marking matched rows changed at most once per chunk (`P-04`).
+/// columns, marking matched rows changed at most once per chunk.
 ///
 /// # Safety
 /// `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
@@ -1263,7 +1263,7 @@ pub unsafe extern "C" fn host_iter_column_rows_mutable(
     out_ptr
 }
 
-/// Writes [`BamColumnInfo`] metadata for `term_index` into `*out_info` (`C-13`).
+/// Writes [`BamColumnInfo`] metadata for `term_index` into `*out_info`.
 ///
 /// # Safety
 /// - `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
@@ -1304,7 +1304,7 @@ pub unsafe extern "C" fn host_iter_column_info(
     FfiResult::OK
 }
 
-/// Returns a read-only pointer to the singleton `Resource` declared at `term_index` (`C-05`),
+/// Returns a read-only pointer to the singleton `Resource` declared at `term_index`,
 /// or null if unauthorized or absent in the `World`.
 ///
 /// # Safety
@@ -1335,7 +1335,7 @@ pub unsafe extern "C" fn host_res_ptr(iter: *const BamIter, term_index: usize) -
 }
 
 /// Returns an exclusive mutable pointer to the singleton `Resource` declared with `RESOURCE_WRITE`
-/// at `term_index` (`C-05`), marking its Bevy change tick, or null if unauthorized or absent.
+/// at `term_index`, marking its Bevy change tick, or null if unauthorized or absent.
 ///
 /// # Safety
 /// `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
@@ -1374,7 +1374,7 @@ pub unsafe extern "C" fn host_res_mut_ptr(iter: *mut BamIter, term_index: usize)
 }
 
 /// Reads up to `max_count` buffered POD Bevy `Messages<M>` from `MESSAGE_READ` / `MESSAGE_WRITE`
-/// term `term_index` into `out_buf` (`F-02`), advancing this system's dedicated `MessageCursor<M>`.
+/// term `term_index` into `out_buf`, advancing this system's dedicated `MessageCursor<M>`.
 ///
 /// # Safety
 /// - `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
@@ -1433,7 +1433,7 @@ pub unsafe extern "C" fn host_msg_read_batch(
     }
 }
 
-/// Sends a single POD Bevy `Message` into `Messages<M>` declared with `MESSAGE_WRITE` at `term_index` (`F-02`).
+/// Sends a single POD Bevy `Message` into `Messages<M>` declared with `MESSAGE_WRITE` at `term_index`.
 ///
 /// # Safety
 /// - `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
@@ -1643,7 +1643,7 @@ struct ArchetypeParPartition {
 }
 
 /// Executes `chunk_fn(task_iter, user_data)` in parallel across Bevy's [`ComputeTaskPool`] over
-/// disjoint matched table/archetype sub-ranges (`P-07`).
+/// disjoint matched table/archetype sub-ranges.
 ///
 /// Each worker task receives a scoped `BamIter` already positioned on an active non-empty chunk.
 /// Non-reentrant (`in_par_iter == true` rejects nested `par_for_each_chunk` with `ACCESS_CONFLICT`),

@@ -1,4 +1,4 @@
-//! Generated C99 component & VTable header emitter (`cargo xtask gen-component-headers`, `M-07`).
+//! Generated C99 component & VTable header emitter (`cargo xtask gen-component-headers`).
 //!
 //! Emits `include/generated/testbed_components.h` from the canonical `#[derive(ModComponent)]`
 //! definitions shared by the host integration testbed and `tests/asymmetric_c_mod/mod.c`.
@@ -64,8 +64,8 @@ pub struct Armor {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Default, ModComponent)]
-#[mod_component(name = "testbed::Phase4Transform")]
-pub struct Phase4Transform {
+#[mod_component(name = "testbed::FilteredTransform")]
+pub struct FilteredTransform {
     pub x: f32,
     pub y: f32,
     pub z: f32,
@@ -73,8 +73,8 @@ pub struct Phase4Transform {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Default, ModComponent)]
-#[mod_component(name = "testbed::Phase4CTransform")]
-pub struct Phase4CTransform {
+#[mod_component(name = "testbed::CFilteredTransform")]
+pub struct CFilteredTransform {
     pub x: f32,
     pub y: f32,
     pub z: f32,
@@ -82,50 +82,50 @@ pub struct Phase4CTransform {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Default, ModComponent)]
-#[mod_component(name = "testbed::Phase4Sensor")]
-pub struct Phase4Sensor {
+#[mod_component(name = "testbed::ChangeSensor")]
+pub struct ChangeSensor {
     pub val: u32,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Default, ModComponent)]
-#[mod_component(name = "testbed::Phase4CSensor")]
-pub struct Phase4CSensor {
+#[mod_component(name = "testbed::CChangeSensor")]
+pub struct CChangeSensor {
     pub val: u32,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Default, ModComponent)]
-#[mod_component(name = "testbed::Phase4FreshTag")]
-pub struct Phase4FreshTag {
+#[mod_component(name = "testbed::FreshSpawnTag")]
+pub struct FreshSpawnTag {
     pub code: u32,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Default, ModComponent)]
-#[mod_component(name = "testbed::Phase4CFreshTag")]
-pub struct Phase4CFreshTag {
+#[mod_component(name = "testbed::CFreshSpawnTag")]
+pub struct CFreshSpawnTag {
     pub code: u32,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Default, ModComponent)]
-#[mod_component(name = "testbed::Phase4Removable")]
-pub struct Phase4Removable {
+#[mod_component(name = "testbed::TransientMarker")]
+pub struct TransientMarker {
     pub dummy: u32,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Default, ModComponent)]
-#[mod_component(name = "testbed::Phase4CRemovable")]
-pub struct Phase4CRemovable {
+#[mod_component(name = "testbed::CTransientMarker")]
+pub struct CTransientMarker {
     pub dummy: u32,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Default, ModComponent)]
-#[mod_component(name = "testbed::Phase4RustRes")]
-pub struct Phase4RustRes {
+#[mod_component(name = "testbed::RustFilterTelemetry")]
+pub struct RustFilterTelemetry {
     pub scale: f32,
     pub matched_rows: u32,
     pub optional_vel_hits: u32,
@@ -134,8 +134,8 @@ pub struct Phase4RustRes {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Default, ModComponent)]
-#[mod_component(name = "testbed::Phase4CRes")]
-pub struct Phase4CRes {
+#[mod_component(name = "testbed::CFilterTelemetry")]
+pub struct CFilterTelemetry {
     pub scale: f32,
     pub matched_rows: u32,
     pub optional_vel_hits: u32,
@@ -200,16 +200,16 @@ pub fn generate_testbed_components_header() -> String {
     push_component_section::<MetadataTag>(&mut out);
     push_component_section::<Mass>(&mut out);
     push_component_section::<Armor>(&mut out);
-    push_component_section::<Phase4Transform>(&mut out);
-    push_component_section::<Phase4CTransform>(&mut out);
-    push_component_section::<Phase4Sensor>(&mut out);
-    push_component_section::<Phase4CSensor>(&mut out);
-    push_component_section::<Phase4FreshTag>(&mut out);
-    push_component_section::<Phase4CFreshTag>(&mut out);
-    push_component_section::<Phase4Removable>(&mut out);
-    push_component_section::<Phase4CRemovable>(&mut out);
-    push_component_section::<Phase4RustRes>(&mut out);
-    push_component_section::<Phase4CRes>(&mut out);
+    push_component_section::<FilteredTransform>(&mut out);
+    push_component_section::<CFilteredTransform>(&mut out);
+    push_component_section::<ChangeSensor>(&mut out);
+    push_component_section::<CChangeSensor>(&mut out);
+    push_component_section::<FreshSpawnTag>(&mut out);
+    push_component_section::<CFreshSpawnTag>(&mut out);
+    push_component_section::<TransientMarker>(&mut out);
+    push_component_section::<CTransientMarker>(&mut out);
+    push_component_section::<RustFilterTelemetry>(&mut out);
+    push_component_section::<CFilterTelemetry>(&mut out);
     push_component_section::<Vec3>(&mut out);
     push_component_section::<CInteropComponent>(&mut out);
 

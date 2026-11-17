@@ -1,5 +1,5 @@
 //! Copy-on-Write (`CoW`) component, resource, VTable, and `"bam.v0.*"` symbol catalog
-//! (`C-03..C-05`, `L-07`, `P-08`, `B-01`, `B-08`).
+//!.
 
 use crate::loader::ModId;
 use crate::registry::collision::ComponentCollisionError;
@@ -31,16 +31,16 @@ use std::sync::Arc;
 /// Function signature for monomorphized raw component byte insertion into a Bevy [`World`].
 ///
 /// Takes a raw `*const u8` pointer (backed by `MaybeUninit<u8>` arena storage) rather than `&[u8]`
-/// so uninitialized struct padding bytes never form a Rust `[u8]` slice (`S-04`).
+/// so uninitialized struct padding bytes never form a Rust `[u8]` slice.
 pub type InsertRawFn = unsafe fn(world: &mut World, entity: Entity, data: *const u8);
 
 /// Function signature for monomorphized `Default` component insertion into a Bevy [`World`].
 pub type InsertDefaultFn = fn(world: &mut World, entity: Entity);
 
-/// Monomorphized factory creating a per-system type-erased `MessageCursor<M>` (`F-02`).
+/// Monomorphized factory creating a per-system type-erased `MessageCursor<M>`.
 pub type CreateMsgCursorFn = fn() -> Box<dyn Any + Send + Sync>;
 
-/// Monomorphized batch reader advancing a per-system `MessageCursor<M>` over `Messages<M>` (`F-02`).
+/// Monomorphized batch reader advancing a per-system `MessageCursor<M>` over `Messages<M>`.
 ///
 /// # Safety
 /// - `world` must hold shared read (or write) access to `msg_res_id` (`Messages<M>`).
@@ -56,7 +56,7 @@ pub type MsgReadBatchFn = unsafe fn(
     out_count: *mut usize,
 ) -> FfiResult;
 
-/// Monomorphized message writer pushing a single POD `M` into `Messages<M>` (`F-02`).
+/// Monomorphized message writer pushing a single POD `M` into `Messages<M>`.
 ///
 /// # Safety
 /// - `world` must hold exclusive write access to `msg_res_id` (`Messages<M>`).
@@ -70,7 +70,7 @@ pub type MsgSendFn = unsafe fn(
     data_len: usize,
 ) -> FfiResult;
 
-/// Function signature for monomorphized batch `Messages<M>` writes across the C ABI (`F-02`).
+/// Function signature for monomorphized batch `Messages<M>` writes across the C ABI.
 pub type MsgWriteBatchFn = unsafe fn(
     world: UnsafeWorldCell<'_>,
     last_run: Tick,
@@ -403,7 +403,7 @@ fn insert_default_impl<T: Component + Default>(world: &mut World, entity: Entity
 }
 
 /// Fluent registration options configuring how a host Rust [`Component`] is exposed to guest mods
-/// (`B-01`, ADR 0006).
+/// (ADR 0006).
 ///
 /// By default (`ComponentOptions::default()`), raw byte insertion (`cmd_insert` / `cmd_spawn`) is
 /// enabled automatically when `T::IS_RAW_INSERTABLE && !needs_drop::<T>()`, and disabled otherwise.
@@ -555,19 +555,19 @@ pub struct RegisteredComponent {
     pub drop_fn: Option<ComponentDropFn>,
     /// Optional drop trampoline slot index assigned in [`crate::WorldDropGuard`].
     pub drop_slot: Option<usize>,
-    /// Optional dynamic component hook (`on_add` / `on_remove`) trampoline slot index (`F-04`).
+    /// Optional dynamic component hook (`on_add` / `on_remove`) trampoline slot index.
     pub hook_slot: Option<usize>,
-    /// Whether `on_add` hook trampoline was registered on Bevy's `ComponentHooks` (`F-04`).
+    /// Whether `on_add` hook trampoline was registered on Bevy's `ComponentHooks`.
     pub has_on_add_hook: bool,
-    /// Whether `on_remove` hook trampoline was registered on Bevy's `ComponentHooks` (`F-04`).
+    /// Whether `on_remove` hook trampoline was registered on Bevy's `ComponentHooks`.
     pub has_on_remove_hook: bool,
     /// Optional [`ModId`] owning a dynamic component's VTable and drop callback.
     pub create_msg_cursor_fn: Option<CreateMsgCursorFn>,
-    /// Optional monomorphized batch reader for `Messages<M>` (`F-02`).
+    /// Optional monomorphized batch reader for `Messages<M>`.
     pub msg_read_batch_fn: Option<MsgReadBatchFn>,
-    /// Optional monomorphized writer for `Messages<M>` (`F-02`).
+    /// Optional monomorphized writer for `Messages<M>`.
     pub msg_send_fn: Option<MsgSendFn>,
-    /// Optional monomorphized batch writer for `Messages<M>` (`F-02`).
+    /// Optional monomorphized batch writer for `Messages<M>`.
     pub msg_write_batch_fn: Option<MsgWriteBatchFn>,
     /// Whether raw 8-byte entity payloads (such as `ChildOf`) must be validated before insert.
     pub validates_entity_payload: bool,
@@ -588,7 +588,7 @@ impl RegisteredComponent {
         (self.storage_flags & BAM_STORAGE_FLAG_RESOURCE) != 0
     }
 
-    /// Returns `true` if this entry represents a buffered Bevy `Messages<M>` stream (`F-02`).
+    /// Returns `true` if this entry represents a buffered Bevy `Messages<M>` stream.
     #[inline]
     pub const fn is_message(&self) -> bool {
         (self.storage_flags & BAM_STORAGE_FLAG_MESSAGE) != 0
@@ -620,7 +620,7 @@ impl RegisteredComponent {
 }
 
 /// Immutable dense snapshot shared via `Arc` across `ModRegistry`, `HostContext`, and `GuestSystem`
-/// (`L-07`, `P-08`).
+///.
 #[derive(Clone, Default)]
 pub struct RegistrySnapshot {
     entries: Vec<RegisteredComponent>,
@@ -631,7 +631,7 @@ pub struct RegistrySnapshot {
 }
 
 impl RegistrySnapshot {
-    /// Looks up a component or resource in `O(1)` by its 1-based [`BamComponent`] handle (`C-05`).
+    /// Looks up a component or resource in `O(1)` by its 1-based [`BamComponent`] handle.
     #[inline]
     pub fn get_by_handle(&self, handle: BamComponent) -> Option<&RegisteredComponent> {
         let idx = handle.0.checked_sub(1)? as usize;
@@ -659,7 +659,7 @@ impl RegistrySnapshot {
         self.get_by_handle(handle)
     }
 
-    /// Resolves a `"bam.v0.*"` symbol or VTable address in this snapshot (`C-04`).
+    /// Resolves a `"bam.v0.*"` symbol or VTable address in this snapshot.
     #[inline]
     pub fn resolve_symbol(&self, name: &str) -> Option<*const c_void> {
         if !name.starts_with("bam.v0.") {
@@ -697,7 +697,7 @@ struct RegistryTracker {
     generation: AtomicU64,
 }
 
-/// World-scoped Copy-on-Write (`CoW`) component, resource, and `"bam.v0.*"` symbol registry (`L-07`).
+/// World-scoped Copy-on-Write (`CoW`) component, resource, and `"bam.v0.*"` symbol registry.
 ///
 /// Cloning `ModRegistry` is an `O(1)` `Arc` bump. Mutations run on cold setup/load/unload paths via
 /// `Arc::make_mut` and increment `generation` so `GuestSystem`s refresh their cached snapshot only
@@ -717,7 +717,7 @@ impl Default for ModRegistry {
 }
 
 impl ModRegistry {
-    /// Creates an empty [`ModRegistry`] with **zero** built-in function symbols (`C-03`).
+    /// Creates an empty [`ModRegistry`] with **zero** built-in function symbols.
     #[inline]
     pub fn new() -> Self {
         let initial = Arc::new(RegistrySnapshot::default());
@@ -787,7 +787,7 @@ impl ModRegistry {
     }
 
     /// Validates that registering `(name, uuid, size, align, storage_flags, expected_comp_id)` does
-    /// not collide with an incompatible existing component or resource entry (`C-10`).
+    /// not collide with an incompatible existing component or resource entry.
     pub fn check_registration_collision(
         &self,
         name: &str,
@@ -876,7 +876,7 @@ impl ModRegistry {
     }
 
     /// Validates that dynamically re-registering `name` with `(has_on_add, has_on_remove)` matches
-    /// the lifecycle hooks permanently wired into Bevy's `ComponentHooks` (`F-04`).
+    /// the lifecycle hooks permanently wired into Bevy's `ComponentHooks`.
     pub fn check_dynamic_hook_compatibility(
         &self,
         name: &str,
@@ -907,7 +907,7 @@ impl ModRegistry {
     }
 
     /// Registers a host [`Component`] implementing [`ModComponent`] with [`ComponentOptions`],
-    /// returning its 1-based [`BamComponent`] handle (`B-01`, `C-05`).
+    /// returning its 1-based [`BamComponent`] handle.
     pub fn register_component<T: Component + ModComponent>(
         &mut self,
         comp_id: ComponentId,
@@ -943,7 +943,7 @@ impl ModRegistry {
     }
 
     /// Registers a singleton Bevy [`Resource`] implementing [`ModComponent`], returning its
-    /// 1-based [`BamComponent`] handle (`B-01`, `C-05`).
+    /// 1-based [`BamComponent`] handle.
     pub fn register_resource<R: Resource + ModComponent>(
         &mut self,
         comp_id: ComponentId,
@@ -954,7 +954,7 @@ impl ModRegistry {
     }
 
     /// Registers a buffered POD Bevy [`Message`] type (`Messages<M>`) implementing [`ModComponent`]
-    /// and [`AbiPod`], returning its 1-based [`BamComponent`] handle (`F-02`).
+    /// and [`AbiPod`], returning its 1-based [`BamComponent`] handle.
     pub fn register_message<M: Message + ModComponent + AbiPod>(
         &mut self,
         messages_res_id: ComponentId,

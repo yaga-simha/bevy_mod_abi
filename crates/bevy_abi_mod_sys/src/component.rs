@@ -17,7 +17,7 @@ use crate::{
 pub type ComponentDropFn = unsafe extern "C" fn(ptr: *mut c_void);
 
 /// Lifecycle hook callback (`on_add` / `on_remove`) invoked by the host when a dynamic component
-/// is added to or removed from an entity (`F-04`, `typedef void (*BamComponentHookFn)(BamEntity entity, const void* data_ptr, void* user_data);`).
+/// is added to or removed from an entity (`typedef void (*BamComponentHookFn)(BamEntity entity, const void* data_ptr, void* user_data);`).
 ///
 /// # Safety
 /// - `data_ptr` points to the entity's component payload while present in Bevy storage (valid only
@@ -74,11 +74,11 @@ pub struct ComponentDesc {
     pub drop_fn: Option<ComponentDropFn>,
     /// Optional `VTableHeader`-prefixed static VTable pointer (`offset 56` on 64-bit / `40` on 32-bit).
     pub vtable_ptr: *const c_void,
-    /// Optional guest `on_add` lifecycle hook (`F-04`, `offset 64` on 64-bit / `44` on 32-bit).
+    /// Optional guest `on_add` lifecycle hook (`offset 64` on 64-bit / `44` on 32-bit).
     pub on_add: Option<ComponentHookFn>,
-    /// Optional guest `on_remove` lifecycle hook (`F-04`, `offset 72` on 64-bit / `48` on 32-bit).
+    /// Optional guest `on_remove` lifecycle hook (`offset 72` on 64-bit / `48` on 32-bit).
     pub on_remove: Option<ComponentHookFn>,
-    /// Opaque context pointer passed to `on_add` and `on_remove` (`F-04`, `offset 80` on 64-bit / `52` on 32-bit).
+    /// Opaque context pointer passed to `on_add` and `on_remove` (`offset 80` on 64-bit / `52` on 32-bit).
     pub hook_user_data: *mut c_void,
 }
 
@@ -136,21 +136,21 @@ impl ComponentDesc {
         self
     }
 
-    /// Attaches an `on_add` lifecycle hook callback (`F-04`).
+    /// Attaches an `on_add` lifecycle hook callback.
     #[inline]
     pub const fn with_on_add(mut self, on_add: ComponentHookFn) -> Self {
         self.on_add = Some(on_add);
         self
     }
 
-    /// Attaches an `on_remove` lifecycle hook callback (`F-04`).
+    /// Attaches an `on_remove` lifecycle hook callback.
     #[inline]
     pub const fn with_on_remove(mut self, on_remove: ComponentHookFn) -> Self {
         self.on_remove = Some(on_remove);
         self
     }
 
-    /// Attaches `on_add` and/or `on_remove` lifecycle hooks with shared `user_data` (`F-04`).
+    /// Attaches `on_add` and/or `on_remove` lifecycle hooks with shared `user_data`.
     #[inline]
     pub const fn with_hooks(
         mut self,
@@ -164,7 +164,7 @@ impl ComponentDesc {
         self
     }
 
-    /// Returns `true` if either `on_add` or `on_remove` is set (`F-04`).
+    /// Returns `true` if either `on_add` or `on_remove` is set.
     #[inline]
     pub const fn has_hooks(&self) -> bool {
         self.on_add.is_some() || self.on_remove.is_some()

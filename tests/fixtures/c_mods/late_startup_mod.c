@@ -17,7 +17,7 @@ struct BamInstance {
 static const BamManifest MANIFEST = {
     .struct_size = (uint32_t)sizeof(BamManifest),
     .abi_version = BAM_ABI_VERSION,
-    .name = "l01_late_startup",
+    .name = "late_startup_mod",
     .version = "0.2.0",
     .flags = 0u,
     .reserved0 = 0u

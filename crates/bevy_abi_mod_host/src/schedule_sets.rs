@@ -1,5 +1,5 @@
 //! Schedule mapping (`ModScheduleMap`), scoped named ordering sets (`ModNamedSystemSet`),
-//! and `&mut World`-native schedule configuration helpers (`B-06`, `L-01`, `L-05`).
+//! and `&mut World`-native schedule configuration helpers.
 
 use bevy_abi_mod_host_sys::{
     GuestSystem, ModHost, ModId, ModLoadError, ModQuarantine, record_mod_named_sets_in_world,
@@ -65,7 +65,7 @@ fn target_exists_in_batch_or_world(
 
 /// Validates that all systems in `systems` target built-in schedules (`0..=5`) or custom schedules
 /// (`>= 1024`) registered in `world`'s [`ModScheduleMap`], and (when `strict == true`) that all
-/// `before`/`after` ordering targets resolve (`B-06`, `L-05`).
+/// `before`/`after` ordering targets resolve.
 pub(crate) fn prevalidate_mod_schedules_and_ordering(
     world: &World,
     path: &Path,
@@ -173,7 +173,7 @@ pub(crate) fn prevalidate_mod_schedules_and_ordering(
 
 /// Registers each `GuestSystem`'s quarantine handle in [`ModQuarantine`] and attaches non-immediate
 /// systems into `world`'s [`Schedules`], returning any late `Startup` systems that should execute
-/// immediately once (`L-01`, `L-05`, `B-05`, `B-06`).
+/// immediately once.
 pub(crate) fn schedule_mod_systems_in_world(
     world: &mut World,
     mod_id: ModId,
@@ -365,7 +365,7 @@ pub(crate) fn schedule_mod_systems_in_world(
 }
 
 /// Runs `ScheduleId::STARTUP` systems once immediately when a mod is hot-loaded after Bevy's
-/// `Startup` schedule has already executed (`L-01`).
+/// `Startup` schedule has already executed.
 pub(crate) fn run_late_startup_systems_in_world(
     world: &mut World,
     mod_name: &str,

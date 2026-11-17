@@ -1,4 +1,4 @@
-//! C99 and Zig declaration emission (`ModComponent::C_DECL` and `ModComponent::ZIG_DECL`, `M-07`).
+//! C99 and Zig declaration emission (`ModComponent::C_DECL` and `ModComponent::ZIG_DECL`).
 
 use crate::classify::FieldKind;
 use crate::codegen::CodegenState;

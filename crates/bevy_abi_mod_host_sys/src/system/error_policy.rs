@@ -1,5 +1,5 @@
 //! Fault policies, `ModQuarantine` resource, runtime system errors, and initialization diagnostics
-//! (`B-05`, `B-09`, `E-02`).
+//!.
 
 use crate::loader::ModId;
 use bevy_abi_mod_sys::FfiResult;
@@ -30,7 +30,7 @@ pub enum ModErrorPolicy {
 pub struct ModErrorPolicyConfig(pub ModErrorPolicy);
 
 /// World resource tracking per-system quarantine flags so host code can inspect and re-enable
-/// quarantined guest systems without reloading the entire mod (`B-05`).
+/// quarantined guest systems without reloading the entire mod.
 #[derive(Resource, Default, Clone, Debug)]
 pub struct ModQuarantine {
     systems: HashMap<(ModId, Arc<str>), Arc<AtomicBool>>,
@@ -66,7 +66,7 @@ impl ModQuarantine {
             .is_some_and(|flag| !flag.load(Ordering::Acquire))
     }
 
-    /// Re-enables a quarantined guest system identified by `(mod_id, system_name)` (`B-05`).
+    /// Re-enables a quarantined guest system identified by `(mod_id, system_name)`.
     ///
     /// Returns `true` if the system existed and transitioned from quarantined (`false`) to
     /// enabled (`true`), or `false` if unknown or already enabled.
@@ -85,7 +85,7 @@ impl ModQuarantine {
     }
 }
 
-/// Diagnostic reason why a guest system failed query validation or `System::initialize` (`E-02`).
+/// Diagnostic reason why a guest system failed query validation or `System::initialize`.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum SystemInitError {
     /// A single query group declared more than [`bevy_abi_mod_sys::MAX_TERMS_PER_QUERY`] terms.
@@ -134,7 +134,7 @@ impl SystemInitError {
 }
 
 /// Typed error reported to Bevy when [`ModErrorPolicy::ReportToBevy`] is active and a guest system
-/// faults (`E-02`).
+/// faults.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error(
     "guest mod system '{system_name}' (mod_id={mod_id:?}) faulted with {status} (panicked={panicked})"
@@ -151,7 +151,7 @@ pub struct ModSystemError {
 }
 
 /// Buffered Bevy [`Message`] emitted once via `Messages<ModSystemFaulted>` whenever a guest system
-/// faults at initialization or runtime (`B-09`).
+/// faults at initialization or runtime.
 #[derive(Message, Debug, Clone, PartialEq, Eq)]
 pub struct ModSystemFaulted {
     /// [`ModId`] owning the faulting system, if tracked.

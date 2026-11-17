@@ -83,7 +83,7 @@ impl Drop for OwnedManifestBytes {
 /// `bevy_abi_mod_init` and reclaimed in `bevy_abi_mod_shutdown`.
 ///
 /// Owns the validated [`Host`] table, all registered system/`run_if` closure states, owned
-/// descriptor strings, hot-reload state hooks (`F-01`), and per-instance shutdown hooks so loading
+/// descriptor strings, hot-reload state hooks, and per-instance shutdown hooks so loading
 /// the same `.cdylib` into multiple Bevy `World`s simultaneously shares zero mutable global state.
 pub struct GuestInstance {
     host: Host,
@@ -150,7 +150,7 @@ impl GuestInstance {
         self.shutdown_hooks.push(Box::new(hook));
     }
 
-    /// Registers or replaces the hot-reload state snapshot callback (`F-01`) for this instance.
+    /// Registers or replaces the hot-reload state snapshot callback for this instance.
     pub fn set_save_state_hook<F>(&mut self, hook: F)
     where
         F: FnMut() -> Result<Vec<u8>, FfiResult> + Send + 'static,
@@ -158,7 +158,7 @@ impl GuestInstance {
         self.save_state_hook = Some(ReentrantCell::new(Box::new(hook)));
     }
 
-    /// Registers or replaces the hot-reload state restoration callback (`F-01`) for this instance.
+    /// Registers or replaces the hot-reload state restoration callback for this instance.
     pub fn set_restore_state_hook<F>(&mut self, hook: F)
     where
         F: FnMut(&[u8]) -> FfiResult + Send + 'static,
@@ -290,7 +290,7 @@ pub unsafe fn shutdown_guest_instance(instance: *mut BamInstance) {
     });
 }
 
-/// Panic-safe `BamSaveStateFn` trampoline exporting guest state into the host-owned writer (`F-01`).
+/// Panic-safe `BamSaveStateFn` trampoline exporting guest state into the host-owned writer.
 ///
 /// # Safety
 /// - When `instance` is non-null, it must point to a live [`GuestInstance`] allocated by
@@ -330,7 +330,7 @@ pub unsafe extern "C" fn guest_save_state_trampoline(
 }
 
 /// Panic-safe `BamRestoreStateFn` trampoline restoring host-buffered state into a newly initialized
-/// [`GuestInstance`] (`F-01`).
+/// [`GuestInstance`].
 ///
 /// # Safety
 /// - When `instance` is non-null, it must point to a live [`GuestInstance`] allocated by

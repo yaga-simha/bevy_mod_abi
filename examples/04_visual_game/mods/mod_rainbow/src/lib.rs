@@ -3,7 +3,7 @@
 //! Mod 2: Dynamic Rainbow Spectrum (`mod_rainbow`, `ABI 0.2.0`).
 //!
 //! Generates animated rainbow hues across entities from spatial position and a
-//! per-World tick counter stored in the system closure (`L-02`).
+//! per-World tick counter stored in the system closure.
 
 use bevy_abi_mod_guest::prelude::*;
 use core::ffi::CStr;

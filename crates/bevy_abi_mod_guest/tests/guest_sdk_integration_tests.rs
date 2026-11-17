@@ -1,10 +1,10 @@
-//! Unit and regression tests for `bevy_abi_mod_guest` (`ABI 0.2.0`):
-//! - `G-01` & `M-05`: Single `Host` table validation, `"bam.v0.*"` custom symbols, and `VTableHeader` checks.
-//! - `G-02`: Unified `SystemBuilder` (`query`, `resource_read`/`resource_write`, `schedule`, `after`/`before`, `main_thread`, `run_if`).
-//! - `P-06`: Lock-free re-entrant closure guard (`regression_p06_reentrant_trampoline_conflict`).
-//! - `C-13`: Column UUID/size/align/mode validation (`regression_c13_column_uuid_mismatch_returns_none`).
-//! - `P-02`: Indirect sparse-set row pointers (`Chunk::rows`, `Chunk::rows_mut`).
-//! - `P-04`: Untracked mutable column slices + `mark_changed_range` / `mark_changed`.
+//! Integration tests for `bevy_abi_mod_guest` (`ABI 0.2.0`):
+//! - Single `Host` table validation, `"bam.v0.*"` custom symbols, and `VTableHeader` checks.
+//! - Unified `SystemBuilder` (`query`, `resource_read`/`resource_write`, `schedule`, `after`/`before`, `main_thread`, `run_if`).
+//! - Lock-free re-entrant closure guard (`reentrant_trampoline_conflict`).
+//! - Column UUID/size/align/mode validation (`column_uuid_mismatch_returns_none`).
+//! - Indirect sparse-set row pointers (`Chunk::rows`, `Chunk::rows_mut`).
+//! - Untracked mutable column slices + `mark_changed_range` / `mark_changed`.
 
 #![deny(unsafe_code)]
 
@@ -63,7 +63,7 @@ impl GuestComponent for Vel {
     const NAME: &'static CStr = c"game::Vel";
 }
 
-/// Same C layout as `Pos` (`2 * f32`), but distinct `GuestComponent::UUID` (`C-13` test).
+/// Same C layout as `Pos` (`2 * f32`), but distinct `GuestComponent::UUID` (`test).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "derive", derive(AbiPod))]
@@ -159,12 +159,12 @@ struct SendWorldPtr(*const MockHostWorld);
 unsafe impl Send for SendWorldPtr {}
 
 #[test]
-fn regression_p06_reentrant_trampoline_conflict() {
+fn reentrant_trampoline_conflict() {
     let mut world = MockHostWorld::new();
     let _pos_h = world.expose_component::<Pos>("game::Pos", Pos::UUID, 0, false);
 
     // Register a system whose closure re-entrantly invokes its own registered C trampoline.
-    // The lock-free AtomicBool guard (`P-06`) must return `ACCESS_CONFLICT` without UB or deadlock,
+    // The lock-free AtomicBool guard must return `ACCESS_CONFLICT` without UB or deadlock,
     // and must release cleanly even across panics.
     let raw_world_ptr = SendWorldPtr(world.raw_ptr().cast_const());
     let inner_result = Arc::new(AtomicUsize::new(usize::MAX));
@@ -187,7 +187,7 @@ fn regression_p06_reentrant_trampoline_conflict() {
                     let wrld = raw_world_ptr;
                     let sys_ctx = ctx.as_raw_ptr();
                     #[allow(unsafe_code)]
-                    // SAFETY: Invoking registered C system trampoline re-entrantly to test `P-06`.
+                    // SAFETY: Invoking registered C system trampoline re-entrantly to test the re-entrancy guard.
                     let nested = unsafe {
                         let host_world = &*wrld.0;
                         let sys = &host_world.systems[0];
@@ -227,7 +227,7 @@ fn regression_p06_reentrant_trampoline_conflict() {
                 .run_if(move |_ctx| {
                     let wrld = run_if_world_ptr;
                     #[allow(unsafe_code)]
-                    // SAFETY: Invoking registered C `run_if` trampoline re-entrantly to test `P-06`.
+                    // SAFETY: Invoking registered C `run_if` trampoline re-entrantly to test the re-entrancy guard.
                     let nested = unsafe {
                         let host_world = &*wrld.0;
                         let sys = &host_world.systems[2];
@@ -252,7 +252,7 @@ fn regression_p06_reentrant_trampoline_conflict() {
 }
 
 #[test]
-fn regression_c13_column_uuid_mismatch_returns_none() {
+fn column_uuid_mismatch_returns_none() {
     let mut world = MockHostWorld::new();
     let pos_h = world.expose_component::<Pos>("game::Pos", Pos::UUID, 0, false);
     let vel_h = world.expose_component::<Vel>("game::Vel", Vel::UUID, 0, false);
@@ -528,7 +528,7 @@ fn sparse_rows_and_untracked_change_marking_work_end_to_end() {
                         assert!(chunk.column::<SparseBuff>(1).is_none());
                         assert!(chunk.column_mut::<SparseBuff>(1).is_none());
 
-                        // P-02: Read and mutate indirect sparse rows!
+                        // Read and mutate indirect sparse rows!
                         let multipliers: Vec<Option<f32>> = {
                             let ro_rows =
                                 chunk.component_rows::<SparseBuff>(1).expect("sparse rows");
@@ -550,7 +550,7 @@ fn sparse_rows_and_untracked_change_marking_work_end_to_end() {
                             });
                         }
 
-                        // P-04: Untracked dense mutation + selective `mark_changed`:
+                        // Untracked dense mutation + selective `mark_changed`:
                         {
                             let pos = chunk
                                 .component_mut_untracked::<Pos>(0)
@@ -685,7 +685,7 @@ fn derive_mod_component_vtable_header_roundtrip() {
             }
             assert_eq!(h.current, 90.0);
 
-            // Wrong UUID must fail with `TYPE_MISMATCH` (`M-05`):
+            // Wrong UUID must fail with `TYPE_MISMATCH`:
             let wrong_uuid = ComponentUuid::from_u128(0xDEAD);
             #[allow(unsafe_code)]
             // SAFETY: Testing header UUID mismatch rejection before dereferencing `HealthVTable`.
@@ -702,7 +702,7 @@ fn derive_mod_component_vtable_header_roundtrip() {
 }
 
 #[test]
-fn wave4_g03_typed_tuple_queries_and_p07_par_chunks_without_magic_indices() {
+fn typed_tuple_queries_and_par_chunks_without_magic_indices() {
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq)]
     #[cfg_attr(feature = "derive", derive(AbiPod))]
@@ -779,7 +779,7 @@ fn wave4_g03_typed_tuple_queries_and_p07_par_chunks_without_magic_indices() {
     );
 
     let inst = world
-        .load_fn(c"g03_p07_mod", |app| {
+        .load_fn(c"typed_par_mod", |app| {
             // System 0: 8-arity typed tuple query (zero magic indices!)
             let r0 = app
                 .system(c"arity8_typed")
@@ -811,7 +811,7 @@ fn wave4_g03_typed_tuple_queries_and_p07_par_chunks_without_magic_indices() {
                 });
             assert_eq!(r0, FfiResult::OK);
 
-            // System 1: `par_for_each` over typed query (`P-07` + `G-03`)
+            // System 1: `par_for_each` over typed query
             let r1 = app
                 .system(c"par_typed")
                 .query_typed::<(&mut Pos, &Vel, Without<Dead>)>()
@@ -833,7 +833,7 @@ fn wave4_g03_typed_tuple_queries_and_p07_par_chunks_without_magic_indices() {
                 })
             })
         })
-        .expect("load g03_p07_mod");
+        .expect("load typed_par_mod");
 
     assert_eq!(world.run_system(0), FfiResult::OK);
     // Chunk 0 row 0: (0+1+0.5*2, 0+2+0.5*2) = (2.0, 3.0); row 1: (10+3+1*4, 20+4+1*4) = (17.0, 28.0)
@@ -856,7 +856,7 @@ fn wave4_g03_typed_tuple_queries_and_p07_par_chunks_without_magic_indices() {
         vec![Pos { x: 99.0, y: 99.0 }]
     );
 
-    // Run parallel typed query (`P-07`)
+    // Run parallel typed query
     assert_eq!(world.run_system(1), FfiResult::OK);
     assert_eq!(
         world.chunks[0].read_dense::<Pos>(pos_h),
@@ -874,7 +874,7 @@ fn wave4_g03_typed_tuple_queries_and_p07_par_chunks_without_magic_indices() {
 }
 
 #[test]
-fn wave4_f01_f02_f03_f04_state_messages_random_get_and_hooks() {
+fn state_messages_random_get_and_hooks() {
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     #[cfg_attr(feature = "derive", derive(AbiPod))]
@@ -949,7 +949,7 @@ fn wave4_f01_f02_f03_f04_state_messages_random_get_and_hooks() {
     c1.insert_dense(dead_h, &[Dead]);
     world.chunks.push(c1);
 
-    // 1. Test `F-01` `GuestPlugin::save_state` & `restore_state` via `StatefulMod::MANIFEST`
+    // 1. Test `GuestPlugin::save_state` & `restore_state` via `StatefulMod::MANIFEST`
     let inst_a = world
         .load_plugin::<StatefulMod>()
         .expect("load StatefulMod A");
@@ -991,7 +991,7 @@ fn wave4_f01_f02_f03_f04_state_messages_random_get_and_hooks() {
     assert_eq!(SAVED_RESTORED_VALUE.load(Ordering::SeqCst), 142);
     world.unload_instance(inst_b);
 
-    // 2. Test `F-02` (messages), `F-03` (random `get`/`get_mut`), and `F-04` (component hooks)
+    // 2. Test messages, random `get`/`get_mut`, and component hooks
     let added_sum = Arc::new(AtomicUsize::new(0));
     let removed_sum = Arc::new(AtomicUsize::new(0));
     let added_sum_c = Arc::clone(&added_sum);
@@ -1033,7 +1033,7 @@ fn wave4_f01_f02_f03_f04_state_messages_random_get_and_hooks() {
                 });
             assert_eq!(s0, FfiResult::OK);
 
-            // System 1: Reader A + Random Entity Access (`F-03`)
+            // System 1: Reader A + Random Entity Access
             let s1 = app
                 .system(c"msg_reader_a_and_random_get")
                 .query_typed::<(&mut Pos, &Vel, Without<Dead>)>()
@@ -1074,7 +1074,7 @@ fn wave4_f01_f02_f03_f04_state_messages_random_get_and_hooks() {
         })
         .expect("load ext_mod");
 
-    // Verify `F-04` hook trampolines registered on mock component descriptor
+    // Verify hook trampolines registered on mock component descriptor
     let meta = world.components[(hook_comp_handle.to_raw() as usize) - 1].clone();
     let sample = HookComp { code: 77 };
     #[allow(unsafe_code)]
@@ -1115,7 +1115,7 @@ fn wave4_f01_f02_f03_f04_state_messages_random_get_and_hooks() {
 }
 
 #[test]
-fn wave5_guest_sdk_child_of_ticks_and_in_set_smoke() {
+fn guest_sdk_child_of_ticks_and_in_set_smoke() {
     use bevy_abi_mod_guest::prelude::*;
 
     assert_eq!(FfiChildOf::NAME, c"bevy_ecs::hierarchy::ChildOf");

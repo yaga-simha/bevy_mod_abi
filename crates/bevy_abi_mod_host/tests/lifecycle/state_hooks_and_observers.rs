@@ -1,9 +1,9 @@
-//! Wave 4 Lifecycle & Safety Feature Tests (`F-01`, `F-04`):
-//! - `F-01`: `reload_mod` / `reload_mod_with` / `ModCommandsExt::reload_mod` preserving guest
+//! Lifecycle, State Serialization, Component Hooks, Dynamic Layouts & Observers Tests (`ABI 0.2.0`):
+//! - `reload_mod` / `reload_mod_with` / `ModCommandsExt::reload_mod` preserving guest
 //!   state via `BamManifest::save_state` and `BamManifest::restore_state`, propagating
 //!   `StateSaveFailed` / `StateRestoreFailed`, and remaining backwards-compatible with
 //!   `MIN_V0_2_SIZE` (`32`-byte) manifests that omit state callbacks.
-//! - `F-04`: Dynamic component `on_add` and `on_remove` hooks firing on spawn/insert/remove/despawn,
+//! - Dynamic component `on_add` and `on_remove` hooks firing on spawn/insert/remove/despawn,
 //!   disarming cleanly via `ArcSwapOption` on `unload_mod` (`dlclose` safety when entities outlive
 //!   the mod), and rolling back cleanly on failed `init`.
 
@@ -23,8 +23,8 @@ use std::sync::Mutex;
 
 #[repr(C)]
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq, ModComponent)]
-#[mod_component(name = "w4::StateProbe")]
-struct W4StateProbe {
+#[mod_component(name = "ext::ReloadStateProbe")]
+struct ReloadStateProbe {
     reload_epoch: u64,
     accumulated_ticks: u64,
     fail_next_save: u32,
@@ -39,27 +39,30 @@ struct HookedAuraMirror {
 }
 
 #[test]
-fn wave4_f01_hot_reload_transfers_state_handles_errors_and_supports_legacy_manifests() {
-    let w4_dylib = TempDylibCopy::new(&fixture_dylib("w4_ext_mod"), "f01_state");
+fn hot_reload_transfers_state_handles_errors_and_supports_legacy_manifests() {
+    let ext_dylib = TempDylibCopy::new(
+        &fixture_dylib("state_hooks_and_observers_mod"),
+        "hot_reload_state",
+    );
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
     app.init_schedule(FixedUpdate);
     app.init_schedule(PostUpdate);
-    app.insert_resource(W4StateProbe::default());
-    app.register_mod_resource::<W4StateProbe>().unwrap();
+    app.insert_resource(ReloadStateProbe::default());
+    app.register_mod_resource::<ReloadStateProbe>().unwrap();
 
     let opts = LoadOptions::new().with_shadow_copy(true).strict();
     let mod_v1 = app
-        .load_mod_with(w4_dylib.path(), opts.clone())
-        .expect("initial load of w4_ext_mod");
+        .load_mod_with(ext_dylib.path(), opts.clone())
+        .expect("initial load of state_hooks_and_observers_mod");
 
     // Run 3 frames: `reload_epoch == 0`, `accumulated_ticks == 3`.
     app.update();
     app.update();
     app.update();
     assert_eq!(
-        *app.world().resource::<W4StateProbe>(),
-        W4StateProbe {
+        *app.world().resource::<ReloadStateProbe>(),
+        ReloadStateProbe {
             reload_epoch: 0,
             accumulated_ticks: 3,
             fail_next_save: 0,
@@ -74,8 +77,8 @@ fn wave4_f01_hot_reload_transfers_state_handles_errors_and_supports_legacy_manif
     assert_ne!(mod_v1, mod_v2);
     app.update();
     assert_eq!(
-        *app.world().resource::<W4StateProbe>(),
-        W4StateProbe {
+        *app.world().resource::<ReloadStateProbe>(),
+        ReloadStateProbe {
             reload_epoch: 1,
             accumulated_ticks: 4,
             fail_next_save: 0,
@@ -91,10 +94,13 @@ fn wave4_f01_hot_reload_transfers_state_handles_errors_and_supports_legacy_manif
             commands.reload_mod(mod_v2);
         }
     });
-    app.update(); // Runs `w4_state_tick` (ticks=5), then applies deferred `reload_mod` -> epoch=2!
+    app.update(); // Runs `ext_state_tick` (ticks=5), then applies deferred `reload_mod` -> epoch=2!
     app.update(); // Runs reloaded instance -> epoch=2, ticks=6!
-    assert_eq!(app.world().resource::<W4StateProbe>().reload_epoch, 2);
-    assert_eq!(app.world().resource::<W4StateProbe>().accumulated_ticks, 6);
+    assert_eq!(app.world().resource::<ReloadStateProbe>().reload_epoch, 2);
+    assert_eq!(
+        app.world().resource::<ReloadStateProbe>().accumulated_ticks,
+        6
+    );
 
     // Find current active ModId after deferred reload
     let active_id = app
@@ -107,7 +113,7 @@ fn wave4_f01_hot_reload_transfers_state_handles_errors_and_supports_legacy_manif
 
     // 3. `save_state` failure aborts reload BEFORE unloading the running mod (`StateSaveFailed`)!
     app.world_mut()
-        .resource_mut::<W4StateProbe>()
+        .resource_mut::<ReloadStateProbe>()
         .fail_next_save = 1;
     app.update(); // Syncs `fail_next_save = 1` into guest instance (`ticks = 7`)
     let save_err = app
@@ -131,12 +137,12 @@ fn wave4_f01_hot_reload_transfers_state_handles_errors_and_supports_legacy_manif
             .is_some()
     );
     app.world_mut()
-        .resource_mut::<W4StateProbe>()
+        .resource_mut::<ReloadStateProbe>()
         .fail_next_save = 0;
 
     // 4. `restore_state` failure rolls back the replacement mod cleanly (`StateRestoreFailed`)!
     app.world_mut()
-        .resource_mut::<W4StateProbe>()
+        .resource_mut::<ReloadStateProbe>()
         .fail_next_restore = 1;
     app.update(); // Syncs `fail_next_restore = 1` into guest instance
     let restore_err = app
@@ -154,8 +160,8 @@ fn wave4_f01_hot_reload_transfers_state_handles_errors_and_supports_legacy_manif
     );
     assert!(app.world().resource::<ModHost>().is_empty());
 
-    // 5. Backwards compatibility: reloading a mod without state callbacks (`l05c_clean_mod`) succeeds cleanly!
-    let clean_dylib = TempDylibCopy::new(&fixture_dylib("l05c_clean_mod"), "f01_legacy");
+    // 5. Backwards compatibility: reloading a mod without state callbacks (`ordered_sets_mod`) succeeds cleanly!
+    let clean_dylib = TempDylibCopy::new(&fixture_dylib("ordered_sets_mod"), "legacy_reload");
     let clean_v1 = app.load_mod_with(clean_dylib.path(), opts.clone()).unwrap();
     let clean_v2 = app
         .reload_mod_with(clean_v1, opts)
@@ -166,7 +172,7 @@ fn wave4_f01_hot_reload_transfers_state_handles_errors_and_supports_legacy_manif
 }
 
 #[test]
-fn wave4_f04_dynamic_component_hooks_fire_and_disarm_safely_on_unload() {
+fn dynamic_component_hooks_fire_and_disarm_safely_on_unload() {
     static HOOK_EVENTS: Mutex<Vec<(u64, u32, u32)>> = Mutex::new(Vec::new());
 
     unsafe extern "C" fn record_hook_event(entity: FfiEntity, is_remove: u32, strength: u32) {
@@ -177,7 +183,10 @@ fn wave4_f04_dynamic_component_hooks_fire_and_disarm_safely_on_unload() {
     }
 
     HOOK_EVENTS.lock().unwrap().clear();
-    let w4_dylib = TempDylibCopy::new(&fixture_dylib("w4_ext_mod"), "f04_hooks");
+    let ext_dylib = TempDylibCopy::new(
+        &fixture_dylib("state_hooks_and_observers_mod"),
+        "component_hooks",
+    );
 
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
@@ -187,20 +196,20 @@ fn wave4_f04_dynamic_component_hooks_fire_and_disarm_safely_on_unload() {
     unsafe {
         app.world_mut()
             .resource_mut::<ModRegistry>()
-            .register_custom_symbol("bam.v0.w4.record_hook", record_hook_event as *const c_void);
+            .register_custom_symbol("bam.v0.ext.record_hook", record_hook_event as *const c_void);
     }
 
     let mod_id = app
         .load_mod_with(
-            w4_dylib.path(),
+            ext_dylib.path(),
             LoadOptions::new().with_shadow_copy(true).strict(),
         )
-        .expect("load w4_ext_mod");
+        .expect("load state_hooks_and_observers_mod");
 
     let reg_comp = app
         .world()
         .resource::<ModRegistry>()
-        .get_by_name("w4_ext_mod::HookedAura")
+        .get_by_name("state_hooks_and_observers_mod::HookedAura")
         .cloned()
         .expect("HookedAura registered");
     let comp_id = reg_comp.component_id;
@@ -249,8 +258,9 @@ fn wave4_f04_dynamic_component_hooks_fire_and_disarm_safely_on_unload() {
         ]
     );
 
-    // Now UNLOAD `w4_ext_mod` (`dlclose`!) while `e2` STILL carries `HookedAura` in `World`!
-    app.unload_mod(mod_id).expect("unload w4_ext_mod");
+    // Now UNLOAD `state_hooks_and_observers_mod` (`dlclose`!) while `e2` STILL carries `HookedAura` in `World`!
+    app.unload_mod(mod_id)
+        .expect("unload state_hooks_and_observers_mod");
 
     // Despawning `e2` AFTER unload must NOT crash (`ArcSwapOption` disarmed the hook before `dlclose`)
     // and must NOT invoke the unmapped guest hook!
@@ -260,24 +270,24 @@ fn wave4_f04_dynamic_component_hooks_fire_and_disarm_safely_on_unload() {
 
 #[repr(C)]
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, ModComponent)]
-#[mod_component(name = "w5::EnableObserverAndLayoutTest")]
+#[mod_component(name = "ext::EnableObserverAndLayoutTest")]
 struct EnableObserverAndLayoutTest;
 
 #[repr(C)]
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, ModComponent)]
-#[mod_component(name = "w5::WatchedTarget")]
+#[mod_component(name = "ext::WatchedTarget")]
 struct WatchedTarget;
 
 #[repr(C)]
 #[derive(Event, Clone, Copy, Debug, PartialEq, Eq, ModComponent)]
-#[mod_component(name = "w5::WavePing")]
-struct CWavePing {
-    wave: u32,
+#[mod_component(name = "ext::PingSignal")]
+struct CPingSignal {
+    seq: u32,
 }
 
 #[repr(C)]
 #[derive(EntityEvent, Clone, Copy, Debug, PartialEq, ModComponent)]
-#[mod_component(name = "w5::DamageApplied")]
+#[mod_component(name = "ext::DamageApplied")]
 struct CDamageApplied {
     #[event_target]
     entity: TargetEntity,
@@ -286,22 +296,22 @@ struct CDamageApplied {
 
 #[repr(C)]
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, ModComponent)]
-#[mod_component(name = "w5::EnableInSetTest")]
+#[mod_component(name = "ext::EnableInSetTest")]
 struct EnableInSetTest;
 
 #[repr(C)]
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, ModComponent)]
-#[mod_component(name = "w5::DamagedMark")]
+#[mod_component(name = "ext::DamagedMark")]
 struct CDamagedMark {
     hits: u32,
 }
 
 #[test]
-fn wave5_req4_req5_c99_dynamic_layout_and_entity_event_observers_lifecycle() {
+fn c99_dynamic_layout_and_entity_event_observers_lifecycle() {
     static OBS_EVENTS: Mutex<Vec<(u32, u64, u32, i32)>> = Mutex::new(Vec::new());
     static WATCHED_BITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-    unsafe extern "C" fn record_w5_event(
+    unsafe extern "C" fn record_obs_event(
         kind: u32,
         target: FfiEntity,
         value_u32: u32,
@@ -320,26 +330,29 @@ fn wave5_req4_req5_c99_dynamic_layout_and_entity_event_observers_lifecycle() {
     OBS_EVENTS.lock().unwrap().clear();
 
     #[derive(bevy_ecs::schedule::SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
-    enum W5HostPhase {
+    enum ObserverHostSet {
         BeforeLogic,
         Logic,
         AfterLogic,
     }
 
-    let w4_dylib = TempDylibCopy::new(&fixture_dylib("w4_ext_mod"), "w5_obs_layout");
+    let ext_dylib = TempDylibCopy::new(
+        &fixture_dylib("state_hooks_and_observers_mod"),
+        "obs_layout",
+    );
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
     app.init_schedule(FixedUpdate);
     app.init_schedule(PostUpdate);
-    app.register_mod_visible_set("w5_logic", W5HostPhase::Logic);
+    app.register_mod_visible_set("logic", ObserverHostSet::Logic);
     {
         use bevy_ecs::schedule::IntoScheduleConfigs;
         app.configure_sets(
             Update,
             (
-                W5HostPhase::BeforeLogic,
-                W5HostPhase::Logic,
-                W5HostPhase::AfterLogic,
+                ObserverHostSet::BeforeLogic,
+                ObserverHostSet::Logic,
+                ObserverHostSet::AfterLogic,
             )
                 .chain(),
         );
@@ -349,11 +362,11 @@ fn wave5_req4_req5_c99_dynamic_layout_and_entity_event_observers_lifecycle() {
                 (|| {
                     OBS_EVENTS.lock().unwrap().push((10, 0, 0, 0));
                 })
-                .in_set(W5HostPhase::BeforeLogic),
+                .in_set(ObserverHostSet::BeforeLogic),
                 (|| {
                     OBS_EVENTS.lock().unwrap().push((20, 0, 0, 0));
                 })
-                .in_set(W5HostPhase::AfterLogic),
+                .in_set(ObserverHostSet::AfterLogic),
             ),
         );
     }
@@ -366,26 +379,28 @@ fn wave5_req4_req5_c99_dynamic_layout_and_entity_event_observers_lifecycle() {
         .unwrap();
     app.register_mod_component::<CDamagedMark>(ComponentOptions::new())
         .unwrap();
-    app.register_mod_event::<CWavePing>().unwrap();
+    app.register_mod_event::<CPingSignal>().unwrap();
     app.register_mod_entity_event::<CDamageApplied>().unwrap();
 
     let watched_entity = app.world_mut().spawn_empty().id();
     let unwatched_entity = app.world_mut().spawn_empty().id();
     WATCHED_BITS.store(watched_entity.to_bits(), Ordering::SeqCst);
 
-    // SAFETY: `record_w5_event` and `get_watched_target` have C ABI linkage and live for the process.
+    // SAFETY: `record_obs_event` and `get_watched_target` have C ABI linkage and live for the process.
     unsafe {
         let mut reg = app.world_mut().resource_mut::<ModRegistry>();
-        reg.register_custom_symbol("bam.v0.w5.record_event", record_w5_event as *const c_void);
+        reg.register_custom_symbol("bam.v0.ext.record_event", record_obs_event as *const c_void);
         reg.register_custom_symbol(
-            "bam.v0.w5.get_watched_target",
+            "bam.v0.ext.get_watched_target",
             get_watched_target as *const c_void,
         );
     }
 
-    let mod_id = app.load_mod(w4_dylib.path()).expect("load w4_ext_mod w5");
+    let mod_id = app
+        .load_mod(ext_dylib.path())
+        .expect("load state_hooks_and_observers_mod");
 
-    // 1. Requirement 4: Verify runtime component registered via `bam_desc_component_with_layout` /
+    // 1. Verify runtime component registered via `bam_desc_component_with_layout` /
     //    `ComponentDescriptor::new_with_layout` can be attached to host entities and runs `drop_fn`.
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -396,7 +411,7 @@ fn wave5_req4_req5_c99_dynamic_layout_and_entity_event_observers_lifecycle() {
     }
     let reg_snap = app.world().resource::<ModRegistry>().snapshot_arc();
     let priv_comp = reg_snap
-        .get_by_name("w4_ext_mod::CPrivateLayout")
+        .get_by_name("state_hooks_and_observers_mod::CPrivateLayout")
         .expect("CPrivateLayout registered by C99 mod");
     let priv_id = priv_comp.component_id;
     let e_layout_pre = app.world_mut().spawn_empty().id();
@@ -424,8 +439,8 @@ fn wave5_req4_req5_c99_dynamic_layout_and_entity_event_observers_lifecycle() {
     }
     assert!(app.world_mut().despawn(e_layout_pre));
 
-    // 2. Requirement 5: Trigger global `Event` (`WavePing`) & `EntityEvent` (`DamageApplied`).
-    app.world_mut().trigger(CWavePing { wave: 9 });
+    // 2. Trigger global `Event` (`PingSignal`) & `EntityEvent` (`DamageApplied`).
+    app.world_mut().trigger(CPingSignal { seq: 9 });
     // Trigger on unwatched entity -> watched entity observer must NOT fire.
     app.world_mut().trigger(CDamageApplied {
         entity: TargetEntity::from(unwatched_entity),
@@ -438,7 +453,7 @@ fn wave5_req4_req5_c99_dynamic_layout_and_entity_event_observers_lifecycle() {
         entity: TargetEntity::from(watched_entity),
         amount: 33.0,
     });
-    // Flush observer deferred commands and verify `.in_set("host::w5_logic")` executes strictly
+    // Flush observer deferred commands and verify `.in_set("host::logic")` executes strictly
     // between host `BeforeLogic` (10) and `AfterLogic` (20).
     app.update();
     app.world_mut().run_schedule(FixedUpdate);
@@ -463,10 +478,11 @@ fn wave5_req4_req5_c99_dynamic_layout_and_entity_event_observers_lifecycle() {
 
     // 3. Unload mod (`dlclose`!) and verify host sets still execute, while observers & dynamic
     //    destructors are cleanly disarmed/despawned.
-    app.unload_mod(mod_id).expect("unload w4_ext_mod w5");
+    app.unload_mod(mod_id)
+        .expect("unload state_hooks_and_observers_mod");
 
     let count_before = OBS_EVENTS.lock().unwrap().len();
-    app.world_mut().trigger(CWavePing { wave: 10 });
+    app.world_mut().trigger(CPingSignal { seq: 10 });
     app.world_mut().trigger(CDamageApplied {
         entity: TargetEntity::from(watched_entity),
         amount: 99.0,

@@ -2,7 +2,7 @@
 //!
 //! Demonstrates three ordered systems built with [`GuestApp::system`] and typed tuple queries
 //! ([`SystemBuilder::query_typed`], [`SystemContext::single_query`], and
-//! [`SystemContext::single_query_and_commands`]) without magic column index literals (`G-03`),
+//! [`SystemContext::single_query_and_commands`]) without magic column index literals,
 //! query inclusion/exclusion filters ([`With`] / [`Without`]), pre-resolved [`BamComponent`]
 //! handles with single-archetype batched [`GuestCommands::spawn`], and per-`World` instance state
 //! cleanup on unload.
@@ -105,7 +105,7 @@ impl GuestPlugin for MultiSystemPipelineMod {
     const VERSION: &'static CStr = c"0.2.0";
 
     fn build(&mut self, app: &mut GuestApp<'_>) -> FfiResult {
-        // Pre-resolve handles once during init for O(1) batched spawns on the hot path (`C-05`).
+        // Pre-resolve handles once during init for O(1) batched spawns on the hot path.
         let pos_h = match app.resolve_component::<Position>() {
             Ok(h) => h,
             Err(err) => return err,
@@ -123,7 +123,7 @@ impl GuestPlugin for MultiSystemPipelineMod {
             Err(err) => return err,
         };
 
-        // 1. KinematicsMovementSystem: typed tuple query `(&mut Position, &Velocity)` (`G-03`).
+        // 1. KinematicsMovementSystem: typed tuple query `(&mut Position, &Velocity)`.
         let res1 = app
             .system(c"KinematicsMovementSystem")
             .query_typed::<(&mut Position, &Velocity)>()

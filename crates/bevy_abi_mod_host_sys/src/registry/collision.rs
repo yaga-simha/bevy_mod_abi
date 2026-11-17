@@ -1,4 +1,4 @@
-//! Error diagnostics for conflicting component or resource registrations (`C-10`, `E-02`).
+//! Error diagnostics for conflicting component or resource registrations.
 
 use bevy_abi_mod_sys::ComponentUuid;
 use thiserror::Error;

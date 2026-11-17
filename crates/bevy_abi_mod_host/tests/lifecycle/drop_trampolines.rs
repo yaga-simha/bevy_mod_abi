@@ -1,4 +1,4 @@
-//! Foreign drop-trampoline pool conservation, saturation, `WorldDropGuard` reclamation (`L-06`),
+//! Foreign drop-trampoline pool conservation, saturation, `WorldDropGuard` reclamation,
 //! slot reuse on reload, paired active-guard fallback across multiple mods, and panic containment.
 
 use crate::DROP_SLOT_POOL_RWLOCK;
@@ -271,7 +271,7 @@ fn test_drop_trampoline_saturation_and_reclamation() {
         load_ctx_2.finish_init();
     }
 
-    // `WorldDropGuard` MUST reclaim every allocated slot once `world` drops (`L-06`).
+    // `WorldDropGuard` MUST reclaim every allocated slot once `world` drops.
     assert_eq!(available_drop_trampoline_slots(), baseline_free);
 }
 

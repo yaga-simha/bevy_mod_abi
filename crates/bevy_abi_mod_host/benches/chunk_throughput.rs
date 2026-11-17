@@ -1,4 +1,4 @@
-//! Canonical ABI `0.2.0` Benchmark Suite (`X-03`).
+//! Canonical ABI `0.2.0` Benchmark Suite.
 //!
 //! Unifies the five core `bevy_abi_mod` performance scenarios into a single zero-dependency,
 //! Criterion-compatible benchmark harness (`--bench`, `--test`, `--quick`, and substring filter
@@ -7,13 +7,13 @@
 //! 1. **`dense_iterate`** — Contiguous SoA chunk iteration at `1k`, `10k`, and `100k` entities
 //!    comparing Native Bevy, GuestSystem C-ABI, Rust `.cdylib`, and ISO C99 `.dylib`/`.so`.
 //! 2. **`changed_filter`** — `Changed<Position>` tick filtering over `100k` entities at `1%`,
-//!    `50%`, and `100%` mutation rates (`P-01` table summary-tick skip + branch-light scan).
+//!    `50%`, and `100%` mutation rates (`table summary-tick skip + branch-light scan).
 //! 3. **`command_burst`** — `10k` handle-resolved `host_cmd_insert` writes/frame into reusable
-//!    per-system `CommandArena` (`C-05`, `P-05`).
+//!    per-system `CommandArena`.
 //! 4. **`sparse_query`** — Batched indirect `StorageType::SparseSet` row-pointer iteration over
-//!    `10k` entities (`P-02`).
+//!    `10k` entities.
 //! 5. **`spawn_with_4`** — Batched single-archetype `host_cmd_spawn` with 4 components vs.
-//!    sequential `host_cmd_spawn_empty` + 4x `host_cmd_insert` (`P-05`).
+//!    sequential `host_cmd_spawn_empty` + 4x `host_cmd_insert`.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![allow(clippy::cast_ptr_alignment, unreachable_pub)]
@@ -93,7 +93,7 @@ pub struct Armor {
     pub faction: u32,
 }
 
-/// Sparse-set 8-byte buff payload (`StorageType::SparseSet`, `P-02`).
+/// Sparse-set 8-byte buff payload (`StorageType::SparseSet`).
 #[repr(C)]
 #[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
 #[component(storage = "SparseSet")]
@@ -420,7 +420,7 @@ unsafe extern "C" fn c_abi_sparse_iter_cb(
     }
 
     let mut len = 0usize;
-    // SAFETY: Advancing `iter` across batched sparse-set archetype runs (`P-02`).
+    // SAFETY: Advancing `iter` across batched sparse-set archetype runs.
     while unsafe { host_iter_next_chunk(iter, &mut len) } != FfiBool::FALSE {
         // SAFETY: Term `0` (`Position`) is dense `Table` storage declared `WRITE`.
         let pos_ptr = unsafe { host_iter_column_mutable(iter, 0) }.cast::<Position>();
@@ -737,14 +737,14 @@ fn bench_dense_iterate(cfg: &BenchConfig, dylibs: Option<&(PathBuf, PathBuf)>) {
 }
 
 // ============================================================================
-// Scenario 2: `Changed<Position>` Filter (`1%`, `50%`, `100%` Changed, `P-01`)
+// Scenario 2: `Changed<Position>` Filter (`1%`, `50%`, `100%` Changed)
 // ============================================================================
 
 fn bench_changed_filter(cfg: &BenchConfig) {
     let total_entities = cfg.scale_count(100_000);
     println!("\n================================================================================");
     println!(
-        " SCENARIO 2: Changed<Position> Tick Filter ({total_entities} Entities @ 1%, 50%, 100%, P-01)"
+        " SCENARIO 2: Changed<Position> Tick Filter ({total_entities} Entities @ 1%, 50%, 100%)"
     );
     println!("================================================================================");
 
@@ -797,7 +797,7 @@ fn bench_changed_filter(cfg: &BenchConfig) {
             "ent",
         );
 
-        // 2b. C-ABI `AccessMode::CHANGED` (`HostIter` table summary skip + tight scan, `P-01`)
+        // 2b. C-ABI `AccessMode::CHANGED` (`HostIter` table summary skip + tight scan)
         let mut last_visited = Box::new(0usize);
         let cabi_stats = {
             let mut app = App::new();
@@ -857,13 +857,13 @@ fn bench_changed_filter(cfg: &BenchConfig) {
 }
 
 // ============================================================================
-// Scenario 3: Command Burst (`10k` `cmd_insert`s / Frame, `C-05`, `P-05`)
+// Scenario 3: Command Burst (`10k` `cmd_insert`s / Frame)
 // ============================================================================
 
 fn bench_command_burst(cfg: &BenchConfig) {
     let count = cfg.scale_count(10_000);
     println!("\n================================================================================");
-    println!(" SCENARIO 3: Deferred Command Burst ({count} Inserts / Frame, C-05 + P-05)");
+    println!(" SCENARIO 3: Deferred Command Burst ({count} Inserts / Frame)");
     println!("================================================================================");
 
     // 3a. Native Bevy `Commands::entity(e).insert(Armor)`
@@ -930,13 +930,13 @@ fn bench_command_burst(cfg: &BenchConfig) {
 }
 
 // ============================================================================
-// Scenario 4: Sparse-Set Query Iteration (`10k` Entities, `P-02`)
+// Scenario 4: Sparse-Set Query Iteration (`10k` Entities)
 // ============================================================================
 
 fn bench_sparse_query(cfg: &BenchConfig) {
     let count = cfg.scale_count(10_000);
     println!("\n================================================================================");
-    println!(" SCENARIO 4: Batched Sparse-Set Query Iteration ({count} Entities, P-02)");
+    println!(" SCENARIO 4: Batched Sparse-Set Query Iteration ({count} Entities)");
     println!("================================================================================");
 
     // 4a. Native Bevy `Query<(&mut Position, &mut SparseBuff)>`
@@ -965,7 +965,7 @@ fn bench_sparse_query(cfg: &BenchConfig) {
     };
     print_row("Native Bevy SparseSet Query", native_stats, "ent");
 
-    // 4b. C-ABI `host_iter_column_rows_mutable` indirect batched sparse rows (`P-02`)
+    // 4b. C-ABI `host_iter_column_rows_mutable` indirect batched sparse rows
     let cabi_stats = {
         let mut app = App::new();
         app.add_plugins(AbiModPlugin);
@@ -1008,11 +1008,11 @@ fn bench_sparse_query(cfg: &BenchConfig) {
         app.add_systems(Update, sys);
         measure_fn(|| timed_update(&mut app), cfg.warmup, cfg.rounds, count)
     };
-    print_row("C-ABI Indirect Sparse Rows (P-02)", cabi_stats, "ent");
+    print_row("C-ABI Indirect Sparse Rows", cabi_stats, "ent");
 }
 
 // ============================================================================
-// Scenario 5: Batched `cmd_spawn` (4 Components) vs. Sequential Spawn+Insert (`P-05`)
+// Scenario 5: Batched `cmd_spawn` (4 Components) vs. Sequential Spawn+Insert
 // ============================================================================
 
 fn despawn_all_with_position(world: &mut bevy_ecs::world::World) {
@@ -1026,7 +1026,7 @@ fn despawn_all_with_position(world: &mut bevy_ecs::world::World) {
 fn bench_spawn_with_4(cfg: &BenchConfig) {
     let spawn_per_frame = cfg.scale_count(2_500);
     println!("\n================================================================================");
-    println!(" SCENARIO 5: Spawn-with-4 Components ({spawn_per_frame} Entities / Frame, P-05)");
+    println!(" SCENARIO 5: Spawn-with-4 Components ({spawn_per_frame} Entities / Frame)");
     println!("================================================================================");
 
     // 5a. Native Bevy Bundle Spawn `(Position, Velocity, Vitality, Armor)`
@@ -1069,7 +1069,7 @@ fn bench_spawn_with_4(cfg: &BenchConfig) {
     };
     print_row("Native Bevy 4-Component Bundle Spawn", native_stats, "ent");
 
-    // 5b. C-ABI Batched `host_cmd_spawn` (`insert_by_ids` single archetype move, `P-05`)
+    // 5b. C-ABI Batched `host_cmd_spawn` (`insert_by_ids` single archetype move)
     let mut batched_ctx = Box::new(SpawnBenchCtx {
         pos: BamComponent::INVALID,
         vel: BamComponent::INVALID,
@@ -1177,7 +1177,7 @@ fn main() {
 
     println!("================================================================================");
     println!(
-        " bevy_abi_mod Canonical Benchmark Suite (ABI 0.2.0, X-03) [mode={}]",
+        " bevy_abi_mod Canonical Benchmark Suite (ABI 0.2.0) [mode={}]",
         if cfg.test_mode {
             "smoke-test"
         } else if cfg.quick_mode {

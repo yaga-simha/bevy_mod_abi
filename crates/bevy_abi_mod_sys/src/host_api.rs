@@ -34,7 +34,7 @@ pub struct BamInstance {
     _marker: PhantomData<(*mut u8, PhantomPinned)>,
 }
 
-/// Host-provided byte-sink callback passed to [`BamSaveStateFn`] (`F-01`) so serialized hot-reload
+/// Host-provided byte-sink callback passed to [`BamSaveStateFn`] so serialized hot-reload
 /// state bytes are copied directly into a host-allocated `Vec<u8>` without cross-ABI heap ownership.
 ///
 /// # Safety
@@ -43,7 +43,7 @@ pub struct BamInstance {
 pub type BamStateWriterFn =
     unsafe extern "C" fn(ctx: *mut c_void, bytes: *const u8, len: usize) -> FfiResult;
 
-/// Optional guest hot-reload state snapshot callback on [`BamManifest`] (`F-01`).
+/// Optional guest hot-reload state snapshot callback on [`BamManifest`].
 ///
 /// Invoked by `world.reload_mod(id)` prior to `bevy_abi_mod_shutdown(instance)`.
 ///
@@ -57,7 +57,7 @@ pub type BamSaveStateFn = unsafe extern "C" fn(
     writer_ctx: *mut c_void,
 ) -> FfiResult;
 
-/// Optional guest hot-reload state restoration callback on [`BamManifest`] (`F-01`).
+/// Optional guest hot-reload state restoration callback on [`BamManifest`].
 ///
 /// Invoked by `world.reload_mod(id)` immediately after the replacement library's `bevy_abi_mod_init`
 /// succeeds.
@@ -94,9 +94,9 @@ pub struct BamManifest {
     pub flags: u32,
     /// Explicit zero-reserved field (`must be 0`, `offset 28` / `20`).
     pub reserved0: u32,
-    /// Optional hot-reload state snapshot callback (`F-01`, `offset 32` / `24`).
+    /// Optional hot-reload state snapshot callback (`offset 32` / `24`).
     pub save_state: Option<BamSaveStateFn>,
-    /// Optional hot-reload state restoration callback (`F-01`, `offset 40` / `28`).
+    /// Optional hot-reload state restoration callback (`offset 40` / `28`).
     pub restore_state: Option<BamRestoreStateFn>,
 }
 
@@ -143,21 +143,21 @@ impl BamManifest {
         self
     }
 
-    /// Attaches an optional hot-reload `save_state` callback (`F-01`).
+    /// Attaches an optional hot-reload `save_state` callback.
     #[inline]
     pub const fn with_save_state(mut self, save_state: BamSaveStateFn) -> Self {
         self.save_state = Some(save_state);
         self
     }
 
-    /// Attaches an optional hot-reload `restore_state` callback (`F-01`).
+    /// Attaches an optional hot-reload `restore_state` callback.
     #[inline]
     pub const fn with_restore_state(mut self, restore_state: BamRestoreStateFn) -> Self {
         self.restore_state = Some(restore_state);
         self
     }
 
-    /// Attaches both hot-reload `save_state` and `restore_state` callbacks (`F-01`).
+    /// Attaches both hot-reload `save_state` and `restore_state` callbacks.
     #[inline]
     pub const fn with_state_callbacks(
         mut self,
@@ -360,7 +360,7 @@ pub type BamSysCommandsFn = unsafe extern "C" fn(
 ) -> FfiResult;
 
 /// Random O(1) read-only per-entity component lookup for `entity` under declared `query_index`
-/// and `term_index` (`F-03`), returning null if `entity` does not match `query_index`'s archetype
+/// and `term_index`, returning null if `entity` does not match `query_index`'s archetype
 /// filters, lacks the component, or `term_index` did not declare entity read/write access.
 ///
 /// # Safety
@@ -374,7 +374,7 @@ pub type BamSysEntityGetFn = unsafe extern "C" fn(
 ) -> *const u8;
 
 /// Random O(1) mutable per-entity component lookup for `entity` under declared `query_index` and
-/// `term_index` (`F-03`), marking `entity`'s component change tick and returning null if `entity`
+/// `term_index`, marking `entity`'s component change tick and returning null if `entity`
 /// does not match `query_index`'s archetype filters, lacks the component, or `term_index` did not
 /// declare `WRITE` / `OPTIONAL_WRITE` access.
 ///
@@ -435,8 +435,8 @@ pub type BamRegisterObserverFn =
 /// null-pointer checks are sound without raw pointer byte-probing.
 ///
 /// Layout:
-/// - 64-bit: `MIN_V0_2_SIZE = 224` bytes (`8`B header + `27 * 8`B mandatory slots; `size_of = 312` bytes with 11 optional Wave 4 extension slots), `8`-byte alignment.
-/// - 32-bit: `MIN_V0_2_SIZE = 116` bytes (`8`B header + `27 * 4`B mandatory slots; `size_of = 160` bytes with 11 optional Wave 4 extension slots), `4`-byte alignment.
+/// - 64-bit: `MIN_V0_2_SIZE = 224` bytes (`8`B header + `27 * 8`B core slots; `size_of = 312` bytes with 11 optional extended slots), `8`-byte alignment.
+/// - 32-bit: `MIN_V0_2_SIZE = 116` bytes (`8`B header + `27 * 4`B core slots; `size_of = 160` bytes with 11 optional extended slots), `4`-byte alignment.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct BamHostApi {
@@ -511,16 +511,16 @@ pub struct BamHostApi {
     /// Queue component removal by [`BamComponent`] handle (`offset 216` / `112`).
     pub cmd_remove: Option<BamCmdRemoveFn>,
 
-    // Optional Wave 4 engine extension slots (appended after `MIN_V0_2_SIZE`)
-    /// Host-driven parallel chunk iteration across `ComputeTaskPool` (`P-07`, `offset 224` / `116`).
+    // Optional extended engine slots (appended after `MIN_V0_2_SIZE`)
+    /// Host-driven parallel chunk iteration across `ComputeTaskPool` (`offset 224` / `116`).
     pub par_for_each_chunk: Option<BamParForEachChunkFn>,
-    /// Random O(1) read-only per-entity component lookup (`F-03`, `offset 232` / `120`).
+    /// Random O(1) read-only per-entity component lookup (`offset 232` / `120`).
     pub sys_entity_get: Option<BamSysEntityGetFn>,
-    /// Random O(1) mutable per-entity component lookup (`F-03`, `offset 240` / `124`).
+    /// Random O(1) mutable per-entity component lookup (`offset 240` / `124`).
     pub sys_entity_get_mut: Option<BamSysEntityGetMutFn>,
-    /// Buffered Bevy `Messages<M>` batch reader (`F-02`, `offset 248` / `128`).
+    /// Buffered Bevy `Messages<M>` batch reader (`offset 248` / `128`).
     pub msg_read_batch: Option<BamMsgReadBatchFn>,
-    /// Buffered Bevy `Messages<M>` writer (`F-02`, `offset 256` / `132`).
+    /// Buffered Bevy `Messages<M>` writer (`offset 256` / `132`).
     pub msg_send: Option<BamMsgSendFn>,
     /// Buffered Bevy `Messages<M>` batch writer (`offset 264` / `136`).
     pub msg_write_batch: Option<BamMsgWriteBatchFn>,
@@ -613,9 +613,9 @@ impl BamHostApi {
             && self.cmd_remove.is_some()
     }
 
-    /// Returns `true` if all 38 ABI `0.2` + Wave 4 optional function-pointer slots are `Some`.
+    /// Returns `true` if all 38 ABI `0.2` core and extended function-pointer slots are `Some`.
     #[inline]
-    pub const fn has_all_wave4_slots(&self) -> bool {
+    pub const fn has_all_slots(&self) -> bool {
         self.has_all_v0_2_slots()
             && self.par_for_each_chunk.is_some()
             && self.sys_entity_get.is_some()

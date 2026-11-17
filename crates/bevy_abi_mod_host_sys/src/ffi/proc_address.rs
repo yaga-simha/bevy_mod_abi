@@ -1,11 +1,11 @@
-//! Context-carrying `"bam.v0.*"` symbol and VTable resolution (`host_get_proc_address`, `C-04`).
+//! Context-carrying `"bam.v0.*"` symbol and VTable resolution (`host_get_proc_address`).
 
 use crate::handle_header::{HOST_CTX_MAGIC, HostContext, validate_handle_ref};
 use bevy_abi_mod_sys::BamHostCtx;
 use core::ffi::{CStr, c_char, c_void};
 
 /// Resolves a `"bam.v0.<name>"` symbol or component VTable (`"bam.v0.<canonical_name>.vtable"`)
-/// against the world-scoped [`BamHostCtx`] (`C-04`).
+/// against the world-scoped [`BamHostCtx`].
 ///
 /// Returns null and populates `last_error` on `ctx` if `name` is null, invalid UTF-8, lacks the
 /// `"bam.v0."` namespace prefix, or is unregistered/evicted in `ctx`.
