@@ -1,19 +1,17 @@
 UNAME_S := $(shell uname -s)
 
 ifeq ($(UNAME_S),Darwin)
-    TARGET = libmod_ cuddle.dylib
     TARGET := libmod_cuddle.dylib
-    LDFLAGS = -shared -fPIC
+    LDFLAGS = -shared -fPIC -lm
 else ifeq ($(OS),Windows_NT)
-    TARGET = mod_cuddle.dll
+    TARGET := mod_cuddle.dll
     LDFLAGS = -shared
 else
-    TARGET = libmod_cuddle.so
+    TARGET := libmod_cuddle.so
     LDFLAGS = -shared -fPIC -lm
 endif
 
-# Mandatory C99 compile flags
-override CFLAGS += -std=c99 -Wall -Wextra -Werror -I../../../../include -O3
+override CFLAGS += -std=c99 -Wall -Wextra -Wpedantic -Werror -I../../../../include -O3
 
 all: $(TARGET)
 
@@ -22,5 +20,6 @@ $(TARGET): mod.c ../../../../include/bevy_abi_mod.h
 
 clean:
 	rm -f $(TARGET)
+	rm -rf *.dSYM
 
 .PHONY: all clean

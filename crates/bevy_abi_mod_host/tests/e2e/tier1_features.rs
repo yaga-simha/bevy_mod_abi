@@ -2,9 +2,9 @@
 
 use super::harness::*;
 use bevy_abi_mod_sys::{
-    ABI_VERSION_PACKED, ComponentAccessDesc, ComponentAccessMode, ComponentUuid,
-    DynamicSystemCallback, ExposableComponent, FfiEntity, FfiResult, FfiSlice, HostApi,
-    RawChunkIter, RawCommandQueue, StrView, SystemDescriptor,
+    ABI_VERSION, AccessMode, BamComponent, BamHostApi, BamHostCtx, BamInstance, BamIter,
+    BamLoadCtx, BamQueryDesc, BamSystemCtx, BamSystemDesc, BamSystemFn, BamTermDesc, ComponentUuid,
+    FfiEntity, FfiResult, FfiSlice, ModComponent, StrView,
 };
 use core::ffi::{CStr, c_char, c_void};
 use std::collections::HashMap;
@@ -21,12 +21,13 @@ fn t1_f01_01_component_uuid_lookup() {
     let u1 = KinematicsPos::UUID;
     let u2 = KinematicsPos::UUID;
     assert_eq!(u1, u2);
-    assert_eq!(u1, ComponentUuid::from_name("KinematicsPos"));
+    assert!(!u1.is_zero());
+    assert_ne!(u1, KinematicsVel::UUID);
 }
 
 #[test]
 fn t1_f01_02_resolve_vtable_pointer() {
-    let sym = "KinematicsPos_vtable";
+    let sym = "bam.v0.e2e_harness::KinematicsPos.vtable";
     let ptr = KinematicsPos::resolve_symbol(sym);
     assert!(ptr.is_some());
     assert_eq!(ptr.unwrap(), KinematicsPos::erased_vtable_ptr());
@@ -34,8 +35,8 @@ fn t1_f01_02_resolve_vtable_pointer() {
 
 #[test]
 fn t1_f01_03_resolve_accessor_symbols() {
-    let get_x = KinematicsPos::resolve_symbol("KinematicsPos_get_x");
-    let set_x = KinematicsPos::resolve_symbol("KinematicsPos_set_x");
+    let get_x = KinematicsPos::resolve_symbol("bam.v0.e2e_harness::KinematicsPos.get_x");
+    let set_x = KinematicsPos::resolve_symbol("bam.v0.e2e_harness::KinematicsPos.set_x");
     assert!(get_x.is_some());
     assert!(set_x.is_some());
 }
@@ -57,35 +58,33 @@ fn t1_f01_05_multiple_components_unique_vtables() {
 
 #[test]
 fn t1_f02_01_system_descriptor_creation() {
-    let name = b"TestSystem\0".as_ptr() as *const c_char;
-    let desc = SystemDescriptor {
-        struct_size: core::mem::size_of::<SystemDescriptor>() as u32,
+    let name = c"TestSystem".as_ptr();
+    let desc = BamSystemDesc::new(
         name,
-        queries: core::ptr::null(),
-        query_count: 0,
-        callback: dummy_callback,
-        user_data: core::ptr::null_mut(),
-    };
+        core::ptr::null(),
+        0,
+        dummy_system_callback,
+        core::ptr::null_mut(),
+    );
     assert_eq!(
         desc.struct_size,
-        core::mem::size_of::<SystemDescriptor>() as u32
+        core::mem::size_of::<BamSystemDesc>() as u32
     );
     assert_eq!(desc.query_count, 0);
+    assert_eq!(desc.validate(), FfiResult::OK);
 }
 
 #[test]
 fn t1_f02_02_system_with_read_access() {
-    let name = KinematicsPos::COMPONENT_CSTR.as_ptr();
-    let query = ComponentAccessDesc::read(name);
-    assert_eq!(query.mode, ComponentAccessMode::READ);
+    let query = BamTermDesc::read(POS_HANDLE);
+    assert_eq!(query.mode, AccessMode::READ);
     assert!(!query.mode.is_mutable());
 }
 
 #[test]
 fn t1_f02_03_system_with_write_access() {
-    let name = KinematicsVel::COMPONENT_CSTR.as_ptr();
-    let query = ComponentAccessDesc::write(name);
-    assert_eq!(query.mode, ComponentAccessMode::WRITE);
+    let query = BamTermDesc::write(VEL_HANDLE);
+    assert_eq!(query.mode, AccessMode::WRITE);
     assert!(query.mode.is_mutable());
 }
 
@@ -93,8 +92,7 @@ fn t1_f02_03_system_with_write_access() {
 fn t1_f02_04_system_callback_invocation_forwards_user_data() {
     static INVOKED: AtomicBool = AtomicBool::new(false);
     unsafe extern "C" fn flag_callback(
-        _iter: *mut RawChunkIter,
-        _cmds: *mut RawCommandQueue,
+        _sys_ctx: *mut BamSystemCtx,
         user_data: *mut c_void,
     ) -> FfiResult {
         if !user_data.is_null() {
@@ -107,7 +105,6 @@ fn t1_f02_04_system_callback_invocation_forwards_user_data() {
     let status = unsafe {
         flag_callback(
             core::ptr::null_mut(),
-            core::ptr::null_mut(),
             &INVOKED as *const AtomicBool as *mut c_void,
         )
     };
@@ -117,13 +114,7 @@ fn t1_f02_04_system_callback_invocation_forwards_user_data() {
 
 #[test]
 fn t1_f02_05_system_callback_ok_return() {
-    let status = unsafe {
-        dummy_callback(
-            core::ptr::null_mut(),
-            core::ptr::null_mut(),
-            core::ptr::null_mut(),
-        )
-    };
+    let status = unsafe { dummy_system_callback(core::ptr::null_mut(), core::ptr::null_mut()) };
     assert_eq!(status, FfiResult::OK);
 }
 
@@ -134,19 +125,19 @@ fn t1_f03_01_iter_next_chunk_returns_count() {
     let mut state = MockChunkIterState::new();
     state.add_table(MockTable {
         entity_count: 50,
-        entities: (0..50).map(|i| FfiEntity::from_bits(i)).collect(),
+        entities: (0..50).map(FfiEntity::from_bits).collect(),
         columns: vec![],
     });
 
-    let iter_ptr = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
-    let count = unsafe { mock_iter_next_chunk(iter_ptr) };
+    let iter_ptr = &mut state as *mut MockChunkIterState as *mut BamIter;
+    let count = unsafe { mock_step_chunk(iter_ptr) };
     assert_eq!(count, 50);
 }
 
 #[test]
 fn t1_f03_02_iter_column_readonly_access() {
     let mut state = MockChunkIterState::new();
-    let positions = vec![KinematicsPos {
+    let positions = [KinematicsPos {
         x: 1.0,
         y: 2.0,
         z: 3.0,
@@ -171,9 +162,9 @@ fn t1_f03_02_iter_column_readonly_access() {
         }],
     });
 
-    let iter_ptr = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter_ptr = &mut state as *mut MockChunkIterState as *mut BamIter;
     unsafe {
-        mock_iter_next_chunk(iter_ptr);
+        mock_step_chunk(iter_ptr);
         let col = mock_iter_column_readonly(iter_ptr, 0);
         assert!(!col.is_null());
         let pos = &*(col as *const KinematicsPos);
@@ -184,7 +175,7 @@ fn t1_f03_02_iter_column_readonly_access() {
 #[test]
 fn t1_f03_03_iter_column_mutable_access() {
     let mut state = MockChunkIterState::new();
-    let positions = vec![KinematicsPos {
+    let positions = [KinematicsPos {
         x: 10.0,
         y: 20.0,
         z: 30.0,
@@ -209,9 +200,9 @@ fn t1_f03_03_iter_column_mutable_access() {
         }],
     });
 
-    let iter_ptr = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter_ptr = &mut state as *mut MockChunkIterState as *mut BamIter;
     unsafe {
-        mock_iter_next_chunk(iter_ptr);
+        mock_step_chunk(iter_ptr);
         let col = mock_iter_column_mutable(iter_ptr, 0);
         assert!(!col.is_null());
         let pos = &mut *(col as *mut KinematicsPos);
@@ -235,9 +226,9 @@ fn t1_f03_04_iter_entities_slice() {
         columns: vec![],
     });
 
-    let iter_ptr = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter_ptr = &mut state as *mut MockChunkIterState as *mut BamIter;
     unsafe {
-        mock_iter_next_chunk(iter_ptr);
+        mock_step_chunk(iter_ptr);
         let ents = mock_iter_entities(iter_ptr);
         assert!(!ents.is_null());
         let slice = core::slice::from_raw_parts(ents, 3);
@@ -262,9 +253,9 @@ fn t1_f03_05_iter_column_stride_matches_size() {
         }],
     });
 
-    let iter_ptr = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter_ptr = &mut state as *mut MockChunkIterState as *mut BamIter;
     unsafe {
-        mock_iter_next_chunk(iter_ptr);
+        mock_step_chunk(iter_ptr);
         let stride = mock_iter_column_stride(iter_ptr, 0);
         assert_eq!(stride, core::mem::size_of::<KinematicsPos>());
     }
@@ -296,14 +287,14 @@ fn t1_f04_03_enqueue_component_insert() {
     let bytes = vec![1, 2, 3, 4];
     q.push(MockCommand::InsertComponent(
         FfiEntity::from_bits(300),
-        "Tag".to_string(),
+        POS_HANDLE,
         bytes.clone(),
     ));
     let flushed = q.flush();
     assert_eq!(flushed.len(), 1);
     assert_eq!(
         flushed[0],
-        MockCommand::InsertComponent(FfiEntity::from_bits(300), "Tag".to_string(), bytes)
+        MockCommand::InsertComponent(FfiEntity::from_bits(300), POS_HANDLE, bytes)
     );
 }
 
@@ -342,9 +333,9 @@ fn t1_f05_01_kinematics_position_update() {
     let vt = KinematicsPos::vtable();
     let ptr = &mut pos as *mut KinematicsPos as *mut c_void;
     unsafe {
-        (vt.set_x)(ptr, (vt.get_x)(ptr) + vel.x);
-        (vt.set_y)(ptr, (vt.get_y)(ptr) + vel.y);
-        (vt.set_z)(ptr, (vt.get_z)(ptr) + vel.z);
+        let _ = (vt.set_x.unwrap())(ptr, (vt.get_x.unwrap())(ptr) + vel.x);
+        let _ = (vt.set_y.unwrap())(ptr, (vt.get_y.unwrap())(ptr) + vel.y);
+        let _ = (vt.set_z.unwrap())(ptr, (vt.get_z.unwrap())(ptr) + vel.z);
     }
 
     assert_eq!(pos.x, 1.0);
@@ -373,7 +364,7 @@ fn t1_f05_02_kinematics_array_stride() {
     for i in 0..2 {
         let elem = unsafe { base.add(i * stride) } as *mut c_void;
         unsafe {
-            (vt.set_y)(elem, 10.0);
+            let _ = (vt.set_y.unwrap())(elem, 10.0);
         }
     }
     assert_eq!(positions[0].y, 10.0);
@@ -382,7 +373,7 @@ fn t1_f05_02_kinematics_array_stride() {
 
 #[test]
 fn t1_f05_03_kinematics_velocity_stride() {
-    let velocities = vec![
+    let velocities = [
         KinematicsVel {
             x: 5.0,
             y: 6.0,
@@ -399,7 +390,7 @@ fn t1_f05_03_kinematics_velocity_stride() {
     let vt = KinematicsVel::vtable();
 
     let elem1 = unsafe { base.add(stride) } as *const c_void;
-    assert_eq!(unsafe { (vt.get_x)(elem1) }, 8.0);
+    assert_eq!(unsafe { (vt.get_x.unwrap())(elem1) }, 8.0);
 }
 
 #[test]
@@ -428,11 +419,11 @@ fn t1_f05_04_kinematics_batch_simulation() {
 #[test]
 fn t1_f05_05_kinematics_vtable_size_matches_size_of() {
     assert_eq!(
-        KinematicsPos::vtable().size,
+        KinematicsPos::vtable().header.size,
         core::mem::size_of::<KinematicsPos>()
     );
     assert_eq!(
-        KinematicsVel::vtable().size,
+        KinematicsVel::vtable().header.size,
         core::mem::size_of::<KinematicsVel>()
     );
 }
@@ -448,9 +439,9 @@ fn t1_f06_01_combat_damage_application() {
     let damage = CombatDamage { amount: 25 };
     let vt = CombatHealth::vtable();
     let ptr = &mut health as *mut CombatHealth as *mut c_void;
-    let cur = unsafe { (vt.get_current)(ptr) };
+    let cur = unsafe { (vt.get_current.unwrap())(ptr) };
     unsafe {
-        (vt.set_current)(ptr, cur - damage.amount);
+        let _ = (vt.set_current.unwrap())(ptr, cur - damage.amount);
     }
     assert_eq!(health.current, 75);
 }
@@ -464,7 +455,7 @@ fn t1_f06_02_combat_damage_to_zero() {
     let vt = CombatHealth::vtable();
     let ptr = &mut health as *mut CombatHealth as *mut c_void;
     unsafe {
-        (vt.set_current)(ptr, 0);
+        let _ = (vt.set_current.unwrap())(ptr, 0);
     }
     assert_eq!(health.current, 0);
 }
@@ -499,8 +490,8 @@ fn t1_f06_05_combat_vtable_field_access() {
     };
     let vt = CombatHealth::vtable();
     let ptr = &health as *const CombatHealth as *const c_void;
-    assert_eq!(unsafe { (vt.get_current)(ptr) }, 42);
-    assert_eq!(unsafe { (vt.get_max)(ptr) }, 200);
+    assert_eq!(unsafe { (vt.get_current.unwrap())(ptr) }, 42);
+    assert_eq!(unsafe { (vt.get_max.unwrap())(ptr) }, 200);
 }
 
 // --- Feature 7: Dynamic Metadata Scenario ---
@@ -512,7 +503,7 @@ fn t1_f07_01_read_string_metadata() {
     };
     let vt = MetadataTag::vtable();
     let ptr = &tag as *const MetadataTag as *const c_void;
-    let slice = unsafe { (vt.get_label)(ptr) };
+    let slice = unsafe { (vt.get_label.unwrap())(ptr) };
     let s = unsafe { slice.as_str().unwrap() };
     assert_eq!(s, "Warrior");
 }
@@ -526,7 +517,13 @@ fn t1_f07_02_write_string_metadata() {
     let ptr = &mut tag as *mut MetadataTag as *mut c_void;
     let new_val = "Mage";
     unsafe {
-        (vt.set_label)(ptr, new_val.as_ptr(), new_val.len());
+        let _ = (vt.set_label.unwrap())(
+            ptr,
+            StrView {
+                ptr: new_val.as_ptr(),
+                len: new_val.len(),
+            },
+        );
     }
     assert_eq!(tag.label, "Mage");
 }
@@ -540,7 +537,13 @@ fn t1_f07_03_string_metadata_growth() {
     let ptr = &mut tag as *mut MetadataTag as *mut c_void;
     let long_str = "A".repeat(1024);
     unsafe {
-        (vt.set_label)(ptr, long_str.as_ptr(), long_str.len());
+        let _ = (vt.set_label.unwrap())(
+            ptr,
+            StrView {
+                ptr: long_str.as_ptr(),
+                len: long_str.len(),
+            },
+        );
     }
     assert_eq!(tag.label.len(), 1024);
 }
@@ -554,7 +557,13 @@ fn t1_f07_04_string_metadata_shrink() {
     let ptr = &mut tag as *mut MetadataTag as *mut c_void;
     let short_str = "X";
     unsafe {
-        (vt.set_label)(ptr, short_str.as_ptr(), short_str.len());
+        let _ = (vt.set_label.unwrap())(
+            ptr,
+            StrView {
+                ptr: short_str.as_ptr(),
+                len: short_str.len(),
+            },
+        );
     }
     assert_eq!(tag.label, "X");
 }
@@ -567,7 +576,13 @@ fn t1_f07_05_string_metadata_empty() {
     let vt = MetadataTag::vtable();
     let ptr = &mut tag as *mut MetadataTag as *mut c_void;
     unsafe {
-        (vt.set_label)(ptr, core::ptr::null(), 0);
+        let _ = (vt.set_label.unwrap())(
+            ptr,
+            StrView {
+                ptr: core::ptr::null(),
+                len: 0,
+            },
+        );
     }
     assert_eq!(tag.label, "");
 }
@@ -581,7 +596,7 @@ fn t1_f08_01_read_buffer_slice() {
     };
     let vt = BufferScores::vtable();
     let ptr = &buf as *const BufferScores as *const c_void;
-    let slice = unsafe { (vt.get_scores)(ptr) };
+    let slice = unsafe { (vt.get_scores.unwrap())(ptr) };
     let s = unsafe { slice.as_slice() };
     assert_eq!(s, &[100, 200, 300]);
 }
@@ -593,7 +608,13 @@ fn t1_f08_02_write_buffer_slice() {
     let ptr = &mut buf as *mut BufferScores as *mut c_void;
     let new_scores = [10, 20, 30, 40];
     unsafe {
-        (vt.set_scores)(ptr, new_scores.as_ptr(), new_scores.len());
+        let _ = (vt.set_scores.unwrap())(
+            ptr,
+            FfiSlice {
+                ptr: new_scores.as_ptr(),
+                len: new_scores.len(),
+            },
+        );
     }
     assert_eq!(buf.scores, vec![10, 20, 30, 40]);
 }
@@ -605,7 +626,13 @@ fn t1_f08_03_buffer_growth() {
     let ptr = &mut buf as *mut BufferScores as *mut c_void;
     let data: Vec<u32> = (0..500).collect();
     unsafe {
-        (vt.set_scores)(ptr, data.as_ptr(), data.len());
+        let _ = (vt.set_scores.unwrap())(
+            ptr,
+            FfiSlice {
+                ptr: data.as_ptr(),
+                len: data.len(),
+            },
+        );
     }
     assert_eq!(buf.scores.len(), 500);
 }
@@ -618,7 +645,13 @@ fn t1_f08_04_buffer_clear() {
     let vt = BufferScores::vtable();
     let ptr = &mut buf as *mut BufferScores as *mut c_void;
     unsafe {
-        (vt.set_scores)(ptr, core::ptr::null(), 0);
+        let _ = (vt.set_scores.unwrap())(
+            ptr,
+            FfiSlice {
+                ptr: core::ptr::null(),
+                len: 0,
+            },
+        );
     }
     assert!(buf.scores.is_empty());
 }
@@ -631,7 +664,13 @@ fn t1_f08_05_buffer_repeated_updates() {
     for i in 0..10 {
         let v = [i; 5];
         unsafe {
-            (vt.set_scores)(ptr, v.as_ptr(), v.len());
+            let _ = (vt.set_scores.unwrap())(
+                ptr,
+                FfiSlice {
+                    ptr: v.as_ptr(),
+                    len: v.len(),
+                },
+            );
         }
     }
     assert_eq!(buf.scores, vec![9; 5]);
@@ -719,20 +758,14 @@ fn t1_f09_05_monotonic_step_counter() {
 fn t1_f10_01_empty_callback_repeated_calls() {
     let iterations = 10_000;
     for _ in 0..iterations {
-        let rc = unsafe {
-            dummy_callback(
-                core::ptr::null_mut(),
-                core::ptr::null_mut(),
-                core::ptr::null_mut(),
-            )
-        };
+        let rc = unsafe { dummy_system_callback(core::ptr::null_mut(), core::ptr::null_mut()) };
         assert_eq!(rc, FfiResult::OK);
     }
 }
 
 #[test]
 fn t1_f10_02_symbol_lookup_determinism() {
-    let name = "KinematicsPos_vtable";
+    let name = "bam.v0.e2e_harness::KinematicsPos.vtable";
     let expected = KinematicsPos::resolve_symbol(name);
     assert!(expected.is_some());
     for _ in 0..1_000 {
@@ -751,7 +784,7 @@ fn t1_f10_03_direct_vtable_fn_call_repeated() {
     let ptr = &mut pos as *mut KinematicsPos as *mut c_void;
     for _ in 0..10_000 {
         unsafe {
-            (vt.set_x)(ptr, 5.0);
+            let _ = (vt.set_x.unwrap())(ptr, 5.0);
         }
     }
     assert_eq!(pos.x, 5.0);
@@ -779,7 +812,7 @@ fn t1_f10_05_vtable_getter_overhead() {
     let ptr = &pos as *const KinematicsPos as *const c_void;
     let mut sum = 0.0f32;
     for _ in 0..10_000 {
-        sum += unsafe { (vt.get_x)(ptr) };
+        sum += unsafe { (vt.get_x.unwrap())(ptr) };
     }
     assert!(sum > 0.0);
 }
@@ -789,21 +822,21 @@ fn t1_f10_05_vtable_getter_overhead() {
 #[test]
 fn t1_f11_01_scale_1k() {
     let count = 1_000;
-    let entities: Vec<FfiEntity> = (0..count).map(|i| FfiEntity::from_bits(i)).collect();
+    let entities: Vec<FfiEntity> = (0..count).map(FfiEntity::from_bits).collect();
     assert_eq!(entities.len(), count as usize);
 }
 
 #[test]
 fn t1_f11_02_scale_10k() {
     let count = 10_000;
-    let entities: Vec<FfiEntity> = (0..count).map(|i| FfiEntity::from_bits(i)).collect();
+    let entities: Vec<FfiEntity> = (0..count).map(FfiEntity::from_bits).collect();
     assert_eq!(entities.len(), count as usize);
 }
 
 #[test]
 fn t1_f11_03_scale_100k() {
     let count = 100_000;
-    let entities: Vec<FfiEntity> = (0..count).map(|i| FfiEntity::from_bits(i)).collect();
+    let entities: Vec<FfiEntity> = (0..count).map(FfiEntity::from_bits).collect();
     assert_eq!(entities.len(), count as usize);
 }
 
@@ -832,14 +865,14 @@ fn t1_f12_01_monolithic_archetype_traversal() {
     let mut state = MockChunkIterState::new();
     state.add_table(MockTable {
         entity_count: 1_000,
-        entities: (0..1_000).map(|i| FfiEntity::from_bits(i)).collect(),
+        entities: (0..1_000).map(FfiEntity::from_bits).collect(),
         columns: vec![],
     });
 
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
     let mut total = 0;
     loop {
-        let count = unsafe { mock_iter_next_chunk(iter) };
+        let count = unsafe { mock_step_chunk(iter) };
         if count == 0 {
             break;
         }
@@ -854,15 +887,15 @@ fn t1_f12_02_fragmented_4_way_archetype() {
     for _ in 0..4 {
         state.add_table(MockTable {
             entity_count: 250,
-            entities: (0..250).map(|i| FfiEntity::from_bits(i)).collect(),
+            entities: (0..250).map(FfiEntity::from_bits).collect(),
             columns: vec![],
         });
     }
 
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
     let mut total = 0;
     loop {
-        let count = unsafe { mock_iter_next_chunk(iter) };
+        let count = unsafe { mock_step_chunk(iter) };
         if count == 0 {
             break;
         }
@@ -877,15 +910,15 @@ fn t1_f12_03_fragmented_16_way_archetype() {
     for _ in 0..16 {
         state.add_table(MockTable {
             entity_count: 100,
-            entities: (0..100).map(|i| FfiEntity::from_bits(i)).collect(),
+            entities: (0..100).map(FfiEntity::from_bits).collect(),
             columns: vec![],
         });
     }
 
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
     let mut total = 0;
     loop {
-        let count = unsafe { mock_iter_next_chunk(iter) };
+        let count = unsafe { mock_step_chunk(iter) };
         if count == 0 {
             break;
         }
@@ -913,13 +946,13 @@ fn t1_f12_04_interspersed_empty_tables() {
         columns: vec![],
     });
 
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
-    let c1 = unsafe { mock_iter_next_chunk(iter) };
-    let c2 = unsafe { mock_iter_next_chunk(iter) };
-    let c3 = unsafe { mock_iter_next_chunk(iter) };
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
+    let c1 = unsafe { mock_step_chunk(iter) };
+    let c2 = unsafe { mock_step_chunk(iter) };
+    let c3 = unsafe { mock_step_chunk(iter) };
     assert_eq!(c1, 50);
-    assert_eq!(c2, 0);
-    assert_eq!(c3, 50);
+    assert_eq!(c2, 50);
+    assert_eq!(c3, 0);
 }
 
 #[test]
@@ -980,9 +1013,10 @@ fn t1_f13_05_metric_aggregation() {
 #[test]
 fn t1_f14_01_alignment_1_byte() {
     assert_eq!(core::mem::align_of::<AlignByte>(), 1);
+    assert_eq!(AlignByte::align(), 1);
     let item = AlignByte { val: 42 };
-    let ptr = &item as *const AlignByte as usize;
-    assert_eq!(ptr % 1, 0);
+    let ptr = &item as *const AlignByte;
+    assert!(ptr.is_aligned());
 }
 
 #[test]
@@ -1029,17 +1063,17 @@ fn t1_f15_01_empty_table_returns_zero() {
         entities: vec![],
         columns: vec![],
     });
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
-    let count = unsafe { mock_iter_next_chunk(iter) };
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
+    let count = unsafe { mock_step_chunk(iter) };
     assert_eq!(count, 0);
 }
 
 #[test]
 fn t1_f15_02_exhausted_iterator_stays_zero() {
     let mut state = MockChunkIterState::new();
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
-    assert_eq!(unsafe { mock_iter_next_chunk(iter) }, 0);
-    assert_eq!(unsafe { mock_iter_next_chunk(iter) }, 0);
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
+    assert_eq!(unsafe { mock_step_chunk(iter) }, 0);
+    assert_eq!(unsafe { mock_step_chunk(iter) }, 0);
 }
 
 #[test]
@@ -1050,9 +1084,9 @@ fn t1_f15_03_single_entity_chunk() {
         entities: vec![FfiEntity::from_bits(99)],
         columns: vec![],
     });
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
-    assert_eq!(unsafe { mock_iter_next_chunk(iter) }, 1);
-    assert_eq!(unsafe { mock_iter_next_chunk(iter) }, 0);
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
+    assert_eq!(unsafe { mock_step_chunk(iter) }, 1);
+    assert_eq!(unsafe { mock_step_chunk(iter) }, 0);
 }
 
 #[test]
@@ -1063,9 +1097,9 @@ fn t1_f15_04_out_of_bounds_column_index() {
         entities: vec![],
         columns: vec![],
     });
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
     unsafe {
-        mock_iter_next_chunk(iter);
+        mock_step_chunk(iter);
         let ptr = mock_iter_column_readonly(iter, 999);
         assert!(ptr.is_null());
     }
@@ -1079,9 +1113,9 @@ fn t1_f15_05_column_stride_out_of_bounds() {
         entities: vec![],
         columns: vec![],
     });
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
     unsafe {
-        mock_iter_next_chunk(iter);
+        mock_step_chunk(iter);
         let stride = mock_iter_column_stride(iter, 999);
         assert_eq!(stride, 0);
     }
@@ -1098,29 +1132,29 @@ fn t1_f16_01_ffi_result_ok() {
 
 #[test]
 fn t1_f16_02_access_mode_read() {
-    assert_eq!(ComponentAccessMode::READ.0, 0);
-    assert!(ComponentAccessMode::READ.is_valid());
-    assert!(!ComponentAccessMode::READ.is_mutable());
+    assert_eq!(AccessMode::READ.0, 0);
+    assert!(AccessMode::READ.is_valid());
+    assert!(!AccessMode::READ.is_mutable());
 }
 
 #[test]
 fn t1_f16_03_access_mode_write() {
-    assert_eq!(ComponentAccessMode::WRITE.0, 1);
-    assert!(ComponentAccessMode::WRITE.is_valid());
-    assert!(ComponentAccessMode::WRITE.is_mutable());
+    assert_eq!(AccessMode::WRITE.0, 1);
+    assert!(AccessMode::WRITE.is_valid());
+    assert!(AccessMode::WRITE.is_mutable());
 }
 
 #[test]
 fn t1_f16_04_access_mode_filter_only() {
-    assert_eq!(ComponentAccessMode::FILTER_ONLY.0, 2);
-    assert!(ComponentAccessMode::FILTER_ONLY.is_valid());
-    assert!(ComponentAccessMode::FILTER_ONLY.is_filter_only());
+    assert_eq!(AccessMode::FILTER_ONLY.0, 2);
+    assert!(AccessMode::FILTER_ONLY.is_valid());
+    assert!(AccessMode::FILTER_ONLY.is_filter_only());
 }
 
 #[test]
-#[allow(deprecated)]
-fn t1_f16_05_ffi_entity_placeholder() {
-    assert_eq!(FfiEntity::PLACEHOLDER.to_bits(), u64::MAX);
+fn t1_f16_05_ffi_entity_null_sentinel() {
+    assert_eq!(FfiEntity::NULL.to_bits(), 0);
+    assert!(FfiEntity::NULL.is_null());
 }
 
 // --- Feature 17: Self-Aliasing String/Vec Overlap Guard ---
@@ -1134,7 +1168,13 @@ fn t1_f17_01_distinct_buffer_setter() {
     let ptr = &mut tag as *mut MetadataTag as *mut c_void;
     let external = "ExternalBuffer";
     unsafe {
-        (vt.set_label)(ptr, external.as_ptr(), external.len());
+        let _ = (vt.set_label.unwrap())(
+            ptr,
+            StrView {
+                ptr: external.as_ptr(),
+                len: external.len(),
+            },
+        );
     }
     assert_eq!(tag.label, "ExternalBuffer");
 }
@@ -1146,9 +1186,15 @@ fn t1_f17_02_self_aliasing_string_pass_own_slice() {
     };
     let vt = MetadataTag::vtable();
     let ptr = &mut tag as *mut MetadataTag as *mut c_void;
-    let slice = unsafe { (vt.get_label)(ptr) };
+    let slice = unsafe { (vt.get_label.unwrap())(ptr) };
     unsafe {
-        (vt.set_label)(ptr, slice.ptr, slice.len);
+        let _ = (vt.set_label.unwrap())(
+            ptr,
+            StrView {
+                ptr: slice.ptr,
+                len: slice.len,
+            },
+        );
     }
     assert_eq!(tag.label, "HelloWorld");
 }
@@ -1160,9 +1206,15 @@ fn t1_f17_03_self_aliasing_string_subslice() {
     };
     let vt = MetadataTag::vtable();
     let ptr = &mut tag as *mut MetadataTag as *mut c_void;
-    let slice = unsafe { (vt.get_label)(ptr) };
+    let slice = unsafe { (vt.get_label.unwrap())(ptr) };
     unsafe {
-        (vt.set_label)(ptr, slice.ptr, 6);
+        let _ = (vt.set_label.unwrap())(
+            ptr,
+            StrView {
+                ptr: slice.ptr,
+                len: 6,
+            },
+        );
     }
     assert_eq!(tag.label, "Prefix");
 }
@@ -1174,9 +1226,15 @@ fn t1_f17_04_self_aliasing_vec_pass_own_slice() {
     };
     let vt = BufferScores::vtable();
     let ptr = &mut buf as *mut BufferScores as *mut c_void;
-    let slice = unsafe { (vt.get_scores)(ptr) };
+    let slice = unsafe { (vt.get_scores.unwrap())(ptr) };
     unsafe {
-        (vt.set_scores)(ptr, slice.ptr, slice.len);
+        let _ = (vt.set_scores.unwrap())(
+            ptr,
+            FfiSlice {
+                ptr: slice.ptr,
+                len: slice.len,
+            },
+        );
     }
     assert_eq!(buf.scores, vec![10, 20, 30]);
 }
@@ -1188,9 +1246,15 @@ fn t1_f17_05_self_aliasing_vec_subslice() {
     };
     let vt = BufferScores::vtable();
     let ptr = &mut buf as *mut BufferScores as *mut c_void;
-    let slice = unsafe { (vt.get_scores)(ptr) };
+    let slice = unsafe { (vt.get_scores.unwrap())(ptr) };
     unsafe {
-        (vt.set_scores)(ptr, slice.ptr, 2);
+        let _ = (vt.set_scores.unwrap())(
+            ptr,
+            FfiSlice {
+                ptr: slice.ptr,
+                len: 2,
+            },
+        );
     }
     assert_eq!(buf.scores, vec![10, 20]);
 }
@@ -1199,42 +1263,36 @@ fn t1_f17_05_self_aliasing_vec_subslice() {
 
 #[test]
 fn t1_f18_01_disjoint_systems_no_conflict() {
-    let pos_name = KinematicsPos::COMPONENT_CSTR.as_ptr();
-    let vel_name = KinematicsVel::COMPONENT_CSTR.as_ptr();
-    let sys_a = [ComponentAccessDesc::write(pos_name)];
-    let sys_b = [ComponentAccessDesc::write(vel_name)];
+    let sys_a = [BamTermDesc::write(POS_HANDLE)];
+    let sys_b = [BamTermDesc::write(VEL_HANDLE)];
     assert!(!check_borrow_conflict(&sys_a, &sys_b));
 }
 
 #[test]
 fn t1_f18_02_read_read_no_conflict() {
-    let pos_name = KinematicsPos::COMPONENT_CSTR.as_ptr();
-    let sys_a = [ComponentAccessDesc::read(pos_name)];
-    let sys_b = [ComponentAccessDesc::read(pos_name)];
+    let sys_a = [BamTermDesc::read(POS_HANDLE)];
+    let sys_b = [BamTermDesc::read(POS_HANDLE)];
     assert!(!check_borrow_conflict(&sys_a, &sys_b));
 }
 
 #[test]
 fn t1_f18_03_read_write_conflict() {
-    let pos_name = KinematicsPos::COMPONENT_CSTR.as_ptr();
-    let sys_a = [ComponentAccessDesc::read(pos_name)];
-    let sys_b = [ComponentAccessDesc::write(pos_name)];
+    let sys_a = [BamTermDesc::read(POS_HANDLE)];
+    let sys_b = [BamTermDesc::write(POS_HANDLE)];
     assert!(check_borrow_conflict(&sys_a, &sys_b));
 }
 
 #[test]
 fn t1_f18_04_write_write_conflict() {
-    let pos_name = KinematicsPos::COMPONENT_CSTR.as_ptr();
-    let sys_a = [ComponentAccessDesc::write(pos_name)];
-    let sys_b = [ComponentAccessDesc::write(pos_name)];
+    let sys_a = [BamTermDesc::write(POS_HANDLE)];
+    let sys_b = [BamTermDesc::write(POS_HANDLE)];
     assert!(check_borrow_conflict(&sys_a, &sys_b));
 }
 
 #[test]
 fn t1_f18_05_filter_only_no_conflict_with_write() {
-    let pos_name = KinematicsPos::COMPONENT_CSTR.as_ptr();
-    let sys_a = [ComponentAccessDesc::filter_only(pos_name)];
-    let sys_b = [ComponentAccessDesc::write(pos_name)];
+    let sys_a = [BamTermDesc::filter_only(POS_HANDLE)];
+    let sys_b = [BamTermDesc::write(POS_HANDLE)];
     assert!(!check_borrow_conflict(&sys_a, &sys_b));
 }
 
@@ -1254,9 +1312,9 @@ fn t1_f19_01_read_column_readonly_allowed() {
             changed_flags: vec![false],
         }],
     });
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
     unsafe {
-        mock_iter_next_chunk(iter);
+        mock_step_chunk(iter);
         let ptr = mock_iter_column_readonly(iter, 0);
         assert!(!ptr.is_null());
     }
@@ -1276,9 +1334,9 @@ fn t1_f19_02_read_column_mutable_forbidden() {
             changed_flags: vec![false],
         }],
     });
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
     unsafe {
-        mock_iter_next_chunk(iter);
+        mock_step_chunk(iter);
         let ptr = mock_iter_column_mutable(iter, 0);
         assert!(ptr.is_null());
     }
@@ -1298,9 +1356,9 @@ fn t1_f19_03_write_column_mutable_allowed() {
             changed_flags: vec![false],
         }],
     });
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
     unsafe {
-        mock_iter_next_chunk(iter);
+        mock_step_chunk(iter);
         let ptr = mock_iter_column_mutable(iter, 0);
         assert!(!ptr.is_null());
     }
@@ -1320,9 +1378,9 @@ fn t1_f19_04_mark_changed_on_readonly_denied() {
             changed_flags: vec![false],
         }],
     });
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
     unsafe {
-        mock_iter_next_chunk(iter);
+        mock_step_chunk(iter);
         let res = mock_iter_mark_changed(iter, 0, 0);
         assert_eq!(res, FfiResult::PERMISSION_DENIED);
     }
@@ -1342,9 +1400,9 @@ fn t1_f19_05_mark_changed_on_mutable_ok() {
             changed_flags: vec![false],
         }],
     });
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
     unsafe {
-        mock_iter_next_chunk(iter);
+        mock_step_chunk(iter);
         let res = mock_iter_mark_changed(iter, 0, 0);
         assert_eq!(res, FfiResult::OK);
         assert!(state.tables[0].columns[0].changed_flags[0]);
@@ -1415,7 +1473,15 @@ fn t1_f21_02_guest_buffer_copied_not_moved() {
     };
     let vt = MetadataTag::vtable();
     let ptr = &mut tag as *mut MetadataTag as *mut c_void;
-    let _ = unsafe { (vt.set_label)(ptr, foreign_buf.as_ptr(), foreign_buf.len()) };
+    let _ = unsafe {
+        (vt.set_label.unwrap())(
+            ptr,
+            StrView {
+                ptr: foreign_buf.as_ptr(),
+                len: foreign_buf.len(),
+            },
+        )
+    };
     assert_eq!(tag.label, "ForeignBytes");
     // Original buffer is untouched and valid
     assert_eq!(foreign_buf, b"ForeignBytes");
@@ -1428,7 +1494,7 @@ fn t1_f21_03_vec_slice_borrows_host_storage() {
     };
     let vt = BufferScores::vtable();
     let ptr = &buf as *const BufferScores as *const c_void;
-    let slice = unsafe { (vt.get_scores)(ptr) };
+    let slice = unsafe { (vt.get_scores.unwrap())(ptr) };
     assert_eq!(slice.ptr, buf.scores.as_ptr());
 }
 
@@ -1439,7 +1505,7 @@ fn t1_f21_04_string_slice_borrows_host_storage() {
     };
     let vt = MetadataTag::vtable();
     let ptr = &tag as *const MetadataTag as *const c_void;
-    let slice = unsafe { (vt.get_label)(ptr) };
+    let slice = unsafe { (vt.get_label.unwrap())(ptr) };
     assert_eq!(slice.ptr, tag.label.as_ptr());
 }
 
@@ -1456,24 +1522,33 @@ fn t1_f21_05_host_heap_expansion_independent() {
 
 #[test]
 fn t1_f22_01_shutdown_hook_signature() {
-    unsafe extern "C" fn mock_shutdown(_ctx: *mut c_void) -> FfiResult {
-        FfiResult::OK
+    static SHUTDOWN_RAN: AtomicBool = AtomicBool::new(false);
+    unsafe extern "C" fn mock_shutdown(_instance: *mut BamInstance) {
+        SHUTDOWN_RAN.store(true, Ordering::SeqCst);
     }
-    let res = unsafe { mock_shutdown(core::ptr::null_mut()) };
-    assert_eq!(res, FfiResult::OK);
+    unsafe { mock_shutdown(core::ptr::null_mut()) };
+    assert!(SHUTDOWN_RAN.load(Ordering::SeqCst));
 }
 
 #[test]
 fn t1_f22_02_init_hook_signature() {
     unsafe extern "C" fn mock_init(
-        _resolver: bevy_abi_mod_sys::GetProcAddressFn,
-        _api: *const HostApi,
-        _ctx: *mut c_void,
+        api: *const BamHostApi,
+        _load_ctx: *mut BamLoadCtx,
+        instance_out: *mut *mut BamInstance,
     ) -> FfiResult {
+        if api.is_null() || instance_out.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        unsafe {
+            *instance_out = core::ptr::null_mut();
+        }
         FfiResult::OK
     }
-    let res = unsafe { mock_init(test_symbol_resolver, &MOCK_HOST_API, core::ptr::null_mut()) };
+    let mut instance: *mut BamInstance = core::ptr::null_mut();
+    let res = unsafe { mock_init(&MOCK_HOST_API, core::ptr::null_mut(), &mut instance) };
     assert_eq!(res, FfiResult::OK);
+    assert!(instance.is_null());
 }
 
 #[test]
@@ -1495,12 +1570,11 @@ fn t1_f22_03_teardown_cleans_resources() {
 fn t1_f22_04_mod_host_empty_drop() {
     let host = bevy_abi_mod_host::ModHost::new();
     drop(host);
-    // Dropping empty ModHost completes cleanly
 }
 
 #[test]
 fn t1_f22_05_abi_version_handshake() {
-    assert_eq!(ABI_VERSION_PACKED, 0x00_01_00_00);
+    assert_eq!(ABI_VERSION, 0x0002_0000);
 }
 
 // --- Feature 23: Mod Hot-Reloading ---
@@ -1510,13 +1584,11 @@ fn t1_f23_01_state_preservation_across_reload() {
     let mut world_state = HashMap::<u64, i32>::new();
     world_state.insert(1, 100);
 
-    // Simulate Mod v1 logic
     if let Some(val) = world_state.get_mut(&1) {
         *val += 10;
     }
     assert_eq!(*world_state.get(&1).unwrap(), 110);
 
-    // Simulate Mod v2 reload and execution
     if let Some(val) = world_state.get_mut(&1) {
         *val += 20;
     }
@@ -1526,56 +1598,32 @@ fn t1_f23_01_state_preservation_across_reload() {
 #[test]
 fn t1_f23_02_system_callback_swap() {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
-    unsafe extern "C" fn cb_v1(
-        _iter: *mut RawChunkIter,
-        _cmds: *mut RawCommandQueue,
-        _ud: *mut c_void,
-    ) -> FfiResult {
+    unsafe extern "C" fn cb_v1(_sys_ctx: *mut BamSystemCtx, _ud: *mut c_void) -> FfiResult {
         COUNTER.fetch_add(1, Ordering::SeqCst);
         FfiResult::OK
     }
 
-    unsafe extern "C" fn cb_v2(
-        _iter: *mut RawChunkIter,
-        _cmds: *mut RawCommandQueue,
-        _ud: *mut c_void,
-    ) -> FfiResult {
+    unsafe extern "C" fn cb_v2(_sys_ctx: *mut BamSystemCtx, _ud: *mut c_void) -> FfiResult {
         COUNTER.fetch_add(10, Ordering::SeqCst);
         FfiResult::OK
     }
 
-    let mut current_cb: DynamicSystemCallback = cb_v1;
-    let _ = unsafe {
-        current_cb(
-            core::ptr::null_mut(),
-            core::ptr::null_mut(),
-            core::ptr::null_mut(),
-        )
-    };
+    let mut current_cb: BamSystemFn = cb_v1;
+    let _ = unsafe { current_cb(core::ptr::null_mut(), core::ptr::null_mut()) };
     assert_eq!(COUNTER.load(Ordering::SeqCst), 1);
 
-    // Swap to v2
     current_cb = cb_v2;
-    let _ = unsafe {
-        current_cb(
-            core::ptr::null_mut(),
-            core::ptr::null_mut(),
-            core::ptr::null_mut(),
-        )
-    };
+    let _ = unsafe { current_cb(core::ptr::null_mut(), core::ptr::null_mut()) };
     assert_eq!(COUNTER.load(Ordering::SeqCst), 11);
 }
 
 #[test]
 fn t1_f23_03_query_descriptor_update() {
-    let name_pos = KinematicsPos::COMPONENT_CSTR.as_ptr();
-    let name_vel = KinematicsVel::COMPONENT_CSTR.as_ptr();
+    let desc_v1 = [BamTermDesc::read(POS_HANDLE)];
+    let desc_v2 = [BamTermDesc::write(VEL_HANDLE)];
 
-    let desc_v1 = [ComponentAccessDesc::read(name_pos)];
-    let desc_v2 = [ComponentAccessDesc::write(name_vel)];
-
-    assert_eq!(desc_v1[0].mode, ComponentAccessMode::READ);
-    assert_eq!(desc_v2[0].mode, ComponentAccessMode::WRITE);
+    assert_eq!(desc_v1[0].mode, AccessMode::READ);
+    assert_eq!(desc_v2[0].mode, AccessMode::WRITE);
 }
 
 #[test]
@@ -1590,7 +1638,7 @@ fn t1_f23_04_hot_reload_idempotent_tick() {
 #[test]
 fn t1_f23_05_reloaded_mod_can_access_vtables() {
     let vt = KinematicsPos::vtable();
-    assert_eq!(vt.size, core::mem::size_of::<KinematicsPos>());
+    assert_eq!(vt.header.size, core::mem::size_of::<KinematicsPos>());
 }
 
 // --- Feature 24: Repeated Registration Stress Cycle ---
@@ -1631,14 +1679,13 @@ fn t1_f24_03_state_stability_across_50_cycles() {
 fn t1_f24_04_no_resource_accumulation() {
     let initial_alloc = Vec::<u8>::with_capacity(100);
     drop(initial_alloc);
-    // Verifies capacity clean drop
 }
 
 #[test]
 fn t1_f24_05_repeated_uuid_resolution() {
     for _ in 0..50 {
-        let u = ComponentUuid::from_name("KinematicsPos");
-        assert_eq!(u, KinematicsPos::UUID);
+        let u = ComponentUuid::from_canonical_name("e2e_harness::MetadataTag");
+        assert_eq!(u, MetadataTag::UUID);
     }
 }
 
@@ -1662,12 +1709,12 @@ fn t1_f25_02_mock_chunk_step_zero_alloc() {
     let mut state = MockChunkIterState::new();
     state.add_table(MockTable {
         entity_count: 10,
-        entities: (0..10).map(|i| FfiEntity::from_bits(i)).collect(),
+        entities: (1..=10).map(FfiEntity::from_bits).collect(),
         columns: vec![],
     });
 
-    let iter = &mut state as *mut MockChunkIterState as *mut RawChunkIter;
-    let count = unsafe { mock_iter_next_chunk(iter) };
+    let iter = &mut state as *mut MockChunkIterState as *mut BamIter;
+    let count = unsafe { mock_step_chunk(iter) };
     assert_eq!(count, 10);
 }
 
@@ -1681,7 +1728,7 @@ fn t1_f25_03_vtable_direct_call_zero_alloc() {
     };
     let ptr = &mut p as *mut KinematicsPos as *mut c_void;
     unsafe {
-        (vt.set_x)(ptr, 10.0);
+        assert_eq!((vt.set_x.unwrap())(ptr, 10.0), FfiResult::OK);
     }
     assert_eq!(p.x, 10.0);
 }
@@ -1707,7 +1754,7 @@ fn t1_f25_05_column_stride_calculation_in_place() {
 
 #[test]
 fn t1_f26_01_entities_survive_failed_system() {
-    let entities = vec![1, 2, 3];
+    let entities = [1, 2, 3];
     let _ = std::panic::catch_unwind(|| {
         panic!("simulated system failure");
     });
@@ -1747,13 +1794,4 @@ fn t1_f26_05_reloaded_mod_restores_consistency() {
     let _ = std::panic::catch_unwind(|| panic!("first"));
     let status = true;
     assert!(status);
-}
-
-// Helper dummy callback
-unsafe extern "C" fn dummy_callback(
-    _iter: *mut RawChunkIter,
-    _cmds: *mut RawCommandQueue,
-    _ud: *mut c_void,
-) -> FfiResult {
-    FfiResult::OK
 }

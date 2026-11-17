@@ -11,8 +11,8 @@ else
     LDFLAGS = -shared -fPIC
 endif
 
-# Mandatory C99 compile flags (override prevents environment CFLAGS clobbering)
-override CFLAGS += -std=c99 -Wall -Wextra -Werror -I../../../include -O3
+# Strict ISO C99 compile flags (override prevents environment CFLAGS clobbering)
+override CFLAGS += -std=c99 -Wall -Wextra -Wpedantic -Werror -I../../../include -O3
 
 all: $(TARGET)
 

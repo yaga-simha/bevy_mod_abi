@@ -1,19 +1,12 @@
-#![allow(
-    clippy::undocumented_unsafe_blocks,
-    clippy::ptr_as_ptr,
-    clippy::cast_ptr_alignment,
-    clippy::transmute_ptr_to_ptr,
-    unreachable_pub
-)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(improper_ctypes_definitions)]
-#![allow(clippy::type_complexity)]
+#![allow(clippy::type_complexity, unreachable_pub)]
 
-//! Shared Complex Multi-Archetype Nested Query Benchmark Scenario.
+//! Shared Multi-Archetype Nested Query Benchmark Scenario (`ABI 0.2.0`).
 //!
 //! Compiled as a shared Rust `dylib` so that:
-//! 1. `permutation_bench` (host binary) runs Pure Native Bevy (no-mod) baselines and C-ABI mods.
-//! 2. `coupled_rust_mod` (coupled Rust `dylib` plugin) dynamically links against the exact same
+//! 1. `permutation_bench` (host binary) runs Pure Native Bevy baselines and C-ABI mods.
+//! 2. `coupled_rust_mod` (coupled Rust `dylib` plugin) dynamically links against the same
 //!    `bevy_ecs`, `bevy_app`, and component `TypeId` definitions in memory — modeling unstable
 //!    Rust-ABI dynamic plugins (`bevy_dynamic_plugin` style).
 
@@ -21,143 +14,215 @@ pub use bevy_abi_mod_host;
 pub use bevy_app;
 pub use bevy_ecs;
 
-use bevy_abi_mod_host::ModAppExt;
-use bevy_abi_mod_macros::ModExposable;
+use bevy_abi_mod_host::{ComponentOptions, ModAppExt, ModComponent};
 use bevy_app::App;
 use bevy_ecs::component::Component;
 use bevy_ecs::query::{With, Without};
 use bevy_ecs::system::Query;
 use bevy_ecs::world::World;
 
+/// Fixed simulation timestep in seconds.
 pub const SIM_DT: f32 = 0.016_f32;
 
 // ============================================================================
-// 1. Nested Compound Structs & ECS Components (`#[derive(ModExposable)]`)
+// 1. Nested Compound Structs & ECS Components (`#[derive(ModComponent)]`)
 // ============================================================================
 
-/// Nested 3D vector exposed via interior pointers (`<Struct>_ptr_<field>`) and `Vec3fVTable`.
-#[derive(Debug, Clone, Copy, PartialEq, Default, ModExposable)]
+/// Nested 3D vector exposed via interior pointers (`ptr_<field>`) and `Vec3fVTable`.
+#[derive(Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+#[mod_component(namespace = "shared_scenario")]
 pub struct Vec3f {
+    /// X component.
     pub x: f32,
+    /// Y component.
     pub y: f32,
+    /// Z component.
     pub z: f32,
 }
 
-/// 3D spatial transform containing TWO nested `Vec3f` structs (`position` and `forward`).
-#[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+/// 3D spatial transform containing two nested `Vec3f` structs (`position` and `forward`).
+#[derive(Component, Debug, Clone, Copy, PartialEq, ModComponent)]
+#[mod_component(namespace = "shared_scenario")]
 pub struct Transform3D {
+    /// World-space position.
     pub position: Vec3f,
+    /// Normalized forward direction.
     pub forward: Vec3f,
+    /// Uniform scale factor.
     pub scale: f32,
 }
 
 /// Linear kinematics containing a nested `Vec3f` velocity, drag coefficient, and speed cap.
-#[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, ModComponent)]
+#[mod_component(namespace = "shared_scenario")]
 pub struct Kinematics {
+    /// Linear velocity vector.
     pub velocity: Vec3f,
+    /// Linear drag coefficient.
     pub drag: f32,
+    /// Maximum speed cap.
     pub max_speed: f32,
 }
 
 /// Multi-pool combat vitality state mutated by friendly/hostile aura interactions.
-#[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, ModComponent)]
+#[mod_component(namespace = "shared_scenario")]
 pub struct Vitality {
+    /// Current health pool.
     pub health: f32,
+    /// Maximum health cap.
     pub max_health: f32,
+    /// Regenerative shield pool.
     pub shield: f32,
+    /// Auxiliary energy pool.
     pub energy: f32,
 }
 
-/// Damage/impulse mitigation resistances.
-#[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+/// Damage and impulse mitigation resistances.
+#[derive(Component, Debug, Clone, Copy, PartialEq, ModComponent)]
+#[mod_component(namespace = "shared_scenario")]
 pub struct Resistance {
+    /// Kinetic impulse mitigation factor.
     pub kinetic: f32,
+    /// Thermal damage mitigation factor.
     pub thermal: f32,
+    /// Ionic drain/heal modifier.
     pub ionic: f32,
 }
 
 /// Spatial field emitter parameters read by the inner nested query.
-#[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, ModComponent)]
+#[mod_component(namespace = "shared_scenario")]
 pub struct AuraEmitter {
+    /// Effective field radius.
     pub radius: f32,
+    /// Radial/directional force strength.
     pub force: f32,
+    /// Hostile thermal damage per second.
     pub thermal_dps: f32,
+    /// Friendly heal rate per second.
     pub heal_hps: f32,
+    /// Quadratic distance falloff coefficient.
     pub falloff: f32,
 }
 
 /// Faction alignment (`team_id`) and deterministic entity serial ID (`serial_id`).
-#[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, ModComponent)]
+#[mod_component(namespace = "shared_scenario")]
 pub struct Faction {
+    /// Team identifier.
     pub team_id: u32,
+    /// Deterministic entity serial number for oracle sorting.
     pub serial_id: u32,
 }
 
 // --- Archetype Filter & Fragmentation Components ---
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+/// Marker payload identifying active aura emitter entities.
+#[derive(Component, Debug, Clone, Copy, PartialEq, ModComponent)]
+#[mod_component(namespace = "shared_scenario")]
 pub struct EmitterBeaconTag {
+    /// Broadcast channel index.
     pub channel: u32,
 }
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+/// Marker payload identifying active combat unit entities.
+#[derive(Component, Debug, Clone, Copy, PartialEq, ModComponent)]
+#[mod_component(namespace = "shared_scenario")]
 pub struct CombatUnitTag {
+    /// Unit class identifier.
     pub unit_class: u32,
 }
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+/// Stasis marker excluding frozen entities via `Without<FrozenFlag>`.
+#[derive(Component, Debug, Clone, Copy, PartialEq, ModComponent)]
+#[mod_component(namespace = "shared_scenario")]
 pub struct FrozenFlag {
+    /// Remaining stasis ticks.
     pub remaining_ticks: u32,
 }
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+/// Optional archetype fragmentation payload: armor plating.
+#[derive(Component, Debug, Clone, Copy, PartialEq, ModComponent)]
+#[mod_component(namespace = "shared_scenario")]
 pub struct ArmorPlating {
+    /// Plating thickness.
     pub thickness: f32,
 }
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+/// Optional archetype fragmentation payload: jetpack module.
+#[derive(Component, Debug, Clone, Copy, PartialEq, ModComponent)]
+#[mod_component(namespace = "shared_scenario")]
 pub struct JetpackModule {
+    /// Remaining fuel.
     pub fuel: f32,
 }
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+/// Optional archetype fragmentation payload: psionic ward.
+#[derive(Component, Debug, Clone, Copy, PartialEq, ModComponent)]
+#[mod_component(namespace = "shared_scenario")]
 pub struct PsionicWard {
+    /// Ward resonance strength.
     pub resonance: f32,
 }
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+/// Optional archetype fragmentation payload: squad banner.
+#[derive(Component, Debug, Clone, Copy, PartialEq, ModComponent)]
+#[mod_component(namespace = "shared_scenario")]
 pub struct SquadBanner {
+    /// Assigned squad identifier.
     pub squad_id: u32,
 }
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
+/// Optional archetype fragmentation payload: stealth cloak.
+#[derive(Component, Debug, Clone, Copy, PartialEq, ModComponent)]
+#[mod_component(namespace = "shared_scenario")]
 pub struct StealthCloak {
+    /// Cloak opacity.
     pub opacity: f32,
 }
 
-#[derive(Component, Debug, Clone, PartialEq, ModExposable)]
+/// Heap-owning string label component exercising non-POD VTable registration.
+#[derive(Component, Debug, Clone, PartialEq, ModComponent)]
+#[mod_component(namespace = "shared_scenario")]
 pub struct TelemetryTag {
+    /// Human-readable telemetry tag string.
     pub label: String,
 }
 
 /// Registers all 15 components and the nested `Vec3f` compound type into `App` and `ModRegistry`.
 pub fn register_all_scenario_components(app: &mut App) {
     app.register_mod_type::<Vec3f>();
-    app.register_mod_component::<Transform3D>();
-    app.register_mod_component::<Kinematics>();
-    app.register_mod_component::<Vitality>();
-    app.register_mod_component::<Resistance>();
-    app.register_mod_component::<AuraEmitter>();
-    app.register_mod_component::<Faction>();
-    app.register_mod_component::<EmitterBeaconTag>();
-    app.register_mod_component::<CombatUnitTag>();
-    app.register_mod_component::<FrozenFlag>();
-    app.register_mod_component::<ArmorPlating>();
-    app.register_mod_component::<JetpackModule>();
-    app.register_mod_component::<PsionicWard>();
-    app.register_mod_component::<SquadBanner>();
-    app.register_mod_component::<StealthCloak>();
-    app.register_mod_component::<TelemetryTag>();
+    app.register_mod_component::<Transform3D>(ComponentOptions::new())
+        .expect("register Transform3D");
+    app.register_mod_component::<Kinematics>(ComponentOptions::new())
+        .expect("register Kinematics");
+    app.register_mod_component::<Vitality>(ComponentOptions::new())
+        .expect("register Vitality");
+    app.register_mod_component::<Resistance>(ComponentOptions::new())
+        .expect("register Resistance");
+    app.register_mod_component::<AuraEmitter>(ComponentOptions::new())
+        .expect("register AuraEmitter");
+    app.register_mod_component::<Faction>(ComponentOptions::new())
+        .expect("register Faction");
+    app.register_mod_component::<EmitterBeaconTag>(ComponentOptions::new())
+        .expect("register EmitterBeaconTag");
+    app.register_mod_component::<CombatUnitTag>(ComponentOptions::new())
+        .expect("register CombatUnitTag");
+    app.register_mod_component::<FrozenFlag>(ComponentOptions::new())
+        .expect("register FrozenFlag");
+    app.register_mod_component::<ArmorPlating>(ComponentOptions::new())
+        .expect("register ArmorPlating");
+    app.register_mod_component::<JetpackModule>(ComponentOptions::new())
+        .expect("register JetpackModule");
+    app.register_mod_component::<PsionicWard>(ComponentOptions::new())
+        .expect("register PsionicWard");
+    app.register_mod_component::<SquadBanner>(ComponentOptions::new())
+        .expect("register SquadBanner");
+    app.register_mod_component::<StealthCloak>(ComponentOptions::new())
+        .expect("register StealthCloak");
+    app.register_mod_component::<TelemetryTag>(ComponentOptions::new())
+        .expect("register TelemetryTag");
 }
 
 /// Registers all 15 components directly on a pure-Bevy `World` (no `AbiModPlugin` / `ModRegistry`).
@@ -183,6 +248,7 @@ pub fn register_pure_native_components(world: &mut World) {
 // 2. Deterministic 34-Archetype World Population
 // ============================================================================
 
+/// Population scale parameters for the 34-archetype benchmark world.
 #[derive(Clone, Copy, Debug)]
 pub struct ScenarioConfig {
     /// Entities per each of the 16 active CombatUnit archetypes.
@@ -204,7 +270,7 @@ impl ScenarioConfig {
     }
 
     /// Standard cross-target matrix scale: 1,024 active units × 48 active emitters = 49,152 pairs/tick
-    /// across 34 distinct Bevy Archetype Tables (fast enough for Debug+Debug, rich enough for sub-percent precision).
+    /// across 34 distinct Bevy Archetype Tables.
     pub const fn standard() -> Self {
         Self {
             units_per_archetype: 64,
@@ -222,28 +288,40 @@ impl ScenarioConfig {
         }
     }
 
+    /// Total active combat units across all 16 unit archetypes.
     pub const fn active_units(&self) -> usize {
         self.units_per_archetype * 16
     }
 
+    /// Total active aura emitters across all 6 emitter archetypes.
     pub const fn active_emitters(&self) -> usize {
         self.emitters_per_archetype * 6
     }
 
+    /// Total unit-emitter pair evaluations per tick.
     pub const fn pair_evaluations_per_frame(&self) -> usize {
         self.active_units() * self.active_emitters()
     }
 }
 
+/// Summary statistics returned after populating a benchmark `World`.
 #[derive(Clone, Copy, Debug)]
 pub struct ScenarioWorldStats {
+    /// Number of active combat units.
     pub active_units: usize,
+    /// Number of active aura emitters.
     pub active_emitters: usize,
+    /// Number of decoy or frozen entities excluded by filters.
     pub excluded_entities: usize,
+    /// Total spawned entities.
     pub total_entities: usize,
+    /// Total archetype count in the Bevy `World`.
     pub total_archetypes: usize,
+    /// Number of active unit archetypes (`16`).
     pub active_unit_archetypes: usize,
+    /// Number of active emitter archetypes (`6`).
     pub active_emitter_archetypes: usize,
+    /// Total pair evaluations per frame (`active_units * active_emitters`).
     pub pair_evaluations_per_frame: usize,
 }
 
@@ -258,7 +336,6 @@ fn make_unit_base(
     CombatUnitTag,
 ) {
     let s = serial as f32;
-    // Deterministic Golden-angle spiral distribution inside [-45, 45]^3 arena
     let px = ((s * 0.618_034).fract() * 90.0) - 45.0;
     let py = ((s * 0.381_966).fract() * 40.0) - 20.0;
     let pz = ((s * 0.754_877).fract() * 90.0) - 45.0;
@@ -313,7 +390,6 @@ fn make_emitter_base(serial: u32) -> (Transform3D, AuraEmitter, Faction, Emitter
     let ey = ((s * 0.732_050).fract() * 30.0) - 15.0;
     let ez = ((s * 0.236_067).fract() * 80.0) - 40.0;
 
-    // Normalized forward vector
     let fx_raw = (serial % 5) as f32 - 2.0;
     let fy_raw = 0.5_f32;
     let fz_raw = (serial % 3) as f32 - 1.0;
@@ -359,7 +435,7 @@ fn make_emitter_base(serial: u32) -> (Transform3D, AuraEmitter, Faction, Emitter
 pub fn populate_scenario_world(world: &mut World, cfg: ScenarioConfig) -> ScenarioWorldStats {
     let mut unit_serial: u32 = 0;
 
-    // 1. 16 Active Unit Archetypes (bitmask 0..16 over 4 optional payload components)
+    // 1. 16 Active Unit Archetypes
     for mask in 0..16_u32 {
         for _ in 0..cfg.units_per_archetype {
             let base = make_unit_base(unit_serial);
@@ -414,11 +490,10 @@ pub fn populate_scenario_world(world: &mut World, cfg: ScenarioConfig) -> Scenar
         }
     }
 
-    // 3. 12 Excluded / Frozen / Decoy Archetypes (must never be mutated or read as active!)
+    // 3. 12 Excluded / Frozen / Decoy Archetypes
     let mut excluded_count = 0_usize;
     let mut decoy_serial = 500_000_u32;
 
-    // 3a. 2 Frozen Emitter archetypes (`FrozenFlag` present -> excluded by `Without<FrozenFlag>`)
     for arch in 0..2_u32 {
         for _ in 0..cfg.decoys_per_archetype {
             let base = make_emitter_base(decoy_serial);
@@ -431,7 +506,6 @@ pub fn populate_scenario_world(world: &mut World, cfg: ScenarioConfig) -> Scenar
         }
     }
 
-    // 3b. 2 Frozen Unit archetypes (`FrozenFlag` present -> excluded by `Without<FrozenFlag>`)
     for arch in 0..2_u32 {
         for _ in 0..cfg.decoys_per_archetype {
             let base = make_unit_base(decoy_serial);
@@ -444,7 +518,6 @@ pub fn populate_scenario_world(world: &mut World, cfg: ScenarioConfig) -> Scenar
         }
     }
 
-    // 3c. 2 Incomplete Unit archetypes (missing `Resistance` -> excluded by Outer Query)
     for arch in 0..2_u32 {
         for _ in 0..cfg.decoys_per_archetype {
             let (tf, kin, vit, _res, fac, tag) = make_unit_base(decoy_serial);
@@ -457,7 +530,6 @@ pub fn populate_scenario_world(world: &mut World, cfg: ScenarioConfig) -> Scenar
         }
     }
 
-    // 3d. 6 Decoy Scenery / Particle / Trigger archetypes (missing `CombatUnitTag` & `EmitterBeaconTag`)
     for arch in 0..6_u32 {
         for _ in 0..cfg.decoys_per_archetype {
             let (tf, kin, vit, _res, fac, _tag) = make_unit_base(decoy_serial);
@@ -500,7 +572,6 @@ pub fn populate_scenario_world(world: &mut World, cfg: ScenarioConfig) -> Scenar
     let active_units = unit_serial as usize;
     let active_emitters = emitter_serial as usize;
     let total_entities = active_units + active_emitters + excluded_count;
-    // +1 or +2 for Bevy's empty root archetype; total >= 34
     let total_archetypes = world.archetypes().len();
 
     ScenarioWorldStats {
@@ -519,7 +590,7 @@ pub fn populate_scenario_world(world: &mut World, cfg: ScenarioConfig) -> Scenar
 // 3. Pure Native Bevy Nested Multi-Archetype System
 // ============================================================================
 
-/// Pure Native Bevy ECS nested multi-archetype system (Direct Idiomatic Entity-Nested `Query`).
+/// Pure Native Bevy ECS nested multi-archetype system (direct entity-nested `Query`).
 ///
 /// Outer query traverses 16 active unit archetypes; inner query traverses 6 active emitter archetypes
 /// per unit, while skipping 12 frozen/incomplete/scenery archetypes.
@@ -610,7 +681,6 @@ pub fn native_nested_aura_combat_system(
             }
         }
 
-        // Integrate drag, speed clamp, position, and orientation
         let damp = 1.0_f32 / (1.0_f32 + u_kin.drag * SIM_DT);
         vx *= damp;
         vy *= damp;
@@ -647,28 +717,38 @@ pub fn native_nested_aura_combat_system(
     }
 }
 
-/// Pure Native Bevy ECS nested multi-archetype system with SoA Emitter Pre-Cache (`Local<Vec<...>>`).
-///
-/// Represents the absolute hardware ceiling of Pure Native Bevy when a Rust gameplay programmer
-/// flattens the 6 fragmented emitter archetypes into an L1-resident contiguous `Local<Vec<CachedEmitter>>`
-/// once per frame before running the 16-archetype outer `Query`.
+/// Flattened emitter record used by [`native_cached_soa_nested_aura_combat_system`].
 #[derive(Clone, Copy)]
 pub struct CachedNativeEmitter {
+    /// Emitter X coordinate.
     pub px: f32,
+    /// Emitter Y coordinate.
     pub py: f32,
+    /// Emitter Z coordinate.
     pub pz: f32,
+    /// Forward X component.
     pub fx: f32,
+    /// Forward Y component.
     pub fy: f32,
+    /// Forward Z component.
     pub fz: f32,
+    /// Effective field radius.
     pub radius: f32,
+    /// Precomputed `radius * radius`.
     pub rad_sq: f32,
+    /// Force magnitude.
     pub force: f32,
+    /// Hostile thermal damage per second.
     pub thermal_dps: f32,
+    /// Friendly heal rate per second.
     pub heal_hps: f32,
+    /// Quadratic distance falloff.
     pub falloff: f32,
+    /// Emitter faction identifier.
     pub team_id: u32,
 }
 
+/// Pure Native Bevy ECS nested multi-archetype system with `Local<Vec<CachedNativeEmitter>>` pre-cache.
 pub fn native_cached_soa_nested_aura_combat_system(
     mut cached_emitters: bevy_ecs::system::Local<Vec<CachedNativeEmitter>>,
     mut units: Query<
@@ -810,27 +890,39 @@ pub fn native_cached_soa_nested_aura_combat_system(
 }
 
 // ============================================================================
-// 4. Mathematical Correctness Oracle (Verifies Every Permutation Matches Native)
+// 4. Mathematical Correctness Oracle
 // ============================================================================
 
+/// Per-unit state snapshot captured for mathematical equivalence verification.
 #[derive(Clone, Debug)]
 pub struct UnitSnapshot {
+    /// Deterministic unit serial identifier.
     pub serial_id: u32,
+    /// World-space `[x, y, z]` position.
     pub pos: [f32; 3],
+    /// Normalized `[x, y, z]` forward vector.
     pub fwd: [f32; 3],
+    /// Linear `[x, y, z]` velocity vector.
     pub vel: [f32; 3],
+    /// Health value.
     pub health: f32,
+    /// Shield value.
     pub shield: f32,
+    /// Energy value.
     pub energy: f32,
 }
 
+/// Complete sorted digest of active units and excluded frozen entities.
 #[derive(Clone, Debug)]
 pub struct OracleDigest {
+    /// Sorted active unit snapshots.
     pub units: Vec<UnitSnapshot>,
+    /// Checksum over `FrozenFlag` entities verifying filter exclusion.
     pub frozen_checksum: f64,
 }
 
 impl OracleDigest {
+    /// Captures an [`OracleDigest`] from `world`.
     pub fn capture(world: &mut World) -> Self {
         let mut unit_query = world
             .query_filtered::<(&Transform3D, &Kinematics, &Vitality, &Faction), (
@@ -854,7 +946,6 @@ impl OracleDigest {
 
         units.sort_by_key(|u| u.serial_id);
 
-        // Also capture checksum of excluded Frozen entities to prove filter soundness
         let mut frozen_query = world.query_filtered::<&Transform3D, With<FrozenFlag>>();
         let mut frozen_checksum = 0.0_f64;
         for tf in frozen_query.iter(world) {
@@ -869,6 +960,7 @@ impl OracleDigest {
         }
     }
 
+    /// Asserts numerical equivalence between `self` (native baseline) and `candidate`.
     pub fn assert_equivalent(&self, candidate: &Self, label: &str) {
         assert_eq!(
             self.units.len(),
@@ -877,7 +969,7 @@ impl OracleDigest {
         );
         assert!(
             (self.frozen_checksum - candidate.frozen_checksum).abs() < 1e-6,
-            "[{label}] FrozenFlag entities were erroneously mutated! expected {}, got {}",
+            "[{label}] FrozenFlag entities were erroneously mutated: expected {}, got {}",
             self.frozen_checksum,
             candidate.frozen_checksum
         );

@@ -1,13 +1,13 @@
 [package]
 name = "example_03_cross_language_interop"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
 
 [dependencies]
-bevy_app = { version = "0.20.1", default-features = false, features = ["std"] }
-bevy_ecs = { version = "0.20.1", default-features = false, features = ["std", "async_executor"] }
+bevy_app = { workspace = true }
+bevy_ecs = { workspace = true }
 bevy_abi_mod = { workspace = true }
 bevy_abi_mod_sys = { workspace = true }
 

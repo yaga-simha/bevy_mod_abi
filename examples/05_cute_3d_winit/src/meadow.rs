@@ -1,6 +1,8 @@
 //! 3D Pastel Slime Meadow simulation environment, entity spawning, and baseline host physics.
 
-use crate::components::{ColorRgba, CuteSpirit, HomeStyle, Position, Scale3D, Velocity};
+use crate::components::{
+    ActiveMod, ColorRgba, CuteSpirit, HomeStyle, ModStatusResource, Position, Scale3D, Velocity,
+};
 use avian3d::prelude::{Collider, CollidingEntities, Friction, LockedAxes, Restitution, RigidBody};
 use avian3d::prelude::{LinearVelocity as AvianVel, Position as AvianPos};
 use bevy_ecs::prelude::Resource;
@@ -150,15 +152,14 @@ const GRID_ORIGIN: f32 = -9.0;
 #[allow(clippy::type_complexity)]
 pub fn host_meadow_post_physics(
     mut clock: ResMut<MeadowClock>,
-    has_active_mod: Option<Res<crate::mod_manager::ModStatusResource>>,
+    has_active_mod: Option<Res<ModStatusResource>>,
     mut query: Query<SlimeQueryItem>,
 ) {
     clock.tick = clock.tick.wrapping_add(1);
     let t = (clock.tick as f32) * DT;
     let has_mod = has_active_mod
         .as_ref()
-        .map(|s| s.active_mod != crate::mod_manager::ActiveMod::None)
-        .unwrap_or(false);
+        .is_some_and(|s| s.active_mod != ActiveMod::None);
 
     let mut slimes_data = Vec::with_capacity(query.iter().count());
 

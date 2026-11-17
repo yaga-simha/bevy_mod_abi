@@ -34,10 +34,9 @@ version = "0.1.0"
 
 [[package]]
 name = "c_abi_rust_mod"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bevy_abi_mod_guest",
- "bevy_abi_mod_sys",
 ]
 
 [[package]]

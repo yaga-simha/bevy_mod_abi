@@ -8,7 +8,6 @@
 )]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(improper_ctypes_definitions)]
-#![allow(clippy::all)]
 
 //! End-to-End Integration Test Binary (`e2e`):
 //! - 4-tier feature, boundary, pairwise, and game-scenario suites

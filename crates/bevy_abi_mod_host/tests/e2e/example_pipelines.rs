@@ -1,33 +1,55 @@
-use crate::support::{Position, Velocity, create_shadow_copy, fixture_dylib};
+use crate::support::fixture_dylib;
 use bevy_abi_mod_host::prelude::*;
-use bevy_abi_mod_macros::ModExposable;
 use bevy_app::{App, PostUpdate};
 use bevy_ecs::component::Component;
 use bevy_ecs::entity::Entity;
 use bevy_ecs::system::Query;
+use core::sync::atomic::{AtomicU64, Ordering};
 use std::fs;
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
 #[repr(C)]
+#[derive(Component, Debug, Clone, Copy, Default, PartialEq, ModComponent)]
+#[mod_component(name = "example::Position")]
+pub struct Position {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+#[repr(C)]
+#[derive(Component, Debug, Clone, Copy, Default, PartialEq, ModComponent)]
+#[mod_component(name = "example::Velocity")]
+pub struct Velocity {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+#[repr(C)]
+#[derive(Component, Debug, Clone, Copy, Default, PartialEq, ModComponent)]
+#[mod_component(name = "example::Health")]
 pub struct Health {
     pub current: f32,
     pub max: f32,
 }
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
 #[repr(C)]
+#[derive(Component, Debug, Clone, Copy, Default, PartialEq, Eq, ModComponent)]
+#[mod_component(name = "example::PlayerTag")]
 pub struct PlayerTag {
     pub id: u32,
 }
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
 #[repr(C)]
+#[derive(Component, Debug, Clone, Copy, Default, PartialEq, Eq, ModComponent)]
+#[mod_component(name = "example::DroneTag")]
 pub struct DroneTag {
     pub squad: u32,
 }
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, ModExposable)]
 #[repr(C)]
+#[derive(Component, Debug, Clone, Copy, Default, PartialEq, ModComponent)]
+#[mod_component(name = "example::ColorRgba")]
 pub struct ColorRgba {
     pub r: f32,
     pub g: f32,
@@ -39,6 +61,13 @@ const ARENA_WIDTH: f32 = 120.0;
 const ARENA_HEIGHT: f32 = 60.0;
 const DT: f32 = 1.0 / 60.0;
 const RESTITUTION: f32 = 0.95;
+
+fn shadow_opts() -> LoadOptions {
+    LoadOptions {
+        shadow_copy: true,
+        ..Default::default()
+    }
+}
 
 fn host_kinematics(mut query: Query<(&mut Position, &mut Velocity)>) {
     for (mut pos, mut vel) in query.iter_mut() {
@@ -69,9 +98,18 @@ fn host_kinematics(mut query: Query<(&mut Position, &mut Velocity)>) {
 fn setup_visual_game_app() -> App {
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
-    app.register_mod_component::<Position>();
-    app.register_mod_component::<Velocity>();
-    app.register_mod_component::<ColorRgba>();
+    app.register_mod_component::<Position>(
+        ComponentOptions::new().with_raw_insert().with_default(),
+    )
+    .unwrap();
+    app.register_mod_component::<Velocity>(
+        ComponentOptions::new().with_raw_insert().with_default(),
+    )
+    .unwrap();
+    app.register_mod_component::<ColorRgba>(
+        ComponentOptions::new().with_raw_insert().with_default(),
+    )
+    .unwrap();
     app.add_systems(PostUpdate, host_kinematics);
     app
 }
@@ -85,7 +123,10 @@ fn test_minimal_handshake_repeated_lifecycle_reload() {
     let dylib = fixture_dylib("minimal_guest_mod");
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
-    app.register_mod_component::<Position>();
+    app.register_mod_component::<Position>(
+        ComponentOptions::new().with_raw_insert().with_default(),
+    )
+    .unwrap();
 
     let mut entities = Vec::new();
     for i in 0..10 {
@@ -104,7 +145,7 @@ fn test_minimal_handshake_repeated_lifecycle_reload() {
 
     for cycle in 1..=15 {
         let mod_id = app
-            .load_mod_tracked(&dylib)
+            .load_mod_with(&dylib, shadow_opts())
             .unwrap_or_else(|e| panic!("Failed to load mod in cycle {cycle}: {e:?}"));
 
         for _ in 0..3 {
@@ -143,9 +184,12 @@ fn test_minimal_handshake_empty_and_large_chunk_iteration() {
     let dylib = fixture_dylib("minimal_guest_mod");
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
-    app.register_mod_component::<Position>();
+    app.register_mod_component::<Position>(
+        ComponentOptions::new().with_raw_insert().with_default(),
+    )
+    .unwrap();
 
-    let mod_id = app.load_mod_tracked(&dylib).expect("load mod");
+    let mod_id = app.load_mod_with(&dylib, shadow_opts()).expect("load mod");
 
     for _ in 0..5 {
         app.update();
@@ -187,11 +231,24 @@ fn test_multi_system_pipeline_deferred_commands_and_attrition() {
     let dylib = fixture_dylib("example_02_guest_mod");
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
-    app.register_mod_component::<Position>();
-    app.register_mod_component::<Velocity>();
-    app.register_mod_component::<Health>();
-    app.register_mod_component::<PlayerTag>();
-    app.register_mod_component::<DroneTag>();
+    app.register_mod_component::<Position>(
+        ComponentOptions::new().with_raw_insert().with_default(),
+    )
+    .unwrap();
+    app.register_mod_component::<Velocity>(
+        ComponentOptions::new().with_raw_insert().with_default(),
+    )
+    .unwrap();
+    app.register_mod_component::<Health>(ComponentOptions::new().with_raw_insert().with_default())
+        .unwrap();
+    app.register_mod_component::<PlayerTag>(
+        ComponentOptions::new().with_raw_insert().with_default(),
+    )
+    .unwrap();
+    app.register_mod_component::<DroneTag>(
+        ComponentOptions::new().with_raw_insert().with_default(),
+    )
+    .unwrap();
 
     let player = app
         .world_mut()
@@ -266,7 +323,9 @@ fn test_multi_system_pipeline_deferred_commands_and_attrition() {
 
     app.update();
 
-    let mod_id = app.load_mod_tracked(&dylib).expect("load example 2 mod");
+    let mod_id = app
+        .load_mod_with(&dylib, shadow_opts())
+        .expect("load example 2 mod");
     app.update();
 
     for (i, &d) in low_hp_drones.iter().enumerate() {
@@ -326,11 +385,24 @@ fn test_multi_system_pipeline_query_filter_isolation() {
     let dylib = fixture_dylib("example_02_guest_mod");
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
-    app.register_mod_component::<Position>();
-    app.register_mod_component::<Velocity>();
-    app.register_mod_component::<Health>();
-    app.register_mod_component::<PlayerTag>();
-    app.register_mod_component::<DroneTag>();
+    app.register_mod_component::<Position>(
+        ComponentOptions::new().with_raw_insert().with_default(),
+    )
+    .unwrap();
+    app.register_mod_component::<Velocity>(
+        ComponentOptions::new().with_raw_insert().with_default(),
+    )
+    .unwrap();
+    app.register_mod_component::<Health>(ComponentOptions::new().with_raw_insert().with_default())
+        .unwrap();
+    app.register_mod_component::<PlayerTag>(
+        ComponentOptions::new().with_raw_insert().with_default(),
+    )
+    .unwrap();
+    app.register_mod_component::<DroneTag>(
+        ComponentOptions::new().with_raw_insert().with_default(),
+    )
+    .unwrap();
 
     let e_player = app
         .world_mut()
@@ -366,7 +438,7 @@ fn test_multi_system_pipeline_query_filter_isolation() {
 
     app.update();
 
-    let mod_id = app.load_mod_tracked(&dylib).expect("load mod");
+    let mod_id = app.load_mod_with(&dylib, shadow_opts()).expect("load mod");
     app.update();
 
     let h_player = *app.world().get::<Health>(e_player).unwrap();
@@ -389,9 +461,18 @@ fn test_cross_language_c99_and_rust_concurrency_and_asymmetric_unload() {
 
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
-    app.register_mod_component::<Position>();
-    app.register_mod_component::<Velocity>();
-    app.register_mod_component::<ColorRgba>();
+    app.register_mod_component::<Position>(
+        ComponentOptions::new().with_raw_insert().with_default(),
+    )
+    .unwrap();
+    app.register_mod_component::<Velocity>(
+        ComponentOptions::new().with_raw_insert().with_default(),
+    )
+    .unwrap();
+    app.register_mod_component::<ColorRgba>(
+        ComponentOptions::new().with_raw_insert().with_default(),
+    )
+    .unwrap();
 
     const DRONE_COUNT: usize = 500;
     let mut drones = Vec::with_capacity(DRONE_COUNT);
@@ -421,10 +502,10 @@ fn test_cross_language_c99_and_rust_concurrency_and_asymmetric_unload() {
     }
 
     let c_mod_id = app
-        .load_mod_tracked(&c_dylib)
+        .load_mod_with(&c_dylib, shadow_opts())
         .expect("Failed to load C99 mod");
     let rust_mod_id = app
-        .load_mod_tracked(&rust_dylib)
+        .load_mod_with(&rust_dylib, shadow_opts())
         .expect("Failed to load Rust mod");
 
     for _ in 0..50 {
@@ -468,7 +549,7 @@ fn test_cross_language_c99_and_rust_concurrency_and_asymmetric_unload() {
 }
 
 // ==============================================================================
-// 4. Visual Game Multi-Mod Switching & Shadow-Copy Oracles (`mod_gravity`, `mod_rainbow`, `mod_vortex`)
+// 4. Visual Game Multi-Mod Switching & Core Shadow-Copy Oracles (`L-03`)
 // ==============================================================================
 
 #[test]
@@ -499,30 +580,29 @@ fn test_visual_game_rapid_mod_cycling_50_cycles() {
     }
 
     for _cycle in 1..=50 {
-        let s_grav = create_shadow_copy(&grav_dylib, "grav");
-        let g_id = app.load_mod_tracked(&s_grav).expect("load gravity");
+        let g_id = app
+            .load_mod_with(&grav_dylib, shadow_opts())
+            .expect("load gravity");
         app.update();
         app.unload_mod(g_id).expect("unload gravity");
-        let _ = fs::remove_file(&s_grav);
 
-        let s_rain = create_shadow_copy(&rain_dylib, "rain");
-        let r_id = app.load_mod_tracked(&s_rain).expect("load rainbow");
+        let r_id = app
+            .load_mod_with(&rain_dylib, shadow_opts())
+            .expect("load rainbow");
         app.update();
         app.unload_mod(r_id).expect("unload rainbow");
-        let _ = fs::remove_file(&s_rain);
 
-        let s_vort = create_shadow_copy(&vort_dylib, "vort");
-        let v_id = app.load_mod_tracked(&s_vort).expect("load vortex");
+        let v_id = app
+            .load_mod_with(&vort_dylib, shadow_opts())
+            .expect("load vortex");
         app.update();
-
         app.unload_mod(v_id).expect("unload vortex");
-        let _ = fs::remove_file(&s_vort);
 
-        let s_vort2 = create_shadow_copy(&vort_dylib, "vort_reloaded");
-        let v2_id = app.load_mod_tracked(&s_vort2).expect("reload vortex");
+        let v2_id = app
+            .load_mod_with(&vort_dylib, shadow_opts())
+            .expect("reload vortex");
         app.update();
         app.unload_mod(v2_id).expect("unload reloaded vortex");
-        let _ = fs::remove_file(&s_vort2);
 
         app.update();
     }
@@ -543,10 +623,14 @@ fn test_visual_game_rapid_mod_cycling_50_cycles() {
 
 #[test]
 fn test_visual_game_shadow_copying_and_file_lock_bypass() {
+    static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
+
     let grav_dylib = fixture_dylib("mod_gravity");
     let vort_dylib = fixture_dylib("mod_vortex");
 
-    let staging_dir = std::env::temp_dir().join(format!("bevy_staging_{}", std::process::id()));
+    let staging_dir =
+        std::env::temp_dir().join(format!("bevy_staging_{}_{}", std::process::id(), seq));
     fs::create_dir_all(&staging_dir).expect("create staging dir");
     let ext = grav_dylib.extension().unwrap().to_string_lossy();
     let dev_mod_path = staging_dir.join(format!("active_mod.{ext}"));
@@ -577,8 +661,9 @@ fn test_visual_game_shadow_copying_and_file_lock_bypass() {
         ))
         .id();
 
-    let shadow_1 = create_shadow_copy(&dev_mod_path, "shadow_run1");
-    let mod_id_1 = app.load_mod_tracked(&shadow_1).expect("load shadow copy 1");
+    let mod_id_1 = app
+        .load_mod_with(&dev_mod_path, shadow_opts())
+        .expect("load core shadow copy 1");
 
     for _ in 0..5 {
         app.update();
@@ -586,11 +671,11 @@ fn test_visual_game_shadow_copying_and_file_lock_bypass() {
     let vy_gravity = app.world().get::<Velocity>(e).unwrap().y;
     assert!(vy_gravity < -0.5);
 
+    // Overwrite `dev_mod_path` in place while `mod_id_1` is still loaded (`L-03`)
     let overwrite_res = fs::copy(&vort_dylib, &dev_mod_path);
     assert!(overwrite_res.is_ok());
 
     app.unload_mod(mod_id_1).expect("unload old gravity mod");
-    let _ = fs::remove_file(&shadow_1);
 
     {
         let mut pos = app.world_mut().get_mut::<Position>(e).unwrap();
@@ -601,10 +686,9 @@ fn test_visual_game_shadow_copying_and_file_lock_bypass() {
         vel.y = 0.0;
     }
 
-    let shadow_2 = create_shadow_copy(&dev_mod_path, "shadow_run2");
     let mod_id_2 = app
-        .load_mod_tracked(&shadow_2)
-        .expect("load reloaded vortex mod");
+        .load_mod_with(&dev_mod_path, shadow_opts())
+        .expect("load reloaded vortex mod via core shadow copy");
 
     app.update();
 
@@ -614,7 +698,6 @@ fn test_visual_game_shadow_copying_and_file_lock_bypass() {
 
     app.unload_mod(mod_id_2)
         .expect("unload reloaded vortex mod");
-    let _ = fs::remove_file(&shadow_2);
     let _ = fs::remove_file(&dev_mod_path);
     let _ = fs::remove_dir_all(&staging_dir);
 }
@@ -622,7 +705,6 @@ fn test_visual_game_shadow_copying_and_file_lock_bypass() {
 #[test]
 fn test_visual_game_gravity_physical_kinematics_oracle() {
     let grav_dylib = fixture_dylib("mod_gravity");
-    let shadow = create_shadow_copy(&grav_dylib, "grav_oracle");
     let mut app = setup_visual_game_app();
 
     let e = app
@@ -647,7 +729,9 @@ fn test_visual_game_gravity_physical_kinematics_oracle() {
         ))
         .id();
 
-    let mod_id = app.load_mod_tracked(&shadow).expect("load gravity mod");
+    let mod_id = app
+        .load_mod_with(&grav_dylib, shadow_opts())
+        .expect("load gravity mod");
 
     app.update();
     let vel1 = *app.world().get::<Velocity>(e).unwrap();
@@ -667,13 +751,11 @@ fn test_visual_game_gravity_physical_kinematics_oracle() {
     assert!(bounced);
 
     app.unload_mod(mod_id).expect("unload gravity mod");
-    let _ = fs::remove_file(&shadow);
 }
 
 #[test]
 fn test_visual_game_rainbow_color_spectrum_oracle() {
     let rain_dylib = fixture_dylib("mod_rainbow");
-    let shadow = create_shadow_copy(&rain_dylib, "rain_oracle");
     let mut app = setup_visual_game_app();
 
     let e1 = app
@@ -720,7 +802,9 @@ fn test_visual_game_rainbow_color_spectrum_oracle() {
         ))
         .id();
 
-    let mod_id = app.load_mod_tracked(&shadow).expect("load rainbow mod");
+    let mod_id = app
+        .load_mod_with(&rain_dylib, shadow_opts())
+        .expect("load rainbow mod");
     app.update();
 
     let c1 = *app.world().get::<ColorRgba>(e1).unwrap();
@@ -741,13 +825,11 @@ fn test_visual_game_rainbow_color_spectrum_oracle() {
     assert!(time_delta > 0.1);
 
     app.unload_mod(mod_id).expect("unload rainbow mod");
-    let _ = fs::remove_file(&shadow);
 }
 
 #[test]
 fn test_visual_game_vortex_orbital_cyclone_oracle() {
     let vort_dylib = fixture_dylib("mod_vortex");
-    let shadow = create_shadow_copy(&vort_dylib, "vort_oracle");
     let mut app = setup_visual_game_app();
 
     let e_orbit = app
@@ -794,7 +876,9 @@ fn test_visual_game_vortex_orbital_cyclone_oracle() {
         ))
         .id();
 
-    let mod_id = app.load_mod_tracked(&shadow).expect("load vortex mod");
+    let mod_id = app
+        .load_mod_with(&vort_dylib, shadow_opts())
+        .expect("load vortex mod");
     app.update();
 
     let vel_orbit = *app.world().get::<Velocity>(e_orbit).unwrap();
@@ -805,29 +889,25 @@ fn test_visual_game_vortex_orbital_cyclone_oracle() {
     assert!(vel_core.x > 0.05);
 
     app.unload_mod(mod_id).expect("unload vortex mod");
-    let _ = fs::remove_file(&shadow);
 }
 
 #[test]
 fn test_visual_game_boundary_empty_world() {
     let grav_dylib = fixture_dylib("mod_gravity");
-    let shadow = create_shadow_copy(&grav_dylib, "empty_world");
     let mut app = setup_visual_game_app();
 
     let mod_id = app
-        .load_mod_tracked(&shadow)
+        .load_mod_with(&grav_dylib, shadow_opts())
         .expect("load into empty world");
     for _ in 0..10 {
         app.update();
     }
     app.unload_mod(mod_id).expect("unload from empty world");
-    let _ = fs::remove_file(&shadow);
 }
 
 #[test]
 fn test_visual_game_scale_2500_entities() {
     let rain_dylib = fixture_dylib("mod_rainbow");
-    let shadow = create_shadow_copy(&rain_dylib, "scale_2500");
     let mut app = setup_visual_game_app();
 
     for i in 0..2500 {
@@ -850,7 +930,7 @@ fn test_visual_game_scale_2500_entities() {
     }
 
     let mod_id = app
-        .load_mod_tracked(&shadow)
+        .load_mod_with(&rain_dylib, shadow_opts())
         .expect("load rainbow at scale");
     for _ in 0..5 {
         app.update();
@@ -866,16 +946,16 @@ fn test_visual_game_scale_2500_entities() {
     }
 
     app.unload_mod(mod_id).expect("unload rainbow at scale");
-    let _ = fs::remove_file(&shadow);
 }
 
 #[test]
 fn test_visual_game_double_unload_and_invalid_mod_id() {
     let grav_dylib = fixture_dylib("mod_gravity");
-    let shadow = create_shadow_copy(&grav_dylib, "double_unload");
     let mut app = setup_visual_game_app();
 
-    let mod_id = app.load_mod_tracked(&shadow).expect("load gravity");
+    let mod_id = app
+        .load_mod_with(&grav_dylib, shadow_opts())
+        .expect("load gravity");
     app.update();
 
     assert!(app.unload_mod(mod_id).is_ok());
@@ -883,13 +963,11 @@ fn test_visual_game_double_unload_and_invalid_mod_id() {
     assert!(app.unload_mod(ModId(999_999)).is_err());
 
     app.update();
-    let _ = fs::remove_file(&shadow);
 }
 
 #[test]
 fn test_visual_game_entity_churn_spawn_despawn_with_active_mod() {
     let rain_dylib = fixture_dylib("mod_rainbow");
-    let shadow = create_shadow_copy(&rain_dylib, "churn_shadow");
     let mut app = setup_visual_game_app();
 
     let mut entities: Vec<Entity> = (0..50)
@@ -918,7 +996,7 @@ fn test_visual_game_entity_churn_spawn_despawn_with_active_mod() {
         .collect();
 
     let mod_id = app
-        .load_mod_tracked(&shadow)
+        .load_mod_with(&rain_dylib, shadow_opts())
         .expect("load rainbow mod for churn");
     app.update();
 
@@ -969,13 +1047,11 @@ fn test_visual_game_entity_churn_spawn_despawn_with_active_mod() {
     }
 
     app.unload_mod(mod_id).expect("unload rainbow after churn");
-    let _ = fs::remove_file(&shadow);
 }
 
 #[test]
 fn test_visual_game_color_restoration_oracle() {
     let rain_dylib = fixture_dylib("mod_rainbow");
-    let shadow = create_shadow_copy(&rain_dylib, "restore_shadow");
     let mut app = setup_visual_game_app();
 
     for i in 0..20 {
@@ -999,7 +1075,9 @@ fn test_visual_game_color_restoration_oracle() {
         ));
     }
 
-    let mod_id = app.load_mod_tracked(&shadow).expect("load rainbow mod");
+    let mod_id = app
+        .load_mod_with(&rain_dylib, shadow_opts())
+        .expect("load rainbow mod");
     for _ in 0..10 {
         app.update();
     }
@@ -1048,6 +1126,4 @@ fn test_visual_game_color_restoration_oracle() {
             (col.r - 1.0).abs() < 1e-4 && (col.g - 1.0).abs() < 1e-4 && (col.b - 1.0).abs() < 1e-4;
         assert!(is_cyan || is_white);
     }
-
-    let _ = fs::remove_file(&shadow);
 }

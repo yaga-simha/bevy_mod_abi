@@ -1,88 +1,22 @@
-# Example 2: Multi-System Pipeline
+# Example 02: Multi-System Pipeline
 
-This example demonstrates a production-grade ECS pipeline running inside a native dynamic mod (`.cdylib`) with zero Bevy dependencies.
-
-It progresses beyond the single-system proof-of-concept in Example 1 by showcasing:
-1. **Multi-Component Queries**: Reading and writing multiple components simultaneously (`Position`, `Velocity`, `Health`).
-2. **All 4 Query Access Modes**:
-   - `ComponentAccessMode::READ` (`&T` read-only access)
-   - `ComponentAccessMode::WRITE` (`&mut T` mutable access)
-   - `ComponentAccessMode::FILTER_ONLY` (Archetype inclusion filter, equivalent to Bevy's `With<T>`)
-   - `ComponentAccessMode::WITHOUT` (Archetype exclusion filter, equivalent to Bevy's `Without<T>`)
-3. **Deferred Commands Queue**:
-   - Synchronously allocating entity IDs via `GuestCommandQueue::spawn_empty()`
-   - Safely attaching typed component values via `GuestCommandQueue::insert_value()`
-   - Deferred entity destruction via `GuestCommandQueue::despawn()`
-4. **Change Detection Integration**:
-   - Marking column and row mutations via `chunk_iter.mark_changed(col, row)`
-   - Seamless detection by host systems querying `Changed<Position>` and `Changed<Health>`
-5. **Per-Mod State Encapsulation**:
-   - Managing guest heap state (`PipelineState`) safely through `SystemDescriptor.user_data` without cross-runtime allocator leakage.
+**Concept taught:** Multi-system guest pipelines using `app.system(...)` — query filters (`With` / `Without`), system ordering (`.after(...)`), run conditions (`.run_if_fn(...)`), and batched single-archetype deferred commands (`GuestCommands::spawn`).
 
 ---
 
-## The Three Interacting Systems
+## What It Shows
 
-```text
-┌─────────────────────────────────────────────────────────────┐
-│                     GUEST MOD (.cdylib)                     │
-│                                                             │
-│   ┌─────────────────────────────────────────────────────┐   │
-│   │ System 1: KinematicsMovementSystem                  │   │
-│   │ Access: Position (WRITE, col 0), Velocity (READ, 1) │   │
-│   │ Action: Moves all entities that have Velocity.      │   │
-│   └──────────────────────────┬──────────────────────────┘   │
-│                              ▼                              │
-│   ┌─────────────────────────────────────────────────────┐   │
-│   │ System 2: FleetLifecycleSystem                      │   │
-│   │ Access: Health (WRITE, 0), Position (READ, 1),      │   │
-│   │         PlayerTag (WITHOUT, 2)                      │   │
-│   │ Action: • Decrements minion drone health.           │   │
-│   │         • Despawns dead drones via commands.despawn.│   │
-│   │         • Spawns reinforcements via spawn_empty +   │   │
-│   │           insert_value.                             │   │
-│   └──────────────────────────┬──────────────────────────┘   │
-│                              ▼                              │
-│   ┌─────────────────────────────────────────────────────┐   │
-│   │ System 3: PlayerRegenSystem                         │   │
-│   │ Access: Health (WRITE, 0),                          │   │
-│   │         PlayerTag (FILTER_ONLY, 1)                  │   │
-│   │ Action: Heals only entities tagged with PlayerTag.  │   │
-│   └─────────────────────────────────────────────────────┘   │
-└──────────────────────────────┬──────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    HOST GAME (Bevy Engine)                  │
-│                                                             │
-│   • monitor_motion_changes (Query<..., Changed<Position>>)  │
-│   • monitor_health_changes (Query<..., Changed<Health>>)    │
-│   • Asserts invariants: player healed, drone despawned,     │
-│     reinforcement drone spawned deferred.                   │
-└─────────────────────────────────────────────────────────────┘
-```
+1. **Declarative multi-system builder (`G-02`):** Registers `KinematicsMovementSystem`, `FleetLifecycleSystem` (`.after(c"KinematicsMovementSystem")`), and `PlayerRegenSystem` (`.after(c"FleetLifecycleSystem").run_if_fn(...)`).
+2. **Archetype inclusion & exclusion filters:** Uses `.without::<PlayerTag>()` to apply drone attrition without damaging the player ship, and `.with::<PlayerTag>()` to regenerate only player entities.
+3. **Handle-based batched spawning (`C-05`, `P-05`):** Resolves `BamComponent` handles once at `GuestPlugin::build` time and spawns reinforcement drones in one archetype transition via `GuestCommands::spawn(&[SpawnEntry::new(...), ...])` alongside `GuestCommands::despawn`.
+4. **Change-tick propagation:** Disjoint mutable borrows (`Chunk::component_read_write`, `Chunk::entities_and_component_mut`) mark Bevy change ticks once per chunk so host `Changed<Position>` and `Changed<Health>` queries observe guest mutations.
 
----
+## Commands
 
-## Running the Example
-
-### Option A: Using Make
 ```bash
-make example-2
-```
-
-### Option B: Using Cargo
-```bash
-# Build guest mod
+# Build the standalone Rust guest .cdylib
 cargo build --manifest-path examples/02_multi_system_pipeline/guest_mod/Cargo.toml --release
 
-# Run host application
-cargo run --manifest-path examples/02_multi_system_pipeline/Cargo.toml
+# Run the host binary
+cargo run -p example_02_multi_system_pipeline
 ```
-
----
-
-## Key Invariants Verified
-- **Invariant A**: Player Ship is shielded from minion attrition by `WITHOUT PlayerTag` and receives health regeneration from `PlayerRegenSystem` (`FILTER_ONLY PlayerTag`).
-- **Invariant B**: Low-health Minion Drone Beta reaches 0 HP and is cleanly despawned deferred via `commands.despawn(entity)`.
-- **Invariant C**: Reinforcement Drone Gamma is dynamically spawned on tick 1 via `commands.spawn_empty()` and populated with `Position`, `Velocity`, `Health`, and `DroneTag` via `commands.insert_value()`.

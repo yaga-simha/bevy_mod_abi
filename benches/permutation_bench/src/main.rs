@@ -1,34 +1,27 @@
-#![allow(
-    clippy::undocumented_unsafe_blocks,
-    clippy::ptr_as_ptr,
-    clippy::cast_ptr_alignment,
-    clippy::transmute_ptr_to_ptr,
-    unreachable_pub
-)]
 #![deny(unsafe_op_in_unsafe_fn)]
-#![allow(clippy::drop_non_drop, clippy::too_many_arguments)]
+#![allow(clippy::drop_non_drop, clippy::too_many_arguments, unreachable_pub)]
 
-//! Comprehensive Cross-Architecture & Cross-Profile Benchmark Matrix Runner.
+//! Cross-Architecture and Cross-Profile Benchmark Matrix Runner (`ABI 0.2.0`).
 //!
-//! Covers EVERY permutation of:
+//! Covers permutations of:
 //! - Execution Architecture:
 //!     1. Pure Native Bevy (No-Mod, statically compiled Rust)
-//!     2. Coupled Rust `dylib` Mod (shared Rust ABI & `bevy_ecs` `Query` via `libloading`)
+//!     2. Coupled Rust `dylib` Mod (shared Rust ABI and `bevy_ecs` `Query` via `libloading`)
 //!     3. Asymmetric C-ABI Rust `cdylib` Mod (`bevy_abi_mod` + `bevy_abi_mod_guest`):
-//!        - `ChunkOptimized` ($O(U + E)$ VTable crossings)
-//!        - `EntityNestedVTable` ($O(U \times E)$ VTable getters + `iter_reset`)
-//!        - `NaiveChattyFfi` ($O(U \times E)$ VTable reads/writes + per-pair `iter_mark_changed`)
+//!        - `ChunkOptimized` (`O(U + E)` VTable crossings)
+//!        - `EntityNestedVTable` (`O(U * E)` VTable getters + `iter_reset`)
+//!        - `NaiveChattyFfi` (`O(U * E)` VTable reads/writes + per-pair `iter_mark_changed_range`)
 //!     4. Asymmetric C-ABI C99 Mod (`bevy_abi_mod` + `bevy_abi_mod.h`):
 //!        - `ChunkOptimized`, `EntityNestedVTable`, and `NaiveChattyFfi`
 //! - Build Profiles:
 //!     - Host [`Release` (`opt-level=3`)] × Guest [`Release` / `-O3` and `Debug` / `-O0`]
 //!     - Host [`Debug`   (`opt-level=0`)] × Guest [`Release` / `-O3` and `Debug` / `-O0`]
-//! - Both Dimensions:
-//!     - Mod Loading, Handshake, 34-Archetype Schedule Init & Teardown Latency (`µs`)
-//!     - Steady-State Complex Nested Multi-Archetype Query Frame Time (`ms`, `ns/pair`, slowdown `x`)
+//! - Dimensions:
+//!     - Mod Loading, Handshake, 34-Archetype Schedule Init, and Teardown Latency (`µs`)
+//!     - Steady-State Nested Multi-Archetype Query Frame Time (`ms`, `ns/pair`, slowdown `x`)
 
 use libloading::{Library, Symbol};
-use shared_scenario::bevy_abi_mod_host::{AbiModPlugin, ModAppExt};
+use shared_scenario::bevy_abi_mod_host::{AbiModPlugin, LoadOptions, ModAppExt};
 use shared_scenario::bevy_app::{App, Update};
 use shared_scenario::bevy_ecs::schedule::ScheduleLabel;
 use shared_scenario::{
@@ -143,7 +136,7 @@ fn file_size_kb(path: &Path) -> f64 {
 }
 
 /// Configures the variant selector on a C-ABI benchmark mod before `ModHost` invokes `bevy_abi_mod_init`.
-/// Kept open during `load_mod_tracked` so the static global in the mapped image retains `variant`.
+/// Kept open during `load_mod_with` (`shadow_copy: false`) so the static global in the mapped image retains `variant`.
 fn set_cabi_mod_variant(dylib_path: &Path, sym_name: &[u8], variant: u32) -> Library {
     // SAFETY: Loading trusted benchmark shared library and calling side-effect-free integer setter.
     unsafe {
@@ -155,6 +148,10 @@ fn set_cabi_mod_variant(dylib_path: &Path, sym_name: &[u8], variant: u32) -> Lib
         setter(variant);
         lib
     }
+}
+
+fn direct_load_options() -> LoadOptions {
+    LoadOptions::new().with_shadow_copy(false)
 }
 
 // ============================================================================
@@ -204,6 +201,7 @@ fn verify_all_permutations_against_oracle(mods: &ModArtifacts, host_prof: &str) 
         // SAFETY: Loading same-profile coupled_rust_mod sharing `libshared_scenario.dylib`.
         let lib = unsafe { Library::new(&mods.coupled_rust_same_profile) }
             .expect("Failed to load coupled_rust_mod");
+        // SAFETY: `coupled_rust_mod_register` matches the same-profile `extern "Rust" fn(&mut App)` signature.
         unsafe {
             #[allow(improper_ctypes_definitions)]
             let reg: Symbol<extern "Rust" fn(&mut App)> = lib
@@ -217,6 +215,7 @@ fn verify_all_permutations_against_oracle(mods: &ModArtifacts, host_prof: &str) 
         let digest = OracleDigest::capture(app.world_mut());
         golden.assert_equivalent(&digest, &format!("CoupledRustDylib[{host_prof}]"));
 
+        // SAFETY: `coupled_rust_mod_shutdown` is an `extern "C" fn()` exported by `lib`.
         unsafe {
             let shutdown: Symbol<extern "C" fn()> = lib
                 .get(b"coupled_rust_mod_shutdown\0")
@@ -264,7 +263,7 @@ fn verify_all_permutations_against_oracle(mods: &ModArtifacts, host_prof: &str) 
 
             let pin_lib = set_cabi_mod_variant(path, setter_sym, variant_id);
             let mod_id = app
-                .load_mod_tracked(path)
+                .load_mod_with(path, direct_load_options())
                 .unwrap_or_else(|e| panic!("Failed to load {target_name} ({variant_name}): {e:?}"));
 
             for _ in 0..TICKS {
@@ -369,6 +368,7 @@ fn measure_loading_permutations(
             dlopen_s.push(t_dl.elapsed().as_secs_f64() * 1_000_000.0);
 
             let t_in = Instant::now();
+            // SAFETY: `coupled_rust_mod_register` matches the same-profile `&mut App` entry signature.
             unsafe {
                 #[allow(improper_ctypes_definitions)]
                 let reg: Symbol<extern "Rust" fn(&mut App)> =
@@ -383,6 +383,7 @@ fn measure_loading_permutations(
             init_s.push(t_in.elapsed().as_secs_f64() * 1_000_000.0);
 
             let t_un = Instant::now();
+            // SAFETY: `coupled_rust_mod_shutdown` is an `extern "C" fn()` exported by `lib`.
             unsafe {
                 let shutdown: Symbol<extern "C" fn()> =
                     lib.get(b"coupled_rust_mod_shutdown\0").unwrap();
@@ -459,18 +460,21 @@ fn measure_loading_permutations(
         }
 
         // Hold one pin handle on `src_path` so the cached measurement measures pure
-        // ABI handshake + 8 VTable lookups + Bevy 34-archetype schedule init without OS dyld mapping!
+        // ABI handshake + 7 VTable lookups + Bevy 34-archetype schedule init without OS dyld mapping.
+        // SAFETY: Pinning trusted benchmark shared library on disk.
         let pin_src = unsafe { Library::new(src_path) }.expect("pin src_path");
 
         for unique_load_copy in &staged_paths {
-            // Measure end-to-end ModHost load (dlopen + handshake + 8 VTable lookups + 34-archetype schedule init)
+            // Measure end-to-end ModHost load (dlopen + handshake + 7 VTable lookups + 34-archetype schedule init)
             let mut app = App::new();
             app.add_plugins(AbiModPlugin);
             register_all_scenario_components(&mut app);
             populate_scenario_world(app.world_mut(), cfg);
 
             let t_dl = Instant::now();
-            let mod_id = app.try_load_mod(unique_load_copy).expect("C-ABI handshake");
+            let mod_id = app
+                .load_mod_with(unique_load_copy, direct_load_options())
+                .expect("C-ABI handshake");
             app.world_mut()
                 .try_schedule_scope(Update.intern(), |world, sched| {
                     let _ = sched.initialize(world);
@@ -478,7 +482,7 @@ fn measure_loading_permutations(
                 .ok();
             let load_and_handshake_us = t_dl.elapsed().as_secs_f64() * 1_000_000.0;
 
-            // Measure pure cached ABI handshake + 8 VTable lookups + Bevy 34-archetype schedule initialization
+            // Measure pure cached ABI handshake + 7 VTable lookups + Bevy 34-archetype schedule initialization
             let mut app_cached = App::new();
             app_cached.add_plugins(AbiModPlugin);
             register_all_scenario_components(&mut app_cached);
@@ -487,7 +491,7 @@ fn measure_loading_permutations(
             let t_in = Instant::now();
             let cached_id = {
                 let cid = app_cached
-                    .try_load_mod(src_path)
+                    .load_mod_with(src_path, direct_load_options())
                     .expect("cached C-ABI handshake");
                 app_cached
                     .world_mut()
@@ -528,7 +532,7 @@ fn measure_loading_permutations(
             init_and_schedule_us: in_us,
             unload_us: un_us,
             total_lifecycle_us: dl_us + in_us + un_us,
-            notes: "Asymmetric C-ABI: resolves 8 VTables + registers multi-query DynamicCSystem across 34 archetypes".to_string(),
+            notes: "Asymmetric C-ABI: resolves 7 VTables + 10 BamComponent handles + registers multi-query GuestSystem across 34 archetypes".to_string(),
         });
     }
 
@@ -673,6 +677,7 @@ fn measure_execution_suite_at_scale(
         // SAFETY: Loading same-profile coupled_rust_mod.
         let lib = unsafe { Library::new(&mods.coupled_rust_same_profile) }
             .expect("load coupled_rust_mod");
+        // SAFETY: `coupled_rust_mod_set_variant` and `coupled_rust_mod_register` match exported signatures.
         unsafe {
             let set_var: Symbol<extern "C" fn(u32)> =
                 lib.get(b"coupled_rust_mod_set_variant\0").unwrap();
@@ -698,6 +703,7 @@ fn measure_execution_suite_at_scale(
             true,
         ));
 
+        // SAFETY: `coupled_rust_mod_shutdown` is an `extern "C" fn()` exported by `lib`.
         unsafe {
             let shutdown: Symbol<extern "C" fn()> =
                 lib.get(b"coupled_rust_mod_shutdown\0").unwrap();
@@ -770,7 +776,9 @@ fn measure_execution_suite_at_scale(
             let stats = populate_scenario_world(app.world_mut(), cfg);
 
             let pin_lib = set_cabi_mod_variant(case.path, case.setter_sym, var_id);
-            let mod_id = app.load_mod_tracked(case.path).expect("load C-ABI mod");
+            let mod_id = app
+                .load_mod_with(case.path, direct_load_options())
+                .expect("load C-ABI mod");
 
             let durs = run_app_timed(&mut app, warmup, frames);
             out.push(summarize_durations(
@@ -807,8 +815,12 @@ fn measure_execution_suite_at_scale(
             set_cabi_mod_variant(&mods.cabi_rust_release, b"c_abi_rust_mod_set_variant\0", 0);
         let pin_c = set_cabi_mod_variant(&mods.cabi_c99_release, b"c_abi_c99_mod_set_variant\0", 0);
 
-        let id_r = app.load_mod_tracked(&mods.cabi_rust_release).unwrap();
-        let id_c = app.load_mod_tracked(&mods.cabi_c99_release).unwrap();
+        let id_r = app
+            .load_mod_with(&mods.cabi_rust_release, direct_load_options())
+            .unwrap();
+        let id_c = app
+            .load_mod_with(&mods.cabi_c99_release, direct_load_options())
+            .unwrap();
 
         let frames = if is_host_debug { 8 } else { 16 };
         let durs = run_app_timed(&mut app, warmup, frames);
