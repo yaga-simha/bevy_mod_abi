@@ -1,28 +1,15 @@
-#![allow(
-    clippy::undocumented_unsafe_blocks,
-    clippy::ptr_as_ptr,
-    clippy::cast_ptr_alignment,
-    clippy::transmute_ptr_to_ptr,
-    unreachable_pub
-)]
-//! Mod A: Shield Emitter Mod (`mod_shield_emitter`)
+//! Mod A: Shield Emitter Mod (`mod_shield_emitter`).
 //!
-//! Demonstrates:
-//! 1. Introducing a brand-new component type (`EnergyShield`) at runtime via `GuestApp::register_guest_component`.
-//!    Neither the host game engine nor any other mod knows about this component at host compile-time.
-//! 2. Spawning autonomous entities and attaching `EnergyShield` dynamically using deferred commands
-//!    (`SystemContext::commands`) with per-instance closure state (zero global statics, zero memory leaks).
-//! 3. Running an active recharge system that modifies `EnergyShield` each tick in 100% safe Rust.
-
-#![deny(unsafe_op_in_unsafe_fn)]
-#![deny(improper_ctypes_definitions)]
+//! Registers a runtime dynamic component (`"mod_shield_emitter::EnergyShield"`) via
+//! [`GuestApp::register_component`], spawns autonomous drone entities carrying that component via
+//! batched [`GuestCommands::spawn`], and recharges shields each tick.
 
 use bevy_abi_mod_guest::prelude::*;
+use core::ffi::CStr;
 
-/// Runtime structured data introduced dynamically by Mod A.
-/// Layout: 12 bytes, 4-byte aligned (POD).
-#[derive(Clone, Copy, Debug, PartialEq, AbiPod)]
+/// Runtime `#[repr(C)]` component (`12` bytes, `4`-byte aligned) introduced dynamically by Mod A.
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, AbiPod)]
 pub struct EnergyShield {
     /// Current shield charge (MW).
     pub current: f32,
@@ -33,100 +20,103 @@ pub struct EnergyShield {
 }
 
 impl GuestComponent for EnergyShield {
-    const NAME: &'static core::ffi::CStr = c"EnergyShield";
+    const NAME: &'static CStr = c"mod_shield_emitter::EnergyShield";
 }
 
-fn setup(app: &mut GuestApp<'_>) -> FfiResult {
-    // 1. Introduce & register runtime component: `EnergyShield`
-    let reg_res = app.register_guest_component::<EnergyShield>();
-    if reg_res.is_err() {
-        return reg_res;
-    }
+/// Per-`World` guest plugin for `mod_shield_emitter`.
+#[derive(Default)]
+pub struct ShieldEmitterMod;
 
-    // 2. Register System 1: Autonomous Shield Drone Spawner (runs once on first tick;
-    //    `spawned` lives inside the guest-managed closure and is freed automatically on unload!)
-    let mut spawned = false;
-    let s1_res = app.add_system(c"shield_spawner_system", &[], move |ctx| {
-        if spawned {
-            return FfiResult::OK;
-        }
-        spawned = true;
+impl GuestPlugin for ShieldEmitterMod {
+    const NAME: &'static CStr = c"mod_shield_emitter";
+    const VERSION: &'static CStr = c"0.2.0";
 
-        let queue = ctx.commands();
-        if queue.is_null() {
-            return FfiResult::NULL_POINTER;
-        }
+    fn build(&mut self, app: &mut GuestApp<'_>) -> FfiResult {
+        // 1. Register runtime dynamic component `"mod_shield_emitter::EnergyShield"`.
+        let shield_h = match app.register_component::<EnergyShield>() {
+            Ok(h) => h,
+            Err(err) => return err,
+        };
 
-        let drone_specs = [
-            EnergyShield {
-                current: 100.0,
-                max: 100.0,
-                frequency_mhz: 142,
-            },
-            EnergyShield {
-                current: 80.0,
-                max: 100.0,
-                frequency_mhz: 242,
-            },
-            EnergyShield {
-                current: 60.0,
-                max: 100.0,
-                frequency_mhz: 342,
-            },
-        ];
+        // 2. Spawner system: spawns 3 drones on the first tick using per-World closure state.
+        let mut spawned = false;
+        let s1_res = app
+            .system(c"shield_spawner_system")
+            .schedule(ScheduleId::UPDATE)
+            .build(move |ctx| {
+                if spawned {
+                    return FfiResult::OK;
+                }
+                spawned = true;
 
-        for (i, spec) in drone_specs.iter().enumerate() {
-            let entity = queue.spawn_empty();
-            if entity.0 == 0 {
-                return FfiResult::INTERNAL_ERROR;
-            }
+                let queue = ctx.commands();
+                let drone_specs = [
+                    EnergyShield {
+                        current: 100.0,
+                        max: 100.0,
+                        frequency_mhz: 142,
+                    },
+                    EnergyShield {
+                        current: 80.0,
+                        max: 100.0,
+                        frequency_mhz: 242,
+                    },
+                    EnergyShield {
+                        current: 60.0,
+                        max: 100.0,
+                        frequency_mhz: 342,
+                    },
+                ];
 
-            let res = queue.insert_component(entity, spec);
-            if res.is_err() {
-                return res;
-            }
-
-            println!(
-                "  [Mod A::spawner] Spawned Drone #{} (FfiEntity {:?}) with EnergyShield({:.1}/{:.1} MW, {} MHz)",
-                i + 1,
-                entity,
-                spec.current,
-                spec.max,
-                spec.frequency_mhz
-            );
-        }
-
-        FfiResult::OK
-    });
-    if s1_res.is_err() {
-        return s1_res;
-    }
-
-    // 3. Register System 2: Shield Generator & Recharge Loop
-    let recharge_queries = [EnergyShield::write_desc()];
-    app.add_system(c"shield_recharge_system", &recharge_queries, |ctx| {
-        while let Some(mut chunk) = ctx.iter().next_chunk_view() {
-            let Some(shields) = chunk.column_mut::<EnergyShield>(0) else {
-                return FfiResult::INTERNAL_ERROR;
-            };
-
-            for shield in shields.iter_mut() {
-                let before = shield.current;
-                shield.current = (shield.current + 5.0).min(shield.max);
-                shield.frequency_mhz = shield.frequency_mhz.wrapping_add(1);
-                let delta = shield.current - before;
-
-                if delta > 0.0 {
+                for (i, spec) in drone_specs.iter().enumerate() {
+                    let entity = match queue.spawn(&[SpawnEntry::new(shield_h, spec)]) {
+                        Ok(e) => e,
+                        Err(err) => return err,
+                    };
                     println!(
-                        "  [Mod A::recharge] Recharged drone shield: {:.1} -> {:.1} MW (+{:.1} MW)",
-                        before, shield.current, delta
+                        "  [Mod A::spawner] Spawned Drone #{} ({:?}) with EnergyShield({:.1}/{:.1} MW, {} MHz)",
+                        i + 1,
+                        entity,
+                        spec.current,
+                        spec.max,
+                        spec.frequency_mhz
                     );
                 }
-            }
+
+                FfiResult::OK
+            });
+        if !s1_res.is_ok() {
+            return s1_res;
         }
 
-        FfiResult::OK
-    })
+        // 3. Recharge system: recharges shields (+5.0 MW) and increments harmonic frequency.
+        app.system(c"shield_recharge_system")
+            .query(|q| q.write_handle(shield_h))
+            .schedule(ScheduleId::UPDATE)
+            .after(c"shield_spawner_system")
+            .build(|ctx| {
+                while let Some(mut chunk) = ctx.iter().next_chunk_view() {
+                    let Some(shields) = chunk.component_mut::<EnergyShield>(0) else {
+                        return FfiResult::TYPE_MISMATCH;
+                    };
+
+                    for shield in shields {
+                        let before = shield.current;
+                        shield.current = (shield.current + 5.0).min(shield.max);
+                        shield.frequency_mhz = shield.frequency_mhz.wrapping_add(1);
+                        let delta = shield.current - before;
+
+                        if delta > 0.0 {
+                            println!(
+                                "  [Mod A::recharge] Recharged drone shield: {:.1} -> {:.1} MW (+{:.1} MW)",
+                                before, shield.current, delta
+                            );
+                        }
+                    }
+                }
+                FfiResult::OK
+            })
+    }
 }
 
-export_mod!(setup);
+export_mod!(plugin: ShieldEmitterMod);

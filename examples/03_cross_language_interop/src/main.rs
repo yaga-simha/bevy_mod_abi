@@ -1,22 +1,17 @@
-#![allow(
-    clippy::undocumented_unsafe_blocks,
-    clippy::ptr_as_ptr,
-    clippy::cast_ptr_alignment,
-    clippy::transmute_ptr_to_ptr,
-    unreachable_pub
-)]
-//! # Example 3: Cross-Language Interoperability
+//! Example 3: Cross-Language Interoperability (Host Application).
 //!
-//! Demonstrates concurrent execution of an ISO C99 dynamic library and an independent
-//! Rust cdylib inside the same Bevy schedule operating on the same entities.
+//! Loads an ISO C99 shared library (`c_mod`) and an independent Rust `.cdylib` (`rust_mod`) into
+//! the same Bevy `Update` schedule operating on the same drone entities.
 
-#![allow(clippy::default_constructed_unit_structs, clippy::type_complexity)]
+#![allow(clippy::type_complexity)]
 
-mod components;
+/// Exposed ECS components for Example 3.
+pub mod components;
 
 use bevy_abi_mod::prelude::*;
 use bevy_app::{App, Update};
 use bevy_ecs::entity::Entity;
+use bevy_ecs::message::Messages;
 use bevy_ecs::query::{Changed, Or};
 use bevy_ecs::system::Query;
 use components::{ColorRgba, Position, Velocity};
@@ -30,7 +25,7 @@ fn host_telemetry_monitor(
         Or<(Changed<Position>, Changed<ColorRgba>)>,
     >,
 ) {
-    for (entity, pos, vel, color) in query.iter() {
+    for (entity, pos, vel, color) in &query {
         println!(
             "  Drone {:?} | Pos: ({:6.2}, {:6.2}, {:6.2}) [C99] | Vel: ({:4.1}, {:4.1}) | Color: RGBA({:.2}, {:.2}, {:.2}, {:.2}) [Rust]",
             entity, pos.x, pos.y, pos.z, vel.x, vel.y, color.r, color.g, color.b, color.a
@@ -38,7 +33,6 @@ fn host_telemetry_monitor(
     }
 }
 
-/// Returns platform-specific dynamic library paths for C and Rust guest mods.
 fn get_guest_dylib_paths() -> (PathBuf, PathBuf) {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let (prefix, ext) = if cfg!(target_os = "windows") {
@@ -60,7 +54,6 @@ fn get_guest_dylib_paths() -> (PathBuf, PathBuf) {
     (c_dylib, rust_dylib)
 }
 
-/// Ensures both C99 and Rust guest mods are compiled before loading.
 fn ensure_mods_built() -> (PathBuf, PathBuf) {
     let (c_dylib, rust_dylib) = get_guest_dylib_paths();
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -93,27 +86,31 @@ fn ensure_mods_built() -> (PathBuf, PathBuf) {
 fn main() {
     println!("==================================================================");
     println!("  bevy_abi_mod: Example 3 — Cross-Language Interoperability       ");
-    println!("  C99 Guest Mod + Rust Guest Mod Running Concurrently in Bevy ECS ");
+    println!("  ISO C99 Guest Mod + Rust Guest Mod in One Bevy ECS Schedule     ");
     println!("==================================================================\n");
 
-    // 1. Build and locate dynamic libraries
     let (c_dylib, rust_dylib) = ensure_mods_built();
     println!("[HOST] C99 Mod Library : {}", c_dylib.display());
     println!("[HOST] Rust Mod Library: {}\n", rust_dylib.display());
 
-    // 2. Initialize Bevy App with AbiModPlugin
     let mut app = App::new();
-    app.add_plugins(AbiModPlugin::default());
+    app.add_plugins(AbiModPlugin);
 
-    // 3. Register mod-exposable components
-    app.register_mod_component::<Position>();
-    app.register_mod_component::<Velocity>();
-    app.register_mod_component::<ColorRgba>();
+    app.register_mod_component::<Position>(
+        ComponentOptions::new().with_raw_insert().with_default(),
+    )
+    .expect("register Position");
+    app.register_mod_component::<Velocity>(
+        ComponentOptions::new().with_raw_insert().with_default(),
+    )
+    .expect("register Velocity");
+    app.register_mod_component::<ColorRgba>(
+        ComponentOptions::new().with_raw_insert().with_default(),
+    )
+    .expect("register ColorRgba");
 
-    // 4. Add host telemetry observer
     app.add_systems(Update, host_telemetry_monitor);
 
-    // 5. Spawn test drone entities
     println!("[HOST] Spawning 3 test drones with initial coordinates:");
     let e0 = app
         .world_mut()
@@ -179,31 +176,41 @@ fn main() {
         ))
         .id();
 
-    // 6. Load both mods into the Bevy schedule
+    let load_opts = LoadOptions {
+        shadow_copy: true,
+        strict: true,
+        ..Default::default()
+    };
+
     println!("\n[HOST] Loading C99 guest mod...");
     let c_mod_id = app
-        .load_mod_tracked(&c_dylib)
+        .load_mod_with(&c_dylib, load_opts.clone())
         .expect("Failed to load C99 mod");
-    println!("[HOST] Loaded C99 mod (ModId: {:?})", c_mod_id);
+    println!("[HOST] Loaded C99 mod (ModId: {c_mod_id:?})");
 
     println!("[HOST] Loading Rust guest mod...");
     let rust_mod_id = app
-        .load_mod_tracked(&rust_dylib)
+        .load_mod_with(&rust_dylib, load_opts)
         .expect("Failed to load Rust mod");
-    println!("[HOST] Loaded Rust mod (ModId: {:?})\n", rust_mod_id);
+    println!("[HOST] Loaded Rust mod (ModId: {rust_mod_id:?})\n");
+    assert_eq!(app.world().resource::<Messages<ModLoaded>>().len(), 2);
 
-    // 7. Execute 5 simulation ticks
     println!("--- Commencing Simulation Ticks ---");
     for tick in 1..=5 {
-        println!("\n>> Tick {}", tick);
+        println!("\n>> Tick {tick}");
         app.update();
     }
 
-    // 8. Assert cooperative execution:
-    // C99 modified Position (x: 0 -> 0 + 5 * 10 * 0.1 = 5.0)
-    // Rust modified ColorRgba based on updated Position
-    let p0 = *app.world().get::<Position>(e0).unwrap();
-    let c0 = *app.world().get::<ColorRgba>(e0).unwrap();
+    assert_eq!(
+        app.world().resource::<Messages<ModSystemFaulted>>().len(),
+        0
+    );
+
+    let p0 = *app.world().get::<Position>(e0).expect("drone e0 Position");
+    let c0 = *app
+        .world()
+        .get::<ColorRgba>(e0)
+        .expect("drone e0 ColorRgba");
     assert!(
         (p0.x - 5.0).abs() < 1e-4,
         "C99 mod must have updated Position"
@@ -213,27 +220,26 @@ fn main() {
         "Rust mod must have updated ColorRgba based on Position"
     );
     println!(
-        "\n[HOST] Verified cooperative assertions for Drone e0: Pos ({:.2}, {:.2}, {:.2}), Color ({:.2}, {:.2}, {:.2})",
+        "\n[HOST] Verified cooperative state for Drone e0: Pos ({:.2}, {:.2}, {:.2}), Color ({:.2}, {:.2}, {:.2})",
         p0.x, p0.y, p0.z, c0.r, c0.g, c0.b
     );
 
-    // 9. Unload both mods cleanly
-    println!("\n[HOST] Unloading both mods (Atomic Tombstone + Shutdown Hook)...");
+    println!("\n[HOST] Unloading both mods...");
     app.unload_mod(c_mod_id).expect("Failed to unload C99 mod");
     app.unload_mod(rust_mod_id)
         .expect("Failed to unload Rust mod");
+    assert_eq!(app.world().resource::<Messages<ModUnloaded>>().len(), 2);
 
-    // 10. Verify that post-unload ticks execute safely with no further mutations
     println!("[HOST] Executing 1 post-unload tick (expecting 0 mutations):");
     app.update();
 
-    let p0_after = *app.world().get::<Position>(e0).unwrap();
+    let p0_after = *app.world().get::<Position>(e0).expect("drone e0 Position");
     assert_eq!(
         p0, p0_after,
         "Position must not change after mods are unloaded"
     );
 
     println!("\n==================================================================");
-    println!("  SUCCESS: Cross-language interop verified with zero data races!  ");
+    println!("  Cross-language C99 + Rust interoperability verified cleanly.    ");
     println!("==================================================================");
 }
