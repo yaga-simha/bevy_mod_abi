@@ -461,52 +461,51 @@ pub fn run_batched_spawn4_gate() {
 }
 
 #[cfg(target_os = "linux")]
-mod linux_callgrind {
-    use super::*;
-    use iai_callgrind::{library_benchmark, library_benchmark_group, main};
+use iai_callgrind::{library_benchmark, library_benchmark_group, main as iai_main};
 
-    #[library_benchmark]
-    fn bench_gate_dense_1k() {
-        run_dense_1k_gate();
-    }
-
-    #[library_benchmark]
-    fn bench_gate_changed_1pct() {
-        run_changed_1pct_gate();
-    }
-
-    #[library_benchmark]
-    fn bench_gate_command_arena_1k() {
-        run_command_arena_zero_alloc_gate();
-    }
-
-    #[library_benchmark]
-    fn bench_gate_sparse_1k() {
-        run_sparse_batching_gate();
-    }
-
-    #[library_benchmark]
-    fn bench_gate_spawn4_256() {
-        run_batched_spawn4_gate();
-    }
-
-    library_benchmark_group!(
-        name = deterministic_abi_gates;
-        benchmarks =
-            bench_gate_dense_1k,
-            bench_gate_changed_1pct,
-            bench_gate_command_arena_1k,
-            bench_gate_sparse_1k,
-            bench_gate_spawn4_256
-    );
-
-    main!(library_benchmark_groups = deterministic_abi_gates);
+#[cfg(target_os = "linux")]
+#[library_benchmark]
+fn bench_gate_dense_1k() {
+    run_dense_1k_gate();
 }
 
 #[cfg(target_os = "linux")]
-fn main() {
-    linux_callgrind::main();
+#[library_benchmark]
+fn bench_gate_changed_1pct() {
+    run_changed_1pct_gate();
 }
+
+#[cfg(target_os = "linux")]
+#[library_benchmark]
+fn bench_gate_command_arena_1k() {
+    run_command_arena_zero_alloc_gate();
+}
+
+#[cfg(target_os = "linux")]
+#[library_benchmark]
+fn bench_gate_sparse_1k() {
+    run_sparse_batching_gate();
+}
+
+#[cfg(target_os = "linux")]
+#[library_benchmark]
+fn bench_gate_spawn4_256() {
+    run_batched_spawn4_gate();
+}
+
+#[cfg(target_os = "linux")]
+library_benchmark_group!(
+    name = deterministic_abi_gates;
+    benchmarks =
+        bench_gate_dense_1k,
+        bench_gate_changed_1pct,
+        bench_gate_command_arena_1k,
+        bench_gate_sparse_1k,
+        bench_gate_spawn4_256
+);
+
+#[cfg(target_os = "linux")]
+iai_main!(library_benchmark_groups = deterministic_abi_gates);
 
 #[cfg(not(target_os = "linux"))]
 fn main() {

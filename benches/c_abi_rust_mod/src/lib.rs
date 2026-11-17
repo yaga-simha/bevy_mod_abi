@@ -411,7 +411,7 @@ fn run_chunk_optimized(ctx: &mut SystemContext<'_>, vts: VTableBundle) -> FfiRes
                 let mut energy = (vit_vt.get_energy)(vit_p);
 
                 let r_kin = (res_vt.get_kinetic)(res_p);
-                let r_thm = (res_vt.get_thermal)(res_p);
+                let r_therm = (res_vt.get_thermal)(res_p);
                 let r_ion = (res_vt.get_ionic)(res_p);
                 let u_team = (fac_vt.get_team_id)(fac_p);
 
@@ -447,7 +447,7 @@ fn run_chunk_optimized(ctx: &mut SystemContext<'_>, vts: VTableBundle) -> FfiRes
                             vz += dz * imp;
 
                             let raw_dmg =
-                                em.thermal_dps * atten * SIM_DT * (1.0_f32 - 0.6_f32 * r_thm);
+                                em.thermal_dps * atten * SIM_DT * (1.0_f32 - 0.6_f32 * r_therm);
                             let absorbed = if shield >= raw_dmg { raw_dmg } else { shield };
                             shield -= absorbed;
                             let nh = health - (raw_dmg - absorbed);
@@ -577,7 +577,7 @@ fn run_entity_nested_vtable(ctx: &mut SystemContext<'_>, vts: VTableBundle) -> F
                 let mut energy = (vit_vt.get_energy)(vit_p);
 
                 let r_kin = (res_vt.get_kinetic)(res_p);
-                let r_thm = (res_vt.get_thermal)(res_p);
+                let r_therm = (res_vt.get_thermal)(res_p);
                 let r_ion = (res_vt.get_ionic)(res_p);
                 let u_team = (fac_vt.get_team_id)(fac_p);
 
@@ -634,7 +634,7 @@ fn run_entity_nested_vtable(ctx: &mut SystemContext<'_>, vts: VTableBundle) -> F
                                 vz += dz * imp;
 
                                 let tdps = (aura_vt.get_thermal_dps)(e_aura_p);
-                                let raw_dmg = tdps * atten * SIM_DT * (1.0_f32 - 0.6_f32 * r_thm);
+                                let raw_dmg = tdps * atten * SIM_DT * (1.0_f32 - 0.6_f32 * r_therm);
                                 let absorbed = if shield >= raw_dmg { raw_dmg } else { shield };
                                 shield -= absorbed;
                                 let nh = health - (raw_dmg - absorbed);
@@ -855,8 +855,8 @@ fn run_naive_chatty_ffi(ctx: &mut SystemContext<'_>, vts: VTableBundle) -> FfiRe
                                 let _ = (v3.set_z)(vel_mut, (v3.get_z)(vel_mut) + dz * imp);
 
                                 let tdps = (aura_vt.get_thermal_dps)(e_aura_p);
-                                let r_thm = (res_vt.get_thermal)(res_p);
-                                let raw_dmg = tdps * atten * SIM_DT * (1.0_f32 - 0.6_f32 * r_thm);
+                                let r_therm = (res_vt.get_thermal)(res_p);
+                                let raw_dmg = tdps * atten * SIM_DT * (1.0_f32 - 0.6_f32 * r_therm);
                                 let cur_sh = (vit_vt.get_shield)(vit_p);
                                 let absorbed = if cur_sh >= raw_dmg { raw_dmg } else { cur_sh };
                                 let _ = (vit_vt.set_shield)(vit_p, cur_sh - absorbed);

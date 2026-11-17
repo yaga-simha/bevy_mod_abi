@@ -303,7 +303,7 @@ jobs:
               -p bevy_abi_mod_host_sys \
               -p bevy_abi_mod_host
           cargo llvm-cov report \
-            --ignore-filename-regex '(crates/bevy_abi_mod_host_sys/src/(drop_trampoline|handle_header|loader|registry|schedule|sync_ptr)|crates/bevy_abi_mod_host/|tests/)' \
+            --ignore-filename-regex '(crates/bevy_abi_mod_host_sys/src/(drop_trampoline|handle_header|lib|loader|registry|schedule|sync_ptr)|crates/bevy_abi_mod_(host|macros|sys|guest|guest_sys)/|tests/)' \
             --fail-under-lines 85
 
   # ============================================================================
