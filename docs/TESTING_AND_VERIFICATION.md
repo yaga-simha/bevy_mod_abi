@@ -98,7 +98,7 @@ Executed with `make test-e2e` or `bash scripts/run_e2e_tests.sh`:
 
 | Stage | Target / Test | Objective | Success Metric |
 |---|---|---|---|
-| **[1/9]** | `make -C tests/asymmetric_c_mod`<br>`cargo build --manifest-path tests/asymmetric_rust_mod/Cargo.toml --release` | Compile independent guest shared libraries (`.so`/`.dylib`/`.dll` and `.cdylib`). | Zero compilation errors. |
+| **[1/9]** | `cargo xtask fixtures` | Compile independent guest shared libraries (`.so`/`.dylib`/`.dll` and `.cdylib`). | Zero compilation errors. |
 | **[2/9]** | `cargo check --workspace --all-targets` | Static typing and API boundary compliance across all crates. | 0 warnings, 0 errors. |
 | **[3/9]** | `cargo test --workspace -- --test-threads=1` | Unit, parity, fuzz, compile-fail, and doc tests across all crates. | All tests pass. |
 | **[4/9]** | `cargo test --test e2e_suite` | 275 tests across 4 comprehensive tiers (Core, Boundary, Pairwise Matrix, Game Scenarios). | 275/275 passed. |

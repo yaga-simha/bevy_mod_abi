@@ -517,7 +517,7 @@ cargo test -p bevy_abi_mod_host --test e2e_suite tier4
 
 #### 4. C99 Mod Compilation & Interop
 ```bash
-make -C tests/asymmetric_c_mod
+cargo xtask fixtures
 cargo test -p bevy_abi_mod_host --test c_vtable_interop
 ```
 

@@ -15,7 +15,7 @@
 
 ```bash
 # Compile the C++17 shared library
-make -C examples/07_cpp17_guest/cpp_mod
+c++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -Iinclude -O3 -shared -fPIC examples/07_cpp17_guest/cpp_mod/mod.cpp -o examples/07_cpp17_guest/cpp_mod/libcpp17_mod.so
 
 # Run the Bevy host example
 cargo run -p example_07_cpp17_guest

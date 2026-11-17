@@ -59,9 +59,8 @@ cargo tree -p bevy_abi_mod_sys -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest |
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 
-# Build the asymmetric Rust & C99 guest test mods
-cargo build --manifest-path tests/asymmetric_rust_mod/Cargo.toml --release
-make -C tests/asymmetric_c_mod
+# Build the hermetic Rust & C99 guest test fixtures (including asymmetric_rust_mod & asymmetric_c_mod)
+cargo xtask fixtures
 
 # Run default workspace tests (excludes heavy GUI/3D examples)
 cargo test -- --test-threads=1

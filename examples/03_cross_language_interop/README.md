@@ -14,7 +14,7 @@
 
 ```bash
 # Build ISO C99 guest mod (-std=c99 -Wall -Wextra -Wpedantic -Werror)
-make -C examples/03_cross_language_interop/c_mod
+cargo xtask fixtures
 
 # Build standalone Rust guest .cdylib
 cargo build --manifest-path examples/03_cross_language_interop/rust_mod/Cargo.toml --release
