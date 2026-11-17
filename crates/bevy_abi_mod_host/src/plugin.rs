@@ -98,5 +98,6 @@ impl Plugin for ConfiguredAbiModPlugin {
         {
             app.add_message::<ModSystemFaulted>();
         }
+        crate::world_ext::ensure_hierarchy_registered(app.world_mut());
     }
 }

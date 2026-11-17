@@ -3,10 +3,10 @@
 use core::marker::PhantomData;
 
 use bevy_abi_mod_guest_sys::{Host, SparseRows, SparseRowsMut, ValidatedIter};
-use bevy_abi_mod_sys::{AbiPod, BamColumnInfo, BamIter, FfiEntity, FfiResult};
+use bevy_abi_mod_sys::{AbiPod, BamChangeTicks, BamColumnInfo, BamIter, FfiEntity, FfiResult};
 
 use crate::{
-    app::IntoSystemResult,
+    app::{GuestRes, GuestResMut, IntoSystemResult},
     component::{GuestComponent, guest_uuid_filter},
     iter::{
         chunk::Chunk,
@@ -207,6 +207,39 @@ impl<'a> ChunkIter<'a> {
             .resource_mut_checked::<R>(term_index, Some(filter))
     }
 
+    /// Reads Bevy change-detection ticks for the singleton resource declared at `term_index`.
+    #[inline]
+    pub fn resource_ticks(&self, term_index: usize) -> Result<BamChangeTicks, FfiResult> {
+        self.inner.res_ticks(term_index)
+    }
+
+    /// Borrows singleton resource `R` (`R: GuestComponent`) wrapped with its [`BamChangeTicks`].
+    #[inline]
+    pub fn component_resource_with_ticks<R: GuestComponent>(
+        &self,
+        term_index: usize,
+    ) -> Result<GuestRes<'_, R>, FfiResult> {
+        let filter = guest_uuid_filter::<R>(self.inner.host().manifest_name());
+        self.inner
+            .resource_with_ticks_checked::<R>(term_index, Some(filter))
+            .map(|(val, ticks)| GuestRes::new(val, ticks))
+            .ok_or(FfiResult::NOT_FOUND)
+    }
+
+    /// Mutably borrows singleton resource `R` (`R: GuestComponent`) wrapped with its prior
+    /// [`BamChangeTicks`].
+    #[inline]
+    pub fn component_resource_mut_with_ticks<R: GuestComponent>(
+        &mut self,
+        term_index: usize,
+    ) -> Result<GuestResMut<'_, R>, FfiResult> {
+        let filter = guest_uuid_filter::<R>(self.inner.host().manifest_name());
+        self.inner
+            .resource_mut_with_ticks_checked::<R>(term_index, Some(filter))
+            .map(|(val, ticks)| GuestResMut::new(val, ticks))
+            .ok_or(FfiResult::NOT_FOUND)
+    }
+
     /// Processes disjoint chunk partitions in parallel on the host `ComputeTaskPool` (`P-07`).
     ///
     /// Panics inside `f` are caught per worker task and surfaced as [`FfiResult::PANIC_CAUGHT`]
@@ -281,6 +314,33 @@ impl<'a> ChunkIter<'a> {
         let filter = guest_uuid_filter::<M>(self.inner.host().manifest_name());
         self.inner
             .send_message_checked::<M>(term_index, Some(filter), msg)
+    }
+
+    /// Batch-sends POD messages (`M: AbiPod`) on `term_index` declared with `MESSAGE_WRITE`.
+    #[inline]
+    pub fn send_pod_messages<M: AbiPod>(
+        &mut self,
+        term_index: usize,
+        messages: &[M],
+    ) -> Result<(), FfiResult> {
+        let status = self
+            .inner
+            .send_messages_batch_checked::<M>(term_index, None, messages);
+        if status.is_ok() { Ok(()) } else { Err(status) }
+    }
+
+    /// Batch-sends messages (`M: GuestComponent`) on `term_index`, validating `M`'s UUID.
+    #[inline]
+    pub fn send_messages<M: GuestComponent>(
+        &mut self,
+        term_index: usize,
+        messages: &[M],
+    ) -> Result<(), FfiResult> {
+        let filter = guest_uuid_filter::<M>(self.inner.host().manifest_name());
+        let status =
+            self.inner
+                .send_messages_batch_checked::<M>(term_index, Some(filter), messages);
+        if status.is_ok() { Ok(()) } else { Err(status) }
     }
 }
 

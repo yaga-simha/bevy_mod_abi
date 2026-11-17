@@ -15,9 +15,10 @@ pub use bevy_abi_mod_guest_sys::{
     allocate_run_if_trampoline, allocate_system_trampoline, catch_guest_bool, catch_guest_result,
     catch_guest_unit, generic_drop_trampoline, guest_restore_state_trampoline,
     guest_save_state_trampoline, init_guest_instance, register_component_raw,
-    register_dynamic_component_with_drop, register_pod_component,
-    register_pod_component_with_hooks, register_system_closure, resolve_component,
-    shutdown_guest_instance, wrap_run_condition, wrap_system_callback,
+    register_component_with_layout, register_dynamic_component_with_drop,
+    register_observer_closure, register_pod_component, register_pod_component_with_hooks,
+    register_system_closure, resolve_component, shutdown_guest_instance, wrap_run_condition,
+    wrap_system_callback,
 };
 
 use crate::{

@@ -151,6 +151,38 @@ impl<'a> GuestCommands<'a> {
             Err(err) => err,
         }
     }
+
+    /// Triggers a global Bevy `Event` (`E: GuestComponent`) resolved on the host via deferred
+    /// `world.trigger(...)`.
+    #[inline]
+    pub fn trigger<E: GuestComponent>(&mut self, event: &E) -> Result<(), FfiResult> {
+        self.trigger_entity::<E>(FfiEntity::NULL, event)
+    }
+
+    /// Triggers an entity-targeted Bevy `EntityEvent` (`E: GuestComponent`) on `target` via deferred
+    /// `world.trigger(...)` / `world.trigger_dynamic_targets`.
+    #[inline]
+    pub fn trigger_entity<E: GuestComponent>(
+        &mut self,
+        target: FfiEntity,
+        event: &E,
+    ) -> Result<(), FfiResult> {
+        let host = self.inner.host();
+        let comp = resolve_guest_component::<E>(host, host.manifest_name())?;
+        self.trigger_handle(comp, target, event)
+    }
+
+    /// Triggers a pre-resolved event handle `handle` (Pass [`FfiEntity::NULL`] for global triggers).
+    #[inline]
+    pub fn trigger_handle<E: AbiPod>(
+        &mut self,
+        handle: BamComponent,
+        target: FfiEntity,
+        event: &E,
+    ) -> Result<(), FfiResult> {
+        let status = self.inner.trigger(handle, target, event);
+        if status.is_ok() { Ok(()) } else { Err(status) }
+    }
 }
 
 impl<'a> From<ValidatedCommands<'a>> for GuestCommands<'a> {

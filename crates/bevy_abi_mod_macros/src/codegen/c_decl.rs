@@ -25,7 +25,7 @@ fn map_scalar_type(ty: &Type) -> Option<(&'static str, &'static str)> {
             "usize" => Some(("size_t", "usize")),
             "isize" => Some(("ptrdiff_t", "isize")),
             "FfiBool" => Some(("BamBool", "bam.BamBool")),
-            "FfiEntity" => Some(("BamEntity", "bam.BamEntity")),
+            "FfiEntity" | "TargetEntity" => Some(("BamEntity", "bam.BamEntity")),
             "BamComponent" => Some(("BamComponent", "bam.BamComponent")),
             "ComponentUuid" => Some(("BamComponentUuid", "bam.BamComponentUuid")),
             _ => None,

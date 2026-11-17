@@ -390,6 +390,7 @@ pub(crate) fn initialize_query_groups_in_world(
                 storage_flags,
                 msg_read_batch_fn: reg.msg_read_batch_fn,
                 msg_send_fn: reg.msg_send_fn,
+                msg_write_batch_fn: reg.msg_write_batch_fn,
             });
         }
 

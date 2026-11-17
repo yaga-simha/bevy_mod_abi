@@ -49,7 +49,7 @@ pub use access::{
 };
 pub use commands::{
     BamCmdDespawnFn, BamCmdInsertDefaultFn, BamCmdInsertFn, BamCmdRemoveFn, BamCmdSpawnEmptyFn,
-    BamCmdSpawnFn, BamCommands,
+    BamCmdSpawnFn, BamCmdTriggerFn, BamCommands,
 };
 pub use component::{
     BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_COMPONENT_KNOWN_FLAGS,
@@ -59,25 +59,28 @@ pub use extensible::{ExtensibleStruct, read_descriptor, read_extensible_struct};
 pub use host_api::{
     BAM_MANIFEST_KNOWN_FLAGS, BamGetProcAddressFn, BamHostApi, BamInitFn, BamInstance,
     BamLastErrorFn, BamLoadHostCtxFn, BamManifest, BamManifestFn, BamRegisterComponentFn,
-    BamRegisterSystemFn, BamResolveComponentFn, BamRestoreStateFn, BamSaveStateFn, BamShutdownFn,
-    BamStateWriterFn, BamSysCommandsFn, BamSysEntityGetFn, BamSysEntityGetMutFn, BamSysHostCtxFn,
-    BamSysQueryFn,
+    BamRegisterObserverFn, BamRegisterSystemFn, BamResolveComponentFn, BamRestoreStateFn,
+    BamSaveStateFn, BamShutdownFn, BamStateWriterFn, BamSysCommandsFn, BamSysEntityGetFn,
+    BamSysEntityGetMutFn, BamSysHostCtxFn, BamSysQueryFn, BamSysResMutPtrFn, BamSysResPtrFn,
 };
 pub use iter::{
+    BAM_MAX_CHANGE_AGE, BAM_STORAGE_FLAG_ENTITY_EVENT, BAM_STORAGE_FLAG_EVENT,
     BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE,
-    BAM_STORAGE_FLAG_SPARSE_SET, BamChunkTaskFn, BamColumnInfo, BamIter, BamIterColumnInfoFn,
-    BamIterColumnMutableFn, BamIterColumnMutableUntrackedFn, BamIterColumnReadonlyFn,
-    BamIterColumnRowsMutableFn, BamIterColumnRowsReadonlyFn, BamIterEntitiesFn,
-    BamIterMarkChangedRangeFn, BamIterNextChunkFn, BamIterResetFn, BamMsgReadBatchFn, BamMsgSendFn,
-    BamParForEachChunkFn, BamResMutPtrFn, BamResPtrFn,
+    BAM_STORAGE_FLAG_SPARSE_SET, BamChangeTicks, BamChunkTaskFn, BamColumnInfo, BamIter,
+    BamIterColumnInfoFn, BamIterColumnMutableFn, BamIterColumnMutableUntrackedFn,
+    BamIterColumnReadonlyFn, BamIterColumnRowsMutableFn, BamIterColumnRowsReadonlyFn,
+    BamIterEntitiesFn, BamIterMarkChangedRangeFn, BamIterNextChunkFn, BamIterResetFn,
+    BamMsgReadBatchFn, BamMsgSendFn, BamMsgWriteBatchFn, BamParForEachChunkFn, BamResMutPtrFn,
+    BamResPtrFn, BamResTicksFn,
 };
 pub use primitives::{
-    BamComponent, ComponentUuid, FfiBool, FfiEntity, FfiResult, FfiSlice, SIPHASH_KEY_0,
-    SIPHASH_KEY_1, StrView, siphash24_128,
+    BAM_CHILD_OF_NAME, BamComponent, ComponentUuid, FfiBool, FfiChildOf, FfiEntity, FfiResult,
+    FfiSlice, SIPHASH_KEY_0, SIPHASH_KEY_1, StrView, siphash24_128,
 };
 pub use system::{
-    BAM_QUERY_KNOWN_FLAGS, BAM_SYSTEM_FLAG_MAIN_THREAD, BAM_SYSTEM_KNOWN_FLAGS, BamHostCtx,
-    BamLoadCtx, BamQueryDesc, BamRunIfFn, BamSystemCtx, BamSystemDesc, BamSystemFn,
+    BAM_OBSERVER_KNOWN_FLAGS, BAM_QUERY_KNOWN_FLAGS, BAM_SYSTEM_FLAG_MAIN_THREAD,
+    BAM_SYSTEM_KNOWN_FLAGS, BamHostCtx, BamLoadCtx, BamObserverDesc, BamObserverFn, BamQueryDesc,
+    BamRunIfFn, BamSystemCtx, BamSystemDesc, BamSystemFn,
 };
 pub use traits::{
     AbiPod, ModComponent, RawInsertable, SymbolEntry, assert_abi_pod, assert_raw_insertable,

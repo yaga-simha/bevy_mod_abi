@@ -13,18 +13,29 @@
 use crate::support::{NameTag, Position, Velocity};
 use bevy_abi_mod_host::prelude::*;
 use bevy_abi_mod_host_sys::{
-    BamQuerySpecOwned, GuestSystem, HOST_API, host_iter_column_mutable, host_iter_column_readonly,
+    BamQuerySpecOwned, GuestSystem, HOST_API, host_cmd_insert, host_cmd_remove, host_cmd_spawn,
+    host_cmd_spawn_empty, host_cmd_trigger, host_iter_column_mutable, host_iter_column_readonly,
     host_iter_column_rows_mutable, host_iter_entities, host_iter_next_chunk, host_msg_read_batch,
-    host_msg_send, host_par_for_each_chunk, host_sys_entity_get, host_sys_entity_get_mut,
-    host_sys_query,
+    host_msg_send, host_msg_write_batch, host_par_for_each_chunk, host_res_ticks,
+    host_sys_commands, host_sys_entity_get, host_sys_entity_get_mut, host_sys_host_ctx,
+    host_sys_query, host_sys_res_mut_ptr, host_sys_res_ptr,
 };
-use bevy_abi_mod_sys::{BamIter, BamRunIfFn, BamSystemCtx, ModComponent as _};
+use bevy_abi_mod_sys::{
+    BAM_CHILD_OF_NAME, BamChangeTicks, BamIter, BamRunIfFn, BamSystemCtx, ModComponent as _,
+};
 use bevy_app::{App, Update};
 use bevy_ecs::component::Component;
 use bevy_ecs::entity::Entity;
+use bevy_ecs::event::{EntityEvent, Event};
+use bevy_ecs::hierarchy::{ChildOf, Children};
+use bevy_ecs::lifecycle::HookContext;
 use bevy_ecs::message::{Message, Messages};
+use bevy_ecs::observer::On;
+use bevy_ecs::prelude::Resource;
 use bevy_ecs::query::Changed;
 use bevy_ecs::schedule::IntoScheduleConfigs;
+use bevy_ecs::system::System as BevySystem;
+use bevy_ecs::world::DeferredWorld;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -700,4 +711,644 @@ fn wave4_f03_random_entity_access_enforces_access_and_filters_and_marks_changed(
     );
     // ONLY `e_a` had `get_mut` called on it — `e_b` was read-only and must NOT be marked changed!
     assert_eq!(*changed_entities.lock().unwrap(), vec![e_a]);
+}
+
+#[derive(Component, Default, Clone, Copy, Debug, PartialEq, Eq)]
+struct PowerGridTag;
+
+static TURRET_ADD_EVENTS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+static TURRET_REMOVE_EVENTS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+fn turret_on_add(_world: DeferredWorld<'_>, ctx: HookContext) {
+    TURRET_ADD_EVENTS.lock().unwrap().push(ctx.entity.to_bits());
+}
+
+fn turret_on_remove(_world: DeferredWorld<'_>, ctx: HookContext) {
+    TURRET_REMOVE_EVENTS
+        .lock()
+        .unwrap()
+        .push(ctx.entity.to_bits());
+}
+
+#[repr(C)]
+#[derive(Component, Clone, Copy, Default, Debug, PartialEq, ModComponent)]
+#[require(PowerGridTag)]
+#[component(on_add = turret_on_add, on_remove = turret_on_remove)]
+#[mod_component(name = "wave5::Turret")]
+struct Turret {
+    range: f32,
+}
+
+#[test]
+fn wave5_req1_entity_world_mut_hooks_required_and_child_of_hierarchy() {
+    TURRET_ADD_EVENTS.lock().unwrap().clear();
+    TURRET_REMOVE_EVENTS.lock().unwrap().clear();
+
+    let mut app = App::new();
+    app.add_plugins(AbiModPlugin);
+    let turret_h = app
+        .register_mod_component::<Turret>(ComponentOptions::new())
+        .unwrap();
+
+    let reg = app.world().resource::<ModRegistry>().clone();
+    let child_of_h = reg
+        .get_by_name(BAM_CHILD_OF_NAME)
+        .expect("ChildOf must be registered automatically")
+        .handle;
+    assert_eq!(
+        reg.get_by_name("ChildOf").map(|c| c.handle),
+        Some(child_of_h)
+    );
+
+    let parent = app.world_mut().spawn_empty().id();
+    let parent_ffi = FfiEntity::from_bits(parent.to_bits());
+
+    struct SpawnHierarchyCtx {
+        parent: FfiEntity,
+        turret_h: BamComponent,
+        child_of_h: BamComponent,
+        spawned_a: AtomicU64,
+        spawned_b: AtomicU64,
+        phase: AtomicUsize,
+    }
+
+    unsafe extern "C" fn hierarchy_cmd_sys(
+        sys_ctx: *mut BamSystemCtx,
+        user_data: *mut c_void,
+    ) -> FfiResult {
+        let ctx = unsafe { &*(user_data as *const SpawnHierarchyCtx) };
+        let mut cmds = core::ptr::null_mut();
+        assert_eq!(
+            unsafe { host_sys_commands(sys_ctx, &mut cmds) },
+            FfiResult::OK
+        );
+
+        let phase = ctx.phase.fetch_add(1, Ordering::SeqCst);
+        if phase == 0 {
+            // 1. Validate null/invalid ChildOf payload rejection on both spawn and insert.
+            let bad_child = FfiChildOf::new(FfiEntity::NULL);
+            let t = Turret { range: 15.0 };
+            let comps = [ctx.turret_h, ctx.child_of_h];
+            let ptrs = [
+                core::ptr::from_ref(&t).cast::<u8>(),
+                core::ptr::from_ref(&bad_child).cast::<u8>(),
+            ];
+            let mut bad_e = FfiEntity::NULL;
+            assert_eq!(
+                unsafe { host_cmd_spawn(cmds, comps.as_ptr(), ptrs.as_ptr(), 2, &mut bad_e) },
+                FfiResult::INVALID_ENTITY
+            );
+
+            // 2. Batch-spawn child A with Turret (#[require(PowerGridTag)], hooks) + ChildOf(parent).
+            let valid_child_of = FfiChildOf::new(ctx.parent);
+            let ptrs_ok = [
+                core::ptr::from_ref(&t).cast::<u8>(),
+                core::ptr::from_ref(&valid_child_of).cast::<u8>(),
+            ];
+            let mut child_a = FfiEntity::NULL;
+            assert_eq!(
+                unsafe { host_cmd_spawn(cmds, comps.as_ptr(), ptrs_ok.as_ptr(), 2, &mut child_a) },
+                FfiResult::OK
+            );
+            ctx.spawned_a.store(child_a.to_bits(), Ordering::SeqCst);
+
+            // 3. Spawn empty child B, reject self-parenting, then insert Turret + ChildOf via cmd_insert.
+            let mut child_b = FfiEntity::NULL;
+            assert_eq!(
+                unsafe { host_cmd_spawn_empty(cmds, &mut child_b) },
+                FfiResult::OK
+            );
+            let self_parent = FfiChildOf::new(child_b);
+            assert_eq!(
+                unsafe {
+                    host_cmd_insert(
+                        cmds,
+                        child_b,
+                        ctx.child_of_h,
+                        core::ptr::from_ref(&self_parent).cast::<u8>(),
+                        core::mem::size_of::<FfiChildOf>(),
+                    )
+                },
+                FfiResult::INVALID_ARGUMENT
+            );
+            assert_eq!(
+                unsafe {
+                    host_cmd_insert(
+                        cmds,
+                        child_b,
+                        ctx.turret_h,
+                        core::ptr::from_ref(&Turret { range: 30.0 }).cast::<u8>(),
+                        core::mem::size_of::<Turret>(),
+                    )
+                },
+                FfiResult::OK
+            );
+            assert_eq!(
+                unsafe {
+                    host_cmd_insert(
+                        cmds,
+                        child_b,
+                        ctx.child_of_h,
+                        core::ptr::from_ref(&valid_child_of).cast::<u8>(),
+                        core::mem::size_of::<FfiChildOf>(),
+                    )
+                },
+                FfiResult::OK
+            );
+            ctx.spawned_b.store(child_b.to_bits(), Ordering::SeqCst);
+        } else if phase == 1 {
+            let child_a = FfiEntity::from_bits(ctx.spawned_a.load(Ordering::SeqCst));
+            assert_eq!(
+                unsafe { host_cmd_remove(cmds, child_a, ctx.child_of_h) },
+                FfiResult::OK
+            );
+            assert_eq!(
+                unsafe { host_cmd_remove(cmds, child_a, ctx.turret_h) },
+                FfiResult::OK
+            );
+        }
+        FfiResult::OK
+    }
+
+    let state = Arc::new(SpawnHierarchyCtx {
+        parent: parent_ffi,
+        turret_h,
+        child_of_h,
+        spawned_a: AtomicU64::new(0),
+        spawned_b: AtomicU64::new(0),
+        phase: AtomicUsize::new(0),
+    });
+
+    let sys = GuestSystem::new(
+        "hierarchy_cmd_sys",
+        Vec::new(),
+        hierarchy_cmd_sys,
+        Arc::as_ptr(&state) as *mut c_void,
+        reg,
+    );
+    app.add_systems(Update, sys);
+
+    app.update();
+
+    let child_a = Entity::from_bits(state.spawned_a.load(Ordering::SeqCst));
+    let child_b = Entity::from_bits(state.spawned_b.load(Ordering::SeqCst));
+
+    assert!(app.world().entity(child_a).contains::<PowerGridTag>());
+    assert!(app.world().entity(child_b).contains::<PowerGridTag>());
+    assert_eq!(
+        app.world().get::<ChildOf>(child_a).map(ChildOf::parent),
+        Some(parent)
+    );
+    assert_eq!(
+        app.world().get::<ChildOf>(child_b).map(ChildOf::parent),
+        Some(parent)
+    );
+    let children = app.world().get::<Children>(parent).unwrap();
+    assert!(children.contains(&child_a));
+    assert!(children.contains(&child_b));
+    assert_eq!(
+        *TURRET_ADD_EVENTS.lock().unwrap(),
+        vec![child_a.to_bits(), child_b.to_bits()]
+    );
+
+    // Phase 1: remove ChildOf & Turret on child_a via host_cmd_remove -> EntityWorldMut cleanup hooks fire.
+    app.update();
+    assert!(!app.world().entity(child_a).contains::<Turret>());
+    assert!(!app.world().entity(child_a).contains::<ChildOf>());
+    let children_after = app.world().get::<Children>(parent).unwrap();
+    assert!(!children_after.contains(&child_a));
+    assert!(children_after.contains(&child_b));
+    assert_eq!(
+        *TURRET_REMOVE_EVENTS.lock().unwrap(),
+        vec![child_a.to_bits()]
+    );
+}
+
+#[repr(C)]
+#[derive(Resource, Clone, Copy, Default, Debug, PartialEq, ModComponent)]
+#[mod_component(name = "wave5::SimClock")]
+struct SimClock {
+    elapsed: f32,
+    frame: u32,
+}
+
+#[test]
+fn wave5_req2_resource_lookup_by_handle_ticks_and_parallel_access() {
+    let mut app = App::new();
+    app.add_plugins(AbiModPlugin);
+    app.insert_resource(SimClock {
+        elapsed: 1.5,
+        frame: 1,
+    });
+    let clock_h = app.register_mod_resource::<SimClock>().unwrap();
+
+    // 1. Verify two RESOURCE_READ guest systems produce compatible `FilteredAccessSet`s (parallelizable).
+    let reg = app.world().resource::<ModRegistry>().clone();
+    let mut sys_a = GuestSystem::new(
+        "clock_reader_a",
+        vec![BamQuerySpecOwned::new(vec![BamTermDesc::new(
+            clock_h,
+            AccessMode::RESOURCE_READ,
+        )])],
+        dummy_ok_sys,
+        core::ptr::null_mut(),
+        reg.clone(),
+    );
+    let mut sys_b = GuestSystem::new(
+        "clock_reader_b",
+        vec![BamQuerySpecOwned::new(vec![BamTermDesc::new(
+            clock_h,
+            AccessMode::RESOURCE_READ,
+        )])],
+        dummy_ok_sys,
+        core::ptr::null_mut(),
+        reg.clone(),
+    );
+    let mut sys_w = GuestSystem::new(
+        "clock_writer",
+        vec![BamQuerySpecOwned::new(vec![BamTermDesc::new(
+            clock_h,
+            AccessMode::RESOURCE_WRITE,
+        )])],
+        dummy_ok_sys,
+        core::ptr::null_mut(),
+        reg.clone(),
+    );
+    let acc_a = BevySystem::initialize(&mut sys_a, app.world_mut());
+    let acc_b = BevySystem::initialize(&mut sys_b, app.world_mut());
+    let acc_w = BevySystem::initialize(&mut sys_w, app.world_mut());
+    assert!(acc_a.is_compatible(&acc_b));
+    assert!(!acc_a.is_compatible(&acc_w));
+
+    // 2. Test `host_sys_res_ptr`, `host_sys_res_mut_ptr`, and `host_res_ticks` across frames.
+    struct TickProbeCtx {
+        clock_h: BamComponent,
+        read_ticks: Mutex<Vec<BamChangeTicks>>,
+        write_ticks: Mutex<Vec<BamChangeTicks>>,
+        unauthorized_write_was_null: AtomicUsize,
+        unauthorized_error: Mutex<String>,
+        should_mutate: AtomicUsize,
+    }
+
+    unsafe extern "C" fn dummy_ok_sys(_: *mut BamSystemCtx, _: *mut c_void) -> FfiResult {
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn reader_probe_cb(
+        sys_ctx: *mut BamSystemCtx,
+        user_data: *mut c_void,
+    ) -> FfiResult {
+        let state = unsafe { &*(user_data as *const TickProbeCtx) };
+        let mut iter: *mut BamIter = core::ptr::null_mut();
+        assert_eq!(
+            unsafe { host_sys_query(sys_ctx, 0, &mut iter) },
+            FfiResult::OK
+        );
+
+        // Mutable lookup by handle on RESOURCE_READ-only system MUST be denied!
+        let mut denied_ticks = BamChangeTicks::default();
+        let bad_mut = unsafe { host_sys_res_mut_ptr(sys_ctx, state.clock_h, &mut denied_ticks) };
+        if bad_mut.is_null() {
+            state
+                .unauthorized_write_was_null
+                .fetch_add(1, Ordering::SeqCst);
+            let hctx = unsafe { host_sys_host_ctx(sys_ctx) };
+            let mut buf = [0i8; 256];
+            let len = unsafe {
+                bevy_abi_mod_host_sys::host_last_error(hctx, buf.as_mut_ptr(), buf.len())
+            };
+            let msg = unsafe { core::ffi::CStr::from_ptr(buf.as_ptr()) }
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert_eq!(len, msg.len());
+            *state.unauthorized_error.lock().unwrap() = msg;
+        }
+
+        let mut iter_ticks = BamChangeTicks::default();
+        assert_eq!(
+            unsafe { host_res_ticks(iter, 0, &mut iter_ticks) },
+            FfiResult::OK
+        );
+
+        let mut handle_ticks = BamChangeTicks::default();
+        let ptr = unsafe { host_sys_res_ptr(sys_ctx, state.clock_h, &mut handle_ticks) };
+        assert!(!ptr.is_null());
+        assert_eq!(handle_ticks, iter_ticks);
+        let clock = unsafe { &*ptr.cast::<SimClock>() };
+        assert!(clock.elapsed >= 1.5);
+
+        state.read_ticks.lock().unwrap().push(handle_ticks);
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn writer_probe_cb(
+        sys_ctx: *mut BamSystemCtx,
+        user_data: *mut c_void,
+    ) -> FfiResult {
+        let state = unsafe { &*(user_data as *const TickProbeCtx) };
+        if state.should_mutate.load(Ordering::SeqCst) == 0 {
+            return FfiResult::OK;
+        }
+        let mut prior_ticks = BamChangeTicks::default();
+        let ptr = unsafe { host_sys_res_mut_ptr(sys_ctx, state.clock_h, &mut prior_ticks) };
+        assert!(!ptr.is_null());
+        state.write_ticks.lock().unwrap().push(prior_ticks);
+        let clock = unsafe { &mut *ptr.cast::<SimClock>() };
+        clock.frame += 10;
+        FfiResult::OK
+    }
+
+    let state = Arc::new(TickProbeCtx {
+        clock_h,
+        read_ticks: Mutex::new(Vec::new()),
+        write_ticks: Mutex::new(Vec::new()),
+        unauthorized_write_was_null: AtomicUsize::new(0),
+        unauthorized_error: Mutex::new(String::new()),
+        should_mutate: AtomicUsize::new(0),
+    });
+
+    #[derive(bevy_ecs::schedule::SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+    struct ReaderSet;
+    #[derive(bevy_ecs::schedule::SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+    struct WriterSet;
+
+    let reader_sys = GuestSystem::new(
+        "probe_reader",
+        vec![BamQuerySpecOwned::new(vec![BamTermDesc::new(
+            clock_h,
+            AccessMode::RESOURCE_READ,
+        )])],
+        reader_probe_cb,
+        Arc::as_ptr(&state) as *mut c_void,
+        reg.clone(),
+    );
+    let writer_sys = GuestSystem::new(
+        "probe_writer",
+        vec![BamQuerySpecOwned::new(vec![BamTermDesc::new(
+            clock_h,
+            AccessMode::RESOURCE_WRITE,
+        )])],
+        writer_probe_cb,
+        Arc::as_ptr(&state) as *mut c_void,
+        reg,
+    );
+    app.add_systems(
+        Update,
+        (
+            reader_sys.in_set(ReaderSet),
+            writer_sys.in_set(WriterSet).after(ReaderSet),
+        ),
+    );
+
+    // Frame 1: newly added SimClock -> is_added() == true && is_changed() == true
+    app.update();
+    assert_eq!(state.unauthorized_write_was_null.load(Ordering::SeqCst), 1);
+    assert!(
+        state
+            .unauthorized_error
+            .lock()
+            .unwrap()
+            .contains("ResourceWrite")
+    );
+    {
+        let ticks = state.read_ticks.lock().unwrap();
+        assert_eq!(ticks.len(), 1);
+        assert!(ticks[0].is_added());
+        assert!(ticks[0].is_changed());
+    }
+
+    // Frame 2: untouched -> is_added() == false && is_changed() == false
+    app.update();
+    {
+        let ticks = state.read_ticks.lock().unwrap();
+        assert_eq!(ticks.len(), 2);
+        assert!(!ticks[1].is_added());
+        assert!(!ticks[1].is_changed());
+    }
+
+    // Frame 3: guest writer mutates via `host_sys_res_mut_ptr`, so Frame 4 reader sees `is_changed() == true`!
+    state.should_mutate.store(1, Ordering::SeqCst);
+    app.update();
+    state.should_mutate.store(0, Ordering::SeqCst);
+    app.update();
+    {
+        let ticks = state.read_ticks.lock().unwrap();
+        assert_eq!(ticks.len(), 4);
+        assert!(!ticks[3].is_added());
+        assert!(ticks[3].is_changed());
+    }
+    assert_eq!(app.world().resource::<SimClock>().frame, 11);
+}
+
+#[repr(C)]
+#[derive(Message, Clone, Copy, Debug, PartialEq, Eq, ModComponent)]
+#[mod_component(name = "wave5::TelemetryMsg")]
+struct TelemetryMsg {
+    code: u32,
+    val: i32,
+}
+
+#[repr(C)]
+#[derive(Event, Clone, Copy, Debug, PartialEq, Eq, ModComponent)]
+#[mod_component(name = "wave5::WavePing")]
+struct WavePing {
+    wave: u32,
+}
+
+#[repr(C)]
+#[derive(EntityEvent, Clone, Copy, Debug, PartialEq, ModComponent)]
+#[mod_component(name = "wave5::DamageApplied")]
+struct DamageApplied {
+    #[event_target]
+    entity: TargetEntity,
+    amount: f32,
+}
+
+#[test]
+fn wave5_req5_messages_batch_write_and_cmd_trigger_entity_events() {
+    let mut app = App::new();
+    app.add_plugins(AbiModPlugin);
+    let msg_h = app.register_mod_message::<TelemetryMsg>().unwrap();
+    let ping_h = app.register_mod_event::<WavePing>().unwrap();
+    let dmg_h = app.register_mod_entity_event::<DamageApplied>().unwrap();
+
+    let e_watched = app.world_mut().spawn_empty().id();
+    let e_other = app.world_mut().spawn_empty().id();
+
+    let observed_log: Arc<Mutex<Vec<(u32, u64, i32)>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_ping = Arc::clone(&observed_log);
+    app.world_mut().add_observer(move |on: On<WavePing>| {
+        log_ping.lock().unwrap().push((1, 0, on.wave as i32));
+    });
+
+    let log_dmg = Arc::clone(&observed_log);
+    app.world_mut()
+        .entity_mut(e_watched)
+        .observe(move |on: On<DamageApplied>| {
+            log_dmg
+                .lock()
+                .unwrap()
+                .push((2, on.entity.to_bits(), on.amount as i32));
+        });
+
+    struct BatchAndTriggerCtx {
+        target_watched: FfiEntity,
+        target_other: FfiEntity,
+        ping_h: BamComponent,
+        dmg_h: BamComponent,
+        read_msgs: Mutex<Vec<TelemetryMsg>>,
+    }
+
+    unsafe extern "C" fn batch_sender_and_trigger(
+        sys_ctx: *mut BamSystemCtx,
+        user_data: *mut c_void,
+    ) -> FfiResult {
+        let state = unsafe { &*(user_data as *const BatchAndTriggerCtx) };
+        let mut iter: *mut BamIter = core::ptr::null_mut();
+        assert_eq!(
+            unsafe { host_sys_query(sys_ctx, 0, &mut iter) },
+            FfiResult::OK
+        );
+        let msgs = [
+            TelemetryMsg { code: 10, val: -1 },
+            TelemetryMsg { code: 20, val: 2 },
+            TelemetryMsg { code: 30, val: 99 },
+        ];
+        assert_eq!(
+            unsafe { host_msg_write_batch(iter, 0, msgs.as_ptr().cast::<u8>(), msgs.len()) },
+            FfiResult::OK
+        );
+
+        let mut cmds = core::ptr::null_mut();
+        assert_eq!(
+            unsafe { host_sys_commands(sys_ctx, &mut cmds) },
+            FfiResult::OK
+        );
+        let ping = WavePing { wave: 7 };
+        assert_eq!(
+            unsafe {
+                host_cmd_trigger(
+                    cmds,
+                    state.ping_h,
+                    FfiEntity::NULL,
+                    core::ptr::from_ref(&ping).cast::<u8>(),
+                    core::mem::size_of::<WavePing>(),
+                )
+            },
+            FfiResult::OK
+        );
+        // Fire EntityEvent for both `e_other` (no entity observer on it) and `e_watched`.
+        let dmg_other = DamageApplied {
+            entity: TargetEntity::from(state.target_other),
+            amount: 12.0,
+        };
+        assert_eq!(
+            unsafe {
+                host_cmd_trigger(
+                    cmds,
+                    state.dmg_h,
+                    state.target_other,
+                    core::ptr::from_ref(&dmg_other).cast::<u8>(),
+                    core::mem::size_of::<DamageApplied>(),
+                )
+            },
+            FfiResult::OK
+        );
+        let dmg_watched = DamageApplied {
+            entity: TargetEntity::from(state.target_watched),
+            amount: 42.0,
+        };
+        assert_eq!(
+            unsafe {
+                host_cmd_trigger(
+                    cmds,
+                    state.dmg_h,
+                    FfiEntity::NULL,
+                    core::ptr::from_ref(&dmg_watched).cast::<u8>(),
+                    core::mem::size_of::<DamageApplied>(),
+                )
+            },
+            FfiResult::OK
+        );
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn batch_reader_cb(
+        sys_ctx: *mut BamSystemCtx,
+        user_data: *mut c_void,
+    ) -> FfiResult {
+        let state = unsafe { &*(user_data as *const BatchAndTriggerCtx) };
+        let mut iter: *mut BamIter = core::ptr::null_mut();
+        assert_eq!(
+            unsafe { host_sys_query(sys_ctx, 0, &mut iter) },
+            FfiResult::OK
+        );
+        let mut out = [TelemetryMsg { code: 0, val: 0 }; 8];
+        let mut count = 0usize;
+        assert_eq!(
+            unsafe { host_msg_read_batch(iter, 0, out.as_mut_ptr().cast::<u8>(), 8, &mut count) },
+            FfiResult::OK
+        );
+        state
+            .read_msgs
+            .lock()
+            .unwrap()
+            .extend_from_slice(&out[..count]);
+        FfiResult::OK
+    }
+
+    let state = Arc::new(BatchAndTriggerCtx {
+        target_watched: FfiEntity::from_bits(e_watched.to_bits()),
+        target_other: FfiEntity::from_bits(e_other.to_bits()),
+        ping_h,
+        dmg_h,
+        read_msgs: Mutex::new(Vec::new()),
+    });
+
+    #[derive(bevy_ecs::schedule::SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+    struct WriteBatchSet;
+    let reg = app.world().resource::<ModRegistry>().clone();
+    let writer_sys = GuestSystem::new(
+        "batch_writer",
+        vec![BamQuerySpecOwned::new(vec![BamTermDesc::new(
+            msg_h,
+            AccessMode::MESSAGE_WRITE,
+        )])],
+        batch_sender_and_trigger,
+        Arc::as_ptr(&state) as *mut c_void,
+        reg.clone(),
+    );
+    let reader_sys = GuestSystem::new(
+        "batch_reader",
+        vec![BamQuerySpecOwned::new(vec![BamTermDesc::new(
+            msg_h,
+            AccessMode::MESSAGE_READ,
+        )])],
+        batch_reader_cb,
+        Arc::as_ptr(&state) as *mut c_void,
+        reg,
+    );
+    app.add_systems(
+        Update,
+        (
+            writer_sys.in_set(WriteBatchSet),
+            reader_sys.after(WriteBatchSet),
+        ),
+    );
+
+    app.update();
+
+    assert_eq!(
+        *state.read_msgs.lock().unwrap(),
+        vec![
+            TelemetryMsg { code: 10, val: -1 },
+            TelemetryMsg { code: 20, val: 2 },
+            TelemetryMsg { code: 30, val: 99 },
+        ]
+    );
+    assert_eq!(
+        *observed_log.lock().unwrap(),
+        vec![(1, 0, 7), (2, e_watched.to_bits(), 42)]
+    );
 }

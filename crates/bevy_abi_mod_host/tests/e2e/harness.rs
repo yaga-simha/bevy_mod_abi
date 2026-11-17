@@ -742,6 +742,12 @@ pub static MOCK_HOST_API: BamHostApi = BamHostApi {
     sys_entity_get_mut: None,
     msg_read_batch: None,
     msg_send: None,
+    msg_write_batch: None,
+    res_ticks: None,
+    sys_res_ptr: None,
+    sys_res_mut_ptr: None,
+    register_observer: None,
+    cmd_trigger: None,
 };
 
 // ============================================================================

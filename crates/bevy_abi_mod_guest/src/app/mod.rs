@@ -5,4 +5,4 @@ pub mod builder;
 pub mod context;
 
 pub use builder::{GuestApp, IntoSystemResult, QueryBuilder, SystemBuilder};
-pub use context::{MultiQueryContext, RunConditionContext, SystemContext};
+pub use context::{GuestRes, GuestResMut, MultiQueryContext, RunConditionContext, SystemContext};

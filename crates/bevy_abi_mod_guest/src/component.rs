@@ -125,6 +125,11 @@ pub trait GuestComponent: AbiPod {
     };
 }
 
+impl GuestComponent for bevy_abi_mod_sys::FfiChildOf {
+    const NAME: &'static CStr = c"bevy_ecs::hierarchy::ChildOf";
+    const UUID: ComponentUuid = bevy_abi_mod_sys::FfiChildOf::UUID;
+}
+
 /// Computes the qualified registration `(CString, ComponentUuid)` for `T: GuestComponent` inside a
 /// mod whose manifest name is `manifest_name`.
 ///

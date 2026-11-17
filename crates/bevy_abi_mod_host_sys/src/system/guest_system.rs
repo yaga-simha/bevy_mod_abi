@@ -16,8 +16,8 @@ use crate::system::error_policy::{
 };
 use crate::system::query_group::{BamQuerySpecOwned, CachedQueryGroup, MAX_SYSTEM_QUERIES};
 use bevy_abi_mod_sys::{
-    AccessMode, BamCommands, BamHostCtx, BamIter, BamRunIfFn, BamSystemCtx, BamSystemFn, FfiEntity,
-    FfiResult, ScheduleId,
+    AccessMode, BamChangeTicks, BamCommands, BamComponent, BamHostCtx, BamIter, BamRunIfFn,
+    BamSystemCtx, BamSystemFn, FfiEntity, FfiResult, ScheduleId,
 };
 use bevy_ecs::archetype::ArchetypeId;
 use bevy_ecs::change_detection::{CheckChangeTicks, Tick};
@@ -416,6 +416,155 @@ pub unsafe extern "C" fn host_sys_entity_get_mut(
     }
 }
 
+/// Looks up a singleton read-only `Resource` by its pre-resolved [`BamComponent`] handle
+/// (`host_sys_res_ptr`) across this system's declared queries, optionally writing its Bevy
+/// change-detection ticks into `out_ticks` (nullable).
+///
+/// Returns null if `sys_ctx` is invalid, `component` was not declared with `RESOURCE_READ` or
+/// `RESOURCE_WRITE` in this system, `out_ticks` is non-null and misaligned, or the resource is absent.
+///
+/// # Safety
+/// - `sys_ctx` must point to an active [`HostSystemCtx`] cast to [`BamSystemCtx`], or null.
+/// - If `out_ticks` is non-null, it must point to aligned writable [`BamChangeTicks`] storage.
+pub unsafe extern "C" fn host_sys_res_ptr(
+    sys_ctx: *const BamSystemCtx,
+    component: BamComponent,
+    out_ticks: *mut BamChangeTicks,
+) -> *const u8 {
+    // SAFETY: Validating `sys_ctx` against `SYS_CTX_MAGIC` under `STRICT_FFI_CHECKS`.
+    let Ok(ctx) = (unsafe {
+        validate_handle_ref::<HostSystemCtx<'_>>(sys_ctx.cast::<c_void>(), SYS_CTX_MAGIC, false)
+    }) else {
+        return core::ptr::null();
+    };
+    if !out_ticks.is_null() && !out_ticks.is_aligned() {
+        ctx.host_ctx
+            .set_last_error("sys_res_ptr: misaligned out_ticks pointer");
+        return core::ptr::null();
+    }
+    let Some(term) = ctx
+        .query_views
+        .iter()
+        .take(ctx.query_count)
+        .flatten()
+        .flat_map(|v| v.plan.terms.iter())
+        .find(|t| t.component == component && t.mode.is_resource() && t.is_resource())
+    else {
+        ctx.host_ctx.set_last_error(
+            "sys_res_ptr: resource handle was not declared with ResourceRead or ResourceWrite in any query of this system",
+        );
+        return core::ptr::null();
+    };
+    let Some(world) = ctx.world else {
+        return core::ptr::null();
+    };
+    // SAFETY: `RESOURCE_READ` or `RESOURCE_WRITE` on `term.component_id` was declared in `FilteredAccessSet`.
+    let Some(entity) = (unsafe { world.resource_entities() }).get(term.component_id) else {
+        return core::ptr::null();
+    };
+    let Ok(entity_cell) = world.get_entity(entity) else {
+        return core::ptr::null();
+    };
+    if !out_ticks.is_null() {
+        // SAFETY: Shared read access to `term.component_id` was declared in `FilteredAccessSet`.
+        if let Some(ticks) = unsafe { entity_cell.get_change_ticks_by_id(term.component_id) } {
+            // SAFETY: `out_ticks` is non-null, aligned, and exclusively writable here.
+            unsafe {
+                *out_ticks = BamChangeTicks {
+                    added: ticks.added.get(),
+                    changed: ticks.changed.get(),
+                    last_run: ctx.last_run.get(),
+                    this_run: ctx.this_run.get(),
+                };
+            }
+        }
+    }
+    // SAFETY: Shared read access to `term.component_id` was declared in `FilteredAccessSet`.
+    match unsafe { entity_cell.get_by_id(term.component_id) } {
+        Some(ptr) => ptr.as_ptr(),
+        None => core::ptr::null(),
+    }
+}
+
+/// Looks up an exclusive mutable singleton `Resource` by its pre-resolved [`BamComponent`] handle
+/// (`host_sys_res_mut_ptr`), optionally writing its prior Bevy change-detection ticks into
+/// `out_ticks` (nullable) and stamping `changed = this_run`.
+///
+/// Returns null if `sys_ctx` is invalid, `component` was not declared with `RESOURCE_WRITE` in
+/// this system (or is immutable), `out_ticks` is non-null and misaligned, or the resource is absent.
+///
+/// # Safety
+/// - `sys_ctx` must point to an active [`HostSystemCtx`] cast to [`BamSystemCtx`], or null.
+/// - If `out_ticks` is non-null, it must point to aligned writable [`BamChangeTicks`] storage.
+pub unsafe extern "C" fn host_sys_res_mut_ptr(
+    sys_ctx: *mut BamSystemCtx,
+    component: BamComponent,
+    out_ticks: *mut BamChangeTicks,
+) -> *mut u8 {
+    // SAFETY: Validating `sys_ctx` against `SYS_CTX_MAGIC` under `STRICT_FFI_CHECKS`.
+    let Ok(ctx) = (unsafe {
+        validate_handle_mut::<HostSystemCtx<'_>>(sys_ctx.cast::<c_void>(), SYS_CTX_MAGIC, false)
+    }) else {
+        return core::ptr::null_mut();
+    };
+    if !out_ticks.is_null() && !out_ticks.is_aligned() {
+        ctx.host_ctx
+            .set_last_error("sys_res_mut_ptr: misaligned out_ticks pointer");
+        return core::ptr::null_mut();
+    }
+    let Some(term) = ctx
+        .query_views
+        .iter()
+        .take(ctx.query_count)
+        .flatten()
+        .flat_map(|v| v.plan.terms.iter())
+        .find(|t| {
+            t.component == component && t.mode == AccessMode::RESOURCE_WRITE && t.is_resource()
+        })
+    else {
+        ctx.host_ctx.set_last_error(
+            "sys_res_mut_ptr: resource handle was not declared with ResourceWrite in this system",
+        );
+        return core::ptr::null_mut();
+    };
+    if term.is_immutable() {
+        ctx.host_ctx
+            .set_last_error("sys_res_mut_ptr: resource is immutable");
+        return core::ptr::null_mut();
+    }
+    let Some(world) = ctx.world else {
+        return core::ptr::null_mut();
+    };
+    // SAFETY: `RESOURCE_WRITE` on `term.component_id` was declared in `FilteredAccessSet`.
+    let Some(entity) = (unsafe { world.resource_entities() }).get(term.component_id) else {
+        return core::ptr::null_mut();
+    };
+    if !out_ticks.is_null()
+        && let Ok(read_cell) = world.get_entity(entity)
+        && let Some(ticks) =
+            // SAFETY: No alias exists yet; reading prior change ticks before mutable borrow.
+            unsafe { read_cell.get_change_ticks_by_id(term.component_id) }
+    {
+        // SAFETY: `out_ticks` is non-null, aligned, and exclusively writable here.
+        unsafe {
+            *out_ticks = BamChangeTicks {
+                added: ticks.added.get(),
+                changed: ticks.changed.get(),
+                last_run: ctx.last_run.get(),
+                this_run: ctx.this_run.get(),
+            };
+        }
+    }
+    let Ok(entity_cell) = world.get_entity_with_ticks(entity, ctx.last_run, ctx.this_run) else {
+        return core::ptr::null_mut();
+    };
+    // SAFETY: Exclusive mutable access to this resource component is guaranteed by Bevy's scheduler.
+    let Ok(mut_untyped) = (unsafe { entity_cell.get_mut_by_id(term.component_id) }) else {
+        return core::ptr::null_mut();
+    };
+    mut_untyped.into_inner().as_ptr()
+}
+
 /// Host-side Bevy [`System`] wrapping a unified ABI v0.2 [`BamSystemFn`] callback (`N-02`).
 pub struct GuestSystem {
     name: Arc<str>,
@@ -438,6 +587,7 @@ pub struct GuestSystem {
     is_main_thread: bool,
     after_systems: Vec<String>,
     before_systems: Vec<String>,
+    in_sets: Vec<String>,
     error_policy: ModErrorPolicy,
     error_policy_explicit: bool,
 
@@ -487,6 +637,7 @@ impl GuestSystem {
             is_main_thread: false,
             after_systems: Vec::new(),
             before_systems: Vec::new(),
+            in_sets: Vec::new(),
             error_policy: ModErrorPolicy::Quarantine,
             error_policy_explicit: false,
             enabled_flag: Arc::new(AtomicBool::new(true)),
@@ -659,6 +810,18 @@ impl GuestSystem {
     #[inline]
     pub fn before_systems(&self) -> &[String] {
         &self.before_systems
+    }
+
+    /// Configures explicit `in_sets` membership target names (`"host::<set>"` or named sets).
+    pub fn with_in_sets(mut self, in_sets: Vec<String>) -> Self {
+        self.in_sets = in_sets;
+        self
+    }
+
+    /// System-set membership target names declared in `BamSystemDesc::in_sets`.
+    #[inline]
+    pub fn in_sets(&self) -> &[String] {
+        &self.in_sets
     }
 
     /// Returns the [`ModErrorPolicy`] governing faults in this system.

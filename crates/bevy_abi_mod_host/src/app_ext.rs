@@ -8,6 +8,7 @@ use bevy_abi_mod_host_sys::{
 use bevy_abi_mod_sys::{AbiPod, BamComponent, ModComponent, ScheduleId};
 use bevy_app::App;
 use bevy_ecs::component::Component;
+use bevy_ecs::event::{EntityEvent, Event};
 use bevy_ecs::message::{Message, Messages};
 use bevy_ecs::prelude::Resource;
 use bevy_ecs::schedule::{ScheduleLabel, SystemSet};
@@ -48,6 +49,19 @@ pub trait ModAppExt {
     fn register_mod_message<M: Message + ModComponent + AbiPod>(
         &mut self,
     ) -> Result<BamComponent, ComponentCollisionError>;
+
+    /// Registers a triggerable host Bevy [`Event`] implementing [`ModComponent`] + [`Copy`],
+    /// returning its 1-based [`BamComponent`] handle.
+    fn register_mod_event<E>(&mut self) -> Result<BamComponent, ComponentCollisionError>
+    where
+        E: Event<Trigger<'static>: Default> + ModComponent + Copy;
+
+    /// Registers a triggerable entity-targeted Bevy [`EntityEvent`] implementing [`ModComponent`]
+    /// + [`Copy`], returning its 1-based [`BamComponent`] handle.
+    fn register_mod_entity_event<E>(&mut self) -> Result<BamComponent, ComponentCollisionError>
+    where
+        E: EntityEvent + Event + ModComponent + Copy,
+        for<'a> E::Trigger<'a>: Default;
 
     /// Registers a non-component [`ModComponent`] helper/nested struct type so its static VTable
     /// and field accessors are resolvable via `get_proc_address`.
@@ -125,6 +139,23 @@ impl ModAppExt for App {
             self.add_message::<M>();
         }
         self.world_mut().register_mod_message::<M>()
+    }
+
+    #[inline]
+    fn register_mod_event<E>(&mut self) -> Result<BamComponent, ComponentCollisionError>
+    where
+        E: Event<Trigger<'static>: Default> + ModComponent + Copy,
+    {
+        self.world_mut().register_mod_event::<E>()
+    }
+
+    #[inline]
+    fn register_mod_entity_event<E>(&mut self) -> Result<BamComponent, ComponentCollisionError>
+    where
+        E: EntityEvent + Event + ModComponent + Copy,
+        for<'a> E::Trigger<'a>: Default,
+    {
+        self.world_mut().register_mod_entity_event::<E>()
     }
 
     #[inline]

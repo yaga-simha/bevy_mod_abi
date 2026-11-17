@@ -23,7 +23,8 @@ use crate::registry::{InsertDefaultFn, RegistrySnapshot};
 use bevy_abi_mod_sys::{BamCommands, BamComponent, FfiEntity, FfiResult};
 use bevy_ecs::component::ComponentId;
 use bevy_ecs::entity::{Entity, EntityAllocator};
-use bevy_ecs::ptr::OwningPtr;
+use bevy_ecs::event::{EntityTrigger, GlobalTrigger};
+use bevy_ecs::ptr::{OwningPtr, PtrMut};
 use bevy_ecs::world::World;
 use core::ffi::c_void;
 use core::mem::MaybeUninit;
@@ -236,6 +237,11 @@ enum RecordedCommand {
         entity: Entity,
         component_id: ComponentId,
     },
+    Trigger {
+        component: BamComponent,
+        target: Option<Entity>,
+        slice: ArenaSlice,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -243,6 +249,7 @@ struct BatchItem {
     component_id: ComponentId,
     slice: ArenaSlice,
     drop_slot: Option<usize>,
+    validates_entity_payload: bool,
 }
 
 /// Persistent per-system command buffer storage reused across frames with zero steady-state heap
@@ -366,28 +373,57 @@ impl HostCommandsStorage {
                     batch_start,
                     batch_len,
                 } => {
+                    let mut include = [true; MAX_SPAWN_BATCH_COMPONENTS];
+                    for (idx, item) in self.batch_items[batch_start..(batch_start + batch_len)]
+                        .iter()
+                        .enumerate()
+                    {
+                        if item.validates_entity_payload {
+                            let nn = self.arena.ptr_mut(item.slice);
+                            // SAFETY: `validates_entity_payload` entries hold an 8-byte `FfiEntity`.
+                            let raw_bits =
+                                unsafe { core::ptr::read_unaligned(nn.as_ptr().cast::<u64>()) };
+                            let valid_parent = Entity::try_from_bits(raw_bits)
+                                .is_some_and(|p| p != entity && world.entities().contains(p));
+                            if !valid_parent {
+                                include[idx] = false;
+                                tracing::warn!(
+                                    child = ?entity,
+                                    parent_bits = raw_bits,
+                                    "skipping ChildOf during spawn because parent entity is invalid or equals child"
+                                );
+                            }
+                        }
+                    }
                     if let Ok(mut entity_mut) = world.spawn_empty_at(entity) {
                         self.scratch_ids.clear();
                         let batch_slice =
                             &mut self.batch_items[batch_start..(batch_start + batch_len)];
-                        for item in batch_slice.iter_mut() {
-                            // Ownership of each payload transfers into Bevy ECS below.
+                        for (idx, item) in batch_slice.iter_mut().enumerate() {
+                            // Ownership of each payload transfers into Bevy ECS below (or is skipped).
                             item.drop_slot = None;
-                            self.scratch_ids.push(item.component_id);
+                            if include[idx] {
+                                self.scratch_ids.push(item.component_id);
+                            }
                         }
-                        let arena = &mut self.arena;
-                        let ptrs_iter = batch_slice.iter().map(|item| {
-                            let nn = arena.ptr_mut(item.slice);
-                            // SAFETY: Each `nn` points to disjoint aligned arena storage matching
-                            // the registered `(size, align)` of `scratch_ids[k]` (or an aligned
-                            // ZST provenance-free address), transferring ownership into Bevy ECS.
-                            unsafe { OwningPtr::new(nn) }
-                        });
-                        // SAFETY: `scratch_ids` has no duplicate `ComponentId`s (verified during
-                        // `host_cmd_spawn`), matches `ptrs_iter` length, and each `ComponentId`
-                        // was registered in `world` with the exact payload layout.
-                        unsafe {
-                            entity_mut.insert_by_ids(&self.scratch_ids, ptrs_iter);
+                        if !self.scratch_ids.is_empty() {
+                            let arena = &mut self.arena;
+                            let ptrs_iter = batch_slice
+                                .iter()
+                                .enumerate()
+                                .filter(|(idx, _)| include[*idx])
+                                .map(|(_, item)| {
+                                    let nn = arena.ptr_mut(item.slice);
+                                    // SAFETY: Each `nn` points to disjoint aligned arena storage matching
+                                    // the registered `(size, align)` of `scratch_ids[k]`, transferring ownership into Bevy ECS.
+                                    unsafe { OwningPtr::new(nn) }
+                                });
+                            // SAFETY: `scratch_ids` has no duplicate `ComponentId`s (verified during
+                            // `host_cmd_spawn`), matches `ptrs_iter` length, and each `ComponentId`
+                            // was registered in `world` with the exact payload layout.
+                            unsafe {
+                                entity_mut.insert_by_ids(&self.scratch_ids, ptrs_iter);
+                            }
                         }
                     } else {
                         for item in &mut self.batch_items[batch_start..(batch_start + batch_len)] {
@@ -430,6 +466,21 @@ impl HostCommandsStorage {
                         continue;
                     };
                     let nn = self.arena.ptr_mut(slice);
+                    if meta.validates_entity_payload {
+                        // SAFETY: `validates_entity_payload` components hold an 8-byte `FfiEntity`.
+                        let raw_bits =
+                            unsafe { core::ptr::read_unaligned(nn.as_ptr().cast::<u64>()) };
+                        let valid_parent = Entity::try_from_bits(raw_bits)
+                            .is_some_and(|p| p != entity && world.entities().contains(p));
+                        if !valid_parent {
+                            tracing::warn!(
+                                child = ?entity,
+                                parent_bits = raw_bits,
+                                "skipping ChildOf insert because parent entity is invalid or equals child"
+                            );
+                            continue;
+                        }
+                    }
                     if !meta.is_dynamic {
                         if let Some(insert_fn) = meta.insert_raw_fn {
                             // SAFETY: `nn` points to `meta.size` bytes aligned to `meta.align`
@@ -464,6 +515,48 @@ impl HostCommandsStorage {
                 } => {
                     if let Ok(mut entity_mut) = world.get_entity_mut(entity) {
                         entity_mut.remove_by_id(component_id);
+                    }
+                }
+                RecordedCommand::Trigger {
+                    component,
+                    target,
+                    slice,
+                } => {
+                    let Some(meta) = snapshot.get_by_handle(component) else {
+                        continue;
+                    };
+                    if let Some(t) = target
+                        && !world.entities().contains(t)
+                    {
+                        continue;
+                    }
+                    let nn = self.arena.ptr_mut(slice);
+                    if let Some(trigger_fn) = meta.trigger_event_fn {
+                        // SAFETY: `nn` holds `meta.size` bytes for `meta`'s registered event type.
+                        unsafe {
+                            let _ = trigger_fn(world, target, nn.as_ptr().cast_const());
+                        }
+                    } else if let Some(event_key) = meta.event_key {
+                        // SAFETY: `nn` is aligned to `meta.align` and valid for `meta.size` bytes
+                        // inside `self.arena` for the duration of this synchronous `trigger_dynamic*`.
+                        let event_mut = unsafe { PtrMut::new(nn) };
+                        if let Some(t) = target {
+                            let mut trigger = EntityTrigger;
+                            let trigger_mut = PtrMut::from(&mut trigger);
+                            // SAFETY: `event_key` was registered from `ComponentId` with `(meta.size, meta.align)`
+                            // and `trigger_mut` points to ZST `EntityTrigger`.
+                            unsafe {
+                                world.trigger_dynamic_targets(event_key, t, event_mut, trigger_mut);
+                            }
+                        } else {
+                            let mut trigger = GlobalTrigger;
+                            let trigger_mut = PtrMut::from(&mut trigger);
+                            // SAFETY: `event_key` was registered from `ComponentId` with `(meta.size, meta.align)`
+                            // and `trigger_mut` points to ZST `GlobalTrigger`.
+                            unsafe {
+                                world.trigger_dynamic(event_key, event_mut, trigger_mut);
+                            }
+                        }
                     }
                 }
             }
@@ -627,9 +720,9 @@ pub unsafe extern "C" fn host_cmd_spawn(
 
     // Pass 1: Validate every component handle, raw-insert permission, non-null payload, and
     // absence of duplicate `ComponentId`s BEFORE allocating an entity or mutating batch buffers.
-    let mut validated: [(ComponentId, usize, usize, *const u8, Option<usize>);
+    let mut validated: [(ComponentId, usize, usize, *const u8, Option<usize>, bool);
         MAX_SPAWN_BATCH_COMPONENTS] =
-        [(ComponentId::new(0), 0, 1, core::ptr::null(), None); MAX_SPAWN_BATCH_COMPONENTS];
+        [(ComponentId::new(0), 0, 1, core::ptr::null(), None, false); MAX_SPAWN_BATCH_COMPONENTS];
 
     for i in 0..count {
         // SAFETY: `components` and `data_ptrs` are non-null and caller guarantees `count` elements.
@@ -649,6 +742,17 @@ pub unsafe extern "C" fn host_cmd_spawn(
         if meta.size > 0 && ptr.is_null() {
             return FfiResult::NULL_POINTER;
         }
+        if meta.validates_entity_payload {
+            if meta.size != core::mem::size_of::<FfiEntity>() {
+                return FfiResult::INVALID_ARGUMENT;
+            }
+            // SAFETY: `ptr` is non-null and points to 8 bytes (`FfiEntity`) above.
+            let raw_bits = unsafe { core::ptr::read_unaligned(ptr.cast::<u64>()) };
+            let target = FfiEntity::from_bits(raw_bits);
+            if validate_command_entity(target).is_err() {
+                return FfiResult::INVALID_ENTITY;
+            }
+        }
         for prev in &validated[..i] {
             if prev.0 == meta.component_id {
                 return FfiResult::INVALID_ARGUMENT;
@@ -659,12 +763,21 @@ pub unsafe extern "C" fn host_cmd_spawn(
         } else {
             None
         };
-        validated[i] = (meta.component_id, meta.size, meta.align, ptr, drop_slot);
+        validated[i] = (
+            meta.component_id,
+            meta.size,
+            meta.align,
+            ptr,
+            drop_slot,
+            meta.validates_entity_payload,
+        );
     }
 
     // Pass 2: Copy payloads into `CommandArena` and record single `SpawnBatch`.
     let batch_start = cmds.storage.batch_items.len();
-    for &(component_id, size, align, ptr, drop_slot) in &validated[..count] {
+    for &(component_id, size, align, ptr, drop_slot, validates_entity_payload) in
+        &validated[..count]
+    {
         // SAFETY: `ptr` was verified non-null when `size > 0`, and caller guarantees `size` readable bytes.
         let slice = match unsafe { cmds.storage.arena.alloc_copy_raw(ptr, size, align) } {
             Ok(s) => s,
@@ -686,6 +799,7 @@ pub unsafe extern "C" fn host_cmd_spawn(
             component_id,
             slice,
             drop_slot,
+            validates_entity_payload,
         });
     }
 
@@ -766,6 +880,20 @@ pub unsafe extern "C" fn host_cmd_insert(
         Ok(e) => e,
         Err(err) => return err,
     };
+    if meta.validates_entity_payload {
+        if data_len != core::mem::size_of::<FfiEntity>() {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        // SAFETY: `data_ptr` is non-null (`data_len == 8`) and readable for 8 bytes.
+        let raw_bits = unsafe { core::ptr::read_unaligned(data_ptr.cast::<u64>()) };
+        let parent_ffi = FfiEntity::from_bits(raw_bits);
+        let Ok(parent) = validate_command_entity(parent_ffi) else {
+            return FfiResult::INVALID_ENTITY;
+        };
+        if parent == bevy_entity {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+    }
 
     // SAFETY: `data_ptr` is non-null when `data_len > 0` and readable for `meta.size` bytes.
     let slice = match unsafe {
@@ -860,6 +988,89 @@ pub unsafe extern "C" fn host_cmd_remove(
     cmds.storage.commands.push(RecordedCommand::Remove {
         entity: bevy_entity,
         component_id: meta.component_id,
+    });
+    FfiResult::OK
+}
+
+/// Queues deferred `world.trigger(...)` or `world.trigger_dynamic*` for pre-resolved `event`.
+///
+/// Pass `FfiEntity::NONE` as `target` for global events, or a valid non-null entity handle for
+/// `EntityEvent` triggers.
+///
+/// # Safety
+/// - `commands` must point to an active [`HostCommands`] cast to [`BamCommands`], or null.
+/// - When `data_len > 0`, `data_ptr` must point to at least `data_len` initialized readable bytes.
+pub unsafe extern "C" fn host_cmd_trigger(
+    commands: *mut BamCommands,
+    event: BamComponent,
+    target: FfiEntity,
+    data_ptr: *const u8,
+    data_len: usize,
+) -> FfiResult {
+    if data_len > 0 && data_ptr.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: Validating `commands` against `COMMANDS_MAGIC` under `STRICT_FFI_CHECKS`.
+    let cmds = match unsafe {
+        validate_handle_mut::<HostCommands<'_>>(commands.cast::<c_void>(), COMMANDS_MAGIC, false)
+    } {
+        Ok(c) => c,
+        Err(err) => return err,
+    };
+
+    let Some(meta) = cmds.snapshot.get_by_handle(event) else {
+        return FfiResult::INVALID_COMPONENT;
+    };
+    if meta.is_resource()
+        || meta.is_message()
+        || meta.event_key.is_none()
+        || meta.drop_fn.is_some()
+        || meta.drop_slot.is_some()
+    {
+        return FfiResult::INVALID_COMPONENT;
+    }
+    if meta.size != data_len {
+        return FfiResult::INVALID_ARGUMENT;
+    }
+
+    let mut target_entity = if target.is_null() {
+        None
+    } else {
+        Some(match validate_command_entity(target) {
+            Ok(e) => e,
+            Err(err) => return err,
+        })
+    };
+
+    if meta.is_entity_event() && target_entity.is_none() {
+        if let Some(extract_fn) = meta.extract_event_target_fn {
+            // SAFETY: `data_ptr` has `meta.size` bytes matching the `EntityEvent` layout.
+            let Some(extracted) = (unsafe { extract_fn(data_ptr) }) else {
+                return FfiResult::INVALID_ENTITY;
+            };
+            if extracted == Entity::PLACEHOLDER {
+                return FfiResult::INVALID_ENTITY;
+            }
+            target_entity = Some(extracted);
+        } else {
+            return FfiResult::INVALID_ENTITY;
+        }
+    }
+
+    // SAFETY: `data_ptr` is non-null when `meta.size > 0` and readable for `meta.size` bytes.
+    let slice = match unsafe {
+        cmds.storage
+            .arena
+            .alloc_copy_raw(data_ptr, meta.size, meta.align)
+    } {
+        Ok(s) => s,
+        Err(err) => return err,
+    };
+
+    cmds.storage.commands.push(RecordedCommand::Trigger {
+        component: event,
+        target: target_entity,
+        slice,
     });
     FfiResult::OK
 }

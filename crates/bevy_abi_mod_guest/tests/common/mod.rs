@@ -1405,5 +1405,11 @@ pub fn make_mock_host_api() -> BamHostApi {
         sys_entity_get_mut: Some(host_sys_entity_get_mut),
         msg_read_batch: Some(host_msg_read_batch),
         msg_send: Some(host_msg_send),
+        msg_write_batch: None,
+        res_ticks: None,
+        sys_res_ptr: None,
+        sys_res_mut_ptr: None,
+        register_observer: None,
+        cmd_trigger: None,
     }
 }

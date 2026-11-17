@@ -19,6 +19,28 @@ typedef struct HookedAura {
 } HookedAura;
 
 typedef void (*W4RecordHookFn)(BamEntity entity, uint32_t is_remove, uint32_t strength);
+typedef void (*W5RecordEventFn)(uint32_t kind, BamEntity target, uint32_t value_u32, float value_f32);
+typedef BamEntity (*W5GetWatchedFn)(void);
+
+typedef struct CPrivateLayout {
+    uint64_t magic;
+    uint32_t counter;
+    uint32_t pad0;
+} CPrivateLayout;
+
+typedef struct W5WavePing {
+    uint32_t wave;
+} W5WavePing;
+
+typedef struct W5DamageApplied {
+    BamEntity target;
+    float amount;
+    uint32_t pad0;
+} W5DamageApplied;
+
+typedef struct W5DamagedMark {
+    uint32_t hits;
+} W5DamagedMark;
 
 typedef struct W4Instance {
     BamHostApi     api;
@@ -29,8 +51,82 @@ typedef struct W4Instance {
     uint32_t       fail_next_restore;
     BamComponent   probe_res;
     BamComponent   aura_comp;
+    BamComponent   private_comp;
+    BamComponent   damaged_mark_comp;
     W4RecordHookFn record_hook;
+    W5RecordEventFn w5_record;
 } W4Instance;
+
+static void w5_private_drop(void* ptr) {
+    CPrivateLayout* layout = (CPrivateLayout*)ptr;
+    (void)layout;
+    if (ptr != NULL) {
+        /* Note: called via host WorldDropGuard when entity despawns before unload. */
+        layout->magic = 0ull;
+    }
+}
+
+static W5RecordEventFn g_w5_last_drop_cb = NULL;
+
+static void w5_private_drop_recorded(void* ptr) {
+    CPrivateLayout* layout = (CPrivateLayout*)ptr;
+    if (layout != NULL && g_w5_last_drop_cb != NULL) {
+        g_w5_last_drop_cb(99u, BAM_ENTITY_NULL, layout->counter, (float)layout->magic);
+    }
+    w5_private_drop(ptr);
+}
+
+static BamResult w5_global_ping_obs(
+    BamEntity target_entity,
+    const void* event_data,
+    BamCommands* commands,
+    void* user_data
+) {
+    W4Instance* inst = (W4Instance*)user_data;
+    const W5WavePing* ping = (const W5WavePing*)event_data;
+    (void)commands;
+    if (inst != NULL && inst->w5_record != NULL && ping != NULL) {
+        inst->w5_record(1u, target_entity, ping->wave, 0.0f);
+    }
+    return BAM_RESULT_OK;
+}
+
+static BamResult w5_damage_entity_obs(
+    BamEntity target_entity,
+    const void* event_data,
+    BamCommands* commands,
+    void* user_data
+) {
+    W4Instance* inst = (W4Instance*)user_data;
+    const W5DamageApplied* dmg = (const W5DamageApplied*)event_data;
+    if (inst != NULL && inst->w5_record != NULL && dmg != NULL) {
+        inst->w5_record(2u, target_entity, 0u, dmg->amount);
+        if (commands != NULL && bam_component_is_valid(inst->damaged_mark_comp) && target_entity != BAM_ENTITY_NULL) {
+            W5DamagedMark mark;
+            mark.hits = (uint32_t)dmg->amount;
+            inst->api.cmd_insert(commands, target_entity, inst->damaged_mark_comp, (const uint8_t*)&mark, sizeof(mark));
+        }
+    }
+    return BAM_RESULT_OK;
+}
+
+static BamResult w5_in_set_sys_cb(BamSystemCtx* sys_ctx, void* user_data) {
+    W4Instance* inst = (W4Instance*)user_data;
+    (void)sys_ctx;
+    if (inst != NULL && inst->w5_record != NULL) {
+        inst->w5_record(5u, BAM_ENTITY_NULL, 0u, 0.0f);
+    }
+    return BAM_RESULT_OK;
+}
+
+static BamResult w5_fixed_sys_cb(BamSystemCtx* sys_ctx, void* user_data) {
+    W4Instance* inst = (W4Instance*)user_data;
+    (void)sys_ctx;
+    if (inst != NULL && inst->w5_record != NULL) {
+        inst->w5_record(6u, BAM_ENTITY_NULL, 0u, 0.0f);
+    }
+    return BAM_RESULT_OK;
+}
 
 static void w4_aura_on_add(BamEntity entity, const void* component_ptr, void* user_data) {
     W4Instance* inst = (W4Instance*)user_data;
@@ -220,6 +316,101 @@ BAM_EXPORT BamResult bevy_abi_mod_init(
         if (rc != BAM_RESULT_OK) {
             free(inst);
             return rc;
+        }
+    }
+
+    if (inst->api.resolve_component(inst->host_ctx, "w5::EnableObserverAndLayoutTest", NULL, &step_res) == BAM_RESULT_OK) {
+        BamComponentDesc priv_desc;
+        BamComponent ping_ev = BAM_COMPONENT_INVALID;
+        BamComponent dmg_ev = BAM_COMPONENT_INVALID;
+        BamObserverDesc obs_ping;
+        BamObserverDesc obs_dmg;
+
+        inst->w5_record = (W5RecordEventFn)inst->api.get_proc_address(
+            inst->host_ctx,
+            "bam.v0.w5.record_event"
+        );
+        g_w5_last_drop_cb = inst->w5_record;
+
+        priv_desc = bam_desc_component_with_layout(
+            "w4_ext_mod::CPrivateLayout",
+            sizeof(CPrivateLayout),
+            BAM_ALIGNOF(CPrivateLayout),
+            w5_private_drop_recorded
+        );
+        rc = inst->api.register_component(load_ctx, &priv_desc, &inst->private_comp);
+        if (rc != BAM_RESULT_OK) {
+            free(inst);
+            return rc;
+        }
+
+        (void)inst->api.resolve_component(
+            inst->host_ctx,
+            "w5::DamagedMark",
+            NULL,
+            &inst->damaged_mark_comp
+        );
+
+        if (inst->api.resolve_component(inst->host_ctx, "w5::WavePing", NULL, &ping_ev) == BAM_RESULT_OK) {
+            obs_ping = bam_observer_desc(ping_ev, BAM_ENTITY_NULL, w5_global_ping_obs, inst);
+            obs_ping.name = "w5_c_ping_obs";
+            rc = inst->api.register_observer(load_ctx, &obs_ping);
+            if (rc != BAM_RESULT_OK) {
+                free(inst);
+                return rc;
+            }
+        }
+        if (inst->api.resolve_component(inst->host_ctx, "w5::DamageApplied", NULL, &dmg_ev) == BAM_RESULT_OK) {
+            /* Global watch or specific target handle passed via W5TargetHolder resource if desired; test both global EntityEvent & entity-scoped via BAM_ENTITY_NULL. */
+            BamComponent tgt_res = BAM_COMPONENT_INVALID;
+            BamEntity watched = BAM_ENTITY_NULL;
+            if (inst->api.resolve_component(inst->host_ctx, "w5::WatchedTarget", NULL, &tgt_res) == BAM_RESULT_OK) {
+                W5GetWatchedFn get_watched = (W5GetWatchedFn)inst->api.get_proc_address(
+                    inst->host_ctx,
+                    "bam.v0.w5.get_watched_target"
+                );
+                if (get_watched != NULL) {
+                    watched = get_watched();
+                }
+            }
+            obs_dmg = bam_observer_desc(dmg_ev, watched, w5_damage_entity_obs, inst);
+            obs_dmg.name = "w5_c_damage_obs";
+            rc = inst->api.register_observer(load_ctx, &obs_dmg);
+            if (rc != BAM_RESULT_OK) {
+                free(inst);
+                return rc;
+            }
+        }
+
+        if (inst->api.resolve_component(inst->host_ctx, "w5::EnableInSetTest", NULL, &step_res) == BAM_RESULT_OK) {
+            static const char* const IN_SET_LOGIC[] = { "host::w5_logic" };
+            BamSystemDesc logic_desc;
+            BamSystemDesc fixed_desc;
+            memset(&logic_desc, 0, sizeof(logic_desc));
+            logic_desc.struct_size = (uint32_t)sizeof(BamSystemDesc);
+            logic_desc.name = "w5_in_set_logic";
+            logic_desc.callback = w5_in_set_sys_cb;
+            logic_desc.user_data = inst;
+            logic_desc.schedule = BAM_SCHEDULE_UPDATE;
+            logic_desc.in_sets = IN_SET_LOGIC;
+            logic_desc.in_set_count = 1u;
+            rc = inst->api.register_system(load_ctx, &logic_desc);
+            if (rc != BAM_RESULT_OK) {
+                free(inst);
+                return rc;
+            }
+
+            memset(&fixed_desc, 0, sizeof(fixed_desc));
+            fixed_desc.struct_size = (uint32_t)sizeof(BamSystemDesc);
+            fixed_desc.name = "w5_fixed_step";
+            fixed_desc.callback = w5_fixed_sys_cb;
+            fixed_desc.user_data = inst;
+            fixed_desc.schedule = BAM_SCHEDULE_FIXED_UPDATE;
+            rc = inst->api.register_system(load_ctx, &fixed_desc);
+            if (rc != BAM_RESULT_OK) {
+                free(inst);
+                return rc;
+            }
         }
     }
 

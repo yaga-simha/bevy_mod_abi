@@ -1113,3 +1113,38 @@ fn wave4_f01_f02_f03_f04_state_messages_random_get_and_hooks() {
 
     world.unload_instance(inst_ext);
 }
+
+#[test]
+fn wave5_guest_sdk_child_of_ticks_and_in_set_smoke() {
+    use bevy_abi_mod_guest::prelude::*;
+
+    assert_eq!(FfiChildOf::NAME, c"bevy_ecs::hierarchy::ChildOf");
+    assert_eq!(
+        FfiChildOf::UUID,
+        ComponentUuid::from_parts("bevy_ecs::hierarchy::ChildOf", 8, 8, 0)
+    );
+
+    let mut val = 10u32;
+    let ticks = BamChangeTicks {
+        added: 5,
+        changed: 8,
+        last_run: 5,
+        this_run: 8,
+    };
+    let r = GuestRes::new(&val, ticks);
+    assert!(!r.is_added());
+    assert!(r.is_changed());
+    assert_eq!(*r, 10);
+
+    let ticks_mut = BamChangeTicks {
+        added: 10,
+        changed: 10,
+        last_run: 10,
+        this_run: 12,
+    };
+    let mut rm = GuestResMut::new(&mut val, ticks_mut);
+    assert!(!rm.is_added());
+    assert!(!rm.is_changed());
+    *rm += 5;
+    assert_eq!(*rm, 15);
+}

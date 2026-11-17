@@ -4,8 +4,9 @@
 use crate::drop_trampoline::{
     StagedDropBinding, StagedHookBinding, WorldDropGuard, prune_drop_trampolines_for_guard,
 };
+use crate::ffi::commands::{HostCommands, HostCommandsStorage};
 use crate::ffi::host_api::HOST_API;
-use crate::ffi::register::LoadContext;
+use crate::ffi::register::{GuestObserverBinding, LoadContext};
 use crate::loader::error::{ModLoadError, is_abi_version_compatible};
 use crate::loader::shared_lib::{
     LoadOptions, LoadedLibrary, SharedLibState, shared_lib_state_for_path,
@@ -13,18 +14,20 @@ use crate::loader::shared_lib::{
 use crate::loader::transaction::LoadTransaction;
 use crate::registry::{ModRegistry, RegistrySnapshot};
 use crate::schedule::{ModNamedSystemSet, ModSystemSet};
-use crate::sync_ptr::GuestInstancePtr;
+use crate::sync_ptr::{GuestFnPtr, GuestInstancePtr};
 use crate::system::{GuestSystem, ModQuarantine};
 use bevy_abi_mod_sys::{
     ABI_VERSION, BamInitFn, BamInstance, BamManifest, BamManifestFn, BamRestoreStateFn,
-    BamSaveStateFn, BamShutdownFn, FfiResult, read_descriptor,
+    BamSaveStateFn, BamShutdownFn, FfiEntity, FfiResult, read_descriptor,
 };
 use bevy_ecs::component::Component;
 use bevy_ecs::entity::Entity;
 use bevy_ecs::message::Message;
+use bevy_ecs::observer::{Observer, TriggerContext};
 use bevy_ecs::prelude::Resource;
+use bevy_ecs::ptr::PtrMut;
 use bevy_ecs::schedule::{InternedScheduleLabel, ScheduleCleanupPolicy, Schedules};
-use bevy_ecs::world::World;
+use bevy_ecs::world::{DeferredWorld, World};
 use bevy_platform::collections::{HashMap, HashSet};
 use core::ffi::{CStr, c_void};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -126,6 +129,77 @@ pub struct LoadedMod {
     is_active: Arc<AtomicBool>,
     lib_state: Arc<Mutex<SharedLibState>>,
     pub(crate) registered_named_sets: Vec<(InternedScheduleLabel, ModNamedSystemSet)>,
+    pub(crate) observer_entities: Vec<Entity>,
+}
+
+#[derive(Component)]
+struct ModObserverState(Arc<GuestObserverBinding>);
+
+/// Dynamic [`ObserverRunner`](bevy_ecs::observer::ObserverRunner) dispatching Bevy `Event` /
+/// `EntityEvent` triggers into a registered guest [`BamObserverFn`].
+///
+/// # Safety
+/// - `world` must be the [`DeferredWorld`] owning `observer`.
+/// - `event_ptr` must point to an initialized value matching the registered event layout.
+unsafe fn guest_observer_runner(
+    mut world: DeferredWorld,
+    observer: Entity,
+    _trigger_ctx: &TriggerContext,
+    event_ptr: PtrMut,
+    _trigger_ptr: PtrMut,
+) {
+    let Some(binding) = world
+        .get::<ModObserverState>(observer)
+        .map(|state| Arc::clone(&state.0))
+    else {
+        return;
+    };
+    if !binding.is_active.load(Ordering::Acquire) {
+        return;
+    }
+
+    let target_ffi = if let Some(extract_fn) = binding.extract_target_fn {
+        // SAFETY: `event_ptr` holds an initialized `EntityEvent` matching `binding.event_id`.
+        match unsafe { extract_fn(event_ptr.as_ptr()) } {
+            Some(entity) => FfiEntity::from_bits(entity.to_bits()),
+            None => FfiEntity::NULL,
+        }
+    } else if let Some(watched) = binding.target_entity {
+        FfiEntity::from_bits(watched.to_bits())
+    } else {
+        FfiEntity::NULL
+    };
+
+    let mut storage = HostCommandsStorage::new();
+    let snap = binding.registry.latest_snapshot_arc();
+    let status = {
+        let cell = world.as_unsafe_world_cell();
+        let allocator = cell.entity_allocator();
+        let mut host_cmds = HostCommands::new(&mut storage, allocator, &snap);
+        let GuestFnPtr(callback) = binding.callback;
+        let data_ptr = if binding.event_size == 0 {
+            core::ptr::null()
+        } else {
+            event_ptr.as_ptr().cast::<c_void>()
+        };
+        // SAFETY: `binding.is_active` is verified true and `host_cmds` is poisoned before exit.
+        unsafe {
+            callback(
+                target_ffi,
+                data_ptr,
+                host_cmds.as_ffi_ptr(),
+                binding.user_data.as_ptr(),
+            )
+        }
+    };
+
+    if status == FfiResult::OK && !storage.is_empty() {
+        world.commands().queue(move |w: &mut World| {
+            storage.apply_to_world(w, &snap);
+        });
+    } else {
+        storage.clear();
+    }
 }
 
 impl LoadedMod {
@@ -490,11 +564,30 @@ impl ModHost {
             });
         }
 
-        // Ensure `World`'s `ModRegistry` reflects any components registered during `init`.
+        // Ensure `World`'s `ModRegistry` reflects any components registered during `init`,
+        // and spawn any dynamic observers registered during `init`.
+        let mut observer_entities = Vec::new();
         if !world_ptr.is_null() {
             // SAFETY: `world_ptr` is exclusively borrowed and `load_ctx` holds no live `&mut World`.
             let world = unsafe { &mut *world_ptr };
             world.insert_resource(load_ctx.registry.clone());
+            if !load_ctx.registered_observers.is_empty() {
+                for mut obs_binding in core::mem::take(&mut load_ctx.registered_observers) {
+                    obs_binding.registry = load_ctx.registry.clone();
+                    obs_binding.mod_id = Some(mod_id);
+                    let mut obs = Observer::with_dynamic_runner(guest_observer_runner);
+                    // SAFETY: `obs_binding.event_key` was resolved/registered in `world` with matching payload layout.
+                    obs = unsafe { obs.with_event_key(obs_binding.event_key) };
+                    if let Some(target) = obs_binding.target_entity {
+                        obs.watch_entity(target);
+                    }
+                    let obs_entity = world
+                        .spawn((obs, ModObserverState(Arc::new(obs_binding))))
+                        .id();
+                    observer_entities.push(obs_entity);
+                }
+                world.flush();
+            }
         }
 
         for sys in &mut load_ctx.registered_systems {
@@ -540,6 +633,7 @@ impl ModHost {
             is_active,
             lib_state,
             registered_named_sets: Vec::new(),
+            observer_entities,
         });
 
         Ok((mod_id, systems))
@@ -654,16 +748,23 @@ pub fn rollback_unscheduled_mod_in_world(world: &mut World, id: ModId) {
         h.get_mod_mut(id).map(|m| {
             let staged = core::mem::take(&mut m.staged_drop_bindings);
             let staged_hooks = core::mem::take(&mut m.staged_hook_bindings);
+            let observers = core::mem::take(&mut m.observer_entities);
             (
                 staged,
                 staged_hooks,
+                observers,
                 Arc::clone(&m.is_active),
                 Arc::clone(&m.pre_snapshot),
             )
         })
     });
 
-    if let Some((staged, staged_hooks, is_active, snap)) = rollback_data {
+    if let Some((staged, staged_hooks, observers, is_active, snap)) = rollback_data {
+        for obs_entity in observers {
+            if let Ok(e) = world.get_entity_mut(obs_entity) {
+                e.despawn();
+            }
+        }
         if let Some(mut drop_guard) = world.get_resource_mut::<WorldDropGuard>() {
             drop_guard.rollback_staged_bindings(&staged);
             drop_guard.rollback_staged_hook_bindings(&staged_hooks);
@@ -696,7 +797,7 @@ pub fn excise_and_unload_mod_in_world<F: FnOnce(&mut World)>(
     id: ModId,
     before_dlclose: F,
 ) -> Result<(Arc<str>, PathBuf, usize), ModLoadError> {
-    let (owned_named_sets, shared_named_sets) = {
+    let (owned_named_sets, shared_named_sets, observer_entities) = {
         let Some(mut mod_host) = world.get_resource_mut::<ModHost>() else {
             return Err(ModLoadError::ModNotFound { id });
         };
@@ -705,6 +806,7 @@ pub fn excise_and_unload_mod_in_world<F: FnOnce(&mut World)>(
         };
         prune_drop_trampolines_for_guard(&mod_host.loaded_libraries[idx].is_active);
         let taken = core::mem::take(&mut mod_host.loaded_libraries[idx].registered_named_sets);
+        let observers = core::mem::take(&mut mod_host.loaded_libraries[idx].observer_entities);
         let shared: HashSet<(InternedScheduleLabel, ModNamedSystemSet)> = mod_host
             .loaded_libraries
             .iter()
@@ -712,8 +814,14 @@ pub fn excise_and_unload_mod_in_world<F: FnOnce(&mut World)>(
             .filter(|&(i, m)| i != idx && m.is_active())
             .flat_map(|(_, m)| m.registered_named_sets.iter().cloned())
             .collect();
-        (taken, shared)
+        (taken, shared, observers)
     };
+
+    for obs_entity in observer_entities {
+        if let Ok(e) = world.get_entity_mut(obs_entity) {
+            e.despawn();
+        }
+    }
 
     let mut removed_systems = 0usize;
     if let Some(schedules) = world.get_resource::<Schedules>() {

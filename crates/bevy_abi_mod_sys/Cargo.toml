@@ -11,3 +11,6 @@ workspace = true
 
 [dependencies]
 # Zero external dependencies. Strictly no_std.
+
+[package.metadata.cargo-semver-checks.lints]
+constructible_struct_adds_field = "allow"

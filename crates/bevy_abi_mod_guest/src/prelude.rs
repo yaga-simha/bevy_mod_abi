@@ -3,9 +3,10 @@
 pub use bevy_abi_mod_guest_sys::SpawnEntry;
 pub use bevy_abi_mod_sys::{
     ABI_VERSION, AbiPod, AccessMode, BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET,
-    BAM_SYSTEM_FLAG_MAIN_THREAD, BamColumnInfo, BamComponent, BamManifest, ComponentUuid, FfiBool,
-    FfiEntity, FfiResult, FfiSlice, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent,
-    RawInsertable, ScheduleId, StrView, VTableHeader,
+    BAM_SYSTEM_FLAG_MAIN_THREAD, BamChangeTicks, BamColumnInfo, BamComponent, BamManifest,
+    BamObserverDesc, BamObserverFn, ComponentUuid, FfiBool, FfiChildOf, FfiEntity, FfiResult,
+    FfiSlice, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent, RawInsertable, ScheduleId,
+    StrView, VTableHeader,
 };
 
 #[cfg(feature = "derive")]
@@ -13,8 +14,8 @@ pub use bevy_abi_mod_macros::{AbiPod, ModComponent};
 
 pub use crate::{
     app::{
-        GuestApp, MultiQueryContext, QueryBuilder, RunConditionContext, SystemBuilder,
-        SystemContext,
+        GuestApp, GuestRes, GuestResMut, MultiQueryContext, QueryBuilder, RunConditionContext,
+        SystemBuilder, SystemContext,
     },
     commands::GuestCommands,
     component::{GuestComponent, GuestComponentHooks, guest_component_uuid},

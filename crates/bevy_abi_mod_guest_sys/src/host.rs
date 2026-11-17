@@ -9,10 +9,14 @@ use bevy_abi_mod_sys::{
 };
 
 use crate::{
-    component::{PodComponentHooks, register_pod_component, register_pod_component_with_hooks},
+    component::{
+        PodComponentHooks, register_component_with_layout, register_pod_component,
+        register_pod_component_with_hooks,
+    },
     instance::GuestInstance,
     trampoline::{
-        PreparedRunIf, SystemRegistrationConfig, ValidatedSystemInvocation, register_system_closure,
+        PreparedRunIf, SystemRegistrationConfig, ValidatedSystemInvocation,
+        register_observer_closure, register_system_closure,
     },
 };
 
@@ -350,6 +354,48 @@ impl<'a> ValidatedLoadCtx<'a> {
                 core::ptr::null(),
                 hooks,
             )
+        }
+    }
+
+    /// Registers a runtime layout-defined dynamic component (`name`, `size`, `align`, `drop_fn`)
+    /// backed by `ComponentDescriptor::new_with_layout` on the host.
+    #[inline]
+    pub fn register_component_with_layout(
+        &self,
+        instance: &mut GuestInstance,
+        name: &str,
+        size: usize,
+        align: usize,
+        drop_fn: Option<bevy_abi_mod_sys::ComponentDropFn>,
+    ) -> Result<BamComponent, FfiResult> {
+        // SAFETY: `self.raw` was validated in `ValidatedLoadCtx::from_raw`.
+        unsafe { register_component_with_layout(instance, self.raw, name, size, align, drop_fn) }
+    }
+
+    /// Registers a dynamic Bevy ECS [`Observer`](bevy_abi_mod_sys::BamObserverDesc) callback on
+    /// this validated load context, storing all owned state inside `instance`.
+    #[inline]
+    pub fn register_observer<E, F>(
+        &self,
+        instance: &mut GuestInstance,
+        name: &str,
+        event: BamComponent,
+        target: bevy_abi_mod_sys::FfiEntity,
+        callback: F,
+    ) -> FfiResult
+    where
+        E: AbiPod,
+        F: FnMut(
+                bevy_abi_mod_sys::FfiEntity,
+                &E,
+                &mut crate::commands::ValidatedCommands<'_>,
+            ) -> FfiResult
+            + Send
+            + 'static,
+    {
+        // SAFETY: `self.raw` was validated as an active `BamLoadCtx` in `ValidatedLoadCtx::from_raw`.
+        unsafe {
+            register_observer_closure::<E, F>(instance, self.raw, name, event, target, callback)
         }
     }
 

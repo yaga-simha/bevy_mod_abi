@@ -2,7 +2,10 @@
 
 use core::ffi::c_void;
 
-use crate::primitives::{BamComponent, ComponentUuid, FfiBool, FfiEntity};
+use crate::{
+    BamChangeTicks,
+    primitives::{BamComponent, ComponentUuid, FfiBool, FfiChildOf, FfiEntity},
+};
 
 /// Marker trait for types without internal heap ownership, drop glue, or invalid bit patterns
 /// that support same-process raw byte moves and unaligned reads.
@@ -109,6 +112,8 @@ impl_abi_pod_primitives!(
     FfiBool,
     BamComponent,
     FfiEntity,
+    FfiChildOf,
+    BamChangeTicks,
     ComponentUuid,
 );
 

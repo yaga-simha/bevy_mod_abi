@@ -177,7 +177,8 @@ pub(crate) fn classify_type(ty: &Type, attr_override: FieldAttrOverride) -> syn:
                     (
                         PathArguments::None,
                         "f32" | "f64" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
-                        | "FfiBool" | "FfiEntity" | "BamComponent" | "ComponentUuid",
+                        | "FfiBool" | "FfiEntity" | "TargetEntity" | "BamComponent"
+                        | "ComponentUuid",
                     ) => {
                         return Ok(FieldKind::Primitive {
                             ty: boxed_ty(),

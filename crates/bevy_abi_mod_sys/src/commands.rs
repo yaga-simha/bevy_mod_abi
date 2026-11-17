@@ -80,3 +80,18 @@ pub type BamCmdRemoveFn = unsafe extern "C" fn(
     entity: FfiEntity,
     component: BamComponent,
 ) -> FfiResult;
+
+/// Queues deferred observer trigger (`World::trigger`) for pre-resolved `event` (`data_len` bytes
+/// at `data_ptr`), optionally targeting `target` (`FfiEntity::NULL` for global `Event` triggers
+/// or non-null target for `EntityEvent` triggers).
+///
+/// # Safety
+/// - `commands` must point to an active [`BamCommands`] belonging to the running system invocation.
+/// - If `data_len > 0`, `data_ptr` must point to at least `data_len` readable bytes matching `event`.
+pub type BamCmdTriggerFn = unsafe extern "C" fn(
+    commands: *mut BamCommands,
+    event: BamComponent,
+    target: FfiEntity,
+    data_ptr: *const u8,
+    data_len: usize,
+) -> FfiResult;

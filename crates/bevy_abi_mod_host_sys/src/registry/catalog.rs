@@ -6,14 +6,17 @@ use crate::registry::collision::ComponentCollisionError;
 use crate::sync_ptr::SymbolAddress;
 use arc_swap::ArcSwap;
 use bevy_abi_mod_sys::{
-    AbiPod, BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET,
-    BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE,
-    BAM_STORAGE_FLAG_SPARSE_SET, BamComponent, ComponentDesc, ComponentDropFn, ComponentUuid,
-    FfiResult, ModComponent, RawInsertable,
+    AbiPod, BAM_CHILD_OF_NAME, BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET,
+    BAM_STORAGE_FLAG_ENTITY_EVENT, BAM_STORAGE_FLAG_EVENT, BAM_STORAGE_FLAG_IMMUTABLE,
+    BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET, BamComponent,
+    ComponentDesc, ComponentDropFn, ComponentUuid, FfiChildOf, FfiEntity, FfiResult, ModComponent,
+    RawInsertable,
 };
 use bevy_ecs::change_detection::Tick;
 use bevy_ecs::component::ComponentId;
-use bevy_ecs::entity::Entity;
+use bevy_ecs::entity::{ContainsEntity, Entity};
+use bevy_ecs::event::{EntityEvent, Event, EventKey};
+use bevy_ecs::hierarchy::ChildOf;
 use bevy_ecs::message::{Message, MessageCursor, Messages};
 use bevy_ecs::prelude::{Component, Resource};
 use bevy_ecs::world::World;
@@ -66,6 +69,98 @@ pub type MsgSendFn = unsafe fn(
     data_ptr: *const u8,
     data_len: usize,
 ) -> FfiResult;
+
+/// Function signature for monomorphized batch `Messages<M>` writes across the C ABI (`F-02`).
+pub type MsgWriteBatchFn = unsafe fn(
+    world: UnsafeWorldCell<'_>,
+    last_run: Tick,
+    this_run: Tick,
+    msg_res_id: ComponentId,
+    data_ptr: *const u8,
+    count: usize,
+) -> FfiResult;
+
+/// Function signature for monomorphized typed `world.trigger(...)` invocation from raw guest bytes.
+pub type TriggerEventFn =
+    unsafe fn(world: &mut World, target: Option<Entity>, data: *const u8) -> Result<(), FfiResult>;
+
+/// Function signature extracting the target [`Entity`] from a raw `EntityEvent` payload.
+pub type ExtractEventTargetFn = unsafe fn(data: *const u8) -> Option<Entity>;
+
+/// ABI-stable `#[repr(transparent)]` entity wrapper implementing Bevy's [`ContainsEntity`] trait
+/// for `#[event_target]` fields in `#[derive(EntityEvent, ModComponent)]` host event structs.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TargetEntity(pub FfiEntity);
+
+impl Default for TargetEntity {
+    #[inline]
+    fn default() -> Self {
+        Self(FfiEntity::NULL)
+    }
+}
+
+impl TargetEntity {
+    /// Wraps a Bevy [`Entity`] as a `TargetEntity`.
+    #[inline]
+    pub const fn from_entity(entity: Entity) -> Self {
+        Self(FfiEntity::from_bits(entity.to_bits()))
+    }
+
+    /// Converts back to a Bevy [`Entity`], or `Entity::PLACEHOLDER` if [`FfiEntity::NULL`].
+    #[inline]
+    pub const fn to_entity(self) -> Entity {
+        if let Some(e) = Entity::try_from_bits(self.0.to_bits()) {
+            e
+        } else {
+            Entity::PLACEHOLDER
+        }
+    }
+}
+
+impl From<Entity> for TargetEntity {
+    #[inline]
+    fn from(entity: Entity) -> Self {
+        Self::from_entity(entity)
+    }
+}
+
+impl From<FfiEntity> for TargetEntity {
+    #[inline]
+    fn from(entity: FfiEntity) -> Self {
+        Self(entity)
+    }
+}
+
+impl From<TargetEntity> for FfiEntity {
+    #[inline]
+    fn from(entity: TargetEntity) -> Self {
+        entity.0
+    }
+}
+
+impl core::ops::Deref for TargetEntity {
+    type Target = FfiEntity;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl ContainsEntity for TargetEntity {
+    #[inline]
+    fn entity(&self) -> Entity {
+        self.to_entity()
+    }
+}
+
+// SAFETY: `TargetEntity` is `#[repr(transparent)]` over `FfiEntity` (`u64`), has no padding or drop
+// glue, and matches `ModComponent` field classification for `TargetEntity`.
+unsafe impl RawInsertable for TargetEntity {}
+
+// SAFETY: `TargetEntity` is `#[repr(transparent)]` over `FfiEntity`, which is `AbiPod`.
+unsafe impl AbiPod for TargetEntity {}
 
 fn create_msg_cursor_impl<M: Message>() -> Box<dyn Any + Send + Sync> {
     Box::new(MessageCursor::<M>::default())
@@ -182,6 +277,122 @@ unsafe fn insert_raw_impl<T: Component + ModComponent>(
     if let Ok(mut e) = world.get_entity_mut(entity) {
         e.insert(comp);
     }
+}
+
+unsafe fn msg_write_batch_impl<M: Message + AbiPod>(
+    world: UnsafeWorldCell<'_>,
+    last_run: Tick,
+    this_run: Tick,
+    msg_res_id: ComponentId,
+    data_ptr: *const u8,
+    count: usize,
+) -> FfiResult {
+    if count == 0 {
+        return FfiResult::OK;
+    }
+    if core::mem::size_of::<M>() > 0 && data_ptr.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: `MESSAGE_WRITE` on `msg_res_id` (`Messages<M>`) was declared in `FilteredAccessSet`.
+    let Some(entity) = (unsafe { world.resource_entities() }).get(msg_res_id) else {
+        return FfiResult::NOT_FOUND;
+    };
+    let Ok(entity_cell) = world.get_entity_with_ticks(entity, last_run, this_run) else {
+        return FfiResult::NOT_FOUND;
+    };
+    // SAFETY: Exclusive mutable access to `Messages<M>` is guaranteed by Bevy's scheduler.
+    let Ok(mut_untyped) = (unsafe { entity_cell.get_mut_by_id(msg_res_id) }) else {
+        return FfiResult::NOT_FOUND;
+    };
+    // SAFETY: `msg_res_id` was registered for `Messages<M>`.
+    let mut messages = unsafe { mut_untyped.with_type::<Messages<M>>() };
+    let msg_size = core::mem::size_of::<M>();
+    if msg_size == 0 {
+        for _ in 0..count {
+            // SAFETY: `M: AbiPod` is zero-sized, `Copy`, and valid when zeroed.
+            let zst = unsafe { core::mem::MaybeUninit::<M>::zeroed().assume_init() };
+            messages.write(zst);
+        }
+    } else {
+        for i in 0..count {
+            // SAFETY: Caller verified `data_ptr` is readable for `count * size_of::<M>()` bytes.
+            let msg = unsafe { core::ptr::read_unaligned(data_ptr.cast::<M>().add(i)) };
+            messages.write(msg);
+        }
+    }
+    FfiResult::OK
+}
+
+unsafe fn insert_child_of_raw(world: &mut World, entity: Entity, data: *const u8) {
+    if data.is_null() {
+        return;
+    }
+    // SAFETY: `data` points to an 8-byte `FfiChildOf` payload (`FfiEntity` parent handle).
+    let raw_bits = unsafe { core::ptr::read_unaligned(data.cast::<u64>()) };
+    let Some(parent) = Entity::try_from_bits(raw_bits) else {
+        return;
+    };
+    if parent == entity || world.get_entity(parent).is_err() {
+        return;
+    }
+    if let Ok(mut e) = world.get_entity_mut(entity) {
+        e.insert(ChildOf(parent));
+    }
+}
+
+unsafe fn trigger_event_impl<E>(
+    world: &mut World,
+    _target: Option<Entity>,
+    data: *const u8,
+) -> Result<(), FfiResult>
+where
+    E: Event<Trigger<'static>: Default> + ModComponent + Copy,
+{
+    if core::mem::size_of::<E>() > 0 && data.is_null() {
+        return Err(FfiResult::NULL_POINTER);
+    }
+    let event: E = if core::mem::size_of::<E>() == 0 {
+        // SAFETY: `E` is zero-sized and valid as POD event data.
+        unsafe { core::mem::MaybeUninit::<E>::zeroed().assume_init() }
+    } else {
+        // SAFETY: `data` points to `size_of::<E>()` initialized bytes.
+        unsafe { core::ptr::read_unaligned(data.cast::<E>()) }
+    };
+    world.trigger(event);
+    Ok(())
+}
+
+unsafe fn trigger_entity_event_impl<E>(
+    world: &mut World,
+    target: Option<Entity>,
+    data: *const u8,
+) -> Result<(), FfiResult>
+where
+    E: EntityEvent + Event + ModComponent + Copy,
+    for<'a> E::Trigger<'a>: Default,
+{
+    if core::mem::size_of::<E>() > 0 && data.is_null() {
+        return Err(FfiResult::NULL_POINTER);
+    }
+    // SAFETY: `data` points to `size_of::<E>()` initialized bytes.
+    let event: E = unsafe { core::ptr::read_unaligned(data.cast::<E>()) };
+    let target_entity = target.unwrap_or_else(|| event.event_target());
+    if !world.entities().contains(target_entity) {
+        return Err(FfiResult::INVALID_ENTITY);
+    }
+    world.trigger(event);
+    Ok(())
+}
+
+unsafe fn extract_entity_event_target_impl<E: EntityEvent + Copy>(
+    data: *const u8,
+) -> Option<Entity> {
+    if core::mem::size_of::<E>() > 0 && data.is_null() {
+        return None;
+    }
+    // SAFETY: `data` points to an initialized `E` value during observer execution.
+    let event: E = unsafe { core::ptr::read_unaligned(data.cast::<E>()) };
+    Some(event.event_target())
 }
 
 /// Monomorphized host-side `T::default()` component constructor and inserter.
@@ -350,12 +561,22 @@ pub struct RegisteredComponent {
     pub has_on_add_hook: bool,
     /// Whether `on_remove` hook trampoline was registered on Bevy's `ComponentHooks` (`F-04`).
     pub has_on_remove_hook: bool,
-    /// Optional `MessageCursor<M>` constructor for buffered Bevy `Messages<M>` entries (`F-02`).
+    /// Optional [`ModId`] owning a dynamic component's VTable and drop callback.
     pub create_msg_cursor_fn: Option<CreateMsgCursorFn>,
     /// Optional monomorphized batch reader for `Messages<M>` (`F-02`).
     pub msg_read_batch_fn: Option<MsgReadBatchFn>,
     /// Optional monomorphized writer for `Messages<M>` (`F-02`).
     pub msg_send_fn: Option<MsgSendFn>,
+    /// Optional monomorphized batch writer for `Messages<M>` (`F-02`).
+    pub msg_write_batch_fn: Option<MsgWriteBatchFn>,
+    /// Whether raw 8-byte entity payloads (such as `ChildOf`) must be validated before insert.
+    pub validates_entity_payload: bool,
+    /// Bevy [`EventKey`] when registered as a triggerable host [`Event`] / [`EntityEvent`] or dynamic event.
+    pub event_key: Option<EventKey>,
+    /// Monomorphized typed `world.trigger(...)` dispatcher for host-registered events.
+    pub trigger_event_fn: Option<TriggerEventFn>,
+    /// Extractor returning the target entity from raw `EntityEvent` payload bytes.
+    pub extract_event_target_fn: Option<ExtractEventTargetFn>,
     /// Optional [`ModId`] owning a dynamic component's VTable and drop callback.
     pub owner: Option<ModId>,
 }
@@ -371,6 +592,18 @@ impl RegisteredComponent {
     #[inline]
     pub const fn is_message(&self) -> bool {
         (self.storage_flags & BAM_STORAGE_FLAG_MESSAGE) != 0
+    }
+
+    /// Returns `true` if this entry represents a registered triggerable Bevy `Event`.
+    #[inline]
+    pub const fn is_event(&self) -> bool {
+        (self.storage_flags & BAM_STORAGE_FLAG_EVENT) != 0
+    }
+
+    /// Returns `true` if this entry represents an entity-targeted Bevy `EntityEvent`.
+    #[inline]
+    pub const fn is_entity_event(&self) -> bool {
+        (self.storage_flags & BAM_STORAGE_FLAG_ENTITY_EVENT) != 0
     }
 
     /// Returns `true` if this entry uses `StorageType::SparseSet`.
@@ -748,6 +981,7 @@ impl ModRegistry {
                 snap.entries[idx].create_msg_cursor_fn = Some(create_msg_cursor_impl::<M>);
                 snap.entries[idx].msg_read_batch_fn = Some(msg_read_batch_impl::<M>);
                 snap.entries[idx].msg_send_fn = Some(msg_send_impl::<M>);
+                snap.entries[idx].msg_write_batch_fn = Some(msg_write_batch_impl::<M>);
                 existing_handle
             } else {
                 let next_raw = u32::try_from(snap.entries.len() + 1)
@@ -775,6 +1009,11 @@ impl ModRegistry {
                     create_msg_cursor_fn: Some(create_msg_cursor_impl::<M>),
                     msg_read_batch_fn: Some(msg_read_batch_impl::<M>),
                     msg_send_fn: Some(msg_send_impl::<M>),
+                    msg_write_batch_fn: Some(msg_write_batch_impl::<M>),
+                    validates_entity_payload: false,
+                    event_key: None,
+                    trigger_event_fn: None,
+                    extract_event_target_fn: None,
                     owner: None,
                 };
                 snap.entries.push(entry);
@@ -784,6 +1023,196 @@ impl ModRegistry {
                 handle
             };
             Self::insert_mod_component_symbols::<M>(snap);
+            handle
+        };
+        self.publish_after_mutation();
+        Ok(handle)
+    }
+
+    /// Registers Bevy's built-in [`ChildOf`] relationship component under [`BAM_CHILD_OF_NAME`]
+    /// (plus `"ChildOf"` alias if unclaimed) with [`FfiChildOf`] wire layout (`validates_entity_payload = true`).
+    pub fn register_hierarchy(
+        &mut self,
+        child_of_id: ComponentId,
+        is_immutable: bool,
+    ) -> Result<BamComponent, ComponentCollisionError> {
+        let storage_flags = if is_immutable {
+            BAM_STORAGE_FLAG_IMMUTABLE
+        } else {
+            0
+        };
+        let uuid = FfiChildOf::UUID;
+        self.check_registration_collision(
+            BAM_CHILD_OF_NAME,
+            uuid,
+            core::mem::size_of::<FfiChildOf>(),
+            core::mem::align_of::<FfiChildOf>(),
+            storage_flags,
+            Some(child_of_id),
+        )?;
+
+        let handle = {
+            let snap = Arc::make_mut(&mut self.snapshot);
+            let handle = if let Some(&existing_handle) = snap.by_name.get(BAM_CHILD_OF_NAME) {
+                let idx = (existing_handle.0 - 1) as usize;
+                snap.entries[idx].insert_raw_fn = Some(insert_child_of_raw);
+                snap.entries[idx].validates_entity_payload = true;
+                snap.entries[idx].is_dynamic = false;
+                snap.entries[idx].owner = None;
+                existing_handle
+            } else {
+                let next_raw = u32::try_from(snap.entries.len() + 1)
+                    .expect("ModRegistry exceeded u32::MAX component handles");
+                let handle = BamComponent::from_raw(next_raw);
+                let arc_name: Arc<str> = Arc::from(BAM_CHILD_OF_NAME);
+                let entry = RegisteredComponent {
+                    handle,
+                    name: Arc::clone(&arc_name),
+                    uuid,
+                    component_id: child_of_id,
+                    size: core::mem::size_of::<FfiChildOf>(),
+                    align: core::mem::align_of::<FfiChildOf>(),
+                    storage_flags,
+                    is_abi_pod: true,
+                    is_dynamic: false,
+                    vtable_ptr: SymbolAddress::NULL,
+                    insert_raw_fn: Some(insert_child_of_raw),
+                    insert_default_fn: None,
+                    drop_fn: None,
+                    drop_slot: None,
+                    hook_slot: None,
+                    has_on_add_hook: false,
+                    has_on_remove_hook: false,
+                    create_msg_cursor_fn: None,
+                    msg_read_batch_fn: None,
+                    msg_send_fn: None,
+                    msg_write_batch_fn: None,
+                    validates_entity_payload: true,
+                    event_key: None,
+                    trigger_event_fn: None,
+                    extract_event_target_fn: None,
+                    owner: None,
+                };
+                snap.entries.push(entry);
+                snap.by_name.insert(arc_name, handle);
+                snap.by_uuid.insert(uuid, handle);
+                snap.by_component_id.insert(child_of_id, handle);
+                handle
+            };
+            if !snap.by_name.contains_key("ChildOf") {
+                snap.by_name.insert(Arc::from("ChildOf"), handle);
+            }
+            handle
+        };
+        self.publish_after_mutation();
+        Ok(handle)
+    }
+
+    /// Registers a triggerable host Bevy [`Event`] implementing [`ModComponent`] + [`Copy`],
+    /// returning its 1-based [`BamComponent`] handle.
+    pub fn register_event<E>(
+        &mut self,
+        event_key: EventKey,
+    ) -> Result<BamComponent, ComponentCollisionError>
+    where
+        E: Event<Trigger<'static>: Default> + ModComponent + Copy,
+    {
+        self.register_event_internal::<E>(
+            event_key,
+            BAM_STORAGE_FLAG_EVENT,
+            Some(trigger_event_impl::<E>),
+            None,
+        )
+    }
+
+    /// Registers a triggerable entity-targeted Bevy [`EntityEvent`] implementing [`ModComponent`] + [`Copy`],
+    /// returning its 1-based [`BamComponent`] handle.
+    pub fn register_entity_event<E>(
+        &mut self,
+        event_key: EventKey,
+    ) -> Result<BamComponent, ComponentCollisionError>
+    where
+        E: EntityEvent + Event + ModComponent + Copy,
+        for<'a> E::Trigger<'a>: Default,
+    {
+        self.register_event_internal::<E>(
+            event_key,
+            BAM_STORAGE_FLAG_EVENT | BAM_STORAGE_FLAG_ENTITY_EVENT,
+            Some(trigger_entity_event_impl::<E>),
+            Some(extract_entity_event_target_impl::<E>),
+        )
+    }
+
+    fn register_event_internal<E: ModComponent + Copy>(
+        &mut self,
+        event_key: EventKey,
+        extra_flags: u32,
+        trigger_event_fn: Option<TriggerEventFn>,
+        extract_event_target_fn: Option<ExtractEventTargetFn>,
+    ) -> Result<BamComponent, ComponentCollisionError> {
+        let storage_flags = component_flags_to_storage_flags(E::COMPONENT_FLAGS) | extra_flags;
+        let comp_id = event_key.component_id();
+        let name_str = E::CANONICAL_NAME;
+        let uuid = E::UUID;
+        self.check_registration_collision(
+            name_str,
+            uuid,
+            E::size(),
+            E::align(),
+            storage_flags,
+            Some(comp_id),
+        )?;
+
+        let sym_addr = SymbolAddress::new(E::erased_vtable_ptr());
+        let handle = {
+            let snap = Arc::make_mut(&mut self.snapshot);
+            let handle = if let Some(&existing_handle) = snap.by_name.get(name_str) {
+                let idx = (existing_handle.0 - 1) as usize;
+                snap.entries[idx].vtable_ptr = sym_addr;
+                snap.entries[idx].event_key = Some(event_key);
+                snap.entries[idx].trigger_event_fn = trigger_event_fn;
+                snap.entries[idx].extract_event_target_fn = extract_event_target_fn;
+                existing_handle
+            } else {
+                let next_raw = u32::try_from(snap.entries.len() + 1)
+                    .expect("ModRegistry exceeded u32::MAX component handles");
+                let handle = BamComponent::from_raw(next_raw);
+                let arc_name: Arc<str> = Arc::from(name_str);
+                let entry = RegisteredComponent {
+                    handle,
+                    name: Arc::clone(&arc_name),
+                    uuid,
+                    component_id: comp_id,
+                    size: E::size(),
+                    align: E::align(),
+                    storage_flags,
+                    is_abi_pod: E::IS_ABI_POD,
+                    is_dynamic: false,
+                    vtable_ptr: sym_addr,
+                    insert_raw_fn: None,
+                    insert_default_fn: None,
+                    drop_fn: None,
+                    drop_slot: None,
+                    hook_slot: None,
+                    has_on_add_hook: false,
+                    has_on_remove_hook: false,
+                    create_msg_cursor_fn: None,
+                    msg_read_batch_fn: None,
+                    msg_send_fn: None,
+                    msg_write_batch_fn: None,
+                    validates_entity_payload: false,
+                    event_key: Some(event_key),
+                    trigger_event_fn,
+                    extract_event_target_fn,
+                    owner: None,
+                };
+                snap.entries.push(entry);
+                snap.by_name.insert(arc_name, handle);
+                snap.by_uuid.insert(uuid, handle);
+                snap.by_component_id.insert(comp_id, handle);
+                handle
+            };
+            Self::insert_mod_component_symbols::<E>(snap);
             handle
         };
         self.publish_after_mutation();
@@ -847,6 +1276,11 @@ impl ModRegistry {
                     create_msg_cursor_fn: None,
                     msg_read_batch_fn: None,
                     msg_send_fn: None,
+                    msg_write_batch_fn: None,
+                    validates_entity_payload: false,
+                    event_key: None,
+                    trigger_event_fn: None,
+                    extract_event_target_fn: None,
                     owner: None,
                 };
                 snap.entries.push(entry);
@@ -969,6 +1403,13 @@ impl ModRegistry {
                     create_msg_cursor_fn: None,
                     msg_read_batch_fn: None,
                     msg_send_fn: None,
+                    msg_write_batch_fn: None,
+                    validates_entity_payload: false,
+                    // SAFETY: `comp_id` was registered via `world.register_component_with_descriptor`
+                    // with layout `(desc.size, desc.align)` and is safe for dynamic event dispatch.
+                    event_key: Some(unsafe { EventKey::new(comp_id) }),
+                    trigger_event_fn: None,
+                    extract_event_target_fn: None,
                     owner,
                 };
                 snap.entries.push(entry);

@@ -9,8 +9,10 @@
 
 use crate::support::{TempDylibCopy, fixture_dylib};
 use bevy_abi_mod_host::prelude::*;
-use bevy_app::{App, Update};
+use bevy_app::{App, FixedUpdate, PostUpdate, Update};
+use bevy_ecs::component::Component;
 use bevy_ecs::entity::Entity;
+use bevy_ecs::event::{EntityEvent, Event};
 use bevy_ecs::message::Messages;
 use bevy_ecs::prelude::Resource;
 use bevy_ecs::ptr::OwningPtr;
@@ -41,6 +43,8 @@ fn wave4_f01_hot_reload_transfers_state_handles_errors_and_supports_legacy_manif
     let w4_dylib = TempDylibCopy::new(&fixture_dylib("w4_ext_mod"), "f01_state");
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
+    app.init_schedule(FixedUpdate);
+    app.init_schedule(PostUpdate);
     app.insert_resource(W4StateProbe::default());
     app.register_mod_resource::<W4StateProbe>().unwrap();
 
@@ -177,6 +181,8 @@ fn wave4_f04_dynamic_component_hooks_fire_and_disarm_safely_on_unload() {
 
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
+    app.init_schedule(FixedUpdate);
+    app.init_schedule(PostUpdate);
     // SAFETY: `record_hook_event` is a static `extern "C"` function valid for the lifetime of the test process.
     unsafe {
         app.world_mut()
@@ -250,4 +256,227 @@ fn wave4_f04_dynamic_component_hooks_fire_and_disarm_safely_on_unload() {
     // and must NOT invoke the unmapped guest hook!
     assert!(app.world_mut().despawn(e2));
     assert_eq!(HOOK_EVENTS.lock().unwrap().len(), 3);
+}
+
+#[repr(C)]
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, ModComponent)]
+#[mod_component(name = "w5::EnableObserverAndLayoutTest")]
+struct EnableObserverAndLayoutTest;
+
+#[repr(C)]
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, ModComponent)]
+#[mod_component(name = "w5::WatchedTarget")]
+struct WatchedTarget;
+
+#[repr(C)]
+#[derive(Event, Clone, Copy, Debug, PartialEq, Eq, ModComponent)]
+#[mod_component(name = "w5::WavePing")]
+struct CWavePing {
+    wave: u32,
+}
+
+#[repr(C)]
+#[derive(EntityEvent, Clone, Copy, Debug, PartialEq, ModComponent)]
+#[mod_component(name = "w5::DamageApplied")]
+struct CDamageApplied {
+    #[event_target]
+    entity: TargetEntity,
+    amount: f32,
+}
+
+#[repr(C)]
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, ModComponent)]
+#[mod_component(name = "w5::EnableInSetTest")]
+struct EnableInSetTest;
+
+#[repr(C)]
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, ModComponent)]
+#[mod_component(name = "w5::DamagedMark")]
+struct CDamagedMark {
+    hits: u32,
+}
+
+#[test]
+fn wave5_req4_req5_c99_dynamic_layout_and_entity_event_observers_lifecycle() {
+    static OBS_EVENTS: Mutex<Vec<(u32, u64, u32, i32)>> = Mutex::new(Vec::new());
+    static WATCHED_BITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+    unsafe extern "C" fn record_w5_event(
+        kind: u32,
+        target: FfiEntity,
+        value_u32: u32,
+        value_f32: f32,
+    ) {
+        OBS_EVENTS
+            .lock()
+            .unwrap()
+            .push((kind, target.to_bits(), value_u32, value_f32 as i32));
+    }
+
+    unsafe extern "C" fn get_watched_target() -> FfiEntity {
+        FfiEntity::from_bits(WATCHED_BITS.load(Ordering::SeqCst))
+    }
+
+    OBS_EVENTS.lock().unwrap().clear();
+
+    #[derive(bevy_ecs::schedule::SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+    enum W5HostPhase {
+        BeforeLogic,
+        Logic,
+        AfterLogic,
+    }
+
+    let w4_dylib = TempDylibCopy::new(&fixture_dylib("w4_ext_mod"), "w5_obs_layout");
+    let mut app = App::new();
+    app.add_plugins(AbiModPlugin);
+    app.init_schedule(FixedUpdate);
+    app.init_schedule(PostUpdate);
+    app.register_mod_visible_set("w5_logic", W5HostPhase::Logic);
+    {
+        use bevy_ecs::schedule::IntoScheduleConfigs;
+        app.configure_sets(
+            Update,
+            (
+                W5HostPhase::BeforeLogic,
+                W5HostPhase::Logic,
+                W5HostPhase::AfterLogic,
+            )
+                .chain(),
+        );
+        app.add_systems(
+            Update,
+            (
+                (|| {
+                    OBS_EVENTS.lock().unwrap().push((10, 0, 0, 0));
+                })
+                .in_set(W5HostPhase::BeforeLogic),
+                (|| {
+                    OBS_EVENTS.lock().unwrap().push((20, 0, 0, 0));
+                })
+                .in_set(W5HostPhase::AfterLogic),
+            ),
+        );
+    }
+
+    app.register_mod_component::<EnableObserverAndLayoutTest>(ComponentOptions::new())
+        .unwrap();
+    app.register_mod_component::<EnableInSetTest>(ComponentOptions::new())
+        .unwrap();
+    app.register_mod_component::<WatchedTarget>(ComponentOptions::new())
+        .unwrap();
+    app.register_mod_component::<CDamagedMark>(ComponentOptions::new())
+        .unwrap();
+    app.register_mod_event::<CWavePing>().unwrap();
+    app.register_mod_entity_event::<CDamageApplied>().unwrap();
+
+    let watched_entity = app.world_mut().spawn_empty().id();
+    let unwatched_entity = app.world_mut().spawn_empty().id();
+    WATCHED_BITS.store(watched_entity.to_bits(), Ordering::SeqCst);
+
+    // SAFETY: `record_w5_event` and `get_watched_target` have C ABI linkage and live for the process.
+    unsafe {
+        let mut reg = app.world_mut().resource_mut::<ModRegistry>();
+        reg.register_custom_symbol("bam.v0.w5.record_event", record_w5_event as *const c_void);
+        reg.register_custom_symbol(
+            "bam.v0.w5.get_watched_target",
+            get_watched_target as *const c_void,
+        );
+    }
+
+    let mod_id = app.load_mod(w4_dylib.path()).expect("load w4_ext_mod w5");
+
+    // 1. Requirement 4: Verify runtime component registered via `bam_desc_component_with_layout` /
+    //    `ComponentDescriptor::new_with_layout` can be attached to host entities and runs `drop_fn`.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CPrivateLayoutMirror {
+        magic: u64,
+        counter: u32,
+        pad0: u32,
+    }
+    let reg_snap = app.world().resource::<ModRegistry>().snapshot_arc();
+    let priv_comp = reg_snap
+        .get_by_name("w4_ext_mod::CPrivateLayout")
+        .expect("CPrivateLayout registered by C99 mod");
+    let priv_id = priv_comp.component_id;
+    let e_layout_pre = app.world_mut().spawn_empty().id();
+    let e_layout_post = app.world_mut().spawn_empty().id();
+    let mut val_a = CPrivateLayoutMirror {
+        magic: 123,
+        counter: 77,
+        pad0: 0,
+    };
+    let mut val_b = CPrivateLayoutMirror {
+        magic: 456,
+        counter: 88,
+        pad0: 0,
+    };
+    // SAFETY: `val_a` and `val_b` are initialized `CPrivateLayoutMirror` values matching `priv_id` layout.
+    unsafe {
+        let p_a = OwningPtr::new(core::ptr::NonNull::from(&mut val_a).cast::<u8>());
+        app.world_mut()
+            .entity_mut(e_layout_pre)
+            .insert_by_id(priv_id, p_a);
+        let p_b = OwningPtr::new(core::ptr::NonNull::from(&mut val_b).cast::<u8>());
+        app.world_mut()
+            .entity_mut(e_layout_post)
+            .insert_by_id(priv_id, p_b);
+    }
+    assert!(app.world_mut().despawn(e_layout_pre));
+
+    // 2. Requirement 5: Trigger global `Event` (`WavePing`) & `EntityEvent` (`DamageApplied`).
+    app.world_mut().trigger(CWavePing { wave: 9 });
+    // Trigger on unwatched entity -> watched entity observer must NOT fire.
+    app.world_mut().trigger(CDamageApplied {
+        entity: TargetEntity::from(unwatched_entity),
+        amount: 15.0,
+    });
+    assert!(app.world().get::<CDamagedMark>(unwatched_entity).is_none());
+
+    // Trigger on watched entity -> C99 observer fires AND enqueues `CDamagedMark` via `cmd_insert`!
+    app.world_mut().trigger(CDamageApplied {
+        entity: TargetEntity::from(watched_entity),
+        amount: 33.0,
+    });
+    // Flush observer deferred commands and verify `.in_set("host::w5_logic")` executes strictly
+    // between host `BeforeLogic` (10) and `AfterLogic` (20).
+    app.update();
+    app.world_mut().run_schedule(FixedUpdate);
+    app.world_mut().run_schedule(PostUpdate);
+
+    assert_eq!(
+        app.world().get::<CDamagedMark>(watched_entity),
+        Some(&CDamagedMark { hits: 33 })
+    );
+    assert_eq!(
+        *OBS_EVENTS.lock().unwrap(),
+        vec![
+            (99, 0, 77, 123),
+            (1, 0, 9, 0),
+            (2, watched_entity.to_bits(), 0, 33),
+            (10, 0, 0, 0),
+            (5, 0, 0, 0),
+            (20, 0, 0, 0),
+            (6, 0, 0, 0),
+        ]
+    );
+
+    // 3. Unload mod (`dlclose`!) and verify host sets still execute, while observers & dynamic
+    //    destructors are cleanly disarmed/despawned.
+    app.unload_mod(mod_id).expect("unload w4_ext_mod w5");
+
+    let count_before = OBS_EVENTS.lock().unwrap().len();
+    app.world_mut().trigger(CWavePing { wave: 10 });
+    app.world_mut().trigger(CDamageApplied {
+        entity: TargetEntity::from(watched_entity),
+        amount: 99.0,
+    });
+    assert!(app.world_mut().despawn(e_layout_post));
+    // Trigger/despawn caused zero callbacks; host Update still runs BeforeLogic & AfterLogic only.
+    assert_eq!(OBS_EVENTS.lock().unwrap().len(), count_before);
+    app.update();
+    assert_eq!(
+        &OBS_EVENTS.lock().unwrap()[count_before..],
+        &[(10, 0, 0, 0), (20, 0, 0, 0)]
+    );
 }

@@ -296,6 +296,7 @@ mod archetype_and_permission_boundaries {
                 storage_flags: 0,
                 msg_read_batch_fn: None,
                 msg_send_fn: None,
+                msg_write_batch_fn: None,
             },
             QueryTermMeta {
                 component: BamComponent::from_raw(2),
@@ -307,6 +308,7 @@ mod archetype_and_permission_boundaries {
                 storage_flags: 0,
                 msg_read_batch_fn: None,
                 msg_send_fn: None,
+                msg_write_batch_fn: None,
             },
         ]);
 
@@ -408,6 +410,7 @@ mod archetype_and_permission_boundaries {
                 storage_flags: 0,
                 msg_read_batch_fn: None,
                 msg_send_fn: None,
+                msg_write_batch_fn: None,
             },
             QueryTermMeta {
                 component: BamComponent::from_raw(2),
@@ -419,6 +422,7 @@ mod archetype_and_permission_boundaries {
                 storage_flags: 0,
                 msg_read_batch_fn: None,
                 msg_send_fn: None,
+                msg_write_batch_fn: None,
             },
             QueryTermMeta {
                 component: BamComponent::from_raw(3),
@@ -430,6 +434,7 @@ mod archetype_and_permission_boundaries {
                 storage_flags: 0,
                 msg_read_batch_fn: None,
                 msg_send_fn: None,
+                msg_write_batch_fn: None,
             },
         ]);
 
@@ -499,6 +504,7 @@ mod archetype_and_permission_boundaries {
             storage_flags: 0,
             msg_read_batch_fn: None,
             msg_send_fn: None,
+            msg_write_batch_fn: None,
         }]);
 
         let matched_tables = vec![cell.archetypes().iter().last().unwrap().table_id()];
@@ -799,6 +805,8 @@ mod archetype_and_permission_boundaries {
             before_count: 0,
             run_if: None,
             run_if_user_data: core::ptr::null_mut(),
+            in_sets: core::ptr::null(),
+            in_set_count: 0,
         };
         assert_eq!(
             unsafe { host_register_system(core::ptr::null_mut(), &valid_sys_desc) },
@@ -867,6 +875,8 @@ mod archetype_and_permission_boundaries {
             before_count: 0,
             run_if: None,
             run_if_user_data: core::ptr::null_mut(),
+            in_sets: core::ptr::null(),
+            in_set_count: 0,
         };
         let mut load_ctx = LoadContext::new(registry);
         assert_eq!(
@@ -893,6 +903,7 @@ mod archetype_and_permission_boundaries {
                 storage_flags: 0,
                 msg_read_batch_fn: None,
                 msg_send_fn: None,
+                msg_write_batch_fn: None,
             });
         }
         let plan = QueryPlan::from_terms(max_terms);

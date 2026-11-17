@@ -7,8 +7,9 @@ use core::{
 
 use crate::{
     access::{BamTermDesc, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ScheduleId},
+    commands::BamCommands,
     extensible::ExtensibleStruct,
-    primitives::{FfiBool, FfiResult},
+    primitives::{BamComponent, FfiBool, FfiEntity, FfiResult},
 };
 
 /// Opaque world-scoped host registry and diagnostic context handle (`typedef struct BamHostCtx BamHostCtx;`).
@@ -160,12 +161,12 @@ pub const BAM_SYSTEM_KNOWN_FLAGS: u32 = BAM_SYSTEM_FLAG_MAIN_THREAD;
 ///
 /// Replaces all six v0.1 single-query, multi-query, scheduled, and conditional descriptor variants
 /// with a single zero-padding structure covering `0..=MAX_QUERIES_PER_SYSTEM` queries, custom or
-/// built-in schedules, `before`/`after` system-set ordering, main-thread pinning, and optional
-/// `run_if` predicates.
+/// built-in schedules, `before`/`after` system-set ordering, explicit `.in_set()` membership,
+/// main-thread pinning, and optional `run_if` predicates.
 ///
 /// Layout:
-/// - 64-bit: `MIN_V0_2_SIZE = 104` bytes, `8`-byte alignment, zero implicit padding (`reserved0` explicit).
-/// - 32-bit: `MIN_V0_2_SIZE = 60` bytes, `4`-byte alignment, zero implicit padding.
+/// - 64-bit: `MIN_V0_2_SIZE = 104` bytes (`size_of = 120` bytes with `in_sets`), `8`-byte alignment, zero implicit padding (`reserved0` explicit).
+/// - 32-bit: `MIN_V0_2_SIZE = 60` bytes (`size_of = 68` bytes with `in_sets`), `4`-byte alignment, zero implicit padding.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct BamSystemDesc {
@@ -199,6 +200,10 @@ pub struct BamSystemDesc {
     pub run_if: Option<BamRunIfFn>,
     /// Opaque guest-owned state passed to `run_if` (`offset 96` / `56`).
     pub run_if_user_data: *mut c_void,
+    /// Optional array of NUL-terminated system-set names that this system belongs to (`in_sets[0..in_set_count]`, `offset 104` / `60`).
+    pub in_sets: *const *const c_char,
+    /// Number of entries in `in_sets` (`offset 112` / `64`).
+    pub in_set_count: usize,
 }
 
 impl BamSystemDesc {
@@ -207,7 +212,7 @@ impl BamSystemDesc {
         core::mem::offset_of!(Self, run_if_user_data) + core::mem::size_of::<*mut c_void>();
 
     /// Constructs a `BamSystemDesc` targeting [`ScheduleId::UPDATE`] with no flags, ordering
-    /// constraints, or `run_if` predicate.
+    /// constraints, set memberships, or `run_if` predicate.
     #[inline]
     pub const fn new(
         name: *const c_char,
@@ -232,6 +237,8 @@ impl BamSystemDesc {
             before_count: 0,
             run_if: None,
             run_if_user_data: core::ptr::null_mut(),
+            in_sets: core::ptr::null(),
+            in_set_count: 0,
         }
     }
 
@@ -272,6 +279,18 @@ impl BamSystemDesc {
         self
     }
 
+    /// Declares NUL-terminated system-set names (`.in_set(...)`) that this system joins.
+    #[inline]
+    pub const fn with_in_sets(
+        mut self,
+        in_sets: *const *const c_char,
+        in_set_count: usize,
+    ) -> Self {
+        self.in_sets = in_sets;
+        self.in_set_count = in_set_count;
+        self
+    }
+
     /// Attaches an optional `run_if` condition callback and its user-data pointer.
     #[inline]
     pub const fn with_run_if(mut self, run_if: BamRunIfFn, run_if_user_data: *mut c_void) -> Self {
@@ -308,6 +327,7 @@ impl BamSystemDesc {
         if (self.query_count > 0 && self.queries.is_null())
             || (self.after_count > 0 && self.after.is_null())
             || (self.before_count > 0 && self.before.is_null())
+            || (self.in_set_count > 0 && self.in_sets.is_null())
         {
             return FfiResult::NULL_POINTER;
         }
@@ -323,7 +343,7 @@ const _: () = {
     #[cfg(target_pointer_width = "64")]
     {
         assert!(BamSystemDesc::MIN_V0_2_SIZE == 104);
-        assert!(core::mem::size_of::<BamSystemDesc>() == 104);
+        assert!(core::mem::size_of::<BamSystemDesc>() == 120);
         assert!(core::mem::align_of::<BamSystemDesc>() == 8);
         assert!(core::mem::offset_of!(BamSystemDesc, struct_size) == 0);
         assert!(core::mem::offset_of!(BamSystemDesc, flags) == 4);
@@ -340,11 +360,13 @@ const _: () = {
         assert!(core::mem::offset_of!(BamSystemDesc, before_count) == 80);
         assert!(core::mem::offset_of!(BamSystemDesc, run_if) == 88);
         assert!(core::mem::offset_of!(BamSystemDesc, run_if_user_data) == 96);
+        assert!(core::mem::offset_of!(BamSystemDesc, in_sets) == 104);
+        assert!(core::mem::offset_of!(BamSystemDesc, in_set_count) == 112);
     }
     #[cfg(target_pointer_width = "32")]
     {
         assert!(BamSystemDesc::MIN_V0_2_SIZE == 60);
-        assert!(core::mem::size_of::<BamSystemDesc>() == 60);
+        assert!(core::mem::size_of::<BamSystemDesc>() == 68);
         assert!(core::mem::align_of::<BamSystemDesc>() == 4);
         assert!(core::mem::offset_of!(BamSystemDesc, struct_size) == 0);
         assert!(core::mem::offset_of!(BamSystemDesc, flags) == 4);
@@ -361,11 +383,163 @@ const _: () = {
         assert!(core::mem::offset_of!(BamSystemDesc, before_count) == 48);
         assert!(core::mem::offset_of!(BamSystemDesc, run_if) == 52);
         assert!(core::mem::offset_of!(BamSystemDesc, run_if_user_data) == 56);
+        assert!(core::mem::offset_of!(BamSystemDesc, in_sets) == 60);
+        assert!(core::mem::offset_of!(BamSystemDesc, in_set_count) == 64);
     }
 };
 
 // SAFETY: `BamSystemDesc` is `#[repr(C)]`, starts with `struct_size: u32` at offset 0, and every
 // field (`Option<BamSystemFn>`, `Option<BamRunIfFn>`, raw pointers, integers) is zero-valid.
 unsafe impl ExtensibleStruct for BamSystemDesc {
+    const MIN_V0_2_SIZE: usize = Self::MIN_V0_2_SIZE;
+}
+
+/// Guest callback invoked when an observed `Event` or `EntityEvent` fires
+/// (`typedef BamResult (*BamObserverFn)(BamEntity entity, const void* event_data, BamCommands* commands, void* user_data);`).
+///
+/// # Safety
+/// - `event_data` points to the triggered event payload valid strictly for the duration of the call.
+/// - `commands` points to a valid deferred [`BamCommands`] queue scoped to this observer invocation.
+/// - Must never unwind across the `extern "C"` boundary.
+pub type BamObserverFn = unsafe extern "C" fn(
+    entity: FfiEntity,
+    event_data: *const c_void,
+    commands: *mut BamCommands,
+    user_data: *mut c_void,
+) -> FfiResult;
+
+/// Bitmask of recognized [`BamObserverDesc::flags`] bits in ABI `0.2` (`0`).
+pub const BAM_OBSERVER_KNOWN_FLAGS: u32 = 0;
+
+/// Extensible dynamic observer registration descriptor (`typedef struct BamObserverDesc BamObserverDesc;`).
+///
+/// Layout:
+/// - 64-bit: `MIN_V0_2_SIZE = 48` bytes, `8`-byte alignment, zero implicit padding.
+/// - 32-bit: `MIN_V0_2_SIZE = 36` bytes, `4`-byte alignment, zero implicit padding.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct BamObserverDesc {
+    /// Size of this struct in bytes (`offset 0`).
+    pub struct_size: u32,
+    /// Observer bitflags (`0` in ABI `0.2`, `offset 4`).
+    pub flags: u32,
+    /// Optional NUL-terminated UTF-8 diagnostic observer name (`offset 8`).
+    pub name: *const c_char,
+    /// Pre-resolved [`BamComponent`] handle of the observed `Event` / `EntityEvent` (`offset 16` / `12`).
+    pub event: BamComponent,
+    /// Lower 32 bits of optional target [`FfiEntity`] (`0` when global, `offset 20` / `16`).
+    pub entity_lo: u32,
+    /// Upper 32 bits of optional target [`FfiEntity`] (`0` when global, `offset 24` / `20`).
+    pub entity_hi: u32,
+    /// Explicit zero-reserved field (`must be 0`, `offset 28` / `24`).
+    pub reserved0: u32,
+    /// Mandatory observer callback (`Some`, `offset 32` / `28`).
+    pub callback: Option<BamObserverFn>,
+    /// Opaque guest-owned state passed to `callback` (`offset 40` / `32`).
+    pub user_data: *mut c_void,
+}
+
+impl BamObserverDesc {
+    /// Frozen minimum valid `BamObserverDesc` size (`48` on 64-bit, `36` on 32-bit).
+    pub const MIN_V0_2_SIZE: usize =
+        core::mem::offset_of!(Self, user_data) + core::mem::size_of::<*mut c_void>();
+
+    /// Constructs a global observer descriptor watching `event` with `callback(entity, event_data, commands, user_data)`.
+    #[inline]
+    pub const fn new(event: BamComponent, callback: BamObserverFn, user_data: *mut c_void) -> Self {
+        Self {
+            struct_size: core::mem::size_of::<Self>() as u32,
+            flags: 0,
+            name: core::ptr::null(),
+            event,
+            entity_lo: 0,
+            entity_hi: 0,
+            reserved0: 0,
+            callback: Some(callback),
+            user_data,
+        }
+    }
+
+    /// Sets an optional NUL-terminated UTF-8 diagnostic name on this observer.
+    #[inline]
+    pub const fn with_name(mut self, name: *const c_char) -> Self {
+        self.name = name;
+        self
+    }
+
+    /// Targets a specific entity (`FfiEntity::NULL` restores global observation).
+    #[inline]
+    pub const fn with_entity(mut self, entity: FfiEntity) -> Self {
+        let bits = entity.to_bits();
+        self.entity_lo = bits as u32;
+        self.entity_hi = (bits >> 32) as u32;
+        self
+    }
+
+    /// Reconstructs the configured target [`FfiEntity`] (`FfiEntity::NULL` when global).
+    #[inline]
+    pub const fn entity(&self) -> FfiEntity {
+        FfiEntity::from_bits(((self.entity_hi as u64) << 32) | (self.entity_lo as u64))
+    }
+
+    /// Validates `struct_size`, known `flags`, `reserved0 == 0`, valid `event`, and non-null `callback`.
+    #[inline]
+    pub const fn validate(&self) -> FfiResult {
+        if (self.struct_size as usize) < Self::MIN_V0_2_SIZE {
+            return FfiResult::INVALID_VERSION;
+        }
+        if (self.flags & !BAM_OBSERVER_KNOWN_FLAGS) != 0 {
+            return FfiResult::UNSUPPORTED;
+        }
+        if self.reserved0 != 0 {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        if !self.event.is_valid() {
+            return FfiResult::INVALID_COMPONENT;
+        }
+        if self.callback.is_none() {
+            return FfiResult::NULL_POINTER;
+        }
+        FfiResult::OK
+    }
+}
+
+const _: () = {
+    assert!(BamObserverDesc::MIN_V0_2_SIZE <= core::mem::size_of::<BamObserverDesc>());
+    #[cfg(target_pointer_width = "64")]
+    {
+        assert!(BamObserverDesc::MIN_V0_2_SIZE == 48);
+        assert!(core::mem::size_of::<BamObserverDesc>() == 48);
+        assert!(core::mem::align_of::<BamObserverDesc>() == 8);
+        assert!(core::mem::offset_of!(BamObserverDesc, struct_size) == 0);
+        assert!(core::mem::offset_of!(BamObserverDesc, flags) == 4);
+        assert!(core::mem::offset_of!(BamObserverDesc, name) == 8);
+        assert!(core::mem::offset_of!(BamObserverDesc, event) == 16);
+        assert!(core::mem::offset_of!(BamObserverDesc, entity_lo) == 20);
+        assert!(core::mem::offset_of!(BamObserverDesc, entity_hi) == 24);
+        assert!(core::mem::offset_of!(BamObserverDesc, reserved0) == 28);
+        assert!(core::mem::offset_of!(BamObserverDesc, callback) == 32);
+        assert!(core::mem::offset_of!(BamObserverDesc, user_data) == 40);
+    }
+    #[cfg(target_pointer_width = "32")]
+    {
+        assert!(BamObserverDesc::MIN_V0_2_SIZE == 36);
+        assert!(core::mem::size_of::<BamObserverDesc>() == 36);
+        assert!(core::mem::align_of::<BamObserverDesc>() == 4);
+        assert!(core::mem::offset_of!(BamObserverDesc, struct_size) == 0);
+        assert!(core::mem::offset_of!(BamObserverDesc, flags) == 4);
+        assert!(core::mem::offset_of!(BamObserverDesc, name) == 8);
+        assert!(core::mem::offset_of!(BamObserverDesc, event) == 12);
+        assert!(core::mem::offset_of!(BamObserverDesc, entity_lo) == 16);
+        assert!(core::mem::offset_of!(BamObserverDesc, entity_hi) == 20);
+        assert!(core::mem::offset_of!(BamObserverDesc, reserved0) == 24);
+        assert!(core::mem::offset_of!(BamObserverDesc, callback) == 28);
+        assert!(core::mem::offset_of!(BamObserverDesc, user_data) == 32);
+    }
+};
+
+// SAFETY: `BamObserverDesc` is `#[repr(C)]`, starts with `struct_size: u32` at offset 0, and all
+// fields are valid when zero-filled.
+unsafe impl ExtensibleStruct for BamObserverDesc {
     const MIN_V0_2_SIZE: usize = Self::MIN_V0_2_SIZE;
 }

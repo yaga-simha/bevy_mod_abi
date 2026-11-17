@@ -32,7 +32,7 @@ pub use bevy_abi_mod_sys::{BamSystemCtx, FfiBool, FfiResult};
 pub use commands::{SpawnEntry, ValidatedCommands};
 pub use component::{
     PodComponentHooks, generic_drop_trampoline, register_component_raw,
-    register_dynamic_component_with_drop, register_pod_component,
+    register_component_with_layout, register_dynamic_component_with_drop, register_pod_component,
     register_pod_component_with_hooks, resolve_component,
 };
 pub use host::{CUSTOM_SYMBOL_PREFIX, Host, ValidatedLoadCtx};
@@ -48,7 +48,7 @@ pub use panic::{catch_guest_bool, catch_guest_result, catch_guest_unit};
 pub use trampoline::{
     PreparedRunIf, ReentrantCell, SystemRegistrationConfig, ValidatedSystemInvocation,
     ValidatedSystemRef, allocate_run_if_trampoline, allocate_system_trampoline,
-    register_system_closure,
+    register_observer_closure, register_system_closure,
 };
 
 #[cfg(test)]
@@ -392,6 +392,12 @@ mod tests {
             sys_entity_get_mut: None,
             msg_read_batch: None,
             msg_send: None,
+            msg_write_batch: None,
+            res_ticks: None,
+            sys_res_ptr: None,
+            sys_res_mut_ptr: None,
+            register_observer: None,
+            cmd_trigger: None,
         }
     }
 

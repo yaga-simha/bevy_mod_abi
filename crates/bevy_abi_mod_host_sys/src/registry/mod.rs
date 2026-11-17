@@ -5,7 +5,8 @@ pub mod collision;
 
 pub(crate) use catalog::component_flags_to_storage_flags;
 pub use catalog::{
-    ComponentOptions, CreateMsgCursorFn, InsertDefaultFn, InsertRawFn, ModRegistry, MsgReadBatchFn,
-    MsgSendFn, RegisteredComponent, RegistrySnapshot,
+    ComponentOptions, CreateMsgCursorFn, ExtractEventTargetFn, InsertDefaultFn, InsertRawFn,
+    ModRegistry, MsgReadBatchFn, MsgSendFn, MsgWriteBatchFn, RegisteredComponent, RegistrySnapshot,
+    TargetEntity, TriggerEventFn,
 };
 pub use collision::ComponentCollisionError;

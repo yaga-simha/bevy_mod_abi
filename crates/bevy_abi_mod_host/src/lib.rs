@@ -25,7 +25,7 @@ pub use app_ext::ModAppExt;
 pub use bevy_abi_mod_host_sys::{
     ComponentCollisionError, ComponentOptions, LoadOptions, LoadedMod, ModErrorPolicy,
     ModErrorPolicyConfig, ModHost, ModId, ModLoadError, ModQuarantine, ModRegistry,
-    RegisteredComponent, RegistrySnapshot, WorldDropGuard, is_abi_version_compatible,
+    RegisteredComponent, RegistrySnapshot, TargetEntity, WorldDropGuard, is_abi_version_compatible,
 };
 pub use commands_ext::ModCommandsExt;
 pub use events::{
@@ -51,12 +51,13 @@ pub mod prelude {
     pub use crate::world_ext::ModWorldExt;
     pub use crate::{
         AbiPod, ComponentCollisionError, ComponentOptions, LoadOptions, LoadedMod, ModComponent,
-        ModErrorPolicy, ModHost, ModId, ModLoadError, ModQuarantine, ModRegistry,
+        ModErrorPolicy, ModHost, ModId, ModLoadError, ModQuarantine, ModRegistry, TargetEntity,
     };
     pub use bevy_abi_mod_sys::{
-        ABI_VERSION, AccessMode, BamColumnInfo, BamComponent, BamQueryDesc, BamRunIfFn,
-        BamSystemDesc, BamTermDesc, ComponentDesc, ComponentUuid, FfiBool, FfiEntity, FfiResult,
-        FfiSlice, RawInsertable, ScheduleId, StrView, VTableHeader,
+        ABI_VERSION, AccessMode, BamChangeTicks, BamColumnInfo, BamComponent, BamObserverDesc,
+        BamObserverFn, BamQueryDesc, BamRunIfFn, BamSystemDesc, BamTermDesc, ComponentDesc,
+        ComponentUuid, FfiBool, FfiChildOf, FfiEntity, FfiResult, FfiSlice, RawInsertable,
+        ScheduleId, StrView, VTableHeader,
     };
 }
 
@@ -122,11 +123,16 @@ mod tests {
             .unwrap();
         let grav_h = app.register_mod_resource::<Gravity>().unwrap();
 
-        assert_eq!(health_h, BamComponent::from_raw(1));
-        assert_eq!(tag_h, BamComponent::from_raw(2));
-        assert_eq!(grav_h, BamComponent::from_raw(3));
+        assert_eq!(health_h, BamComponent::from_raw(2));
+        assert_eq!(tag_h, BamComponent::from_raw(3));
+        assert_eq!(grav_h, BamComponent::from_raw(4));
 
         let reg = app.world().resource::<ModRegistry>();
+        assert_eq!(
+            reg.get_by_name(bevy_abi_mod_sys::BAM_CHILD_OF_NAME)
+                .map(|c| c.handle),
+            Some(BamComponent::from_raw(1))
+        );
         let health_meta = reg.get_by_handle(health_h).unwrap();
         assert!(health_meta.insert_raw_fn.is_some());
         assert!(health_meta.insert_default_fn.is_some());

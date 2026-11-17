@@ -1091,6 +1091,7 @@ mod fuzz_boundaries {
                 storage_flags: 0,
                 msg_read_batch_fn: None,
                 msg_send_fn: None,
+                msg_write_batch_fn: None,
             },
             QueryTermMeta {
                 component: BamComponent::from_raw(2),
@@ -1102,6 +1103,7 @@ mod fuzz_boundaries {
                 storage_flags: 0,
                 msg_read_batch_fn: None,
                 msg_send_fn: None,
+                msg_write_batch_fn: None,
             },
             QueryTermMeta {
                 component: BamComponent::from_raw(3),
@@ -1113,6 +1115,7 @@ mod fuzz_boundaries {
                 storage_flags: 0,
                 msg_read_batch_fn: None,
                 msg_send_fn: None,
+                msg_write_batch_fn: None,
             },
         ]);
 
@@ -1134,6 +1137,7 @@ mod fuzz_boundaries {
                 storage_flags: 0,
                 msg_read_batch_fn: None,
                 msg_send_fn: None,
+                msg_write_batch_fn: None,
             },
             QueryTermMeta {
                 component: BamComponent::from_raw(4),
@@ -1145,6 +1149,7 @@ mod fuzz_boundaries {
                 storage_flags: BAM_STORAGE_FLAG_SPARSE_SET,
                 msg_read_batch_fn: None,
                 msg_send_fn: None,
+                msg_write_batch_fn: None,
             },
             QueryTermMeta {
                 component: BamComponent::from_raw(2),
@@ -1156,6 +1161,7 @@ mod fuzz_boundaries {
                 storage_flags: 0,
                 msg_read_batch_fn: None,
                 msg_send_fn: None,
+                msg_write_batch_fn: None,
             },
         ]);
 
@@ -1747,7 +1753,7 @@ mod host_api_boundary_and_proc_address {
         {
             assert_eq!(core::mem::size_of::<TruncatedHostApi40>(), 40);
             assert_eq!(core::mem::align_of::<TruncatedHostApi40>(), 8);
-            assert_eq!(core::mem::size_of::<BamHostApi>(), 264);
+            assert_eq!(core::mem::size_of::<BamHostApi>(), 312);
             assert_eq!(BamHostApi::MIN_V0_2_SIZE, 224);
             assert_eq!(core::mem::align_of::<BamHostApi>(), 8);
         }
@@ -2169,7 +2175,7 @@ mod dynamic_descriptor_layouts {
         #[cfg(target_pointer_width = "64")]
         {
             assert_eq!(BamHostApi::MIN_V0_2_SIZE, 224);
-            assert_eq!(core::mem::size_of::<BamHostApi>(), 264);
+            assert_eq!(core::mem::size_of::<BamHostApi>(), 312);
             assert_eq!(core::mem::align_of::<BamHostApi>(), 8);
             assert_eq!(core::mem::offset_of!(BamHostApi, struct_size), 0);
             assert_eq!(core::mem::offset_of!(BamHostApi, abi_version), 4);

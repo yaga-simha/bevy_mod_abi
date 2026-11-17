@@ -4,8 +4,9 @@
 use core::{ffi::c_void, marker::PhantomData, mem::MaybeUninit, ops::Index};
 
 use bevy_abi_mod_sys::{
-    AbiPod, AccessMode, BamColumnInfo, BamComponent, BamHostApi, BamIter, BamMsgReadBatchFn,
-    BamMsgSendFn, BamParForEachChunkFn, ComponentUuid, FfiEntity, FfiResult, MAX_TERMS_PER_QUERY,
+    AbiPod, AccessMode, BamChangeTicks, BamColumnInfo, BamComponent, BamHostApi, BamIter,
+    BamMsgReadBatchFn, BamMsgSendFn, BamMsgWriteBatchFn, BamParForEachChunkFn, BamResTicksFn,
+    ComponentUuid, FfiEntity, FfiResult, MAX_TERMS_PER_QUERY,
 };
 
 use crate::{host::Host, panic::catch_guest_result};
@@ -1706,6 +1707,51 @@ impl<'a> ValidatedIter<'a> {
         Some(unsafe { &mut *ptr.cast::<R>() })
     }
 
+    /// Reads Bevy change-detection ticks for the singleton `Resource` declared at `term_index`.
+    #[inline]
+    pub fn res_ticks(&self, term_index: usize) -> Result<BamChangeTicks, FfiResult> {
+        if self.raw.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        if !self.host.api().covers_slot(
+            core::mem::offset_of!(BamHostApi, res_ticks),
+            core::mem::size_of::<Option<BamResTicksFn>>(),
+        ) {
+            return Err(FfiResult::UNSUPPORTED);
+        }
+        let Some(ticks_fn) = self.host.api().res_ticks else {
+            return Err(FfiResult::UNSUPPORTED);
+        };
+        let mut out = BamChangeTicks::default();
+        // SAFETY: `self.raw` is active and `&mut out` is aligned writable `BamChangeTicks` storage.
+        let status = unsafe { ticks_fn(self.raw.cast_const(), term_index, &mut out) };
+        if status.is_ok() { Ok(out) } else { Err(status) }
+    }
+
+    /// Borrows singleton resource `R` along with its Bevy change-detection ticks (`BamChangeTicks`).
+    #[inline]
+    pub fn resource_with_ticks_checked<R: AbiPod>(
+        &self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Option<(&R, BamChangeTicks)> {
+        let ticks = self.res_ticks(term_index).ok()?;
+        let r = self.resource_checked::<R>(term_index, expected_uuid)?;
+        Some((r, ticks))
+    }
+
+    /// Mutably borrows singleton resource `R` along with its prior Bevy change-detection ticks.
+    #[inline]
+    pub fn resource_mut_with_ticks_checked<R: AbiPod>(
+        &mut self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Option<(&mut R, BamChangeTicks)> {
+        let ticks = self.res_ticks(term_index).ok()?;
+        let r = self.resource_mut_checked::<R>(term_index, expected_uuid)?;
+        Some((r, ticks))
+    }
+
     /// Executes `f` in parallel across disjoint sub-range chunks on the host `ComputeTaskPool`
     /// (`P-07`), catching panics per task so unwinding never crosses `extern "C"`.
     pub fn par_for_each_chunk<F>(&mut self, f: F) -> FfiResult
@@ -1849,6 +1895,46 @@ impl<'a> ValidatedIter<'a> {
         // SAFETY: `self.raw` is active, `validate_message_write_info` verified `M`'s exact layout
         // and `MESSAGE_WRITE` permission, and `data_ptr` points to `size_of::<M>()` readable bytes.
         unsafe { send_fn(self.raw, term_index, data_ptr, core::mem::size_of::<M>()) }
+    }
+
+    /// Batch-appends `messages` (`M: AbiPod`) into `Messages<M>` declared with `MESSAGE_WRITE` at
+    /// `term_index`.
+    pub fn send_messages_batch_checked<M: AbiPod>(
+        &mut self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+        messages: &[M],
+    ) -> FfiResult {
+        if self.raw.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if !self.host.api().covers_slot(
+            core::mem::offset_of!(BamHostApi, msg_write_batch),
+            core::mem::size_of::<Option<BamMsgWriteBatchFn>>(),
+        ) {
+            return FfiResult::UNSUPPORTED;
+        }
+        let Some(write_fn) = self.host.api().msg_write_batch else {
+            return FfiResult::UNSUPPORTED;
+        };
+        let info = match self.column_info(term_index) {
+            Ok(i) => i,
+            Err(err) => return err,
+        };
+        if !validate_message_write_info::<M>(&info, expected_uuid) {
+            return FfiResult::TYPE_MISMATCH;
+        }
+        if messages.is_empty() {
+            return FfiResult::OK;
+        }
+        let data_ptr = if core::mem::size_of::<M>() == 0 {
+            core::ptr::NonNull::<u8>::dangling().as_ptr().cast_const()
+        } else {
+            messages.as_ptr().cast::<u8>()
+        };
+        // SAFETY: `self.raw` is active, `validate_message_write_info` confirmed layout and
+        // `MESSAGE_WRITE`, and `data_ptr` covers `messages.len() * size_of::<M>()` initialized bytes.
+        unsafe { write_fn(self.raw, term_index, data_ptr, messages.len()) }
     }
 }
 

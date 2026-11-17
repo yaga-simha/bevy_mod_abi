@@ -148,6 +148,23 @@ pub(crate) fn prevalidate_mod_schedules_and_ordering(
                     });
                 }
             }
+            for target_set in sys.in_sets() {
+                if target_set.starts_with("host::") {
+                    if resolve_host_visible_set(world, target_set).is_none() {
+                        return Err(ModLoadError::UnresolvedOrderingTarget {
+                            path: path.to_path_buf(),
+                            system_name: sys.system_name().to_string(),
+                            target: target_set.clone(),
+                        });
+                    }
+                } else if ModNamedSystemSet::parse_target(target_set, mod_name).is_none() {
+                    return Err(ModLoadError::UnresolvedOrderingTarget {
+                        path: path.to_path_buf(),
+                        system_name: sys.system_name().to_string(),
+                        target: target_set.clone(),
+                    });
+                }
+            }
         }
     }
 
@@ -211,8 +228,46 @@ pub(crate) fn schedule_mod_systems_in_world(
 
         let after = sys.after_systems().to_vec();
         let before = sys.before_systems().to_vec();
+        let in_sets = sys.in_sets().to_vec();
 
         let mut cfg = sys.in_set(own_set);
+
+        for target_set_name in in_sets {
+            if target_set_name.starts_with("host::") {
+                if let Some(host_set) = resolve_host_visible_set(world, &target_set_name) {
+                    // Do not add `host::*` sets to `recorded_sets` so mod unload never excises
+                    // host-owned system sets or native host systems.
+                    cfg = IntoScheduleConfigs::in_set(cfg, host_set);
+                } else {
+                    tracing::warn!(
+                        system = %sys_name,
+                        mod_name = %mod_name,
+                        target = %target_set_name,
+                        "guest system declares `in_set` on unregistered `host::` set"
+                    );
+                }
+                continue;
+            }
+            let Some(parsed) = ModNamedSystemSet::parse_target(&target_set_name, mod_name) else {
+                tracing::warn!(
+                    system = %sys_name,
+                    mod_name = %mod_name,
+                    target = %target_set_name,
+                    "guest system has invalid `in_set` target"
+                );
+                continue;
+            };
+            let target_gen = if parsed.mod_name.as_ref() == mod_name {
+                own_gen
+            } else {
+                resolve_mod_generation_in_world(world, &parsed.mod_name)
+            };
+            let target = parsed.at_generation(target_gen);
+            if target.mod_name.as_ref() == mod_name {
+                recorded_sets.push((interned, target.clone()));
+            }
+            cfg = IntoScheduleConfigs::in_set(cfg, target);
+        }
 
         for dep in after {
             if dep.starts_with("host::") {
@@ -332,8 +387,43 @@ pub(crate) fn run_late_startup_systems_in_world(
         let own_set = ModNamedSystemSet::with_generation(mod_name, sys_name.as_str(), own_gen);
         let after = sys.after_systems().to_vec();
         let before = sys.before_systems().to_vec();
+        let in_sets = sys.in_sets().to_vec();
 
         let mut cfg = sys.in_set(own_set);
+
+        for target_set_name in in_sets {
+            if target_set_name.starts_with("host::") {
+                if let Some(host_set) = resolve_host_visible_set(world, &target_set_name) {
+                    // Do not add `host::*` sets to `recorded_sets` so mod unload never excises
+                    // host-owned system sets or native host systems.
+                    cfg = IntoScheduleConfigs::in_set(cfg, host_set);
+                } else {
+                    tracing::warn!(
+                        system = %sys_name,
+                        mod_name = %mod_name,
+                        target = %target_set_name,
+                        "guest system declares `in_set` on unregistered `host::` set"
+                    );
+                }
+                continue;
+            }
+            let Some(parsed) = ModNamedSystemSet::parse_target(&target_set_name, mod_name) else {
+                tracing::warn!(
+                    system = %sys_name,
+                    mod_name = %mod_name,
+                    target = %target_set_name,
+                    "guest system has invalid `in_set` target"
+                );
+                continue;
+            };
+            let target_gen = if parsed.mod_name.as_ref() == mod_name {
+                own_gen
+            } else {
+                resolve_mod_generation_in_world(world, &parsed.mod_name)
+            };
+            let target = parsed.at_generation(target_gen);
+            cfg = IntoScheduleConfigs::in_set(cfg, target);
+        }
         for dep in after {
             if dep.starts_with("host::") {
                 if let Some(host_set) = resolve_host_visible_set(world, &dep) {

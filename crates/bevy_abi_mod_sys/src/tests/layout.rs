@@ -8,25 +8,27 @@ use core::{
 
 use crate::{
     ABI_VERSION, ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PATCH, AccessMode,
-    BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_IMMUTABLE,
-    BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET,
-    BAM_SYSTEM_FLAG_MAIN_THREAD, BamChunkTaskFn, BamCmdDespawnFn, BamCmdInsertDefaultFn,
-    BamCmdInsertFn, BamCmdRemoveFn, BamCmdSpawnEmptyFn, BamCmdSpawnFn, BamColumnInfo, BamCommands,
+    BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_ENTITY_EVENT,
+    BAM_STORAGE_FLAG_EVENT, BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE,
+    BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET, BAM_SYSTEM_FLAG_MAIN_THREAD,
+    BamChangeTicks, BamChunkTaskFn, BamCmdDespawnFn, BamCmdInsertDefaultFn, BamCmdInsertFn,
+    BamCmdRemoveFn, BamCmdSpawnEmptyFn, BamCmdSpawnFn, BamCmdTriggerFn, BamColumnInfo, BamCommands,
     BamComponent, BamGetProcAddressFn, BamHostApi, BamHostCtx, BamInitFn, BamInstance, BamIter,
     BamIterColumnInfoFn, BamIterColumnMutableFn, BamIterColumnMutableUntrackedFn,
     BamIterColumnReadonlyFn, BamIterColumnRowsMutableFn, BamIterColumnRowsReadonlyFn,
     BamIterEntitiesFn, BamIterMarkChangedRangeFn, BamIterNextChunkFn, BamIterResetFn,
     BamLastErrorFn, BamLoadCtx, BamLoadHostCtxFn, BamManifest, BamManifestFn, BamMsgReadBatchFn,
-    BamMsgSendFn, BamParForEachChunkFn, BamQueryDesc, BamRegisterComponentFn, BamRegisterSystemFn,
-    BamResMutPtrFn, BamResPtrFn, BamResolveComponentFn, BamRestoreStateFn, BamRunIfFn,
-    BamSaveStateFn, BamShutdownFn, BamStateWriterFn, BamSysCommandsFn, BamSysEntityGetFn,
-    BamSysEntityGetMutFn, BamSysHostCtxFn, BamSysQueryFn, BamSystemCtx, BamSystemDesc, BamSystemFn,
-    BamTermDesc, ComponentDesc, ComponentHookFn, ComponentUuid, ExtensibleStruct, FfiBool,
-    FfiEntity, FfiResult, FfiSlice, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent,
-    SIPHASH_KEY_0, SIPHASH_KEY_1, ScheduleId, StrView, SymbolEntry, VTableHeader,
-    abi_version_is_compatible, abi_version_major, abi_version_minor, abi_version_patch,
-    assert_abi_pod, assert_raw_insertable, pack_abi_version, read_descriptor,
-    read_extensible_struct, siphash24_128, unpack_abi_version,
+    BamMsgSendFn, BamMsgWriteBatchFn, BamObserverDesc, BamObserverFn, BamParForEachChunkFn,
+    BamQueryDesc, BamRegisterComponentFn, BamRegisterObserverFn, BamRegisterSystemFn,
+    BamResMutPtrFn, BamResPtrFn, BamResTicksFn, BamResolveComponentFn, BamRestoreStateFn,
+    BamRunIfFn, BamSaveStateFn, BamShutdownFn, BamStateWriterFn, BamSysCommandsFn,
+    BamSysEntityGetFn, BamSysEntityGetMutFn, BamSysHostCtxFn, BamSysQueryFn, BamSysResMutPtrFn,
+    BamSysResPtrFn, BamSystemCtx, BamSystemDesc, BamSystemFn, BamTermDesc, ComponentDesc,
+    ComponentHookFn, ComponentUuid, ExtensibleStruct, FfiBool, FfiChildOf, FfiEntity, FfiResult,
+    FfiSlice, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent, SIPHASH_KEY_0,
+    SIPHASH_KEY_1, ScheduleId, StrView, SymbolEntry, VTableHeader, abi_version_is_compatible,
+    abi_version_major, abi_version_minor, abi_version_patch, assert_abi_pod, assert_raw_insertable,
+    pack_abi_version, read_descriptor, read_extensible_struct, siphash24_128, unpack_abi_version,
 };
 
 struct StackFmtBuf<const N: usize> {
@@ -305,6 +307,12 @@ fn populated_host_api() -> BamHostApi {
         sys_entity_get_mut: None,
         msg_read_batch: None,
         msg_send: None,
+        msg_write_batch: None,
+        res_ticks: None,
+        sys_res_ptr: None,
+        sys_res_mut_ptr: None,
+        register_observer: None,
+        cmd_trigger: None,
     }
 }
 
@@ -315,6 +323,9 @@ fn abi_v0_2_exact_sizes_alignments_and_offsets() {
     assert_eq!(size_of::<BamComponent>(), 4);
     assert_eq!(align_of::<BamComponent>(), 4);
     assert_eq!(size_of::<FfiEntity>(), 8);
+    assert_eq!(size_of::<FfiChildOf>(), 8);
+    assert_eq!(size_of::<BamChangeTicks>(), 16);
+    assert_eq!(align_of::<BamChangeTicks>(), 4);
     assert_eq!(size_of::<FfiResult>(), 4);
     assert_eq!(align_of::<FfiResult>(), 4);
     assert_eq!(size_of::<AccessMode>(), 4);
@@ -371,6 +382,13 @@ fn abi_v0_2_exact_sizes_alignments_and_offsets() {
     assert_eq!(size_of::<Option<BamSysEntityGetMutFn>>(), ptr_sz);
     assert_eq!(size_of::<Option<BamMsgReadBatchFn>>(), ptr_sz);
     assert_eq!(size_of::<Option<BamMsgSendFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamMsgWriteBatchFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamResTicksFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamSysResPtrFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamSysResMutPtrFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamRegisterObserverFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamCmdTriggerFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamObserverFn>>(), ptr_sz);
     assert_eq!(size_of::<Option<BamStateWriterFn>>(), ptr_sz);
     assert_eq!(size_of::<Option<BamSaveStateFn>>(), ptr_sz);
     assert_eq!(size_of::<Option<BamRestoreStateFn>>(), ptr_sz);
@@ -384,14 +402,16 @@ fn abi_v0_2_exact_sizes_alignments_and_offsets() {
         assert_eq!(BamManifest::MIN_V0_2_SIZE, 32);
         assert_eq!(size_of::<BamQueryDesc>(), 24);
         assert_eq!(BamQueryDesc::MIN_V0_2_SIZE, 24);
-        assert_eq!(size_of::<BamSystemDesc>(), 104);
+        assert_eq!(size_of::<BamSystemDesc>(), 120);
         assert_eq!(BamSystemDesc::MIN_V0_2_SIZE, 104);
+        assert_eq!(size_of::<BamObserverDesc>(), 48);
+        assert_eq!(BamObserverDesc::MIN_V0_2_SIZE, 48);
         assert_eq!(size_of::<ComponentDesc>(), 88);
         assert_eq!(ComponentDesc::MIN_V0_2_SIZE, 64);
         assert_eq!(size_of::<BamColumnInfo>(), 48);
         assert_eq!(size_of::<VTableHeader>(), 40);
         assert_eq!(VTableHeader::MIN_V0_2_SIZE, 40);
-        assert_eq!(size_of::<BamHostApi>(), 264);
+        assert_eq!(size_of::<BamHostApi>(), 312);
         assert_eq!(BamHostApi::MIN_V0_2_SIZE, 224);
     }
 
@@ -403,14 +423,16 @@ fn abi_v0_2_exact_sizes_alignments_and_offsets() {
         assert_eq!(BamManifest::MIN_V0_2_SIZE, 24);
         assert_eq!(size_of::<BamQueryDesc>(), 16);
         assert_eq!(BamQueryDesc::MIN_V0_2_SIZE, 16);
-        assert_eq!(size_of::<BamSystemDesc>(), 60);
+        assert_eq!(size_of::<BamSystemDesc>(), 68);
         assert_eq!(BamSystemDesc::MIN_V0_2_SIZE, 60);
+        assert_eq!(size_of::<BamObserverDesc>(), 36);
+        assert_eq!(BamObserverDesc::MIN_V0_2_SIZE, 36);
         assert_eq!(size_of::<ComponentDesc>(), 56);
         assert_eq!(ComponentDesc::MIN_V0_2_SIZE, 44);
         assert_eq!(size_of::<BamColumnInfo>(), 40);
         assert_eq!(size_of::<VTableHeader>(), 32);
         assert_eq!(VTableHeader::MIN_V0_2_SIZE, 32);
-        assert_eq!(size_of::<BamHostApi>(), 136);
+        assert_eq!(size_of::<BamHostApi>(), 160);
         assert_eq!(BamHostApi::MIN_V0_2_SIZE, 116);
     }
 }
@@ -977,6 +999,54 @@ fn regression_c11_m05_traits_vtable_header_and_column_info() {
     assert!(AccessMode::MESSAGE_WRITE.is_message());
     assert!(AccessMode::MESSAGE_WRITE.is_mutable());
     assert!(!AccessMode::MESSAGE_READ.is_mutable());
+
+    let event_info = BamColumnInfo {
+        storage_flags: BAM_STORAGE_FLAG_EVENT | BAM_STORAGE_FLAG_ENTITY_EVENT,
+        ..info
+    };
+    assert!(event_info.is_event());
+    assert!(event_info.is_entity_event());
+
+    // `BamChangeTicks` wraparound-safe change detection:
+    let ticks = BamChangeTicks {
+        added: 10,
+        changed: 12,
+        last_run: 10,
+        this_run: 15,
+    };
+    assert!(!ticks.is_added());
+    assert!(ticks.is_changed());
+    let wrapped = BamChangeTicks {
+        added: 5,
+        changed: 2,
+        last_run: u32::MAX - 2,
+        this_run: 8,
+    };
+    assert!(wrapped.is_added());
+    assert!(wrapped.is_changed());
+
+    // `BamObserverDesc` validation & entity packing:
+    unsafe extern "C" fn stub_obs(
+        _entity: FfiEntity,
+        _event_data: *const c_void,
+        _commands: *mut BamCommands,
+        _user_data: *mut c_void,
+    ) -> FfiResult {
+        FfiResult::OK
+    }
+    let obs = BamObserverDesc::new(BamComponent::from_raw(7), stub_obs, core::ptr::null_mut())
+        .with_name(c"test_obs".as_ptr())
+        .with_entity(FfiEntity::from_bits(0xDEAD_BEEF_CAFE_BABE));
+    assert_eq!(obs.validate(), FfiResult::OK);
+    assert_eq!(obs.entity().to_bits(), 0xDEAD_BEEF_CAFE_BABE);
+
+    // `FfiChildOf` Pod invariants:
+    assert_abi_pod::<FfiChildOf>();
+    assert_abi_pod::<BamChangeTicks>();
+    assert_eq!(
+        FfiChildOf::new(FfiEntity::from_bits(99)).parent.to_bits(),
+        99
+    );
 }
 
 #[test]

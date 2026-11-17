@@ -4,8 +4,8 @@ use core::ffi::{CStr, c_void};
 use std::ffi::CString;
 
 use bevy_abi_mod_sys::{
-    AbiPod, BamComponent, BamLoadCtx, ComponentDesc, ComponentHookFn, ComponentUuid, FfiEntity,
-    FfiResult,
+    AbiPod, BamComponent, BamLoadCtx, ComponentDesc, ComponentDropFn, ComponentHookFn,
+    ComponentUuid, FfiEntity, FfiResult,
 };
 
 use crate::{
@@ -304,6 +304,42 @@ pub unsafe fn register_dynamic_component_with_drop<T: 'static>(
     let host = *instance.host();
     // SAFETY: `load_ctx` and `vtable_ptr` satisfy caller invariants; `generic_drop_trampoline::<T>`
     // catches panics and drops `T` in place.
+    unsafe { register_component_raw(load_ctx, &host, &desc) }
+}
+
+/// Registers a runtime layout-defined dynamic component (`name`, `size`, `align`, `drop_fn`)
+/// backed by `ComponentDescriptor::new_with_layout` on the host, storing an owned copy of `name`
+/// inside `instance` and returning its 1-based [`BamComponent`] handle.
+///
+/// # Safety
+/// - `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance`.
+/// - If `drop_fn` is `Some`, it must be safe for the host to invoke on instances of `(size, align)`
+///   on entity despawn/remove, and the guest library must stay mapped until all instances drop.
+pub unsafe fn register_component_with_layout(
+    instance: &mut GuestInstance,
+    load_ctx: *mut BamLoadCtx,
+    name: &str,
+    size: usize,
+    align: usize,
+    drop_fn: Option<ComponentDropFn>,
+) -> Result<BamComponent, FfiResult> {
+    if name.is_empty() {
+        return Err(FfiResult::INVALID_ARGUMENT);
+    }
+    let Ok(owned_name) = CString::new(name) else {
+        return Err(FfiResult::INVALID_ARGUMENT);
+    };
+    let uuid = ComponentUuid::from_parts(name, size, align, 0);
+    let raw_name = instance.track_allocation(Box::new(owned_name));
+    // SAFETY: `raw_name` was allocated via `instance.track_allocation` and stays valid for
+    // the lifetime of `instance`.
+    let name_ptr = unsafe { (*raw_name).as_ptr() };
+    let mut desc = ComponentDesc::new(name_ptr, uuid, size, align);
+    if let Some(df) = drop_fn {
+        desc = desc.with_drop(df);
+    }
+    let host = *instance.host();
+    // SAFETY: `load_ctx` and `desc` satisfy caller and C-ABI invariants.
     unsafe { register_component_raw(load_ctx, &host, &desc) }
 }
 

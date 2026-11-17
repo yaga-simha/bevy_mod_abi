@@ -89,8 +89,44 @@ impl FfiEntity {
     }
 }
 
+use crate::primitives::ComponentUuid;
+
+/// Canonical namespaced component name for Bevy's built-in hierarchy parent component
+/// (`bevy_ecs::hierarchy::ChildOf`).
+pub const BAM_CHILD_OF_NAME: &str = "bevy_ecs::hierarchy::ChildOf";
+
+/// FFI-safe wire representation of Bevy's `ChildOf(Entity)` hierarchy relationship component
+/// (`typedef struct BamChildOf { BamEntity parent; } BamChildOf;`).
+///
+/// Layout: `8` bytes, zero implicit padding. Inserting or spawning `FfiChildOf` through
+/// `GuestCommands` routes through host `EntityWorldMut` so `ChildOf` / `Children` relationship
+/// hooks maintain parent-child links and recursive despawn invariants.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Hash)]
+pub struct FfiChildOf {
+    /// Target parent entity (`BamEntity`).
+    pub parent: FfiEntity,
+}
+
+impl FfiChildOf {
+    /// Deterministic 128-bit [`ComponentUuid`] matching host `bevy_ecs::hierarchy::ChildOf`.
+    pub const UUID: ComponentUuid = ComponentUuid::from_parts(BAM_CHILD_OF_NAME, 8, 8, 0);
+
+    /// Constructs a [`FfiChildOf`] pointing at `parent`.
+    #[inline]
+    pub const fn new(parent: FfiEntity) -> Self {
+        Self { parent }
+    }
+}
+
 const _: () = {
     assert!(core::mem::size_of::<BamComponent>() == 4);
     assert!(core::mem::align_of::<BamComponent>() == 4);
     assert!(core::mem::size_of::<FfiEntity>() == 8);
+    assert!(core::mem::size_of::<FfiChildOf>() == 8);
+    assert!(core::mem::offset_of!(FfiChildOf, parent) == 0);
+    #[cfg(target_pointer_width = "64")]
+    {
+        assert!(core::mem::align_of::<FfiChildOf>() == 8);
+    }
 };

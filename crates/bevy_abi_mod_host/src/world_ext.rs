@@ -20,12 +20,25 @@ use bevy_abi_mod_sys::{
 };
 use bevy_ecs::component::{Component, StorageType};
 use bevy_ecs::entity::Entity;
+use bevy_ecs::event::{EntityEvent, Event};
+use bevy_ecs::hierarchy::ChildOf;
 use bevy_ecs::message::{Message, Messages};
 use bevy_ecs::name::Name;
 use bevy_ecs::prelude::Resource;
 use bevy_ecs::schedule::{ScheduleLabel, Schedules, SystemSet};
 use bevy_ecs::world::World;
 use std::path::{Path, PathBuf};
+
+pub(crate) fn ensure_hierarchy_registered(world: &mut World) {
+    let child_of_id = world.register_component::<ChildOf>();
+    let child_of_immutable = world
+        .components()
+        .get_info(child_of_id)
+        .is_some_and(|info| !info.mutable());
+    let _ = with_world_registry(world, |reg| {
+        reg.register_hierarchy(child_of_id, child_of_immutable)
+    });
+}
 
 pub(crate) fn ensure_world_mod_resources(world: &mut World) {
     if !world.contains_resource::<WorldDropGuard>() {
@@ -60,6 +73,7 @@ pub(crate) fn ensure_world_mod_resources(world: &mut World) {
     if !world.contains_resource::<Messages<ModSystemFaulted>>() {
         world.init_resource::<Messages<ModSystemFaulted>>();
     }
+    ensure_hierarchy_registered(world);
 }
 
 fn with_world_registry<R>(world: &mut World, f: impl FnOnce(&mut ModRegistry) -> R) -> R {
@@ -238,6 +252,19 @@ pub trait ModWorldExt {
         &mut self,
     ) -> Result<BamComponent, ComponentCollisionError>;
 
+    /// Registers a triggerable host Bevy [`Event`] implementing [`ModComponent`] + [`Copy`],
+    /// returning its 1-based [`BamComponent`] handle for deferred triggers and guest observers.
+    fn register_mod_event<E>(&mut self) -> Result<BamComponent, ComponentCollisionError>
+    where
+        E: Event<Trigger<'static>: Default> + ModComponent + Copy;
+
+    /// Registers a triggerable entity-targeted Bevy [`EntityEvent`] implementing [`ModComponent`]
+    /// + [`Copy`], returning its 1-based [`BamComponent`] handle for deferred triggers and observers.
+    fn register_mod_entity_event<E>(&mut self) -> Result<BamComponent, ComponentCollisionError>
+    where
+        E: EntityEvent + Event + ModComponent + Copy,
+        for<'a> E::Trigger<'a>: Default;
+
     /// Registers a non-component [`ModComponent`] helper/nested struct type so its static VTable
     /// and field accessors are resolvable via `get_proc_address`.
     fn register_mod_type<T: ModComponent>(&mut self) -> &mut Self;
@@ -331,6 +358,23 @@ impl ModWorldExt for World {
         }
         let messages_res_id = self.register_component::<Messages<M>>();
         with_world_registry(self, |reg| reg.register_message::<M>(messages_res_id))
+    }
+
+    fn register_mod_event<E>(&mut self) -> Result<BamComponent, ComponentCollisionError>
+    where
+        E: Event<Trigger<'static>: Default> + ModComponent + Copy,
+    {
+        let event_key = self.register_event_key::<E>();
+        with_world_registry(self, |reg| reg.register_event::<E>(event_key))
+    }
+
+    fn register_mod_entity_event<E>(&mut self) -> Result<BamComponent, ComponentCollisionError>
+    where
+        E: EntityEvent + Event + ModComponent + Copy,
+        for<'a> E::Trigger<'a>: Default,
+    {
+        let event_key = self.register_event_key::<E>();
+        with_world_registry(self, |reg| reg.register_entity_event::<E>(event_key))
     }
 
     fn register_mod_type<T: ModComponent>(&mut self) -> &mut Self {

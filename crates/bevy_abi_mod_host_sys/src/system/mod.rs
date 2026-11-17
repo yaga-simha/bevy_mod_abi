@@ -11,7 +11,7 @@ pub use error_policy::{
 };
 pub use guest_system::{
     GuestSystem, HostSystemCtx, host_sys_commands, host_sys_entity_get, host_sys_entity_get_mut,
-    host_sys_host_ctx, host_sys_query,
+    host_sys_host_ctx, host_sys_query, host_sys_res_mut_ptr, host_sys_res_ptr,
 };
 #[cfg(feature = "diagnostics")]
 pub use guest_system::{ModDiagnosticsCollector, ModDiagnosticsSample};

@@ -6,8 +6,8 @@ use bevy_abi_mod_guest_sys::{
     Host, ValidatedIter, ValidatedSystemInvocation, ValidatedSystemRef, resolve_component,
 };
 use bevy_abi_mod_sys::{
-    AbiPod, BamComponent, BamHostApi, BamSystemCtx, ComponentUuid, FfiEntity, FfiResult,
-    MAX_QUERIES_PER_SYSTEM,
+    AbiPod, BamChangeTicks, BamComponent, BamHostApi, BamSystemCtx, ComponentUuid, FfiEntity,
+    FfiResult, MAX_QUERIES_PER_SYSTEM,
 };
 
 use crate::{
@@ -87,6 +87,95 @@ pub struct SystemContext<'a> {
     resource_query: Option<ChunkIter<'a>>,
     empty_iter: ChunkIter<'a>,
     commands: GuestCommands<'a>,
+}
+
+/// Safe read-only singleton resource guard carrying Bevy change-detection [`BamChangeTicks`].
+pub struct GuestRes<'a, R> {
+    value: &'a R,
+    ticks: BamChangeTicks,
+}
+
+impl<'a, R> GuestRes<'a, R> {
+    /// Wraps a validated resource reference and its Bevy change-detection ticks.
+    #[inline]
+    pub const fn new(value: &'a R, ticks: BamChangeTicks) -> Self {
+        Self { value, ticks }
+    }
+
+    /// Returns raw [`BamChangeTicks`] (`added`, `changed`, `last_run`, `this_run`).
+    #[inline]
+    pub const fn ticks(&self) -> BamChangeTicks {
+        self.ticks
+    }
+
+    /// Returns `true` if the resource was added since this system last ran.
+    #[inline]
+    pub const fn is_added(&self) -> bool {
+        self.ticks.is_added()
+    }
+
+    /// Returns `true` if the resource was added or changed since this system last ran.
+    #[inline]
+    pub const fn is_changed(&self) -> bool {
+        self.ticks.is_changed()
+    }
+}
+
+impl<R> core::ops::Deref for GuestRes<'_, R> {
+    type Target = R;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.value
+    }
+}
+
+/// Safe exclusive mutable singleton resource guard carrying prior [`BamChangeTicks`].
+pub struct GuestResMut<'a, R> {
+    value: &'a mut R,
+    ticks: BamChangeTicks,
+}
+
+impl<'a, R> GuestResMut<'a, R> {
+    /// Wraps a validated mutable resource reference and its prior Bevy change-detection ticks.
+    #[inline]
+    pub const fn new(value: &'a mut R, ticks: BamChangeTicks) -> Self {
+        Self { value, ticks }
+    }
+
+    /// Returns raw [`BamChangeTicks`] captured before this mutable borrow stamped `changed`.
+    #[inline]
+    pub const fn ticks(&self) -> BamChangeTicks {
+        self.ticks
+    }
+
+    /// Returns `true` if the resource was added since this system last ran.
+    #[inline]
+    pub const fn is_added(&self) -> bool {
+        self.ticks.is_added()
+    }
+
+    /// Returns `true` if the resource was changed by an earlier system since this system last ran.
+    #[inline]
+    pub const fn is_changed(&self) -> bool {
+        self.ticks.is_changed()
+    }
+}
+
+impl<R> core::ops::Deref for GuestResMut<'_, R> {
+    type Target = R;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.value
+    }
+}
+
+impl<R> core::ops::DerefMut for GuestResMut<'_, R> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.value
+    }
 }
 
 /// Backwards-compatible alias unifying multi-query systems onto [`SystemContext`].
@@ -292,6 +381,78 @@ impl<'a> SystemContext<'a> {
         }
     }
 
+    /// Looks up a shared singleton resource `R` wrapped in [`GuestRes`] by pre-resolved
+    /// [`BamComponent`] handle (`sys_res_ptr`), returning `None` if undeclared or absent.
+    #[inline]
+    pub fn res_by_handle<R: AbiPod>(&self, handle: BamComponent) -> Option<GuestRes<'_, R>> {
+        self.sys_ref
+            .res_ptr_by_handle_checked::<R>(handle)
+            .map(|(val, ticks)| GuestRes::new(val, ticks))
+    }
+
+    /// Looks up an exclusive mutable singleton resource `R` wrapped in [`GuestResMut`] by
+    /// pre-resolved [`BamComponent`] handle (`sys_res_mut_ptr`), returning `None` if undeclared
+    /// with `ResourceWrite`, immutable, or absent.
+    #[inline]
+    pub fn res_mut_by_handle<R: AbiPod>(
+        &mut self,
+        handle: BamComponent,
+    ) -> Option<GuestResMut<'_, R>> {
+        self.sys_ref
+            .res_mut_ptr_by_handle_checked::<R>(handle)
+            .map(|(val, ticks)| GuestResMut::new(val, ticks))
+    }
+
+    /// Reads Bevy change-detection ticks for the singleton resource declared at `decl_index`.
+    #[inline]
+    pub fn resource_ticks(&self, decl_index: usize) -> Result<BamChangeTicks, FfiResult> {
+        if let Some(ref res_q) = self.resource_query {
+            res_q.resource_ticks(decl_index)
+        } else {
+            self.queries
+                .first()
+                .and_then(Option::as_ref)
+                .ok_or(FfiResult::OUT_OF_RANGE)?
+                .resource_ticks(decl_index)
+        }
+    }
+
+    /// Borrows singleton resource `R` (`R: GuestComponent`) with [`BamChangeTicks`] at
+    /// `decl_index`.
+    #[inline]
+    pub fn res_with_ticks<R: GuestComponent>(
+        &self,
+        decl_index: usize,
+    ) -> Result<GuestRes<'_, R>, FfiResult> {
+        if let Some(ref res_q) = self.resource_query {
+            res_q.component_resource_with_ticks::<R>(decl_index)
+        } else {
+            self.queries
+                .first()
+                .and_then(Option::as_ref)
+                .ok_or(FfiResult::OUT_OF_RANGE)?
+                .component_resource_with_ticks::<R>(decl_index)
+        }
+    }
+
+    /// Mutably borrows singleton resource `R` (`R: GuestComponent`) with prior [`BamChangeTicks`]
+    /// at `decl_index`.
+    #[inline]
+    pub fn res_mut_with_ticks<R: GuestComponent>(
+        &mut self,
+        decl_index: usize,
+    ) -> Result<GuestResMut<'_, R>, FfiResult> {
+        if let Some(ref mut res_q) = self.resource_query {
+            res_q.component_resource_mut_with_ticks::<R>(decl_index)
+        } else {
+            self.queries
+                .first_mut()
+                .and_then(Option::as_mut)
+                .ok_or(FfiResult::OUT_OF_RANGE)?
+                .component_resource_mut_with_ticks::<R>(decl_index)
+        }
+    }
+
     /// Processes primary query `0` chunks in parallel across the host `ComputeTaskPool` (`P-07`).
     #[inline]
     pub fn par_chunks<F>(&mut self, f: F) -> FfiResult
@@ -488,6 +649,25 @@ impl<'a> SystemContext<'a> {
                 Some(q) => q.send_pod_message::<M>(decl_index, msg),
                 None => FfiResult::OUT_OF_RANGE,
             }
+        }
+    }
+
+    /// Batch-appends `messages` (`M: GuestComponent`) into the stream declared with `MESSAGE_WRITE`
+    /// at `decl_index`.
+    #[inline]
+    pub fn send_messages<M: GuestComponent>(
+        &mut self,
+        decl_index: usize,
+        messages: &[M],
+    ) -> Result<(), FfiResult> {
+        if let Some(ref mut res_q) = self.resource_query {
+            res_q.send_messages::<M>(decl_index, messages)
+        } else {
+            self.queries
+                .first_mut()
+                .and_then(Option::as_mut)
+                .ok_or(FfiResult::OUT_OF_RANGE)?
+                .send_messages::<M>(decl_index, messages)
         }
     }
 }

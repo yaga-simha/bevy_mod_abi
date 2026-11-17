@@ -7,7 +7,7 @@ mod uuid;
 
 pub use self::{
     bool::FfiBool,
-    entity::{BamComponent, FfiEntity},
+    entity::{BAM_CHILD_OF_NAME, BamComponent, FfiChildOf, FfiEntity},
     slice::{FfiSlice, StrView},
     uuid::{ComponentUuid, SIPHASH_KEY_0, SIPHASH_KEY_1, siphash24_128},
 };

@@ -184,6 +184,8 @@ fuzz_target!(|data: &[u8]| {
         before_count: 0,
         run_if: if use_run_if { Some(noop_run_if) } else { None },
         run_if_user_data: core::ptr::null_mut(),
+        in_sets: core::ptr::null(),
+        in_set_count: 0,
     };
 
     if poison_early {

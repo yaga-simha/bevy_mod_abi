@@ -29,6 +29,74 @@ pub const BAM_STORAGE_FLAG_RESOURCE: u32 = 1 << 2;
 /// Term refers to a buffered Bevy `Messages<M>` stream (`F-02`).
 pub const BAM_STORAGE_FLAG_MESSAGE: u32 = 1 << 3;
 
+/// Registered type is a triggerable Bevy `Event` (`world.trigger` / dynamic observer).
+pub const BAM_STORAGE_FLAG_EVENT: u32 = 1 << 4;
+
+/// Registered type is an entity-targeted Bevy `EntityEvent`.
+pub const BAM_STORAGE_FLAG_ENTITY_EVENT: u32 = 1 << 5;
+
+/// Maximum change-tick relative age matching `bevy_ecs::change_detection::MAX_CHANGE_AGE`.
+pub const BAM_MAX_CHANGE_AGE: u32 = u32::MAX - (2 * 518_400_000 - 1);
+
+/// Snapshot of Bevy `ComponentTicks` (`added`, `changed`) alongside the enclosing system's
+/// `(last_run, this_run)` tick window (`typedef struct BamChangeTicks BamChangeTicks;`).
+///
+/// Layout: `16` bytes, `4`-byte alignment, zero implicit padding on 32-bit and 64-bit targets.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Hash)]
+pub struct BamChangeTicks {
+    /// Tick when the resource or component was added (`offset 0`).
+    pub added: u32,
+    /// Tick when the resource or component was last changed (`offset 4`).
+    pub changed: u32,
+    /// Calling system's `last_run` tick (`offset 8`).
+    pub last_run: u32,
+    /// Calling system's `this_run` tick (`offset 12`).
+    pub this_run: u32,
+}
+
+impl BamChangeTicks {
+    /// Evaluates wraparound-safe Bevy change detection: returns `true` iff `tick` occurred strictly
+    /// after `last_run` relative to `this_run`, clamping ages at [`BAM_MAX_CHANGE_AGE`].
+    #[inline]
+    pub const fn is_tick_newer(tick: u32, last_run: u32, this_run: u32) -> bool {
+        let ticks_since_insert = this_run.wrapping_sub(tick);
+        let clamped_insert = if ticks_since_insert < BAM_MAX_CHANGE_AGE {
+            ticks_since_insert
+        } else {
+            BAM_MAX_CHANGE_AGE
+        };
+        let ticks_since_system = this_run.wrapping_sub(last_run);
+        let clamped_system = if ticks_since_system < BAM_MAX_CHANGE_AGE {
+            ticks_since_system
+        } else {
+            BAM_MAX_CHANGE_AGE
+        };
+        clamped_system > clamped_insert
+    }
+
+    /// Returns `true` if the resource or component was added since the system's `last_run` tick.
+    #[inline]
+    pub const fn is_added(&self) -> bool {
+        Self::is_tick_newer(self.added, self.last_run, self.this_run)
+    }
+
+    /// Returns `true` if the resource or component was changed since the system's `last_run` tick.
+    #[inline]
+    pub const fn is_changed(&self) -> bool {
+        Self::is_tick_newer(self.changed, self.last_run, self.this_run)
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<BamChangeTicks>() == 16);
+    assert!(core::mem::align_of::<BamChangeTicks>() == 4);
+    assert!(core::mem::offset_of!(BamChangeTicks, added) == 0);
+    assert!(core::mem::offset_of!(BamChangeTicks, changed) == 4);
+    assert!(core::mem::offset_of!(BamChangeTicks, last_run) == 8);
+    assert!(core::mem::offset_of!(BamChangeTicks, this_run) == 12);
+};
+
 /// Metadata returned by [`BamIterColumnInfoFn`] (`iter_column_info`) for guest type-confusion checks.
 ///
 /// Layout:
@@ -76,6 +144,18 @@ impl BamColumnInfo {
     #[inline]
     pub const fn is_message(&self) -> bool {
         (self.storage_flags & BAM_STORAGE_FLAG_MESSAGE) != 0
+    }
+
+    /// Returns `true` if `BAM_STORAGE_FLAG_EVENT` is set.
+    #[inline]
+    pub const fn is_event(&self) -> bool {
+        (self.storage_flags & BAM_STORAGE_FLAG_EVENT) != 0
+    }
+
+    /// Returns `true` if `BAM_STORAGE_FLAG_ENTITY_EVENT` is set.
+    #[inline]
+    pub const fn is_entity_event(&self) -> bool {
+        (self.storage_flags & BAM_STORAGE_FLAG_ENTITY_EVENT) != 0
     }
 
     /// Returns `true` if `(uuid, size, align)` match the expected guest type metadata.
@@ -266,4 +346,30 @@ pub type BamMsgSendFn = unsafe extern "C" fn(
     term_index: usize,
     data_ptr: *const u8,
     data_len: usize,
+) -> FfiResult;
+
+/// Writes `count` contiguous POD message payloads from `in_buf` (`count * size_of::<M>()` readable
+/// bytes) into the Bevy `Messages<M>` stream declared with `MESSAGE_WRITE` at `term_index`.
+///
+/// # Safety
+/// - `iter` must point to an active [`BamIter`] belonging to the running system invocation.
+/// - When `count > 0` and element size `> 0`, `in_buf` must point to `count * elem_size` readable bytes.
+pub type BamMsgWriteBatchFn = unsafe extern "C" fn(
+    iter: *mut BamIter,
+    term_index: usize,
+    in_buf: *const u8,
+    count: usize,
+) -> FfiResult;
+
+/// Queries Bevy change-detection ticks (`added`, `changed`, `last_run`, `this_run`) for the
+/// singleton `Resource` declared at `term_index` (`RESOURCE_READ` or `RESOURCE_WRITE`), writing
+/// them into `*out_ticks`.
+///
+/// # Safety
+/// - `iter` must point to an active [`BamIter`] belonging to the running system invocation.
+/// - `out_ticks` must point to writable [`BamChangeTicks`] storage.
+pub type BamResTicksFn = unsafe extern "C" fn(
+    iter: *const BamIter,
+    term_index: usize,
+    out_ticks: *mut BamChangeTicks,
 ) -> FfiResult;

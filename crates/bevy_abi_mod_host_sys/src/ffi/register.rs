@@ -10,19 +10,53 @@ use crate::handle_header::{
     validate_handle_ref,
 };
 use crate::loader::ModId;
-use crate::registry::{ModRegistry, RegistrySnapshot, component_flags_to_storage_flags};
+use crate::registry::{
+    ExtractEventTargetFn, ModRegistry, RegistrySnapshot, component_flags_to_storage_flags,
+};
 use crate::schedule::ModNamedSystemSet;
+use crate::sync_ptr::{GuestFnPtr, GuestUserData};
 use crate::system::access_builder::validate_system_queries_against_snapshot;
 use crate::system::{BamQuerySpecOwned, GuestSystem};
 use bevy_abi_mod_sys::{
-    BamComponent, BamHostCtx, BamLoadCtx, BamQueryDesc, BamSystemDesc, BamTermDesc, ComponentDesc,
-    ComponentUuid, FfiResult, read_descriptor,
+    BamComponent, BamHostCtx, BamLoadCtx, BamObserverDesc, BamObserverFn, BamQueryDesc,
+    BamSystemDesc, BamTermDesc, ComponentDesc, ComponentUuid, FfiResult, read_descriptor,
 };
 use bevy_ecs::component::{ComponentCloneBehavior, ComponentDescriptor, ComponentId, StorageType};
+use bevy_ecs::entity::Entity;
+use bevy_ecs::event::EventKey;
 use bevy_ecs::world::World;
 use core::ffi::{CStr, c_char, c_void};
 use core::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
+
+/// Dynamic Bevy ECS observer registration captured during `bevy_abi_mod_init`.
+#[derive(Clone)]
+pub struct GuestObserverBinding {
+    /// Human-readable observer name for diagnostics.
+    pub name: Arc<str>,
+    /// Pre-resolved 1-based [`BamComponent`] handle of the observed event.
+    pub event: BamComponent,
+    /// Underlying Bevy [`ComponentId`] corresponding to `event`.
+    pub event_id: ComponentId,
+    /// Bevy [`EventKey`] dispatched by `world.trigger*` / `world.trigger_dynamic*`.
+    pub event_key: EventKey,
+    /// Payload size (`size_of::<E>()`).
+    pub event_size: usize,
+    /// Optional watched target entity (`None` for global observers).
+    pub target_entity: Option<Entity>,
+    /// Extractor returning the target entity from typed host `EntityEvent` payloads.
+    pub extract_target_fn: Option<ExtractEventTargetFn>,
+    /// Foreign C-ABI callback (`BamObserverFn`).
+    pub callback: GuestFnPtr<BamObserverFn>,
+    /// Opaque guest state pointer forwarded to `callback`.
+    pub user_data: GuestUserData,
+    /// Shared module liveness flag disarmed before `dlclose`.
+    pub is_active: Arc<AtomicBool>,
+    /// CoW registry handle for snapshot lookup inside commands recorded by the observer.
+    pub registry: ModRegistry,
+    /// Owning [`ModId`].
+    pub mod_id: Option<ModId>,
+}
 
 /// Concrete `#[repr(C)]` initialization context backing opaque [`BamLoadCtx`] (`N-02`, `S-08`).
 ///
@@ -38,6 +72,8 @@ pub struct LoadContext {
     pub registry: ModRegistry,
     /// Accumulated systems registered during `bevy_abi_mod_init`.
     pub registered_systems: Vec<GuestSystem>,
+    /// Accumulated dynamic observers registered during `bevy_abi_mod_init`.
+    pub registered_observers: Vec<GuestObserverBinding>,
     /// Handles of dynamic components registered during this init session.
     pub registered_components: Vec<BamComponent>,
     /// Shared liveness flag for this module load session.
@@ -86,6 +122,7 @@ impl LoadContext {
             host_ctx,
             registry,
             registered_systems: Vec::new(),
+            registered_observers: Vec::new(),
             registered_components: Vec::new(),
             is_active,
             world_ptr,
@@ -741,6 +778,14 @@ pub unsafe extern "C" fn host_register_system(
             return status;
         }
     };
+    // SAFETY: `desc.validate()` verified `in_sets` non-null when `in_set_count > 0`.
+    let in_sets = match unsafe { parse_ordering_targets(desc.in_sets, desc.in_set_count) } {
+        Ok(v) => v,
+        Err((status, msg)) => {
+            ctx.host_ctx.set_last_error(msg);
+            return status;
+        }
+    };
 
     let run_if = desc.run_if.map(|cb| (cb, desc.run_if_user_data));
 
@@ -754,6 +799,7 @@ pub unsafe extern "C" fn host_register_system(
     .with_schedule(desc.schedule)
     .with_main_thread(desc.is_main_thread())
     .with_ordering(after_systems, before_systems)
+    .with_in_sets(in_sets)
     .with_run_if(run_if)
     .with_is_active(Arc::clone(&ctx.is_active));
 
@@ -762,5 +808,126 @@ pub unsafe extern "C" fn host_register_system(
     }
 
     ctx.registered_systems.push(sys);
+    FfiResult::OK
+}
+
+/// Registers a dynamic Bevy ECS [`Observer`](bevy_ecs::observer::Observer) from a [`BamObserverDesc`]
+/// during `bevy_abi_mod_init`.
+///
+/// # Safety
+/// - `load_ctx` must point to an active [`LoadContext`] cast to [`BamLoadCtx`], or null.
+/// - `desc` must point to a valid aligned [`BamObserverDesc`] whose `name` (if non-null) is NUL-terminated UTF-8.
+pub unsafe extern "C" fn host_register_observer(
+    load_ctx: *mut BamLoadCtx,
+    desc: *const BamObserverDesc,
+) -> FfiResult {
+    // SAFETY: Validating `load_ctx` against `LOAD_CTX_MAGIC` under `STRICT_FFI_CHECKS`.
+    let ctx = match unsafe {
+        validate_handle_mut::<LoadContext>(load_ctx.cast::<c_void>(), LOAD_CTX_MAGIC, false)
+    } {
+        Ok(c) => c,
+        Err(err) => return err,
+    };
+    if !ctx.in_init {
+        ctx.host_ctx
+            .set_last_error("host_register_observer called outside bevy_abi_mod_init");
+        return FfiResult::INVALID_STATE;
+    }
+    ctx.host_ctx.clear_last_error();
+
+    if desc.is_null() {
+        ctx.host_ctx
+            .set_last_error("host_register_observer received null BamObserverDesc pointer");
+        return FfiResult::NULL_POINTER;
+    }
+
+    // SAFETY: `desc` is non-null; `read_descriptor` checks alignment and `struct_size >= MIN_V0_2_SIZE`.
+    let desc = match unsafe { read_descriptor::<BamObserverDesc>(desc.cast::<c_void>()) } {
+        Ok(d) => d,
+        Err(err) => {
+            ctx.host_ctx
+                .set_last_error(format!("invalid BamObserverDesc descriptor ({err})"));
+            return err;
+        }
+    };
+
+    let validation = desc.validate();
+    if validation.is_err() {
+        ctx.host_ctx
+            .set_last_error(format!("BamObserverDesc validation failed ({validation})"));
+        return validation;
+    }
+
+    let obs_name: Arc<str> = if desc.name.is_null() {
+        Arc::from("<unnamed_observer>")
+    } else {
+        // SAFETY: `desc.name` was verified non-null and points to NUL-terminated UTF-8.
+        let Ok(s) = (unsafe { CStr::from_ptr(desc.name) }).to_str() else {
+            ctx.host_ctx
+                .set_last_error("BamObserverDesc `name` is not valid UTF-8");
+            return FfiResult::INVALID_UTF8;
+        };
+        if s.is_empty() {
+            ctx.host_ctx
+                .set_last_error("BamObserverDesc `name` must not be empty");
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        Arc::from(s)
+    };
+
+    let Some(callback) = desc.callback else {
+        ctx.host_ctx
+            .set_last_error("BamObserverDesc `callback` must not be null");
+        return FfiResult::NULL_POINTER;
+    };
+
+    let Some(meta) = ctx.registry.get_by_handle(desc.event) else {
+        ctx.host_ctx
+            .set_last_error("BamObserverDesc `event` handle is not registered");
+        return FfiResult::INVALID_COMPONENT;
+    };
+    if meta.is_resource() || meta.is_message() {
+        ctx.host_ctx.set_last_error(
+            "BamObserverDesc `event` must refer to an Event, EntityEvent, or component, not a Resource or Message",
+        );
+        return FfiResult::INVALID_COMPONENT;
+    }
+    let event_key = meta.event_key.unwrap_or_else(|| {
+        // SAFETY: `meta.component_id` is valid in `world` and matches `meta`'s registered layout.
+        unsafe { EventKey::new(meta.component_id) }
+    });
+
+    let raw_target = desc.entity();
+    let target_entity = if raw_target.is_null() {
+        None
+    } else {
+        let Some(entity) = Entity::try_from_bits(raw_target.to_bits()) else {
+            ctx.host_ctx
+                .set_last_error("BamObserverDesc target entity is invalid");
+            return FfiResult::INVALID_ENTITY;
+        };
+        if entity == Entity::PLACEHOLDER {
+            ctx.host_ctx
+                .set_last_error("BamObserverDesc target entity is Entity::PLACEHOLDER");
+            return FfiResult::INVALID_ENTITY;
+        }
+        Some(entity)
+    };
+
+    ctx.registered_observers.push(GuestObserverBinding {
+        name: obs_name,
+        event: desc.event,
+        event_id: meta.component_id,
+        event_key,
+        event_size: meta.size,
+        target_entity,
+        extract_target_fn: meta.extract_event_target_fn,
+        callback: GuestFnPtr(callback),
+        user_data: GuestUserData::new(desc.user_data),
+        is_active: Arc::clone(&ctx.is_active),
+        registry: ctx.registry.clone(),
+        mod_id: ctx.mod_id,
+    });
+
     FfiResult::OK
 }

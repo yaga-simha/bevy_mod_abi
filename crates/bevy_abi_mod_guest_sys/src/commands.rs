@@ -2,7 +2,9 @@
 
 use core::marker::PhantomData;
 
-use bevy_abi_mod_sys::{AbiPod, BamCommands, BamComponent, FfiEntity, FfiResult};
+use bevy_abi_mod_sys::{
+    AbiPod, BamCmdTriggerFn, BamCommands, BamComponent, BamHostApi, FfiEntity, FfiResult,
+};
 
 use crate::host::Host;
 
@@ -304,5 +306,58 @@ impl<'a> ValidatedCommands<'a> {
         };
         // SAFETY: `self.raw` is active and `entity`/`component` were checked non-zero.
         unsafe { remove_fn(self.raw, entity, component) }
+    }
+
+    /// Queues deferred `world.trigger(...)` or `world.trigger_dynamic*` for pre-resolved `event`.
+    ///
+    /// Pass [`FfiEntity::NULL`] for global event triggers or a valid target [`FfiEntity`] for
+    /// entity-targeted triggers.
+    ///
+    /// # Safety
+    /// If `data_len > 0`, `data_ptr` must be non-null and point to `data_len` initialized readable bytes.
+    pub unsafe fn trigger_raw(
+        &mut self,
+        event: BamComponent,
+        target: FfiEntity,
+        data_ptr: *const u8,
+        data_len: usize,
+    ) -> FfiResult {
+        if self.raw.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if !event.is_valid() {
+            return FfiResult::INVALID_COMPONENT;
+        }
+        if data_len > 0 && data_ptr.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if !self.host.api().covers_slot(
+            core::mem::offset_of!(BamHostApi, cmd_trigger),
+            core::mem::size_of::<Option<BamCmdTriggerFn>>(),
+        ) {
+            return FfiResult::UNSUPPORTED;
+        }
+        let Some(trigger_fn) = self.host.api().cmd_trigger else {
+            return FfiResult::UNSUPPORTED;
+        };
+        // SAFETY: `self.raw` is active and caller guarantees `data_ptr` is readable for `data_len` bytes.
+        unsafe { trigger_fn(self.raw, event, target, data_ptr, data_len) }
+    }
+
+    /// Queues a deferred event trigger of `value` (`T: AbiPod`) under pre-resolved handle `event`.
+    #[inline]
+    pub fn trigger<T: AbiPod>(
+        &mut self,
+        event: BamComponent,
+        target: FfiEntity,
+        value: &T,
+    ) -> FfiResult {
+        let data_ptr = if core::mem::size_of::<T>() == 0 {
+            core::ptr::NonNull::<u8>::dangling().as_ptr().cast_const()
+        } else {
+            core::ptr::from_ref(value).cast::<u8>()
+        };
+        // SAFETY: `value` is `T: AbiPod` and valid for `size_of::<T>()` initialized bytes.
+        unsafe { self.trigger_raw(event, target, data_ptr, core::mem::size_of::<T>()) }
     }
 }

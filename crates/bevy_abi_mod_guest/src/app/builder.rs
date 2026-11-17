@@ -8,11 +8,13 @@ use bevy_abi_mod_guest_sys::{
 };
 use bevy_abi_mod_sys::{
     AbiPod, AccessMode, BAM_SYSTEM_FLAG_MAIN_THREAD, BamComponent, BamHostApi, BamLoadCtx,
-    BamTermDesc, ComponentUuid, FfiResult, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ScheduleId,
+    BamTermDesc, ComponentDropFn, ComponentUuid, FfiEntity, FfiResult, MAX_QUERIES_PER_SYSTEM,
+    MAX_TERMS_PER_QUERY, ScheduleId,
 };
 
 use crate::{
     app::context::{RunConditionContext, SystemContext},
+    commands::GuestCommands,
     component::{
         GuestComponent, GuestComponentHooks, qualify_component_identity, resolve_guest_component,
     },
@@ -217,6 +219,88 @@ impl<'a> GuestApp<'a> {
         )
     }
 
+    /// Registers a runtime layout-defined dynamic component (`name`, `size`, `align`, `drop_fn`)
+    /// backed by `ComponentDescriptor::new_with_layout` on the host, allowing mods to attach private
+    /// `#[repr(C)]` state or custom dynamic events without recompiling the host.
+    pub fn register_component_with_layout(
+        &mut self,
+        name: &str,
+        size: usize,
+        align: usize,
+        drop_fn: Option<ComponentDropFn>,
+    ) -> Result<BamComponent, FfiResult> {
+        self.load_ctx
+            .register_component_with_layout(self.instance, name, size, align, drop_fn)
+    }
+
+    /// Registers a global dynamic observer for `E: GuestComponent` events triggered via
+    /// `world.trigger(...)` or `commands.trigger(...)`.
+    pub fn observe<E, F>(&mut self, name: &str, mut callback: F) -> Result<&mut Self, FfiResult>
+    where
+        E: GuestComponent,
+        F: FnMut(&E, &mut GuestCommands<'_>) + Send + 'static,
+    {
+        let event = self.resolve_component::<E>()?;
+        self.observe_handle::<E, _>(name, event, FfiEntity::NULL, move |_target, ev, cmds| {
+            callback(ev, cmds);
+        })
+    }
+
+    /// Registers an entity-scoped dynamic observer for `EntityEvent` `E: GuestComponent` on
+    /// `target` (or `FfiEntity::NULL` to watch all targets while receiving the event target entity).
+    pub fn observe_entity<E, F>(
+        &mut self,
+        name: &str,
+        target: FfiEntity,
+        mut callback: F,
+    ) -> Result<&mut Self, FfiResult>
+    where
+        E: GuestComponent,
+        F: FnMut(FfiEntity, &E, &mut GuestCommands<'_>) + Send + 'static,
+    {
+        let event = self.resolve_component::<E>()?;
+        self.observe_handle::<E, _>(name, event, target, move |tgt, ev, cmds| {
+            callback(tgt, ev, cmds);
+        })
+    }
+
+    /// Registers a dynamic observer for a pre-resolved event handle `event` (`FfiEntity::NULL`
+    /// for global, or a specific `target` entity).
+    pub fn observe_handle<E, F>(
+        &mut self,
+        name: &str,
+        event: BamComponent,
+        target: FfiEntity,
+        mut callback: F,
+    ) -> Result<&mut Self, FfiResult>
+    where
+        E: AbiPod,
+        F: FnMut(FfiEntity, &E, &mut GuestCommands<'_>) + Send + 'static,
+    {
+        let status = self.load_ctx.register_observer::<E, _>(
+            self.instance,
+            name,
+            event,
+            target,
+            move |tgt, ev, validated_cmds| {
+                let host = validated_cmds.host();
+                // SAFETY: Reborrow of `validated_cmds` is strictly scoped to `callback` invocation.
+                let mut cmds = GuestCommands::from_validated(
+                    bevy_abi_mod_guest_sys::ValidatedCommands::empty(host),
+                );
+                core::mem::swap(&mut cmds.inner, validated_cmds);
+                callback(tgt, ev, &mut cmds);
+                core::mem::swap(&mut cmds.inner, validated_cmds);
+                FfiResult::OK
+            },
+        );
+        if status.is_ok() {
+            Ok(self)
+        } else {
+            Err(status)
+        }
+    }
+
     /// Registers a hot-reload state snapshot callback invoked prior to `bevy_abi_mod_shutdown` (`F-01`).
     #[inline]
     pub fn on_save_state<F>(&mut self, hook: F)
@@ -264,6 +348,7 @@ impl<'a> GuestApp<'a> {
             flags: 0,
             after: Vec::new(),
             before: Vec::new(),
+            in_sets: Vec::new(),
             run_if: None,
             first_error: None,
         }
@@ -513,6 +598,7 @@ pub struct SystemBuilder<'b, 'a> {
     flags: u32,
     after: Vec<&'b CStr>,
     before: Vec<&'b CStr>,
+    in_sets: Vec<&'b CStr>,
     run_if: Option<PreparedRunIf>,
     first_error: Option<FfiResult>,
 }
@@ -669,6 +755,13 @@ impl<'b, 'a> SystemBuilder<'b, 'a> {
         self
     }
 
+    /// Places this system into `target_set_name` (`"host::<name>"` or custom mod set).
+    #[inline]
+    pub fn in_set(mut self, target_set_name: &'b CStr) -> Self {
+        self.in_sets.push(target_set_name);
+        self
+    }
+
     /// Pins this system onto Bevy's main thread (`BAM_SYSTEM_FLAG_MAIN_THREAD`).
     #[inline]
     pub fn main_thread(mut self) -> Self {
@@ -734,6 +827,7 @@ impl<'b, 'a> SystemBuilder<'b, 'a> {
             flags: self.flags,
             after: &self.after,
             before: &self.before,
+            in_sets: &self.in_sets,
         };
         self.app.load_ctx.register_system(
             self.app.instance,

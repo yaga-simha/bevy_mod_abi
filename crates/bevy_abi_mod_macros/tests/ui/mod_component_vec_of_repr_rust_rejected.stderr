@@ -10,14 +10,14 @@ help: the trait `AbiPod` is not implemented for `ReprRustPos`
  4 | pub struct ReprRustPos {
    | ^^^^^^^^^^^^^^^^^^^^^^
    = help: the following other types implement trait `AbiPod`:
+             BamChangeTicks
              BamComponent
              ComponentUuid
              FfiBool
+             FfiChildOf
              FfiEntity
              [T; N]
              f32
-             f64
-             i16
            and $N others
 note: required by a bound in `assert_abi_pod`
   --> $WORKSPACE/crates/bevy_abi_mod_sys/src/traits.rs
@@ -37,14 +37,14 @@ help: the trait `AbiPod` is not implemented for `ReprRustPos`
  4 | pub struct ReprRustPos {
    | ^^^^^^^^^^^^^^^^^^^^^^
    = help: the following other types implement trait `AbiPod`:
+             BamChangeTicks
              BamComponent
              ComponentUuid
              FfiBool
+             FfiChildOf
              FfiEntity
              [T; N]
              f32
-             f64
-             i16
            and $N others
 note: required by a bound in `__bam_read_vec`
   --> tests/ui/mod_component_vec_of_repr_rust_rejected.rs:9:17
@@ -65,14 +65,14 @@ help: the trait `AbiPod` is not implemented for `ReprRustPos`
  4 | pub struct ReprRustPos {
    | ^^^^^^^^^^^^^^^^^^^^^^
    = help: the following other types implement trait `AbiPod`:
+             BamChangeTicks
              BamComponent
              ComponentUuid
              FfiBool
+             FfiChildOf
              FfiEntity
              [T; N]
              f32
-             f64
-             i16
            and $N others
 note: required by a bound in `__bam_write_vec`
   --> tests/ui/mod_component_vec_of_repr_rust_rejected.rs:9:17
@@ -93,14 +93,14 @@ help: the trait `AbiPod` is not implemented for `ReprRustPos`
  4 | pub struct ReprRustPos {
    | ^^^^^^^^^^^^^^^^^^^^^^
    = help: the following other types implement trait `AbiPod`:
+             BamChangeTicks
              BamComponent
              ComponentUuid
              FfiBool
+             FfiChildOf
              FfiEntity
              [T; N]
              f32
-             f64
-             i16
            and $N others
 note: required by a bound in `__bam_push_vec`
   --> tests/ui/mod_component_vec_of_repr_rust_rejected.rs:9:17

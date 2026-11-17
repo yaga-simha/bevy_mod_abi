@@ -22,12 +22,12 @@
 //!    against `last_run` and `this_run`.
 
 use crate::handle_header::{HandleHeader, ITER_MAGIC, validate_handle_mut, validate_handle_ref};
-use crate::registry::{MsgReadBatchFn, MsgSendFn};
+use crate::registry::{MsgReadBatchFn, MsgSendFn, MsgWriteBatchFn};
 use crate::sync_ptr::{GuestFnPtr, GuestUserData};
 use bevy_abi_mod_sys::{
     AccessMode, BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE,
-    BAM_STORAGE_FLAG_SPARSE_SET, BamChunkTaskFn, BamColumnInfo, BamComponent, BamIter,
-    ComponentUuid, FfiBool, FfiEntity, FfiResult, MAX_TERMS_PER_QUERY,
+    BAM_STORAGE_FLAG_SPARSE_SET, BamChangeTicks, BamChunkTaskFn, BamColumnInfo, BamComponent,
+    BamIter, ComponentUuid, FfiBool, FfiEntity, FfiResult, MAX_TERMS_PER_QUERY,
 };
 use bevy_ecs::archetype::{ArchetypeId, Archetypes};
 use bevy_ecs::change_detection::{AtomicTick, Tick};
@@ -68,6 +68,8 @@ pub struct QueryTermMeta {
     pub msg_read_batch_fn: Option<MsgReadBatchFn>,
     /// Optional monomorphized message sender (`F-02`).
     pub msg_send_fn: Option<MsgSendFn>,
+    /// Optional monomorphized batch message writer (`F-02`).
+    pub msg_write_batch_fn: Option<MsgWriteBatchFn>,
 }
 
 impl QueryTermMeta {
@@ -1477,6 +1479,119 @@ pub unsafe extern "C" fn host_msg_send(
             data_len,
         )
     }
+}
+
+/// Writes `count` contiguous POD messages into `Messages<M>` declared with `MESSAGE_WRITE` at `term_index`.
+///
+/// # Safety
+/// - `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
+/// - If `count > 0`, `in_buf` must be readable for `count * size_of::<M>()` bytes.
+pub unsafe extern "C" fn host_msg_write_batch(
+    iter: *mut BamIter,
+    term_index: usize,
+    in_buf: *const u8,
+    count: usize,
+) -> FfiResult {
+    // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
+    let host_iter = match unsafe {
+        validate_handle_mut::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false)
+    } {
+        Ok(it) => it,
+        Err(err) => return err,
+    };
+    if host_iter.in_par_iter {
+        return FfiResult::ACCESS_CONFLICT;
+    }
+    if term_index >= host_iter.plan.terms.len() {
+        return FfiResult::OUT_OF_RANGE;
+    }
+    let term = &host_iter.plan.terms[term_index];
+    if term.mode != AccessMode::MESSAGE_WRITE || !term.is_message() || term.is_immutable() {
+        return FfiResult::PERMISSION_DENIED;
+    }
+    if count == 0 {
+        return FfiResult::OK;
+    }
+    if term.size > 0 && in_buf.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    let Some(_) = count.checked_mul(term.size) else {
+        return FfiResult::INVALID_ARGUMENT;
+    };
+    let Some(write_fn) = term.msg_write_batch_fn else {
+        return FfiResult::INVALID_COMPONENT;
+    };
+    let Some(world) = host_iter.world else {
+        return FfiResult::INVALID_STATE;
+    };
+    // SAFETY: `MESSAGE_WRITE` was declared in `FilteredAccessSet` and `in_buf` bounds were checked above.
+    unsafe {
+        write_fn(
+            world,
+            host_iter.last_run,
+            host_iter.this_run,
+            term.component_id,
+            in_buf,
+            count,
+        )
+    }
+}
+
+/// Reads Bevy change-detection ticks (`added`, `changed`, `last_run`, `this_run`) for the
+/// singleton `Resource` declared at `term_index`.
+///
+/// # Safety
+/// - `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
+/// - `out_ticks` must point to aligned writable [`BamChangeTicks`] storage, or null.
+pub unsafe extern "C" fn host_res_ticks(
+    iter: *const BamIter,
+    term_index: usize,
+    out_ticks: *mut BamChangeTicks,
+) -> FfiResult {
+    if out_ticks.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    if !out_ticks.is_aligned() {
+        return FfiResult::INVALID_ARGUMENT;
+    }
+    // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
+    let host_iter = match unsafe {
+        validate_handle_ref::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false)
+    } {
+        Ok(it) => it,
+        Err(err) => return err,
+    };
+    if term_index >= host_iter.plan.terms.len() {
+        return FfiResult::OUT_OF_RANGE;
+    }
+    let term = &host_iter.plan.terms[term_index];
+    if !term.mode.is_resource() || !term.is_resource() {
+        return FfiResult::PERMISSION_DENIED;
+    }
+    let Some(world) = host_iter.world else {
+        return FfiResult::INVALID_STATE;
+    };
+    // SAFETY: `RESOURCE_READ` or `RESOURCE_WRITE` on `term.component_id` was declared in `FilteredAccessSet`.
+    let Some(entity) = (unsafe { world.resource_entities() }).get(term.component_id) else {
+        return FfiResult::NOT_FOUND;
+    };
+    let Ok(entity_cell) = world.get_entity(entity) else {
+        return FfiResult::NOT_FOUND;
+    };
+    // SAFETY: Shared or exclusive access to this resource was declared in `FilteredAccessSet`.
+    let Some(ticks) = (unsafe { entity_cell.get_change_ticks_by_id(term.component_id) }) else {
+        return FfiResult::NOT_FOUND;
+    };
+    // SAFETY: `out_ticks` is non-null, aligned, and exclusively writable here.
+    unsafe {
+        *out_ticks = BamChangeTicks {
+            added: ticks.added.get(),
+            changed: ticks.changed.get(),
+            last_run: host_iter.last_run.get(),
+            this_run: host_iter.this_run.get(),
+        };
+    }
+    FfiResult::OK
 }
 
 #[derive(Clone, Copy)]

@@ -62,18 +62,18 @@ pub use bevy_abi_mod_sys::{
     ABI_VERSION, ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PATCH, AbiPod, AccessMode,
     BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_IMMUTABLE,
     BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET,
-    BAM_SYSTEM_FLAG_MAIN_THREAD, BamColumnInfo, BamComponent, BamManifest, BamTermDesc,
-    ComponentDesc, ComponentUuid, FfiBool, FfiEntity, FfiResult, FfiSlice, MAX_QUERIES_PER_SYSTEM,
-    MAX_TERMS_PER_QUERY, ModComponent, RawInsertable, ScheduleId, StrView, SymbolEntry,
-    VTableHeader,
+    BAM_SYSTEM_FLAG_MAIN_THREAD, BamChangeTicks, BamColumnInfo, BamComponent, BamManifest,
+    BamObserverDesc, BamObserverFn, BamTermDesc, ComponentDesc, ComponentUuid, FfiBool, FfiChildOf,
+    FfiEntity, FfiResult, FfiSlice, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent,
+    RawInsertable, ScheduleId, StrView, SymbolEntry, VTableHeader,
 };
 
 #[cfg(feature = "derive")]
 pub use bevy_abi_mod_macros::{AbiPod, ModComponent};
 
 pub use app::{
-    GuestApp, IntoSystemResult, MultiQueryContext, QueryBuilder, RunConditionContext,
-    SystemBuilder, SystemContext,
+    GuestApp, GuestRes, GuestResMut, IntoSystemResult, MultiQueryContext, QueryBuilder,
+    RunConditionContext, SystemBuilder, SystemContext,
 };
 pub use commands::GuestCommands;
 pub use component::{GuestComponent, GuestComponentHooks, guest_component_uuid};

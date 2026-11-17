@@ -9,10 +9,11 @@ use core::{
 use std::ffi::CString;
 
 use bevy_abi_mod_sys::{
-    AbiPod, BAM_SYSTEM_KNOWN_FLAGS, BamCommands, BamHostApi, BamIter, BamLoadCtx, BamQueryDesc,
-    BamRunIfFn, BamSysEntityGetFn, BamSysEntityGetMutFn, BamSystemCtx, BamSystemDesc, BamSystemFn,
-    BamTermDesc, FfiBool, FfiEntity, FfiResult, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY,
-    ScheduleId,
+    AbiPod, BAM_SYSTEM_KNOWN_FLAGS, BamChangeTicks, BamCommands, BamComponent, BamHostApi, BamIter,
+    BamLoadCtx, BamObserverDesc, BamObserverFn, BamQueryDesc, BamRegisterObserverFn, BamRunIfFn,
+    BamSysEntityGetFn, BamSysEntityGetMutFn, BamSysResMutPtrFn, BamSysResPtrFn, BamSystemCtx,
+    BamSystemDesc, BamSystemFn, BamTermDesc, FfiBool, FfiEntity, FfiResult, MAX_QUERIES_PER_SYSTEM,
+    MAX_TERMS_PER_QUERY, ScheduleId,
 };
 
 use crate::{
@@ -490,6 +491,78 @@ impl<'a> ValidatedSystemRef<'a> {
         // marked change ticks; `&'b mut self` guarantees exclusive access for `'b`.
         Some(unsafe { &mut *ptr.cast::<T>() })
     }
+
+    /// Looks up a shared singleton resource `&'b R` by its pre-resolved `BamComponent` handle,
+    /// returning `(ref, BamChangeTicks)` if declared with `ResourceRead` or `ResourceWrite`.
+    pub fn res_ptr_by_handle_checked<R: AbiPod>(
+        &self,
+        component: BamComponent,
+    ) -> Option<(&R, BamChangeTicks)> {
+        if self.sys_ctx.is_null() || !component.is_valid() {
+            return None;
+        }
+        if !self.host.api().covers_slot(
+            core::mem::offset_of!(BamHostApi, sys_res_ptr),
+            core::mem::size_of::<Option<BamSysResPtrFn>>(),
+        ) {
+            return None;
+        }
+        let get_fn = self.host.api().sys_res_ptr?;
+        let mut ticks = BamChangeTicks::default();
+        // SAFETY: `self.sys_ctx` is an active `BamSystemCtx` and `&mut ticks` is aligned writable storage.
+        let ptr = unsafe { get_fn(self.sys_ctx.cast_const(), component, &mut ticks) };
+        if ptr.is_null() {
+            return None;
+        }
+        if core::mem::size_of::<R>() == 0 {
+            // SAFETY: Zero-sized `R: AbiPod` may be referenced via `NonNull::dangling()`.
+            return Some((
+                unsafe { core::ptr::NonNull::<R>::dangling().as_ref() },
+                ticks,
+            ));
+        }
+        if !(ptr as usize).is_multiple_of(core::mem::align_of::<R>()) {
+            return None;
+        }
+        // SAFETY: Host verified resource borrow permissions in `FilteredAccessSet` and alignment holds.
+        Some((unsafe { &*ptr.cast::<R>() }, ticks))
+    }
+
+    /// Looks up an exclusive mutable singleton resource `&'b mut R` by its pre-resolved
+    /// `BamComponent` handle, returning `(mut_ref, BamChangeTicks)` if declared with `ResourceWrite`.
+    pub fn res_mut_ptr_by_handle_checked<R: AbiPod>(
+        &mut self,
+        component: BamComponent,
+    ) -> Option<(&mut R, BamChangeTicks)> {
+        if self.sys_ctx.is_null() || !component.is_valid() {
+            return None;
+        }
+        if !self.host.api().covers_slot(
+            core::mem::offset_of!(BamHostApi, sys_res_mut_ptr),
+            core::mem::size_of::<Option<BamSysResMutPtrFn>>(),
+        ) {
+            return None;
+        }
+        let get_mut_fn = self.host.api().sys_res_mut_ptr?;
+        let mut ticks = BamChangeTicks::default();
+        // SAFETY: `self.sys_ctx` is active, `&'b mut self` prevents aliasing, and `&mut ticks` is aligned.
+        let ptr = unsafe { get_mut_fn(self.sys_ctx, component, &mut ticks) };
+        if ptr.is_null() {
+            return None;
+        }
+        if core::mem::size_of::<R>() == 0 {
+            // SAFETY: Zero-sized `R: AbiPod` may be mutably referenced via `NonNull::dangling()`.
+            return Some((
+                unsafe { core::ptr::NonNull::<R>::dangling().as_mut() },
+                ticks,
+            ));
+        }
+        if !(ptr as usize).is_multiple_of(core::mem::align_of::<R>()) {
+            return None;
+        }
+        // SAFETY: Host verified exclusive `ResourceWrite` permission and stamped change ticks.
+        Some((unsafe { &mut *ptr.cast::<R>() }, ticks))
+    }
 }
 
 struct SystemClosureState<F> {
@@ -648,6 +721,8 @@ pub struct SystemRegistrationConfig<'a> {
     pub after: &'a [&'a CStr],
     /// Named system sets that this system must execute before.
     pub before: &'a [&'a CStr],
+    /// Named system sets (`"host::<set>"` or custom sets) that this system belongs to.
+    pub in_sets: &'a [&'a CStr],
 }
 
 struct OwnedDescriptorStorage {
@@ -658,6 +733,8 @@ struct OwnedDescriptorStorage {
     after_ptrs: Box<[*const c_char]>,
     _before_names: Vec<CString>,
     before_ptrs: Box<[*const c_char]>,
+    _in_set_names: Vec<CString>,
+    in_set_ptrs: Box<[*const c_char]>,
 }
 
 // SAFETY: Every raw pointer inside `queries`, `after_ptrs`, and `before_ptrs` points exclusively
@@ -723,7 +800,12 @@ where
             return status;
         }
     }
-    for set_name in config.after.iter().chain(config.before.iter()) {
+    for set_name in config
+        .after
+        .iter()
+        .chain(config.before.iter())
+        .chain(config.in_sets.iter())
+    {
         if set_name.to_bytes().is_empty() {
             return FfiResult::INVALID_ARGUMENT;
         }
@@ -774,6 +856,14 @@ where
         before_names.push(cstr);
     }
 
+    let mut in_set_names: Vec<CString> = Vec::with_capacity(config.in_sets.len());
+    let mut in_set_ptrs: Vec<*const c_char> = Vec::with_capacity(config.in_sets.len());
+    for set_name in config.in_sets {
+        let cstr = CString::from(*set_name);
+        in_set_ptrs.push(cstr.as_ptr());
+        in_set_names.push(cstr);
+    }
+
     let storage = OwnedDescriptorStorage {
         name: CString::from(config.name),
         _term_vecs: term_vecs,
@@ -782,6 +872,8 @@ where
         after_ptrs: after_ptrs.into_boxed_slice(),
         _before_names: before_names,
         before_ptrs: before_ptrs.into_boxed_slice(),
+        _in_set_names: in_set_names,
+        in_set_ptrs: in_set_ptrs.into_boxed_slice(),
     };
     let raw_storage = instance.track_allocation(Box::new(storage));
     // SAFETY: `raw_storage` was just allocated by `instance.track_allocation` and remains pinned
@@ -803,6 +895,11 @@ where
     } else {
         storage_ref.before_ptrs.as_ptr()
     };
+    let in_sets_ptr = if storage_ref.in_set_ptrs.is_empty() {
+        core::ptr::null()
+    } else {
+        storage_ref.in_set_ptrs.as_ptr()
+    };
 
     let (callback_fn, user_data) = allocate_system_trampoline(
         instance,
@@ -822,7 +919,8 @@ where
     .with_flags(config.flags)
     .with_schedule(config.schedule)
     .with_after(after_ptr, config.after.len())
-    .with_before(before_ptr, config.before.len());
+    .with_before(before_ptr, config.before.len())
+    .with_in_sets(in_sets_ptr, config.in_sets.len());
 
     if let Some((run_if_fn, run_if_data)) = run_if {
         desc = desc.with_run_if(run_if_fn, run_if_data);
@@ -838,6 +936,108 @@ where
     };
     // SAFETY: `load_ctx` is active per caller contract and `desc` passed full validation with all
     // pointed-to strings, term slices, and closures owned by `instance`.
+    unsafe { register_fn(load_ctx, &desc) }
+}
+
+struct ObserverTrampolineState<F> {
+    host: Host,
+    callback: ReentrantCell<F>,
+}
+
+unsafe extern "C" fn observer_closure_trampoline<E, F>(
+    target: FfiEntity,
+    event_data: *const c_void,
+    commands: *mut BamCommands,
+    user_data: *mut c_void,
+) -> FfiResult
+where
+    E: AbiPod,
+    F: FnMut(FfiEntity, &E, &mut ValidatedCommands<'_>) -> FfiResult + Send + 'static,
+{
+    catch_guest_result(|| {
+        if user_data.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        // SAFETY: `user_data` points to `ObserverTrampolineState<F>` owned by `GuestInstance`.
+        let state = unsafe { &*user_data.cast::<ObserverTrampolineState<F>>() };
+        let event_ref: &E = if core::mem::size_of::<E>() == 0 {
+            // SAFETY: Zero-sized `E: AbiPod` may be referenced via `NonNull::dangling()`.
+            unsafe { core::ptr::NonNull::<E>::dangling().as_ref() }
+        } else {
+            if event_data.is_null()
+                || !(event_data as usize).is_multiple_of(core::mem::align_of::<E>())
+            {
+                return FfiResult::INVALID_ARGUMENT;
+            }
+            // SAFETY: Host guarantees `event_data` points to initialized `E` matching `event_key`.
+            unsafe { &*event_data.cast::<E>() }
+        };
+        // SAFETY: `commands` is stack-scoped for this observer invocation.
+        let mut cmds = unsafe { ValidatedCommands::from_raw(commands, &state.host) };
+        state
+            .callback
+            .try_with_mut(|cb| cb(target, event_ref, &mut cmds))
+            .unwrap_or(FfiResult::ACCESS_CONFLICT)
+    })
+}
+
+/// Validates and registers a dynamic [`BamObserverDesc`] closure on `load_ctx`, tracking its
+/// heap-owned name and state inside `instance`.
+///
+/// # Safety
+/// `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance` during
+/// `bevy_abi_mod_init`.
+pub unsafe fn register_observer_closure<E, F>(
+    instance: &mut GuestInstance,
+    load_ctx: *mut BamLoadCtx,
+    name: &str,
+    event: bevy_abi_mod_sys::BamComponent,
+    target: FfiEntity,
+    callback: F,
+) -> FfiResult
+where
+    E: AbiPod,
+    F: FnMut(FfiEntity, &E, &mut ValidatedCommands<'_>) -> FfiResult + Send + 'static,
+{
+    if load_ctx.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    if name.is_empty() || !event.is_valid() {
+        return FfiResult::INVALID_ARGUMENT;
+    }
+    let Ok(owned_name) = CString::new(name) else {
+        return FfiResult::INVALID_ARGUMENT;
+    };
+    if !instance.host().api().covers_slot(
+        core::mem::offset_of!(BamHostApi, register_observer),
+        core::mem::size_of::<Option<BamRegisterObserverFn>>(),
+    ) {
+        return FfiResult::UNSUPPORTED;
+    }
+    let Some(register_fn) = instance.host().api().register_observer else {
+        return FfiResult::UNSUPPORTED;
+    };
+
+    let raw_name = instance.track_allocation(Box::new(owned_name));
+    // SAFETY: `raw_name` stays pinned inside `instance` until `shutdown_guest_instance`.
+    let name_ptr = unsafe { (*raw_name).as_ptr() };
+
+    let host = *instance.host();
+    let raw_state = instance.track_allocation(Box::new(ObserverTrampolineState {
+        host,
+        callback: ReentrantCell::new(callback),
+    }));
+
+    let obs_cb: BamObserverFn = observer_closure_trampoline::<E, F>;
+    let desc = BamObserverDesc::new(event, obs_cb, raw_state.cast::<c_void>())
+        .with_name(name_ptr)
+        .with_entity(target);
+    let validation = desc.validate();
+    if !validation.is_ok() {
+        return validation;
+    }
+    // SAFETY: `load_ctx` is active per caller contract and `desc` passed validation with `name_ptr`
+    // and `raw_state` owned by `instance`.
     unsafe { register_fn(load_ctx, &desc) }
 }
 

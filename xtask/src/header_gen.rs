@@ -11,13 +11,16 @@ use std::path::Path;
 
 use bevy_abi_mod_sys::{
     ABI_VERSION, ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PATCH, AccessMode,
-    BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_COMPONENT_KNOWN_FLAGS,
-    BAM_MANIFEST_KNOWN_FLAGS, BAM_QUERY_KNOWN_FLAGS, BAM_STORAGE_FLAG_IMMUTABLE,
-    BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET,
-    BAM_SYSTEM_FLAG_MAIN_THREAD, BAM_SYSTEM_KNOWN_FLAGS, BAM_TERM_KNOWN_FLAGS, BamColumnInfo,
-    BamComponent, BamHostApi, BamManifest, BamQueryDesc, BamSystemDesc, BamTermDesc, ComponentDesc,
-    ComponentUuid, FfiBool, FfiEntity, FfiResult, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY,
-    SIPHASH_KEY_0, SIPHASH_KEY_1, ScheduleId, StrView, VTableHeader,
+    BAM_CHILD_OF_NAME, BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET,
+    BAM_COMPONENT_KNOWN_FLAGS, BAM_MANIFEST_KNOWN_FLAGS, BAM_MAX_CHANGE_AGE,
+    BAM_OBSERVER_KNOWN_FLAGS, BAM_QUERY_KNOWN_FLAGS, BAM_STORAGE_FLAG_ENTITY_EVENT,
+    BAM_STORAGE_FLAG_EVENT, BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE,
+    BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET, BAM_SYSTEM_FLAG_MAIN_THREAD,
+    BAM_SYSTEM_KNOWN_FLAGS, BAM_TERM_KNOWN_FLAGS, BamChangeTicks, BamColumnInfo, BamComponent,
+    BamHostApi, BamManifest, BamObserverDesc, BamQueryDesc, BamSystemDesc, BamTermDesc,
+    ComponentDesc, ComponentUuid, FfiBool, FfiChildOf, FfiEntity, FfiResult,
+    MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, SIPHASH_KEY_0, SIPHASH_KEY_1, ScheduleId, StrView,
+    VTableHeader,
 };
 
 struct FieldLayoutSpec {
@@ -210,9 +213,9 @@ fn wire_struct_specs() -> Vec<StructLayoutSpec> {
         StructLayoutSpec {
             c_name: "BamSystemDesc",
             assert_stem: "bam_system_desc",
-            size_64: 104,
+            size_64: 120,
             align_64: 8,
-            size_32: 60,
+            size_32: 68,
             align_32: 4,
             rust_host_size: size_of::<BamSystemDesc>(),
             rust_host_align: align_of::<BamSystemDesc>(),
@@ -306,6 +309,120 @@ fn wire_struct_specs() -> Vec<StructLayoutSpec> {
                     offset_64: 96,
                     offset_32: 56,
                     rust_host_offset: offset_of!(BamSystemDesc, run_if_user_data),
+                },
+                FieldLayoutSpec {
+                    c_name: "in_sets",
+                    offset_64: 104,
+                    offset_32: 60,
+                    rust_host_offset: offset_of!(BamSystemDesc, in_sets),
+                },
+                FieldLayoutSpec {
+                    c_name: "in_set_count",
+                    offset_64: 112,
+                    offset_32: 64,
+                    rust_host_offset: offset_of!(BamSystemDesc, in_set_count),
+                },
+            ],
+        },
+        StructLayoutSpec {
+            c_name: "BamObserverDesc",
+            assert_stem: "bam_observer_desc",
+            size_64: 48,
+            align_64: 8,
+            size_32: 36,
+            align_32: 4,
+            rust_host_size: size_of::<BamObserverDesc>(),
+            rust_host_align: align_of::<BamObserverDesc>(),
+            fields: &[
+                FieldLayoutSpec {
+                    c_name: "struct_size",
+                    offset_64: 0,
+                    offset_32: 0,
+                    rust_host_offset: offset_of!(BamObserverDesc, struct_size),
+                },
+                FieldLayoutSpec {
+                    c_name: "flags",
+                    offset_64: 4,
+                    offset_32: 4,
+                    rust_host_offset: offset_of!(BamObserverDesc, flags),
+                },
+                FieldLayoutSpec {
+                    c_name: "name",
+                    offset_64: 8,
+                    offset_32: 8,
+                    rust_host_offset: offset_of!(BamObserverDesc, name),
+                },
+                FieldLayoutSpec {
+                    c_name: "event",
+                    offset_64: 16,
+                    offset_32: 12,
+                    rust_host_offset: offset_of!(BamObserverDesc, event),
+                },
+                FieldLayoutSpec {
+                    c_name: "entity_lo",
+                    offset_64: 20,
+                    offset_32: 16,
+                    rust_host_offset: offset_of!(BamObserverDesc, entity_lo),
+                },
+                FieldLayoutSpec {
+                    c_name: "entity_hi",
+                    offset_64: 24,
+                    offset_32: 20,
+                    rust_host_offset: offset_of!(BamObserverDesc, entity_hi),
+                },
+                FieldLayoutSpec {
+                    c_name: "reserved0",
+                    offset_64: 28,
+                    offset_32: 24,
+                    rust_host_offset: offset_of!(BamObserverDesc, reserved0),
+                },
+                FieldLayoutSpec {
+                    c_name: "callback",
+                    offset_64: 32,
+                    offset_32: 28,
+                    rust_host_offset: offset_of!(BamObserverDesc, callback),
+                },
+                FieldLayoutSpec {
+                    c_name: "user_data",
+                    offset_64: 40,
+                    offset_32: 32,
+                    rust_host_offset: offset_of!(BamObserverDesc, user_data),
+                },
+            ],
+        },
+        StructLayoutSpec {
+            c_name: "BamChangeTicks",
+            assert_stem: "bam_change_ticks",
+            size_64: 16,
+            align_64: 4,
+            size_32: 16,
+            align_32: 4,
+            rust_host_size: size_of::<BamChangeTicks>(),
+            rust_host_align: align_of::<BamChangeTicks>(),
+            fields: &[
+                FieldLayoutSpec {
+                    c_name: "added",
+                    offset_64: 0,
+                    offset_32: 0,
+                    rust_host_offset: offset_of!(BamChangeTicks, added),
+                },
+                FieldLayoutSpec {
+                    c_name: "changed",
+                    offset_64: 4,
+                    offset_32: 4,
+                    rust_host_offset: offset_of!(BamChangeTicks, changed),
+                },
+                FieldLayoutSpec {
+                    c_name: "last_run",
+                    offset_64: 8,
+                    offset_32: 8,
+                    rust_host_offset: offset_of!(BamChangeTicks, last_run),
+                },
+                FieldLayoutSpec {
+                    c_name: "this_run",
+                    offset_64: 12,
+                    offset_32: 12,
+                    rust_host_offset: offset_of!(BamChangeTicks, this_run),
                 },
             ],
         },
@@ -486,9 +603,9 @@ fn wire_struct_specs() -> Vec<StructLayoutSpec> {
         StructLayoutSpec {
             c_name: "BamHostApi",
             assert_stem: "bam_host_api",
-            size_64: 264,
+            size_64: 312,
             align_64: 8,
-            size_32: 136,
+            size_32: 160,
             align_32: 4,
             rust_host_size: size_of::<BamHostApi>(),
             rust_host_align: align_of::<BamHostApi>(),
@@ -697,6 +814,42 @@ fn wire_struct_specs() -> Vec<StructLayoutSpec> {
                     offset_32: 132,
                     rust_host_offset: offset_of!(BamHostApi, msg_send),
                 },
+                FieldLayoutSpec {
+                    c_name: "msg_write_batch",
+                    offset_64: 264,
+                    offset_32: 136,
+                    rust_host_offset: offset_of!(BamHostApi, msg_write_batch),
+                },
+                FieldLayoutSpec {
+                    c_name: "res_ticks",
+                    offset_64: 272,
+                    offset_32: 140,
+                    rust_host_offset: offset_of!(BamHostApi, res_ticks),
+                },
+                FieldLayoutSpec {
+                    c_name: "sys_res_ptr",
+                    offset_64: 280,
+                    offset_32: 144,
+                    rust_host_offset: offset_of!(BamHostApi, sys_res_ptr),
+                },
+                FieldLayoutSpec {
+                    c_name: "sys_res_mut_ptr",
+                    offset_64: 288,
+                    offset_32: 148,
+                    rust_host_offset: offset_of!(BamHostApi, sys_res_mut_ptr),
+                },
+                FieldLayoutSpec {
+                    c_name: "register_observer",
+                    offset_64: 296,
+                    offset_32: 152,
+                    rust_host_offset: offset_of!(BamHostApi, register_observer),
+                },
+                FieldLayoutSpec {
+                    c_name: "cmd_trigger",
+                    offset_64: 304,
+                    offset_32: 156,
+                    rust_host_offset: offset_of!(BamHostApi, cmd_trigger),
+                },
             ],
         },
     ]
@@ -707,6 +860,7 @@ fn verify_host_rust_layouts(specs: &[StructLayoutSpec]) -> Result<(), String> {
     if size_of::<FfiBool>() != 1
         || size_of::<BamComponent>() != 4
         || size_of::<FfiEntity>() != 8
+        || size_of::<FfiChildOf>() != 8
         || size_of::<FfiResult>() != 4
         || size_of::<AccessMode>() != 4
         || size_of::<ScheduleId>() != 4
@@ -859,7 +1013,9 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
          #define BAM_MAX_TERMS_PER_QUERY   {MAX_TERMS_PER_QUERY}u\n\
          #define BAM_MAX_QUERIES_PER_SYSTEM {MAX_QUERIES_PER_SYSTEM}u\n\n\
          #define BAM_SIPHASH_KEY_0 0x{SIPHASH_KEY_0:016x}ull\n\
-         #define BAM_SIPHASH_KEY_1 0x{SIPHASH_KEY_1:016x}ull\n"
+         #define BAM_SIPHASH_KEY_1 0x{SIPHASH_KEY_1:016x}ull\n\
+         #define BAM_MAX_CHANGE_AGE 0x{BAM_MAX_CHANGE_AGE:08X}u\n\
+         #define BAM_CHILD_OF_NAME \"{BAM_CHILD_OF_NAME}\"\n"
     );
 
     // Primitives, Result taxonomy, AccessMode, ScheduleId, Flags
@@ -914,18 +1070,21 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
          #define BAM_SCHEDULE_FIXED_UPDATE ((BamScheduleId){}u)\n\
          #define BAM_SCHEDULE_LAST         ((BamScheduleId){}u)\n\
          #define BAM_SCHEDULE_CUSTOM_BASE  ((BamScheduleId){}u)\n\n\
-         #define BAM_MANIFEST_KNOWN_FLAGS      0x{BAM_MANIFEST_KNOWN_FLAGS:08X}u\n\
-         #define BAM_TERM_KNOWN_FLAGS          0x{BAM_TERM_KNOWN_FLAGS:08X}u\n\
-         #define BAM_QUERY_KNOWN_FLAGS         0x{BAM_QUERY_KNOWN_FLAGS:08X}u\n\
-         #define BAM_SYSTEM_FLAG_MAIN_THREAD   0x{BAM_SYSTEM_FLAG_MAIN_THREAD:08X}u\n\
-         #define BAM_SYSTEM_KNOWN_FLAGS        0x{BAM_SYSTEM_KNOWN_FLAGS:08X}u\n\
-         #define BAM_COMPONENT_FLAG_SPARSE_SET 0x{BAM_COMPONENT_FLAG_SPARSE_SET:08X}u\n\
-         #define BAM_COMPONENT_FLAG_IMMUTABLE  0x{BAM_COMPONENT_FLAG_IMMUTABLE:08X}u\n\
-         #define BAM_COMPONENT_KNOWN_FLAGS     0x{BAM_COMPONENT_KNOWN_FLAGS:08X}u\n\
-         #define BAM_STORAGE_FLAG_SPARSE_SET   0x{BAM_STORAGE_FLAG_SPARSE_SET:08X}u\n\
-         #define BAM_STORAGE_FLAG_IMMUTABLE    0x{BAM_STORAGE_FLAG_IMMUTABLE:08X}u\n\
-         #define BAM_STORAGE_FLAG_RESOURCE     0x{BAM_STORAGE_FLAG_RESOURCE:08X}u\n\
-         #define BAM_STORAGE_FLAG_MESSAGE      0x{BAM_STORAGE_FLAG_MESSAGE:08X}u\n",
+         #define BAM_MANIFEST_KNOWN_FLAGS       0x{BAM_MANIFEST_KNOWN_FLAGS:08X}u\n\
+         #define BAM_TERM_KNOWN_FLAGS           0x{BAM_TERM_KNOWN_FLAGS:08X}u\n\
+         #define BAM_QUERY_KNOWN_FLAGS          0x{BAM_QUERY_KNOWN_FLAGS:08X}u\n\
+         #define BAM_SYSTEM_FLAG_MAIN_THREAD    0x{BAM_SYSTEM_FLAG_MAIN_THREAD:08X}u\n\
+         #define BAM_SYSTEM_KNOWN_FLAGS         0x{BAM_SYSTEM_KNOWN_FLAGS:08X}u\n\
+         #define BAM_OBSERVER_KNOWN_FLAGS       0x{BAM_OBSERVER_KNOWN_FLAGS:08X}u\n\
+         #define BAM_COMPONENT_FLAG_SPARSE_SET  0x{BAM_COMPONENT_FLAG_SPARSE_SET:08X}u\n\
+         #define BAM_COMPONENT_FLAG_IMMUTABLE   0x{BAM_COMPONENT_FLAG_IMMUTABLE:08X}u\n\
+         #define BAM_COMPONENT_KNOWN_FLAGS      0x{BAM_COMPONENT_KNOWN_FLAGS:08X}u\n\
+         #define BAM_STORAGE_FLAG_SPARSE_SET    0x{BAM_STORAGE_FLAG_SPARSE_SET:08X}u\n\
+         #define BAM_STORAGE_FLAG_IMMUTABLE     0x{BAM_STORAGE_FLAG_IMMUTABLE:08X}u\n\
+         #define BAM_STORAGE_FLAG_RESOURCE      0x{BAM_STORAGE_FLAG_RESOURCE:08X}u\n\
+         #define BAM_STORAGE_FLAG_MESSAGE       0x{BAM_STORAGE_FLAG_MESSAGE:08X}u\n\
+         #define BAM_STORAGE_FLAG_EVENT         0x{BAM_STORAGE_FLAG_EVENT:08X}u\n\
+         #define BAM_STORAGE_FLAG_ENTITY_EVENT  0x{BAM_STORAGE_FLAG_ENTITY_EVENT:08X}u\n",
         FfiBool::FALSE.0,
         FfiBool::TRUE.0,
         BamComponent::INVALID.0,
@@ -988,6 +1147,15 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
          typedef struct BamComponentUuid {\n\
              uint8_t bytes[16];\n\
          } BamComponentUuid;\n\n\
+         typedef struct BamChildOf {\n\
+             BamEntity parent;\n\
+         } BamChildOf;\n\n\
+         typedef struct BamChangeTicks {\n\
+             uint32_t added;\n\
+             uint32_t changed;\n\
+             uint32_t last_run;\n\
+             uint32_t this_run;\n\
+         } BamChangeTicks;\n\n\
          typedef BamResult (*BamStateWriterFn)(void* ctx, const uint8_t* bytes, size_t len);\n\
          typedef BamResult (*BamSaveStateFn)(BamInstance* instance, BamStateWriterFn writer, void* writer_ctx);\n\
          typedef BamResult (*BamRestoreStateFn)(BamInstance* instance, const uint8_t* bytes, size_t len);\n\n\
@@ -1009,7 +1177,8 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
          typedef void      (*BamComponentDropFn)(void* ptr);\n\
          typedef void      (*BamComponentHookFn)(BamEntity entity, const void* data_ptr, void* user_data);\n\
          typedef BamResult (*BamSystemFn)(BamSystemCtx* sys_ctx, void* user_data);\n\
-         typedef BamBool   (*BamRunIfFn)(void* user_data);\n\n\
+         typedef BamBool   (*BamRunIfFn)(void* user_data);\n\
+         typedef BamResult (*BamObserverFn)(BamEntity entity, const void* event_data, BamCommands* commands, void* user_data);\n\n\
          typedef struct BamTermDesc {\n\
              BamComponent  component;\n\
              BamAccessMode mode;\n\
@@ -1037,7 +1206,25 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
              size_t              before_count;\n\
              BamRunIfFn          run_if;\n\
              void*               run_if_user_data;\n\
+         #if defined(__cplusplus) && (__cplusplus >= 201402L)\n\
+             const char* const*  in_sets          = nullptr;\n\
+             size_t              in_set_count     = 0;\n\
+         #else\n\
+             const char* const*  in_sets;\n\
+             size_t              in_set_count;\n\
+         #endif\n\
          } BamSystemDesc;\n\n\
+         typedef struct BamObserverDesc {\n\
+             uint32_t      struct_size;\n\
+             uint32_t      flags;\n\
+             const char*   name;\n\
+             BamComponent  event;\n\
+             uint32_t      entity_lo;\n\
+             uint32_t      entity_hi;\n\
+             uint32_t      reserved0;\n\
+             BamObserverFn callback;\n\
+             void*         user_data;\n\
+         } BamObserverDesc;\n\n\
          typedef struct BamComponentDesc {\n\
              uint32_t           struct_size;\n\
              uint32_t           flags;\n\
@@ -1120,7 +1307,13 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
          typedef const uint8_t* (*BamSysEntityGetFn)(const BamSystemCtx* sys_ctx, size_t query_index, BamEntity entity, size_t term_index);\n\
          typedef uint8_t*       (*BamSysEntityGetMutFn)(BamSystemCtx* sys_ctx, size_t query_index, BamEntity entity, size_t term_index);\n\
          typedef BamResult      (*BamMsgReadBatchFn)(BamIter* iter, size_t term_index, uint8_t* out_buf, size_t max_count, size_t* out_read);\n\
-         typedef BamResult      (*BamMsgSendFn)(BamIter* iter, size_t term_index, const uint8_t* data_ptr, size_t data_len);\n\n\
+         typedef BamResult      (*BamMsgSendFn)(BamIter* iter, size_t term_index, const uint8_t* data_ptr, size_t data_len);\n\
+         typedef BamResult      (*BamMsgWriteBatchFn)(BamIter* iter, size_t term_index, const uint8_t* in_buf, size_t count);\n\
+         typedef BamResult      (*BamResTicksFn)(const BamIter* iter, size_t term_index, BamChangeTicks* out_ticks);\n\
+         typedef const uint8_t* (*BamSysResPtrFn)(const BamSystemCtx* sys_ctx, BamComponent component, BamChangeTicks* out_ticks);\n\
+         typedef uint8_t*       (*BamSysResMutPtrFn)(BamSystemCtx* sys_ctx, BamComponent component, BamChangeTicks* out_ticks);\n\
+         typedef BamResult      (*BamRegisterObserverFn)(BamLoadCtx* load_ctx, const BamObserverDesc* desc);\n\
+         typedef BamResult      (*BamCmdTriggerFn)(BamCommands* commands, BamComponent event, BamEntity target, const uint8_t* data_ptr, size_t data_len);\n\n\
          struct BamHostApi {\n\
              uint32_t struct_size;\n\
              uint32_t abi_version;\n\n\
@@ -1158,15 +1351,22 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
              BamCmdInsertDefaultFn cmd_insert_default;\n\
              BamCmdRemoveFn        cmd_remove;\n\n\
              /* Optional Wave 4 engine extension slots (appended after `BAM_HOST_API_MIN_V0_2_SIZE`) */\n\
-             BamParForEachChunkFn par_for_each_chunk;\n\
-             BamSysEntityGetFn    sys_entity_get;\n\
-             BamSysEntityGetMutFn sys_entity_get_mut;\n\
-             BamMsgReadBatchFn    msg_read_batch;\n\
-             BamMsgSendFn         msg_send;\n\
+             BamParForEachChunkFn  par_for_each_chunk;\n\
+             BamSysEntityGetFn     sys_entity_get;\n\
+             BamSysEntityGetMutFn  sys_entity_get_mut;\n\
+             BamMsgReadBatchFn     msg_read_batch;\n\
+             BamMsgSendFn          msg_send;\n\
+             BamMsgWriteBatchFn    msg_write_batch;\n\
+             BamResTicksFn         res_ticks;\n\
+             BamSysResPtrFn        sys_res_ptr;\n\
+             BamSysResMutPtrFn     sys_res_mut_ptr;\n\
+             BamRegisterObserverFn register_observer;\n\
+             BamCmdTriggerFn       cmd_trigger;\n\
          };\n\n\
          #define BAM_MANIFEST_MIN_V0_2_SIZE       (offsetof(BamManifest, reserved0) + sizeof(uint32_t))\n\
          #define BAM_QUERY_DESC_MIN_V0_2_SIZE     (offsetof(BamQueryDesc, term_count) + sizeof(size_t))\n\
          #define BAM_SYSTEM_DESC_MIN_V0_2_SIZE    (offsetof(BamSystemDesc, run_if_user_data) + sizeof(void*))\n\
+         #define BAM_OBSERVER_DESC_MIN_V0_2_SIZE  (offsetof(BamObserverDesc, user_data) + sizeof(void*))\n\
          #define BAM_COMPONENT_DESC_MIN_V0_2_SIZE (offsetof(BamComponentDesc, vtable_ptr) + sizeof(const void*))\n\
          #define BAM_VTABLE_HEADER_MIN_V0_2_SIZE  (offsetof(BamVTableHeader, align) + sizeof(size_t))\n\
          #define BAM_HOST_API_MIN_V0_2_SIZE       (offsetof(BamHostApi, cmd_remove) + sizeof(BamCmdRemoveFn))\n\n",
@@ -1420,6 +1620,58 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
          }\n\n\
          static BAM_UNUSED inline int bam_uuid_equals(BamComponentUuid a, BamComponentUuid b) {\n\
              return memcmp(a.bytes, b.bytes, 16u) == 0;\n\
+         }\n\n\
+         static BAM_UNUSED inline int bam_ticks_is_newer(uint32_t tick, uint32_t last_run, uint32_t this_run) {\n\
+             uint32_t ticks_since_insert = this_run - tick;\n\
+             uint32_t clamped_insert = (ticks_since_insert < BAM_MAX_CHANGE_AGE) ? ticks_since_insert : BAM_MAX_CHANGE_AGE;\n\
+             uint32_t ticks_since_system = this_run - last_run;\n\
+             uint32_t clamped_system = (ticks_since_system < BAM_MAX_CHANGE_AGE) ? ticks_since_system : BAM_MAX_CHANGE_AGE;\n\
+             return clamped_system > clamped_insert;\n\
+         }\n\n\
+         static BAM_UNUSED inline int bam_ticks_is_added(const BamChangeTicks* ticks) {\n\
+             if (ticks == NULL) {\n\
+                 return 0;\n\
+             }\n\
+             return bam_ticks_is_newer(ticks->added, ticks->last_run, ticks->this_run);\n\
+         }\n\n\
+         static BAM_UNUSED inline int bam_ticks_is_changed(const BamChangeTicks* ticks) {\n\
+             if (ticks == NULL) {\n\
+                 return 0;\n\
+             }\n\
+             return bam_ticks_is_newer(ticks->changed, ticks->last_run, ticks->this_run);\n\
+         }\n\n\
+         static BAM_UNUSED inline BamComponentDesc bam_desc_component_with_layout(\n\
+             const char* name,\n\
+             size_t size,\n\
+             size_t align,\n\
+             BamComponentDropFn drop_fn\n\
+         ) {\n\
+             BamComponentDesc d;\n\
+             memset(&d, 0, sizeof(d));\n\
+             d.struct_size = (uint32_t)sizeof(BamComponentDesc);\n\
+             d.flags = 0u;\n\
+             d.name = name;\n\
+             d.uuid = bam_uuid_from_parts(name, size, align, 0ull);\n\
+             d.size = size;\n\
+             d.align = align;\n\
+             d.drop_fn = drop_fn;\n\
+             return d;\n\
+         }\n\n\
+         static BAM_UNUSED inline BamObserverDesc bam_observer_desc(\n\
+             BamComponent event,\n\
+             BamEntity entity,\n\
+             BamObserverFn callback,\n\
+             void* user_data\n\
+         ) {\n\
+             BamObserverDesc d;\n\
+             memset(&d, 0, sizeof(d));\n\
+             d.struct_size = (uint32_t)sizeof(BamObserverDesc);\n\
+             d.event = event;\n\
+             d.entity_lo = (uint32_t)(entity & 0xFFFFFFFFull);\n\
+             d.entity_hi = (uint32_t)((entity >> 32) & 0xFFFFFFFFull);\n\
+             d.callback = callback;\n\
+             d.user_data = user_data;\n\
+             return d;\n\
          }\n\n",
     );
 
@@ -1433,6 +1685,8 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
          BAM_STATIC_ASSERT(sizeof(BamComponent) == 4u, bam_component_size);\n\
          BAM_STATIC_ASSERT(BAM_ALIGNOF(BamComponent) == 4u, bam_component_align);\n\
          BAM_STATIC_ASSERT(sizeof(BamEntity) == 8u, bam_entity_size);\n\
+         BAM_STATIC_ASSERT(sizeof(BamChildOf) == 8u, bam_child_of_size);\n\
+         BAM_STATIC_ASSERT(offsetof(BamChildOf, parent) == 0u, bam_child_of_off_parent);\n\
          BAM_STATIC_ASSERT(sizeof(BamResult) == 4u, bam_result_size);\n\
          BAM_STATIC_ASSERT(BAM_ALIGNOF(BamResult) == 4u, bam_result_align);\n\
          BAM_STATIC_ASSERT(sizeof(BamAccessMode) == 4u, bam_access_mode_size);\n\
@@ -1466,9 +1720,11 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
         "BAM_STATIC_ASSERT(BAM_MANIFEST_MIN_V0_2_SIZE == 32u, bam_manifest_min_64);\n\
          BAM_STATIC_ASSERT(BAM_QUERY_DESC_MIN_V0_2_SIZE == 24u, bam_query_desc_min_64);\n\
          BAM_STATIC_ASSERT(BAM_SYSTEM_DESC_MIN_V0_2_SIZE == 104u, bam_system_desc_min_64);\n\
+         BAM_STATIC_ASSERT(BAM_OBSERVER_DESC_MIN_V0_2_SIZE == 48u, bam_observer_desc_min_64);\n\
          BAM_STATIC_ASSERT(BAM_COMPONENT_DESC_MIN_V0_2_SIZE == 64u, bam_component_desc_min_64);\n\
          BAM_STATIC_ASSERT(BAM_VTABLE_HEADER_MIN_V0_2_SIZE == 40u, bam_vtable_header_min_64);\n\
-         BAM_STATIC_ASSERT(BAM_HOST_API_MIN_V0_2_SIZE == 224u, bam_host_api_min_64);\n",
+         BAM_STATIC_ASSERT(BAM_HOST_API_MIN_V0_2_SIZE == 224u, bam_host_api_min_64);\n\
+         BAM_STATIC_ASSERT(BAM_ALIGNOF(BamChildOf) == 8u, bam_child_of_align_64);\n",
     );
 
     // 32-bit assertions
@@ -1496,6 +1752,7 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
         "BAM_STATIC_ASSERT(BAM_MANIFEST_MIN_V0_2_SIZE == 24u, bam_manifest_min_32);\n\
          BAM_STATIC_ASSERT(BAM_QUERY_DESC_MIN_V0_2_SIZE == 16u, bam_query_desc_min_32);\n\
          BAM_STATIC_ASSERT(BAM_SYSTEM_DESC_MIN_V0_2_SIZE == 60u, bam_system_desc_min_32);\n\
+         BAM_STATIC_ASSERT(BAM_OBSERVER_DESC_MIN_V0_2_SIZE == 36u, bam_observer_desc_min_32);\n\
          BAM_STATIC_ASSERT(BAM_COMPONENT_DESC_MIN_V0_2_SIZE == 44u, bam_component_desc_min_32);\n\
          BAM_STATIC_ASSERT(BAM_VTABLE_HEADER_MIN_V0_2_SIZE == 32u, bam_vtable_header_min_32);\n\
          BAM_STATIC_ASSERT(BAM_HOST_API_MIN_V0_2_SIZE == 116u, bam_host_api_min_32);\n",
@@ -1559,10 +1816,10 @@ mod tests {
         assert!(first.contains("#define BAM_ABI_VERSION 0x00020000u"));
         assert!(first.contains("typedef struct BamHostApi   BamHostApi;"));
         assert!(
-            first.contains("BAM_STATIC_ASSERT(sizeof(BamHostApi) == 264u, bam_host_api_size_64);")
+            first.contains("BAM_STATIC_ASSERT(sizeof(BamHostApi) == 312u, bam_host_api_size_64);")
         );
         assert!(
-            first.contains("BAM_STATIC_ASSERT(sizeof(BamHostApi) == 136u, bam_host_api_size_32);")
+            first.contains("BAM_STATIC_ASSERT(sizeof(BamHostApi) == 160u, bam_host_api_size_32);")
         );
         assert!(first.contains("BAM_STATIC_ASSERT(BAM_HOST_API_MIN_V0_2_SIZE == 224u"));
         // Verify old v0.1 unprefixed C typedefs are completely absent:

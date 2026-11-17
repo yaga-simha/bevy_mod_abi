@@ -854,11 +854,101 @@ static void test_end_to_end_c99_lifecycle_and_vtable(void) {
     assert(g_shutdown_calls == 1u);
 }
 
+static BamResult mock_observer_cb(BamEntity target_entity, const void* event_data, BamCommands* commands, void* user_data) {
+    (void)target_entity;
+    (void)event_data;
+    (void)commands;
+    (void)user_data;
+    return BAM_RESULT_OK;
+}
+
+static void test_wave4_5_extensions(void) {
+    BamChildOf child_of;
+    BamChangeTicks ticks;
+    BamComponentDesc dyn_desc;
+    BamComponentUuid expected_dyn_uuid;
+    BamObserverDesc obs_desc;
+    BamSystemDesc sys_desc;
+    const char* sets[1] = { "host::SimulationSet" };
+    BamHostApi api;
+
+    /* 1. ChildOf wire struct & UUID */
+    child_of.parent = 42ull;
+    assert(sizeof(child_of) == 8u);
+    assert(child_of.parent == 42ull);
+    assert(strcmp(BAM_CHILD_OF_NAME, "bevy_ecs::hierarchy::ChildOf") == 0);
+    {
+        BamComponentUuid u1 = bam_uuid_from_parts(BAM_CHILD_OF_NAME, 8u, 8u, 0ull);
+        BamComponentUuid u2 = bam_uuid_from_parts("bevy_ecs::hierarchy::ChildOf", 8u, 8u, 0ull);
+        assert(memcmp(&u1, &u2, sizeof(BamComponentUuid)) == 0);
+    }
+
+    /* 2. Change-detection ticks & wraparound */
+    assert(bam_ticks_is_added(NULL) == 0);
+    assert(bam_ticks_is_changed(NULL) == 0);
+    ticks.added = 10u;
+    ticks.changed = 12u;
+    ticks.last_run = 10u;
+    ticks.this_run = 12u;
+    assert(bam_ticks_is_added(&ticks) == 0);
+    assert(bam_ticks_is_changed(&ticks) == 1);
+
+    /* Wraparound across uint32_t boundary */
+    ticks.added = 0xFFFFFFFEu;
+    ticks.changed = 2u;
+    ticks.last_run = 0xFFFFFFFEu;
+    ticks.this_run = 2u;
+    assert(bam_ticks_is_added(&ticks) == 0);
+    assert(bam_ticks_is_changed(&ticks) == 1);
+
+    /* 3. Dynamic layout registration helper */
+    dyn_desc = bam_desc_component_with_layout("c_mod::RuntimeState", 16u, 8u, mock_health_drop);
+    expected_dyn_uuid = bam_uuid_from_parts("c_mod::RuntimeState", 16u, 8u, 0ull);
+    assert(dyn_desc.struct_size == (uint32_t)sizeof(BamComponentDesc));
+    assert(dyn_desc.flags == 0u);
+    assert(strcmp(dyn_desc.name, "c_mod::RuntimeState") == 0);
+    assert(dyn_desc.size == 16u);
+    assert(dyn_desc.align == 8u);
+    assert(dyn_desc.drop_fn == mock_health_drop);
+    assert(memcmp(&dyn_desc.uuid, &expected_dyn_uuid, sizeof(BamComponentUuid)) == 0);
+
+    /* 4. Observer descriptor helper & 64-bit entity packing */
+    obs_desc = bam_observer_desc(77u, 0x11223344AABBCCDDull, mock_observer_cb, (void*)0x1234);
+    assert(obs_desc.struct_size == (uint32_t)sizeof(BamObserverDesc));
+    assert(obs_desc.flags == 0u);
+    assert(obs_desc.event == 77u);
+    assert(obs_desc.entity_lo == 0xAABBCCDDu);
+    assert(obs_desc.entity_hi == 0x11223344u);
+    assert(obs_desc.callback == mock_observer_cb);
+    assert(obs_desc.user_data == (void*)0x1234);
+
+    /* 5. Event flags & SystemDesc.in_sets */
+    assert(BAM_STORAGE_FLAG_EVENT == 0x10u);
+    assert(BAM_STORAGE_FLAG_ENTITY_EVENT == 0x20u);
+    memset(&sys_desc, 0, sizeof(sys_desc));
+    sys_desc.struct_size = (uint32_t)sizeof(BamSystemDesc);
+    sys_desc.in_sets = sets;
+    sys_desc.in_set_count = 1u;
+    assert(sys_desc.in_set_count == 1u);
+    assert(strcmp(sys_desc.in_sets[0], "host::SimulationSet") == 0);
+
+    /* 6. HostApi has extended slots */
+    api = build_mock_host_api();
+    assert(api.struct_size >= (uint32_t)(offsetof(BamHostApi, cmd_trigger) + sizeof(BamCmdTriggerFn)));
+    assert(api.msg_write_batch == NULL);
+    assert(api.res_ticks == NULL);
+    assert(api.sys_res_ptr == NULL);
+    assert(api.sys_res_mut_ptr == NULL);
+    assert(api.register_observer == NULL);
+    assert(api.cmd_trigger == NULL);
+}
+
 int main(void) {
     test_versions_and_result_names();
     test_cross_language_siphash_uuids();
     test_extensible_host_api_copy_bounded();
     test_end_to_end_c99_lifecycle_and_vtable();
+    test_wave4_5_extensions();
 
     printf("All ABI v0.2.0 ISO C99 conformance & layout checks passed.\n");
     return 0;

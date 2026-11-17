@@ -8,18 +8,19 @@ use core::{
 use crate::{
     commands::{
         BamCmdDespawnFn, BamCmdInsertDefaultFn, BamCmdInsertFn, BamCmdRemoveFn, BamCmdSpawnEmptyFn,
-        BamCmdSpawnFn, BamCommands,
+        BamCmdSpawnFn, BamCmdTriggerFn, BamCommands,
     },
     component::ComponentDesc,
     extensible::ExtensibleStruct,
     iter::{
-        BamIter, BamIterColumnInfoFn, BamIterColumnMutableFn, BamIterColumnMutableUntrackedFn,
-        BamIterColumnReadonlyFn, BamIterColumnRowsMutableFn, BamIterColumnRowsReadonlyFn,
-        BamIterEntitiesFn, BamIterMarkChangedRangeFn, BamIterNextChunkFn, BamIterResetFn,
-        BamMsgReadBatchFn, BamMsgSendFn, BamParForEachChunkFn, BamResMutPtrFn, BamResPtrFn,
+        BamChangeTicks, BamIter, BamIterColumnInfoFn, BamIterColumnMutableFn,
+        BamIterColumnMutableUntrackedFn, BamIterColumnReadonlyFn, BamIterColumnRowsMutableFn,
+        BamIterColumnRowsReadonlyFn, BamIterEntitiesFn, BamIterMarkChangedRangeFn,
+        BamIterNextChunkFn, BamIterResetFn, BamMsgReadBatchFn, BamMsgSendFn, BamMsgWriteBatchFn,
+        BamParForEachChunkFn, BamResMutPtrFn, BamResPtrFn, BamResTicksFn,
     },
     primitives::{BamComponent, ComponentUuid, FfiEntity, FfiResult},
-    system::{BamHostCtx, BamLoadCtx, BamSystemCtx, BamSystemDesc},
+    system::{BamHostCtx, BamLoadCtx, BamObserverDesc, BamSystemCtx, BamSystemDesc},
     version::{ABI_VERSION, abi_version_is_compatible},
 };
 
@@ -387,6 +388,46 @@ pub type BamSysEntityGetMutFn = unsafe extern "C" fn(
     term_index: usize,
 ) -> *mut u8;
 
+/// Direct read-only resource lookup by pre-resolved [`BamComponent`] handle on `sys_ctx`,
+/// optionally writing change-detection ticks into `*out_ticks` when non-null.
+///
+/// Returns null if `component` is not declared as `RESOURCE_READ` or `RESOURCE_WRITE` in the
+/// system's `FilteredAccessSet` or if the resource does not exist in the `World`.
+///
+/// # Safety
+/// - `sys_ctx` must point to an active [`BamSystemCtx`].
+/// - If non-null, `out_ticks` must point to writable [`BamChangeTicks`] storage.
+pub type BamSysResPtrFn = unsafe extern "C" fn(
+    sys_ctx: *const BamSystemCtx,
+    component: BamComponent,
+    out_ticks: *mut BamChangeTicks,
+) -> *const u8;
+
+/// Direct exclusive mutable resource lookup by pre-resolved [`BamComponent`] handle on `sys_ctx`,
+/// reading prior change-detection ticks into `*out_ticks` (when non-null) and marking the
+/// resource's `changed` tick as modified in this run.
+///
+/// Returns null if `component` is not declared as `RESOURCE_WRITE` in the system's
+/// `FilteredAccessSet`, is immutable, or does not exist in the `World`.
+///
+/// # Safety
+/// - `sys_ctx` must point to an active [`BamSystemCtx`], and the caller must not create aliasing
+///   references to the resource.
+/// - If non-null, `out_ticks` must point to writable [`BamChangeTicks`] storage.
+pub type BamSysResMutPtrFn = unsafe extern "C" fn(
+    sys_ctx: *mut BamSystemCtx,
+    component: BamComponent,
+    out_ticks: *mut BamChangeTicks,
+) -> *mut u8;
+
+/// Registers a dynamic observer described by [`BamObserverDesc`] during `bevy_abi_mod_init`.
+///
+/// # Safety
+/// - `load_ctx` must point to the active [`BamLoadCtx`] during `bevy_abi_mod_init`.
+/// - `desc` must point to a valid [`BamObserverDesc`].
+pub type BamRegisterObserverFn =
+    unsafe extern "C" fn(load_ctx: *mut BamLoadCtx, desc: *const BamObserverDesc) -> FfiResult;
+
 /// Complete versioned host function table passed to `bevy_abi_mod_init`
 /// (`typedef struct BamHostApi BamHostApi;`).
 ///
@@ -394,8 +435,8 @@ pub type BamSysEntityGetMutFn = unsafe extern "C" fn(
 /// null-pointer checks are sound without raw pointer byte-probing.
 ///
 /// Layout:
-/// - 64-bit: `MIN_V0_2_SIZE = 224` bytes (`8`B header + `27 * 8`B mandatory slots; `size_of = 264` bytes with 5 optional Wave 4 extension slots), `8`-byte alignment.
-/// - 32-bit: `MIN_V0_2_SIZE = 116` bytes (`8`B header + `27 * 4`B mandatory slots; `size_of = 136` bytes with 5 optional Wave 4 extension slots), `4`-byte alignment.
+/// - 64-bit: `MIN_V0_2_SIZE = 224` bytes (`8`B header + `27 * 8`B mandatory slots; `size_of = 312` bytes with 11 optional Wave 4 extension slots), `8`-byte alignment.
+/// - 32-bit: `MIN_V0_2_SIZE = 116` bytes (`8`B header + `27 * 4`B mandatory slots; `size_of = 160` bytes with 11 optional Wave 4 extension slots), `4`-byte alignment.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct BamHostApi {
@@ -481,6 +522,18 @@ pub struct BamHostApi {
     pub msg_read_batch: Option<BamMsgReadBatchFn>,
     /// Buffered Bevy `Messages<M>` writer (`F-02`, `offset 256` / `132`).
     pub msg_send: Option<BamMsgSendFn>,
+    /// Buffered Bevy `Messages<M>` batch writer (`offset 264` / `136`).
+    pub msg_write_batch: Option<BamMsgWriteBatchFn>,
+    /// Singleton resource change-detection ticks at `term_index` (`offset 272` / `140`).
+    pub res_ticks: Option<BamResTicksFn>,
+    /// Direct pre-resolved read-only resource lookup with change ticks (`offset 280` / `144`).
+    pub sys_res_ptr: Option<BamSysResPtrFn>,
+    /// Direct pre-resolved mutable resource lookup with change ticks (`offset 288` / `148`).
+    pub sys_res_mut_ptr: Option<BamSysResMutPtrFn>,
+    /// Dynamic `Event` / `EntityEvent` observer registration (`offset 296` / `152`).
+    pub register_observer: Option<BamRegisterObserverFn>,
+    /// Deferred `world.trigger(...)` event emission (`offset 304` / `156`).
+    pub cmd_trigger: Option<BamCmdTriggerFn>,
 }
 
 impl BamHostApi {
@@ -560,7 +613,7 @@ impl BamHostApi {
             && self.cmd_remove.is_some()
     }
 
-    /// Returns `true` if all 32 ABI `0.2` + Wave 4 optional function-pointer slots are `Some`.
+    /// Returns `true` if all 38 ABI `0.2` + Wave 4 optional function-pointer slots are `Some`.
     #[inline]
     pub const fn has_all_wave4_slots(&self) -> bool {
         self.has_all_v0_2_slots()
@@ -569,6 +622,12 @@ impl BamHostApi {
             && self.sys_entity_get_mut.is_some()
             && self.msg_read_batch.is_some()
             && self.msg_send.is_some()
+            && self.msg_write_batch.is_some()
+            && self.res_ticks.is_some()
+            && self.sys_res_ptr.is_some()
+            && self.sys_res_mut_ptr.is_some()
+            && self.register_observer.is_some()
+            && self.cmd_trigger.is_some()
     }
 
     /// Validates `struct_size >= MIN_V0_2_SIZE`, SemVer compatibility against `guest_version`,
@@ -593,7 +652,7 @@ const _: () = {
     #[cfg(target_pointer_width = "64")]
     {
         assert!(BamHostApi::MIN_V0_2_SIZE == 224);
-        assert!(core::mem::size_of::<BamHostApi>() == 264);
+        assert!(core::mem::size_of::<BamHostApi>() == 312);
         assert!(core::mem::align_of::<BamHostApi>() == 8);
         assert!(core::mem::offset_of!(BamHostApi, struct_size) == 0);
         assert!(core::mem::offset_of!(BamHostApi, abi_version) == 4);
@@ -629,11 +688,17 @@ const _: () = {
         assert!(core::mem::offset_of!(BamHostApi, sys_entity_get_mut) == 240);
         assert!(core::mem::offset_of!(BamHostApi, msg_read_batch) == 248);
         assert!(core::mem::offset_of!(BamHostApi, msg_send) == 256);
+        assert!(core::mem::offset_of!(BamHostApi, msg_write_batch) == 264);
+        assert!(core::mem::offset_of!(BamHostApi, res_ticks) == 272);
+        assert!(core::mem::offset_of!(BamHostApi, sys_res_ptr) == 280);
+        assert!(core::mem::offset_of!(BamHostApi, sys_res_mut_ptr) == 288);
+        assert!(core::mem::offset_of!(BamHostApi, register_observer) == 296);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_trigger) == 304);
     }
     #[cfg(target_pointer_width = "32")]
     {
         assert!(BamHostApi::MIN_V0_2_SIZE == 116);
-        assert!(core::mem::size_of::<BamHostApi>() == 136);
+        assert!(core::mem::size_of::<BamHostApi>() == 160);
         assert!(core::mem::align_of::<BamHostApi>() == 4);
         assert!(core::mem::offset_of!(BamHostApi, struct_size) == 0);
         assert!(core::mem::offset_of!(BamHostApi, abi_version) == 4);
@@ -669,6 +734,12 @@ const _: () = {
         assert!(core::mem::offset_of!(BamHostApi, sys_entity_get_mut) == 124);
         assert!(core::mem::offset_of!(BamHostApi, msg_read_batch) == 128);
         assert!(core::mem::offset_of!(BamHostApi, msg_send) == 132);
+        assert!(core::mem::offset_of!(BamHostApi, msg_write_batch) == 136);
+        assert!(core::mem::offset_of!(BamHostApi, res_ticks) == 140);
+        assert!(core::mem::offset_of!(BamHostApi, sys_res_ptr) == 144);
+        assert!(core::mem::offset_of!(BamHostApi, sys_res_mut_ptr) == 148);
+        assert!(core::mem::offset_of!(BamHostApi, register_observer) == 152);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_trigger) == 156);
     }
 };
 
