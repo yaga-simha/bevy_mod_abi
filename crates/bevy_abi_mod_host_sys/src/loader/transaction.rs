@@ -136,13 +136,21 @@ mod tests {
 
     #[test]
     fn load_transaction_drop_reclaims_fresh_slots_across_1100_failed_inits_in_one_live_world() {
+        let _serial = crate::drop_trampoline::TEST_DROP_SLAB_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut world = World::new();
         world.insert_resource(WorldDropGuard::new());
         world.insert_resource(ModRegistry::new());
         let baseline_free = available_drop_trampoline_slots();
 
-        // Exceed `MAX_DROP_TRAMPOLINES` (1024) on a single live `World` without dropping `world`!
-        for i in 0..(MAX_DROP_TRAMPOLINES + 76) {
+        // Exceed `MAX_DROP_TRAMPOLINES` on a single live `World` without dropping `world`!
+        let iters = if cfg!(miri) {
+            12
+        } else {
+            MAX_DROP_TRAMPOLINES + 76
+        };
+        for i in 0..iters {
             let reg = world.resource::<ModRegistry>().clone();
             let pre_snap = reg.snapshot_arc();
             let is_active = Arc::new(AtomicBool::new(true));

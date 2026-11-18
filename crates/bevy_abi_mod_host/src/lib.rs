@@ -16,6 +16,13 @@
 //! - `diagnostics`: Publishes per-mod and aggregate `bevy_diagnostic` counters.
 //! - `signature-verification`: Pure-Rust OpenSSH `SSHSIG` + Ed25519 CA certificate verification
 //!   of shared libraries prior to `dlopen` / `LoadLibraryW` (`ModTrustPolicy`, `VerifiedModSignature`).
+//! - `bridge-std-types`: Zero-copy / VTable host bridges for Bevy `Transform`, `GlobalTransform`,
+//!   `Visibility`, `Name`, `Time`, `ButtonInput<KeyCode>`, and `ButtonInput<MouseButton>`.
+//! - `bridge-asset`: Isolated `mod://<namespace>/...` Bevy `AssetSource` + refcounted `FfiAssetHandle`
+//!   host backend (`ModAssetPlugin`).
+//! - `bridge-state`: Bevy `States` exposure (`ModStateExt::expose_mod_state`), transition schedules,
+//!   and `in_state` run conditions.
+//! - `hot-reload-watcher`: Debounced filesystem hot-reload watcher (`ModHotReloadPlugin`).
 //!
 //! # Quickstart
 //!
@@ -60,6 +67,12 @@ pub use bevy_abi_mod_macros::{AbiPod, ModComponent};
 pub use bevy_abi_mod_sys;
 
 pub use app_ext::ModAppExt;
+pub use bevy_abi_mod_host_sys::{
+    BinaryFormat, ComponentCollisionError, ComponentOptions, LibraryResidencyInfo, LoadOptions,
+    LoadedMod, ModErrorPolicy, ModErrorPolicyConfig, ModHost, ModId, ModLoadError, ModQuarantine,
+    ModRegistry, ModScoped, RegisteredComponent, RegistrySnapshot, TargetEntity, WorldDropGuard,
+    inspect_library_residency, inspect_library_residency_file, is_abi_version_compatible,
+};
 #[cfg(feature = "signature-verification")]
 pub use bevy_abi_mod_host_sys::{
     CertificateValidityPolicy, DEFAULT_KRL_SIGNATURE_NAMESPACE, DEFAULT_MAX_MOD_BINARY_BYTES,
@@ -69,38 +82,73 @@ pub use bevy_abi_mod_host_sys::{
     preverify_mod_on_disk, sign_mod_bytes_with_certificate, sign_mod_bytes_with_key,
     sign_mod_bytes_with_openssh_certificate,
 };
-pub use bevy_abi_mod_host_sys::{
-    ComponentCollisionError, ComponentOptions, LoadOptions, LoadedMod, ModErrorPolicy,
-    ModErrorPolicyConfig, ModHost, ModId, ModLoadError, ModQuarantine, ModRegistry,
-    RegisteredComponent, RegistrySnapshot, TargetEntity, WorldDropGuard, is_abi_version_compatible,
+#[cfg(feature = "bridge-std-types")]
+pub use bridges::{
+    FfiGlobalTransform, FfiKeyCode, FfiKeyboardInput, FfiMouseButton, FfiMouseInput, FfiTimeFixed,
+    FfiTimeReal, FfiTimeVirtual, FfiTransform, FfiVisibility, StdTypesBridgePlugin,
+    register_std_types_bridges,
 };
+#[cfg(feature = "bridge-asset")]
+pub use bridges::{ModAssetAppExt, ModAssetPlugin, ModAssetRegistry, ModAssetWorldExt};
+#[cfg(feature = "bridge-state")]
+pub use bridges::{ModNextState, ModStateError, ModStateExt, ModStateSpec};
 pub use commands_ext::ModCommandsExt;
 pub use events::{
     LoadedModInfo, ModLoaded, ModSystemError, ModSystemFaulted, ModUnloaded, SystemInitError,
 };
+pub use mod_dag::{
+    DagResolution, DirectoryLoadReport, ModDagError, ModDagNode, ModDependencyGraph,
+    ModTomlManifest, discover_mod_manifests, host_abi_semver, resolve_dependency_dag,
+};
 pub use plugin::{AbiModPlugin, ConfiguredAbiModPlugin};
 pub use schedule_sets::{
     ModNamedSystemSet, ModScheduleMap, ModSystemSet, ModVisibleSets, StartupCompleted,
+    configure_guest_system_in_world, configure_weak_set_chain,
+};
+#[cfg(feature = "hot-reload-watcher")]
+pub use watcher::{
+    ModHotReloadAction, ModHotReloadHistory, ModHotReloadOutcome, ModHotReloadPlugin,
+    ModHotReloadWatcher,
 };
 pub use world_ext::ModWorldExt;
 
 /// Convenient prelude module for Bevy games hosting native C-ABI mods (`ABI 0.2.0`).
 pub mod prelude {
     pub use crate::app_ext::ModAppExt;
+    #[cfg(feature = "bridge-std-types")]
+    pub use crate::bridges::{
+        FfiGlobalTransform, FfiKeyCode, FfiKeyboardInput, FfiMouseButton, FfiMouseInput,
+        FfiTimeFixed, FfiTimeReal, FfiTimeVirtual, FfiTransform, FfiVisibility,
+        StdTypesBridgePlugin,
+    };
+    #[cfg(feature = "bridge-asset")]
+    pub use crate::bridges::{ModAssetAppExt, ModAssetPlugin, ModAssetRegistry, ModAssetWorldExt};
+    #[cfg(feature = "bridge-state")]
+    pub use crate::bridges::{ModNextState, ModStateError, ModStateExt, ModStateSpec};
     pub use crate::commands_ext::ModCommandsExt;
     #[cfg(feature = "signature-verification")]
     pub use crate::events::VerifiedModSignature;
     pub use crate::events::{
         LoadedModInfo, ModLoaded, ModSystemError, ModSystemFaulted, ModUnloaded, SystemInitError,
     };
+    pub use crate::mod_dag::{
+        DirectoryLoadReport, ModDagError, ModDependencyGraph, ModTomlManifest,
+    };
     pub use crate::plugin::{AbiModPlugin, ConfiguredAbiModPlugin};
     pub use crate::schedule_sets::{
         ModNamedSystemSet, ModScheduleMap, ModSystemSet, ModVisibleSets, StartupCompleted,
+        configure_guest_system_in_world, configure_weak_set_chain,
+    };
+    #[cfg(feature = "hot-reload-watcher")]
+    pub use crate::watcher::{
+        ModHotReloadAction, ModHotReloadHistory, ModHotReloadOutcome, ModHotReloadPlugin,
+        ModHotReloadWatcher,
     };
     pub use crate::world_ext::ModWorldExt;
     pub use crate::{
         AbiPod, ComponentCollisionError, ComponentOptions, LoadOptions, LoadedMod, ModComponent,
-        ModErrorPolicy, ModHost, ModId, ModLoadError, ModQuarantine, ModRegistry, TargetEntity,
+        ModErrorPolicy, ModHost, ModId, ModLoadError, ModQuarantine, ModRegistry, ModScoped,
+        TargetEntity,
     };
     #[cfg(feature = "signature-verification")]
     pub use crate::{
@@ -112,10 +160,13 @@ pub mod prelude {
         sign_mod_bytes_with_openssh_certificate,
     };
     pub use bevy_abi_mod_sys::{
-        ABI_VERSION, AccessMode, BamChangeTicks, BamColumnInfo, BamComponent, BamObserverDesc,
-        BamObserverFn, BamQueryDesc, BamRunIfFn, BamSystemDesc, BamTermDesc, ComponentDesc,
-        ComponentUuid, FfiBool, FfiChildOf, FfiEntity, FfiResult, FfiSlice, RawInsertable,
-        ScheduleId, StrView, VTableHeader,
+        ABI_VERSION, AccessMode, BAM_COMPONENT_FLAG_SUMMARY_TICK, BAM_OBSERVER_FLAG_PROPAGATE,
+        BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL, BAM_TRIGGER_FLAG_PROPAGATE, BamChangeTicks,
+        BamColumnInfo, BamComponent, BamEventKind, BamObserverDesc, BamObserverFn,
+        BamObserverMutFn, BamQueryDesc, BamRunIfFn, BamSystemDesc, BamTermDesc, BamTriggerDesc,
+        ComponentDesc, ComponentUuid, FfiAssetHandle, FfiAssetLoadState, FfiBool, FfiChildOf,
+        FfiEntity, FfiOption, FfiResult, FfiSlice, RawInsertable, ScheduleId, StrView,
+        VTableHeader,
     };
 }
 

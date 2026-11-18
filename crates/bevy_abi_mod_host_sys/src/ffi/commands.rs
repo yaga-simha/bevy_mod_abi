@@ -1393,6 +1393,9 @@ mod tests {
 
         DROP_A_COUNT.store(0, Ordering::SeqCst);
         DROP_B_COUNT.store(0, Ordering::SeqCst);
+        let _serial = crate::drop_trampoline::TEST_DROP_SLAB_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let mut world = World::new();
         world.insert_resource(WorldDropGuard::new());

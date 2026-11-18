@@ -18,7 +18,10 @@ pub use mod_host::{
 };
 #[cfg(feature = "signature-verification")]
 pub use shared_lib::preverify_mod_on_disk;
-pub use shared_lib::{LoadOptions, canonical_mod_name_from_path};
+pub use shared_lib::{
+    BinaryFormat, LibraryResidencyInfo, LoadOptions, canonical_mod_name_from_path,
+    inspect_library_residency, inspect_library_residency_file,
+};
 #[cfg(feature = "signature-verification")]
 pub use signing::{
     CertificateValidityPolicy, DEFAULT_KRL_SIGNATURE_NAMESPACE, DEFAULT_MAX_MOD_BINARY_BYTES,

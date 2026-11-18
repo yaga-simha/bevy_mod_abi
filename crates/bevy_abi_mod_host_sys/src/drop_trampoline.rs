@@ -7,7 +7,7 @@
 //! - Lazily-allocated paged slab: up to [`MAX_DROP_PAGES`] (`64`) pages of [`DROP_PAGE_SIZE`] (`64`)
 //!   slots ([`MAX_DROP_TRAMPOLINES`] = `4,096`), allocated on demand so empty worlds pay zero heap cost.
 //! - Generation-stamped per-`World` recycling: when `unload_mod` finishes despawning mod entities and
-//!   `live_values == 0`, [`WorldDropGuard::recycle_slots_for_guard`] immediately recycles the slot
+//!   `live_values == 0`, `WorldDropGuard::recycle_slots_for_guard` immediately recycles the slot
 //!   with `generation + 1` back to the global free list without waiting for `World::drop`.
 //! - Deferred reclamation (`live_values: AtomicUsize`): for persistent/host entities that outlive
 //!   `unload_mod` or `World::drop`, a slot is returned to the global free list only once *both*
@@ -681,7 +681,7 @@ struct WorldDropSlot {
 /// Per-`World` RAII resource owning all drop trampoline slots bound to `ComponentDescriptor`s in
 /// that `World`.
 ///
-/// On `unload_mod`, [`Self::recycle_slots_for_guard`] immediately returns any slot owned exclusively
+/// On `unload_mod`, `Self::recycle_slots_for_guard` immediately returns any slot owned exclusively
 /// by the unloaded mod whose `live_values == 0` (with incremented `generation + 1`) back to the
 /// global free list. Slots whose entities persist past mod unload are reclaimed when the `World`
 /// drops (or once `live_values` reaches `0`).
@@ -1156,6 +1156,9 @@ pub fn allocated_drop_pages() -> usize {
 }
 
 #[cfg(test)]
+pub(crate) static TEST_DROP_SLAB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use bevy_ecs::world::World;
@@ -1164,12 +1167,16 @@ mod tests {
 
     #[test]
     fn paged_slab_recycles_5000_distinct_uuids_in_one_world_with_generation_bump() {
+        let _serial = TEST_DROP_SLAB_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _ctrl_sanity = available_drop_trampoline_slots();
         let mut guard = WorldDropGuard::new();
         let mut expected_slot: Option<usize> = None;
         let mut prev_gen: Option<u64> = None;
 
-        for i in 0..5_000u64 {
+        let cycles = if cfg!(miri) { 16u64 } else { 5_000u64 };
+        for i in 0..cycles {
             let uuid = ComponentUuid::from_parts(&format!("unit_slab::{i}"), 8, 8, i);
             let is_active = Arc::new(AtomicBool::new(true));
             let (slot, _tramp, _staged) = guard
@@ -1212,6 +1219,9 @@ mod tests {
 
     #[test]
     fn recycle_skips_slots_with_live_persistent_values_until_world_drop() {
+        let _serial = TEST_DROP_SLAB_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut guard = WorldDropGuard::new();
         let uuid = ComponentUuid::from_parts("unit_slab::PersistentComp", 8, 8, 999);
         let is_active = Arc::new(AtomicBool::new(true));

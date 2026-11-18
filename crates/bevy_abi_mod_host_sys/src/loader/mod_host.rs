@@ -386,7 +386,7 @@ impl ModHost {
         // SAFETY: Resolving mandatory `bevy_abi_mod_manifest` symbol with signature `extern "C" fn() -> *const BamManifest`.
         let manifest_fn: Symbol<BamManifestFn> = unsafe {
             loaded_lib
-                .library
+                .lib()
                 .get(b"bevy_abi_mod_manifest\0")
                 .map_err(|source| ModLoadError::MissingManifest {
                     path: source_path.to_path_buf(),
@@ -484,7 +484,7 @@ impl ModHost {
         // SAFETY: Resolving `bevy_abi_mod_init`.
         let init_fn: Symbol<BamInitFn> = unsafe {
             loaded_lib
-                .library
+                .lib()
                 .get(b"bevy_abi_mod_init\0")
                 .map_err(|source| ModLoadError::MissingEntryPoint {
                     path: source_path.to_path_buf(),
@@ -496,7 +496,7 @@ impl ModHost {
         // SAFETY: Resolving `bevy_abi_mod_shutdown`.
         let shutdown_fn: BamShutdownFn = unsafe {
             *loaded_lib
-                .library
+                .lib()
                 .get::<BamShutdownFn>(b"bevy_abi_mod_shutdown\0")
                 .map_err(|source| ModLoadError::MissingEntryPoint {
                     path: source_path.to_path_buf(),
@@ -1140,23 +1140,11 @@ mod tests {
             reg.restore_snapshot(Arc::new(snap));
         }
 
-        // Open a harmless system shared library handle for `LoadedMod` and push into `ModHost`.
-        #[cfg(target_os = "macos")]
-        let sys_lib_path = Path::new("/usr/lib/libSystem.B.dylib");
-        #[cfg(target_os = "linux")]
-        let sys_lib_path = Path::new("libc.so.6");
-        #[cfg(target_os = "windows")]
-        let sys_lib_path = Path::new("kernel32.dll");
-
-        let opts = LoadOptions::new().with_shadow_copy(false);
+        let sys_lib_path = Path::new("in_memory_test_mod.dylib");
+        let loaded_path = sys_lib_path.to_path_buf();
+        let loaded_lib = LoadedLibrary::mock_empty_for_test();
         #[cfg(feature = "signature-verification")]
-        // SAFETY: Opening standard OS system library without invoking guest code.
-        let (loaded_lib, loaded_path, verified_signature) =
-            unsafe { LoadedLibrary::open(sys_lib_path, &opts, None) }.expect("open system lib");
-        #[cfg(not(feature = "signature-verification"))]
-        // SAFETY: Opening standard OS system library without invoking guest code.
-        let (loaded_lib, loaded_path) =
-            unsafe { LoadedLibrary::open(sys_lib_path, &opts) }.expect("open system lib");
+        let verified_signature = None;
 
         let lib_state = shared_lib_state_for_path(&loaded_path);
         lib_state.lock().unwrap().active_count += 1;

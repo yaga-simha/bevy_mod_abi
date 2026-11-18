@@ -267,8 +267,8 @@ mod fuzz_boundaries {
                     assert_eq!(res, FfiResult::NULL_POINTER, "step {step}");
                 }
                 2 => {
-                    // Unknown `BamSystemDesc::flags` bit -> `UNSUPPORTED`
-                    let bad_flag = 1u32 << (1 + rng.range(31));
+                    // Unknown `BamSystemDesc::flags` bit (`>= 1 << 2`) -> `UNSUPPORTED`
+                    let bad_flag = 1u32 << (2 + rng.range(30));
                     let desc = valid_base.with_flags(bad_flag);
                     let res = unsafe { host_register_system(ctx_ptr, &desc) };
                     assert_eq!(res, FfiResult::UNSUPPORTED, "step {step}");

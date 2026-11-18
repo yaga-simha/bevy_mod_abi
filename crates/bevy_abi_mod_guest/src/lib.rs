@@ -96,26 +96,42 @@ pub mod raw;
 pub use bevy_abi_mod_guest_sys::SpawnEntry;
 pub use bevy_abi_mod_sys::{
     ABI_VERSION, ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PATCH, AbiPod, AccessMode,
-    BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_IMMUTABLE,
-    BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET,
-    BAM_SYSTEM_FLAG_MAIN_THREAD, BamChangeTicks, BamColumnInfo, BamComponent, BamManifest,
-    BamObserverDesc, BamObserverFn, BamTermDesc, ComponentDesc, ComponentUuid, FfiBool, FfiChildOf,
-    FfiEntity, FfiResult, FfiSlice, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent,
-    RawInsertable, ScheduleId, StrView, SymbolEntry, VTableHeader,
+    BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_COMPONENT_FLAG_SUMMARY_TICK,
+    BAM_OBSERVER_FLAG_PROPAGATE, BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE,
+    BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_SUMMARY_TICK,
+    BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL, BAM_SYSTEM_FLAG_MAIN_THREAD, BAM_TRIGGER_FLAG_PROPAGATE,
+    BamChangeTicks, BamColumnInfo, BamComponent, BamEventKind, BamManifest, BamObserverDesc,
+    BamObserverFn, BamObserverMutFn, BamTermDesc, BamTriggerDesc, ComponentDesc, ComponentUuid,
+    FfiAssetHandle, FfiAssetLoadState, FfiBool, FfiChildOf, FfiEntity, FfiOption, FfiResult,
+    FfiSlice, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent, RawInsertable, ScheduleId,
+    StrView, SymbolEntry, VTableHeader,
 };
 
 #[cfg(feature = "derive")]
 pub use bevy_abi_mod_macros::{AbiPod, ModComponent};
 
 pub use app::{
-    GuestApp, GuestRes, GuestResMut, IntoSystemResult, MultiQueryContext, QueryBuilder,
-    RunConditionContext, SystemBuilder, SystemContext,
+    GuestApp, GuestComponentOptions, GuestRes, GuestResMut, IntoSystemResult, MultiQueryContext,
+    QueryBuilder, RunConditionContext, SystemBuilder, SystemContext,
+};
+pub use bridges::{
+    FfiGlobalTransform, FfiKeyCode, FfiKeyboardInput, FfiMouseButton, FfiMouseInput, FfiTimeFixed,
+    FfiTimeReal, FfiTimeVirtual, FfiTransform, FfiVisibility, GuestAssetHandle, GuestAssetHostExt,
+    GuestAssetServer, GuestCommandsStateExt, GuestNameBridge, GuestStateBridge,
+    GuestStateSystemBuilderExt, TypedAssetHandle, on_enter_schedule, on_exit_schedule,
+    on_transition_schedule,
+};
+#[cfg(feature = "derive")]
+pub use bridges::{
+    GuestGlobalTransformBridge, GuestKeyboardInputBridge, GuestMouseInputBridge,
+    GuestTimeFixedBridge, GuestTimeRealBridge, GuestTimeVirtualBridge, GuestTransformBridge,
+    GuestVisibilityBridge, GuestWireBridge,
 };
 pub use commands::GuestCommands;
 pub use component::{GuestComponent, GuestComponentHooks, guest_component_uuid};
 pub use iter::{
-    Added, Changed, Chunk, ChunkIter, ChunkSlice, ChunkSliceMut, QueryTerm, QueryTuple, SparseRows,
-    SparseRowsIter, SparseRowsMut, TypedChunkIter, With, Without,
+    Added, Allow, Changed, Chunk, ChunkIter, ChunkSlice, ChunkSliceMut, Has, Or2, Or3, QueryTerm,
+    QueryTuple, SparseRows, SparseRowsIter, SparseRowsMut, TypedChunkIter, With, Without,
 };
 pub use lifecycle::{GuestPlugin, build_guest_fn, build_guest_plugin};
 

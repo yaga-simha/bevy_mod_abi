@@ -14,14 +14,15 @@ pub use bevy_abi_mod_host_sys::loader::ModScoped;
 use bevy_abi_mod_host_sys::{
     ComponentCollisionError, ComponentOptions, LoadOptions, LoadedMod, ModErrorPolicy,
     ModErrorPolicyConfig, ModHost, ModId, ModLoadError, ModQuarantine, ModRegistry, WorldDropGuard,
-    excise_and_unload_mod_in_world, load_mod_in_world, restore_mod_state_in_world,
-    rollback_unscheduled_mod_in_world, save_mod_state_in_world, unload_all_mods_in_world,
+    ensure_dynamic_hook_map_in_world, excise_and_unload_mod_in_world, load_mod_in_world,
+    restore_mod_state_in_world, rollback_unscheduled_mod_in_world, save_mod_state_in_world,
+    unload_all_mods_in_world,
 };
 #[cfg(feature = "signature-verification")]
 use bevy_abi_mod_host_sys::{ModTrustPolicy, default_signature_path_for, preverify_mod_on_disk};
 use bevy_abi_mod_sys::{
-    AbiPod, BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_SPARSE_SET, BamComponent, ModComponent,
-    ScheduleId,
+    AbiPod, BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_SUMMARY_TICK,
+    BamComponent, ModComponent, ScheduleId,
 };
 use bevy_ecs::component::{Component, StorageType};
 use bevy_ecs::entity::Entity;
@@ -50,6 +51,7 @@ pub(crate) fn ensure_world_mod_resources(world: &mut World) {
     if !world.contains_resource::<WorldDropGuard>() {
         world.insert_resource(WorldDropGuard::new());
     }
+    ensure_dynamic_hook_map_in_world(world);
     if !world.contains_resource::<ModRegistry>() {
         world.insert_resource(ModRegistry::new());
     }
@@ -529,6 +531,9 @@ impl ModWorldExt for World {
             }
             if !info.mutable() {
                 inferred_flags |= BAM_STORAGE_FLAG_IMMUTABLE;
+            }
+            if info.summary_tick() {
+                inferred_flags |= BAM_STORAGE_FLAG_SUMMARY_TICK;
             }
         }
         with_world_registry(self, |reg| {

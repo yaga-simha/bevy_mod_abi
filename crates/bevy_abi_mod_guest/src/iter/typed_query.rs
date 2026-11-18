@@ -33,7 +33,7 @@ pub struct Changed<T>(PhantomData<fn() -> T>);
 /// Row-level added-tick filter with read-only slice access (`AccessMode::ADDED`) for [`QueryTuple`].
 pub struct Added<T>(PhantomData<fn() -> T>);
 
-/// Archetype filter bypass marker (`AccessMode::ALLOW`) suppressing [`DefaultQueryFilters`]
+/// Archetype filter bypass marker (`AccessMode::ALLOW`) suppressing `DefaultQueryFilters`
 /// (such as `Disabled`) for `T` without requiring `T` to be present on matched entities.
 pub struct Allow<T>(PhantomData<fn() -> T>);
 

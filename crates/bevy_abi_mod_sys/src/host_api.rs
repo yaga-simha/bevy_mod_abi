@@ -439,8 +439,8 @@ pub type BamRegisterObserverFn =
 ///
 /// When `entity` has zero children/targets, writes `*out_len = 0` and returns [`FfiResult::OK`]
 /// (`*out_entities` may be null when `*out_len == 0`). When `*out_len > 0`, `*out_entities` is
-/// non-null, 8-byte aligned, and valid for shared reads throughout the enclosing [`BamSystemFn`]
-/// invocation (or until a mutable borrow of the same component).
+/// non-null, 8-byte aligned, and valid for shared reads throughout the enclosing
+/// [`BamSystemFn`](crate::BamSystemFn) invocation (or until a mutable borrow of the same component).
 ///
 /// Requires declared shared read (or write) access to `Children` / `relationship_target` in the
 /// running system's `FilteredAccessSet`.

@@ -200,13 +200,28 @@ impl Drop for ShadowFileGuard {
 /// `library` (`dlclose` / `FreeLibrary`) runs **strictly before** `_shadow_guard` unlinks the
 /// temporary file (and `.pdb` sidecar) on Windows, macOS, and Linux.
 pub(crate) struct LoadedLibrary {
-    pub(crate) library: Library,
+    library: Option<Library>,
     _shadow_guard: Option<ShadowFileGuard>,
     #[allow(dead_code)]
     pub(crate) residency: LibraryResidencyInfo,
 }
 
 impl LoadedLibrary {
+    #[inline]
+    pub(crate) fn lib(&self) -> &Library {
+        self.library
+            .as_ref()
+            .expect("live LoadedLibrary must hold an open libloading::Library")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mock_empty_for_test() -> Self {
+        Self {
+            library: None,
+            _shadow_guard: None,
+            residency: LibraryResidencyInfo::default(),
+        }
+    }
     /// Stages a shadow copy (or verifies & exclusively stages when `signature-verification`
     /// is active and enforced) and opens the shared library via `libloading`.
     ///
@@ -324,7 +339,7 @@ impl LoadedLibrary {
             })?;
 
         Ok(Self {
-            library,
+            library: Some(library),
             _shadow_guard: shadow_guard,
             residency,
         })
@@ -707,6 +722,9 @@ enum SharedLibKey {
 
 impl SharedLibKey {
     fn from_path(path: &Path) -> Self {
+        if cfg!(miri) {
+            return Self::CanonicalPath(path.to_path_buf());
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -1496,6 +1514,18 @@ mod tests {
 
     #[test]
     fn shadow_copy_stages_and_cleans_up_pdb_sidecar_and_patches_rsds() {
+        let orig_pdb_str = "C:\\very\\long\\build\\output\\target\\debug\\sample_mod.pdb";
+        let pe_bytes = build_synthetic_pe_with_rsds(orig_pdb_str);
+        if cfg!(miri) {
+            let mut pe = pe_bytes;
+            assert!(patch_pe_codeview_pdb_path(
+                &mut pe,
+                Path::new("shadow_sample_mod.pdb")
+            ));
+            assert_eq!(&pe[0x80 + 24 + 64..0x80 + 24 + 68], &[0, 0, 0, 0]);
+            return;
+        }
+
         let dir = std::env::temp_dir().join(format!(
             "bam_pdb_shadow_test_{}_{}",
             std::process::id(),
@@ -1507,8 +1537,6 @@ mod tests {
 
         let dll_path = src_dir.join("sample_mod.dll");
         let pdb_path = src_dir.join("sample_mod.pdb");
-        let orig_pdb_str = "C:\\very\\long\\build\\output\\target\\debug\\sample_mod.pdb";
-        let pe_bytes = build_synthetic_pe_with_rsds(orig_pdb_str);
 
         std::fs::write(&dll_path, &pe_bytes).unwrap();
         std::fs::write(&pdb_path, b"FAKE_PDB_DATA").unwrap();

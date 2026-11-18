@@ -173,6 +173,10 @@
 //! - `diagnostics`: Enables optional diagnostic instrumentation in `bevy_abi_mod_host`.
 //! - `signature-verification`: Enables optional pure-Rust OpenSSH `SSHSIG` and Ed25519 CA
 //!   certificate verification (`ModTrustPolicy`) prior to mapping native shared libraries.
+//! - `bridge-std-types`: Enables Bevy standard component/resource/input bridges (`StdTypesBridgePlugin`).
+//! - `bridge-asset`: Enables isolated `mod://<namespace>/...` Bevy asset sourcing (`ModAssetPlugin`).
+//! - `bridge-state`: Enables Bevy `States` exposure (`ModStateExt`).
+//! - `hot-reload-watcher`: Enables debounced filesystem hot-reload watching (`ModHotReloadPlugin`).
 
 pub use bevy_abi_mod_host;
 pub use bevy_abi_mod_host::*;

@@ -500,6 +500,14 @@ impl<T: Component + ModComponent> ComponentOptions<T> {
         self
     }
 
+    /// Marks this component registration as carrying a Bevy 0.20 per-table summary tick
+    /// (`BAM_STORAGE_FLAG_SUMMARY_TICK`).
+    #[inline]
+    pub const fn summary_tick(mut self) -> Self {
+        self.extra_storage_flags |= BAM_STORAGE_FLAG_SUMMARY_TICK;
+        self
+    }
+
     /// Returns additional `BAM_STORAGE_FLAG_*` bits configured on these options.
     #[inline]
     pub const fn extra_storage_flags(&self) -> u32 {

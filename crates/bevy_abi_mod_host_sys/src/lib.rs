@@ -48,12 +48,20 @@ pub use ffi::iter_ext::host_iter_read_removed;
 pub use ffi::observers_ext::{host_cmd_observe, host_cmd_trigger_ex};
 pub use ffi::proc_address::host_get_proc_address;
 pub use ffi::register::{
-    GuestObserverBinding, LoadContext, host_load_host_ctx, host_register_component,
-    host_register_observer, host_register_system, host_resolve_component,
+    GuestObserverBinding, LoadContext, ensure_dynamic_hook_map_in_world, host_load_host_ctx,
+    host_register_component, host_register_observer, host_register_system, host_resolve_component,
 };
 pub use handle_header::{
     COMMANDS_MAGIC, HOST_CTX_MAGIC, HandleHeader, HostContext, ITER_MAGIC, LOAD_CTX_MAGIC,
     POISONED_MAGIC, STRICT_FFI_CHECKS, SYS_CTX_MAGIC, host_last_error,
+};
+pub use loader::{
+    BinaryFormat, LibraryResidencyInfo, LoadOptions, LoadedMod, LoadedModInfo, ModHost, ModId,
+    ModLoadError, ModLoaded, ModScoped, ModUnloaded, canonical_mod_name_from_path,
+    excise_and_unload_mod_in_world, inspect_library_residency, inspect_library_residency_file,
+    is_abi_version_compatible, load_mod_in_world, record_mod_named_sets_in_world,
+    restore_mod_state_in_world, rollback_unscheduled_mod_in_world, save_mod_state_in_world,
+    unload_all_mods_in_world,
 };
 #[cfg(feature = "signature-verification")]
 pub use loader::{
@@ -63,12 +71,6 @@ pub use loader::{
     SignatureVerificationError, VerifiedModSignature, default_signature_path_for,
     preverify_mod_on_disk, sign_mod_bytes_with_certificate, sign_mod_bytes_with_key,
     sign_mod_bytes_with_openssh_certificate,
-};
-pub use loader::{
-    LoadOptions, LoadedMod, LoadedModInfo, ModHost, ModId, ModLoadError, ModLoaded, ModUnloaded,
-    canonical_mod_name_from_path, excise_and_unload_mod_in_world, is_abi_version_compatible,
-    load_mod_in_world, record_mod_named_sets_in_world, restore_mod_state_in_world,
-    rollback_unscheduled_mod_in_world, save_mod_state_in_world, unload_all_mods_in_world,
 };
 pub use registry::{
     ComponentCollisionError, ComponentOptions, CreateMsgCursorFn, ExtractEventTargetFn,

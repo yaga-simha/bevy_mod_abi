@@ -111,6 +111,15 @@ pub(crate) struct DynamicComponentHookMap {
     clone_by_id: HashMap<ComponentId, Vec<CloneBindingEntry>>,
 }
 
+/// Ensures the per-`World` dynamic component hook/clone dispatch table is pre-initialized so
+/// registering dynamic components never lazily allocates an `IsResource` entity mid-session.
+#[inline]
+pub fn ensure_dynamic_hook_map_in_world(world: &mut World) {
+    if !world.contains_resource::<DynamicComponentHookMap>() {
+        world.insert_resource(DynamicComponentHookMap::default());
+    }
+}
+
 impl DynamicComponentHookMap {
     fn insert_or_update(&mut self, component_id: ComponentId, binding: DynamicHookBinding) {
         let entries = self.by_id.entry(component_id).or_default();
@@ -1273,35 +1282,32 @@ pub unsafe extern "C" fn host_register_system(
         }
     };
     // SAFETY: `desc.validate()` verified `after_weak` is non-null when `after_weak_count > 0`.
-    let after_weak_res = unsafe { parse_ordering_targets(desc.after_weak, desc.after_weak_count) };
-    if let Err((status, msg)) = after_weak_res {
-        ctx.host_ctx.set_last_error(msg);
-        return status;
-    }
-    // SAFETY: `desc.validate()` verified `before_weak` is non-null when `before_weak_count > 0`.
-    let before_weak_res =
-        unsafe { parse_ordering_targets(desc.before_weak, desc.before_weak_count) };
-    if let Err((status, msg)) = before_weak_res {
-        ctx.host_ctx.set_last_error(msg);
-        return status;
-    }
-    // SAFETY: `desc.validate()` verified `ambiguous_with` is non-null when `ambiguous_with_count > 0`.
-    let ambiguous_res =
-        unsafe { parse_ordering_targets(desc.ambiguous_with, desc.ambiguous_with_count) };
-    if let Err((status, msg)) = ambiguous_res {
-        ctx.host_ctx.set_last_error(msg);
-        return status;
-    }
-    if desc.is_ambiguous_with_all()
-        || desc.after_weak_count > 0
-        || desc.before_weak_count > 0
-        || desc.ambiguous_with_count > 0
+    let after_weak = match unsafe { parse_ordering_targets(desc.after_weak, desc.after_weak_count) }
     {
-        ctx.host_ctx.set_last_error(
-            "weak ordering and schedule ambiguity flags are not yet active in this build",
-        );
-        return FfiResult::UNSUPPORTED;
-    }
+        Ok(v) => v,
+        Err((status, msg)) => {
+            ctx.host_ctx.set_last_error(msg);
+            return status;
+        }
+    };
+    // SAFETY: `desc.validate()` verified `before_weak` is non-null when `before_weak_count > 0`.
+    let before_weak =
+        match unsafe { parse_ordering_targets(desc.before_weak, desc.before_weak_count) } {
+            Ok(v) => v,
+            Err((status, msg)) => {
+                ctx.host_ctx.set_last_error(msg);
+                return status;
+            }
+        };
+    // SAFETY: `desc.validate()` verified `ambiguous_with` is non-null when `ambiguous_with_count > 0`.
+    let ambiguous_with =
+        match unsafe { parse_ordering_targets(desc.ambiguous_with, desc.ambiguous_with_count) } {
+            Ok(v) => v,
+            Err((status, msg)) => {
+                ctx.host_ctx.set_last_error(msg);
+                return status;
+            }
+        };
 
     let run_if = desc.run_if.map(|cb| (cb, desc.run_if_user_data));
 
@@ -1315,7 +1321,10 @@ pub unsafe extern "C" fn host_register_system(
     .with_schedule(desc.schedule)
     .with_main_thread(desc.is_main_thread())
     .with_ordering(after_systems, before_systems)
+    .with_weak_ordering(after_weak, before_weak)
     .with_in_sets(in_sets)
+    .with_ambiguous_with(ambiguous_with)
+    .with_ambiguous_with_all(desc.is_ambiguous_with_all())
     .with_run_if(run_if)
     .with_is_active(Arc::clone(&ctx.is_active));
 
@@ -1870,7 +1879,8 @@ mod tests {
             assert_eq!(r_main, FfiResult::OK);
 
             // Register 1,100 additional hooked components in the same World to prove zero 1,024-slot cap.
-            for idx in 0..1100 {
+            let extra_count = if cfg!(miri) { 8 } else { 1100 };
+            for idx in 0..extra_count {
                 let name = format!("reg_test::ManyHooked_{idx}");
                 let cname = CString::new(name.as_str()).unwrap();
                 let mut h = BamComponent::INVALID;
@@ -2186,6 +2196,9 @@ mod tests {
 
     #[test]
     fn drop_fn_plus_on_insert_active_and_disarmed_never_underflows_live_values() {
+        let _serial = crate::drop_trampoline::TEST_DROP_SLAB_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let drop_count = Box::new(AtomicUsize::new(0));
         let insert_count = Box::new(AtomicUsize::new(0));
         let drop_ptr = &*drop_count as *const AtomicUsize;
@@ -2275,7 +2288,8 @@ mod tests {
         let reg = ModRegistry::new();
 
         // 1. 60 failed/rolled-back inits with `clone_fn` + 1,100 live registrations in one World.
-        for idx in 0..60 {
+        let (rollback_iters, live_iters) = if cfg!(miri) { (4, 8) } else { (60, 1100) };
+        for idx in 0..rollback_iters {
             let mut ctx = LoadContext::with_world_and_mod_id(
                 reg.clone(),
                 Arc::new(AtomicBool::new(true)),
@@ -2307,7 +2321,7 @@ mod tests {
                 &mut world as *mut World,
                 Some(ModId(400)),
             );
-            for idx in 0..1100 {
+            for idx in 0..live_iters {
                 let name = format!("clone_cap_test::Live_{idx}");
                 let cname = CString::new(name.as_str()).unwrap();
                 let mut h = BamComponent::INVALID;
@@ -2347,6 +2361,9 @@ mod tests {
 
     #[test]
     fn recycled_drop_slot_reregistration_allocates_fresh_component_id() {
+        let _serial = crate::drop_trampoline::TEST_DROP_SLAB_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let drop_a_count = Box::new(AtomicUsize::new(0));
         let drop_b_count = Box::new(AtomicUsize::new(0));
         let drop_a_ptr = &*drop_a_count as *const AtomicUsize;

@@ -12,11 +12,12 @@ pub use crate::watcher::{
 pub use crate::world_ext::ModWorldExt;
 
 use crate::commands_ext::{PendingModLifecycleOps, flush_pending_mod_lifecycle_ops};
+use crate::mod_dag::ModDependencyGraph;
 #[cfg(feature = "signature-verification")]
 use bevy_abi_mod_host_sys::ModTrustPolicy;
 use bevy_abi_mod_host_sys::{
     ModErrorPolicy, ModErrorPolicyConfig, ModHost, ModQuarantine, ModRegistry, ModSystemFaulted,
-    StartupCompleted, WorldDropGuard, mark_startup_completed,
+    StartupCompleted, WorldDropGuard, ensure_dynamic_hook_map_in_world, mark_startup_completed,
 };
 use bevy_app::{App, Last, Plugin, PostStartup, Update};
 use bevy_ecs::message::Messages;
@@ -96,6 +97,10 @@ impl Plugin for ConfiguredAbiModPlugin {
     fn build(&self, app: &mut App) {
         if !app.world().contains_resource::<WorldDropGuard>() {
             app.insert_resource(WorldDropGuard::new());
+        }
+        ensure_dynamic_hook_map_in_world(app.world_mut());
+        if !app.world().contains_resource::<ModDependencyGraph>() {
+            app.insert_resource(ModDependencyGraph::new());
         }
         if !app.world().contains_resource::<ModRegistry>() {
             app.insert_resource(ModRegistry::new());

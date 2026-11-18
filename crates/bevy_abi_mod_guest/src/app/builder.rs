@@ -8,9 +8,10 @@ use bevy_abi_mod_guest_sys::{
 };
 use bevy_abi_mod_sys::{
     AbiPod, AccessMode, BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET,
-    BAM_COMPONENT_FLAG_SUMMARY_TICK, BAM_SYSTEM_FLAG_MAIN_THREAD, BamComponent, BamHostApi,
-    BamLoadCtx, BamTermDesc, ComponentDropFn, ComponentUuid, FfiEntity, FfiResult,
-    MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ScheduleId,
+    BAM_COMPONENT_FLAG_SUMMARY_TICK, BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL,
+    BAM_SYSTEM_FLAG_MAIN_THREAD, BamComponent, BamHostApi, BamLoadCtx, BamTermDesc,
+    ComponentDropFn, ComponentUuid, FfiEntity, FfiResult, MAX_QUERIES_PER_SYSTEM,
+    MAX_TERMS_PER_QUERY, ScheduleId,
 };
 
 use crate::{
@@ -60,27 +61,6 @@ impl IntoSystemResult for Result<(), FfiResult> {
     }
 }
 
-/// Safe per-World mod initialization builder passed to [`GuestPlugin::build`](crate::GuestPlugin::build)
-/// and [`export_mod!`](crate::export_mod).
-///
-/// Constructing `GuestApp` directly from raw C pointers in safe Rust is rejected at compile time:
-///
-/// ```compile_fail
-/// use bevy_abi_mod_guest::GuestApp;
-///
-/// let _app = GuestApp::from_raw(core::ptr::null(), core::ptr::null_mut());
-/// ```
-///
-/// Registering non-`AbiPod` types (such as `String` or `Vec<u8>`) via `register_component` is
-/// rejected at compile time:
-///
-/// ```compile_fail
-/// use bevy_abi_mod_guest::GuestApp;
-///
-/// fn register_bad(app: &mut GuestApp<'_>) {
-///     let _ = app.register_component::<String>();
-/// }
-/// ```
 /// Fluent registration options for [`GuestApp::register_component_with_options`], supporting
 /// storage flags (`summary_tick`, `sparse_set`, `immutable`), `EntityCloner` support (`clone`),
 /// full lifecycle hooks (`on_add`, `on_insert`, `on_discard`, `on_remove`, `on_despawn`), and
@@ -512,6 +492,9 @@ impl<'a> GuestApp<'a> {
             after: Vec::new(),
             before: Vec::new(),
             in_sets: Vec::new(),
+            after_weak: Vec::new(),
+            before_weak: Vec::new(),
+            ambiguous_with: Vec::new(),
             run_if: None,
             first_error: None,
         }
@@ -812,6 +795,9 @@ pub struct SystemBuilder<'b, 'a> {
     after: Vec<&'b CStr>,
     before: Vec<&'b CStr>,
     in_sets: Vec<&'b CStr>,
+    after_weak: Vec<&'b CStr>,
+    before_weak: Vec<&'b CStr>,
+    ambiguous_with: Vec<&'b CStr>,
     run_if: Option<PreparedRunIf>,
     first_error: Option<FfiResult>,
 }
@@ -975,6 +961,37 @@ impl<'b, 'a> SystemBuilder<'b, 'a> {
         self
     }
 
+    /// Weakly orders this system to run after `target_set_name` when that target exists in the
+    /// schedule (silently ignored when the optional target mod/set is absent, even under `strict`).
+    #[inline]
+    pub fn after_weak(mut self, target_set_name: &'b CStr) -> Self {
+        self.after_weak.push(target_set_name);
+        self
+    }
+
+    /// Weakly orders this system to run before `target_set_name` when that target exists in the
+    /// schedule (silently ignored when the optional target mod/set is absent, even under `strict`).
+    #[inline]
+    pub fn before_weak(mut self, target_set_name: &'b CStr) -> Self {
+        self.before_weak.push(target_set_name);
+        self
+    }
+
+    /// Suppresses schedule ambiguity warnings/errors between this system and `target_set_name`.
+    #[inline]
+    pub fn ambiguous_with(mut self, target_set_name: &'b CStr) -> Self {
+        self.ambiguous_with.push(target_set_name);
+        self
+    }
+
+    /// Suppresses schedule ambiguity warnings/errors between this system and all other systems in
+    /// its schedule (`BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL`).
+    #[inline]
+    pub fn ambiguous_with_all(mut self) -> Self {
+        self.flags |= BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL;
+        self
+    }
+
     /// Pins this system onto Bevy's main thread (`BAM_SYSTEM_FLAG_MAIN_THREAD`).
     #[inline]
     pub fn main_thread(mut self) -> Self {
@@ -1041,9 +1058,9 @@ impl<'b, 'a> SystemBuilder<'b, 'a> {
             after: &self.after,
             before: &self.before,
             in_sets: &self.in_sets,
-            after_weak: &[],
-            before_weak: &[],
-            ambiguous_with: &[],
+            after_weak: &self.after_weak,
+            before_weak: &self.before_weak,
+            ambiguous_with: &self.ambiguous_with,
         };
         self.app.load_ctx.register_system(
             self.app.instance,
