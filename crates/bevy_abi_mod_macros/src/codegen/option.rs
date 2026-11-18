@@ -36,7 +36,7 @@ pub(crate) fn spec(
             SlotSpec {
                 prefix: "get",
                 receiver: ReceiverKind::Const {
-                    on_invalid: quote! { #sys_crate::FfiOption::<#inner_ty>::none() },
+                    on_invalid: quote! { __bam_none_option::<#inner_ty>() },
                 },
                 extra_params_fn: quote! {},
                 extra_params_vt: quote! {},

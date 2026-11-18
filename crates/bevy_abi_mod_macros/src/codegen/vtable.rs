@@ -520,6 +520,18 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
                 vec_mut.as_mut_ptr()
             }
 
+            #[allow(dead_code)]
+            #[inline]
+            fn __bam_none_option<Inner: #sys_crate::AbiPod>() -> #sys_crate::FfiOption<Inner> {
+                #sys_crate::FfiOption::<Inner>::none()
+            }
+
+            #[allow(dead_code)]
+            #[inline]
+            fn __bam_some_option<Inner: #sys_crate::AbiPod>(val: Inner) -> #sys_crate::FfiOption<Inner> {
+                #sys_crate::FfiOption::<Inner>::some(val)
+            }
+
             #[allow(dead_code, clippy::undocumented_unsafe_blocks)]
             #[inline]
             unsafe fn __bam_read_option<Inner: #sys_crate::AbiPod, T: __BamFfiOption<Inner>>(

@@ -1188,13 +1188,12 @@ fn cmd_miri(args: &[String]) -> Result<(), String> {
                 "test",
                 "-p",
                 "bevy_abi_mod_macros",
-                "--lib",
                 "--test",
                 "mod_component_vtable",
             ]);
         run_cmd(
             &mut macros_cmd,
-            "rustup run nightly cargo miri test -p bevy_abi_mod_macros --lib --test mod_component_vtable",
+            "rustup run nightly cargo miri test -p bevy_abi_mod_macros --test mod_component_vtable",
         )?;
 
         let mut host_sys_cmd = Command::new("rustup");

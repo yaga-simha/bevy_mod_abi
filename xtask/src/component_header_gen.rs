@@ -353,7 +353,7 @@ mod tests {
         fs::write(&full_hdr_path, full_hdr).expect("write all_features.h");
 
         // 1. Strict ISO C99 compilation check
-        let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_owned());
+        let cc = crate::c_compiler();
         for hdr in [&testbed_hdr, &full_hdr_path] {
             let status = Command::new(&cc)
                 .args([
@@ -378,7 +378,7 @@ mod tests {
         }
 
         // 2. Strict ISO C++17 compilation check (including template views & HostVecView)
-        let cxx = std::env::var("CXX").unwrap_or_else(|_| "c++".to_owned());
+        let cxx = crate::cxx_compiler();
         for hdr in [&testbed_hdr, &full_hdr_path] {
             let status = Command::new(&cxx)
                 .args([

@@ -2391,7 +2391,8 @@ pub(crate) fn write_or_check_header(root: &Path, check_only: bool) -> Result<(),
 
     if check_only {
         let existing = fs::read_to_string(&header_path)
-            .map_err(|e| format!("failed to read {}: {e}", header_path.display()))?;
+            .map_err(|e| format!("failed to read {}: {e}", header_path.display()))?
+            .replace("\r\n", "\n");
         if existing != rendered {
             return Err(format!(
                 "{} is out of date with crates/bevy_abi_mod_sys (run `cargo xtask header`)",
@@ -2405,7 +2406,7 @@ pub(crate) fn write_or_check_header(root: &Path, check_only: bool) -> Result<(),
         .map_err(|e| format!("failed to create {}: {e}", include_dir.display()))?;
 
     let up_to_date = fs::read_to_string(&header_path)
-        .map(|existing| existing == rendered)
+        .map(|existing| existing.replace("\r\n", "\n") == rendered)
         .unwrap_or(false);
     if !up_to_date {
         fs::write(&header_path, rendered)

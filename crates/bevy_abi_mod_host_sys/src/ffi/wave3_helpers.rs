@@ -9,8 +9,8 @@
 //!    - [`apply_entity_component_fields`], [`apply_resource_fields`]
 //!    - [`insert_entity_component_from_fields`], [`insert_or_apply_entity_component_fields`]
 //!    - [`read_entity_pod_bytes`], [`write_entity_pod_bytes`]
-//!    - Optional `bridge-reflect` helpers: [`empty_reflect_unchecked_mut`],
-//!      [`reflect_entity_component`], [`reflect_entity_component_mut`]
+//!    - Optional `bridge-reflect` helpers: `empty_reflect_unchecked_mut`,
+//!      `reflect_entity_component`, `reflect_entity_component_mut`
 //! 2. **Cross-`World` (`SubApp`) Component & Resource Extraction (`#18`)**:
 //!    - [`ensure_component_in_target_world`]
 //!    - [`extract_component_between_worlds`]

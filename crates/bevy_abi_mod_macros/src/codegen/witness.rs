@@ -704,7 +704,7 @@ fn emit_import_field_body(
                     return #sys_crate::FfiResult::INVALID_ARGUMENT;
                 }
                 unsafe {
-                    ::core::ptr::write(opt_ptr, #sys_crate::FfiOption::<#inner_ty>::none());
+                    ::core::ptr::write(opt_ptr, __bam_none_option::<#inner_ty>());
                 }
                 return #sys_crate::FfiResult::OK;
             }
@@ -716,7 +716,7 @@ fn emit_import_field_body(
                 ::core::ptr::read_unaligned(bytes[1..].as_ptr().cast::<#inner_ty>())
             };
             unsafe {
-                ::core::ptr::write(opt_ptr, #sys_crate::FfiOption::some(inner_val));
+                ::core::ptr::write(opt_ptr, __bam_some_option::<#inner_ty>(inner_val));
             }
             #sys_crate::FfiResult::OK
         },
