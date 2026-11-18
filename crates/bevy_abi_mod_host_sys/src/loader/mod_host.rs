@@ -1235,6 +1235,7 @@ mod tests {
                 validates_entity_payload: false,
                 synthesizes_ffi_entity_payload: false,
                 event_key: None,
+                entity_event_trigger_fn: None,
                 trigger_event_fn: None,
                 extract_event_target_fn: None,
                 extract_relationship_targets_fn: None,

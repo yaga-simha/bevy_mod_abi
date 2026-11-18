@@ -87,6 +87,10 @@ pub type MsgWriteBatchFn = unsafe fn(
 pub type TriggerEventFn =
     unsafe fn(world: &mut World, target: Option<Entity>, data: *const u8) -> Result<(), FfiResult>;
 
+/// Safe function signature triggering an entity-only host `EntityEvent` (such as `bevy_scene::Ready`)
+/// directly from a validated target [`Entity`] without requiring `From<Entity>`.
+pub type EntityEventTriggerFn = fn(world: &mut World, entity: Entity);
+
 /// Function signature extracting the target [`Entity`] from a raw `EntityEvent` payload.
 pub type ExtractEventTargetFn = unsafe fn(data: *const u8) -> Option<Entity>;
 
@@ -751,6 +755,9 @@ pub struct RegisteredComponent {
     pub synthesizes_ffi_entity_payload: bool,
     /// Bevy [`EventKey`] when registered as a triggerable host [`Event`] / [`EntityEvent`] or dynamic event.
     pub event_key: Option<EventKey>,
+    /// Optional safe entity-only trigger constructor (`fn(&mut World, Entity)`) for bridged
+    /// `EntityEvent` types such as `bevy_scene::Ready` that do not implement `From<Entity>`.
+    pub entity_event_trigger_fn: Option<EntityEventTriggerFn>,
     /// Monomorphized typed `world.trigger(...)` dispatcher for host-registered events.
     pub trigger_event_fn: Option<TriggerEventFn>,
     /// Extractor returning the target entity from raw `EntityEvent` payload bytes.
@@ -1361,6 +1368,7 @@ impl ModRegistry {
                     validates_entity_payload: false,
                     synthesizes_ffi_entity_payload: false,
                     event_key: None,
+                    entity_event_trigger_fn: None,
                     trigger_event_fn: None,
                     extract_event_target_fn: None,
                     extract_relationship_targets_fn: None,
@@ -1450,6 +1458,7 @@ impl ModRegistry {
                     validates_entity_payload: true,
                     synthesizes_ffi_entity_payload: false,
                     event_key: None,
+                    entity_event_trigger_fn: None,
                     trigger_event_fn: None,
                     extract_event_target_fn: None,
                     extract_relationship_targets_fn: None,
@@ -1532,6 +1541,7 @@ impl ModRegistry {
                 let idx = (existing_handle.0 - 1) as usize;
                 snap.entries[idx].vtable_ptr = sym_addr;
                 snap.entries[idx].event_key = Some(event_key);
+                snap.entries[idx].entity_event_trigger_fn = None;
                 snap.entries[idx].trigger_event_fn = trigger_event_fn;
                 snap.entries[idx].extract_event_target_fn = extract_event_target_fn;
                 existing_handle
@@ -1565,6 +1575,7 @@ impl ModRegistry {
                     validates_entity_payload: false,
                     synthesizes_ffi_entity_payload: false,
                     event_key: Some(event_key),
+                    entity_event_trigger_fn: None,
                     trigger_event_fn,
                     extract_event_target_fn,
                     extract_relationship_targets_fn: None,
@@ -1644,6 +1655,7 @@ impl ModRegistry {
                     validates_entity_payload: false,
                     synthesizes_ffi_entity_payload: false,
                     event_key: None,
+                    entity_event_trigger_fn: None,
                     trigger_event_fn: None,
                     extract_event_target_fn: None,
                     extract_relationship_targets_fn: None,
@@ -1816,6 +1828,7 @@ impl ModRegistry {
                     // SAFETY: `comp_id` was registered via `world.register_component_with_descriptor`
                     // with layout `(desc.size, desc.align)` and is safe for dynamic event dispatch.
                     event_key: Some(unsafe { EventKey::new(comp_id) }),
+                    entity_event_trigger_fn: None,
                     trigger_event_fn: None,
                     extract_event_target_fn: None,
                     extract_relationship_targets_fn: None,
