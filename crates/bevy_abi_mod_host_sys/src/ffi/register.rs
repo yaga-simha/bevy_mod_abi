@@ -18,7 +18,6 @@ use crate::schedule::ModNamedSystemSet;
 use crate::sync_ptr::{GuestFnPtr, GuestUserData};
 use crate::system::access_builder::validate_system_queries_against_snapshot;
 use crate::system::{BamQuerySpecOwned, GuestSystem};
-use arc_swap::ArcSwapOption;
 use bevy_abi_mod_sys::{
     BamComponent, BamEventKind, BamHostCtx, BamLoadCtx, BamObserverDesc, BamObserverFn,
     BamObserverMutFn, BamQueryDesc, BamSystemDesc, BamTermDesc, ComponentCloneFn, ComponentDesc,
@@ -29,14 +28,14 @@ use bevy_ecs::entity::{ComponentCloneCtx, Entity, SourceComponent};
 use bevy_ecs::event::EventKey;
 use bevy_ecs::lifecycle::HookContext;
 use bevy_ecs::prelude::Resource;
-use bevy_ecs::ptr::{OwningPtr, Ptr};
+use bevy_ecs::ptr::OwningPtr;
 use bevy_ecs::world::{DeferredWorld, World};
 use bevy_platform::collections::{HashMap, HashSet};
 use core::alloc::Layout;
 use core::ffi::{CStr, c_char, c_void};
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::collections::VecDeque;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 
 /// Dynamic Bevy ECS observer registration captured during `bevy_abi_mod_init` or runtime `cmd_observe`.
 #[derive(Clone)]
@@ -91,16 +90,25 @@ struct DynamicHookBinding {
     on_discard: Option<GuestFnPtr<ComponentHookFn>>,
     on_remove: Option<GuestFnPtr<ComponentHookFn>>,
     on_despawn: Option<GuestFnPtr<ComponentHookFn>>,
-    drop_slot: Option<usize>,
     user_data: GuestUserData,
     is_active: Arc<AtomicBool>,
     required_components: Arc<[BamComponent]>,
     registry: ModRegistry,
 }
 
+#[derive(Clone)]
+struct CloneBindingEntry {
+    clone_fn: GuestFnPtr<ComponentCloneFn>,
+    user_data: GuestUserData,
+    layout: Layout,
+    is_active: Arc<AtomicBool>,
+}
+
 #[derive(Resource, Default)]
 pub(crate) struct DynamicComponentHookMap {
     by_id: HashMap<ComponentId, Vec<DynamicHookBinding>>,
+    drop_slot_by_id: HashMap<ComponentId, usize>,
+    clone_by_id: HashMap<ComponentId, Vec<CloneBindingEntry>>,
 }
 
 impl DynamicComponentHookMap {
@@ -117,13 +125,39 @@ impl DynamicComponentHookMap {
         }
     }
 
-    fn rollback_for_guard(&mut self, is_active: &Arc<AtomicBool>) {
+    fn set_drop_slot(&mut self, component_id: ComponentId, slot: usize) {
+        self.drop_slot_by_id.insert(component_id, slot);
+    }
+
+    fn insert_or_update_clone(&mut self, component_id: ComponentId, entry: CloneBindingEntry) {
+        let entries = self.clone_by_id.entry(component_id).or_default();
+        entries.retain(|e| e.is_active.load(Ordering::Acquire));
+        if let Some(existing) = entries
+            .iter_mut()
+            .find(|e| Arc::ptr_eq(&e.is_active, &entry.is_active))
+        {
+            *existing = entry;
+        } else {
+            entries.push(entry);
+        }
+    }
+
+    fn rollback_for_guard(&mut self, is_active: &Arc<AtomicBool>, fresh_comp_ids: &[ComponentId]) {
         self.by_id.retain(|_, entries| {
             entries.retain(|e| {
                 !Arc::ptr_eq(&e.is_active, is_active) && e.is_active.load(Ordering::Acquire)
             });
             !entries.is_empty()
         });
+        self.clone_by_id.retain(|_, entries| {
+            entries.retain(|e| {
+                !Arc::ptr_eq(&e.is_active, is_active) && e.is_active.load(Ordering::Acquire)
+            });
+            !entries.is_empty()
+        });
+        for comp_id in fresh_comp_ids {
+            self.drop_slot_by_id.remove(comp_id);
+        }
     }
 }
 
@@ -288,7 +322,13 @@ fn dynamic_on_add_hook(mut world: DeferredWorld<'_>, ctx: HookContext) {
 }
 
 fn dynamic_on_insert_hook(world: DeferredWorld<'_>, ctx: HookContext) {
-    if let Some(slot) = active_hook_binding(&world, ctx.component_id).and_then(|e| e.drop_slot) {
+    // Increment unconditionally regardless of `is_active` because `ComponentDescriptor` permanently
+    // binds `drop_trampoline::<SLOT>` to `ctx.component_id`, which always decrements `live_values`
+    // on despawn / `World::drop`.
+    if let Some(slot) = world
+        .get_resource::<DynamicComponentHookMap>()
+        .and_then(|map| map.drop_slot_by_id.get(&ctx.component_id).copied())
+    {
         increment_drop_slot_live_values(slot);
     }
     invoke_dynamic_hook(&world, ctx, |e| e.on_insert);
@@ -307,289 +347,103 @@ fn dynamic_on_despawn_hook(world: DeferredWorld<'_>, ctx: HookContext) {
 }
 
 // ============================================================================
-// Per-World Disarmed-on-Unload Custom Component Clone Trampolines (`clone_fn`)
+// Per-World Disarmed-on-Unload Custom Component Clone Runner (`clone_fn`)
 // ============================================================================
 
-const MAX_CLONE_TRAMPOLINES: usize = 1024;
-
-#[derive(Clone)]
-struct CloneBindingEntry {
-    clone_fn: GuestFnPtr<ComponentCloneFn>,
-    user_data: GuestUserData,
-    layout: Layout,
-    is_active: Arc<AtomicBool>,
-}
-
-struct CloneSlotSnapshot {
-    entries: Box<[CloneBindingEntry]>,
-}
-
-static CLONE_SLOTS: [ArcSwapOption<CloneSlotSnapshot>; MAX_CLONE_TRAMPOLINES] =
-    [const { ArcSwapOption::const_empty() }; MAX_CLONE_TRAMPOLINES];
-
-struct CloneControlPlane {
-    free_list: Vec<usize>,
-    entries: Vec<Vec<CloneBindingEntry>>,
-}
-
-static CLONE_CONTROL: LazyLock<Mutex<CloneControlPlane>> = LazyLock::new(|| {
-    Mutex::new(CloneControlPlane {
-        free_list: (0..MAX_CLONE_TRAMPOLINES).rev().collect(),
-        entries: (0..MAX_CLONE_TRAMPOLINES).map(|_| Vec::new()).collect(),
-    })
-});
-
-#[derive(Clone)]
-struct StagedCloneBinding {
-    uuid: ComponentUuid,
-    slot: usize,
-    fresh_slot_allocated: bool,
-    previous_snapshot: Option<Arc<CloneSlotSnapshot>>,
-    is_active: Arc<AtomicBool>,
-}
-
-#[derive(Resource, Default)]
-struct DynamicCloneGuard {
-    slots_by_uuid: HashMap<ComponentUuid, usize>,
-}
-
-impl DynamicCloneGuard {
-    fn bind_or_update(
-        &mut self,
-        uuid: ComponentUuid,
-        clone_fn: ComponentCloneFn,
-        user_data: *mut c_void,
-        layout: Layout,
-        is_active: Arc<AtomicBool>,
-    ) -> Option<(usize, StagedCloneBinding)> {
-        let mut ctrl = CLONE_CONTROL
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let new_entry = CloneBindingEntry {
-            clone_fn: GuestFnPtr(clone_fn),
-            user_data: GuestUserData::new(user_data),
-            layout,
-            is_active: Arc::clone(&is_active),
-        };
-        if let Some(&slot) = self.slots_by_uuid.get(&uuid) {
-            let previous_snapshot = CLONE_SLOTS[slot].load_full();
-            let entries = &mut ctrl.entries[slot];
-            entries.retain(|e| e.is_active.load(Ordering::Acquire));
-            if let Some(existing) = entries
-                .iter_mut()
-                .find(|e| Arc::ptr_eq(&e.is_active, &is_active))
-            {
-                *existing = new_entry;
-            } else {
-                entries.push(new_entry);
-            }
-            let snap = Arc::new(CloneSlotSnapshot {
-                entries: entries.clone().into_boxed_slice(),
-            });
-            CLONE_SLOTS[slot].store(Some(snap));
-            return Some((
-                slot,
-                StagedCloneBinding {
-                    uuid,
-                    slot,
-                    fresh_slot_allocated: false,
-                    previous_snapshot,
-                    is_active,
-                },
-            ));
-        }
-
-        let slot = ctrl.free_list.pop()?;
-        let entries = &mut ctrl.entries[slot];
-        entries.clear();
-        entries.push(new_entry);
-        let snap = Arc::new(CloneSlotSnapshot {
-            entries: entries.clone().into_boxed_slice(),
-        });
-        CLONE_SLOTS[slot].store(Some(snap));
-        self.slots_by_uuid.insert(uuid, slot);
-        Some((
-            slot,
-            StagedCloneBinding {
-                uuid,
-                slot,
-                fresh_slot_allocated: true,
-                previous_snapshot: None,
-                is_active,
-            },
-        ))
-    }
-
-    fn rollback_staged_bindings(&mut self, bindings: &[StagedCloneBinding]) {
-        if bindings.is_empty() {
-            return;
-        }
-        let mut ctrl = CLONE_CONTROL
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for binding in bindings.iter().rev() {
-            let slot = binding.slot;
-            if binding.fresh_slot_allocated {
-                self.slots_by_uuid.remove(&binding.uuid);
-                CLONE_SLOTS[slot].store(None);
-                ctrl.entries[slot].clear();
-                if !ctrl.free_list.contains(&slot) {
-                    ctrl.free_list.push(slot);
-                }
-            } else {
-                ctrl.entries[slot].retain(|e| {
-                    !Arc::ptr_eq(&e.is_active, &binding.is_active)
-                        && e.is_active.load(Ordering::Acquire)
-                });
-                CLONE_SLOTS[slot].store(binding.previous_snapshot.clone());
-            }
-        }
-    }
-}
-
-impl Drop for DynamicCloneGuard {
-    fn drop(&mut self) {
-        if self.slots_by_uuid.is_empty() {
-            return;
-        }
-        let mut ctrl = CLONE_CONTROL
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for &slot in self.slots_by_uuid.values() {
-            CLONE_SLOTS[slot].store(None);
-            ctrl.entries[slot].clear();
-            if !ctrl.free_list.contains(&slot) {
-                ctrl.free_list.push(slot);
-            }
-        }
-    }
-}
-
-fn dynamic_clone_trampoline<const SLOT: usize>(
-    source: &SourceComponent,
-    ctx: &mut ComponentCloneCtx,
-) {
-    let Some(snap) = CLONE_SLOTS[SLOT].load_full() else {
-        return;
-    };
-    let Some(entry) = snap
-        .entries
-        .iter()
-        .rev()
-        .find(|e| e.is_active.load(Ordering::Acquire))
-    else {
-        return;
-    };
+fn dynamic_clone_runner(_source: &SourceComponent, ctx: &mut ComponentCloneCtx) {
+    let comp_id = ctx.component_id();
+    let source_entity = ctx.source();
+    let target_entity = ctx.target();
     let expected_layout = ctx.component_info().layout();
-    if entry.layout != expected_layout {
-        return;
-    }
-    let GuestFnPtr(clone_fn) = entry.clone_fn;
-    let size = expected_layout.size();
-    if size == 0 {
-        // SAFETY: `entry.is_active` is verified true (`Ordering::Acquire`) and `size == 0`, so
-        // `clone_fn` receives valid non-null dangling ZST pointers without reading/writing memory.
-        let status = unsafe {
-            clone_fn(
-                core::ptr::NonNull::<u8>::dangling()
-                    .as_ptr()
-                    .cast::<c_void>(),
-                core::ptr::NonNull::<u8>::dangling()
-                    .as_ptr()
-                    .cast::<c_void>(),
-                entry.user_data.as_ptr(),
-            )
+
+    ctx.queue_deferred(move |world: &mut World, _mapper| {
+        let active_entry = world
+            .get_resource::<DynamicComponentHookMap>()
+            .and_then(|map| map.clone_by_id.get(&comp_id))
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .rev()
+                    .find(|e| e.is_active.load(Ordering::Acquire))
+            })
+            .filter(|entry| entry.layout == expected_layout)
+            .map(|entry| (entry.clone_fn, entry.user_data));
+
+        let Some((GuestFnPtr(clone_fn), user_data)) = active_entry else {
+            return;
         };
-        if status.is_ok() {
-            // SAFETY: `size == 0`; `NonNull::dangling()` is valid for ZST `Ptr`.
-            let ptr = unsafe { Ptr::new(core::ptr::NonNull::<u8>::dangling()) };
-            // SAFETY: `ptr` matches the zero-sized layout of `ctx.component_id()`.
+
+        if world.get_entity(target_entity).is_err() {
+            return;
+        }
+
+        let size = expected_layout.size();
+        if size == 0 {
+            if !world
+                .get_entity(source_entity)
+                .is_ok_and(|ent| ent.contains_id(comp_id))
+            {
+                return;
+            }
+            // SAFETY: `is_active` was verified true (`Ordering::Acquire`) and `size == 0`, so
+            // `clone_fn` receives valid non-null dangling ZST pointers without reading/writing.
+            let status = unsafe {
+                clone_fn(
+                    core::ptr::NonNull::<u8>::dangling()
+                        .as_ptr()
+                        .cast::<c_void>(),
+                    core::ptr::NonNull::<u8>::dangling()
+                        .as_ptr()
+                        .cast::<c_void>(),
+                    user_data.as_ptr(),
+                )
+            };
+            if status.is_ok()
+                && let Ok(mut target_ent) = world.get_entity_mut(target_entity)
+            {
+                // SAFETY: `size == 0`; `NonNull::dangling()` is valid for ZST `OwningPtr`.
+                let owning = unsafe { OwningPtr::new(core::ptr::NonNull::<u8>::dangling()) };
+                // SAFETY: `comp_id` was registered in `world` with zero-sized `expected_layout`.
+                unsafe {
+                    target_ent.insert_by_id(comp_id, owning);
+                }
+            }
+            return;
+        }
+
+        let temp = OwnedZeroedBuffer::new(expected_layout);
+        let status = {
+            let Ok(source_ent) = world.get_entity(source_entity) else {
+                return;
+            };
+            let Ok(src_ptr) = source_ent.get_by_id(comp_id) else {
+                return;
+            };
+            // SAFETY: `src_ptr` points to `size` initialized source bytes; `temp.ptr` points to
+            // `size` writable `expected_layout.align()`-aligned bytes; `is_active` is true.
             unsafe {
-                ctx.write_target_component_ptr(ptr);
+                clone_fn(
+                    src_ptr.as_ptr().cast::<c_void>(),
+                    temp.ptr.cast::<c_void>(),
+                    user_data.as_ptr(),
+                )
+            }
+        };
+
+        if status.is_ok()
+            && let Ok(mut target_ent) = world.get_entity_mut(target_entity)
+        {
+            // SAFETY: `OwnedZeroedBuffer::new` aborts on null when `size > 0`.
+            let nn = unsafe { core::ptr::NonNull::new_unchecked(temp.ptr) };
+            // SAFETY: `nn` points to `size` initialized bytes written by `clone_fn`;
+            // `insert_by_id` moves out of `owning` without freeing `temp`'s scratch buffer.
+            let owning = unsafe { OwningPtr::new(nn) };
+            // SAFETY: `comp_id` was registered in `world` with `expected_layout`.
+            unsafe {
+                target_ent.insert_by_id(comp_id, owning);
             }
         }
-        return;
-    }
-
-    let temp = OwnedZeroedBuffer::new(expected_layout);
-    let src_ptr = source.ptr().as_ptr().cast::<c_void>();
-    // SAFETY: `src_ptr` points to initialized source component storage (`size` bytes); `temp.ptr`
-    // points to `size` writable `expected_layout.align()`-aligned bytes; `entry.is_active` is true.
-    let status = unsafe { clone_fn(src_ptr, temp.ptr.cast::<c_void>(), entry.user_data.as_ptr()) };
-    if status.is_ok() {
-        // SAFETY: `OwnedZeroedBuffer::new` aborts on null when `size > 0`.
-        let nn = unsafe { core::ptr::NonNull::new_unchecked(temp.ptr) };
-        // SAFETY: `nn` points to `size` bytes initialized by `clone_fn` matching
-        // `ctx.component_id()`'s layout; `write_target_component_ptr` copies bytes into Bevy scratch.
-        unsafe {
-            ctx.write_target_component_ptr(Ptr::new(nn));
-        }
-    }
-}
-
-type BevyCloneFn = fn(&SourceComponent, &mut ComponentCloneCtx);
-type CloneTrampolineBlock = [[BevyCloneFn; 16]; 16];
-
-macro_rules! clone_fn_16 {
-    ($b:expr) => {
-        [
-            dynamic_clone_trampoline::<{ $b }>,
-            dynamic_clone_trampoline::<{ $b + 1 }>,
-            dynamic_clone_trampoline::<{ $b + 2 }>,
-            dynamic_clone_trampoline::<{ $b + 3 }>,
-            dynamic_clone_trampoline::<{ $b + 4 }>,
-            dynamic_clone_trampoline::<{ $b + 5 }>,
-            dynamic_clone_trampoline::<{ $b + 6 }>,
-            dynamic_clone_trampoline::<{ $b + 7 }>,
-            dynamic_clone_trampoline::<{ $b + 8 }>,
-            dynamic_clone_trampoline::<{ $b + 9 }>,
-            dynamic_clone_trampoline::<{ $b + 10 }>,
-            dynamic_clone_trampoline::<{ $b + 11 }>,
-            dynamic_clone_trampoline::<{ $b + 12 }>,
-            dynamic_clone_trampoline::<{ $b + 13 }>,
-            dynamic_clone_trampoline::<{ $b + 14 }>,
-            dynamic_clone_trampoline::<{ $b + 15 }>,
-        ]
-    };
-}
-
-macro_rules! clone_fn_256 {
-    ($b:expr) => {
-        [
-            clone_fn_16!($b),
-            clone_fn_16!($b + 16),
-            clone_fn_16!($b + 32),
-            clone_fn_16!($b + 48),
-            clone_fn_16!($b + 64),
-            clone_fn_16!($b + 80),
-            clone_fn_16!($b + 96),
-            clone_fn_16!($b + 112),
-            clone_fn_16!($b + 128),
-            clone_fn_16!($b + 144),
-            clone_fn_16!($b + 160),
-            clone_fn_16!($b + 176),
-            clone_fn_16!($b + 192),
-            clone_fn_16!($b + 208),
-            clone_fn_16!($b + 224),
-            clone_fn_16!($b + 240),
-        ]
-    };
-}
-
-static CLONE_TRAMPOLINE_BLOCKS: [CloneTrampolineBlock; 4] = [
-    clone_fn_256!(0),
-    clone_fn_256!(256),
-    clone_fn_256!(512),
-    clone_fn_256!(768),
-];
-
-#[inline]
-fn dynamic_clone_fn_for_slot(slot: usize) -> BevyCloneFn {
-    let b256 = slot / 256;
-    let rem = slot % 256;
-    let b16 = rem / 16;
-    let idx = rem % 16;
-    CLONE_TRAMPOLINE_BLOCKS[b256][b16][idx]
+    });
 }
 
 /// Concrete `#[repr(C)]` initialization context backing opaque [`BamLoadCtx`].
@@ -623,7 +477,7 @@ pub struct LoadContext {
     pre_snapshot: Arc<RegistrySnapshot>,
     staged_drop_bindings: Arc<Mutex<Vec<StagedDropBinding>>>,
     staged_hook_bindings: Arc<Mutex<Vec<StagedHookBinding>>>,
-    staged_clone_bindings: Arc<Mutex<Vec<StagedCloneBinding>>>,
+    fresh_dynamic_comp_ids: Vec<ComponentId>,
     in_init: bool,
 }
 
@@ -667,7 +521,7 @@ impl LoadContext {
             pre_snapshot,
             staged_drop_bindings: Arc::new(Mutex::new(Vec::new())),
             staged_hook_bindings: Arc::new(Mutex::new(Vec::new())),
-            staged_clone_bindings: Arc::new(Mutex::new(Vec::new())),
+            fresh_dynamic_comp_ids: Vec::new(),
             in_init: true,
         }
     }
@@ -728,13 +582,7 @@ impl LoadContext {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             core::mem::take(&mut *guard)
         };
-        let clone_bindings = {
-            let mut guard = self
-                .staged_clone_bindings
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            core::mem::take(&mut *guard)
-        };
+        let fresh_comp_ids = core::mem::take(&mut self.fresh_dynamic_comp_ids);
         let active_guard = Arc::clone(&self.is_active);
         if let Some(mut drop_guard) = self.world_mut().get_resource_mut::<WorldDropGuard>() {
             drop_guard.rollback_staged_bindings(&bindings);
@@ -744,10 +592,7 @@ impl LoadContext {
             .world_mut()
             .get_resource_mut::<DynamicComponentHookMap>()
         {
-            hook_map.rollback_for_guard(&active_guard);
-        }
-        if let Some(mut clone_guard) = self.world_mut().get_resource_mut::<DynamicCloneGuard>() {
-            clone_guard.rollback_staged_bindings(&clone_bindings);
+            hook_map.rollback_for_guard(&active_guard, &fresh_comp_ids);
         }
         prune_drop_trampolines_for_guard(&self.is_active);
         let pre = Arc::clone(&self.pre_snapshot);
@@ -1051,7 +896,8 @@ pub unsafe extern "C" fn host_register_component(
     let required_boxed: Box<[BamComponent]> = required_handles.into_boxed_slice();
 
     let storage_flags = component_flags_to_storage_flags(desc.flags);
-    let existing_comp_id = ctx.registry.get_by_name(name_ref).map(|e| e.component_id);
+    let existing_entry = ctx.registry.get_by_name(name_ref).cloned();
+    let existing_comp_id = existing_entry.as_ref().map(|e| e.component_id);
 
     if let Err(collision) = ctx.registry.check_registration_collision(
         name_ref,
@@ -1082,7 +928,6 @@ pub unsafe extern "C" fn host_register_component(
     let is_active = Arc::clone(&ctx.is_active);
     let owner = ctx.mod_id;
     let staged_log = Arc::clone(&ctx.staged_drop_bindings);
-    let staged_clone_log = Arc::clone(&ctx.staged_clone_bindings);
     let _legacy_refs = (
         on_add_hook_for_slot as *const (),
         on_remove_hook_for_slot as *const (),
@@ -1090,13 +935,10 @@ pub unsafe extern "C" fn host_register_component(
     );
     let has_any_dynamic_hook = desc.has_hooks() || !required_boxed.is_empty();
 
-    let (comp_id, drop_slot): (ComponentId, Option<usize>) = {
+    let (comp_id, drop_slot, was_fresh_id): (ComponentId, Option<usize>, bool) = {
         let world = ctx.world_mut();
         if !world.contains_resource::<WorldDropGuard>() {
             world.insert_resource(WorldDropGuard::new());
-        }
-        if desc.clone_fn.is_some() && !world.contains_resource::<DynamicCloneGuard>() {
-            world.insert_resource(DynamicCloneGuard::default());
         }
 
         let (slot_opt, trampoline_opt) = if let Some(drop_fn) = desc.drop_fn {
@@ -1118,42 +960,27 @@ pub unsafe extern "C" fn host_register_component(
             (None, None)
         };
 
-        let clone_slot_opt = if let Some(clone_fn) = desc.clone_fn {
-            let bound_clone = world
-                .get_resource_mut::<DynamicCloneGuard>()
-                .and_then(|mut g| {
-                    g.bind_or_update(
-                        desc.uuid,
-                        clone_fn,
-                        desc.hook_user_data,
-                        layout,
-                        Arc::clone(&is_active),
-                    )
-                });
-            let Some((cslot, staged_clone)) = bound_clone else {
-                ctx.host_ctx
-                    .set_last_error("exhausted MAX_CLONE_TRAMPOLINES (1024) clone slots");
-                return FfiResult::CAPACITY_EXCEEDED;
-            };
-            staged_clone_log
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(staged_clone);
-            Some(cslot)
-        } else {
-            None
-        };
+        // Reuse an existing dynamic ComponentId ONLY when its permanently bound drop slot matches
+        // `slot_opt`. If the old drop slot was recycled after unload and a different slot is now
+        // bound, allocate a fresh `ComponentDescriptor` wired to the new `drop_trampoline::<SLOT>`.
+        let reusable_comp_id = existing_entry.as_ref().and_then(|entry| {
+            if !entry.is_dynamic || entry.drop_slot == slot_opt {
+                Some(entry.component_id)
+            } else {
+                None
+            }
+        });
 
-        if let Some(existing_id) = existing_comp_id {
-            (existing_id, slot_opt)
+        if let Some(existing_id) = reusable_comp_id {
+            (existing_id, slot_opt, false)
         } else {
             let storage_type = if desc.is_sparse_set() {
                 StorageType::SparseSet
             } else {
                 StorageType::Table
             };
-            let clone_behavior = if let Some(cslot) = clone_slot_opt {
-                ComponentCloneBehavior::Custom(dynamic_clone_fn_for_slot(cslot))
+            let clone_behavior = if desc.clone_fn.is_some() {
+                ComponentCloneBehavior::Custom(dynamic_clone_runner)
             } else if desc.drop_fn.is_some() {
                 ComponentCloneBehavior::Ignore
             } else {
@@ -1195,9 +1022,12 @@ pub unsafe extern "C" fn host_register_component(
                     hooks.on_despawn(dynamic_on_despawn_hook);
                 }
             }
-            (new_id, slot_opt)
+            (new_id, slot_opt, true)
         }
     };
+    if was_fresh_id {
+        ctx.fresh_dynamic_comp_ids.push(comp_id);
+    }
 
     let reqs_arc: Arc<[BamComponent]> = Arc::from(required_boxed.as_ref());
     let handle = match ctx.registry.register_dynamic_component_owned_with_required(
@@ -1216,25 +1046,37 @@ pub unsafe extern "C" fn host_register_component(
         }
     };
 
-    if has_any_dynamic_hook {
-        let binding = DynamicHookBinding {
+    if drop_slot.is_some() || has_any_dynamic_hook || desc.clone_fn.is_some() {
+        let mut hook_binding = has_any_dynamic_hook.then(|| DynamicHookBinding {
             on_add: desc.on_add.map(GuestFnPtr),
             on_insert: desc.on_insert.map(GuestFnPtr),
             on_discard: desc.on_discard.map(GuestFnPtr),
             on_remove: desc.on_remove.map(GuestFnPtr),
             on_despawn: desc.on_despawn.map(GuestFnPtr),
-            drop_slot,
             user_data: GuestUserData::new(desc.hook_user_data),
             is_active: Arc::clone(&ctx.is_active),
             required_components: reqs_arc,
             registry: ctx.registry.clone(),
-        };
+        });
+        let clone_entry = desc.clone_fn.map(|clone_fn| CloneBindingEntry {
+            clone_fn: GuestFnPtr(clone_fn),
+            user_data: GuestUserData::new(desc.hook_user_data),
+            layout,
+            is_active: Arc::clone(&ctx.is_active),
+        });
         let world = ctx.world_mut();
-        world
-            .get_resource_or_insert_with::<DynamicComponentHookMap>(
-                DynamicComponentHookMap::default,
-            )
-            .insert_or_update(comp_id, binding);
+        let mut map = world.get_resource_or_insert_with::<DynamicComponentHookMap>(
+            DynamicComponentHookMap::default,
+        );
+        if let Some(slot) = drop_slot {
+            map.set_drop_slot(comp_id, slot);
+        }
+        if let Some(binding) = hook_binding.take() {
+            map.insert_or_update(comp_id, binding);
+        }
+        if let Some(entry) = clone_entry {
+            map.insert_or_update_clone(comp_id, entry);
+        }
     }
 
     ctx.host_ctx.set_snapshot(ctx.registry.snapshot_arc());
@@ -2320,5 +2162,332 @@ mod tests {
         unsafe {
             assert_eq!(core::ptr::read_unaligned(e2_b_ptr.cast::<u32>()), 99);
         }
+    }
+
+    unsafe extern "C" fn test_drop_atomic_ptr(ptr: *mut c_void) {
+        // SAFETY: `ptr` stores an aligned `*const AtomicUsize` pointing to a live counter.
+        let counter_ptr = unsafe { core::ptr::read_unaligned(ptr.cast::<*const AtomicUsize>()) };
+        if !counter_ptr.is_null() {
+            // SAFETY: Test keeps the `Box<AtomicUsize>` alive for the test duration.
+            unsafe { (*counter_ptr).fetch_add(1, Ordering::Relaxed) };
+        }
+    }
+
+    unsafe extern "C" fn test_on_insert_atomic(
+        _entity: FfiEntity,
+        _data: *const c_void,
+        user_data: *mut c_void,
+    ) {
+        if !user_data.is_null() {
+            // SAFETY: `user_data` points to a live `AtomicUsize`.
+            unsafe { (*user_data.cast::<AtomicUsize>()).fetch_add(1, Ordering::Relaxed) };
+        }
+    }
+
+    #[test]
+    fn drop_fn_plus_on_insert_active_and_disarmed_never_underflows_live_values() {
+        let drop_count = Box::new(AtomicUsize::new(0));
+        let insert_count = Box::new(AtomicUsize::new(0));
+        let drop_ptr = &*drop_count as *const AtomicUsize;
+        let insert_ptr = (&*insert_count as *const AtomicUsize)
+            .cast_mut()
+            .cast::<c_void>();
+
+        let mut world = World::new();
+        let reg = ModRegistry::new();
+        let active = Arc::new(AtomicBool::new(true));
+        let mut handle = BamComponent::INVALID;
+
+        let reg_after = {
+            let mut ctx = LoadContext::with_world_and_mod_id(
+                reg,
+                Arc::clone(&active),
+                &mut world as *mut World,
+                Some(ModId(21)),
+            );
+            let desc = ComponentDesc::new(
+                c"reg_test::DropPlusInsert".as_ptr(),
+                ComponentUuid::from_parts(
+                    "reg_test::DropPlusInsert",
+                    core::mem::size_of::<*const AtomicUsize>(),
+                    core::mem::align_of::<*const AtomicUsize>(),
+                    0,
+                ),
+                core::mem::size_of::<*const AtomicUsize>(),
+                core::mem::align_of::<*const AtomicUsize>(),
+            )
+            .with_drop(test_drop_atomic_ptr)
+            .with_on_insert(test_on_insert_atomic)
+            .with_hook_user_data(insert_ptr);
+            // SAFETY: Valid `LoadContext`, `ComponentDesc`, and output pointer.
+            let rc = unsafe { host_register_component(ctx.as_ffi_ptr(), &desc, &mut handle) };
+            assert_eq!(rc, FfiResult::OK);
+            let r = ctx.registry.clone();
+            ctx.finish_init();
+            r
+        };
+
+        let meta = reg_after.get_by_handle(handle).unwrap();
+        let cid = meta.component_id;
+        let slot = meta.drop_slot.expect("drop_fn allocates a drop slot");
+        assert_eq!(
+            world
+                .get_resource::<DynamicComponentHookMap>()
+                .and_then(|m| m.drop_slot_by_id.get(&cid).copied()),
+            Some(slot)
+        );
+
+        // 1. Active insert + despawn runs both `on_insert` and `drop_fn`.
+        let e1 = world.spawn_empty().id();
+        let mut payload1 = drop_ptr;
+        // SAFETY: `cid` matches `*const AtomicUsize` layout.
+        unsafe {
+            world.entity_mut(e1).insert_by_id(
+                cid,
+                OwningPtr::new(core::ptr::NonNull::from(&mut payload1).cast()),
+            );
+        }
+        assert_eq!(insert_count.load(Ordering::Relaxed), 1);
+        assert!(world.despawn(e1));
+        assert_eq!(drop_count.load(Ordering::Relaxed), 1);
+
+        // 2. Disarm `is_active` and insert/despawn again: callbacks do NOT run, and `live_values`
+        // must still increment on insert so `drop_trampoline` does not underflow on despawn.
+        active.store(false, Ordering::Release);
+        let e2 = world.spawn_empty().id();
+        let mut payload2 = drop_ptr;
+        // SAFETY: `cid` matches `*const AtomicUsize` layout.
+        unsafe {
+            world.entity_mut(e2).insert_by_id(
+                cid,
+                OwningPtr::new(core::ptr::NonNull::from(&mut payload2).cast()),
+            );
+        }
+        assert_eq!(insert_count.load(Ordering::Relaxed), 1);
+        assert!(world.despawn(e2));
+        assert_eq!(drop_count.load(Ordering::Relaxed), 1);
+        drop(world);
+    }
+
+    #[test]
+    fn clone_fn_supports_over_1024_components_and_failed_inits_in_one_world() {
+        let mut world = World::new();
+        let reg = ModRegistry::new();
+
+        // 1. 60 failed/rolled-back inits with `clone_fn` + 1,100 live registrations in one World.
+        for idx in 0..60 {
+            let mut ctx = LoadContext::with_world_and_mod_id(
+                reg.clone(),
+                Arc::new(AtomicBool::new(true)),
+                &mut world as *mut World,
+                Some(ModId(300 + idx)),
+            );
+            let name = format!("clone_cap_test::RolledBack_{idx}");
+            let cname = CString::new(name.as_str()).unwrap();
+            let mut h = BamComponent::INVALID;
+            let desc = ComponentDesc::new(
+                cname.as_ptr(),
+                ComponentUuid::from_parts(&name, 4, 4, 0),
+                4,
+                4,
+            )
+            .with_clone_fn(test_clone_u32_doubled);
+            // SAFETY: Valid `LoadContext`, `ComponentDesc`, and output pointer.
+            let rc = unsafe { host_register_component(ctx.as_ffi_ptr(), &desc, &mut h) };
+            assert_eq!(rc, FfiResult::OK);
+            ctx.rollback();
+        }
+
+        let active = Arc::new(AtomicBool::new(true));
+        let mut last_handle = BamComponent::INVALID;
+        let reg_after = {
+            let mut ctx = LoadContext::with_world_and_mod_id(
+                reg,
+                Arc::clone(&active),
+                &mut world as *mut World,
+                Some(ModId(400)),
+            );
+            for idx in 0..1100 {
+                let name = format!("clone_cap_test::Live_{idx}");
+                let cname = CString::new(name.as_str()).unwrap();
+                let mut h = BamComponent::INVALID;
+                let desc = ComponentDesc::new(
+                    cname.as_ptr(),
+                    ComponentUuid::from_parts(&name, 4, 4, 0),
+                    4,
+                    4,
+                )
+                .with_clone_fn(test_clone_u32_doubled);
+                // SAFETY: Valid `LoadContext`, `ComponentDesc`, and output pointer.
+                let rc = unsafe { host_register_component(ctx.as_ffi_ptr(), &desc, &mut h) };
+                assert_eq!(rc, FfiResult::OK);
+                last_handle = h;
+            }
+            let r = ctx.registry.clone();
+            ctx.finish_init();
+            r
+        };
+
+        let cid_last = reg_after.get_by_handle(last_handle).unwrap().component_id;
+        let e = world.spawn_empty().id();
+        let mut val: u32 = 21;
+        // SAFETY: `cid_last` has 4-byte `u32` layout.
+        unsafe {
+            world.entity_mut(e).insert_by_id(
+                cid_last,
+                OwningPtr::new(core::ptr::NonNull::from(&mut val).cast()),
+            );
+        }
+        let cloned = world.entity_mut(e).clone_and_spawn();
+        let cloned_ptr = world.entity(cloned).get_by_id(cid_last).unwrap();
+        // SAFETY: `cloned_ptr` holds `u32` produced by `test_clone_u32_doubled`.
+        let cloned_val = unsafe { core::ptr::read_unaligned(cloned_ptr.as_ptr().cast::<u32>()) };
+        assert_eq!(cloned_val, 42);
+    }
+
+    #[test]
+    fn recycled_drop_slot_reregistration_allocates_fresh_component_id() {
+        let drop_a_count = Box::new(AtomicUsize::new(0));
+        let drop_b_count = Box::new(AtomicUsize::new(0));
+        let drop_a_ptr = &*drop_a_count as *const AtomicUsize;
+        let drop_b_ptr = &*drop_b_count as *const AtomicUsize;
+
+        let mut world = World::new();
+        let reg = ModRegistry::new();
+        let active_a1 = Arc::new(AtomicBool::new(true));
+        let mut h_a1 = BamComponent::INVALID;
+
+        let reg_after_a1 = {
+            let mut ctx = LoadContext::with_world_and_mod_id(
+                reg,
+                Arc::clone(&active_a1),
+                &mut world as *mut World,
+                Some(ModId(501)),
+            );
+            let desc_a = ComponentDesc::new(
+                c"recycle_test::CompA".as_ptr(),
+                ComponentUuid::from_parts(
+                    "recycle_test::CompA",
+                    core::mem::size_of::<*const AtomicUsize>(),
+                    core::mem::align_of::<*const AtomicUsize>(),
+                    0,
+                ),
+                core::mem::size_of::<*const AtomicUsize>(),
+                core::mem::align_of::<*const AtomicUsize>(),
+            )
+            .with_drop(test_drop_atomic_ptr);
+            // SAFETY: Valid `LoadContext`, `ComponentDesc`, and output pointer.
+            let rc = unsafe { host_register_component(ctx.as_ffi_ptr(), &desc_a, &mut h_a1) };
+            assert_eq!(rc, FfiResult::OK);
+            let r = ctx.registry.clone();
+            ctx.finish_init();
+            r
+        };
+
+        let meta_a1 = reg_after_a1.get_by_handle(h_a1).unwrap();
+        let cid_a1 = meta_a1.component_id;
+        let slot_a1 = meta_a1.drop_slot.unwrap();
+
+        // Simulate Mod A unloading with 0 live values and its drop slot being recycled cleanly.
+        active_a1.store(false, Ordering::Release);
+        prune_drop_trampolines_for_guard(&active_a1);
+        drop(world.remove_resource::<WorldDropGuard>());
+        world.insert_resource(WorldDropGuard::new());
+
+        // Mod B claims the recycled slot (`slot_a1`).
+        let active_b = Arc::new(AtomicBool::new(true));
+        let mut h_b = BamComponent::INVALID;
+        let reg_after_b = {
+            let mut ctx = LoadContext::with_world_and_mod_id(
+                reg_after_a1,
+                Arc::clone(&active_b),
+                &mut world as *mut World,
+                Some(ModId(502)),
+            );
+            let desc_b = ComponentDesc::new(
+                c"recycle_test::CompB".as_ptr(),
+                ComponentUuid::from_parts(
+                    "recycle_test::CompB",
+                    core::mem::size_of::<*const AtomicUsize>(),
+                    core::mem::align_of::<*const AtomicUsize>(),
+                    0,
+                ),
+                core::mem::size_of::<*const AtomicUsize>(),
+                core::mem::align_of::<*const AtomicUsize>(),
+            )
+            .with_drop(test_drop_atomic_ptr);
+            // SAFETY: Valid `LoadContext`, `ComponentDesc`, and output pointer.
+            let rc = unsafe { host_register_component(ctx.as_ffi_ptr(), &desc_b, &mut h_b) };
+            assert_eq!(rc, FfiResult::OK);
+            let r = ctx.registry.clone();
+            ctx.finish_init();
+            r
+        };
+        let _slot_b = reg_after_b.get_by_handle(h_b).unwrap().drop_slot.unwrap();
+
+        // Mod A reloads and gets a DIFFERENT drop slot than `slot_a1` (when Mod B took `slot_a1`).
+        let active_a2 = Arc::new(AtomicBool::new(true));
+        let mut h_a2 = BamComponent::INVALID;
+        let reg_after_a2 = {
+            let mut ctx = LoadContext::with_world_and_mod_id(
+                reg_after_b,
+                Arc::clone(&active_a2),
+                &mut world as *mut World,
+                Some(ModId(503)),
+            );
+            let desc_a2 = ComponentDesc::new(
+                c"recycle_test::CompA".as_ptr(),
+                ComponentUuid::from_parts(
+                    "recycle_test::CompA",
+                    core::mem::size_of::<*const AtomicUsize>(),
+                    core::mem::align_of::<*const AtomicUsize>(),
+                    0,
+                ),
+                core::mem::size_of::<*const AtomicUsize>(),
+                core::mem::align_of::<*const AtomicUsize>(),
+            )
+            .with_drop(test_drop_atomic_ptr);
+            // SAFETY: Valid `LoadContext`, `ComponentDesc`, and output pointer.
+            let rc = unsafe { host_register_component(ctx.as_ffi_ptr(), &desc_a2, &mut h_a2) };
+            assert_eq!(rc, FfiResult::OK);
+            let r = ctx.registry.clone();
+            ctx.finish_init();
+            r
+        };
+
+        assert_eq!(h_a2, h_a1);
+        let meta_a2 = reg_after_a2.get_by_handle(h_a2).unwrap();
+        let slot_a2 = meta_a2.drop_slot.unwrap();
+        assert_ne!(slot_a2, slot_a1);
+        assert_ne!(
+            meta_a2.component_id, cid_a1,
+            "re-registering onto a different drop slot must allocate a fresh ComponentId"
+        );
+        assert_eq!(
+            reg_after_a2.get_by_id(meta_a2.component_id).unwrap().handle,
+            h_a2
+        );
+        assert!(reg_after_a2.get_by_id(cid_a1).is_none());
+
+        let ea = world.spawn_empty().id();
+        let mut pa = drop_a_ptr;
+        let eb = world.spawn_empty().id();
+        let mut pb = drop_b_ptr;
+        let cid_b = reg_after_a2.get_by_handle(h_b).unwrap().component_id;
+        // SAFETY: Layouts match `*const AtomicUsize`.
+        unsafe {
+            world.entity_mut(ea).insert_by_id(
+                meta_a2.component_id,
+                OwningPtr::new(core::ptr::NonNull::from(&mut pa).cast()),
+            );
+            world.entity_mut(eb).insert_by_id(
+                cid_b,
+                OwningPtr::new(core::ptr::NonNull::from(&mut pb).cast()),
+            );
+        }
+        assert!(world.despawn(ea));
+        assert!(world.despawn(eb));
+        assert_eq!(drop_a_count.load(Ordering::Relaxed), 1);
+        assert_eq!(drop_b_count.load(Ordering::Relaxed), 1);
     }
 }

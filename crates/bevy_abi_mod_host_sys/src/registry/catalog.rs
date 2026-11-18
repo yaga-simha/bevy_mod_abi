@@ -1502,13 +1502,18 @@ impl ModRegistry {
         required_components: Box<[BamComponent]>,
     ) -> Result<BamComponent, ComponentCollisionError> {
         let storage_flags = component_flags_to_storage_flags(desc.flags);
+        let expected_comp_id = self
+            .snapshot
+            .get_by_name(name)
+            .filter(|entry| entry.is_dynamic)
+            .map_or(comp_id, |entry| entry.component_id);
         self.check_registration_collision(
             name,
             desc.uuid,
             desc.size,
             desc.align,
             storage_flags,
-            Some(comp_id),
+            Some(expected_comp_id),
         )?;
         self.check_dynamic_drop_compatibility(name, desc.drop_fn.is_some())?;
         self.check_dynamic_extended_hook_compatibility(name, desc)?;
@@ -1526,16 +1531,22 @@ impl ModRegistry {
         let handle = {
             let snap = Arc::make_mut(&mut self.snapshot);
             let mut is_dynamic_entry = true;
+            let mut replaced_comp_id: Option<(ComponentId, ComponentId)> = None;
             let handle = if let Some(&existing_handle) = snap.by_name.get(name) {
                 let idx = (existing_handle.0 - 1) as usize;
                 let entry = &mut snap.entries[idx];
                 is_dynamic_entry = entry.is_dynamic;
                 if entry.is_dynamic {
+                    if entry.component_id != comp_id {
+                        replaced_comp_id = Some((entry.component_id, comp_id));
+                    }
+                    entry.component_id = comp_id;
                     entry.vtable_ptr = sym_addr;
                     entry.drop_fn = desc.drop_fn;
-                    if drop_slot.is_some() {
-                        entry.drop_slot = drop_slot;
-                    }
+                    entry.drop_slot = drop_slot;
+                    // SAFETY: `comp_id` was registered in `world` with `(desc.size, desc.align)`
+                    // and is safe for dynamic event dispatch.
+                    entry.event_key = Some(unsafe { EventKey::new(comp_id) });
                     if hook_slot.is_some() {
                         entry.hook_slot = hook_slot;
                     }
@@ -1585,6 +1596,11 @@ impl ModRegistry {
                 snap.by_component_id.insert(comp_id, handle);
                 handle
             };
+
+            if let Some((old_comp_id, new_comp_id)) = replaced_comp_id {
+                snap.by_component_id.remove(&old_comp_id);
+                snap.by_component_id.insert(new_comp_id, handle);
+            }
 
             if is_dynamic_entry {
                 snap.extended_hook_flags.insert(handle, ext_flags);
