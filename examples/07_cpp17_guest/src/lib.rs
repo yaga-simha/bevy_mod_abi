@@ -111,6 +111,27 @@ pub enum BehaviorMode {
     Attack(u32) = 2,
 }
 
+/// Telemetry resource updated by C++17 Wave 1–2 systems & lifecycle observers (`"example::CppTelemetry"`).
+#[repr(C)]
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, ModComponent)]
+#[mod_component(name = "example::CppTelemetry")]
+pub struct CppTelemetry {
+    /// Number of `Add<ActorStats>` lifecycle observer triggers observed by C++17.
+    pub observed_adds: u32,
+    /// Number of `Position` entities where `Has<ActorStats>` was `true`.
+    pub entities_with_stats: u32,
+    /// Number of `Position` entities where `Has<ActorStats>` was `false`.
+    pub entities_without_stats: u32,
+    /// Number of entities carrying `ChildOf` seen by the C++17 query.
+    pub child_entities_seen: u32,
+    /// Requested number of `Position` entities to spawn via `cmd_spawn_batch`.
+    pub spawn_batch_count: u32,
+    /// Set to `FfiBool::TRUE` once the batch spawn has been queued.
+    pub batch_spawned: FfiBool,
+    /// Explicit C alignment padding.
+    pub pad: [u8; 3],
+}
+
 /// Renders `examples/07_cpp17_guest/cpp_mod/example_components.h` from `ModComponent::C_DECL`.
 pub fn render_example_components_header() -> String {
     let mut out = String::with_capacity(16 * 1024);
@@ -125,6 +146,7 @@ pub fn render_example_components_header() -> String {
         <SimConfig as ModComponentTrait>::C_DECL,
         <ActorStats as ModComponentTrait>::C_DECL,
         <BehaviorMode as ModComponentTrait>::C_DECL,
+        <CppTelemetry as ModComponentTrait>::C_DECL,
     ] {
         out.push_str(decl);
         out.push('\n');
@@ -144,6 +166,7 @@ fn is_dylib_up_to_date(
     dylib_path: &Path,
     src_path: &Path,
     gen_header_path: &Path,
+    sdk_header_path: &Path,
     abi_header_path: &Path,
 ) -> bool {
     let Some(dylib_mtime) = file_mtime(dylib_path) else {
@@ -155,10 +178,16 @@ fn is_dylib_up_to_date(
     let Some(gen_mtime) = file_mtime(gen_header_path) else {
         return false;
     };
+    let Some(sdk_mtime) = file_mtime(sdk_header_path) else {
+        return false;
+    };
     let Some(abi_mtime) = file_mtime(abi_header_path) else {
         return false;
     };
-    dylib_mtime >= src_mtime && dylib_mtime >= gen_mtime && dylib_mtime >= abi_mtime
+    dylib_mtime >= src_mtime
+        && dylib_mtime >= gen_mtime
+        && dylib_mtime >= sdk_mtime
+        && dylib_mtime >= abi_mtime
 }
 
 /// Resolves or builds the C++17 guest shared library (`libcpp17_mod.{dylib,so}` / `cpp17_mod.dll`).
@@ -186,9 +215,16 @@ pub fn resolve_or_build_cpp17_mod() -> PathBuf {
             let dylib_path = cpp_dir.join(&filename);
             let src_path = cpp_dir.join("mod.cpp");
             let gen_header_path = cpp_dir.join("example_components.h");
+            let sdk_header_path = cpp_dir.join("bam_cpp17_sdk.hpp");
             let abi_header_path = cpp_dir.join("../../../include/bevy_abi_mod.h");
 
-            if !is_dylib_up_to_date(&dylib_path, &src_path, &gen_header_path, &abi_header_path) {
+            if !is_dylib_up_to_date(
+                &dylib_path,
+                &src_path,
+                &gen_header_path,
+                &sdk_header_path,
+                &abi_header_path,
+            ) {
                 build_cpp17_mod(&cpp_dir, &dylib_path, ext);
             }
             dylib_path

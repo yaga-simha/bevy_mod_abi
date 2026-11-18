@@ -105,6 +105,27 @@ pub enum ZigBehaviorMode {
     Attack(u32) = 2,
 }
 
+/// Resource tracking Wave 2 lifecycle observer, `Has<T>`, hierarchy, and batch spawn telemetry.
+#[repr(C)]
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, ModComponent)]
+#[mod_component(name = "example::ZigTelemetry")]
+pub struct ZigTelemetry {
+    /// Count of `BAM_EVENT_KIND_ADD` lifecycle observer fires observed by the Zig guest.
+    pub observed_adds: u32,
+    /// Entities matched in a query with `BAM_ACCESS_HAS` where `ZigActorStats` was present.
+    pub entities_with_stats: u32,
+    /// Entities matched in a query with `BAM_ACCESS_HAS` where `ZigActorStats` was absent.
+    pub entities_without_stats: u32,
+    /// Entities observed with a `BamChildOf` parent component (`BAM_CHILD_OF_NAME`).
+    pub child_entities_seen: u32,
+    /// Number of entities created via `cmd_spawn_batch` by the Zig guest.
+    pub spawn_batch_count: u32,
+    /// Whether the Zig guest has already submitted its one-shot SoA `cmd_spawn_batch`.
+    pub batch_spawned: FfiBool,
+    /// Explicit ABI tail padding to maintain 4-byte alignment with zero implicit padding.
+    pub pad: [u8; 3],
+}
+
 /// Renders `examples/08_zig_guest/zig_mod/src/generated_components.zig` from `ModComponent::ZIG_DECL`.
 pub fn render_example_zig_components() -> String {
     let mut out = String::with_capacity(16 * 1024);
@@ -117,6 +138,7 @@ pub fn render_example_zig_components() -> String {
         <ZigSimConfig as ModComponentTrait>::ZIG_DECL,
         <ZigActorStats as ModComponentTrait>::ZIG_DECL,
         <ZigBehaviorMode as ModComponentTrait>::ZIG_DECL,
+        <ZigTelemetry as ModComponentTrait>::ZIG_DECL,
     ] {
         out.push_str(decl);
         out.push('\n');

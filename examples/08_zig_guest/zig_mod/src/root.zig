@@ -1,7 +1,8 @@
 //! Zig Guest Mod for `bevy_abi_mod` Example 08 (`ABI 0.2.0`).
 //!
 //! Demonstrates:
-//! 1. Importing `generated_components.zig` (`ModComponent::ZIG_DECL`) and `include/bevy_abi_mod.h`.
+//! 1. Importing `generated_components.zig` (`ModComponent::ZIG_DECL`) and `bam_zig_sdk.zig`
+//!    (`GuestApp`, `SystemContext`, `Chunk`, `Commands`).
 //! 2. Exporting `bevy_abi_mod_manifest`, `bevy_abi_mod_init`, and `bevy_abi_mod_shutdown`
 //!    with `callconv(.c)`.
 //! 3. Mapping typed Zig error unions (`BamError!void`) cleanly to `c.BamResult` status codes
@@ -10,14 +11,18 @@
 //!    performing zero-copy SoA chunk iteration over `example::Position` and `example::Velocity`.
 //! 5. Using Zig `comptime` VTable/view wrappers (`ZigActorStatsView`, `VecView`, `ZigBehaviorModeView`)
 //!    when `example::ZigActorStats` and `example::ZigBehaviorMode` are registered by the host.
+//! 6. Optionally exercising `BAM_EVENT_KIND_ADD` lifecycle observers, `BAM_ACCESS_HAS`,
+//!    `BAM_CHILD_OF_NAME` optional hierarchy reads, and `cmd_spawn_batch` SoA bulk spawning.
 
 const std = @import("std");
 const gen = @import("generated_components.zig");
+const sdk = @import("bam_zig_sdk.zig");
 const c = gen.bam;
 
 pub const Position = gen.Position;
 pub const Velocity = gen.Velocity;
 pub const ZigSimConfig = gen.ZigSimConfig;
+pub const ZigTelemetry = gen.ZigTelemetry;
 
 comptime {
     if (@sizeOf(Position) != 12 or @alignOf(Position) != 4) {
@@ -28,6 +33,9 @@ comptime {
     }
     if (@sizeOf(ZigSimConfig) != 8 or @alignOf(ZigSimConfig) != 4) {
         @compileError("ZigSimConfig layout mismatch");
+    }
+    if (@sizeOf(ZigTelemetry) != 24 or @alignOf(ZigTelemetry) != 4) {
+        @compileError("ZigTelemetry layout mismatch");
     }
     if (@offsetOf(gen.ZigActorStatsVTable, "header") != 0) {
         @compileError("ZigActorStatsVTable header must sit at offset 0");
@@ -89,45 +97,39 @@ const ZigModInstance = struct {
     cfg_res: c.BamComponent,
     stats_comp: c.BamComponent,
     mode_comp: c.BamComponent,
+    child_of_comp: c.BamComponent,
+    telemetry_res: c.BamComponent,
     stats_vt: ?*const gen.ZigActorStatsVTable,
     mode_vt: ?*const gen.ZigBehaviorModeVTable,
+    observed_adds: u32,
 
     fn initAndRegister(self: *ZigModInstance, load_ctx: *c.BamLoadCtx) BamError!void {
-        const load_host_ctx = self.api.load_host_ctx orelse return error.NullPointer;
-        const resolve_component = self.api.resolve_component orelse return error.NullPointer;
-        const register_system = self.api.register_system orelse return error.NullPointer;
+        const app = sdk.GuestApp.init(&self.api, load_ctx);
+        if (!app.valid()) {
+            return error.NullPointer;
+        }
+        const host_ctx = app.host_ctx orelse return error.NullPointer;
 
-        const host_ctx = load_host_ctx(load_ctx) orelse return error.NullPointer;
-
-        try checkBamResult(resolve_component(host_ctx, "example::Position", null, &self.pos_comp));
-        try checkBamResult(resolve_component(host_ctx, "example::Velocity", null, &self.vel_comp));
-        try checkBamResult(resolve_component(host_ctx, "example::ZigSimConfig", null, &self.cfg_res));
+        try checkBamResult(app.resolveComponent("example::Position", &self.pos_comp));
+        try checkBamResult(app.resolveComponent("example::Velocity", &self.vel_comp));
+        try checkBamResult(app.resolveComponent("example::ZigSimConfig", &self.cfg_res));
 
         const terms = [_]c.BamTermDesc{
             c.bam_term_desc(self.pos_comp, c.BAM_ACCESS_WRITE, 0),
             c.bam_term_desc(self.vel_comp, c.BAM_ACCESS_READ, 0),
             c.bam_term_desc(self.cfg_res, c.BAM_ACCESS_RESOURCE_READ, 0),
         };
-
-        var query = std.mem.zeroes(c.BamQueryDesc);
-        query.struct_size = @intCast(@sizeOf(c.BamQueryDesc));
-        query.terms = &terms[0];
-        query.term_count = terms.len;
-
-        var sys_desc = std.mem.zeroes(c.BamSystemDesc);
-        sys_desc.struct_size = @intCast(@sizeOf(c.BamSystemDesc));
-        sys_desc.name = "zig_orbital_step";
-        sys_desc.queries = &query;
-        sys_desc.query_count = 1;
-        sys_desc.callback = &zigSystemCallback;
-        sys_desc.user_data = @ptrCast(self);
-        sys_desc.schedule = c.BAM_SCHEDULE_UPDATE;
-
-        try checkBamResult(register_system(load_ctx, &sys_desc));
+        try checkBamResult(app.registerSystem(
+            "zig_orbital_step",
+            &terms,
+            &zigSystemCallback,
+            @ptrCast(self),
+            c.BAM_SCHEDULE_UPDATE,
+        ));
 
         // Optionally bind `ZigActorStats` + `ZigBehaviorMode` via `comptime` generated Views.
-        if (resolve_component(host_ctx, "example::ZigActorStats", null, &self.stats_comp) == c.BAM_RESULT_OK and
-            resolve_component(host_ctx, "example::ZigBehaviorMode", null, &self.mode_comp) == c.BAM_RESULT_OK)
+        if (app.tryResolveComponent("example::ZigActorStats", &self.stats_comp) and
+            app.tryResolveComponent("example::ZigBehaviorMode", &self.mode_comp))
         {
             self.stats_vt = try gen.ZigActorStatsView.resolveVTable(
                 &self.api,
@@ -144,60 +146,71 @@ const ZigModInstance = struct {
                 c.bam_term_desc(self.stats_comp, c.BAM_ACCESS_WRITE, 0),
                 c.bam_term_desc(self.mode_comp, c.BAM_ACCESS_WRITE, 0),
             };
-            var view_query = std.mem.zeroes(c.BamQueryDesc);
-            view_query.struct_size = @intCast(@sizeOf(c.BamQueryDesc));
-            view_query.terms = &view_terms[0];
-            view_query.term_count = view_terms.len;
+            try checkBamResult(app.registerSystem(
+                "zig_actor_views",
+                &view_terms,
+                &zigActorViewsCallback,
+                @ptrCast(self),
+                c.BAM_SCHEDULE_UPDATE,
+            ));
 
-            var view_sys = std.mem.zeroes(c.BamSystemDesc);
-            view_sys.struct_size = @intCast(@sizeOf(c.BamSystemDesc));
-            view_sys.name = "zig_actor_views";
-            view_sys.queries = &view_query;
-            view_sys.query_count = 1;
-            view_sys.callback = &zigActorViewsCallback;
-            view_sys.user_data = @ptrCast(self);
-            view_sys.schedule = c.BAM_SCHEDULE_UPDATE;
+            // Optionally bind Wave 1-2 showcase: `BAM_EVENT_KIND_ADD` lifecycle observer,
+            // `BAM_ACCESS_HAS`, `BamChildOf` optional hierarchy read, and `cmd_spawn_batch`.
+            if (app.tryResolveComponent("example::ZigTelemetry", &self.telemetry_res) and
+                app.tryResolveComponent(c.BAM_CHILD_OF_NAME, &self.child_of_comp))
+            {
+                try checkBamResult(app.registerLifecycleObserver(
+                    "zig_on_actor_added",
+                    c.BAM_EVENT_KIND_ADD,
+                    self.stats_comp,
+                    &zigOnActorAddedCallback,
+                    @ptrCast(self),
+                ));
 
-            try checkBamResult(register_system(load_ctx, &view_sys));
+                const has_terms = [_]c.BamTermDesc{
+                    c.bam_term_desc(self.pos_comp, c.BAM_ACCESS_READ, 0),
+                    c.bam_term_desc(self.stats_comp, c.BAM_ACCESS_HAS, 0),
+                    c.bam_term_desc(self.child_of_comp, c.BAM_ACCESS_OPTIONAL_READ, 0),
+                    c.bam_term_desc(self.telemetry_res, c.BAM_ACCESS_RESOURCE_WRITE, 0),
+                };
+                try checkBamResult(app.registerSystem(
+                    "zig_has_hierarchy_and_batch",
+                    &has_terms,
+                    &zigHasHierarchyCallback,
+                    @ptrCast(self),
+                    c.BAM_SCHEDULE_UPDATE,
+                ));
+            }
         }
     }
 
-    fn runStep(self: *ZigModInstance, sys_ctx: *c.BamSystemCtx) BamError!void {
-        const sys_query = self.api.sys_query orelse return error.NullPointer;
-        const iter_next_chunk = self.api.iter_next_chunk orelse return error.NullPointer;
-        const iter_col_mut = self.api.iter_column_mutable orelse return error.NullPointer;
-        const iter_col_ro = self.api.iter_column_readonly orelse return error.NullPointer;
-        const iter_col_info = self.api.iter_column_info orelse return error.NullPointer;
-        const res_ptr = self.api.res_ptr orelse return error.NullPointer;
-
+    fn runStep(self: *ZigModInstance, raw_ctx: *c.BamSystemCtx) BamError!void {
+        const ctx = sdk.SystemContext.init(&self.api, raw_ctx);
         var iter_opt: ?*c.BamIter = null;
-        try checkBamResult(sys_query(sys_ctx, 0, &iter_opt));
+        try checkBamResult(ctx.query(0, &iter_opt));
         const iter = iter_opt orelse return error.NullPointer;
 
-        const raw_cfg = res_ptr(iter, 2) orelse return error.NullPointer;
-        const cfg: *const ZigSimConfig = @ptrCast(@alignCast(raw_cfg));
+        const cfg = ctx.resPtr(ZigSimConfig, iter, 2) orelse return error.NullPointer;
         if (cfg.trigger_error != c.BAM_FALSE) {
             return error.InvalidArgument;
         }
 
         var pos_info = std.mem.zeroes(c.BamColumnInfo);
         var vel_info = std.mem.zeroes(c.BamColumnInfo);
-        try checkBamResult(iter_col_info(iter, 0, &pos_info));
-        try checkBamResult(iter_col_info(iter, 1, &vel_info));
+        try checkBamResult(ctx.columnInfo(iter, 0, &pos_info));
+        try checkBamResult(ctx.columnInfo(iter, 1, &vel_info));
         if (pos_info.size != @sizeOf(Position) or vel_info.size != @sizeOf(Velocity)) {
             return error.TypeMismatch;
         }
 
         var chunk_len: usize = 0;
-        while (iter_next_chunk(iter, &chunk_len) != c.BAM_FALSE) {
-            const pos_bytes = iter_col_mut(iter, 0) orelse return error.NullPointer;
-            const vel_bytes = iter_col_ro(iter, 1) orelse return error.NullPointer;
+        while (ctx.nextChunk(iter, &chunk_len)) {
+            const chunk = sdk.Chunk{ .api = &self.api, .iter = iter, .len = chunk_len };
+            const pos_ptr = chunk.columnMutable(Position, 0) orelse return error.NullPointer;
+            const vel_ptr = chunk.columnReadonly(Velocity, 1) orelse return error.NullPointer;
 
-            const pos_ptr: [*]Position = @ptrCast(@alignCast(pos_bytes));
-            const vel_ptr: [*]const Velocity = @ptrCast(@alignCast(vel_bytes));
-
-            const positions = pos_ptr[0..chunk_len];
-            const velocities = vel_ptr[0..chunk_len];
+            const positions = pos_ptr[0..chunk.len];
+            const velocities = vel_ptr[0..chunk.len];
 
             for (positions, velocities) |*pos, vel| {
                 pos.x += vel.x * cfg.dt;
@@ -207,32 +220,27 @@ const ZigModInstance = struct {
         }
     }
 
-    fn runActorViews(self: *ZigModInstance, sys_ctx: *c.BamSystemCtx) BamError!void {
+    fn runActorViews(self: *ZigModInstance, raw_ctx: *c.BamSystemCtx) BamError!void {
         const stats_vt = self.stats_vt orelse return error.NullPointer;
         const mode_vt = self.mode_vt orelse return error.NullPointer;
-        const sys_query = self.api.sys_query orelse return error.NullPointer;
-        const iter_next_chunk = self.api.iter_next_chunk orelse return error.NullPointer;
-        const iter_col_mut = self.api.iter_column_mutable orelse return error.NullPointer;
-        const iter_col_info = self.api.iter_column_info orelse return error.NullPointer;
+        const ctx = sdk.SystemContext.init(&self.api, raw_ctx);
 
         var iter_opt: ?*c.BamIter = null;
-        try checkBamResult(sys_query(sys_ctx, 0, &iter_opt));
+        try checkBamResult(ctx.query(0, &iter_opt));
         const iter = iter_opt orelse return error.NullPointer;
 
         var stats_info = std.mem.zeroes(c.BamColumnInfo);
         var mode_info = std.mem.zeroes(c.BamColumnInfo);
-        try checkBamResult(iter_col_info(iter, 0, &stats_info));
-        try checkBamResult(iter_col_info(iter, 1, &mode_info));
+        try checkBamResult(ctx.columnInfo(iter, 0, &stats_info));
+        try checkBamResult(ctx.columnInfo(iter, 1, &mode_info));
 
         var chunk_len: usize = 0;
-        while (iter_next_chunk(iter, &chunk_len) != c.BAM_FALSE) {
-            const stats_base = iter_col_mut(iter, 0) orelse return error.NullPointer;
-            const mode_base = iter_col_mut(iter, 1) orelse return error.NullPointer;
-
+        while (ctx.nextChunk(iter, &chunk_len)) {
+            const chunk = sdk.Chunk{ .api = &self.api, .iter = iter, .len = chunk_len };
             var i: usize = 0;
-            while (i < chunk_len) : (i += 1) {
-                const stats_ptr: *anyopaque = @ptrCast(stats_base + i * stats_info.size);
-                const mode_ptr: *anyopaque = @ptrCast(mode_base + i * mode_info.size);
+            while (i < chunk.len) : (i += 1) {
+                const stats_ptr = chunk.rowsMutable(0, i, stats_info.size) orelse return error.NullPointer;
+                const mode_ptr = chunk.rowsMutable(1, i, mode_info.size) orelse return error.NullPointer;
 
                 const stats = gen.ZigActorStatsView.init(stats_ptr, stats_vt);
                 const mode = gen.ZigBehaviorModeView.init(mode_ptr, mode_vt);
@@ -255,6 +263,71 @@ const ZigModInstance = struct {
             }
         }
     }
+
+    fn runHasHierarchyAndBatch(self: *ZigModInstance, raw_ctx: *c.BamSystemCtx) BamError!void {
+        const ctx = sdk.SystemContext.init(&self.api, raw_ctx);
+        var iter_opt: ?*c.BamIter = null;
+        try checkBamResult(ctx.query(0, &iter_opt));
+        const iter = iter_opt orelse return error.NullPointer;
+
+        const telemetry = ctx.resMutPtr(ZigTelemetry, iter, 3) orelse return error.NullPointer;
+
+        var with_stats: u32 = 0;
+        var without_stats: u32 = 0;
+        var children_seen: u32 = 0;
+
+        var chunk_len: usize = 0;
+        while (ctx.nextChunk(iter, &chunk_len)) {
+            const chunk = sdk.Chunk{ .api = &self.api, .iter = iter, .len = chunk_len };
+            const has_stats = chunk.hasColumn(1) orelse return error.NullPointer;
+            const child_ofs = chunk.columnReadonly(c.BamChildOf, 2);
+
+            var i: usize = 0;
+            while (i < chunk.len) : (i += 1) {
+                if (has_stats[i] != c.BAM_FALSE) {
+                    with_stats += 1;
+                } else {
+                    without_stats += 1;
+                }
+                if (child_ofs) |parents| {
+                    if (parents[i].parent != c.BAM_ENTITY_NULL) {
+                        children_seen += 1;
+                    }
+                }
+            }
+        }
+
+        telemetry.observed_adds = self.observed_adds;
+        telemetry.entities_with_stats = with_stats;
+        telemetry.entities_without_stats = without_stats;
+        telemetry.child_entities_seen = children_seen;
+
+        if (telemetry.spawn_batch_count > 0 and telemetry.batch_spawned == c.BAM_FALSE) {
+            var cmd_res: c.BamResult = c.BAM_RESULT_OK;
+            const cmds = ctx.commands(&cmd_res);
+            try checkBamResult(cmd_res);
+            if (!cmds.valid()) {
+                return error.NullPointer;
+            }
+
+            const count: usize = @intCast(telemetry.spawn_batch_count);
+            const batch_positions = std.heap.c_allocator.alloc(Position, count) catch return error.OutOfMemory;
+            defer std.heap.c_allocator.free(batch_positions);
+
+            for (batch_positions, 0..) |*pos, idx| {
+                pos.* = .{
+                    .x = @as(f32, @floatFromInt(idx)) + 1.0,
+                    .y = 0.0,
+                    .z = 0.0,
+                };
+            }
+
+            const comps = [_]c.BamComponent{self.pos_comp};
+            const cols = [_]?[*]const u8{@ptrCast(batch_positions.ptr)};
+            try checkBamResult(cmds.spawnBatch(&comps, &cols, count, null));
+            telemetry.batch_spawned = c.BAM_TRUE;
+        }
+    }
 };
 
 fn zigSystemCallback(sys_ctx_opt: ?*c.BamSystemCtx, user_data: ?*anyopaque) callconv(.c) c.BamResult {
@@ -270,6 +343,29 @@ fn zigActorViewsCallback(sys_ctx_opt: ?*c.BamSystemCtx, user_data: ?*anyopaque) 
     const raw_ud = user_data orelse return c.BAM_RESULT_NULL_POINTER;
     const self: *ZigModInstance = @ptrCast(@alignCast(raw_ud));
     self.runActorViews(sys_ctx) catch |err| return mapErrorToBamResult(err);
+    return c.BAM_RESULT_OK;
+}
+
+fn zigHasHierarchyCallback(sys_ctx_opt: ?*c.BamSystemCtx, user_data: ?*anyopaque) callconv(.c) c.BamResult {
+    const sys_ctx = sys_ctx_opt orelse return c.BAM_RESULT_NULL_POINTER;
+    const raw_ud = user_data orelse return c.BAM_RESULT_NULL_POINTER;
+    const self: *ZigModInstance = @ptrCast(@alignCast(raw_ud));
+    self.runHasHierarchyAndBatch(sys_ctx) catch |err| return mapErrorToBamResult(err);
+    return c.BAM_RESULT_OK;
+}
+
+fn zigOnActorAddedCallback(
+    target: c.BamEntity,
+    event_data: ?*const anyopaque,
+    commands: ?*c.BamCommands,
+    user_data: ?*anyopaque,
+) callconv(.c) c.BamResult {
+    _ = target;
+    _ = event_data;
+    _ = commands;
+    const raw_ud = user_data orelse return c.BAM_RESULT_NULL_POINTER;
+    const self: *ZigModInstance = @ptrCast(@alignCast(raw_ud));
+    self.observed_adds += 1;
     return c.BAM_RESULT_OK;
 }
 
@@ -309,8 +405,11 @@ fn initImpl(
         .cfg_res = c.BAM_COMPONENT_INVALID,
         .stats_comp = c.BAM_COMPONENT_INVALID,
         .mode_comp = c.BAM_COMPONENT_INVALID,
+        .child_of_comp = c.BAM_COMPONENT_INVALID,
+        .telemetry_res = c.BAM_COMPONENT_INVALID,
         .stats_vt = null,
         .mode_vt = null,
+        .observed_adds = 0,
     };
 
     try instance.initAndRegister(load_ctx);

@@ -440,3 +440,116 @@ pub const ZigBehaviorModeView = struct {
 };
 
 
+pub const ZigTelemetry = extern struct {
+    observed_adds: u32,
+    entities_with_stats: u32,
+    entities_without_stats: u32,
+    child_entities_seen: u32,
+    spawn_batch_count: u32,
+    batch_spawned: bam.BamBool,
+    pad: [3]u8,
+};
+
+pub const ZigTelemetryVTable = extern struct {
+    header: bam.BamVTableHeader,
+    get_observed_adds: ?*const fn (?*const anyopaque) callconv(.c) u32,
+    set_observed_adds: ?*const fn (?*anyopaque, u32) callconv(.c) bam.BamResult,
+    get_entities_with_stats: ?*const fn (?*const anyopaque) callconv(.c) u32,
+    set_entities_with_stats: ?*const fn (?*anyopaque, u32) callconv(.c) bam.BamResult,
+    get_entities_without_stats: ?*const fn (?*const anyopaque) callconv(.c) u32,
+    set_entities_without_stats: ?*const fn (?*anyopaque, u32) callconv(.c) bam.BamResult,
+    get_child_entities_seen: ?*const fn (?*const anyopaque) callconv(.c) u32,
+    set_child_entities_seen: ?*const fn (?*anyopaque, u32) callconv(.c) bam.BamResult,
+    get_spawn_batch_count: ?*const fn (?*const anyopaque) callconv(.c) u32,
+    set_spawn_batch_count: ?*const fn (?*anyopaque, u32) callconv(.c) bam.BamResult,
+    get_batch_spawned: ?*const fn (?*const anyopaque) callconv(.c) bam.BamBool,
+    set_batch_spawned: ?*const fn (?*anyopaque, bam.BamBool) callconv(.c) bam.BamResult,
+    ptr_pad: ?*const fn (?*const anyopaque) callconv(.c) ?*const anyopaque,
+    ptr_mut_pad: ?*const fn (?*anyopaque) callconv(.c) ?*anyopaque,
+};
+
+pub const ZigTelemetryView = struct {
+    ptr: *anyopaque,
+    vt: *const ZigTelemetryVTable,
+
+    comptime {
+        if (@offsetOf(ZigTelemetryVTable, "header") != 0) @compileError("ZigTelemetryVTable header must be at offset 0");
+    }
+
+    pub fn resolveVTable(
+        api: *const bam.BamHostApi,
+        host_ctx: ?*const bam.BamHostCtx,
+        symbol: [*:0]const u8,
+    ) !*const ZigTelemetryVTable {
+        const get_proc = api.get_proc_address orelse return error.NullPointer;
+        const raw = get_proc(host_ctx, symbol) orelse return error.NotFound;
+        const hdr: *const bam.BamVTableHeader = @ptrCast(@alignCast(raw));
+        if (hdr.struct_size < @sizeOf(ZigTelemetryVTable) or bam.bam_version_is_compatible(bam.BAM_ABI_VERSION, hdr.abi_version) == bam.BAM_FALSE) {
+            return error.InvalidVersion;
+        }
+        return @ptrCast(@alignCast(raw));
+    }
+
+    pub fn init(ptr: *anyopaque, vt: *const ZigTelemetryVTable) @This() {
+        return .{ .ptr = ptr, .vt = vt };
+    }
+
+    pub fn get_observed_adds(self: @This()) u32 {
+        const f = self.vt.get_observed_adds orelse return std.mem.zeroes(u32);
+        return f(self.ptr);
+    }
+    pub fn set_observed_adds(self: @This(), val: u32) bam.BamResult {
+        const f = self.vt.set_observed_adds orelse return bam.BAM_RESULT_NULL_POINTER;
+        return f(self.ptr, val);
+    }
+    pub fn get_entities_with_stats(self: @This()) u32 {
+        const f = self.vt.get_entities_with_stats orelse return std.mem.zeroes(u32);
+        return f(self.ptr);
+    }
+    pub fn set_entities_with_stats(self: @This(), val: u32) bam.BamResult {
+        const f = self.vt.set_entities_with_stats orelse return bam.BAM_RESULT_NULL_POINTER;
+        return f(self.ptr, val);
+    }
+    pub fn get_entities_without_stats(self: @This()) u32 {
+        const f = self.vt.get_entities_without_stats orelse return std.mem.zeroes(u32);
+        return f(self.ptr);
+    }
+    pub fn set_entities_without_stats(self: @This(), val: u32) bam.BamResult {
+        const f = self.vt.set_entities_without_stats orelse return bam.BAM_RESULT_NULL_POINTER;
+        return f(self.ptr, val);
+    }
+    pub fn get_child_entities_seen(self: @This()) u32 {
+        const f = self.vt.get_child_entities_seen orelse return std.mem.zeroes(u32);
+        return f(self.ptr);
+    }
+    pub fn set_child_entities_seen(self: @This(), val: u32) bam.BamResult {
+        const f = self.vt.set_child_entities_seen orelse return bam.BAM_RESULT_NULL_POINTER;
+        return f(self.ptr, val);
+    }
+    pub fn get_spawn_batch_count(self: @This()) u32 {
+        const f = self.vt.get_spawn_batch_count orelse return std.mem.zeroes(u32);
+        return f(self.ptr);
+    }
+    pub fn set_spawn_batch_count(self: @This(), val: u32) bam.BamResult {
+        const f = self.vt.set_spawn_batch_count orelse return bam.BAM_RESULT_NULL_POINTER;
+        return f(self.ptr, val);
+    }
+    pub fn get_batch_spawned(self: @This()) bam.BamBool {
+        const f = self.vt.get_batch_spawned orelse return std.mem.zeroes(bam.BamBool);
+        return f(self.ptr);
+    }
+    pub fn set_batch_spawned(self: @This(), val: bam.BamBool) bam.BamResult {
+        const f = self.vt.set_batch_spawned orelse return bam.BAM_RESULT_NULL_POINTER;
+        return f(self.ptr, val);
+    }
+    pub fn ptr_pad(self: @This()) ?*const anyopaque {
+        const f = self.vt.ptr_pad orelse return null;
+        return f(self.ptr);
+    }
+    pub fn ptr_mut_pad(self: @This()) ?*anyopaque {
+        const f = self.vt.ptr_mut_pad orelse return null;
+        return f(self.ptr);
+    }
+};
+
+

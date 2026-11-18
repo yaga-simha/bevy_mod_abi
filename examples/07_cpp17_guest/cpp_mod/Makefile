@@ -17,7 +17,7 @@ override CXXFLAGS += -std=c++17 -Wall -Wextra -Wpedantic -Werror -I../../../incl
 
 all: $(TARGET)
 
-$(TARGET): mod.cpp example_components.h ../../../include/bevy_abi_mod.h
+$(TARGET): mod.cpp bam_cpp17_sdk.hpp example_components.h ../../../include/bevy_abi_mod.h
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $<
 
 clean:
