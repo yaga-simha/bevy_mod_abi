@@ -170,18 +170,22 @@ pub(crate) struct StagedDropBinding {
 }
 
 /// Invokes the most recent active foreign destructor bound to `slot` on an uncommitted arena
-/// payload (`CommandArena`) **without** decrementing `SLOT_LIFECYCLE` (`on_insert` has not fired).
+/// payload (`CommandArena`) **without** decrementing `SLOT_LIFECYCLE` (`on_insert` has not fired),
+/// iff `slot`'s generation still matches `expected_gen`.
 ///
 /// # Safety
 /// `raw_ptr` must point to a valid initialized guest component payload matching `slot`'s layout.
 #[inline]
-pub(crate) unsafe fn run_uncommitted_slot_drop(slot: usize, raw_ptr: *mut u8) {
+pub(crate) unsafe fn run_uncommitted_slot_drop(slot: usize, expected_gen: u64, raw_ptr: *mut u8) {
     if raw_ptr.is_null() {
         return;
     }
     let Some((page, in_page)) = get_drop_page(slot) else {
         return;
     };
+    if page.generation[in_page].load(Ordering::Acquire) != expected_gen {
+        return;
+    }
     if let Some(snap) = page.slots[in_page].load().as_ref()
         && let Some(&(GuestFnPtr(drop_fn), _)) = snap
             .entries
@@ -190,7 +194,7 @@ pub(crate) unsafe fn run_uncommitted_slot_drop(slot: usize, raw_ptr: *mut u8) {
             .find(|(_, guard)| guard.load(Ordering::Acquire))
     {
         // SAFETY: `raw_ptr` holds an uncommitted guest payload whose owning mod (`guard == true`)
-        // remains mapped in memory.
+        // remains mapped in memory and `slot`'s generation matches `expected_gen`.
         unsafe { drop_fn(raw_ptr.cast::<c_void>()) };
     }
 }
