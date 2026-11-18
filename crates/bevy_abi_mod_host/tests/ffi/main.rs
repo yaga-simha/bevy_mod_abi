@@ -21,6 +21,7 @@ mod c_vtable_interop;
 mod chunk_and_commands;
 mod engine_bridge;
 mod events_hierarchy_and_parallel;
+mod query_filters;
 mod sparse_and_resources;
 mod strides_and_alignment;
 mod uuid_parity;
