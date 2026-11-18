@@ -12,12 +12,12 @@ help: the trait `RawInsertable` is not implemented for `BoolComp`
    = help: the following other types implement trait `RawInsertable`:
              BamChangeTicks
              BamComponent
+             BamEventKind
              ComponentUuid
+             FfiAssetHandle
+             FfiAssetLoadState
              FfiBool
              FfiChildOf
-             FfiEntity
-             [T; N]
-             f32
            and $N others
 note: required by a bound in `assert_raw_insertable`
   --> $WORKSPACE/crates/bevy_abi_mod_sys/src/traits.rs

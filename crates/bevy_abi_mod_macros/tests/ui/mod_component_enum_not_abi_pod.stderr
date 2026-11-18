@@ -1,0 +1,26 @@
+error[E0277]: the trait bound `EnumNotAbiPod: AbiPod` is not satisfied
+  --> tests/ui/mod_component_enum_not_abi_pod.rs:11:40
+   |
+11 |     bevy_abi_mod_sys::assert_abi_pod::<EnumNotAbiPod>();
+   |                                        ^^^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `AbiPod` is not implemented for `EnumNotAbiPod`
+  --> tests/ui/mod_component_enum_not_abi_pod.rs:5:1
+   |
+ 5 | pub enum EnumNotAbiPod {
+   | ^^^^^^^^^^^^^^^^^^^^^^
+   = help: the following other types implement trait `AbiPod`:
+             BamChangeTicks
+             BamComponent
+             BamEventKind
+             ComponentUuid
+             FfiAssetHandle
+             FfiAssetLoadState
+             FfiBool
+             FfiChildOf
+           and $N others
+note: required by a bound in `assert_abi_pod`
+  --> $WORKSPACE/crates/bevy_abi_mod_sys/src/traits.rs
+   |
+   | pub const fn assert_abi_pod<T: AbiPod>() {}
+   |                                ^^^^^^ required by this bound in `assert_abi_pod`

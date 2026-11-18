@@ -1,6 +1,8 @@
 mod bool;
 pub(crate) mod c_decl;
+mod enums;
 mod nested;
+mod option;
 mod primitive;
 mod string;
 mod vec;
@@ -125,9 +127,12 @@ pub(crate) struct CodegenState {
     pub(crate) can_impl_raw_insertable: bool,
     pub(crate) can_impl_abi_pod: bool,
     pub(crate) component_flags_expr: TokenStream,
+    pub(crate) summary_tick: bool,
+    pub(crate) required_components: Vec<syn::Path>,
     pub(crate) custom_uuid: Option<String>,
     pub(crate) schema_fields: Vec<(String, String, TokenStream)>,
     pub(crate) decl_fields: Vec<c_decl::DeclFieldInfo>,
+    pub(crate) decl_enum: Option<c_decl::DeclEnumInfo>,
     pub(crate) extern_fns: Vec<TokenStream>,
     pub(crate) vtable_fields: Vec<TokenStream>,
     pub(crate) vtable_inits: Vec<TokenStream>,
@@ -293,19 +298,9 @@ pub(crate) fn expand_mod_component_with_crate(
     if repr_flags.has_packed {
         return Err(syn::Error::new_spanned(
             &input.ident,
-            "`#[derive(ModComponent)]` cannot be applied to `#[repr(packed)]` structs because aligned field pointers and references are undefined behavior",
+            "`#[derive(ModComponent)]` cannot be applied to `#[repr(packed)]` types because aligned field pointers and references are undefined behavior",
         ));
     }
-
-    let fields = match &input.data {
-        Data::Struct(data_struct) => &data_struct.fields,
-        _ => {
-            return Err(syn::Error::new_spanned(
-                &input.ident,
-                "`#[derive(ModComponent)]` can only be applied to structs",
-            ));
-        }
-    };
 
     let sys_crate = resolve_sys_crate_path(comp_attrs.crate_override.as_ref());
     let struct_ident = input.ident.clone();
@@ -371,13 +366,20 @@ pub(crate) fn expand_mod_component_with_crate(
         None => default_export_stem,
     };
 
-    let component_flags_expr = match (comp_attrs.sparse_set, comp_attrs.immutable) {
-        (false, false) => quote! { 0u32 },
-        (true, false) => quote! { #sys_crate::BAM_COMPONENT_FLAG_SPARSE_SET },
-        (false, true) => quote! { #sys_crate::BAM_COMPONENT_FLAG_IMMUTABLE },
-        (true, true) => {
-            quote! { #sys_crate::BAM_COMPONENT_FLAG_SPARSE_SET | #sys_crate::BAM_COMPONENT_FLAG_IMMUTABLE }
-        }
+    let mut flag_terms = Vec::new();
+    if comp_attrs.sparse_set {
+        flag_terms.push(quote! { #sys_crate::BAM_COMPONENT_FLAG_SPARSE_SET });
+    }
+    if comp_attrs.immutable {
+        flag_terms.push(quote! { #sys_crate::BAM_COMPONENT_FLAG_IMMUTABLE });
+    }
+    if comp_attrs.summary_tick {
+        flag_terms.push(quote! { #sys_crate::BAM_COMPONENT_FLAG_SUMMARY_TICK });
+    }
+    let component_flags_expr = if flag_terms.is_empty() {
+        quote! { 0u32 }
+    } else {
+        quote! { #(#flag_terms)|* }
     };
 
     let mut state = CodegenState {
@@ -392,9 +394,12 @@ pub(crate) fn expand_mod_component_with_crate(
             && repr_flags.is_deterministic_unpacked()
             && !comp_attrs.no_pod,
         component_flags_expr,
+        summary_tick: comp_attrs.summary_tick,
+        required_components: comp_attrs.required_components,
         custom_uuid: comp_attrs.custom_uuid,
         schema_fields: Vec::new(),
         decl_fields: Vec::new(),
+        decl_enum: None,
         extern_fns: Vec::new(),
         vtable_fields: Vec::new(),
         vtable_inits: Vec::new(),
@@ -416,6 +421,25 @@ pub(crate) fn expand_mod_component_with_crate(
             ptr: (&raw const VTABLE_INSTANCE).cast::<::core::ffi::c_void>(),
         }
     });
+
+    let fields = match &input.data {
+        Data::Struct(data_struct) => &data_struct.fields,
+        Data::Enum(data_enum) => {
+            return enums::expand_enum_mod_component(
+                input,
+                data_enum,
+                &repr_flags,
+                state,
+                &vtable_ident,
+            );
+        }
+        Data::Union(_) => {
+            return Err(syn::Error::new_spanned(
+                &input.ident,
+                "`#[derive(ModComponent)]` can only be applied to structs and enums",
+            ));
+        }
+    };
 
     let field_iter: Vec<(String, TokenStream, &Field)> = match fields {
         Fields::Named(named) => named
@@ -473,6 +497,9 @@ pub(crate) fn expand_mod_component_with_crate(
             }
             FieldKind::HostVec { field_ty, elem_ty } => {
                 vec::spec(&sys_crate, &member_tokens, &field_ty, &elem_ty, field_span)
+            }
+            FieldKind::FfiOption { field_ty, inner_ty } => {
+                option::spec(&sys_crate, &member_tokens, &field_ty, &inner_ty, field_span)
             }
             FieldKind::Nested {
                 ty,

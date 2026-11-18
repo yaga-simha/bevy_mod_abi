@@ -9,8 +9,8 @@
 use bevy_abi_mod_macros::{AbiPod, ModComponent};
 use bevy_abi_mod_sys::{
     ABI_VERSION, AbiPod, BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET,
-    ComponentUuid, FfiBool, FfiEntity, FfiResult, FfiSlice, ModComponent, RawInsertable, StrView,
-    read_descriptor,
+    BAM_COMPONENT_FLAG_SUMMARY_TICK, ComponentUuid, FfiBool, FfiEntity, FfiOption, FfiResult,
+    FfiSlice, ModComponent, RawInsertable, StrView, read_descriptor,
 };
 use core::ffi::c_void;
 
@@ -893,6 +893,349 @@ fn emits_c_decl_and_zig_decl_for_pod_and_non_pod_components() {
     assert!(mixed_c.contains("typedef struct MixedComponentVTable_scores_Slice {"));
     assert!(mixed_c.contains("BamBool   (*get_active)(const void* ptr);"));
     assert!(mixed_c.contains("BamStrView (*get_tag)(const void* ptr);"));
+    assert!(mixed_c.contains("size_t (*len_scores)(const void* ptr);"));
     assert!(mixed_c.contains("BamResult (*push_scores)(void* ptr, uint32_t val);"));
+    assert!(
+        mixed_c
+            .contains("BamResult (*remove_scores)(void* ptr, size_t index, uint32_t* out_elem);")
+    );
+    assert!(mixed_c.contains("BamResult (*reserve_scores)(void* ptr, size_t additional);"));
+    assert!(mixed_c.contains("uint32_t* (*as_mut_slice_scores)(void* ptr, size_t* out_len);"));
     assert!(mixed_c.contains("const void* (*ptr_position)(const void* ptr);"));
+    assert!(mixed_c.contains("#ifdef __cplusplus"));
+    assert!(mixed_c.contains("class MixedComponentView"));
+    assert!(mixed_c.contains("HostVecView"));
+    assert!(MixedComponent::ZIG_DECL.contains("MixedComponentVTable_scores_VecView"));
+    assert!(MixedComponent::ZIG_DECL.contains("pub const MixedComponentView = struct"));
+}
+
+#[test]
+fn full_host_vec_vtable_operations_and_bounds_safety() {
+    let vt = MixedComponent::vtable();
+    let mut comp = MixedComponent {
+        active: true,
+        health: 100,
+        position: Vec3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        },
+        tag: String::from("vec_ops"),
+        ticks: 1,
+        scores: vec![10, 20, 30, 40],
+        host_private_cache: None,
+    };
+    let ptr = (&raw mut comp).cast::<c_void>();
+    let c_ptr = ptr as *const c_void;
+
+    unsafe {
+        assert_eq!((vt.len_scores.unwrap())(core::ptr::null()), 0);
+        assert_eq!((vt.len_scores.unwrap())(c_ptr), 4);
+
+        // reserve (normal + OOM CAPACITY_EXCEEDED)
+        assert_eq!((vt.reserve_scores.unwrap())(ptr, 16), FfiResult::OK);
+        assert!(comp.scores.capacity() >= 20);
+        assert_eq!(
+            (vt.reserve_scores.unwrap())(ptr, usize::MAX),
+            FfiResult::CAPACITY_EXCEEDED
+        );
+
+        // remove (bounds checked -> OUT_OF_RANGE)
+        let mut removed = 0u32;
+        assert_eq!(
+            (vt.remove_scores.unwrap())(ptr, 99, &raw mut removed),
+            FfiResult::OUT_OF_RANGE
+        );
+        assert_eq!(
+            (vt.remove_scores.unwrap())(ptr, 1, core::ptr::null_mut()),
+            FfiResult::NULL_POINTER
+        );
+        assert_eq!(
+            (vt.remove_scores.unwrap())(ptr, 1, &raw mut removed),
+            FfiResult::OK
+        );
+        assert_eq!(removed, 20);
+        assert_eq!(comp.scores, vec![10, 30, 40]);
+
+        // swap_remove
+        assert_eq!(
+            (vt.swap_remove_scores.unwrap())(ptr, 10, &raw mut removed),
+            FfiResult::OUT_OF_RANGE
+        );
+        assert_eq!(
+            (vt.swap_remove_scores.unwrap())(ptr, 0, &raw mut removed),
+            FfiResult::OK
+        );
+        assert_eq!(removed, 10);
+        assert_eq!(comp.scores, vec![40, 30]);
+
+        // as_mut_slice in-place mutation
+        let mut slice_len = 0usize;
+        let mut_ptr = (vt.as_mut_slice_scores.unwrap())(ptr, &raw mut slice_len);
+        assert!(!mut_ptr.is_null());
+        assert_eq!(slice_len, 2);
+        *mut_ptr.add(0) += 5;
+        *mut_ptr.add(1) += 5;
+        assert_eq!(comp.scores, vec![45, 35]);
+        assert!((vt.as_mut_slice_scores.unwrap())(ptr, core::ptr::null_mut()).is_null());
+
+        // pop
+        let mut popped = 0u32;
+        assert_eq!(
+            (vt.pop_scores.unwrap())(ptr, &raw mut popped),
+            FfiBool::TRUE
+        );
+        assert_eq!(popped, 35);
+        assert_eq!(comp.scores, vec![45]);
+
+        // truncate + push + clear
+        assert_eq!((vt.push_scores.unwrap())(ptr, 99), FfiResult::OK);
+        assert_eq!((vt.push_scores.unwrap())(ptr, 100), FfiResult::OK);
+        assert_eq!((vt.truncate_scores.unwrap())(ptr, 2), FfiResult::OK);
+        assert_eq!(comp.scores, vec![45, 99]);
+
+        assert_eq!((vt.clear_scores.unwrap())(ptr), FfiResult::OK);
+        assert_eq!((vt.len_scores.unwrap())(c_ptr), 0);
+        assert_eq!(
+            (vt.pop_scores.unwrap())(ptr, &raw mut popped),
+            FfiBool::FALSE
+        );
+    }
+}
+
+pub type OptU64Alias = FfiOption<u64>;
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, ModComponent)]
+#[mod_component(name = "opt::TargetComponent", summary_tick, require(PodPosition))]
+pub struct TargetWithOptions {
+    pub target_id: FfiOption<u32>,
+    pub pos: FfiOption<PodPosition>,
+    #[mod_field(option(u64))]
+    pub aliased_opt: OptU64Alias,
+}
+
+#[test]
+fn ffi_option_summary_tick_and_require_metadata() {
+    const {
+        assert!(TargetWithOptions::IS_ABI_POD);
+        assert!(TargetWithOptions::IS_RAW_INSERTABLE);
+        assert!(TargetWithOptions::SUMMARY_TICK);
+        assert!(TargetWithOptions::COMPONENT_FLAGS == BAM_COMPONENT_FLAG_SUMMARY_TICK);
+        assert!(TargetWithOptions::REQUIRED_COMPONENT_NAMES.len() == 1);
+    }
+    require_abi_pod::<TargetWithOptions>();
+    assert_eq!(
+        TargetWithOptions::REQUIRED_COMPONENT_NAMES,
+        &[PodPosition::CANONICAL_NAME]
+    );
+    assert_eq!(
+        TargetWithOptions::REQUIRED_COMPONENT_UUIDS,
+        &[PodPosition::UUID]
+    );
+
+    let mut comp = TargetWithOptions {
+        target_id: FfiOption::none(),
+        pos: FfiOption::some(PodPosition {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+        }),
+        aliased_opt: FfiOption::none(),
+    };
+    let vt = TargetWithOptions::vtable();
+    let ptr = (&raw mut comp).cast::<c_void>();
+    let c_ptr = ptr as *const c_void;
+
+    unsafe {
+        assert!((vt.get_target_id.unwrap())(c_ptr).is_none());
+        assert_eq!(
+            (vt.set_target_id.unwrap())(ptr, FfiOption::some(42)),
+            FfiResult::OK
+        );
+        assert_eq!((vt.get_target_id.unwrap())(c_ptr).into_option(), Some(42));
+        assert_eq!((vt.clear_target_id.unwrap())(ptr), FfiResult::OK);
+        assert!(comp.target_id.is_none());
+
+        assert_eq!(
+            (vt.set_aliased_opt.unwrap())(ptr, FfiOption::some(9001)),
+            FfiResult::OK
+        );
+        assert_eq!(comp.aliased_opt.into_option(), Some(9001));
+        assert_eq!((vt.clear_pos.unwrap())(ptr), FfiResult::OK);
+        assert!(comp.pos.is_none());
+    }
+
+    assert!(
+        TargetWithOptions::C_DECL.contains("typedef struct TargetWithOptions_target_id_Option")
+    );
+    assert!(TargetWithOptions::C_DECL.contains("BamResult (*clear_target_id)(void* ptr);"));
+    assert!(TargetWithOptions::ZIG_DECL.contains("pub const TargetWithOptions_target_id_Option"));
+}
+
+#[repr(u8)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, ModComponent)]
+#[mod_component(name = "ai::FieldlessState")]
+pub enum FieldlessState {
+    Idle = 0,
+    Patrol = 3,
+    Alert = 7,
+}
+
+#[repr(u8)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, ModComponent)]
+#[mod_component(name = "ai::FieldlessState")]
+pub enum FieldlessStateShifted {
+    Idle = 0,
+    Patrol = 4,
+    Alert = 7,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, ModComponent)]
+#[mod_component(name = "ai::ReprCSigned")]
+pub enum ReprCSigned {
+    Error = -1,
+    Ok = 0,
+    Retry = 1,
+}
+
+#[repr(C, u8)]
+#[derive(Debug, Clone, PartialEq, ModComponent)]
+#[mod_component(name = "combat::ActionPayload", export_symbols)]
+pub enum ActionPayload {
+    Idle = 0,
+    Move { speed: f32, sprinting: bool } = 1,
+    Cast(String, Vec<u32>, FfiOption<u32>, PodPosition) = 2,
+}
+
+#[test]
+fn repr_c_fieldless_and_tagged_enums_vtable_and_schema_uuid() {
+    const {
+        assert!(!FieldlessState::IS_ABI_POD);
+        assert!(!FieldlessState::IS_RAW_INSERTABLE);
+        assert!(!ReprCSigned::IS_ABI_POD);
+        assert!(!ReprCSigned::IS_RAW_INSERTABLE);
+        assert!(!ActionPayload::IS_ABI_POD);
+        assert!(!ActionPayload::IS_RAW_INSERTABLE);
+    }
+
+    // Discriminant change produces a different deterministic schema UUID
+    assert_ne!(FieldlessState::UUID, FieldlessStateShifted::UUID);
+
+    // 1. Fieldless #[repr(u8)] enum
+    let mut state = FieldlessState::Idle;
+    let f_vt = FieldlessState::vtable();
+    let f_ptr = (&raw mut state).cast::<c_void>();
+    unsafe {
+        assert_eq!((f_vt.tag.unwrap())(f_ptr as *const c_void), 0);
+        assert_eq!((f_vt.set_patrol.unwrap())(f_ptr), FfiResult::OK);
+        assert_eq!(state, FieldlessState::Patrol);
+        assert_eq!((f_vt.tag.unwrap())(f_ptr as *const c_void), 3);
+        assert_eq!((f_vt.set_alert.unwrap())(f_ptr), FfiResult::OK);
+        assert_eq!((f_vt.tag.unwrap())(f_ptr as *const c_void), 7);
+    }
+
+    // 2. Fieldless #[repr(C)] enum with negative discriminant
+    let mut signed = ReprCSigned::Ok;
+    let s_vt = ReprCSigned::vtable();
+    let s_ptr = (&raw mut signed).cast::<c_void>();
+    unsafe {
+        assert_eq!((s_vt.tag.unwrap())(s_ptr as *const c_void), 0);
+        assert_eq!((s_vt.set_error.unwrap())(s_ptr), FfiResult::OK);
+        assert_eq!(signed, ReprCSigned::Error);
+        assert_eq!((s_vt.tag.unwrap())(s_ptr as *const c_void), -1);
+    }
+
+    // 3. Tagged #[repr(C, u8)] data enum
+    let mut action = ActionPayload::Idle;
+    let a_vt = ActionPayload::vtable();
+    let a_ptr = (&raw mut action).cast::<c_void>();
+    let a_cptr = a_ptr as *const c_void;
+    unsafe {
+        assert_eq!((a_vt.tag.unwrap())(a_cptr), 0);
+        let mut out_speed = 0.0f32;
+        assert_eq!(
+            (a_vt.try_get_move_speed.unwrap())(a_cptr, &raw mut out_speed),
+            FfiResult::INVALID_STATE
+        );
+
+        assert_eq!(
+            (a_vt.set_move.unwrap())(a_ptr, 12.5, FfiBool::TRUE),
+            FfiResult::OK
+        );
+        assert_eq!((a_vt.tag.unwrap())(a_cptr), 1);
+        let mut out_sprint = FfiBool::FALSE;
+        assert_eq!(
+            (a_vt.try_get_move_speed.unwrap())(a_cptr, &raw mut out_speed),
+            FfiResult::OK
+        );
+        assert_eq!(
+            (a_vt.try_get_move_sprinting.unwrap())(a_cptr, &raw mut out_sprint),
+            FfiResult::OK
+        );
+        assert_eq!(out_speed, 12.5);
+        assert_eq!(out_sprint, FfiBool::TRUE);
+
+        let spell_args = [10u32, 20, 30];
+        let pos = PodPosition {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+        };
+        assert_eq!(
+            (a_vt.set_cast.unwrap())(
+                a_ptr,
+                StrView::from_str("fireball"),
+                FfiSlice::from_slice(&spell_args),
+                FfiOption::some(77),
+                (&raw const pos).cast::<c_void>(),
+            ),
+            FfiResult::OK
+        );
+        assert_eq!((a_vt.tag.unwrap())(a_cptr), 2);
+
+        let mut out_str = StrView::empty();
+        assert_eq!(
+            (a_vt.try_get_cast_0.unwrap())(a_cptr, &raw mut out_str),
+            FfiResult::OK
+        );
+        assert_eq!(out_str.try_as_str().unwrap(), "fireball");
+
+        // Self-aliasing set_cast reusing existing StrView and FfiSlice must remain UB-free!
+        let mut out_slice = FfiSlice::<u32>::empty();
+        assert_eq!(
+            (a_vt.try_get_cast_1.unwrap())(a_cptr, &raw mut out_slice),
+            FfiResult::OK
+        );
+        assert_eq!(
+            (a_vt.set_cast.unwrap())(
+                a_ptr,
+                out_str,
+                out_slice,
+                FfiOption::none(),
+                (&raw const pos).cast::<c_void>(),
+            ),
+            FfiResult::OK
+        );
+        assert_eq!(
+            action,
+            ActionPayload::Cast(
+                String::from("fireball"),
+                vec![10, 20, 30],
+                FfiOption::none(),
+                pos
+            )
+        );
+    }
+
+    assert!(ActionPayload::C_DECL.contains("#define ActionPayload_Tag_Cast ((uint8_t)2)"));
+    assert!(ActionPayload::C_DECL.contains("uint8_t (*tag)(const void* ptr);"));
+    assert!(
+        ActionPayload::C_DECL
+            .contains("BamResult (*try_get_move_speed)(const void* ptr, float* out_val);")
+    );
+    assert!(ActionPayload::C_DECL.contains("class ActionPayloadView"));
+    assert!(ActionPayload::ZIG_DECL.contains("pub const ActionPayloadTag = enum(u8)"));
+    assert!(ActionPayload::ZIG_DECL.contains("pub const ActionPayloadView = struct"));
 }

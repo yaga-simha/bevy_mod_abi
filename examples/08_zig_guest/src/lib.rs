@@ -2,7 +2,7 @@
 //! Shared `#[repr(C)]` `ModComponent` types and Zig build helper for Example 08 (Zig Guest Mod).
 
 use bevy_abi_mod::prelude::*;
-use bevy_abi_mod_sys::FfiBool;
+use bevy_abi_mod_sys::{FfiBool, FfiOption, ModComponent as ModComponentTrait};
 use bevy_ecs::component::Component;
 use bevy_ecs::resource::Resource;
 use std::path::PathBuf;
@@ -69,6 +69,59 @@ impl Default for ZigSimConfig {
             pad: [0; 3],
         }
     }
+}
+
+/// Non-POD actor stats component demonstrating `Vec<u32>`, `String`, `FfiOption<u32>`, and `bool`
+/// accessed via Zig `comptime` VTable/view wrappers (`"example::ZigActorStats"`).
+#[derive(Component, Debug, Clone, Default, PartialEq, ModComponent)]
+#[mod_component(name = "example::ZigActorStats")]
+pub struct ZigActorStats {
+    /// Whether the actor is active.
+    pub active: bool,
+    /// Host-owned label.
+    pub label: String,
+    /// Host-owned score history vector.
+    pub scores: Vec<u32>,
+    /// Optional bonus points.
+    pub bonus: FfiOption<u32>,
+}
+
+/// Tagged `#[repr(C, u8)]` enum component accessed via Zig `ZigBehaviorModeView` (`"example::ZigBehaviorMode"`).
+#[repr(C, u8)]
+#[derive(Component, Debug, Clone, Default, PartialEq, ModComponent)]
+#[mod_component(name = "example::ZigBehaviorMode")]
+pub enum ZigBehaviorMode {
+    /// Idle state.
+    #[default]
+    Idle = 0,
+    /// Patrolling with speed and aggression flag.
+    Patrol {
+        /// Patrol speed.
+        speed: f32,
+        /// Aggression flag.
+        aggressive: bool,
+    } = 1,
+    /// Attacking target ID.
+    Attack(u32) = 2,
+}
+
+/// Renders `examples/08_zig_guest/zig_mod/src/generated_components.zig` from `ModComponent::ZIG_DECL`.
+pub fn render_example_zig_components() -> String {
+    let mut out = String::with_capacity(16 * 1024);
+    out.push_str("//! AUTO-GENERATED FROM `ModComponent::ZIG_DECL` — DO NOT EDIT BY HAND.\n\n");
+    out.push_str("const std = @import(\"std\");\n");
+    out.push_str("pub const bam = @cImport({\n    @cInclude(\"bevy_abi_mod.h\");\n});\n\n");
+    for decl in [
+        <Position as ModComponentTrait>::ZIG_DECL,
+        <Velocity as ModComponentTrait>::ZIG_DECL,
+        <ZigSimConfig as ModComponentTrait>::ZIG_DECL,
+        <ZigActorStats as ModComponentTrait>::ZIG_DECL,
+        <ZigBehaviorMode as ModComponentTrait>::ZIG_DECL,
+    ] {
+        out.push_str(decl);
+        out.push('\n');
+    }
+    out
 }
 
 /// Returns `true` if a `zig` compiler executable is available on `PATH`.

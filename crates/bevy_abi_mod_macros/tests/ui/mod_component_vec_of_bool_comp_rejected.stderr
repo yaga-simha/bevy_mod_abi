@@ -12,12 +12,12 @@ help: the trait `AbiPod` is not implemented for `BoolComp`
    = help: the following other types implement trait `AbiPod`:
              BamChangeTicks
              BamComponent
+             BamEventKind
              ComponentUuid
+             FfiAssetHandle
+             FfiAssetLoadState
              FfiBool
              FfiChildOf
-             FfiEntity
-             [T; N]
-             f32
            and $N others
 note: required by a bound in `assert_abi_pod`
   --> $WORKSPACE/crates/bevy_abi_mod_sys/src/traits.rs
@@ -39,12 +39,12 @@ help: the trait `AbiPod` is not implemented for `BoolComp`
    = help: the following other types implement trait `AbiPod`:
              BamChangeTicks
              BamComponent
+             BamEventKind
              ComponentUuid
+             FfiAssetHandle
+             FfiAssetLoadState
              FfiBool
              FfiChildOf
-             FfiEntity
-             [T; N]
-             f32
            and $N others
 note: required by a bound in `_::__bam_read_vec`
   --> tests/ui/mod_component_vec_of_bool_comp_rejected.rs:9:17
@@ -67,12 +67,12 @@ help: the trait `AbiPod` is not implemented for `BoolComp`
    = help: the following other types implement trait `AbiPod`:
              BamChangeTicks
              BamComponent
+             BamEventKind
              ComponentUuid
+             FfiAssetHandle
+             FfiAssetLoadState
              FfiBool
              FfiChildOf
-             FfiEntity
-             [T; N]
-             f32
            and $N others
 note: required by a bound in `_::__bam_write_vec`
   --> tests/ui/mod_component_vec_of_bool_comp_rejected.rs:9:17
@@ -95,16 +95,240 @@ help: the trait `AbiPod` is not implemented for `BoolComp`
    = help: the following other types implement trait `AbiPod`:
              BamChangeTicks
              BamComponent
+             BamEventKind
              ComponentUuid
+             FfiAssetHandle
+             FfiAssetLoadState
              FfiBool
              FfiChildOf
-             FfiEntity
-             [T; N]
-             f32
+           and $N others
+note: required by a bound in `_::__bam_len_vec`
+  --> tests/ui/mod_component_vec_of_bool_comp_rejected.rs:9:17
+   |
+ 9 | #[derive(Clone, ModComponent)]
+   |                 ^^^^^^^^^^^^ required by this bound in `__bam_len_vec`
+   = note: this error originates in the derive macro `ModComponent` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: the trait bound `BoolComp: AbiPod` is not satisfied
+  --> tests/ui/mod_component_vec_of_bool_comp_rejected.rs:11:20
+   |
+11 |     pub flags: Vec<BoolComp>,
+   |                    ^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `AbiPod` is not implemented for `BoolComp`
+  --> tests/ui/mod_component_vec_of_bool_comp_rejected.rs:5:1
+   |
+ 5 | pub struct BoolComp {
+   | ^^^^^^^^^^^^^^^^^^^
+   = help: the following other types implement trait `AbiPod`:
+             BamChangeTicks
+             BamComponent
+             BamEventKind
+             ComponentUuid
+             FfiAssetHandle
+             FfiAssetLoadState
+             FfiBool
+             FfiChildOf
+           and $N others
+note: required by a bound in `_::__bam_clear_vec`
+  --> tests/ui/mod_component_vec_of_bool_comp_rejected.rs:9:17
+   |
+ 9 | #[derive(Clone, ModComponent)]
+   |                 ^^^^^^^^^^^^ required by this bound in `__bam_clear_vec`
+   = note: this error originates in the derive macro `ModComponent` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: the trait bound `BoolComp: AbiPod` is not satisfied
+  --> tests/ui/mod_component_vec_of_bool_comp_rejected.rs:11:20
+   |
+11 |     pub flags: Vec<BoolComp>,
+   |                    ^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `AbiPod` is not implemented for `BoolComp`
+  --> tests/ui/mod_component_vec_of_bool_comp_rejected.rs:5:1
+   |
+ 5 | pub struct BoolComp {
+   | ^^^^^^^^^^^^^^^^^^^
+   = help: the following other types implement trait `AbiPod`:
+             BamChangeTicks
+             BamComponent
+             BamEventKind
+             ComponentUuid
+             FfiAssetHandle
+             FfiAssetLoadState
+             FfiBool
+             FfiChildOf
            and $N others
 note: required by a bound in `_::__bam_push_vec`
   --> tests/ui/mod_component_vec_of_bool_comp_rejected.rs:9:17
    |
  9 | #[derive(Clone, ModComponent)]
    |                 ^^^^^^^^^^^^ required by this bound in `__bam_push_vec`
+   = note: this error originates in the derive macro `ModComponent` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: the trait bound `BoolComp: AbiPod` is not satisfied
+  --> tests/ui/mod_component_vec_of_bool_comp_rejected.rs:11:20
+   |
+11 |     pub flags: Vec<BoolComp>,
+   |                    ^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `AbiPod` is not implemented for `BoolComp`
+  --> tests/ui/mod_component_vec_of_bool_comp_rejected.rs:5:1
+   |
+ 5 | pub struct BoolComp {
+   | ^^^^^^^^^^^^^^^^^^^
+   = help: the following other types implement trait `AbiPod`:
+             BamChangeTicks
+             BamComponent
+             BamEventKind
+             ComponentUuid
+             FfiAssetHandle
+             FfiAssetLoadState
+             FfiBool
+             FfiChildOf
+           and $N others
+note: required by a bound in `_::__bam_pop_vec`
+  --> tests/ui/mod_component_vec_of_bool_comp_rejected.rs:9:17
+   |
+ 9 | #[derive(Clone, ModComponent)]
+   |                 ^^^^^^^^^^^^ required by this bound in `__bam_pop_vec`
+   = note: this error originates in the derive macro `ModComponent` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: the trait bound `BoolComp: AbiPod` is not satisfied
+  --> tests/ui/mod_component_vec_of_bool_comp_rejected.rs:11:20
+   |
+11 |     pub flags: Vec<BoolComp>,
+   |                    ^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `AbiPod` is not implemented for `BoolComp`
+  --> tests/ui/mod_component_vec_of_bool_comp_rejected.rs:5:1
+   |
+ 5 | pub struct BoolComp {
+   | ^^^^^^^^^^^^^^^^^^^
+   = help: the following other types implement trait `AbiPod`:
+             BamChangeTicks
+             BamComponent
+             BamEventKind
+             ComponentUuid
+             FfiAssetHandle
+             FfiAssetLoadState
+             FfiBool
+             FfiChildOf
+           and $N others
+note: required by a bound in `_::__bam_remove_vec`
+  --> tests/ui/mod_component_vec_of_bool_comp_rejected.rs:9:17
+   |
+ 9 | #[derive(Clone, ModComponent)]
+   |                 ^^^^^^^^^^^^ required by this bound in `__bam_remove_vec`
+   = note: this error originates in the derive macro `ModComponent` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: the trait bound `BoolComp: AbiPod` is not satisfied
+  --> tests/ui/mod_component_vec_of_bool_comp_rejected.rs:11:20
+   |
+11 |     pub flags: Vec<BoolComp>,
+   |                    ^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `AbiPod` is not implemented for `BoolComp`
+  --> tests/ui/mod_component_vec_of_bool_comp_rejected.rs:5:1
+   |
+ 5 | pub struct BoolComp {
+   | ^^^^^^^^^^^^^^^^^^^
+   = help: the following other types implement trait `AbiPod`:
+             BamChangeTicks
+             BamComponent
+             BamEventKind
+             ComponentUuid
+             FfiAssetHandle
+             FfiAssetLoadState
+             FfiBool
+             FfiChildOf
+           and $N others
+note: required by a bound in `_::__bam_swap_remove_vec`
+  --> tests/ui/mod_component_vec_of_bool_comp_rejected.rs:9:17
+   |
+ 9 | #[derive(Clone, ModComponent)]
+   |                 ^^^^^^^^^^^^ required by this bound in `__bam_swap_remove_vec`
+   = note: this error originates in the derive macro `ModComponent` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: the trait bound `BoolComp: AbiPod` is not satisfied
+  --> tests/ui/mod_component_vec_of_bool_comp_rejected.rs:11:20
+   |
+11 |     pub flags: Vec<BoolComp>,
+   |                    ^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `AbiPod` is not implemented for `BoolComp`
+  --> tests/ui/mod_component_vec_of_bool_comp_rejected.rs:5:1
+   |
+ 5 | pub struct BoolComp {
+   | ^^^^^^^^^^^^^^^^^^^
+   = help: the following other types implement trait `AbiPod`:
+             BamChangeTicks
+             BamComponent
+             BamEventKind
+             ComponentUuid
+             FfiAssetHandle
+             FfiAssetLoadState
+             FfiBool
+             FfiChildOf
+           and $N others
+note: required by a bound in `_::__bam_truncate_vec`
+  --> tests/ui/mod_component_vec_of_bool_comp_rejected.rs:9:17
+   |
+ 9 | #[derive(Clone, ModComponent)]
+   |                 ^^^^^^^^^^^^ required by this bound in `__bam_truncate_vec`
+   = note: this error originates in the derive macro `ModComponent` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: the trait bound `BoolComp: AbiPod` is not satisfied
+  --> tests/ui/mod_component_vec_of_bool_comp_rejected.rs:11:20
+   |
+11 |     pub flags: Vec<BoolComp>,
+   |                    ^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `AbiPod` is not implemented for `BoolComp`
+  --> tests/ui/mod_component_vec_of_bool_comp_rejected.rs:5:1
+   |
+ 5 | pub struct BoolComp {
+   | ^^^^^^^^^^^^^^^^^^^
+   = help: the following other types implement trait `AbiPod`:
+             BamChangeTicks
+             BamComponent
+             BamEventKind
+             ComponentUuid
+             FfiAssetHandle
+             FfiAssetLoadState
+             FfiBool
+             FfiChildOf
+           and $N others
+note: required by a bound in `_::__bam_reserve_vec`
+  --> tests/ui/mod_component_vec_of_bool_comp_rejected.rs:9:17
+   |
+ 9 | #[derive(Clone, ModComponent)]
+   |                 ^^^^^^^^^^^^ required by this bound in `__bam_reserve_vec`
+   = note: this error originates in the derive macro `ModComponent` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: the trait bound `BoolComp: AbiPod` is not satisfied
+  --> tests/ui/mod_component_vec_of_bool_comp_rejected.rs:11:20
+   |
+11 |     pub flags: Vec<BoolComp>,
+   |                    ^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `AbiPod` is not implemented for `BoolComp`
+  --> tests/ui/mod_component_vec_of_bool_comp_rejected.rs:5:1
+   |
+ 5 | pub struct BoolComp {
+   | ^^^^^^^^^^^^^^^^^^^
+   = help: the following other types implement trait `AbiPod`:
+             BamChangeTicks
+             BamComponent
+             BamEventKind
+             ComponentUuid
+             FfiAssetHandle
+             FfiAssetLoadState
+             FfiBool
+             FfiChildOf
+           and $N others
+note: required by a bound in `_::__bam_as_mut_slice_vec`
+  --> tests/ui/mod_component_vec_of_bool_comp_rejected.rs:9:17
+   |
+ 9 | #[derive(Clone, ModComponent)]
+   |                 ^^^^^^^^^^^^ required by this bound in `__bam_as_mut_slice_vec`
    = note: this error originates in the derive macro `ModComponent` (in Nightly builds, run with -Z macro-backtrace for more info)

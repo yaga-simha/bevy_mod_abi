@@ -1,7 +1,7 @@
 use proc_macro_crate::FoundCrate;
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
-use syn::{Attribute, DeriveInput, Ident, LitStr, Path, Type};
+use syn::{Attribute, DeriveInput, Ident, LitStr, Path, Type, parse::Parse};
 
 /// Parsed container-level `#[mod_component(...)]` attributes.
 pub(crate) struct ComponentAttrs {
@@ -25,23 +25,93 @@ pub(crate) struct ComponentAttrs {
     pub(crate) sparse_set: bool,
     /// Sets `BAM_COMPONENT_FLAG_IMMUTABLE` on `ModComponent::COMPONENT_FLAGS`.
     pub(crate) immutable: bool,
+    /// Sets `BAM_COMPONENT_FLAG_SUMMARY_TICK` on `ModComponent::COMPONENT_FLAGS`.
+    pub(crate) summary_tick: bool,
+    /// Required component types declared via `#[mod_component(require(CompA, CompB))]`.
+    pub(crate) required_components: Vec<Path>,
 }
 
-/// Parsed `#[repr(...)]` layout flags on a struct.
-#[derive(Default, Copy, Clone)]
+/// Explicit fixed-width integer representation parsed from `#[repr(...)]`.
+#[derive(Default, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum IntRepr {
+    #[default]
+    None,
+    U8,
+    U16,
+    U32,
+    U64,
+    I8,
+    I16,
+    I32,
+    I64,
+}
+
+impl IntRepr {
+    pub(crate) fn is_some(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    pub(crate) fn rust_ty_str(self) -> &'static str {
+        match self {
+            Self::U8 => "u8",
+            Self::U16 => "u16",
+            Self::U32 => "u32",
+            Self::U64 => "u64",
+            Self::I8 => "i8",
+            Self::I16 => "i16",
+            Self::None | Self::I32 => "i32",
+            Self::I64 => "i64",
+        }
+    }
+
+    pub(crate) fn c_ty_str(self) -> &'static str {
+        match self {
+            Self::None | Self::I32 => "int32_t",
+            Self::U8 => "uint8_t",
+            Self::U16 => "uint16_t",
+            Self::U32 => "uint32_t",
+            Self::U64 => "uint64_t",
+            Self::I8 => "int8_t",
+            Self::I16 => "int16_t",
+            Self::I64 => "int64_t",
+        }
+    }
+
+    pub(crate) fn zig_ty_str(self) -> &'static str {
+        self.rust_ty_str()
+    }
+
+    pub(crate) fn fits_i128(self, value: i128) -> bool {
+        match self {
+            Self::None | Self::I32 => value >= i32::MIN as i128 && value <= i32::MAX as i128,
+            Self::U8 => value >= u8::MIN as i128 && value <= u8::MAX as i128,
+            Self::U16 => value >= u16::MIN as i128 && value <= u16::MAX as i128,
+            Self::U32 => value >= u32::MIN as i128 && value <= u32::MAX as i128,
+            Self::U64 => value >= u64::MIN as i128 && value <= u64::MAX as i128,
+            Self::I8 => value >= i8::MIN as i128 && value <= i8::MAX as i128,
+            Self::I16 => value >= i16::MIN as i128 && value <= i16::MAX as i128,
+            Self::I64 => value >= i64::MIN as i128 && value <= i64::MAX as i128,
+        }
+    }
+}
+
+/// Parsed `#[repr(...)]` layout flags on a struct or enum.
+#[derive(Default, Clone)]
 pub(crate) struct ReprFlags {
     pub(crate) has_c: bool,
     pub(crate) has_transparent: bool,
     pub(crate) has_packed: bool,
+    pub(crate) int_repr: IntRepr,
+    pub(crate) unsupported_int_repr: Option<String>,
 }
 
 impl ReprFlags {
-    pub(crate) fn is_deterministic_unpacked(self) -> bool {
+    pub(crate) fn is_deterministic_unpacked(&self) -> bool {
         (self.has_c || self.has_transparent) && !self.has_packed
     }
 }
 
-/// Inspects outer `#[repr(...)]` attributes on a struct.
+/// Inspects outer `#[repr(...)]` attributes on a struct or enum.
 pub(crate) fn parse_repr_flags(attrs: &[Attribute]) -> syn::Result<ReprFlags> {
     let mut flags = ReprFlags::default();
     for attr in attrs {
@@ -54,6 +124,37 @@ pub(crate) fn parse_repr_flags(attrs: &[Attribute]) -> syn::Result<ReprFlags> {
                 Ok(())
             } else if meta.path.is_ident("transparent") {
                 flags.has_transparent = true;
+                Ok(())
+            } else if meta.path.is_ident("u8") {
+                flags.int_repr = IntRepr::U8;
+                Ok(())
+            } else if meta.path.is_ident("u16") {
+                flags.int_repr = IntRepr::U16;
+                Ok(())
+            } else if meta.path.is_ident("u32") {
+                flags.int_repr = IntRepr::U32;
+                Ok(())
+            } else if meta.path.is_ident("u64") {
+                flags.int_repr = IntRepr::U64;
+                Ok(())
+            } else if meta.path.is_ident("i8") {
+                flags.int_repr = IntRepr::I8;
+                Ok(())
+            } else if meta.path.is_ident("i16") {
+                flags.int_repr = IntRepr::I16;
+                Ok(())
+            } else if meta.path.is_ident("i32") {
+                flags.int_repr = IntRepr::I32;
+                Ok(())
+            } else if meta.path.is_ident("i64") {
+                flags.int_repr = IntRepr::I64;
+                Ok(())
+            } else if meta.path.is_ident("usize")
+                || meta.path.is_ident("isize")
+                || meta.path.is_ident("u128")
+                || meta.path.is_ident("i128")
+            {
+                flags.unsupported_int_repr = meta.path.get_ident().map(ToString::to_string);
                 Ok(())
             } else if meta.path.is_ident("packed") {
                 flags.has_packed = true;
@@ -148,6 +249,8 @@ pub(crate) fn parse_component_attrs(input: &DeriveInput) -> syn::Result<Componen
         opaque: false,
         sparse_set: false,
         immutable: false,
+        summary_tick: false,
+        required_components: Vec::new(),
     };
 
     for attr in &input.attrs {
@@ -215,12 +318,38 @@ pub(crate) fn parse_component_attrs(input: &DeriveInput) -> syn::Result<Componen
             } else if meta.path.is_ident("immutable") {
                 attrs.immutable = true;
                 Ok(())
+            } else if meta.path.is_ident("summary_tick") {
+                attrs.summary_tick = true;
+                Ok(())
+            } else if meta.path.is_ident("require") {
+                if !meta.input.peek(syn::token::Paren) {
+                    return Err(meta.error(
+                        "`#[mod_component(require(...))]` requires a parenthesized list of component types",
+                    ));
+                }
+                let content;
+                syn::parenthesized!(content in meta.input);
+                let paths = content.parse_terminated(Path::parse, syn::Token![,])?;
+                if paths.is_empty() {
+                    return Err(meta.error(
+                        "`#[mod_component(require(...))]` requires at least one component type",
+                    ));
+                }
+                attrs.required_components.extend(paths);
+                Ok(())
             } else {
                 Err(meta.error(
-                    "unsupported `#[mod_component(...)]` attribute; expected `name = \"...\"`, `namespace = \"...\"`, `uuid = \"...\"`, `prefix = \"...\"`, `crate = ...`, `export_symbols`, `no_pod`, `opaque`, `sparse_set`, or `immutable`",
+                    "unsupported `#[mod_component(...)]` attribute; expected `name = \"...\"`, `namespace = \"...\"`, `uuid = \"...\"`, `prefix = \"...\"`, `crate = ...`, `export_symbols`, `no_pod`, `opaque`, `sparse_set`, `immutable`, `summary_tick`, or `require(...)`",
                 ))
             }
         })?;
+    }
+
+    if attrs.sparse_set && attrs.summary_tick {
+        return Err(syn::Error::new_spanned(
+            &input.ident,
+            "cannot combine `#[mod_component(sparse_set)]` with `#[mod_component(summary_tick)]` (`summary_tick` requires `Table` storage)",
+        ));
     }
 
     if attrs.custom_namespace.is_some()
@@ -324,6 +453,7 @@ pub(crate) enum FieldAttrOverride {
     Primitive,
     HostString,
     HostVec(Option<Box<Type>>),
+    FfiOption(Option<Box<Type>>),
     Nested,
 }
 
@@ -357,17 +487,48 @@ pub(crate) fn parse_field_attr(attrs: &[Attribute]) -> syn::Result<FieldAttrOver
                     result = FieldAttrOverride::HostVec(None);
                 }
                 Ok(())
+            } else if meta.path.is_ident("option") {
+                if meta.input.peek(syn::token::Paren) {
+                    let content;
+                    syn::parenthesized!(content in meta.input);
+                    let inner_ty: Type = content.parse()?;
+                    result = FieldAttrOverride::FfiOption(Some(Box::new(inner_ty)));
+                } else {
+                    result = FieldAttrOverride::FfiOption(None);
+                }
+                Ok(())
             } else if meta.path.is_ident("nested") {
                 result = FieldAttrOverride::Nested;
                 Ok(())
             } else {
                 Err(meta.error(
-                    "unsupported `#[mod_field(...)]` attribute; expected `skip`, `bool`, `primitive`, `string`, `vec`, `vec(ElemTy)`, or `nested`",
+                    "unsupported `#[mod_field(...)]` attribute; expected `skip`, `bool`, `primitive`, `string`, `vec`, `vec(ElemTy)`, `option`, `option(InnerTy)`, or `nested`",
                 ))
             }
         })?;
     }
     Ok(result)
+}
+
+/// Converts a PascalCase/CamelCase Rust identifier into `snake_case`.
+pub(crate) fn to_snake_case(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 4);
+    let chars: Vec<char> = raw.chars().collect();
+    for (i, &ch) in chars.iter().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if i > 0 {
+                let prev = chars[i - 1];
+                let next_is_lower = chars.get(i + 1).is_some_and(|n| n.is_ascii_lowercase());
+                if prev.is_ascii_lowercase() || (prev.is_ascii_uppercase() && next_is_lower) {
+                    out.push('_');
+                }
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// Sanitizes a namespace or identifier string into a valid C symbol segment,

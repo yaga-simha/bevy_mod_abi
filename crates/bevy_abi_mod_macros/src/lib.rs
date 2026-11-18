@@ -47,16 +47,21 @@
 //! - `#[mod_component(opaque)]`: Marks the struct VTable-only (`IS_RAW_INSERTABLE = false`,
 //!   `IS_ABI_POD = false`), allowing nested fields that implement `ModComponent` without
 //!   `RawInsertable`.
-//! - `#[mod_component(sparse_set)]` / `#[mod_component(immutable)]`: Populates
-//!   `ModComponent::COMPONENT_FLAGS`.
+//! - `#[mod_component(sparse_set)]` / `#[mod_component(immutable)]` /
+//!   `#[mod_component(summary_tick)]`: Populates `ModComponent::COMPONENT_FLAGS`.
+//! - `#[mod_component(require(CompA, CompB))]`: Declares compile-time verified required
+//!   `ModComponent` dependencies (`REQUIRED_COMPONENT_NAMES`, `REQUIRED_COMPONENT_UUIDS`).
 //!
 //! ### Field-Level Attributes (`#[mod_field(...)]`)
 //! - `#[mod_field(skip)]`: Skips accessor generation for host-private fields.
 //! - `#[mod_field(bool)]`: Forces `FfiBool` accessor generation (`bool` or `bool` type alias).
 //! - `#[mod_field(primitive)]`: Forces by-value primitive accessor generation.
 //! - `#[mod_field(string)]`: Forces `StrView` host-allocated `::std::string::String` accessors.
-//! - `#[mod_field(vec)]` / `#[mod_field(vec(ElemTy))]`: Forces `FfiSlice<ElemTy>` + `push_<field>`
-//!   host-allocated `::std::vec::Vec<ElemTy>` accessors (`ElemTy: AbiPod`).
+//! - `#[mod_field(vec)]` / `#[mod_field(vec(ElemTy))]`: Forces full `HostVec` VTable accessors
+//!   (`get`, `set`, `len`, `clear`, `push`, `pop`, `remove`, `swap_remove`, `truncate`, `reserve`,
+//!   `as_mut_slice`) for `::std::vec::Vec<ElemTy>` (`ElemTy: AbiPod`).
+//! - `#[mod_field(option)]` / `#[mod_field(option(InnerTy))]`: Forces `FfiOption<InnerTy>`
+//!   (`get`, `set`, `clear`) accessors (`InnerTy: AbiPod`).
 //! - `#[mod_field(nested)]`: Forces `*const c_void` / `*mut c_void` interior pointer accessors.
 
 mod abi_pod;
@@ -137,15 +142,50 @@ mod tests {
     }
 
     #[test]
-    fn rejects_enums() {
-        let input: DeriveInput = parse_quote! {
+    fn rejects_invalid_enum_reprs_and_abi_pod_enums() {
+        let rust_repr_enum: DeriveInput = parse_quote! {
             pub enum StateComp {
                 Idle,
                 Running,
             }
         };
-        let err = expand_mod_component(&input).unwrap_err();
-        assert!(err.to_string().contains("can only be applied to structs"));
+        let err = expand_mod_component(&rust_repr_enum).unwrap_err();
+        assert!(err.to_string().contains("requires `#[repr("));
+
+        let data_enum_missing_c: DeriveInput = parse_quote! {
+            #[repr(u8)]
+            pub enum MissingC {
+                Idle,
+                Move(f32),
+            }
+        };
+        let err = expand_mod_component(&data_enum_missing_c).unwrap_err();
+        assert!(err.to_string().contains("#[repr(C,"));
+
+        let empty_enum: DeriveInput = parse_quote! {
+            #[repr(u8)]
+            pub enum EmptyEnum {}
+        };
+        assert!(
+            expand_mod_component(&empty_enum)
+                .unwrap_err()
+                .to_string()
+                .contains("zero-variant")
+        );
+
+        let abi_pod_enum: DeriveInput = parse_quote! {
+            #[repr(C, u8)]
+            pub enum NotPodEnum {
+                A = 0,
+                B(u32) = 1,
+            }
+        };
+        assert!(
+            expand_abi_pod(&abi_pod_enum)
+                .unwrap_err()
+                .to_string()
+                .contains("can only be applied to structs")
+        );
     }
 
     #[test]
@@ -273,9 +313,86 @@ mod tests {
             }
         };
         let vec_ts = expand_mod_component(&vec_input).unwrap().to_string();
-        assert!(vec_ts.contains("pub get_items"));
-        assert!(vec_ts.contains("pub set_items"));
-        assert!(vec_ts.contains("pub push_items"));
+        for slot in [
+            "pub get_items",
+            "pub set_items",
+            "pub len_items",
+            "pub clear_items",
+            "pub push_items",
+            "pub pop_items",
+            "pub remove_items",
+            "pub swap_remove_items",
+            "pub truncate_items",
+            "pub reserve_items",
+            "pub as_mut_slice_items",
+        ] {
+            assert!(vec_ts.contains(slot), "missing Vec slot `{slot}`");
+        }
+    }
+
+    #[test]
+    fn supports_enums_ffi_option_summary_tick_and_require() {
+        let fieldless_enum: DeriveInput = parse_quote! {
+            #[repr(u8)]
+            pub enum AiMode {
+                Idle = 0,
+                Patrol = 2,
+            }
+        };
+        let ts_fieldless = expand_mod_component(&fieldless_enum).unwrap().to_string();
+        assert!(ts_fieldless.contains("IS_ABI_POD : bool = false"));
+        assert!(ts_fieldless.contains("IS_RAW_INSERTABLE : bool = false"));
+        assert!(ts_fieldless.contains("pub tag :"));
+        assert!(ts_fieldless.contains("pub set_idle :"));
+        assert!(ts_fieldless.contains("pub set_patrol :"));
+        assert!(!ts_fieldless.contains("unsafe impl :: bevy_abi_mod_sys :: AbiPod"));
+
+        let tagged_enum: DeriveInput = parse_quote! {
+            #[repr(C, u8)]
+            pub enum Action {
+                None = 0,
+                Move { speed: f32, active: bool } = 1,
+                Speak(String) = 2,
+            }
+        };
+        let ts_tagged = expand_mod_component(&tagged_enum).unwrap().to_string();
+        assert!(ts_tagged.contains("pub tag :"));
+        assert!(ts_tagged.contains("pub set_none :"));
+        assert!(ts_tagged.contains("pub set_move :"));
+        assert!(ts_tagged.contains("pub set_speak :"));
+        assert!(ts_tagged.contains("pub try_get_move_speed :"));
+        assert!(ts_tagged.contains("pub try_get_move_active :"));
+        assert!(ts_tagged.contains("pub try_get_speak_0 :"));
+
+        let opt_and_attrs: DeriveInput = parse_quote! {
+            #[repr(C)]
+            #[mod_component(summary_tick, require(AiMode, Action))]
+            pub struct SummaryComp {
+                pub target: FfiOption<u32>,
+            }
+        };
+        let ts_opt = expand_mod_component(&opt_and_attrs).unwrap().to_string();
+        assert!(ts_opt.contains("BAM_COMPONENT_FLAG_SUMMARY_TICK"));
+        assert!(ts_opt.contains("SUMMARY_TICK : bool = true"));
+        assert!(ts_opt.contains("REQUIRED_COMPONENT_NAMES"));
+        assert!(ts_opt.contains("REQUIRED_COMPONENT_UUIDS"));
+        assert!(ts_opt.contains("pub get_target :"));
+        assert!(ts_opt.contains("pub set_target :"));
+        assert!(ts_opt.contains("pub clear_target :"));
+        assert!(ts_opt.contains("IS_ABI_POD : bool = true"));
+
+        let bad_combo: DeriveInput = parse_quote! {
+            #[mod_component(sparse_set, summary_tick)]
+            pub struct BadCombo {
+                pub x: f32,
+            }
+        };
+        assert!(
+            expand_mod_component(&bad_combo)
+                .unwrap_err()
+                .to_string()
+                .contains("cannot combine")
+        );
     }
 
     #[test]

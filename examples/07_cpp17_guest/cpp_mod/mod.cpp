@@ -2,51 +2,35 @@
 // mod.cpp — Strict ISO C++17 Guest Mod for `bevy_abi_mod` Example 07 (`ABI 0.2.0`)
 //
 // Demonstrates:
-// 1. Exporting `bevy_abi_mod_manifest`, `bevy_abi_mod_init`, and `bevy_abi_mod_shutdown`
-//    with `BAM_EXPORT` (`extern "C"` linkage).
-// 2. Per-`World` RAII `CppModInstance` allocated with `std::make_unique` and transferred
-//    across `*instance_out` (`BamInstance*`) with zero process globals.
+// 1. Including macro-generated `example_components.h` (`ModComponent::C_DECL`) with
+//    C++17 `noexcept` RAII & typed view classes (`ActorStatsView`, `HostVecView`,
+//    `BehaviorModeView`, `bam::VTableHandle`, `bam::UniqueGuest`).
+// 2. Per-`World` RAII `CppModInstance` managed by `bam::UniqueGuest` with zero
+//    process globals.
 // 3. Catching all C++ exceptions at the `extern "C"` (`nounwind`) boundary via
 //    `try { ... } catch (...) { return BAM_RESULT_PANIC_CAUGHT; }` (`spec.md` §3.4).
 // 4. Zero-serialization contiguous SoA chunk iteration over `example::Position` and
 //    `example::Velocity` alongside `example::SimConfig` singleton resource reads.
+// 5. Optional typed VTable view mutation over `example::ActorStats` (`Vec<u32>`,
+//    `String`, `FfiOption<u32>`, `bool`) and `example::BehaviorMode` (`#[repr(C, u8)]`).
 // ============================================================================
 
-#include "../../../include/bevy_abi_mod.h"
+#include "example_components.h"
 
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 
 namespace {
 
-// Mirror of the host's `#[repr(C)]` `AbiPod` `Position` (`"example::Position"`).
-struct Position {
-    float x;
-    float y;
-    float z;
-};
+// Static layout parity checks against Rust's `#[repr(C)]` `AbiPod` structs.
 static_assert(sizeof(Position) == 12u, "Position must be 12 bytes");
 static_assert(alignof(Position) == 4u, "Position must be 4-byte aligned");
-
-// Mirror of the host's `#[repr(C)]` `AbiPod` `Velocity` (`"example::Velocity"`).
-struct Velocity {
-    float x;
-    float y;
-    float z;
-};
 static_assert(sizeof(Velocity) == 12u, "Velocity must be 12 bytes");
 static_assert(alignof(Velocity) == 4u, "Velocity must be 4-byte aligned");
-
-// Mirror of the host's `#[repr(C)]` `AbiPod` `SimConfig` resource (`"example::SimConfig"`).
-struct SimConfig {
-    float    dt;
-    float    damping;
-    BamBool  trigger_exception;
-    uint8_t  _pad[3];
-};
 static_assert(sizeof(SimConfig) == 12u, "SimConfig must be 12 bytes");
 static_assert(alignof(SimConfig) == 4u, "SimConfig must be 4-byte aligned");
 
@@ -67,6 +51,10 @@ public:
 
     CppModInstance(const CppModInstance&) = delete;
     CppModInstance& operator=(const CppModInstance&) = delete;
+
+    static void destroy(CppModInstance* ptr) noexcept {
+        delete ptr;
+    }
 
     BamResult initialize(BamLoadCtx* load_ctx) {
         if (api_.load_host_ctx == nullptr ||
@@ -121,7 +109,44 @@ public:
         sys_desc.user_data   = this;
         sys_desc.schedule    = BAM_SCHEDULE_UPDATE;
 
-        return api_.register_system(load_ctx, &sys_desc);
+        res = api_.register_system(load_ctx, &sys_desc);
+        if (res != BAM_RESULT_OK) {
+            return res;
+        }
+
+        // Optionally bind `ActorStats` + `BehaviorMode` VTables using `bam::VTableHandle`.
+        if (api_.resolve_component(host_ctx, "example::ActorStats", nullptr, &stats_comp_) == BAM_RESULT_OK &&
+            api_.resolve_component(host_ctx, "example::BehaviorMode", nullptr, &mode_comp_) == BAM_RESULT_OK) {
+            stats_vt_ = bam::VTableHandle<ActorStatsVTable>::resolve(
+                api_, host_ctx, "bam.v0.example::ActorStats.vtable");
+            mode_vt_ = bam::VTableHandle<BehaviorModeVTable>::resolve(
+                api_, host_ctx, "bam.v0.example::BehaviorMode.vtable");
+            if (!stats_vt_ || !mode_vt_) {
+                return BAM_RESULT_NOT_FOUND;
+            }
+
+            const BamTermDesc actor_terms[2] = {
+                bam_term_desc(stats_comp_, BAM_ACCESS_WRITE, 0u),
+                bam_term_desc(mode_comp_, BAM_ACCESS_WRITE, 0u),
+            };
+            BamQueryDesc actor_query{};
+            actor_query.struct_size = static_cast<uint32_t>(sizeof(BamQueryDesc));
+            actor_query.terms       = actor_terms;
+            actor_query.term_count  = 2u;
+
+            BamSystemDesc actor_sys{};
+            actor_sys.struct_size = static_cast<uint32_t>(sizeof(BamSystemDesc));
+            actor_sys.name        = "cpp17_actor_views";
+            actor_sys.queries     = &actor_query;
+            actor_sys.query_count = 1u;
+            actor_sys.callback    = &CppModInstance::actor_views_trampoline;
+            actor_sys.user_data   = this;
+            actor_sys.schedule    = BAM_SCHEDULE_UPDATE;
+
+            return api_.register_system(load_ctx, &actor_sys);
+        }
+
+        return BAM_RESULT_OK;
     }
 
 private:
@@ -134,6 +159,18 @@ private:
             return self->run_kinematics(sys_ctx);
         } catch (...) {
             // Never allow C++ exceptions to unwind across an `extern "C"` (`nounwind`) boundary!
+            return BAM_RESULT_PANIC_CAUGHT;
+        }
+    }
+
+    static BamResult actor_views_trampoline(BamSystemCtx* sys_ctx, void* user_data) noexcept {
+        if (sys_ctx == nullptr || user_data == nullptr) {
+            return BAM_RESULT_NULL_POINTER;
+        }
+        try {
+            auto* self = static_cast<CppModInstance*>(user_data);
+            return self->run_actor_views(sys_ctx);
+        } catch (...) {
             return BAM_RESULT_PANIC_CAUGHT;
         }
     }
@@ -197,11 +234,105 @@ private:
         return BAM_RESULT_OK;
     }
 
-    BamHostApi   api_{};
-    BamComponent pos_comp_{BAM_COMPONENT_INVALID};
-    BamComponent vel_comp_{BAM_COMPONENT_INVALID};
-    BamComponent cfg_res_{BAM_COMPONENT_INVALID};
+    BamResult run_actor_views(BamSystemCtx* sys_ctx) {
+        if (!stats_vt_ || !mode_vt_ || api_.iter_column_mutable == nullptr) {
+            return BAM_RESULT_NULL_POINTER;
+        }
+        BamIter* iter = nullptr;
+        BamResult res = api_.sys_query(sys_ctx, 0u, &iter);
+        if (res != BAM_RESULT_OK) {
+            return res;
+        }
+
+        BamColumnInfo stats_info{};
+        BamColumnInfo mode_info{};
+        res = api_.iter_column_info(iter, 0u, &stats_info);
+        if (res != BAM_RESULT_OK) {
+            return res;
+        }
+        res = api_.iter_column_info(iter, 1u, &mode_info);
+        if (res != BAM_RESULT_OK) {
+            return res;
+        }
+        if (stats_info.size != stats_vt_->header.size || mode_info.size != mode_vt_->header.size) {
+            return BAM_RESULT_TYPE_MISMATCH;
+        }
+
+        size_t chunk_len = 0u;
+        while (api_.iter_next_chunk(iter, &chunk_len) != BAM_FALSE) {
+            uint8_t* stats_base = api_.iter_column_mutable(iter, 0u);
+            uint8_t* mode_base  = api_.iter_column_mutable(iter, 1u);
+            if (stats_base == nullptr || mode_base == nullptr) {
+                return BAM_RESULT_NULL_POINTER;
+            }
+
+            for (size_t i = 0u; i < chunk_len; ++i) {
+                ActorStatsView stats(stats_base + i * stats_info.size, stats_vt_.raw());
+                BehaviorModeView mode(mode_base + i * mode_info.size, mode_vt_.raw());
+
+                if (!stats || !mode) {
+                    return BAM_RESULT_NULL_POINTER;
+                }
+
+                // Exercise `HostVecView` methods: reserve, push, pop, remove, swap_remove, range-for
+                auto scores = stats.scores();
+                res = scores.reserve(8u);
+                if (res != BAM_RESULT_OK) return res;
+                res = scores.push(50u);
+                if (res != BAM_RESULT_OK) return res;
+                res = scores.push(60u);
+                if (res != BAM_RESULT_OK) return res;
+
+                uint32_t popped = 0u;
+                if (!scores.pop(&popped) || popped != 60u) {
+                    return BAM_RESULT_INTERNAL_ERROR;
+                }
+
+                // Increment every score in-place via mutable range-for (`as_mut_slice`)
+                for (uint32_t& val : scores) {
+                    val += 5u;
+                }
+
+                // Update `bool`, `String`, and `FfiOption<u32>` via typed C++17 `noexcept` view
+                res = stats.set_active(true);
+                if (res != BAM_RESULT_OK) return res;
+                res = stats.set_tag("cpp17_view_updated");
+                if (res != BAM_RESULT_OK) return res;
+                res = stats.set_bonus_some(777u);
+                if (res != BAM_RESULT_OK) return res;
+
+                // Exercise tagged `#[repr(C, u8)]` enum view (`tag`, `set_patrol`, `try_get_patrol_*`)
+                if (mode.tag() == BehaviorMode_Tag_Idle) {
+                    res = mode.set_patrol(14.5f, true);
+                    if (res != BAM_RESULT_OK) return res;
+                    float speed = 0.0f;
+                    BamBool aggressive = BAM_FALSE;
+                    if (mode.try_get_patrol_speed(&speed) != BAM_RESULT_OK ||
+                        mode.try_get_patrol_aggressive(&aggressive) != BAM_RESULT_OK ||
+                        speed != 14.5f || aggressive == BAM_FALSE) {
+                        return BAM_RESULT_INTERNAL_ERROR;
+                    }
+                } else {
+                    res = mode.set_attack(99u);
+                    if (res != BAM_RESULT_OK) return res;
+                }
+            }
+        }
+
+        return BAM_RESULT_OK;
+    }
+
+    BamHostApi                            api_{};
+    BamComponent                          pos_comp_{BAM_COMPONENT_INVALID};
+    BamComponent                          vel_comp_{BAM_COMPONENT_INVALID};
+    BamComponent                          cfg_res_{BAM_COMPONENT_INVALID};
+    BamComponent                          stats_comp_{BAM_COMPONENT_INVALID};
+    BamComponent                          mode_comp_{BAM_COMPONENT_INVALID};
+    bam::VTableHandle<ActorStatsVTable>   stats_vt_{};
+    bam::VTableHandle<BehaviorModeVTable> mode_vt_{};
 };
+
+using UniqueCppInstance = bam::UniqueGuest<CppModInstance, &CppModInstance::destroy>;
 
 } // namespace
 
@@ -226,10 +357,9 @@ BAM_EXPORT BamResult bevy_abi_mod_init(
             return copy_res;
         }
 
-        auto instance = std::make_unique<CppModInstance>(local_api);
+        UniqueCppInstance instance(new CppModInstance(local_api));
         const BamResult init_res = instance->initialize(load_ctx);
         if (init_res != BAM_RESULT_OK) {
-            // RAII `std::unique_ptr` frees `CppModInstance` on the C++ guest heap automatically.
             return init_res;
         }
 
@@ -245,8 +375,8 @@ BAM_EXPORT void bevy_abi_mod_shutdown(BamInstance* instance) {
         return;
     }
     try {
-        auto* typed = reinterpret_cast<CppModInstance*>(instance);
-        delete typed;
+        UniqueCppInstance owned(reinterpret_cast<CppModInstance*>(instance));
+        owned.reset();
     } catch (...) {
         // Destructors are `noexcept` in C++17, but guard unconditionally across `extern "C"`.
     }

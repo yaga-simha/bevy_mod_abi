@@ -38,6 +38,296 @@ BAM_STATIC_ASSERT(sizeof(PositionVTable) == 88u, positionvtable_size64);
 #elif UINTPTR_MAX == UINT32_MAX
 BAM_STATIC_ASSERT(sizeof(PositionVTable) == 56u, positionvtable_size32);
 #endif
+#ifdef __cplusplus
+extern "C++" {
+namespace bam {
+#ifndef BAM_CPP17_SDK_HELPERS_DEFINED
+#define BAM_CPP17_SDK_HELPERS_DEFINED
+
+template <typename VT>
+inline const VT* resolve_vtable(
+    const BamHostApi& api,
+    const BamHostCtx* host_ctx,
+    const char* symbol,
+    BamResult* out_err = nullptr
+) noexcept {
+    if (api.get_proc_address == nullptr || host_ctx == nullptr || symbol == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NULL_POINTER;
+        }
+        return nullptr;
+    }
+    const void* raw = api.get_proc_address(host_ctx, symbol);
+    if (raw == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NOT_FOUND;
+        }
+        return nullptr;
+    }
+    const auto* hdr = static_cast<const BamVTableHeader*>(raw);
+    if (hdr->struct_size < static_cast<uint32_t>(sizeof(VT)) ||
+        bam_version_is_compatible(BAM_ABI_VERSION, hdr->abi_version) == BAM_FALSE) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_INVALID_VERSION;
+        }
+        return nullptr;
+    }
+    if (out_err != nullptr) {
+        *out_err = BAM_RESULT_OK;
+    }
+    return static_cast<const VT*>(raw);
+}
+
+template <typename VT>
+class VTableHandle {
+public:
+    VTableHandle() noexcept = default;
+    explicit VTableHandle(const VT* ptr) noexcept : ptr_(ptr) {}
+
+    static VTableHandle resolve(
+        const BamHostApi& api,
+        const BamHostCtx* host_ctx,
+        const char* symbol,
+        BamResult* out_err = nullptr
+    ) noexcept {
+        return VTableHandle(resolve_vtable<VT>(api, host_ctx, symbol, out_err));
+    }
+
+    bool valid() const noexcept { return ptr_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const VT* raw() const noexcept { return ptr_; }
+    const VT* operator->() const noexcept { return ptr_; }
+
+private:
+    const VT* ptr_{nullptr};
+};
+
+template <typename InstanceT, void (*DestroyFn)(InstanceT*)>
+class UniqueGuest {
+public:
+    UniqueGuest() noexcept = default;
+    explicit UniqueGuest(InstanceT* ptr) noexcept : ptr_(ptr) {}
+    ~UniqueGuest() noexcept { reset(); }
+
+    UniqueGuest(const UniqueGuest&) = delete;
+    UniqueGuest& operator=(const UniqueGuest&) = delete;
+
+    UniqueGuest(UniqueGuest&& other) noexcept : ptr_(other.release()) {}
+    UniqueGuest& operator=(UniqueGuest&& other) noexcept {
+        if (this != &other) {
+            reset(other.release());
+        }
+        return *this;
+    }
+
+    InstanceT* get() const noexcept { return ptr_; }
+    InstanceT* operator->() const noexcept { return ptr_; }
+    InstanceT& operator*() const noexcept { return *ptr_; }
+    explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+    InstanceT* release() noexcept {
+        InstanceT* tmp = ptr_;
+        ptr_ = nullptr;
+        return tmp;
+    }
+
+    void reset(InstanceT* next = nullptr) noexcept {
+        if (ptr_ != nullptr && DestroyFn != nullptr) {
+            DestroyFn(ptr_);
+        }
+        ptr_ = next;
+    }
+
+private:
+    InstanceT* ptr_{nullptr};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class HostVecView {
+public:
+    HostVecView(void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.valid(); }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+
+    Elem* data_mut(size_t* out_len = nullptr) noexcept {
+        size_t local_len = 0u;
+        size_t* len_ptr = out_len != nullptr ? out_len : &local_len;
+        if (ptr_ == nullptr || ops_.as_mut_slice == nullptr) {
+            *len_ptr = 0u;
+            return nullptr;
+        }
+        return ops_.as_mut_slice(ptr_, len_ptr);
+    }
+
+    BamResult set(const Elem* ptr, size_t count) noexcept {
+        if (ptr_ == nullptr || ops_.set == nullptr) {
+            return BAM_RESULT_NULL_POINTER;
+        }
+        return ops_.set(ptr_, SliceTy{ptr, count});
+    }
+
+    BamResult clear() noexcept {
+        return (ptr_ != nullptr && ops_.clear != nullptr) ? ops_.clear(ptr_) : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult push(Elem val) noexcept {
+        return (ptr_ != nullptr && ops_.push != nullptr) ? ops_.push(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+
+    bool pop(Elem* out_elem) noexcept {
+        if (ptr_ == nullptr || ops_.pop == nullptr) {
+            return false;
+        }
+        return ops_.pop(ptr_, out_elem) != BAM_FALSE;
+    }
+
+    BamResult remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.remove != nullptr)
+            ? ops_.remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult swap_remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.swap_remove != nullptr)
+            ? ops_.swap_remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult truncate(size_t new_len) noexcept {
+        return (ptr_ != nullptr && ops_.truncate != nullptr)
+            ? ops_.truncate(ptr_, new_len)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult reserve(size_t additional) noexcept {
+        return (ptr_ != nullptr && ops_.reserve != nullptr)
+            ? ops_.reserve(ptr_, additional)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+    Elem* begin() noexcept { return data_mut(nullptr); }
+    Elem* end() noexcept {
+        size_t n = 0u;
+        Elem* p = data_mut(&n);
+        return p != nullptr ? (p + n) : nullptr;
+    }
+
+private:
+    void* ptr_{nullptr};
+    Ops   ops_{};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class ConstHostVecView {
+public:
+    ConstHostVecView(const void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.get != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+private:
+    const void* ptr_{nullptr};
+    Ops         ops_{};
+};
+
+#endif /* BAM_CPP17_SDK_HELPERS_DEFINED */
+} // namespace bam
+class PositionConstView {
+public:
+    PositionConstView() noexcept = default;
+    PositionConstView(const void* ptr, const PositionVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const void* raw() const noexcept { return ptr_; }
+    const PositionVTable* vtable() const noexcept { return vt_; }
+    float get_x() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_x != nullptr) ? vt_->get_x(ptr_) : float{};
+    }
+    float get_y() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_y != nullptr) ? vt_->get_y(ptr_) : float{};
+    }
+    float get_z() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_z != nullptr) ? vt_->get_z(ptr_) : float{};
+    }
+private:
+    const void* ptr_{nullptr};
+    const PositionVTable* vt_{nullptr};
+};
+
+class PositionView {
+public:
+    PositionView() noexcept = default;
+    PositionView(void* ptr, const PositionVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    void* raw() const noexcept { return ptr_; }
+    const PositionVTable* vtable() const noexcept { return vt_; }
+    PositionConstView as_const() const noexcept { return PositionConstView(ptr_, vt_); }
+    float get_x() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_x != nullptr) ? vt_->get_x(ptr_) : float{};
+    }
+    BamResult set_x(float val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_x != nullptr) ? vt_->set_x(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+    float get_y() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_y != nullptr) ? vt_->get_y(ptr_) : float{};
+    }
+    BamResult set_y(float val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_y != nullptr) ? vt_->set_y(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+    float get_z() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_z != nullptr) ? vt_->get_z(ptr_) : float{};
+    }
+    BamResult set_z(float val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_z != nullptr) ? vt_->set_z(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+private:
+    void* ptr_{nullptr};
+    const PositionVTable* vt_{nullptr};
+};
+
+} // extern "C++"
+#endif /* __cplusplus */
 
 /* Component: `testbed::Velocity` (IS_ABI_POD = true) */
 typedef struct Velocity {
@@ -61,6 +351,296 @@ BAM_STATIC_ASSERT(sizeof(VelocityVTable) == 88u, velocityvtable_size64);
 #elif UINTPTR_MAX == UINT32_MAX
 BAM_STATIC_ASSERT(sizeof(VelocityVTable) == 56u, velocityvtable_size32);
 #endif
+#ifdef __cplusplus
+extern "C++" {
+namespace bam {
+#ifndef BAM_CPP17_SDK_HELPERS_DEFINED
+#define BAM_CPP17_SDK_HELPERS_DEFINED
+
+template <typename VT>
+inline const VT* resolve_vtable(
+    const BamHostApi& api,
+    const BamHostCtx* host_ctx,
+    const char* symbol,
+    BamResult* out_err = nullptr
+) noexcept {
+    if (api.get_proc_address == nullptr || host_ctx == nullptr || symbol == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NULL_POINTER;
+        }
+        return nullptr;
+    }
+    const void* raw = api.get_proc_address(host_ctx, symbol);
+    if (raw == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NOT_FOUND;
+        }
+        return nullptr;
+    }
+    const auto* hdr = static_cast<const BamVTableHeader*>(raw);
+    if (hdr->struct_size < static_cast<uint32_t>(sizeof(VT)) ||
+        bam_version_is_compatible(BAM_ABI_VERSION, hdr->abi_version) == BAM_FALSE) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_INVALID_VERSION;
+        }
+        return nullptr;
+    }
+    if (out_err != nullptr) {
+        *out_err = BAM_RESULT_OK;
+    }
+    return static_cast<const VT*>(raw);
+}
+
+template <typename VT>
+class VTableHandle {
+public:
+    VTableHandle() noexcept = default;
+    explicit VTableHandle(const VT* ptr) noexcept : ptr_(ptr) {}
+
+    static VTableHandle resolve(
+        const BamHostApi& api,
+        const BamHostCtx* host_ctx,
+        const char* symbol,
+        BamResult* out_err = nullptr
+    ) noexcept {
+        return VTableHandle(resolve_vtable<VT>(api, host_ctx, symbol, out_err));
+    }
+
+    bool valid() const noexcept { return ptr_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const VT* raw() const noexcept { return ptr_; }
+    const VT* operator->() const noexcept { return ptr_; }
+
+private:
+    const VT* ptr_{nullptr};
+};
+
+template <typename InstanceT, void (*DestroyFn)(InstanceT*)>
+class UniqueGuest {
+public:
+    UniqueGuest() noexcept = default;
+    explicit UniqueGuest(InstanceT* ptr) noexcept : ptr_(ptr) {}
+    ~UniqueGuest() noexcept { reset(); }
+
+    UniqueGuest(const UniqueGuest&) = delete;
+    UniqueGuest& operator=(const UniqueGuest&) = delete;
+
+    UniqueGuest(UniqueGuest&& other) noexcept : ptr_(other.release()) {}
+    UniqueGuest& operator=(UniqueGuest&& other) noexcept {
+        if (this != &other) {
+            reset(other.release());
+        }
+        return *this;
+    }
+
+    InstanceT* get() const noexcept { return ptr_; }
+    InstanceT* operator->() const noexcept { return ptr_; }
+    InstanceT& operator*() const noexcept { return *ptr_; }
+    explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+    InstanceT* release() noexcept {
+        InstanceT* tmp = ptr_;
+        ptr_ = nullptr;
+        return tmp;
+    }
+
+    void reset(InstanceT* next = nullptr) noexcept {
+        if (ptr_ != nullptr && DestroyFn != nullptr) {
+            DestroyFn(ptr_);
+        }
+        ptr_ = next;
+    }
+
+private:
+    InstanceT* ptr_{nullptr};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class HostVecView {
+public:
+    HostVecView(void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.valid(); }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+
+    Elem* data_mut(size_t* out_len = nullptr) noexcept {
+        size_t local_len = 0u;
+        size_t* len_ptr = out_len != nullptr ? out_len : &local_len;
+        if (ptr_ == nullptr || ops_.as_mut_slice == nullptr) {
+            *len_ptr = 0u;
+            return nullptr;
+        }
+        return ops_.as_mut_slice(ptr_, len_ptr);
+    }
+
+    BamResult set(const Elem* ptr, size_t count) noexcept {
+        if (ptr_ == nullptr || ops_.set == nullptr) {
+            return BAM_RESULT_NULL_POINTER;
+        }
+        return ops_.set(ptr_, SliceTy{ptr, count});
+    }
+
+    BamResult clear() noexcept {
+        return (ptr_ != nullptr && ops_.clear != nullptr) ? ops_.clear(ptr_) : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult push(Elem val) noexcept {
+        return (ptr_ != nullptr && ops_.push != nullptr) ? ops_.push(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+
+    bool pop(Elem* out_elem) noexcept {
+        if (ptr_ == nullptr || ops_.pop == nullptr) {
+            return false;
+        }
+        return ops_.pop(ptr_, out_elem) != BAM_FALSE;
+    }
+
+    BamResult remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.remove != nullptr)
+            ? ops_.remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult swap_remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.swap_remove != nullptr)
+            ? ops_.swap_remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult truncate(size_t new_len) noexcept {
+        return (ptr_ != nullptr && ops_.truncate != nullptr)
+            ? ops_.truncate(ptr_, new_len)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult reserve(size_t additional) noexcept {
+        return (ptr_ != nullptr && ops_.reserve != nullptr)
+            ? ops_.reserve(ptr_, additional)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+    Elem* begin() noexcept { return data_mut(nullptr); }
+    Elem* end() noexcept {
+        size_t n = 0u;
+        Elem* p = data_mut(&n);
+        return p != nullptr ? (p + n) : nullptr;
+    }
+
+private:
+    void* ptr_{nullptr};
+    Ops   ops_{};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class ConstHostVecView {
+public:
+    ConstHostVecView(const void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.get != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+private:
+    const void* ptr_{nullptr};
+    Ops         ops_{};
+};
+
+#endif /* BAM_CPP17_SDK_HELPERS_DEFINED */
+} // namespace bam
+class VelocityConstView {
+public:
+    VelocityConstView() noexcept = default;
+    VelocityConstView(const void* ptr, const VelocityVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const void* raw() const noexcept { return ptr_; }
+    const VelocityVTable* vtable() const noexcept { return vt_; }
+    float get_x() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_x != nullptr) ? vt_->get_x(ptr_) : float{};
+    }
+    float get_y() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_y != nullptr) ? vt_->get_y(ptr_) : float{};
+    }
+    float get_z() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_z != nullptr) ? vt_->get_z(ptr_) : float{};
+    }
+private:
+    const void* ptr_{nullptr};
+    const VelocityVTable* vt_{nullptr};
+};
+
+class VelocityView {
+public:
+    VelocityView() noexcept = default;
+    VelocityView(void* ptr, const VelocityVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    void* raw() const noexcept { return ptr_; }
+    const VelocityVTable* vtable() const noexcept { return vt_; }
+    VelocityConstView as_const() const noexcept { return VelocityConstView(ptr_, vt_); }
+    float get_x() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_x != nullptr) ? vt_->get_x(ptr_) : float{};
+    }
+    BamResult set_x(float val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_x != nullptr) ? vt_->set_x(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+    float get_y() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_y != nullptr) ? vt_->get_y(ptr_) : float{};
+    }
+    BamResult set_y(float val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_y != nullptr) ? vt_->set_y(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+    float get_z() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_z != nullptr) ? vt_->get_z(ptr_) : float{};
+    }
+    BamResult set_z(float val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_z != nullptr) ? vt_->set_z(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+private:
+    void* ptr_{nullptr};
+    const VelocityVTable* vt_{nullptr};
+};
+
+} // extern "C++"
+#endif /* __cplusplus */
 
 /* Component: `testbed::CombatHealth` (IS_ABI_POD = true) */
 typedef struct CombatHealth {
@@ -81,6 +661,287 @@ BAM_STATIC_ASSERT(sizeof(CombatHealthVTable) == 72u, combathealthvtable_size64);
 #elif UINTPTR_MAX == UINT32_MAX
 BAM_STATIC_ASSERT(sizeof(CombatHealthVTable) == 48u, combathealthvtable_size32);
 #endif
+#ifdef __cplusplus
+extern "C++" {
+namespace bam {
+#ifndef BAM_CPP17_SDK_HELPERS_DEFINED
+#define BAM_CPP17_SDK_HELPERS_DEFINED
+
+template <typename VT>
+inline const VT* resolve_vtable(
+    const BamHostApi& api,
+    const BamHostCtx* host_ctx,
+    const char* symbol,
+    BamResult* out_err = nullptr
+) noexcept {
+    if (api.get_proc_address == nullptr || host_ctx == nullptr || symbol == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NULL_POINTER;
+        }
+        return nullptr;
+    }
+    const void* raw = api.get_proc_address(host_ctx, symbol);
+    if (raw == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NOT_FOUND;
+        }
+        return nullptr;
+    }
+    const auto* hdr = static_cast<const BamVTableHeader*>(raw);
+    if (hdr->struct_size < static_cast<uint32_t>(sizeof(VT)) ||
+        bam_version_is_compatible(BAM_ABI_VERSION, hdr->abi_version) == BAM_FALSE) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_INVALID_VERSION;
+        }
+        return nullptr;
+    }
+    if (out_err != nullptr) {
+        *out_err = BAM_RESULT_OK;
+    }
+    return static_cast<const VT*>(raw);
+}
+
+template <typename VT>
+class VTableHandle {
+public:
+    VTableHandle() noexcept = default;
+    explicit VTableHandle(const VT* ptr) noexcept : ptr_(ptr) {}
+
+    static VTableHandle resolve(
+        const BamHostApi& api,
+        const BamHostCtx* host_ctx,
+        const char* symbol,
+        BamResult* out_err = nullptr
+    ) noexcept {
+        return VTableHandle(resolve_vtable<VT>(api, host_ctx, symbol, out_err));
+    }
+
+    bool valid() const noexcept { return ptr_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const VT* raw() const noexcept { return ptr_; }
+    const VT* operator->() const noexcept { return ptr_; }
+
+private:
+    const VT* ptr_{nullptr};
+};
+
+template <typename InstanceT, void (*DestroyFn)(InstanceT*)>
+class UniqueGuest {
+public:
+    UniqueGuest() noexcept = default;
+    explicit UniqueGuest(InstanceT* ptr) noexcept : ptr_(ptr) {}
+    ~UniqueGuest() noexcept { reset(); }
+
+    UniqueGuest(const UniqueGuest&) = delete;
+    UniqueGuest& operator=(const UniqueGuest&) = delete;
+
+    UniqueGuest(UniqueGuest&& other) noexcept : ptr_(other.release()) {}
+    UniqueGuest& operator=(UniqueGuest&& other) noexcept {
+        if (this != &other) {
+            reset(other.release());
+        }
+        return *this;
+    }
+
+    InstanceT* get() const noexcept { return ptr_; }
+    InstanceT* operator->() const noexcept { return ptr_; }
+    InstanceT& operator*() const noexcept { return *ptr_; }
+    explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+    InstanceT* release() noexcept {
+        InstanceT* tmp = ptr_;
+        ptr_ = nullptr;
+        return tmp;
+    }
+
+    void reset(InstanceT* next = nullptr) noexcept {
+        if (ptr_ != nullptr && DestroyFn != nullptr) {
+            DestroyFn(ptr_);
+        }
+        ptr_ = next;
+    }
+
+private:
+    InstanceT* ptr_{nullptr};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class HostVecView {
+public:
+    HostVecView(void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.valid(); }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+
+    Elem* data_mut(size_t* out_len = nullptr) noexcept {
+        size_t local_len = 0u;
+        size_t* len_ptr = out_len != nullptr ? out_len : &local_len;
+        if (ptr_ == nullptr || ops_.as_mut_slice == nullptr) {
+            *len_ptr = 0u;
+            return nullptr;
+        }
+        return ops_.as_mut_slice(ptr_, len_ptr);
+    }
+
+    BamResult set(const Elem* ptr, size_t count) noexcept {
+        if (ptr_ == nullptr || ops_.set == nullptr) {
+            return BAM_RESULT_NULL_POINTER;
+        }
+        return ops_.set(ptr_, SliceTy{ptr, count});
+    }
+
+    BamResult clear() noexcept {
+        return (ptr_ != nullptr && ops_.clear != nullptr) ? ops_.clear(ptr_) : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult push(Elem val) noexcept {
+        return (ptr_ != nullptr && ops_.push != nullptr) ? ops_.push(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+
+    bool pop(Elem* out_elem) noexcept {
+        if (ptr_ == nullptr || ops_.pop == nullptr) {
+            return false;
+        }
+        return ops_.pop(ptr_, out_elem) != BAM_FALSE;
+    }
+
+    BamResult remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.remove != nullptr)
+            ? ops_.remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult swap_remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.swap_remove != nullptr)
+            ? ops_.swap_remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult truncate(size_t new_len) noexcept {
+        return (ptr_ != nullptr && ops_.truncate != nullptr)
+            ? ops_.truncate(ptr_, new_len)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult reserve(size_t additional) noexcept {
+        return (ptr_ != nullptr && ops_.reserve != nullptr)
+            ? ops_.reserve(ptr_, additional)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+    Elem* begin() noexcept { return data_mut(nullptr); }
+    Elem* end() noexcept {
+        size_t n = 0u;
+        Elem* p = data_mut(&n);
+        return p != nullptr ? (p + n) : nullptr;
+    }
+
+private:
+    void* ptr_{nullptr};
+    Ops   ops_{};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class ConstHostVecView {
+public:
+    ConstHostVecView(const void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.get != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+private:
+    const void* ptr_{nullptr};
+    Ops         ops_{};
+};
+
+#endif /* BAM_CPP17_SDK_HELPERS_DEFINED */
+} // namespace bam
+class CombatHealthConstView {
+public:
+    CombatHealthConstView() noexcept = default;
+    CombatHealthConstView(const void* ptr, const CombatHealthVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const void* raw() const noexcept { return ptr_; }
+    const CombatHealthVTable* vtable() const noexcept { return vt_; }
+    int32_t get_current() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_current != nullptr) ? vt_->get_current(ptr_) : int32_t{};
+    }
+    int32_t get_max() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_max != nullptr) ? vt_->get_max(ptr_) : int32_t{};
+    }
+private:
+    const void* ptr_{nullptr};
+    const CombatHealthVTable* vt_{nullptr};
+};
+
+class CombatHealthView {
+public:
+    CombatHealthView() noexcept = default;
+    CombatHealthView(void* ptr, const CombatHealthVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    void* raw() const noexcept { return ptr_; }
+    const CombatHealthVTable* vtable() const noexcept { return vt_; }
+    CombatHealthConstView as_const() const noexcept { return CombatHealthConstView(ptr_, vt_); }
+    int32_t get_current() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_current != nullptr) ? vt_->get_current(ptr_) : int32_t{};
+    }
+    BamResult set_current(int32_t val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_current != nullptr) ? vt_->set_current(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+    int32_t get_max() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_max != nullptr) ? vt_->get_max(ptr_) : int32_t{};
+    }
+    BamResult set_max(int32_t val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_max != nullptr) ? vt_->set_max(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+private:
+    void* ptr_{nullptr};
+    const CombatHealthVTable* vt_{nullptr};
+};
+
+} // extern "C++"
+#endif /* __cplusplus */
 
 /* Component: `testbed::NameTag` (IS_ABI_POD = false) */
 typedef struct NameTag NameTag;
@@ -96,6 +957,282 @@ BAM_STATIC_ASSERT(sizeof(NameTagVTable) == 56u, nametagvtable_size64);
 #elif UINTPTR_MAX == UINT32_MAX
 BAM_STATIC_ASSERT(sizeof(NameTagVTable) == 40u, nametagvtable_size32);
 #endif
+#ifdef __cplusplus
+extern "C++" {
+namespace bam {
+#ifndef BAM_CPP17_SDK_HELPERS_DEFINED
+#define BAM_CPP17_SDK_HELPERS_DEFINED
+
+template <typename VT>
+inline const VT* resolve_vtable(
+    const BamHostApi& api,
+    const BamHostCtx* host_ctx,
+    const char* symbol,
+    BamResult* out_err = nullptr
+) noexcept {
+    if (api.get_proc_address == nullptr || host_ctx == nullptr || symbol == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NULL_POINTER;
+        }
+        return nullptr;
+    }
+    const void* raw = api.get_proc_address(host_ctx, symbol);
+    if (raw == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NOT_FOUND;
+        }
+        return nullptr;
+    }
+    const auto* hdr = static_cast<const BamVTableHeader*>(raw);
+    if (hdr->struct_size < static_cast<uint32_t>(sizeof(VT)) ||
+        bam_version_is_compatible(BAM_ABI_VERSION, hdr->abi_version) == BAM_FALSE) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_INVALID_VERSION;
+        }
+        return nullptr;
+    }
+    if (out_err != nullptr) {
+        *out_err = BAM_RESULT_OK;
+    }
+    return static_cast<const VT*>(raw);
+}
+
+template <typename VT>
+class VTableHandle {
+public:
+    VTableHandle() noexcept = default;
+    explicit VTableHandle(const VT* ptr) noexcept : ptr_(ptr) {}
+
+    static VTableHandle resolve(
+        const BamHostApi& api,
+        const BamHostCtx* host_ctx,
+        const char* symbol,
+        BamResult* out_err = nullptr
+    ) noexcept {
+        return VTableHandle(resolve_vtable<VT>(api, host_ctx, symbol, out_err));
+    }
+
+    bool valid() const noexcept { return ptr_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const VT* raw() const noexcept { return ptr_; }
+    const VT* operator->() const noexcept { return ptr_; }
+
+private:
+    const VT* ptr_{nullptr};
+};
+
+template <typename InstanceT, void (*DestroyFn)(InstanceT*)>
+class UniqueGuest {
+public:
+    UniqueGuest() noexcept = default;
+    explicit UniqueGuest(InstanceT* ptr) noexcept : ptr_(ptr) {}
+    ~UniqueGuest() noexcept { reset(); }
+
+    UniqueGuest(const UniqueGuest&) = delete;
+    UniqueGuest& operator=(const UniqueGuest&) = delete;
+
+    UniqueGuest(UniqueGuest&& other) noexcept : ptr_(other.release()) {}
+    UniqueGuest& operator=(UniqueGuest&& other) noexcept {
+        if (this != &other) {
+            reset(other.release());
+        }
+        return *this;
+    }
+
+    InstanceT* get() const noexcept { return ptr_; }
+    InstanceT* operator->() const noexcept { return ptr_; }
+    InstanceT& operator*() const noexcept { return *ptr_; }
+    explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+    InstanceT* release() noexcept {
+        InstanceT* tmp = ptr_;
+        ptr_ = nullptr;
+        return tmp;
+    }
+
+    void reset(InstanceT* next = nullptr) noexcept {
+        if (ptr_ != nullptr && DestroyFn != nullptr) {
+            DestroyFn(ptr_);
+        }
+        ptr_ = next;
+    }
+
+private:
+    InstanceT* ptr_{nullptr};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class HostVecView {
+public:
+    HostVecView(void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.valid(); }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+
+    Elem* data_mut(size_t* out_len = nullptr) noexcept {
+        size_t local_len = 0u;
+        size_t* len_ptr = out_len != nullptr ? out_len : &local_len;
+        if (ptr_ == nullptr || ops_.as_mut_slice == nullptr) {
+            *len_ptr = 0u;
+            return nullptr;
+        }
+        return ops_.as_mut_slice(ptr_, len_ptr);
+    }
+
+    BamResult set(const Elem* ptr, size_t count) noexcept {
+        if (ptr_ == nullptr || ops_.set == nullptr) {
+            return BAM_RESULT_NULL_POINTER;
+        }
+        return ops_.set(ptr_, SliceTy{ptr, count});
+    }
+
+    BamResult clear() noexcept {
+        return (ptr_ != nullptr && ops_.clear != nullptr) ? ops_.clear(ptr_) : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult push(Elem val) noexcept {
+        return (ptr_ != nullptr && ops_.push != nullptr) ? ops_.push(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+
+    bool pop(Elem* out_elem) noexcept {
+        if (ptr_ == nullptr || ops_.pop == nullptr) {
+            return false;
+        }
+        return ops_.pop(ptr_, out_elem) != BAM_FALSE;
+    }
+
+    BamResult remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.remove != nullptr)
+            ? ops_.remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult swap_remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.swap_remove != nullptr)
+            ? ops_.swap_remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult truncate(size_t new_len) noexcept {
+        return (ptr_ != nullptr && ops_.truncate != nullptr)
+            ? ops_.truncate(ptr_, new_len)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult reserve(size_t additional) noexcept {
+        return (ptr_ != nullptr && ops_.reserve != nullptr)
+            ? ops_.reserve(ptr_, additional)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+    Elem* begin() noexcept { return data_mut(nullptr); }
+    Elem* end() noexcept {
+        size_t n = 0u;
+        Elem* p = data_mut(&n);
+        return p != nullptr ? (p + n) : nullptr;
+    }
+
+private:
+    void* ptr_{nullptr};
+    Ops   ops_{};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class ConstHostVecView {
+public:
+    ConstHostVecView(const void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.get != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+private:
+    const void* ptr_{nullptr};
+    Ops         ops_{};
+};
+
+#endif /* BAM_CPP17_SDK_HELPERS_DEFINED */
+} // namespace bam
+class NameTagConstView {
+public:
+    NameTagConstView() noexcept = default;
+    NameTagConstView(const void* ptr, const NameTagVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const void* raw() const noexcept { return ptr_; }
+    const NameTagVTable* vtable() const noexcept { return vt_; }
+    BamStrView get_label() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_label != nullptr) ? vt_->get_label(ptr_) : BamStrView{nullptr, 0u};
+    }
+private:
+    const void* ptr_{nullptr};
+    const NameTagVTable* vt_{nullptr};
+};
+
+class NameTagView {
+public:
+    NameTagView() noexcept = default;
+    NameTagView(void* ptr, const NameTagVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    void* raw() const noexcept { return ptr_; }
+    const NameTagVTable* vtable() const noexcept { return vt_; }
+    NameTagConstView as_const() const noexcept { return NameTagConstView(ptr_, vt_); }
+    BamStrView get_label() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_label != nullptr) ? vt_->get_label(ptr_) : BamStrView{nullptr, 0u};
+    }
+    BamResult set_label(BamStrView view) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_label != nullptr) ? vt_->set_label(ptr_, view) : BAM_RESULT_NULL_POINTER;
+    }
+    BamResult set_label(const char* cstr) noexcept {
+        const BamStrView view{reinterpret_cast<const uint8_t*>(cstr), cstr != nullptr ? strlen(cstr) : 0u};
+        return set_label(view);
+    }
+private:
+    void* ptr_{nullptr};
+    const NameTagVTable* vt_{nullptr};
+};
+
+} // extern "C++"
+#endif /* __cplusplus */
 
 /* Component: `testbed::MetadataTag` (IS_ABI_POD = false) */
 typedef struct MetadataTag MetadataTag;
@@ -111,6 +1248,282 @@ BAM_STATIC_ASSERT(sizeof(MetadataTagVTable) == 56u, metadatatagvtable_size64);
 #elif UINTPTR_MAX == UINT32_MAX
 BAM_STATIC_ASSERT(sizeof(MetadataTagVTable) == 40u, metadatatagvtable_size32);
 #endif
+#ifdef __cplusplus
+extern "C++" {
+namespace bam {
+#ifndef BAM_CPP17_SDK_HELPERS_DEFINED
+#define BAM_CPP17_SDK_HELPERS_DEFINED
+
+template <typename VT>
+inline const VT* resolve_vtable(
+    const BamHostApi& api,
+    const BamHostCtx* host_ctx,
+    const char* symbol,
+    BamResult* out_err = nullptr
+) noexcept {
+    if (api.get_proc_address == nullptr || host_ctx == nullptr || symbol == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NULL_POINTER;
+        }
+        return nullptr;
+    }
+    const void* raw = api.get_proc_address(host_ctx, symbol);
+    if (raw == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NOT_FOUND;
+        }
+        return nullptr;
+    }
+    const auto* hdr = static_cast<const BamVTableHeader*>(raw);
+    if (hdr->struct_size < static_cast<uint32_t>(sizeof(VT)) ||
+        bam_version_is_compatible(BAM_ABI_VERSION, hdr->abi_version) == BAM_FALSE) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_INVALID_VERSION;
+        }
+        return nullptr;
+    }
+    if (out_err != nullptr) {
+        *out_err = BAM_RESULT_OK;
+    }
+    return static_cast<const VT*>(raw);
+}
+
+template <typename VT>
+class VTableHandle {
+public:
+    VTableHandle() noexcept = default;
+    explicit VTableHandle(const VT* ptr) noexcept : ptr_(ptr) {}
+
+    static VTableHandle resolve(
+        const BamHostApi& api,
+        const BamHostCtx* host_ctx,
+        const char* symbol,
+        BamResult* out_err = nullptr
+    ) noexcept {
+        return VTableHandle(resolve_vtable<VT>(api, host_ctx, symbol, out_err));
+    }
+
+    bool valid() const noexcept { return ptr_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const VT* raw() const noexcept { return ptr_; }
+    const VT* operator->() const noexcept { return ptr_; }
+
+private:
+    const VT* ptr_{nullptr};
+};
+
+template <typename InstanceT, void (*DestroyFn)(InstanceT*)>
+class UniqueGuest {
+public:
+    UniqueGuest() noexcept = default;
+    explicit UniqueGuest(InstanceT* ptr) noexcept : ptr_(ptr) {}
+    ~UniqueGuest() noexcept { reset(); }
+
+    UniqueGuest(const UniqueGuest&) = delete;
+    UniqueGuest& operator=(const UniqueGuest&) = delete;
+
+    UniqueGuest(UniqueGuest&& other) noexcept : ptr_(other.release()) {}
+    UniqueGuest& operator=(UniqueGuest&& other) noexcept {
+        if (this != &other) {
+            reset(other.release());
+        }
+        return *this;
+    }
+
+    InstanceT* get() const noexcept { return ptr_; }
+    InstanceT* operator->() const noexcept { return ptr_; }
+    InstanceT& operator*() const noexcept { return *ptr_; }
+    explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+    InstanceT* release() noexcept {
+        InstanceT* tmp = ptr_;
+        ptr_ = nullptr;
+        return tmp;
+    }
+
+    void reset(InstanceT* next = nullptr) noexcept {
+        if (ptr_ != nullptr && DestroyFn != nullptr) {
+            DestroyFn(ptr_);
+        }
+        ptr_ = next;
+    }
+
+private:
+    InstanceT* ptr_{nullptr};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class HostVecView {
+public:
+    HostVecView(void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.valid(); }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+
+    Elem* data_mut(size_t* out_len = nullptr) noexcept {
+        size_t local_len = 0u;
+        size_t* len_ptr = out_len != nullptr ? out_len : &local_len;
+        if (ptr_ == nullptr || ops_.as_mut_slice == nullptr) {
+            *len_ptr = 0u;
+            return nullptr;
+        }
+        return ops_.as_mut_slice(ptr_, len_ptr);
+    }
+
+    BamResult set(const Elem* ptr, size_t count) noexcept {
+        if (ptr_ == nullptr || ops_.set == nullptr) {
+            return BAM_RESULT_NULL_POINTER;
+        }
+        return ops_.set(ptr_, SliceTy{ptr, count});
+    }
+
+    BamResult clear() noexcept {
+        return (ptr_ != nullptr && ops_.clear != nullptr) ? ops_.clear(ptr_) : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult push(Elem val) noexcept {
+        return (ptr_ != nullptr && ops_.push != nullptr) ? ops_.push(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+
+    bool pop(Elem* out_elem) noexcept {
+        if (ptr_ == nullptr || ops_.pop == nullptr) {
+            return false;
+        }
+        return ops_.pop(ptr_, out_elem) != BAM_FALSE;
+    }
+
+    BamResult remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.remove != nullptr)
+            ? ops_.remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult swap_remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.swap_remove != nullptr)
+            ? ops_.swap_remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult truncate(size_t new_len) noexcept {
+        return (ptr_ != nullptr && ops_.truncate != nullptr)
+            ? ops_.truncate(ptr_, new_len)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult reserve(size_t additional) noexcept {
+        return (ptr_ != nullptr && ops_.reserve != nullptr)
+            ? ops_.reserve(ptr_, additional)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+    Elem* begin() noexcept { return data_mut(nullptr); }
+    Elem* end() noexcept {
+        size_t n = 0u;
+        Elem* p = data_mut(&n);
+        return p != nullptr ? (p + n) : nullptr;
+    }
+
+private:
+    void* ptr_{nullptr};
+    Ops   ops_{};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class ConstHostVecView {
+public:
+    ConstHostVecView(const void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.get != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+private:
+    const void* ptr_{nullptr};
+    Ops         ops_{};
+};
+
+#endif /* BAM_CPP17_SDK_HELPERS_DEFINED */
+} // namespace bam
+class MetadataTagConstView {
+public:
+    MetadataTagConstView() noexcept = default;
+    MetadataTagConstView(const void* ptr, const MetadataTagVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const void* raw() const noexcept { return ptr_; }
+    const MetadataTagVTable* vtable() const noexcept { return vt_; }
+    BamStrView get_label() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_label != nullptr) ? vt_->get_label(ptr_) : BamStrView{nullptr, 0u};
+    }
+private:
+    const void* ptr_{nullptr};
+    const MetadataTagVTable* vt_{nullptr};
+};
+
+class MetadataTagView {
+public:
+    MetadataTagView() noexcept = default;
+    MetadataTagView(void* ptr, const MetadataTagVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    void* raw() const noexcept { return ptr_; }
+    const MetadataTagVTable* vtable() const noexcept { return vt_; }
+    MetadataTagConstView as_const() const noexcept { return MetadataTagConstView(ptr_, vt_); }
+    BamStrView get_label() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_label != nullptr) ? vt_->get_label(ptr_) : BamStrView{nullptr, 0u};
+    }
+    BamResult set_label(BamStrView view) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_label != nullptr) ? vt_->set_label(ptr_, view) : BAM_RESULT_NULL_POINTER;
+    }
+    BamResult set_label(const char* cstr) noexcept {
+        const BamStrView view{reinterpret_cast<const uint8_t*>(cstr), cstr != nullptr ? strlen(cstr) : 0u};
+        return set_label(view);
+    }
+private:
+    void* ptr_{nullptr};
+    const MetadataTagVTable* vt_{nullptr};
+};
+
+} // extern "C++"
+#endif /* __cplusplus */
 
 /* Component: `testbed::Mass` (IS_ABI_POD = true) */
 typedef struct Mass {
@@ -128,6 +1541,278 @@ BAM_STATIC_ASSERT(sizeof(MassVTable) == 56u, massvtable_size64);
 #elif UINTPTR_MAX == UINT32_MAX
 BAM_STATIC_ASSERT(sizeof(MassVTable) == 40u, massvtable_size32);
 #endif
+#ifdef __cplusplus
+extern "C++" {
+namespace bam {
+#ifndef BAM_CPP17_SDK_HELPERS_DEFINED
+#define BAM_CPP17_SDK_HELPERS_DEFINED
+
+template <typename VT>
+inline const VT* resolve_vtable(
+    const BamHostApi& api,
+    const BamHostCtx* host_ctx,
+    const char* symbol,
+    BamResult* out_err = nullptr
+) noexcept {
+    if (api.get_proc_address == nullptr || host_ctx == nullptr || symbol == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NULL_POINTER;
+        }
+        return nullptr;
+    }
+    const void* raw = api.get_proc_address(host_ctx, symbol);
+    if (raw == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NOT_FOUND;
+        }
+        return nullptr;
+    }
+    const auto* hdr = static_cast<const BamVTableHeader*>(raw);
+    if (hdr->struct_size < static_cast<uint32_t>(sizeof(VT)) ||
+        bam_version_is_compatible(BAM_ABI_VERSION, hdr->abi_version) == BAM_FALSE) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_INVALID_VERSION;
+        }
+        return nullptr;
+    }
+    if (out_err != nullptr) {
+        *out_err = BAM_RESULT_OK;
+    }
+    return static_cast<const VT*>(raw);
+}
+
+template <typename VT>
+class VTableHandle {
+public:
+    VTableHandle() noexcept = default;
+    explicit VTableHandle(const VT* ptr) noexcept : ptr_(ptr) {}
+
+    static VTableHandle resolve(
+        const BamHostApi& api,
+        const BamHostCtx* host_ctx,
+        const char* symbol,
+        BamResult* out_err = nullptr
+    ) noexcept {
+        return VTableHandle(resolve_vtable<VT>(api, host_ctx, symbol, out_err));
+    }
+
+    bool valid() const noexcept { return ptr_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const VT* raw() const noexcept { return ptr_; }
+    const VT* operator->() const noexcept { return ptr_; }
+
+private:
+    const VT* ptr_{nullptr};
+};
+
+template <typename InstanceT, void (*DestroyFn)(InstanceT*)>
+class UniqueGuest {
+public:
+    UniqueGuest() noexcept = default;
+    explicit UniqueGuest(InstanceT* ptr) noexcept : ptr_(ptr) {}
+    ~UniqueGuest() noexcept { reset(); }
+
+    UniqueGuest(const UniqueGuest&) = delete;
+    UniqueGuest& operator=(const UniqueGuest&) = delete;
+
+    UniqueGuest(UniqueGuest&& other) noexcept : ptr_(other.release()) {}
+    UniqueGuest& operator=(UniqueGuest&& other) noexcept {
+        if (this != &other) {
+            reset(other.release());
+        }
+        return *this;
+    }
+
+    InstanceT* get() const noexcept { return ptr_; }
+    InstanceT* operator->() const noexcept { return ptr_; }
+    InstanceT& operator*() const noexcept { return *ptr_; }
+    explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+    InstanceT* release() noexcept {
+        InstanceT* tmp = ptr_;
+        ptr_ = nullptr;
+        return tmp;
+    }
+
+    void reset(InstanceT* next = nullptr) noexcept {
+        if (ptr_ != nullptr && DestroyFn != nullptr) {
+            DestroyFn(ptr_);
+        }
+        ptr_ = next;
+    }
+
+private:
+    InstanceT* ptr_{nullptr};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class HostVecView {
+public:
+    HostVecView(void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.valid(); }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+
+    Elem* data_mut(size_t* out_len = nullptr) noexcept {
+        size_t local_len = 0u;
+        size_t* len_ptr = out_len != nullptr ? out_len : &local_len;
+        if (ptr_ == nullptr || ops_.as_mut_slice == nullptr) {
+            *len_ptr = 0u;
+            return nullptr;
+        }
+        return ops_.as_mut_slice(ptr_, len_ptr);
+    }
+
+    BamResult set(const Elem* ptr, size_t count) noexcept {
+        if (ptr_ == nullptr || ops_.set == nullptr) {
+            return BAM_RESULT_NULL_POINTER;
+        }
+        return ops_.set(ptr_, SliceTy{ptr, count});
+    }
+
+    BamResult clear() noexcept {
+        return (ptr_ != nullptr && ops_.clear != nullptr) ? ops_.clear(ptr_) : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult push(Elem val) noexcept {
+        return (ptr_ != nullptr && ops_.push != nullptr) ? ops_.push(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+
+    bool pop(Elem* out_elem) noexcept {
+        if (ptr_ == nullptr || ops_.pop == nullptr) {
+            return false;
+        }
+        return ops_.pop(ptr_, out_elem) != BAM_FALSE;
+    }
+
+    BamResult remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.remove != nullptr)
+            ? ops_.remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult swap_remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.swap_remove != nullptr)
+            ? ops_.swap_remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult truncate(size_t new_len) noexcept {
+        return (ptr_ != nullptr && ops_.truncate != nullptr)
+            ? ops_.truncate(ptr_, new_len)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult reserve(size_t additional) noexcept {
+        return (ptr_ != nullptr && ops_.reserve != nullptr)
+            ? ops_.reserve(ptr_, additional)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+    Elem* begin() noexcept { return data_mut(nullptr); }
+    Elem* end() noexcept {
+        size_t n = 0u;
+        Elem* p = data_mut(&n);
+        return p != nullptr ? (p + n) : nullptr;
+    }
+
+private:
+    void* ptr_{nullptr};
+    Ops   ops_{};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class ConstHostVecView {
+public:
+    ConstHostVecView(const void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.get != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+private:
+    const void* ptr_{nullptr};
+    Ops         ops_{};
+};
+
+#endif /* BAM_CPP17_SDK_HELPERS_DEFINED */
+} // namespace bam
+class MassConstView {
+public:
+    MassConstView() noexcept = default;
+    MassConstView(const void* ptr, const MassVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const void* raw() const noexcept { return ptr_; }
+    const MassVTable* vtable() const noexcept { return vt_; }
+    float get_value() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_value != nullptr) ? vt_->get_value(ptr_) : float{};
+    }
+private:
+    const void* ptr_{nullptr};
+    const MassVTable* vt_{nullptr};
+};
+
+class MassView {
+public:
+    MassView() noexcept = default;
+    MassView(void* ptr, const MassVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    void* raw() const noexcept { return ptr_; }
+    const MassVTable* vtable() const noexcept { return vt_; }
+    MassConstView as_const() const noexcept { return MassConstView(ptr_, vt_); }
+    float get_value() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_value != nullptr) ? vt_->get_value(ptr_) : float{};
+    }
+    BamResult set_value(float val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_value != nullptr) ? vt_->set_value(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+private:
+    void* ptr_{nullptr};
+    const MassVTable* vt_{nullptr};
+};
+
+} // extern "C++"
+#endif /* __cplusplus */
 
 /* Component: `testbed::Armor` (IS_ABI_POD = true) */
 typedef struct Armor {
@@ -145,6 +1830,278 @@ BAM_STATIC_ASSERT(sizeof(ArmorVTable) == 56u, armorvtable_size64);
 #elif UINTPTR_MAX == UINT32_MAX
 BAM_STATIC_ASSERT(sizeof(ArmorVTable) == 40u, armorvtable_size32);
 #endif
+#ifdef __cplusplus
+extern "C++" {
+namespace bam {
+#ifndef BAM_CPP17_SDK_HELPERS_DEFINED
+#define BAM_CPP17_SDK_HELPERS_DEFINED
+
+template <typename VT>
+inline const VT* resolve_vtable(
+    const BamHostApi& api,
+    const BamHostCtx* host_ctx,
+    const char* symbol,
+    BamResult* out_err = nullptr
+) noexcept {
+    if (api.get_proc_address == nullptr || host_ctx == nullptr || symbol == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NULL_POINTER;
+        }
+        return nullptr;
+    }
+    const void* raw = api.get_proc_address(host_ctx, symbol);
+    if (raw == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NOT_FOUND;
+        }
+        return nullptr;
+    }
+    const auto* hdr = static_cast<const BamVTableHeader*>(raw);
+    if (hdr->struct_size < static_cast<uint32_t>(sizeof(VT)) ||
+        bam_version_is_compatible(BAM_ABI_VERSION, hdr->abi_version) == BAM_FALSE) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_INVALID_VERSION;
+        }
+        return nullptr;
+    }
+    if (out_err != nullptr) {
+        *out_err = BAM_RESULT_OK;
+    }
+    return static_cast<const VT*>(raw);
+}
+
+template <typename VT>
+class VTableHandle {
+public:
+    VTableHandle() noexcept = default;
+    explicit VTableHandle(const VT* ptr) noexcept : ptr_(ptr) {}
+
+    static VTableHandle resolve(
+        const BamHostApi& api,
+        const BamHostCtx* host_ctx,
+        const char* symbol,
+        BamResult* out_err = nullptr
+    ) noexcept {
+        return VTableHandle(resolve_vtable<VT>(api, host_ctx, symbol, out_err));
+    }
+
+    bool valid() const noexcept { return ptr_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const VT* raw() const noexcept { return ptr_; }
+    const VT* operator->() const noexcept { return ptr_; }
+
+private:
+    const VT* ptr_{nullptr};
+};
+
+template <typename InstanceT, void (*DestroyFn)(InstanceT*)>
+class UniqueGuest {
+public:
+    UniqueGuest() noexcept = default;
+    explicit UniqueGuest(InstanceT* ptr) noexcept : ptr_(ptr) {}
+    ~UniqueGuest() noexcept { reset(); }
+
+    UniqueGuest(const UniqueGuest&) = delete;
+    UniqueGuest& operator=(const UniqueGuest&) = delete;
+
+    UniqueGuest(UniqueGuest&& other) noexcept : ptr_(other.release()) {}
+    UniqueGuest& operator=(UniqueGuest&& other) noexcept {
+        if (this != &other) {
+            reset(other.release());
+        }
+        return *this;
+    }
+
+    InstanceT* get() const noexcept { return ptr_; }
+    InstanceT* operator->() const noexcept { return ptr_; }
+    InstanceT& operator*() const noexcept { return *ptr_; }
+    explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+    InstanceT* release() noexcept {
+        InstanceT* tmp = ptr_;
+        ptr_ = nullptr;
+        return tmp;
+    }
+
+    void reset(InstanceT* next = nullptr) noexcept {
+        if (ptr_ != nullptr && DestroyFn != nullptr) {
+            DestroyFn(ptr_);
+        }
+        ptr_ = next;
+    }
+
+private:
+    InstanceT* ptr_{nullptr};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class HostVecView {
+public:
+    HostVecView(void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.valid(); }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+
+    Elem* data_mut(size_t* out_len = nullptr) noexcept {
+        size_t local_len = 0u;
+        size_t* len_ptr = out_len != nullptr ? out_len : &local_len;
+        if (ptr_ == nullptr || ops_.as_mut_slice == nullptr) {
+            *len_ptr = 0u;
+            return nullptr;
+        }
+        return ops_.as_mut_slice(ptr_, len_ptr);
+    }
+
+    BamResult set(const Elem* ptr, size_t count) noexcept {
+        if (ptr_ == nullptr || ops_.set == nullptr) {
+            return BAM_RESULT_NULL_POINTER;
+        }
+        return ops_.set(ptr_, SliceTy{ptr, count});
+    }
+
+    BamResult clear() noexcept {
+        return (ptr_ != nullptr && ops_.clear != nullptr) ? ops_.clear(ptr_) : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult push(Elem val) noexcept {
+        return (ptr_ != nullptr && ops_.push != nullptr) ? ops_.push(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+
+    bool pop(Elem* out_elem) noexcept {
+        if (ptr_ == nullptr || ops_.pop == nullptr) {
+            return false;
+        }
+        return ops_.pop(ptr_, out_elem) != BAM_FALSE;
+    }
+
+    BamResult remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.remove != nullptr)
+            ? ops_.remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult swap_remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.swap_remove != nullptr)
+            ? ops_.swap_remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult truncate(size_t new_len) noexcept {
+        return (ptr_ != nullptr && ops_.truncate != nullptr)
+            ? ops_.truncate(ptr_, new_len)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult reserve(size_t additional) noexcept {
+        return (ptr_ != nullptr && ops_.reserve != nullptr)
+            ? ops_.reserve(ptr_, additional)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+    Elem* begin() noexcept { return data_mut(nullptr); }
+    Elem* end() noexcept {
+        size_t n = 0u;
+        Elem* p = data_mut(&n);
+        return p != nullptr ? (p + n) : nullptr;
+    }
+
+private:
+    void* ptr_{nullptr};
+    Ops   ops_{};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class ConstHostVecView {
+public:
+    ConstHostVecView(const void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.get != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+private:
+    const void* ptr_{nullptr};
+    Ops         ops_{};
+};
+
+#endif /* BAM_CPP17_SDK_HELPERS_DEFINED */
+} // namespace bam
+class ArmorConstView {
+public:
+    ArmorConstView() noexcept = default;
+    ArmorConstView(const void* ptr, const ArmorVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const void* raw() const noexcept { return ptr_; }
+    const ArmorVTable* vtable() const noexcept { return vt_; }
+    int32_t get_defense() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_defense != nullptr) ? vt_->get_defense(ptr_) : int32_t{};
+    }
+private:
+    const void* ptr_{nullptr};
+    const ArmorVTable* vt_{nullptr};
+};
+
+class ArmorView {
+public:
+    ArmorView() noexcept = default;
+    ArmorView(void* ptr, const ArmorVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    void* raw() const noexcept { return ptr_; }
+    const ArmorVTable* vtable() const noexcept { return vt_; }
+    ArmorConstView as_const() const noexcept { return ArmorConstView(ptr_, vt_); }
+    int32_t get_defense() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_defense != nullptr) ? vt_->get_defense(ptr_) : int32_t{};
+    }
+    BamResult set_defense(int32_t val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_defense != nullptr) ? vt_->set_defense(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+private:
+    void* ptr_{nullptr};
+    const ArmorVTable* vt_{nullptr};
+};
+
+} // extern "C++"
+#endif /* __cplusplus */
 
 /* Component: `testbed::FilteredTransform` (IS_ABI_POD = true) */
 typedef struct FilteredTransform {
@@ -168,6 +2125,296 @@ BAM_STATIC_ASSERT(sizeof(FilteredTransformVTable) == 88u, filteredtransformvtabl
 #elif UINTPTR_MAX == UINT32_MAX
 BAM_STATIC_ASSERT(sizeof(FilteredTransformVTable) == 56u, filteredtransformvtable_size32);
 #endif
+#ifdef __cplusplus
+extern "C++" {
+namespace bam {
+#ifndef BAM_CPP17_SDK_HELPERS_DEFINED
+#define BAM_CPP17_SDK_HELPERS_DEFINED
+
+template <typename VT>
+inline const VT* resolve_vtable(
+    const BamHostApi& api,
+    const BamHostCtx* host_ctx,
+    const char* symbol,
+    BamResult* out_err = nullptr
+) noexcept {
+    if (api.get_proc_address == nullptr || host_ctx == nullptr || symbol == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NULL_POINTER;
+        }
+        return nullptr;
+    }
+    const void* raw = api.get_proc_address(host_ctx, symbol);
+    if (raw == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NOT_FOUND;
+        }
+        return nullptr;
+    }
+    const auto* hdr = static_cast<const BamVTableHeader*>(raw);
+    if (hdr->struct_size < static_cast<uint32_t>(sizeof(VT)) ||
+        bam_version_is_compatible(BAM_ABI_VERSION, hdr->abi_version) == BAM_FALSE) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_INVALID_VERSION;
+        }
+        return nullptr;
+    }
+    if (out_err != nullptr) {
+        *out_err = BAM_RESULT_OK;
+    }
+    return static_cast<const VT*>(raw);
+}
+
+template <typename VT>
+class VTableHandle {
+public:
+    VTableHandle() noexcept = default;
+    explicit VTableHandle(const VT* ptr) noexcept : ptr_(ptr) {}
+
+    static VTableHandle resolve(
+        const BamHostApi& api,
+        const BamHostCtx* host_ctx,
+        const char* symbol,
+        BamResult* out_err = nullptr
+    ) noexcept {
+        return VTableHandle(resolve_vtable<VT>(api, host_ctx, symbol, out_err));
+    }
+
+    bool valid() const noexcept { return ptr_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const VT* raw() const noexcept { return ptr_; }
+    const VT* operator->() const noexcept { return ptr_; }
+
+private:
+    const VT* ptr_{nullptr};
+};
+
+template <typename InstanceT, void (*DestroyFn)(InstanceT*)>
+class UniqueGuest {
+public:
+    UniqueGuest() noexcept = default;
+    explicit UniqueGuest(InstanceT* ptr) noexcept : ptr_(ptr) {}
+    ~UniqueGuest() noexcept { reset(); }
+
+    UniqueGuest(const UniqueGuest&) = delete;
+    UniqueGuest& operator=(const UniqueGuest&) = delete;
+
+    UniqueGuest(UniqueGuest&& other) noexcept : ptr_(other.release()) {}
+    UniqueGuest& operator=(UniqueGuest&& other) noexcept {
+        if (this != &other) {
+            reset(other.release());
+        }
+        return *this;
+    }
+
+    InstanceT* get() const noexcept { return ptr_; }
+    InstanceT* operator->() const noexcept { return ptr_; }
+    InstanceT& operator*() const noexcept { return *ptr_; }
+    explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+    InstanceT* release() noexcept {
+        InstanceT* tmp = ptr_;
+        ptr_ = nullptr;
+        return tmp;
+    }
+
+    void reset(InstanceT* next = nullptr) noexcept {
+        if (ptr_ != nullptr && DestroyFn != nullptr) {
+            DestroyFn(ptr_);
+        }
+        ptr_ = next;
+    }
+
+private:
+    InstanceT* ptr_{nullptr};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class HostVecView {
+public:
+    HostVecView(void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.valid(); }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+
+    Elem* data_mut(size_t* out_len = nullptr) noexcept {
+        size_t local_len = 0u;
+        size_t* len_ptr = out_len != nullptr ? out_len : &local_len;
+        if (ptr_ == nullptr || ops_.as_mut_slice == nullptr) {
+            *len_ptr = 0u;
+            return nullptr;
+        }
+        return ops_.as_mut_slice(ptr_, len_ptr);
+    }
+
+    BamResult set(const Elem* ptr, size_t count) noexcept {
+        if (ptr_ == nullptr || ops_.set == nullptr) {
+            return BAM_RESULT_NULL_POINTER;
+        }
+        return ops_.set(ptr_, SliceTy{ptr, count});
+    }
+
+    BamResult clear() noexcept {
+        return (ptr_ != nullptr && ops_.clear != nullptr) ? ops_.clear(ptr_) : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult push(Elem val) noexcept {
+        return (ptr_ != nullptr && ops_.push != nullptr) ? ops_.push(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+
+    bool pop(Elem* out_elem) noexcept {
+        if (ptr_ == nullptr || ops_.pop == nullptr) {
+            return false;
+        }
+        return ops_.pop(ptr_, out_elem) != BAM_FALSE;
+    }
+
+    BamResult remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.remove != nullptr)
+            ? ops_.remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult swap_remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.swap_remove != nullptr)
+            ? ops_.swap_remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult truncate(size_t new_len) noexcept {
+        return (ptr_ != nullptr && ops_.truncate != nullptr)
+            ? ops_.truncate(ptr_, new_len)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult reserve(size_t additional) noexcept {
+        return (ptr_ != nullptr && ops_.reserve != nullptr)
+            ? ops_.reserve(ptr_, additional)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+    Elem* begin() noexcept { return data_mut(nullptr); }
+    Elem* end() noexcept {
+        size_t n = 0u;
+        Elem* p = data_mut(&n);
+        return p != nullptr ? (p + n) : nullptr;
+    }
+
+private:
+    void* ptr_{nullptr};
+    Ops   ops_{};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class ConstHostVecView {
+public:
+    ConstHostVecView(const void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.get != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+private:
+    const void* ptr_{nullptr};
+    Ops         ops_{};
+};
+
+#endif /* BAM_CPP17_SDK_HELPERS_DEFINED */
+} // namespace bam
+class FilteredTransformConstView {
+public:
+    FilteredTransformConstView() noexcept = default;
+    FilteredTransformConstView(const void* ptr, const FilteredTransformVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const void* raw() const noexcept { return ptr_; }
+    const FilteredTransformVTable* vtable() const noexcept { return vt_; }
+    float get_x() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_x != nullptr) ? vt_->get_x(ptr_) : float{};
+    }
+    float get_y() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_y != nullptr) ? vt_->get_y(ptr_) : float{};
+    }
+    float get_z() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_z != nullptr) ? vt_->get_z(ptr_) : float{};
+    }
+private:
+    const void* ptr_{nullptr};
+    const FilteredTransformVTable* vt_{nullptr};
+};
+
+class FilteredTransformView {
+public:
+    FilteredTransformView() noexcept = default;
+    FilteredTransformView(void* ptr, const FilteredTransformVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    void* raw() const noexcept { return ptr_; }
+    const FilteredTransformVTable* vtable() const noexcept { return vt_; }
+    FilteredTransformConstView as_const() const noexcept { return FilteredTransformConstView(ptr_, vt_); }
+    float get_x() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_x != nullptr) ? vt_->get_x(ptr_) : float{};
+    }
+    BamResult set_x(float val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_x != nullptr) ? vt_->set_x(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+    float get_y() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_y != nullptr) ? vt_->get_y(ptr_) : float{};
+    }
+    BamResult set_y(float val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_y != nullptr) ? vt_->set_y(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+    float get_z() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_z != nullptr) ? vt_->get_z(ptr_) : float{};
+    }
+    BamResult set_z(float val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_z != nullptr) ? vt_->set_z(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+private:
+    void* ptr_{nullptr};
+    const FilteredTransformVTable* vt_{nullptr};
+};
+
+} // extern "C++"
+#endif /* __cplusplus */
 
 /* Component: `testbed::CFilteredTransform` (IS_ABI_POD = true) */
 typedef struct CFilteredTransform {
@@ -191,6 +2438,296 @@ BAM_STATIC_ASSERT(sizeof(CFilteredTransformVTable) == 88u, cfilteredtransformvta
 #elif UINTPTR_MAX == UINT32_MAX
 BAM_STATIC_ASSERT(sizeof(CFilteredTransformVTable) == 56u, cfilteredtransformvtable_size32);
 #endif
+#ifdef __cplusplus
+extern "C++" {
+namespace bam {
+#ifndef BAM_CPP17_SDK_HELPERS_DEFINED
+#define BAM_CPP17_SDK_HELPERS_DEFINED
+
+template <typename VT>
+inline const VT* resolve_vtable(
+    const BamHostApi& api,
+    const BamHostCtx* host_ctx,
+    const char* symbol,
+    BamResult* out_err = nullptr
+) noexcept {
+    if (api.get_proc_address == nullptr || host_ctx == nullptr || symbol == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NULL_POINTER;
+        }
+        return nullptr;
+    }
+    const void* raw = api.get_proc_address(host_ctx, symbol);
+    if (raw == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NOT_FOUND;
+        }
+        return nullptr;
+    }
+    const auto* hdr = static_cast<const BamVTableHeader*>(raw);
+    if (hdr->struct_size < static_cast<uint32_t>(sizeof(VT)) ||
+        bam_version_is_compatible(BAM_ABI_VERSION, hdr->abi_version) == BAM_FALSE) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_INVALID_VERSION;
+        }
+        return nullptr;
+    }
+    if (out_err != nullptr) {
+        *out_err = BAM_RESULT_OK;
+    }
+    return static_cast<const VT*>(raw);
+}
+
+template <typename VT>
+class VTableHandle {
+public:
+    VTableHandle() noexcept = default;
+    explicit VTableHandle(const VT* ptr) noexcept : ptr_(ptr) {}
+
+    static VTableHandle resolve(
+        const BamHostApi& api,
+        const BamHostCtx* host_ctx,
+        const char* symbol,
+        BamResult* out_err = nullptr
+    ) noexcept {
+        return VTableHandle(resolve_vtable<VT>(api, host_ctx, symbol, out_err));
+    }
+
+    bool valid() const noexcept { return ptr_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const VT* raw() const noexcept { return ptr_; }
+    const VT* operator->() const noexcept { return ptr_; }
+
+private:
+    const VT* ptr_{nullptr};
+};
+
+template <typename InstanceT, void (*DestroyFn)(InstanceT*)>
+class UniqueGuest {
+public:
+    UniqueGuest() noexcept = default;
+    explicit UniqueGuest(InstanceT* ptr) noexcept : ptr_(ptr) {}
+    ~UniqueGuest() noexcept { reset(); }
+
+    UniqueGuest(const UniqueGuest&) = delete;
+    UniqueGuest& operator=(const UniqueGuest&) = delete;
+
+    UniqueGuest(UniqueGuest&& other) noexcept : ptr_(other.release()) {}
+    UniqueGuest& operator=(UniqueGuest&& other) noexcept {
+        if (this != &other) {
+            reset(other.release());
+        }
+        return *this;
+    }
+
+    InstanceT* get() const noexcept { return ptr_; }
+    InstanceT* operator->() const noexcept { return ptr_; }
+    InstanceT& operator*() const noexcept { return *ptr_; }
+    explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+    InstanceT* release() noexcept {
+        InstanceT* tmp = ptr_;
+        ptr_ = nullptr;
+        return tmp;
+    }
+
+    void reset(InstanceT* next = nullptr) noexcept {
+        if (ptr_ != nullptr && DestroyFn != nullptr) {
+            DestroyFn(ptr_);
+        }
+        ptr_ = next;
+    }
+
+private:
+    InstanceT* ptr_{nullptr};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class HostVecView {
+public:
+    HostVecView(void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.valid(); }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+
+    Elem* data_mut(size_t* out_len = nullptr) noexcept {
+        size_t local_len = 0u;
+        size_t* len_ptr = out_len != nullptr ? out_len : &local_len;
+        if (ptr_ == nullptr || ops_.as_mut_slice == nullptr) {
+            *len_ptr = 0u;
+            return nullptr;
+        }
+        return ops_.as_mut_slice(ptr_, len_ptr);
+    }
+
+    BamResult set(const Elem* ptr, size_t count) noexcept {
+        if (ptr_ == nullptr || ops_.set == nullptr) {
+            return BAM_RESULT_NULL_POINTER;
+        }
+        return ops_.set(ptr_, SliceTy{ptr, count});
+    }
+
+    BamResult clear() noexcept {
+        return (ptr_ != nullptr && ops_.clear != nullptr) ? ops_.clear(ptr_) : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult push(Elem val) noexcept {
+        return (ptr_ != nullptr && ops_.push != nullptr) ? ops_.push(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+
+    bool pop(Elem* out_elem) noexcept {
+        if (ptr_ == nullptr || ops_.pop == nullptr) {
+            return false;
+        }
+        return ops_.pop(ptr_, out_elem) != BAM_FALSE;
+    }
+
+    BamResult remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.remove != nullptr)
+            ? ops_.remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult swap_remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.swap_remove != nullptr)
+            ? ops_.swap_remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult truncate(size_t new_len) noexcept {
+        return (ptr_ != nullptr && ops_.truncate != nullptr)
+            ? ops_.truncate(ptr_, new_len)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult reserve(size_t additional) noexcept {
+        return (ptr_ != nullptr && ops_.reserve != nullptr)
+            ? ops_.reserve(ptr_, additional)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+    Elem* begin() noexcept { return data_mut(nullptr); }
+    Elem* end() noexcept {
+        size_t n = 0u;
+        Elem* p = data_mut(&n);
+        return p != nullptr ? (p + n) : nullptr;
+    }
+
+private:
+    void* ptr_{nullptr};
+    Ops   ops_{};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class ConstHostVecView {
+public:
+    ConstHostVecView(const void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.get != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+private:
+    const void* ptr_{nullptr};
+    Ops         ops_{};
+};
+
+#endif /* BAM_CPP17_SDK_HELPERS_DEFINED */
+} // namespace bam
+class CFilteredTransformConstView {
+public:
+    CFilteredTransformConstView() noexcept = default;
+    CFilteredTransformConstView(const void* ptr, const CFilteredTransformVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const void* raw() const noexcept { return ptr_; }
+    const CFilteredTransformVTable* vtable() const noexcept { return vt_; }
+    float get_x() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_x != nullptr) ? vt_->get_x(ptr_) : float{};
+    }
+    float get_y() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_y != nullptr) ? vt_->get_y(ptr_) : float{};
+    }
+    float get_z() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_z != nullptr) ? vt_->get_z(ptr_) : float{};
+    }
+private:
+    const void* ptr_{nullptr};
+    const CFilteredTransformVTable* vt_{nullptr};
+};
+
+class CFilteredTransformView {
+public:
+    CFilteredTransformView() noexcept = default;
+    CFilteredTransformView(void* ptr, const CFilteredTransformVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    void* raw() const noexcept { return ptr_; }
+    const CFilteredTransformVTable* vtable() const noexcept { return vt_; }
+    CFilteredTransformConstView as_const() const noexcept { return CFilteredTransformConstView(ptr_, vt_); }
+    float get_x() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_x != nullptr) ? vt_->get_x(ptr_) : float{};
+    }
+    BamResult set_x(float val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_x != nullptr) ? vt_->set_x(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+    float get_y() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_y != nullptr) ? vt_->get_y(ptr_) : float{};
+    }
+    BamResult set_y(float val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_y != nullptr) ? vt_->set_y(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+    float get_z() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_z != nullptr) ? vt_->get_z(ptr_) : float{};
+    }
+    BamResult set_z(float val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_z != nullptr) ? vt_->set_z(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+private:
+    void* ptr_{nullptr};
+    const CFilteredTransformVTable* vt_{nullptr};
+};
+
+} // extern "C++"
+#endif /* __cplusplus */
 
 /* Component: `testbed::ChangeSensor` (IS_ABI_POD = true) */
 typedef struct ChangeSensor {
@@ -208,6 +2745,278 @@ BAM_STATIC_ASSERT(sizeof(ChangeSensorVTable) == 56u, changesensorvtable_size64);
 #elif UINTPTR_MAX == UINT32_MAX
 BAM_STATIC_ASSERT(sizeof(ChangeSensorVTable) == 40u, changesensorvtable_size32);
 #endif
+#ifdef __cplusplus
+extern "C++" {
+namespace bam {
+#ifndef BAM_CPP17_SDK_HELPERS_DEFINED
+#define BAM_CPP17_SDK_HELPERS_DEFINED
+
+template <typename VT>
+inline const VT* resolve_vtable(
+    const BamHostApi& api,
+    const BamHostCtx* host_ctx,
+    const char* symbol,
+    BamResult* out_err = nullptr
+) noexcept {
+    if (api.get_proc_address == nullptr || host_ctx == nullptr || symbol == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NULL_POINTER;
+        }
+        return nullptr;
+    }
+    const void* raw = api.get_proc_address(host_ctx, symbol);
+    if (raw == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NOT_FOUND;
+        }
+        return nullptr;
+    }
+    const auto* hdr = static_cast<const BamVTableHeader*>(raw);
+    if (hdr->struct_size < static_cast<uint32_t>(sizeof(VT)) ||
+        bam_version_is_compatible(BAM_ABI_VERSION, hdr->abi_version) == BAM_FALSE) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_INVALID_VERSION;
+        }
+        return nullptr;
+    }
+    if (out_err != nullptr) {
+        *out_err = BAM_RESULT_OK;
+    }
+    return static_cast<const VT*>(raw);
+}
+
+template <typename VT>
+class VTableHandle {
+public:
+    VTableHandle() noexcept = default;
+    explicit VTableHandle(const VT* ptr) noexcept : ptr_(ptr) {}
+
+    static VTableHandle resolve(
+        const BamHostApi& api,
+        const BamHostCtx* host_ctx,
+        const char* symbol,
+        BamResult* out_err = nullptr
+    ) noexcept {
+        return VTableHandle(resolve_vtable<VT>(api, host_ctx, symbol, out_err));
+    }
+
+    bool valid() const noexcept { return ptr_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const VT* raw() const noexcept { return ptr_; }
+    const VT* operator->() const noexcept { return ptr_; }
+
+private:
+    const VT* ptr_{nullptr};
+};
+
+template <typename InstanceT, void (*DestroyFn)(InstanceT*)>
+class UniqueGuest {
+public:
+    UniqueGuest() noexcept = default;
+    explicit UniqueGuest(InstanceT* ptr) noexcept : ptr_(ptr) {}
+    ~UniqueGuest() noexcept { reset(); }
+
+    UniqueGuest(const UniqueGuest&) = delete;
+    UniqueGuest& operator=(const UniqueGuest&) = delete;
+
+    UniqueGuest(UniqueGuest&& other) noexcept : ptr_(other.release()) {}
+    UniqueGuest& operator=(UniqueGuest&& other) noexcept {
+        if (this != &other) {
+            reset(other.release());
+        }
+        return *this;
+    }
+
+    InstanceT* get() const noexcept { return ptr_; }
+    InstanceT* operator->() const noexcept { return ptr_; }
+    InstanceT& operator*() const noexcept { return *ptr_; }
+    explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+    InstanceT* release() noexcept {
+        InstanceT* tmp = ptr_;
+        ptr_ = nullptr;
+        return tmp;
+    }
+
+    void reset(InstanceT* next = nullptr) noexcept {
+        if (ptr_ != nullptr && DestroyFn != nullptr) {
+            DestroyFn(ptr_);
+        }
+        ptr_ = next;
+    }
+
+private:
+    InstanceT* ptr_{nullptr};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class HostVecView {
+public:
+    HostVecView(void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.valid(); }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+
+    Elem* data_mut(size_t* out_len = nullptr) noexcept {
+        size_t local_len = 0u;
+        size_t* len_ptr = out_len != nullptr ? out_len : &local_len;
+        if (ptr_ == nullptr || ops_.as_mut_slice == nullptr) {
+            *len_ptr = 0u;
+            return nullptr;
+        }
+        return ops_.as_mut_slice(ptr_, len_ptr);
+    }
+
+    BamResult set(const Elem* ptr, size_t count) noexcept {
+        if (ptr_ == nullptr || ops_.set == nullptr) {
+            return BAM_RESULT_NULL_POINTER;
+        }
+        return ops_.set(ptr_, SliceTy{ptr, count});
+    }
+
+    BamResult clear() noexcept {
+        return (ptr_ != nullptr && ops_.clear != nullptr) ? ops_.clear(ptr_) : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult push(Elem val) noexcept {
+        return (ptr_ != nullptr && ops_.push != nullptr) ? ops_.push(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+
+    bool pop(Elem* out_elem) noexcept {
+        if (ptr_ == nullptr || ops_.pop == nullptr) {
+            return false;
+        }
+        return ops_.pop(ptr_, out_elem) != BAM_FALSE;
+    }
+
+    BamResult remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.remove != nullptr)
+            ? ops_.remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult swap_remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.swap_remove != nullptr)
+            ? ops_.swap_remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult truncate(size_t new_len) noexcept {
+        return (ptr_ != nullptr && ops_.truncate != nullptr)
+            ? ops_.truncate(ptr_, new_len)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult reserve(size_t additional) noexcept {
+        return (ptr_ != nullptr && ops_.reserve != nullptr)
+            ? ops_.reserve(ptr_, additional)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+    Elem* begin() noexcept { return data_mut(nullptr); }
+    Elem* end() noexcept {
+        size_t n = 0u;
+        Elem* p = data_mut(&n);
+        return p != nullptr ? (p + n) : nullptr;
+    }
+
+private:
+    void* ptr_{nullptr};
+    Ops   ops_{};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class ConstHostVecView {
+public:
+    ConstHostVecView(const void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.get != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+private:
+    const void* ptr_{nullptr};
+    Ops         ops_{};
+};
+
+#endif /* BAM_CPP17_SDK_HELPERS_DEFINED */
+} // namespace bam
+class ChangeSensorConstView {
+public:
+    ChangeSensorConstView() noexcept = default;
+    ChangeSensorConstView(const void* ptr, const ChangeSensorVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const void* raw() const noexcept { return ptr_; }
+    const ChangeSensorVTable* vtable() const noexcept { return vt_; }
+    uint32_t get_val() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_val != nullptr) ? vt_->get_val(ptr_) : uint32_t{};
+    }
+private:
+    const void* ptr_{nullptr};
+    const ChangeSensorVTable* vt_{nullptr};
+};
+
+class ChangeSensorView {
+public:
+    ChangeSensorView() noexcept = default;
+    ChangeSensorView(void* ptr, const ChangeSensorVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    void* raw() const noexcept { return ptr_; }
+    const ChangeSensorVTable* vtable() const noexcept { return vt_; }
+    ChangeSensorConstView as_const() const noexcept { return ChangeSensorConstView(ptr_, vt_); }
+    uint32_t get_val() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_val != nullptr) ? vt_->get_val(ptr_) : uint32_t{};
+    }
+    BamResult set_val(uint32_t val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_val != nullptr) ? vt_->set_val(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+private:
+    void* ptr_{nullptr};
+    const ChangeSensorVTable* vt_{nullptr};
+};
+
+} // extern "C++"
+#endif /* __cplusplus */
 
 /* Component: `testbed::CChangeSensor` (IS_ABI_POD = true) */
 typedef struct CChangeSensor {
@@ -225,6 +3034,278 @@ BAM_STATIC_ASSERT(sizeof(CChangeSensorVTable) == 56u, cchangesensorvtable_size64
 #elif UINTPTR_MAX == UINT32_MAX
 BAM_STATIC_ASSERT(sizeof(CChangeSensorVTable) == 40u, cchangesensorvtable_size32);
 #endif
+#ifdef __cplusplus
+extern "C++" {
+namespace bam {
+#ifndef BAM_CPP17_SDK_HELPERS_DEFINED
+#define BAM_CPP17_SDK_HELPERS_DEFINED
+
+template <typename VT>
+inline const VT* resolve_vtable(
+    const BamHostApi& api,
+    const BamHostCtx* host_ctx,
+    const char* symbol,
+    BamResult* out_err = nullptr
+) noexcept {
+    if (api.get_proc_address == nullptr || host_ctx == nullptr || symbol == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NULL_POINTER;
+        }
+        return nullptr;
+    }
+    const void* raw = api.get_proc_address(host_ctx, symbol);
+    if (raw == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NOT_FOUND;
+        }
+        return nullptr;
+    }
+    const auto* hdr = static_cast<const BamVTableHeader*>(raw);
+    if (hdr->struct_size < static_cast<uint32_t>(sizeof(VT)) ||
+        bam_version_is_compatible(BAM_ABI_VERSION, hdr->abi_version) == BAM_FALSE) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_INVALID_VERSION;
+        }
+        return nullptr;
+    }
+    if (out_err != nullptr) {
+        *out_err = BAM_RESULT_OK;
+    }
+    return static_cast<const VT*>(raw);
+}
+
+template <typename VT>
+class VTableHandle {
+public:
+    VTableHandle() noexcept = default;
+    explicit VTableHandle(const VT* ptr) noexcept : ptr_(ptr) {}
+
+    static VTableHandle resolve(
+        const BamHostApi& api,
+        const BamHostCtx* host_ctx,
+        const char* symbol,
+        BamResult* out_err = nullptr
+    ) noexcept {
+        return VTableHandle(resolve_vtable<VT>(api, host_ctx, symbol, out_err));
+    }
+
+    bool valid() const noexcept { return ptr_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const VT* raw() const noexcept { return ptr_; }
+    const VT* operator->() const noexcept { return ptr_; }
+
+private:
+    const VT* ptr_{nullptr};
+};
+
+template <typename InstanceT, void (*DestroyFn)(InstanceT*)>
+class UniqueGuest {
+public:
+    UniqueGuest() noexcept = default;
+    explicit UniqueGuest(InstanceT* ptr) noexcept : ptr_(ptr) {}
+    ~UniqueGuest() noexcept { reset(); }
+
+    UniqueGuest(const UniqueGuest&) = delete;
+    UniqueGuest& operator=(const UniqueGuest&) = delete;
+
+    UniqueGuest(UniqueGuest&& other) noexcept : ptr_(other.release()) {}
+    UniqueGuest& operator=(UniqueGuest&& other) noexcept {
+        if (this != &other) {
+            reset(other.release());
+        }
+        return *this;
+    }
+
+    InstanceT* get() const noexcept { return ptr_; }
+    InstanceT* operator->() const noexcept { return ptr_; }
+    InstanceT& operator*() const noexcept { return *ptr_; }
+    explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+    InstanceT* release() noexcept {
+        InstanceT* tmp = ptr_;
+        ptr_ = nullptr;
+        return tmp;
+    }
+
+    void reset(InstanceT* next = nullptr) noexcept {
+        if (ptr_ != nullptr && DestroyFn != nullptr) {
+            DestroyFn(ptr_);
+        }
+        ptr_ = next;
+    }
+
+private:
+    InstanceT* ptr_{nullptr};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class HostVecView {
+public:
+    HostVecView(void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.valid(); }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+
+    Elem* data_mut(size_t* out_len = nullptr) noexcept {
+        size_t local_len = 0u;
+        size_t* len_ptr = out_len != nullptr ? out_len : &local_len;
+        if (ptr_ == nullptr || ops_.as_mut_slice == nullptr) {
+            *len_ptr = 0u;
+            return nullptr;
+        }
+        return ops_.as_mut_slice(ptr_, len_ptr);
+    }
+
+    BamResult set(const Elem* ptr, size_t count) noexcept {
+        if (ptr_ == nullptr || ops_.set == nullptr) {
+            return BAM_RESULT_NULL_POINTER;
+        }
+        return ops_.set(ptr_, SliceTy{ptr, count});
+    }
+
+    BamResult clear() noexcept {
+        return (ptr_ != nullptr && ops_.clear != nullptr) ? ops_.clear(ptr_) : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult push(Elem val) noexcept {
+        return (ptr_ != nullptr && ops_.push != nullptr) ? ops_.push(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+
+    bool pop(Elem* out_elem) noexcept {
+        if (ptr_ == nullptr || ops_.pop == nullptr) {
+            return false;
+        }
+        return ops_.pop(ptr_, out_elem) != BAM_FALSE;
+    }
+
+    BamResult remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.remove != nullptr)
+            ? ops_.remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult swap_remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.swap_remove != nullptr)
+            ? ops_.swap_remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult truncate(size_t new_len) noexcept {
+        return (ptr_ != nullptr && ops_.truncate != nullptr)
+            ? ops_.truncate(ptr_, new_len)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult reserve(size_t additional) noexcept {
+        return (ptr_ != nullptr && ops_.reserve != nullptr)
+            ? ops_.reserve(ptr_, additional)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+    Elem* begin() noexcept { return data_mut(nullptr); }
+    Elem* end() noexcept {
+        size_t n = 0u;
+        Elem* p = data_mut(&n);
+        return p != nullptr ? (p + n) : nullptr;
+    }
+
+private:
+    void* ptr_{nullptr};
+    Ops   ops_{};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class ConstHostVecView {
+public:
+    ConstHostVecView(const void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.get != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+private:
+    const void* ptr_{nullptr};
+    Ops         ops_{};
+};
+
+#endif /* BAM_CPP17_SDK_HELPERS_DEFINED */
+} // namespace bam
+class CChangeSensorConstView {
+public:
+    CChangeSensorConstView() noexcept = default;
+    CChangeSensorConstView(const void* ptr, const CChangeSensorVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const void* raw() const noexcept { return ptr_; }
+    const CChangeSensorVTable* vtable() const noexcept { return vt_; }
+    uint32_t get_val() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_val != nullptr) ? vt_->get_val(ptr_) : uint32_t{};
+    }
+private:
+    const void* ptr_{nullptr};
+    const CChangeSensorVTable* vt_{nullptr};
+};
+
+class CChangeSensorView {
+public:
+    CChangeSensorView() noexcept = default;
+    CChangeSensorView(void* ptr, const CChangeSensorVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    void* raw() const noexcept { return ptr_; }
+    const CChangeSensorVTable* vtable() const noexcept { return vt_; }
+    CChangeSensorConstView as_const() const noexcept { return CChangeSensorConstView(ptr_, vt_); }
+    uint32_t get_val() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_val != nullptr) ? vt_->get_val(ptr_) : uint32_t{};
+    }
+    BamResult set_val(uint32_t val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_val != nullptr) ? vt_->set_val(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+private:
+    void* ptr_{nullptr};
+    const CChangeSensorVTable* vt_{nullptr};
+};
+
+} // extern "C++"
+#endif /* __cplusplus */
 
 /* Component: `testbed::FreshSpawnTag` (IS_ABI_POD = true) */
 typedef struct FreshSpawnTag {
@@ -242,6 +3323,278 @@ BAM_STATIC_ASSERT(sizeof(FreshSpawnTagVTable) == 56u, freshspawntagvtable_size64
 #elif UINTPTR_MAX == UINT32_MAX
 BAM_STATIC_ASSERT(sizeof(FreshSpawnTagVTable) == 40u, freshspawntagvtable_size32);
 #endif
+#ifdef __cplusplus
+extern "C++" {
+namespace bam {
+#ifndef BAM_CPP17_SDK_HELPERS_DEFINED
+#define BAM_CPP17_SDK_HELPERS_DEFINED
+
+template <typename VT>
+inline const VT* resolve_vtable(
+    const BamHostApi& api,
+    const BamHostCtx* host_ctx,
+    const char* symbol,
+    BamResult* out_err = nullptr
+) noexcept {
+    if (api.get_proc_address == nullptr || host_ctx == nullptr || symbol == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NULL_POINTER;
+        }
+        return nullptr;
+    }
+    const void* raw = api.get_proc_address(host_ctx, symbol);
+    if (raw == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NOT_FOUND;
+        }
+        return nullptr;
+    }
+    const auto* hdr = static_cast<const BamVTableHeader*>(raw);
+    if (hdr->struct_size < static_cast<uint32_t>(sizeof(VT)) ||
+        bam_version_is_compatible(BAM_ABI_VERSION, hdr->abi_version) == BAM_FALSE) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_INVALID_VERSION;
+        }
+        return nullptr;
+    }
+    if (out_err != nullptr) {
+        *out_err = BAM_RESULT_OK;
+    }
+    return static_cast<const VT*>(raw);
+}
+
+template <typename VT>
+class VTableHandle {
+public:
+    VTableHandle() noexcept = default;
+    explicit VTableHandle(const VT* ptr) noexcept : ptr_(ptr) {}
+
+    static VTableHandle resolve(
+        const BamHostApi& api,
+        const BamHostCtx* host_ctx,
+        const char* symbol,
+        BamResult* out_err = nullptr
+    ) noexcept {
+        return VTableHandle(resolve_vtable<VT>(api, host_ctx, symbol, out_err));
+    }
+
+    bool valid() const noexcept { return ptr_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const VT* raw() const noexcept { return ptr_; }
+    const VT* operator->() const noexcept { return ptr_; }
+
+private:
+    const VT* ptr_{nullptr};
+};
+
+template <typename InstanceT, void (*DestroyFn)(InstanceT*)>
+class UniqueGuest {
+public:
+    UniqueGuest() noexcept = default;
+    explicit UniqueGuest(InstanceT* ptr) noexcept : ptr_(ptr) {}
+    ~UniqueGuest() noexcept { reset(); }
+
+    UniqueGuest(const UniqueGuest&) = delete;
+    UniqueGuest& operator=(const UniqueGuest&) = delete;
+
+    UniqueGuest(UniqueGuest&& other) noexcept : ptr_(other.release()) {}
+    UniqueGuest& operator=(UniqueGuest&& other) noexcept {
+        if (this != &other) {
+            reset(other.release());
+        }
+        return *this;
+    }
+
+    InstanceT* get() const noexcept { return ptr_; }
+    InstanceT* operator->() const noexcept { return ptr_; }
+    InstanceT& operator*() const noexcept { return *ptr_; }
+    explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+    InstanceT* release() noexcept {
+        InstanceT* tmp = ptr_;
+        ptr_ = nullptr;
+        return tmp;
+    }
+
+    void reset(InstanceT* next = nullptr) noexcept {
+        if (ptr_ != nullptr && DestroyFn != nullptr) {
+            DestroyFn(ptr_);
+        }
+        ptr_ = next;
+    }
+
+private:
+    InstanceT* ptr_{nullptr};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class HostVecView {
+public:
+    HostVecView(void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.valid(); }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+
+    Elem* data_mut(size_t* out_len = nullptr) noexcept {
+        size_t local_len = 0u;
+        size_t* len_ptr = out_len != nullptr ? out_len : &local_len;
+        if (ptr_ == nullptr || ops_.as_mut_slice == nullptr) {
+            *len_ptr = 0u;
+            return nullptr;
+        }
+        return ops_.as_mut_slice(ptr_, len_ptr);
+    }
+
+    BamResult set(const Elem* ptr, size_t count) noexcept {
+        if (ptr_ == nullptr || ops_.set == nullptr) {
+            return BAM_RESULT_NULL_POINTER;
+        }
+        return ops_.set(ptr_, SliceTy{ptr, count});
+    }
+
+    BamResult clear() noexcept {
+        return (ptr_ != nullptr && ops_.clear != nullptr) ? ops_.clear(ptr_) : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult push(Elem val) noexcept {
+        return (ptr_ != nullptr && ops_.push != nullptr) ? ops_.push(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+
+    bool pop(Elem* out_elem) noexcept {
+        if (ptr_ == nullptr || ops_.pop == nullptr) {
+            return false;
+        }
+        return ops_.pop(ptr_, out_elem) != BAM_FALSE;
+    }
+
+    BamResult remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.remove != nullptr)
+            ? ops_.remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult swap_remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.swap_remove != nullptr)
+            ? ops_.swap_remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult truncate(size_t new_len) noexcept {
+        return (ptr_ != nullptr && ops_.truncate != nullptr)
+            ? ops_.truncate(ptr_, new_len)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult reserve(size_t additional) noexcept {
+        return (ptr_ != nullptr && ops_.reserve != nullptr)
+            ? ops_.reserve(ptr_, additional)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+    Elem* begin() noexcept { return data_mut(nullptr); }
+    Elem* end() noexcept {
+        size_t n = 0u;
+        Elem* p = data_mut(&n);
+        return p != nullptr ? (p + n) : nullptr;
+    }
+
+private:
+    void* ptr_{nullptr};
+    Ops   ops_{};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class ConstHostVecView {
+public:
+    ConstHostVecView(const void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.get != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+private:
+    const void* ptr_{nullptr};
+    Ops         ops_{};
+};
+
+#endif /* BAM_CPP17_SDK_HELPERS_DEFINED */
+} // namespace bam
+class FreshSpawnTagConstView {
+public:
+    FreshSpawnTagConstView() noexcept = default;
+    FreshSpawnTagConstView(const void* ptr, const FreshSpawnTagVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const void* raw() const noexcept { return ptr_; }
+    const FreshSpawnTagVTable* vtable() const noexcept { return vt_; }
+    uint32_t get_code() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_code != nullptr) ? vt_->get_code(ptr_) : uint32_t{};
+    }
+private:
+    const void* ptr_{nullptr};
+    const FreshSpawnTagVTable* vt_{nullptr};
+};
+
+class FreshSpawnTagView {
+public:
+    FreshSpawnTagView() noexcept = default;
+    FreshSpawnTagView(void* ptr, const FreshSpawnTagVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    void* raw() const noexcept { return ptr_; }
+    const FreshSpawnTagVTable* vtable() const noexcept { return vt_; }
+    FreshSpawnTagConstView as_const() const noexcept { return FreshSpawnTagConstView(ptr_, vt_); }
+    uint32_t get_code() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_code != nullptr) ? vt_->get_code(ptr_) : uint32_t{};
+    }
+    BamResult set_code(uint32_t val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_code != nullptr) ? vt_->set_code(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+private:
+    void* ptr_{nullptr};
+    const FreshSpawnTagVTable* vt_{nullptr};
+};
+
+} // extern "C++"
+#endif /* __cplusplus */
 
 /* Component: `testbed::CFreshSpawnTag` (IS_ABI_POD = true) */
 typedef struct CFreshSpawnTag {
@@ -259,6 +3612,278 @@ BAM_STATIC_ASSERT(sizeof(CFreshSpawnTagVTable) == 56u, cfreshspawntagvtable_size
 #elif UINTPTR_MAX == UINT32_MAX
 BAM_STATIC_ASSERT(sizeof(CFreshSpawnTagVTable) == 40u, cfreshspawntagvtable_size32);
 #endif
+#ifdef __cplusplus
+extern "C++" {
+namespace bam {
+#ifndef BAM_CPP17_SDK_HELPERS_DEFINED
+#define BAM_CPP17_SDK_HELPERS_DEFINED
+
+template <typename VT>
+inline const VT* resolve_vtable(
+    const BamHostApi& api,
+    const BamHostCtx* host_ctx,
+    const char* symbol,
+    BamResult* out_err = nullptr
+) noexcept {
+    if (api.get_proc_address == nullptr || host_ctx == nullptr || symbol == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NULL_POINTER;
+        }
+        return nullptr;
+    }
+    const void* raw = api.get_proc_address(host_ctx, symbol);
+    if (raw == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NOT_FOUND;
+        }
+        return nullptr;
+    }
+    const auto* hdr = static_cast<const BamVTableHeader*>(raw);
+    if (hdr->struct_size < static_cast<uint32_t>(sizeof(VT)) ||
+        bam_version_is_compatible(BAM_ABI_VERSION, hdr->abi_version) == BAM_FALSE) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_INVALID_VERSION;
+        }
+        return nullptr;
+    }
+    if (out_err != nullptr) {
+        *out_err = BAM_RESULT_OK;
+    }
+    return static_cast<const VT*>(raw);
+}
+
+template <typename VT>
+class VTableHandle {
+public:
+    VTableHandle() noexcept = default;
+    explicit VTableHandle(const VT* ptr) noexcept : ptr_(ptr) {}
+
+    static VTableHandle resolve(
+        const BamHostApi& api,
+        const BamHostCtx* host_ctx,
+        const char* symbol,
+        BamResult* out_err = nullptr
+    ) noexcept {
+        return VTableHandle(resolve_vtable<VT>(api, host_ctx, symbol, out_err));
+    }
+
+    bool valid() const noexcept { return ptr_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const VT* raw() const noexcept { return ptr_; }
+    const VT* operator->() const noexcept { return ptr_; }
+
+private:
+    const VT* ptr_{nullptr};
+};
+
+template <typename InstanceT, void (*DestroyFn)(InstanceT*)>
+class UniqueGuest {
+public:
+    UniqueGuest() noexcept = default;
+    explicit UniqueGuest(InstanceT* ptr) noexcept : ptr_(ptr) {}
+    ~UniqueGuest() noexcept { reset(); }
+
+    UniqueGuest(const UniqueGuest&) = delete;
+    UniqueGuest& operator=(const UniqueGuest&) = delete;
+
+    UniqueGuest(UniqueGuest&& other) noexcept : ptr_(other.release()) {}
+    UniqueGuest& operator=(UniqueGuest&& other) noexcept {
+        if (this != &other) {
+            reset(other.release());
+        }
+        return *this;
+    }
+
+    InstanceT* get() const noexcept { return ptr_; }
+    InstanceT* operator->() const noexcept { return ptr_; }
+    InstanceT& operator*() const noexcept { return *ptr_; }
+    explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+    InstanceT* release() noexcept {
+        InstanceT* tmp = ptr_;
+        ptr_ = nullptr;
+        return tmp;
+    }
+
+    void reset(InstanceT* next = nullptr) noexcept {
+        if (ptr_ != nullptr && DestroyFn != nullptr) {
+            DestroyFn(ptr_);
+        }
+        ptr_ = next;
+    }
+
+private:
+    InstanceT* ptr_{nullptr};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class HostVecView {
+public:
+    HostVecView(void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.valid(); }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+
+    Elem* data_mut(size_t* out_len = nullptr) noexcept {
+        size_t local_len = 0u;
+        size_t* len_ptr = out_len != nullptr ? out_len : &local_len;
+        if (ptr_ == nullptr || ops_.as_mut_slice == nullptr) {
+            *len_ptr = 0u;
+            return nullptr;
+        }
+        return ops_.as_mut_slice(ptr_, len_ptr);
+    }
+
+    BamResult set(const Elem* ptr, size_t count) noexcept {
+        if (ptr_ == nullptr || ops_.set == nullptr) {
+            return BAM_RESULT_NULL_POINTER;
+        }
+        return ops_.set(ptr_, SliceTy{ptr, count});
+    }
+
+    BamResult clear() noexcept {
+        return (ptr_ != nullptr && ops_.clear != nullptr) ? ops_.clear(ptr_) : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult push(Elem val) noexcept {
+        return (ptr_ != nullptr && ops_.push != nullptr) ? ops_.push(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+
+    bool pop(Elem* out_elem) noexcept {
+        if (ptr_ == nullptr || ops_.pop == nullptr) {
+            return false;
+        }
+        return ops_.pop(ptr_, out_elem) != BAM_FALSE;
+    }
+
+    BamResult remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.remove != nullptr)
+            ? ops_.remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult swap_remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.swap_remove != nullptr)
+            ? ops_.swap_remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult truncate(size_t new_len) noexcept {
+        return (ptr_ != nullptr && ops_.truncate != nullptr)
+            ? ops_.truncate(ptr_, new_len)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult reserve(size_t additional) noexcept {
+        return (ptr_ != nullptr && ops_.reserve != nullptr)
+            ? ops_.reserve(ptr_, additional)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+    Elem* begin() noexcept { return data_mut(nullptr); }
+    Elem* end() noexcept {
+        size_t n = 0u;
+        Elem* p = data_mut(&n);
+        return p != nullptr ? (p + n) : nullptr;
+    }
+
+private:
+    void* ptr_{nullptr};
+    Ops   ops_{};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class ConstHostVecView {
+public:
+    ConstHostVecView(const void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.get != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+private:
+    const void* ptr_{nullptr};
+    Ops         ops_{};
+};
+
+#endif /* BAM_CPP17_SDK_HELPERS_DEFINED */
+} // namespace bam
+class CFreshSpawnTagConstView {
+public:
+    CFreshSpawnTagConstView() noexcept = default;
+    CFreshSpawnTagConstView(const void* ptr, const CFreshSpawnTagVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const void* raw() const noexcept { return ptr_; }
+    const CFreshSpawnTagVTable* vtable() const noexcept { return vt_; }
+    uint32_t get_code() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_code != nullptr) ? vt_->get_code(ptr_) : uint32_t{};
+    }
+private:
+    const void* ptr_{nullptr};
+    const CFreshSpawnTagVTable* vt_{nullptr};
+};
+
+class CFreshSpawnTagView {
+public:
+    CFreshSpawnTagView() noexcept = default;
+    CFreshSpawnTagView(void* ptr, const CFreshSpawnTagVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    void* raw() const noexcept { return ptr_; }
+    const CFreshSpawnTagVTable* vtable() const noexcept { return vt_; }
+    CFreshSpawnTagConstView as_const() const noexcept { return CFreshSpawnTagConstView(ptr_, vt_); }
+    uint32_t get_code() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_code != nullptr) ? vt_->get_code(ptr_) : uint32_t{};
+    }
+    BamResult set_code(uint32_t val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_code != nullptr) ? vt_->set_code(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+private:
+    void* ptr_{nullptr};
+    const CFreshSpawnTagVTable* vt_{nullptr};
+};
+
+} // extern "C++"
+#endif /* __cplusplus */
 
 /* Component: `testbed::TransientMarker` (IS_ABI_POD = true) */
 typedef struct TransientMarker {
@@ -276,6 +3901,278 @@ BAM_STATIC_ASSERT(sizeof(TransientMarkerVTable) == 56u, transientmarkervtable_si
 #elif UINTPTR_MAX == UINT32_MAX
 BAM_STATIC_ASSERT(sizeof(TransientMarkerVTable) == 40u, transientmarkervtable_size32);
 #endif
+#ifdef __cplusplus
+extern "C++" {
+namespace bam {
+#ifndef BAM_CPP17_SDK_HELPERS_DEFINED
+#define BAM_CPP17_SDK_HELPERS_DEFINED
+
+template <typename VT>
+inline const VT* resolve_vtable(
+    const BamHostApi& api,
+    const BamHostCtx* host_ctx,
+    const char* symbol,
+    BamResult* out_err = nullptr
+) noexcept {
+    if (api.get_proc_address == nullptr || host_ctx == nullptr || symbol == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NULL_POINTER;
+        }
+        return nullptr;
+    }
+    const void* raw = api.get_proc_address(host_ctx, symbol);
+    if (raw == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NOT_FOUND;
+        }
+        return nullptr;
+    }
+    const auto* hdr = static_cast<const BamVTableHeader*>(raw);
+    if (hdr->struct_size < static_cast<uint32_t>(sizeof(VT)) ||
+        bam_version_is_compatible(BAM_ABI_VERSION, hdr->abi_version) == BAM_FALSE) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_INVALID_VERSION;
+        }
+        return nullptr;
+    }
+    if (out_err != nullptr) {
+        *out_err = BAM_RESULT_OK;
+    }
+    return static_cast<const VT*>(raw);
+}
+
+template <typename VT>
+class VTableHandle {
+public:
+    VTableHandle() noexcept = default;
+    explicit VTableHandle(const VT* ptr) noexcept : ptr_(ptr) {}
+
+    static VTableHandle resolve(
+        const BamHostApi& api,
+        const BamHostCtx* host_ctx,
+        const char* symbol,
+        BamResult* out_err = nullptr
+    ) noexcept {
+        return VTableHandle(resolve_vtable<VT>(api, host_ctx, symbol, out_err));
+    }
+
+    bool valid() const noexcept { return ptr_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const VT* raw() const noexcept { return ptr_; }
+    const VT* operator->() const noexcept { return ptr_; }
+
+private:
+    const VT* ptr_{nullptr};
+};
+
+template <typename InstanceT, void (*DestroyFn)(InstanceT*)>
+class UniqueGuest {
+public:
+    UniqueGuest() noexcept = default;
+    explicit UniqueGuest(InstanceT* ptr) noexcept : ptr_(ptr) {}
+    ~UniqueGuest() noexcept { reset(); }
+
+    UniqueGuest(const UniqueGuest&) = delete;
+    UniqueGuest& operator=(const UniqueGuest&) = delete;
+
+    UniqueGuest(UniqueGuest&& other) noexcept : ptr_(other.release()) {}
+    UniqueGuest& operator=(UniqueGuest&& other) noexcept {
+        if (this != &other) {
+            reset(other.release());
+        }
+        return *this;
+    }
+
+    InstanceT* get() const noexcept { return ptr_; }
+    InstanceT* operator->() const noexcept { return ptr_; }
+    InstanceT& operator*() const noexcept { return *ptr_; }
+    explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+    InstanceT* release() noexcept {
+        InstanceT* tmp = ptr_;
+        ptr_ = nullptr;
+        return tmp;
+    }
+
+    void reset(InstanceT* next = nullptr) noexcept {
+        if (ptr_ != nullptr && DestroyFn != nullptr) {
+            DestroyFn(ptr_);
+        }
+        ptr_ = next;
+    }
+
+private:
+    InstanceT* ptr_{nullptr};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class HostVecView {
+public:
+    HostVecView(void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.valid(); }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+
+    Elem* data_mut(size_t* out_len = nullptr) noexcept {
+        size_t local_len = 0u;
+        size_t* len_ptr = out_len != nullptr ? out_len : &local_len;
+        if (ptr_ == nullptr || ops_.as_mut_slice == nullptr) {
+            *len_ptr = 0u;
+            return nullptr;
+        }
+        return ops_.as_mut_slice(ptr_, len_ptr);
+    }
+
+    BamResult set(const Elem* ptr, size_t count) noexcept {
+        if (ptr_ == nullptr || ops_.set == nullptr) {
+            return BAM_RESULT_NULL_POINTER;
+        }
+        return ops_.set(ptr_, SliceTy{ptr, count});
+    }
+
+    BamResult clear() noexcept {
+        return (ptr_ != nullptr && ops_.clear != nullptr) ? ops_.clear(ptr_) : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult push(Elem val) noexcept {
+        return (ptr_ != nullptr && ops_.push != nullptr) ? ops_.push(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+
+    bool pop(Elem* out_elem) noexcept {
+        if (ptr_ == nullptr || ops_.pop == nullptr) {
+            return false;
+        }
+        return ops_.pop(ptr_, out_elem) != BAM_FALSE;
+    }
+
+    BamResult remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.remove != nullptr)
+            ? ops_.remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult swap_remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.swap_remove != nullptr)
+            ? ops_.swap_remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult truncate(size_t new_len) noexcept {
+        return (ptr_ != nullptr && ops_.truncate != nullptr)
+            ? ops_.truncate(ptr_, new_len)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult reserve(size_t additional) noexcept {
+        return (ptr_ != nullptr && ops_.reserve != nullptr)
+            ? ops_.reserve(ptr_, additional)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+    Elem* begin() noexcept { return data_mut(nullptr); }
+    Elem* end() noexcept {
+        size_t n = 0u;
+        Elem* p = data_mut(&n);
+        return p != nullptr ? (p + n) : nullptr;
+    }
+
+private:
+    void* ptr_{nullptr};
+    Ops   ops_{};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class ConstHostVecView {
+public:
+    ConstHostVecView(const void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.get != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+private:
+    const void* ptr_{nullptr};
+    Ops         ops_{};
+};
+
+#endif /* BAM_CPP17_SDK_HELPERS_DEFINED */
+} // namespace bam
+class TransientMarkerConstView {
+public:
+    TransientMarkerConstView() noexcept = default;
+    TransientMarkerConstView(const void* ptr, const TransientMarkerVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const void* raw() const noexcept { return ptr_; }
+    const TransientMarkerVTable* vtable() const noexcept { return vt_; }
+    uint32_t get_dummy() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_dummy != nullptr) ? vt_->get_dummy(ptr_) : uint32_t{};
+    }
+private:
+    const void* ptr_{nullptr};
+    const TransientMarkerVTable* vt_{nullptr};
+};
+
+class TransientMarkerView {
+public:
+    TransientMarkerView() noexcept = default;
+    TransientMarkerView(void* ptr, const TransientMarkerVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    void* raw() const noexcept { return ptr_; }
+    const TransientMarkerVTable* vtable() const noexcept { return vt_; }
+    TransientMarkerConstView as_const() const noexcept { return TransientMarkerConstView(ptr_, vt_); }
+    uint32_t get_dummy() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_dummy != nullptr) ? vt_->get_dummy(ptr_) : uint32_t{};
+    }
+    BamResult set_dummy(uint32_t val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_dummy != nullptr) ? vt_->set_dummy(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+private:
+    void* ptr_{nullptr};
+    const TransientMarkerVTable* vt_{nullptr};
+};
+
+} // extern "C++"
+#endif /* __cplusplus */
 
 /* Component: `testbed::CTransientMarker` (IS_ABI_POD = true) */
 typedef struct CTransientMarker {
@@ -293,6 +4190,278 @@ BAM_STATIC_ASSERT(sizeof(CTransientMarkerVTable) == 56u, ctransientmarkervtable_
 #elif UINTPTR_MAX == UINT32_MAX
 BAM_STATIC_ASSERT(sizeof(CTransientMarkerVTable) == 40u, ctransientmarkervtable_size32);
 #endif
+#ifdef __cplusplus
+extern "C++" {
+namespace bam {
+#ifndef BAM_CPP17_SDK_HELPERS_DEFINED
+#define BAM_CPP17_SDK_HELPERS_DEFINED
+
+template <typename VT>
+inline const VT* resolve_vtable(
+    const BamHostApi& api,
+    const BamHostCtx* host_ctx,
+    const char* symbol,
+    BamResult* out_err = nullptr
+) noexcept {
+    if (api.get_proc_address == nullptr || host_ctx == nullptr || symbol == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NULL_POINTER;
+        }
+        return nullptr;
+    }
+    const void* raw = api.get_proc_address(host_ctx, symbol);
+    if (raw == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NOT_FOUND;
+        }
+        return nullptr;
+    }
+    const auto* hdr = static_cast<const BamVTableHeader*>(raw);
+    if (hdr->struct_size < static_cast<uint32_t>(sizeof(VT)) ||
+        bam_version_is_compatible(BAM_ABI_VERSION, hdr->abi_version) == BAM_FALSE) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_INVALID_VERSION;
+        }
+        return nullptr;
+    }
+    if (out_err != nullptr) {
+        *out_err = BAM_RESULT_OK;
+    }
+    return static_cast<const VT*>(raw);
+}
+
+template <typename VT>
+class VTableHandle {
+public:
+    VTableHandle() noexcept = default;
+    explicit VTableHandle(const VT* ptr) noexcept : ptr_(ptr) {}
+
+    static VTableHandle resolve(
+        const BamHostApi& api,
+        const BamHostCtx* host_ctx,
+        const char* symbol,
+        BamResult* out_err = nullptr
+    ) noexcept {
+        return VTableHandle(resolve_vtable<VT>(api, host_ctx, symbol, out_err));
+    }
+
+    bool valid() const noexcept { return ptr_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const VT* raw() const noexcept { return ptr_; }
+    const VT* operator->() const noexcept { return ptr_; }
+
+private:
+    const VT* ptr_{nullptr};
+};
+
+template <typename InstanceT, void (*DestroyFn)(InstanceT*)>
+class UniqueGuest {
+public:
+    UniqueGuest() noexcept = default;
+    explicit UniqueGuest(InstanceT* ptr) noexcept : ptr_(ptr) {}
+    ~UniqueGuest() noexcept { reset(); }
+
+    UniqueGuest(const UniqueGuest&) = delete;
+    UniqueGuest& operator=(const UniqueGuest&) = delete;
+
+    UniqueGuest(UniqueGuest&& other) noexcept : ptr_(other.release()) {}
+    UniqueGuest& operator=(UniqueGuest&& other) noexcept {
+        if (this != &other) {
+            reset(other.release());
+        }
+        return *this;
+    }
+
+    InstanceT* get() const noexcept { return ptr_; }
+    InstanceT* operator->() const noexcept { return ptr_; }
+    InstanceT& operator*() const noexcept { return *ptr_; }
+    explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+    InstanceT* release() noexcept {
+        InstanceT* tmp = ptr_;
+        ptr_ = nullptr;
+        return tmp;
+    }
+
+    void reset(InstanceT* next = nullptr) noexcept {
+        if (ptr_ != nullptr && DestroyFn != nullptr) {
+            DestroyFn(ptr_);
+        }
+        ptr_ = next;
+    }
+
+private:
+    InstanceT* ptr_{nullptr};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class HostVecView {
+public:
+    HostVecView(void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.valid(); }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+
+    Elem* data_mut(size_t* out_len = nullptr) noexcept {
+        size_t local_len = 0u;
+        size_t* len_ptr = out_len != nullptr ? out_len : &local_len;
+        if (ptr_ == nullptr || ops_.as_mut_slice == nullptr) {
+            *len_ptr = 0u;
+            return nullptr;
+        }
+        return ops_.as_mut_slice(ptr_, len_ptr);
+    }
+
+    BamResult set(const Elem* ptr, size_t count) noexcept {
+        if (ptr_ == nullptr || ops_.set == nullptr) {
+            return BAM_RESULT_NULL_POINTER;
+        }
+        return ops_.set(ptr_, SliceTy{ptr, count});
+    }
+
+    BamResult clear() noexcept {
+        return (ptr_ != nullptr && ops_.clear != nullptr) ? ops_.clear(ptr_) : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult push(Elem val) noexcept {
+        return (ptr_ != nullptr && ops_.push != nullptr) ? ops_.push(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+
+    bool pop(Elem* out_elem) noexcept {
+        if (ptr_ == nullptr || ops_.pop == nullptr) {
+            return false;
+        }
+        return ops_.pop(ptr_, out_elem) != BAM_FALSE;
+    }
+
+    BamResult remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.remove != nullptr)
+            ? ops_.remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult swap_remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.swap_remove != nullptr)
+            ? ops_.swap_remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult truncate(size_t new_len) noexcept {
+        return (ptr_ != nullptr && ops_.truncate != nullptr)
+            ? ops_.truncate(ptr_, new_len)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult reserve(size_t additional) noexcept {
+        return (ptr_ != nullptr && ops_.reserve != nullptr)
+            ? ops_.reserve(ptr_, additional)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+    Elem* begin() noexcept { return data_mut(nullptr); }
+    Elem* end() noexcept {
+        size_t n = 0u;
+        Elem* p = data_mut(&n);
+        return p != nullptr ? (p + n) : nullptr;
+    }
+
+private:
+    void* ptr_{nullptr};
+    Ops   ops_{};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class ConstHostVecView {
+public:
+    ConstHostVecView(const void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.get != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+private:
+    const void* ptr_{nullptr};
+    Ops         ops_{};
+};
+
+#endif /* BAM_CPP17_SDK_HELPERS_DEFINED */
+} // namespace bam
+class CTransientMarkerConstView {
+public:
+    CTransientMarkerConstView() noexcept = default;
+    CTransientMarkerConstView(const void* ptr, const CTransientMarkerVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const void* raw() const noexcept { return ptr_; }
+    const CTransientMarkerVTable* vtable() const noexcept { return vt_; }
+    uint32_t get_dummy() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_dummy != nullptr) ? vt_->get_dummy(ptr_) : uint32_t{};
+    }
+private:
+    const void* ptr_{nullptr};
+    const CTransientMarkerVTable* vt_{nullptr};
+};
+
+class CTransientMarkerView {
+public:
+    CTransientMarkerView() noexcept = default;
+    CTransientMarkerView(void* ptr, const CTransientMarkerVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    void* raw() const noexcept { return ptr_; }
+    const CTransientMarkerVTable* vtable() const noexcept { return vt_; }
+    CTransientMarkerConstView as_const() const noexcept { return CTransientMarkerConstView(ptr_, vt_); }
+    uint32_t get_dummy() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_dummy != nullptr) ? vt_->get_dummy(ptr_) : uint32_t{};
+    }
+    BamResult set_dummy(uint32_t val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_dummy != nullptr) ? vt_->set_dummy(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+private:
+    void* ptr_{nullptr};
+    const CTransientMarkerVTable* vt_{nullptr};
+};
+
+} // extern "C++"
+#endif /* __cplusplus */
 
 /* Component: `testbed::RustFilterTelemetry` (IS_ABI_POD = true) */
 typedef struct RustFilterTelemetry {
@@ -319,6 +4488,305 @@ BAM_STATIC_ASSERT(sizeof(RustFilterTelemetryVTable) == 104u, rustfiltertelemetry
 #elif UINTPTR_MAX == UINT32_MAX
 BAM_STATIC_ASSERT(sizeof(RustFilterTelemetryVTable) == 64u, rustfiltertelemetryvtable_size32);
 #endif
+#ifdef __cplusplus
+extern "C++" {
+namespace bam {
+#ifndef BAM_CPP17_SDK_HELPERS_DEFINED
+#define BAM_CPP17_SDK_HELPERS_DEFINED
+
+template <typename VT>
+inline const VT* resolve_vtable(
+    const BamHostApi& api,
+    const BamHostCtx* host_ctx,
+    const char* symbol,
+    BamResult* out_err = nullptr
+) noexcept {
+    if (api.get_proc_address == nullptr || host_ctx == nullptr || symbol == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NULL_POINTER;
+        }
+        return nullptr;
+    }
+    const void* raw = api.get_proc_address(host_ctx, symbol);
+    if (raw == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NOT_FOUND;
+        }
+        return nullptr;
+    }
+    const auto* hdr = static_cast<const BamVTableHeader*>(raw);
+    if (hdr->struct_size < static_cast<uint32_t>(sizeof(VT)) ||
+        bam_version_is_compatible(BAM_ABI_VERSION, hdr->abi_version) == BAM_FALSE) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_INVALID_VERSION;
+        }
+        return nullptr;
+    }
+    if (out_err != nullptr) {
+        *out_err = BAM_RESULT_OK;
+    }
+    return static_cast<const VT*>(raw);
+}
+
+template <typename VT>
+class VTableHandle {
+public:
+    VTableHandle() noexcept = default;
+    explicit VTableHandle(const VT* ptr) noexcept : ptr_(ptr) {}
+
+    static VTableHandle resolve(
+        const BamHostApi& api,
+        const BamHostCtx* host_ctx,
+        const char* symbol,
+        BamResult* out_err = nullptr
+    ) noexcept {
+        return VTableHandle(resolve_vtable<VT>(api, host_ctx, symbol, out_err));
+    }
+
+    bool valid() const noexcept { return ptr_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const VT* raw() const noexcept { return ptr_; }
+    const VT* operator->() const noexcept { return ptr_; }
+
+private:
+    const VT* ptr_{nullptr};
+};
+
+template <typename InstanceT, void (*DestroyFn)(InstanceT*)>
+class UniqueGuest {
+public:
+    UniqueGuest() noexcept = default;
+    explicit UniqueGuest(InstanceT* ptr) noexcept : ptr_(ptr) {}
+    ~UniqueGuest() noexcept { reset(); }
+
+    UniqueGuest(const UniqueGuest&) = delete;
+    UniqueGuest& operator=(const UniqueGuest&) = delete;
+
+    UniqueGuest(UniqueGuest&& other) noexcept : ptr_(other.release()) {}
+    UniqueGuest& operator=(UniqueGuest&& other) noexcept {
+        if (this != &other) {
+            reset(other.release());
+        }
+        return *this;
+    }
+
+    InstanceT* get() const noexcept { return ptr_; }
+    InstanceT* operator->() const noexcept { return ptr_; }
+    InstanceT& operator*() const noexcept { return *ptr_; }
+    explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+    InstanceT* release() noexcept {
+        InstanceT* tmp = ptr_;
+        ptr_ = nullptr;
+        return tmp;
+    }
+
+    void reset(InstanceT* next = nullptr) noexcept {
+        if (ptr_ != nullptr && DestroyFn != nullptr) {
+            DestroyFn(ptr_);
+        }
+        ptr_ = next;
+    }
+
+private:
+    InstanceT* ptr_{nullptr};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class HostVecView {
+public:
+    HostVecView(void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.valid(); }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+
+    Elem* data_mut(size_t* out_len = nullptr) noexcept {
+        size_t local_len = 0u;
+        size_t* len_ptr = out_len != nullptr ? out_len : &local_len;
+        if (ptr_ == nullptr || ops_.as_mut_slice == nullptr) {
+            *len_ptr = 0u;
+            return nullptr;
+        }
+        return ops_.as_mut_slice(ptr_, len_ptr);
+    }
+
+    BamResult set(const Elem* ptr, size_t count) noexcept {
+        if (ptr_ == nullptr || ops_.set == nullptr) {
+            return BAM_RESULT_NULL_POINTER;
+        }
+        return ops_.set(ptr_, SliceTy{ptr, count});
+    }
+
+    BamResult clear() noexcept {
+        return (ptr_ != nullptr && ops_.clear != nullptr) ? ops_.clear(ptr_) : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult push(Elem val) noexcept {
+        return (ptr_ != nullptr && ops_.push != nullptr) ? ops_.push(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+
+    bool pop(Elem* out_elem) noexcept {
+        if (ptr_ == nullptr || ops_.pop == nullptr) {
+            return false;
+        }
+        return ops_.pop(ptr_, out_elem) != BAM_FALSE;
+    }
+
+    BamResult remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.remove != nullptr)
+            ? ops_.remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult swap_remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.swap_remove != nullptr)
+            ? ops_.swap_remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult truncate(size_t new_len) noexcept {
+        return (ptr_ != nullptr && ops_.truncate != nullptr)
+            ? ops_.truncate(ptr_, new_len)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult reserve(size_t additional) noexcept {
+        return (ptr_ != nullptr && ops_.reserve != nullptr)
+            ? ops_.reserve(ptr_, additional)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+    Elem* begin() noexcept { return data_mut(nullptr); }
+    Elem* end() noexcept {
+        size_t n = 0u;
+        Elem* p = data_mut(&n);
+        return p != nullptr ? (p + n) : nullptr;
+    }
+
+private:
+    void* ptr_{nullptr};
+    Ops   ops_{};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class ConstHostVecView {
+public:
+    ConstHostVecView(const void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.get != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+private:
+    const void* ptr_{nullptr};
+    Ops         ops_{};
+};
+
+#endif /* BAM_CPP17_SDK_HELPERS_DEFINED */
+} // namespace bam
+class RustFilterTelemetryConstView {
+public:
+    RustFilterTelemetryConstView() noexcept = default;
+    RustFilterTelemetryConstView(const void* ptr, const RustFilterTelemetryVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const void* raw() const noexcept { return ptr_; }
+    const RustFilterTelemetryVTable* vtable() const noexcept { return vt_; }
+    float get_scale() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_scale != nullptr) ? vt_->get_scale(ptr_) : float{};
+    }
+    uint32_t get_matched_rows() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_matched_rows != nullptr) ? vt_->get_matched_rows(ptr_) : uint32_t{};
+    }
+    uint32_t get_optional_vel_hits() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_optional_vel_hits != nullptr) ? vt_->get_optional_vel_hits(ptr_) : uint32_t{};
+    }
+    uint64_t get_spawned_default_entity() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_spawned_default_entity != nullptr) ? vt_->get_spawned_default_entity(ptr_) : uint64_t{};
+    }
+private:
+    const void* ptr_{nullptr};
+    const RustFilterTelemetryVTable* vt_{nullptr};
+};
+
+class RustFilterTelemetryView {
+public:
+    RustFilterTelemetryView() noexcept = default;
+    RustFilterTelemetryView(void* ptr, const RustFilterTelemetryVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    void* raw() const noexcept { return ptr_; }
+    const RustFilterTelemetryVTable* vtable() const noexcept { return vt_; }
+    RustFilterTelemetryConstView as_const() const noexcept { return RustFilterTelemetryConstView(ptr_, vt_); }
+    float get_scale() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_scale != nullptr) ? vt_->get_scale(ptr_) : float{};
+    }
+    BamResult set_scale(float val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_scale != nullptr) ? vt_->set_scale(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+    uint32_t get_matched_rows() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_matched_rows != nullptr) ? vt_->get_matched_rows(ptr_) : uint32_t{};
+    }
+    BamResult set_matched_rows(uint32_t val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_matched_rows != nullptr) ? vt_->set_matched_rows(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+    uint32_t get_optional_vel_hits() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_optional_vel_hits != nullptr) ? vt_->get_optional_vel_hits(ptr_) : uint32_t{};
+    }
+    BamResult set_optional_vel_hits(uint32_t val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_optional_vel_hits != nullptr) ? vt_->set_optional_vel_hits(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+    uint64_t get_spawned_default_entity() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_spawned_default_entity != nullptr) ? vt_->get_spawned_default_entity(ptr_) : uint64_t{};
+    }
+    BamResult set_spawned_default_entity(uint64_t val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_spawned_default_entity != nullptr) ? vt_->set_spawned_default_entity(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+private:
+    void* ptr_{nullptr};
+    const RustFilterTelemetryVTable* vt_{nullptr};
+};
+
+} // extern "C++"
+#endif /* __cplusplus */
 
 /* Component: `testbed::CFilterTelemetry` (IS_ABI_POD = true) */
 typedef struct CFilterTelemetry {
@@ -345,6 +4813,305 @@ BAM_STATIC_ASSERT(sizeof(CFilterTelemetryVTable) == 104u, cfiltertelemetryvtable
 #elif UINTPTR_MAX == UINT32_MAX
 BAM_STATIC_ASSERT(sizeof(CFilterTelemetryVTable) == 64u, cfiltertelemetryvtable_size32);
 #endif
+#ifdef __cplusplus
+extern "C++" {
+namespace bam {
+#ifndef BAM_CPP17_SDK_HELPERS_DEFINED
+#define BAM_CPP17_SDK_HELPERS_DEFINED
+
+template <typename VT>
+inline const VT* resolve_vtable(
+    const BamHostApi& api,
+    const BamHostCtx* host_ctx,
+    const char* symbol,
+    BamResult* out_err = nullptr
+) noexcept {
+    if (api.get_proc_address == nullptr || host_ctx == nullptr || symbol == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NULL_POINTER;
+        }
+        return nullptr;
+    }
+    const void* raw = api.get_proc_address(host_ctx, symbol);
+    if (raw == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NOT_FOUND;
+        }
+        return nullptr;
+    }
+    const auto* hdr = static_cast<const BamVTableHeader*>(raw);
+    if (hdr->struct_size < static_cast<uint32_t>(sizeof(VT)) ||
+        bam_version_is_compatible(BAM_ABI_VERSION, hdr->abi_version) == BAM_FALSE) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_INVALID_VERSION;
+        }
+        return nullptr;
+    }
+    if (out_err != nullptr) {
+        *out_err = BAM_RESULT_OK;
+    }
+    return static_cast<const VT*>(raw);
+}
+
+template <typename VT>
+class VTableHandle {
+public:
+    VTableHandle() noexcept = default;
+    explicit VTableHandle(const VT* ptr) noexcept : ptr_(ptr) {}
+
+    static VTableHandle resolve(
+        const BamHostApi& api,
+        const BamHostCtx* host_ctx,
+        const char* symbol,
+        BamResult* out_err = nullptr
+    ) noexcept {
+        return VTableHandle(resolve_vtable<VT>(api, host_ctx, symbol, out_err));
+    }
+
+    bool valid() const noexcept { return ptr_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const VT* raw() const noexcept { return ptr_; }
+    const VT* operator->() const noexcept { return ptr_; }
+
+private:
+    const VT* ptr_{nullptr};
+};
+
+template <typename InstanceT, void (*DestroyFn)(InstanceT*)>
+class UniqueGuest {
+public:
+    UniqueGuest() noexcept = default;
+    explicit UniqueGuest(InstanceT* ptr) noexcept : ptr_(ptr) {}
+    ~UniqueGuest() noexcept { reset(); }
+
+    UniqueGuest(const UniqueGuest&) = delete;
+    UniqueGuest& operator=(const UniqueGuest&) = delete;
+
+    UniqueGuest(UniqueGuest&& other) noexcept : ptr_(other.release()) {}
+    UniqueGuest& operator=(UniqueGuest&& other) noexcept {
+        if (this != &other) {
+            reset(other.release());
+        }
+        return *this;
+    }
+
+    InstanceT* get() const noexcept { return ptr_; }
+    InstanceT* operator->() const noexcept { return ptr_; }
+    InstanceT& operator*() const noexcept { return *ptr_; }
+    explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+    InstanceT* release() noexcept {
+        InstanceT* tmp = ptr_;
+        ptr_ = nullptr;
+        return tmp;
+    }
+
+    void reset(InstanceT* next = nullptr) noexcept {
+        if (ptr_ != nullptr && DestroyFn != nullptr) {
+            DestroyFn(ptr_);
+        }
+        ptr_ = next;
+    }
+
+private:
+    InstanceT* ptr_{nullptr};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class HostVecView {
+public:
+    HostVecView(void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.valid(); }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+
+    Elem* data_mut(size_t* out_len = nullptr) noexcept {
+        size_t local_len = 0u;
+        size_t* len_ptr = out_len != nullptr ? out_len : &local_len;
+        if (ptr_ == nullptr || ops_.as_mut_slice == nullptr) {
+            *len_ptr = 0u;
+            return nullptr;
+        }
+        return ops_.as_mut_slice(ptr_, len_ptr);
+    }
+
+    BamResult set(const Elem* ptr, size_t count) noexcept {
+        if (ptr_ == nullptr || ops_.set == nullptr) {
+            return BAM_RESULT_NULL_POINTER;
+        }
+        return ops_.set(ptr_, SliceTy{ptr, count});
+    }
+
+    BamResult clear() noexcept {
+        return (ptr_ != nullptr && ops_.clear != nullptr) ? ops_.clear(ptr_) : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult push(Elem val) noexcept {
+        return (ptr_ != nullptr && ops_.push != nullptr) ? ops_.push(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+
+    bool pop(Elem* out_elem) noexcept {
+        if (ptr_ == nullptr || ops_.pop == nullptr) {
+            return false;
+        }
+        return ops_.pop(ptr_, out_elem) != BAM_FALSE;
+    }
+
+    BamResult remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.remove != nullptr)
+            ? ops_.remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult swap_remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.swap_remove != nullptr)
+            ? ops_.swap_remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult truncate(size_t new_len) noexcept {
+        return (ptr_ != nullptr && ops_.truncate != nullptr)
+            ? ops_.truncate(ptr_, new_len)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult reserve(size_t additional) noexcept {
+        return (ptr_ != nullptr && ops_.reserve != nullptr)
+            ? ops_.reserve(ptr_, additional)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+    Elem* begin() noexcept { return data_mut(nullptr); }
+    Elem* end() noexcept {
+        size_t n = 0u;
+        Elem* p = data_mut(&n);
+        return p != nullptr ? (p + n) : nullptr;
+    }
+
+private:
+    void* ptr_{nullptr};
+    Ops   ops_{};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class ConstHostVecView {
+public:
+    ConstHostVecView(const void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.get != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+private:
+    const void* ptr_{nullptr};
+    Ops         ops_{};
+};
+
+#endif /* BAM_CPP17_SDK_HELPERS_DEFINED */
+} // namespace bam
+class CFilterTelemetryConstView {
+public:
+    CFilterTelemetryConstView() noexcept = default;
+    CFilterTelemetryConstView(const void* ptr, const CFilterTelemetryVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const void* raw() const noexcept { return ptr_; }
+    const CFilterTelemetryVTable* vtable() const noexcept { return vt_; }
+    float get_scale() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_scale != nullptr) ? vt_->get_scale(ptr_) : float{};
+    }
+    uint32_t get_matched_rows() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_matched_rows != nullptr) ? vt_->get_matched_rows(ptr_) : uint32_t{};
+    }
+    uint32_t get_optional_vel_hits() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_optional_vel_hits != nullptr) ? vt_->get_optional_vel_hits(ptr_) : uint32_t{};
+    }
+    uint64_t get_spawned_default_entity() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_spawned_default_entity != nullptr) ? vt_->get_spawned_default_entity(ptr_) : uint64_t{};
+    }
+private:
+    const void* ptr_{nullptr};
+    const CFilterTelemetryVTable* vt_{nullptr};
+};
+
+class CFilterTelemetryView {
+public:
+    CFilterTelemetryView() noexcept = default;
+    CFilterTelemetryView(void* ptr, const CFilterTelemetryVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    void* raw() const noexcept { return ptr_; }
+    const CFilterTelemetryVTable* vtable() const noexcept { return vt_; }
+    CFilterTelemetryConstView as_const() const noexcept { return CFilterTelemetryConstView(ptr_, vt_); }
+    float get_scale() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_scale != nullptr) ? vt_->get_scale(ptr_) : float{};
+    }
+    BamResult set_scale(float val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_scale != nullptr) ? vt_->set_scale(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+    uint32_t get_matched_rows() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_matched_rows != nullptr) ? vt_->get_matched_rows(ptr_) : uint32_t{};
+    }
+    BamResult set_matched_rows(uint32_t val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_matched_rows != nullptr) ? vt_->set_matched_rows(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+    uint32_t get_optional_vel_hits() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_optional_vel_hits != nullptr) ? vt_->get_optional_vel_hits(ptr_) : uint32_t{};
+    }
+    BamResult set_optional_vel_hits(uint32_t val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_optional_vel_hits != nullptr) ? vt_->set_optional_vel_hits(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+    uint64_t get_spawned_default_entity() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_spawned_default_entity != nullptr) ? vt_->get_spawned_default_entity(ptr_) : uint64_t{};
+    }
+    BamResult set_spawned_default_entity(uint64_t val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_spawned_default_entity != nullptr) ? vt_->set_spawned_default_entity(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+private:
+    void* ptr_{nullptr};
+    const CFilterTelemetryVTable* vt_{nullptr};
+};
+
+} // extern "C++"
+#endif /* __cplusplus */
 
 /* Component: `c_interop::Vec3` (IS_ABI_POD = true) */
 typedef struct Vec3 {
@@ -368,6 +5135,296 @@ BAM_STATIC_ASSERT(sizeof(Vec3VTable) == 88u, vec3vtable_size64);
 #elif UINTPTR_MAX == UINT32_MAX
 BAM_STATIC_ASSERT(sizeof(Vec3VTable) == 56u, vec3vtable_size32);
 #endif
+#ifdef __cplusplus
+extern "C++" {
+namespace bam {
+#ifndef BAM_CPP17_SDK_HELPERS_DEFINED
+#define BAM_CPP17_SDK_HELPERS_DEFINED
+
+template <typename VT>
+inline const VT* resolve_vtable(
+    const BamHostApi& api,
+    const BamHostCtx* host_ctx,
+    const char* symbol,
+    BamResult* out_err = nullptr
+) noexcept {
+    if (api.get_proc_address == nullptr || host_ctx == nullptr || symbol == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NULL_POINTER;
+        }
+        return nullptr;
+    }
+    const void* raw = api.get_proc_address(host_ctx, symbol);
+    if (raw == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NOT_FOUND;
+        }
+        return nullptr;
+    }
+    const auto* hdr = static_cast<const BamVTableHeader*>(raw);
+    if (hdr->struct_size < static_cast<uint32_t>(sizeof(VT)) ||
+        bam_version_is_compatible(BAM_ABI_VERSION, hdr->abi_version) == BAM_FALSE) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_INVALID_VERSION;
+        }
+        return nullptr;
+    }
+    if (out_err != nullptr) {
+        *out_err = BAM_RESULT_OK;
+    }
+    return static_cast<const VT*>(raw);
+}
+
+template <typename VT>
+class VTableHandle {
+public:
+    VTableHandle() noexcept = default;
+    explicit VTableHandle(const VT* ptr) noexcept : ptr_(ptr) {}
+
+    static VTableHandle resolve(
+        const BamHostApi& api,
+        const BamHostCtx* host_ctx,
+        const char* symbol,
+        BamResult* out_err = nullptr
+    ) noexcept {
+        return VTableHandle(resolve_vtable<VT>(api, host_ctx, symbol, out_err));
+    }
+
+    bool valid() const noexcept { return ptr_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const VT* raw() const noexcept { return ptr_; }
+    const VT* operator->() const noexcept { return ptr_; }
+
+private:
+    const VT* ptr_{nullptr};
+};
+
+template <typename InstanceT, void (*DestroyFn)(InstanceT*)>
+class UniqueGuest {
+public:
+    UniqueGuest() noexcept = default;
+    explicit UniqueGuest(InstanceT* ptr) noexcept : ptr_(ptr) {}
+    ~UniqueGuest() noexcept { reset(); }
+
+    UniqueGuest(const UniqueGuest&) = delete;
+    UniqueGuest& operator=(const UniqueGuest&) = delete;
+
+    UniqueGuest(UniqueGuest&& other) noexcept : ptr_(other.release()) {}
+    UniqueGuest& operator=(UniqueGuest&& other) noexcept {
+        if (this != &other) {
+            reset(other.release());
+        }
+        return *this;
+    }
+
+    InstanceT* get() const noexcept { return ptr_; }
+    InstanceT* operator->() const noexcept { return ptr_; }
+    InstanceT& operator*() const noexcept { return *ptr_; }
+    explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+    InstanceT* release() noexcept {
+        InstanceT* tmp = ptr_;
+        ptr_ = nullptr;
+        return tmp;
+    }
+
+    void reset(InstanceT* next = nullptr) noexcept {
+        if (ptr_ != nullptr && DestroyFn != nullptr) {
+            DestroyFn(ptr_);
+        }
+        ptr_ = next;
+    }
+
+private:
+    InstanceT* ptr_{nullptr};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class HostVecView {
+public:
+    HostVecView(void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.valid(); }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+
+    Elem* data_mut(size_t* out_len = nullptr) noexcept {
+        size_t local_len = 0u;
+        size_t* len_ptr = out_len != nullptr ? out_len : &local_len;
+        if (ptr_ == nullptr || ops_.as_mut_slice == nullptr) {
+            *len_ptr = 0u;
+            return nullptr;
+        }
+        return ops_.as_mut_slice(ptr_, len_ptr);
+    }
+
+    BamResult set(const Elem* ptr, size_t count) noexcept {
+        if (ptr_ == nullptr || ops_.set == nullptr) {
+            return BAM_RESULT_NULL_POINTER;
+        }
+        return ops_.set(ptr_, SliceTy{ptr, count});
+    }
+
+    BamResult clear() noexcept {
+        return (ptr_ != nullptr && ops_.clear != nullptr) ? ops_.clear(ptr_) : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult push(Elem val) noexcept {
+        return (ptr_ != nullptr && ops_.push != nullptr) ? ops_.push(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+
+    bool pop(Elem* out_elem) noexcept {
+        if (ptr_ == nullptr || ops_.pop == nullptr) {
+            return false;
+        }
+        return ops_.pop(ptr_, out_elem) != BAM_FALSE;
+    }
+
+    BamResult remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.remove != nullptr)
+            ? ops_.remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult swap_remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.swap_remove != nullptr)
+            ? ops_.swap_remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult truncate(size_t new_len) noexcept {
+        return (ptr_ != nullptr && ops_.truncate != nullptr)
+            ? ops_.truncate(ptr_, new_len)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult reserve(size_t additional) noexcept {
+        return (ptr_ != nullptr && ops_.reserve != nullptr)
+            ? ops_.reserve(ptr_, additional)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+    Elem* begin() noexcept { return data_mut(nullptr); }
+    Elem* end() noexcept {
+        size_t n = 0u;
+        Elem* p = data_mut(&n);
+        return p != nullptr ? (p + n) : nullptr;
+    }
+
+private:
+    void* ptr_{nullptr};
+    Ops   ops_{};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class ConstHostVecView {
+public:
+    ConstHostVecView(const void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.get != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+private:
+    const void* ptr_{nullptr};
+    Ops         ops_{};
+};
+
+#endif /* BAM_CPP17_SDK_HELPERS_DEFINED */
+} // namespace bam
+class Vec3ConstView {
+public:
+    Vec3ConstView() noexcept = default;
+    Vec3ConstView(const void* ptr, const Vec3VTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const void* raw() const noexcept { return ptr_; }
+    const Vec3VTable* vtable() const noexcept { return vt_; }
+    float get_x() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_x != nullptr) ? vt_->get_x(ptr_) : float{};
+    }
+    float get_y() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_y != nullptr) ? vt_->get_y(ptr_) : float{};
+    }
+    float get_z() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_z != nullptr) ? vt_->get_z(ptr_) : float{};
+    }
+private:
+    const void* ptr_{nullptr};
+    const Vec3VTable* vt_{nullptr};
+};
+
+class Vec3View {
+public:
+    Vec3View() noexcept = default;
+    Vec3View(void* ptr, const Vec3VTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    void* raw() const noexcept { return ptr_; }
+    const Vec3VTable* vtable() const noexcept { return vt_; }
+    Vec3ConstView as_const() const noexcept { return Vec3ConstView(ptr_, vt_); }
+    float get_x() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_x != nullptr) ? vt_->get_x(ptr_) : float{};
+    }
+    BamResult set_x(float val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_x != nullptr) ? vt_->set_x(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+    float get_y() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_y != nullptr) ? vt_->get_y(ptr_) : float{};
+    }
+    BamResult set_y(float val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_y != nullptr) ? vt_->set_y(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+    float get_z() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_z != nullptr) ? vt_->get_z(ptr_) : float{};
+    }
+    BamResult set_z(float val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_z != nullptr) ? vt_->set_z(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+private:
+    void* ptr_{nullptr};
+    const Vec3VTable* vt_{nullptr};
+};
+
+} // extern "C++"
+#endif /* __cplusplus */
 
 /* Component: `c_interop::CInteropComponent` (IS_ABI_POD = false) */
 typedef struct CInteropComponent CInteropComponent;
@@ -387,6 +5444,300 @@ BAM_STATIC_ASSERT(sizeof(CInteropComponentVTable) == 88u, cinteropcomponentvtabl
 #elif UINTPTR_MAX == UINT32_MAX
 BAM_STATIC_ASSERT(sizeof(CInteropComponentVTable) == 56u, cinteropcomponentvtable_size32);
 #endif
+#ifdef __cplusplus
+extern "C++" {
+namespace bam {
+#ifndef BAM_CPP17_SDK_HELPERS_DEFINED
+#define BAM_CPP17_SDK_HELPERS_DEFINED
+
+template <typename VT>
+inline const VT* resolve_vtable(
+    const BamHostApi& api,
+    const BamHostCtx* host_ctx,
+    const char* symbol,
+    BamResult* out_err = nullptr
+) noexcept {
+    if (api.get_proc_address == nullptr || host_ctx == nullptr || symbol == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NULL_POINTER;
+        }
+        return nullptr;
+    }
+    const void* raw = api.get_proc_address(host_ctx, symbol);
+    if (raw == nullptr) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_NOT_FOUND;
+        }
+        return nullptr;
+    }
+    const auto* hdr = static_cast<const BamVTableHeader*>(raw);
+    if (hdr->struct_size < static_cast<uint32_t>(sizeof(VT)) ||
+        bam_version_is_compatible(BAM_ABI_VERSION, hdr->abi_version) == BAM_FALSE) {
+        if (out_err != nullptr) {
+            *out_err = BAM_RESULT_INVALID_VERSION;
+        }
+        return nullptr;
+    }
+    if (out_err != nullptr) {
+        *out_err = BAM_RESULT_OK;
+    }
+    return static_cast<const VT*>(raw);
+}
+
+template <typename VT>
+class VTableHandle {
+public:
+    VTableHandle() noexcept = default;
+    explicit VTableHandle(const VT* ptr) noexcept : ptr_(ptr) {}
+
+    static VTableHandle resolve(
+        const BamHostApi& api,
+        const BamHostCtx* host_ctx,
+        const char* symbol,
+        BamResult* out_err = nullptr
+    ) noexcept {
+        return VTableHandle(resolve_vtable<VT>(api, host_ctx, symbol, out_err));
+    }
+
+    bool valid() const noexcept { return ptr_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const VT* raw() const noexcept { return ptr_; }
+    const VT* operator->() const noexcept { return ptr_; }
+
+private:
+    const VT* ptr_{nullptr};
+};
+
+template <typename InstanceT, void (*DestroyFn)(InstanceT*)>
+class UniqueGuest {
+public:
+    UniqueGuest() noexcept = default;
+    explicit UniqueGuest(InstanceT* ptr) noexcept : ptr_(ptr) {}
+    ~UniqueGuest() noexcept { reset(); }
+
+    UniqueGuest(const UniqueGuest&) = delete;
+    UniqueGuest& operator=(const UniqueGuest&) = delete;
+
+    UniqueGuest(UniqueGuest&& other) noexcept : ptr_(other.release()) {}
+    UniqueGuest& operator=(UniqueGuest&& other) noexcept {
+        if (this != &other) {
+            reset(other.release());
+        }
+        return *this;
+    }
+
+    InstanceT* get() const noexcept { return ptr_; }
+    InstanceT* operator->() const noexcept { return ptr_; }
+    InstanceT& operator*() const noexcept { return *ptr_; }
+    explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+    InstanceT* release() noexcept {
+        InstanceT* tmp = ptr_;
+        ptr_ = nullptr;
+        return tmp;
+    }
+
+    void reset(InstanceT* next = nullptr) noexcept {
+        if (ptr_ != nullptr && DestroyFn != nullptr) {
+            DestroyFn(ptr_);
+        }
+        ptr_ = next;
+    }
+
+private:
+    InstanceT* ptr_{nullptr};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class HostVecView {
+public:
+    HostVecView(void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.valid(); }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+
+    Elem* data_mut(size_t* out_len = nullptr) noexcept {
+        size_t local_len = 0u;
+        size_t* len_ptr = out_len != nullptr ? out_len : &local_len;
+        if (ptr_ == nullptr || ops_.as_mut_slice == nullptr) {
+            *len_ptr = 0u;
+            return nullptr;
+        }
+        return ops_.as_mut_slice(ptr_, len_ptr);
+    }
+
+    BamResult set(const Elem* ptr, size_t count) noexcept {
+        if (ptr_ == nullptr || ops_.set == nullptr) {
+            return BAM_RESULT_NULL_POINTER;
+        }
+        return ops_.set(ptr_, SliceTy{ptr, count});
+    }
+
+    BamResult clear() noexcept {
+        return (ptr_ != nullptr && ops_.clear != nullptr) ? ops_.clear(ptr_) : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult push(Elem val) noexcept {
+        return (ptr_ != nullptr && ops_.push != nullptr) ? ops_.push(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+
+    bool pop(Elem* out_elem) noexcept {
+        if (ptr_ == nullptr || ops_.pop == nullptr) {
+            return false;
+        }
+        return ops_.pop(ptr_, out_elem) != BAM_FALSE;
+    }
+
+    BamResult remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.remove != nullptr)
+            ? ops_.remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult swap_remove(size_t index, Elem* out_elem) noexcept {
+        return (ptr_ != nullptr && ops_.swap_remove != nullptr)
+            ? ops_.swap_remove(ptr_, index, out_elem)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult truncate(size_t new_len) noexcept {
+        return (ptr_ != nullptr && ops_.truncate != nullptr)
+            ? ops_.truncate(ptr_, new_len)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    BamResult reserve(size_t additional) noexcept {
+        return (ptr_ != nullptr && ops_.reserve != nullptr)
+            ? ops_.reserve(ptr_, additional)
+            : BAM_RESULT_NULL_POINTER;
+    }
+
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+    Elem* begin() noexcept { return data_mut(nullptr); }
+    Elem* end() noexcept {
+        size_t n = 0u;
+        Elem* p = data_mut(&n);
+        return p != nullptr ? (p + n) : nullptr;
+    }
+
+private:
+    void* ptr_{nullptr};
+    Ops   ops_{};
+};
+
+template <typename Elem, typename SliceTy, typename Ops>
+class ConstHostVecView {
+public:
+    ConstHostVecView(const void* ptr, const Ops& ops) noexcept : ptr_(ptr), ops_(ops) {}
+
+    bool valid() const noexcept { return ptr_ != nullptr && ops_.get != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+
+    size_t len() const noexcept {
+        return (ptr_ != nullptr && ops_.len != nullptr) ? ops_.len(ptr_) : 0u;
+    }
+    bool empty() const noexcept { return len() == 0u; }
+
+    SliceTy as_slice() const noexcept {
+        if (ptr_ == nullptr || ops_.get == nullptr) {
+            return SliceTy{nullptr, 0u};
+        }
+        return ops_.get(ptr_);
+    }
+
+    const Elem* data() const noexcept { return as_slice().ptr; }
+    const Elem* begin() const noexcept { return as_slice().ptr; }
+    const Elem* end() const noexcept {
+        const SliceTy s = as_slice();
+        return s.ptr != nullptr ? (s.ptr + s.len) : nullptr;
+    }
+
+private:
+    const void* ptr_{nullptr};
+    Ops         ops_{};
+};
+
+#endif /* BAM_CPP17_SDK_HELPERS_DEFINED */
+} // namespace bam
+class CInteropComponentConstView {
+public:
+    CInteropComponentConstView() noexcept = default;
+    CInteropComponentConstView(const void* ptr, const CInteropComponentVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    const void* raw() const noexcept { return ptr_; }
+    const CInteropComponentVTable* vtable() const noexcept { return vt_; }
+    int32_t get_health() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_health != nullptr) ? vt_->get_health(ptr_) : int32_t{};
+    }
+    const void* ptr_pos() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->ptr_pos != nullptr) ? vt_->ptr_pos(ptr_) : nullptr;
+    }
+    BamStrView get_label() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_label != nullptr) ? vt_->get_label(ptr_) : BamStrView{nullptr, 0u};
+    }
+private:
+    const void* ptr_{nullptr};
+    const CInteropComponentVTable* vt_{nullptr};
+};
+
+class CInteropComponentView {
+public:
+    CInteropComponentView() noexcept = default;
+    CInteropComponentView(void* ptr, const CInteropComponentVTable* vt) noexcept : ptr_(ptr), vt_(vt) {}
+    bool valid() const noexcept { return ptr_ != nullptr && vt_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    void* raw() const noexcept { return ptr_; }
+    const CInteropComponentVTable* vtable() const noexcept { return vt_; }
+    CInteropComponentConstView as_const() const noexcept { return CInteropComponentConstView(ptr_, vt_); }
+    int32_t get_health() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_health != nullptr) ? vt_->get_health(ptr_) : int32_t{};
+    }
+    BamResult set_health(int32_t val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_health != nullptr) ? vt_->set_health(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+    const void* ptr_pos() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->ptr_pos != nullptr) ? vt_->ptr_pos(ptr_) : nullptr;
+    }
+    void* ptr_mut_pos() noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->ptr_mut_pos != nullptr) ? vt_->ptr_mut_pos(ptr_) : nullptr;
+    }
+    BamStrView get_label() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get_label != nullptr) ? vt_->get_label(ptr_) : BamStrView{nullptr, 0u};
+    }
+    BamResult set_label(BamStrView view) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set_label != nullptr) ? vt_->set_label(ptr_, view) : BAM_RESULT_NULL_POINTER;
+    }
+    BamResult set_label(const char* cstr) noexcept {
+        const BamStrView view{reinterpret_cast<const uint8_t*>(cstr), cstr != nullptr ? strlen(cstr) : 0u};
+        return set_label(view);
+    }
+private:
+    void* ptr_{nullptr};
+    const CInteropComponentVTable* vt_{nullptr};
+};
+
+} // extern "C++"
+#endif /* __cplusplus */
 
 #ifdef __cplusplus
 }
