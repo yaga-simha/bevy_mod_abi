@@ -1352,3 +1352,307 @@ fn messages_batch_write_and_cmd_trigger_entity_events() {
         vec![(1, 0, 7), (2, e_watched.to_bits(), 42)]
     );
 }
+
+#[derive(EntityEvent, Clone, Copy, Debug)]
+struct HostReadyEvent {
+    entity: Entity,
+}
+
+impl From<Entity> for HostReadyEvent {
+    fn from(entity: Entity) -> Self {
+        Self { entity }
+    }
+}
+
+#[test]
+fn test_ready_observers_global_entity_scoped_and_child_of_propagation() {
+    use bevy_abi_mod_host_sys::{host_cmd_observe, host_cmd_trigger_ex};
+    use bevy_abi_mod_sys::{
+        BAM_OBSERVER_FLAG_PROPAGATE, BAM_TRIGGER_FLAG_PROPAGATE, BamCommands, BamComponent,
+        BamEventKind, BamObserverDesc, BamTriggerDesc, FfiBool,
+    };
+    use bevy_app::Startup;
+
+    let mut app = App::new();
+    app.add_plugins(AbiModPlugin::default());
+
+    let ready_handle = {
+        let mut reg = app.world().resource::<ModRegistry>().clone();
+        let h = reg
+            .register_bridged_entity_event::<HostReadyEvent>(
+                app.world_mut(),
+                "bevy_scene::Ready",
+                Some("Ready"),
+            )
+            .expect("register bridged Ready event");
+        app.world_mut().insert_resource(reg);
+        h
+    };
+
+    let grandparent = app.world_mut().spawn_empty().id();
+    let parent_stop = app.world_mut().spawn(ChildOf(grandparent)).id();
+    let child_stop = app.world_mut().spawn(ChildOf(parent_stop)).id();
+    let parent_pass = app.world_mut().spawn(ChildOf(grandparent)).id();
+    let child_pass = app.world_mut().spawn(ChildOf(parent_pass)).id();
+    let target_only = app.world_mut().spawn_empty().id();
+    let unrelated = app.world_mut().spawn_empty().id();
+
+    let gp_ffi = FfiEntity::from_bits(grandparent.to_bits());
+    let p_stop_ffi = FfiEntity::from_bits(parent_stop.to_bits());
+    let c_stop_ffi = FfiEntity::from_bits(child_stop.to_bits());
+    let p_pass_ffi = FfiEntity::from_bits(parent_pass.to_bits());
+    let c_pass_ffi = FfiEntity::from_bits(child_pass.to_bits());
+    let target_only_ffi = FfiEntity::from_bits(target_only.to_bits());
+    let unrelated_ffi = FfiEntity::from_bits(unrelated.to_bits());
+
+    #[derive(Default)]
+    struct ReadyLog {
+        global_ready: Mutex<Vec<FfiEntity>>,
+        entity_ready: Mutex<Vec<FfiEntity>>,
+        stoppable_hits: Mutex<Vec<FfiEntity>>,
+    }
+
+    unsafe extern "C" fn on_global_ready(
+        entity: FfiEntity,
+        _event_data: *const c_void,
+        _cmds: *mut BamCommands,
+        user_data: *mut c_void,
+    ) -> FfiResult {
+        let log = unsafe { &*(user_data as *const ReadyLog) };
+        log.global_ready.lock().unwrap().push(entity);
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn on_entity_ready(
+        entity: FfiEntity,
+        _event_data: *const c_void,
+        _cmds: *mut BamCommands,
+        user_data: *mut c_void,
+    ) -> FfiResult {
+        let log = unsafe { &*(user_data as *const ReadyLog) };
+        log.entity_ready.lock().unwrap().push(entity);
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn on_parent_stop_ready(
+        entity: FfiEntity,
+        _event_data: *mut u8,
+        propagate: *mut FfiBool,
+        _cmds: *mut BamCommands,
+        user_data: *mut c_void,
+    ) -> FfiResult {
+        let log = unsafe { &*(user_data as *const ReadyLog) };
+        log.stoppable_hits.lock().unwrap().push(entity);
+        if !propagate.is_null() {
+            unsafe {
+                *propagate = FfiBool::FALSE;
+            }
+        }
+        FfiResult::OK
+    }
+
+    let log = Arc::new(ReadyLog::default());
+    let log_ptr = Arc::as_ptr(&log) as *mut c_void;
+
+    struct ReadySetupCtx {
+        ready_handle: BamComponent,
+        parent_stop: FfiEntity,
+        log_ptr: *mut c_void,
+    }
+    unsafe impl Send for ReadySetupCtx {}
+    unsafe impl Sync for ReadySetupCtx {}
+
+    unsafe extern "C" fn ready_setup_system(
+        sys_ctx: *mut BamSystemCtx,
+        user_data: *mut c_void,
+    ) -> FfiResult {
+        let ctx = unsafe { &*(user_data as *const ReadySetupCtx) };
+        let mut cmds: *mut BamCommands = core::ptr::null_mut();
+        assert_eq!(
+            unsafe { host_sys_commands(sys_ctx, &mut cmds) },
+            FfiResult::OK
+        );
+
+        let global_desc = BamObserverDesc::new_lifecycle(
+            BamEventKind::READY,
+            core::ptr::null(),
+            0,
+            on_global_ready,
+            ctx.log_ptr,
+        )
+        .with_name(c"global_ready".as_ptr())
+        .with_flags(BAM_OBSERVER_FLAG_PROPAGATE);
+        let mut obs1 = FfiEntity::NULL;
+        assert_eq!(
+            unsafe { host_cmd_observe(cmds, &global_desc, &mut obs1) },
+            FfiResult::OK
+        );
+        assert!(!obs1.is_null());
+
+        let stop_desc =
+            BamObserverDesc::new_mut(ctx.ready_handle, on_parent_stop_ready, ctx.log_ptr)
+                .with_entity(ctx.parent_stop)
+                .with_name(c"stop_ready_on_parent".as_ptr())
+                .with_flags(BAM_OBSERVER_FLAG_PROPAGATE);
+        let mut obs2 = FfiEntity::NULL;
+        assert_eq!(
+            unsafe { host_cmd_observe(cmds, &stop_desc, &mut obs2) },
+            FfiResult::OK
+        );
+        assert!(!obs2.is_null());
+        FfiResult::OK
+    }
+
+    // Guest system attaching runtime `observe_entity_ready` on `target_only` and triggering:
+    // 1. Non-propagating `Ready` on `unrelated` (must NOT fire `target_only` observer)
+    // 2. Non-propagating `Ready` on `target_only` (fires global + entity-scoped `Ready`)
+    // 3. Propagating `Ready` on `child_stop` (bubbles to `parent_stop` and halts before `grandparent`)
+    // 4. Propagating `Ready` on `child_pass` (bubbles full `child_pass -> parent_pass -> grandparent`)
+    struct ReadyDriverCtx {
+        ready_handle: BamComponent,
+        target_only: FfiEntity,
+        unrelated: FfiEntity,
+        child_stop: FfiEntity,
+        child_pass: FfiEntity,
+        log_ptr: *mut c_void,
+    }
+    unsafe impl Send for ReadyDriverCtx {}
+    unsafe impl Sync for ReadyDriverCtx {}
+
+    unsafe extern "C" fn ready_driver_system(
+        sys_ctx: *mut BamSystemCtx,
+        user_data: *mut c_void,
+    ) -> FfiResult {
+        let ctx = unsafe { &*(user_data as *const ReadyDriverCtx) };
+        let mut cmds: *mut BamCommands = core::ptr::null_mut();
+        assert_eq!(
+            unsafe { host_sys_commands(sys_ctx, &mut cmds) },
+            FfiResult::OK
+        );
+
+        // Attach runtime entity-scoped Ready observer on `target_only`.
+        let entity_obs_desc = BamObserverDesc::new_lifecycle(
+            BamEventKind::READY,
+            core::ptr::null(),
+            0,
+            on_entity_ready,
+            ctx.log_ptr,
+        )
+        .with_entity(ctx.target_only);
+        let mut obs_ent = FfiEntity::NULL;
+        assert_eq!(
+            unsafe { host_cmd_observe(cmds, &entity_obs_desc, &mut obs_ent) },
+            FfiResult::OK
+        );
+        assert!(!obs_ent.is_null());
+
+        // Trigger Ready on unrelated & target_only.
+        let trig_unrelated = BamTriggerDesc::new(BamComponent::INVALID, core::ptr::null_mut(), 0)
+            .with_event_kind(BamEventKind::READY)
+            .with_entity(ctx.unrelated);
+        assert_eq!(
+            unsafe { host_cmd_trigger_ex(cmds, &trig_unrelated) },
+            FfiResult::OK
+        );
+
+        let trig_target = BamTriggerDesc::new(BamComponent::INVALID, core::ptr::null_mut(), 0)
+            .with_event_kind(BamEventKind::READY)
+            .with_entity(ctx.target_only);
+        assert_eq!(
+            unsafe { host_cmd_trigger_ex(cmds, &trig_target) },
+            FfiResult::OK
+        );
+
+        // Trigger propagating Ready on `child_stop` -> halts at `parent_stop`.
+        let mut child_stop_payload = ctx.child_stop;
+        let trig_stop_prop = BamTriggerDesc::new(
+            ctx.ready_handle,
+            (&raw mut child_stop_payload).cast::<u8>(),
+            core::mem::size_of::<FfiEntity>(),
+        )
+        .with_entity(ctx.child_stop)
+        .with_flags(BAM_TRIGGER_FLAG_PROPAGATE);
+        assert_eq!(
+            unsafe { host_cmd_trigger_ex(cmds, &trig_stop_prop) },
+            FfiResult::OK
+        );
+
+        // Trigger propagating Ready on `child_pass` -> reaches `grandparent`.
+        let mut child_pass_payload = ctx.child_pass;
+        let trig_pass_prop = BamTriggerDesc::new(
+            ctx.ready_handle,
+            (&raw mut child_pass_payload).cast::<u8>(),
+            core::mem::size_of::<FfiEntity>(),
+        )
+        .with_entity(ctx.child_pass)
+        .with_flags(BAM_TRIGGER_FLAG_PROPAGATE);
+        assert_eq!(
+            unsafe { host_cmd_trigger_ex(cmds, &trig_pass_prop) },
+            FfiResult::OK
+        );
+
+        FfiResult::OK
+    }
+
+    let reg_after = app.world().resource::<ModRegistry>().clone();
+    let setup = Arc::new(ReadySetupCtx {
+        ready_handle,
+        parent_stop: p_stop_ffi,
+        log_ptr,
+    });
+    let setup_sys = GuestSystem::new(
+        "ready_setup",
+        Vec::new(),
+        ready_setup_system,
+        Arc::as_ptr(&setup) as *mut c_void,
+        reg_after.clone(),
+    );
+    let driver = Arc::new(ReadyDriverCtx {
+        ready_handle,
+        target_only: target_only_ffi,
+        unrelated: unrelated_ffi,
+        child_stop: c_stop_ffi,
+        child_pass: c_pass_ffi,
+        log_ptr,
+    });
+    let driver_sys = GuestSystem::new(
+        "ready_driver",
+        Vec::new(),
+        ready_driver_system,
+        Arc::as_ptr(&driver) as *mut c_void,
+        reg_after,
+    );
+    app.add_systems(Startup, setup_sys);
+    app.add_systems(Update, driver_sys);
+    app.update();
+
+    assert_eq!(
+        *log.entity_ready.lock().unwrap(),
+        vec![target_only_ffi],
+        "entity-scoped Ready observer must fire ONLY for target_only, never unrelated"
+    );
+    assert_eq!(
+        *log.stoppable_hits.lock().unwrap(),
+        vec![p_stop_ffi],
+        "parent_stop mutable Ready observer must fire once and halt bubbling before grandparent"
+    );
+    assert_eq!(
+        *log.global_ready.lock().unwrap(),
+        vec![
+            unrelated_ffi,
+            target_only_ffi,
+            c_stop_ffi,
+            p_stop_ffi,
+            c_pass_ffi,
+            p_pass_ffi,
+            gp_ffi,
+        ],
+        "global Ready observer must observe direct triggers plus ChildOf hierarchy propagation"
+    );
+
+    #[cfg(feature = "bridge-bsn")]
+    assert_eq!(
+        core::mem::size_of::<bevy_scene::Ready>(),
+        core::mem::size_of::<FfiEntity>()
+    );
+}
