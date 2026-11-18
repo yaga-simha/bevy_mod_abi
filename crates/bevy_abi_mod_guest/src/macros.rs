@@ -85,6 +85,21 @@ macro_rules! export_mod {
                 $crate::raw::shutdown_guest_instance(instance);
             }
         }
+
+        /// Resolves a `"bam.v0.*"` dynamic symbol registered on `instance`.
+        ///
+        /// # Safety
+        /// - `instance` must be null or a live `BamInstance*` produced by `bevy_abi_mod_init`
+        ///   prior to `bevy_abi_mod_shutdown`.
+        /// - `name` must be null or a NUL-terminated C string.
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn bevy_abi_mod_resolve_symbol(
+            instance: *const $crate::raw::BamInstance,
+            name: *const ::core::ffi::c_char,
+        ) -> *const ::core::ffi::c_void {
+            // SAFETY: Forwarding raw `BamInstance*` and NUL-terminated symbol name to guest-sys resolver.
+            unsafe { $crate::commands_lifecycle::resolve_guest_instance_symbol(instance, name) }
+        }
     };
     (name: $name:expr, version: $version:expr, $build_fn:path $(,)?) => {
         static __BAM_EXPORTED_MANIFEST: $crate::BamManifest = $crate::BamManifest::new(
@@ -137,6 +152,21 @@ macro_rules! export_mod {
             unsafe {
                 $crate::raw::shutdown_guest_instance(instance);
             }
+        }
+
+        /// Resolves a `"bam.v0.*"` dynamic symbol registered on `instance`.
+        ///
+        /// # Safety
+        /// - `instance` must be null or a live `BamInstance*` produced by `bevy_abi_mod_init`
+        ///   prior to `bevy_abi_mod_shutdown`.
+        /// - `name` must be null or a NUL-terminated C string.
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn bevy_abi_mod_resolve_symbol(
+            instance: *const $crate::raw::BamInstance,
+            name: *const ::core::ffi::c_char,
+        ) -> *const ::core::ffi::c_void {
+            // SAFETY: Forwarding raw `BamInstance*` and NUL-terminated symbol name to guest-sys resolver.
+            unsafe { $crate::commands_lifecycle::resolve_guest_instance_symbol(instance, name) }
         }
     };
     ($build_fn:path) => {
@@ -194,6 +224,21 @@ macro_rules! export_mod {
             unsafe {
                 $crate::raw::shutdown_guest_instance(instance);
             }
+        }
+
+        /// Resolves a `"bam.v0.*"` dynamic symbol registered on `instance`.
+        ///
+        /// # Safety
+        /// - `instance` must be null or a live `BamInstance*` produced by `bevy_abi_mod_init`
+        ///   prior to `bevy_abi_mod_shutdown`.
+        /// - `name` must be null or a NUL-terminated C string.
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn bevy_abi_mod_resolve_symbol(
+            instance: *const $crate::raw::BamInstance,
+            name: *const ::core::ffi::c_char,
+        ) -> *const ::core::ffi::c_void {
+            // SAFETY: Forwarding raw `BamInstance*` and NUL-terminated symbol name to guest-sys resolver.
+            unsafe { $crate::commands_lifecycle::resolve_guest_instance_symbol(instance, name) }
         }
     };
     (manifest: $manifest:expr, init: $init_fn:path, shutdown: $shutdown_fn:path $(,)?) => {

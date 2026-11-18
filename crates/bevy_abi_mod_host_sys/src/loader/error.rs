@@ -197,4 +197,15 @@ pub enum ModLoadError {
         /// Status returned by `BamManifest::restore_state`.
         status: FfiResult,
     },
+
+    /// Live archetype column schema migration failed during `reload_mod`.
+    #[error("schema migration failed for component '{component_name}' ({status}): {detail}")]
+    SchemaMigrationFailed {
+        /// Canonical name of the dynamic component being migrated.
+        component_name: String,
+        /// Status returned by the guest witness symbol (`export_fields`, `init_default`, or `import_field`).
+        status: FfiResult,
+        /// Human-readable migration error detail.
+        detail: String,
+    },
 }

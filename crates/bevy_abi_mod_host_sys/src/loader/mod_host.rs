@@ -32,11 +32,15 @@ use bevy_ecs::resource::IsResource;
 use bevy_ecs::schedule::{InternedScheduleLabel, ScheduleCleanupPolicy, Schedules};
 use bevy_ecs::world::World;
 use bevy_platform::collections::{HashMap, HashSet};
-use core::ffi::{CStr, c_void};
+use core::ffi::{CStr, c_char, c_void};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use libloading::Symbol;
+use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+pub(crate) type BamResolveSymbolFn =
+    unsafe extern "C" fn(instance: *const BamInstance, name: *const c_char) -> *const c_void;
 
 static NEXT_MOD_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -136,6 +140,7 @@ pub struct LoadedMod {
     shutdown_fn: BamShutdownFn,
     save_state_fn: Option<BamSaveStateFn>,
     restore_state_fn: Option<BamRestoreStateFn>,
+    resolve_symbol_fn: Option<BamResolveSymbolFn>,
     instance: GuestInstancePtr,
     is_active: Arc<AtomicBool>,
     lib_state: Arc<Mutex<SharedLibState>>,
@@ -218,6 +223,74 @@ impl LoadedMod {
     #[inline]
     pub const fn verified_signature(&self) -> Option<&VerifiedModSignature> {
         self.verified_signature.as_ref()
+    }
+
+    /// Resolves a `"bam.v0.*"` symbol exported by this loaded mod instance via
+    /// `bevy_abi_mod_resolve_symbol`, if present.
+    pub(crate) fn resolve_guest_symbol(&self, symbol_name: &str) -> Option<*const c_void> {
+        let resolver = self.resolve_symbol_fn?;
+        let c_name = CString::new(symbol_name.as_bytes()).ok()?;
+        // SAFETY: `self.is_active` / `self.library` remains mapped while `LoadedMod` is in
+        // `ModHost`, `self.instance` is this session's `BamInstance*`, and `c_name` is NUL-terminated.
+        let ptr = unsafe { resolver(self.instance.as_ptr().cast_const(), c_name.as_ptr()) };
+        (!ptr.is_null()).then_some(ptr)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_mock_for_test(
+        world: &mut World,
+        name: &str,
+        is_active: Arc<AtomicBool>,
+        shutdown_fn: BamShutdownFn,
+        resolve_symbol_fn: Option<BamResolveSymbolFn>,
+        instance_ptr: *mut BamInstance,
+    ) -> ModId {
+        let id = ModId::allocate();
+        let mod_name: Arc<str> = Arc::from(name);
+        let sys_lib_path = Path::new("in_memory_test_mod.dylib");
+        let loaded_path = sys_lib_path.to_path_buf();
+        let loaded_lib = LoadedLibrary::mock_empty_for_test();
+        #[cfg(feature = "signature-verification")]
+        let verified_signature = None;
+        let lib_state = shared_lib_state_for_path(&loaded_path);
+        lib_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .active_count += 1;
+        let pre_snapshot = world
+            .get_resource::<ModRegistry>()
+            .map(ModRegistry::snapshot_arc)
+            .unwrap_or_default();
+        if !world.contains_resource::<ModHost>() {
+            world.insert_resource(ModHost::new());
+        }
+        world.resource_mut::<ModHost>().loaded_libraries.push(Self {
+            id,
+            name: mod_name,
+            version: Arc::from("0.1.0"),
+            source_path: sys_lib_path.to_path_buf(),
+            loaded_path,
+            system_count: 0,
+            fault_count: 0,
+            entity: None,
+            generation: 0,
+            pre_snapshot,
+            staged_drop_bindings: Vec::new(),
+            staged_hook_bindings: Vec::new(),
+            library: loaded_lib,
+            shutdown_fn,
+            save_state_fn: None,
+            restore_state_fn: None,
+            resolve_symbol_fn,
+            instance: GuestInstancePtr::new(instance_ptr),
+            is_active,
+            lib_state,
+            #[cfg(feature = "signature-verification")]
+            verified_signature,
+            registered_named_sets: Vec::new(),
+            observer_entities: Vec::new(),
+        });
+        id
     }
 }
 
@@ -505,6 +578,17 @@ impl ModHost {
                 })?
         };
 
+        // Optional `bevy_abi_mod_resolve_symbol` exported by Rust `export_mod!` guests for
+        // per-instance `"bam.v0.*"` witness symbol lookup during schema migration.
+        // SAFETY: Symbol signature matches `BamResolveSymbolFn` when present.
+        let resolve_symbol_fn: Option<BamResolveSymbolFn> = unsafe {
+            loaded_lib
+                .lib()
+                .get::<BamResolveSymbolFn>(b"bevy_abi_mod_resolve_symbol\0")
+                .ok()
+                .map(|sym| *sym)
+        };
+
         let mut load_ctx = LoadContext::with_manifest_name(
             registry,
             Arc::clone(&is_active),
@@ -590,6 +674,7 @@ impl ModHost {
             shutdown_fn,
             save_state_fn: manifest.save_state,
             restore_state_fn: manifest.restore_state,
+            resolve_symbol_fn,
             instance: GuestInstancePtr::new(instance_ptr),
             is_active,
             lib_state,
@@ -775,6 +860,25 @@ pub fn excise_and_unload_mod_in_world<F: FnOnce(&mut World)>(
     id: ModId,
     before_dlclose: F,
 ) -> Result<(Arc<str>, PathBuf, usize), ModLoadError> {
+    excise_and_unload_mod_inner(world, id, true, before_dlclose)
+}
+
+/// Reload variant of [`excise_and_unload_mod_in_world`] that preserves [`ModScoped(id)`](ModScoped)
+/// entities in `world` across hot-reload so they can be migrated onto the replacement [`ModId`].
+pub fn excise_and_unload_mod_for_reload_in_world<F: FnOnce(&mut World)>(
+    world: &mut World,
+    id: ModId,
+    before_dlclose: F,
+) -> Result<(Arc<str>, PathBuf, usize), ModLoadError> {
+    excise_and_unload_mod_inner(world, id, false, before_dlclose)
+}
+
+fn excise_and_unload_mod_inner<F: FnOnce(&mut World)>(
+    world: &mut World,
+    id: ModId,
+    despawn_scoped: bool,
+    before_dlclose: F,
+) -> Result<(Arc<str>, PathBuf, usize), ModLoadError> {
     let (is_active, owned_named_sets, shared_named_sets, observer_entities) = {
         let Some(mut mod_host) = world.get_resource_mut::<ModHost>() else {
             return Err(ModLoadError::ModNotFound { id });
@@ -876,9 +980,11 @@ pub fn excise_and_unload_mod_in_world<F: FnOnce(&mut World)>(
         })
         .unwrap_or_default();
 
-    world.despawn_all_where::<(&ModScoped,), (Allow<Disabled>, Without<IsResource>)>(|(s,)| {
-        s.0 == id
-    });
+    if despawn_scoped {
+        world.despawn_all_where::<(&ModScoped,), (Allow<Disabled>, Without<IsResource>)>(|(s,)| {
+            s.0 == id
+        });
+    }
 
     for res_comp_id in owned_resource_ids {
         world.remove_resource_by_id(res_comp_id);
@@ -1169,6 +1275,7 @@ mod tests {
                 shutdown_fn: test_shutdown,
                 save_state_fn: None,
                 restore_state_fn: None,
+                resolve_symbol_fn: None,
                 instance: GuestInstancePtr::new(core::ptr::null_mut()),
                 is_active: Arc::new(AtomicBool::new(true)),
                 lib_state,

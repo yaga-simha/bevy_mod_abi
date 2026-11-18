@@ -41,7 +41,8 @@ pub use host::{
 };
 pub use instance::{
     GuestInstance, guest_restore_state_trampoline, guest_save_state_trampoline,
-    init_guest_instance, shutdown_guest_instance,
+    init_guest_instance, qualify_mod_component_identity, resolve_guest_instance_symbol,
+    resolve_mod_component, shutdown_guest_instance,
 };
 pub use iter::{
     ChunkColumnDispenser, SparseRows, SparseRowsIter, SparseRowsMut, UuidFilter, ValidatedIter,
@@ -50,9 +51,11 @@ pub use iter::{
 pub use panic::{catch_guest_bool, catch_guest_result, catch_guest_unit};
 pub use trampoline::{
     PreparedRunIf, ReentrantCell, SystemRegistrationConfig, ValidatedSystemInvocation,
-    ValidatedSystemRef, allocate_run_if_trampoline, allocate_system_trampoline,
+    ValidatedSystemRef, allocate_run_if_trampoline, allocate_system_trampoline, iter_dynamic_slice,
+    iter_dynamic_slice_mut, iter_entities_and_dynamic_slice_mut,
     register_lifecycle_observer_closure, register_observer_closure,
     register_observer_closure_with_options, register_observer_mut_closure, register_system_closure,
+    verify_same_mod_dynamic_component,
 };
 
 #[cfg(test)]
@@ -831,5 +834,175 @@ mod tests {
         // SAFETY: `raw_inst` was produced by `init_guest_instance`.
         unsafe { shutdown_guest_instance(raw_inst) };
         assert_eq!(OBS_DROPS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn system_closure_trampoline_refreshes_host_ctx_via_sys_host_ctx() {
+        use core::sync::atomic::AtomicPtr;
+
+        static OBSERVED_ADDRS: AtomicUsize = AtomicUsize::new(0);
+        static EXPECTED_RUNTIME_PTR: AtomicPtr<BamHostCtx> = AtomicPtr::new(core::ptr::null_mut());
+
+        unsafe extern "C" fn runtime_sys_host_ctx(
+            sys_ctx: *const BamSystemCtx,
+        ) -> *const BamHostCtx {
+            let _ = sys_ctx;
+            EXPECTED_RUNTIME_PTR.load(Ordering::SeqCst).cast_const()
+        }
+
+        let mut init_ctx_marker = 11u8;
+        let mut runtime_ctx_marker = 22u8;
+        let init_ctx_ptr = (&raw mut init_ctx_marker).cast::<BamHostCtx>().cast_const();
+        let runtime_ctx_mut = (&raw mut runtime_ctx_marker).cast::<BamHostCtx>();
+        EXPECTED_RUNTIME_PTR.store(runtime_ctx_mut, Ordering::SeqCst);
+
+        let mut api = make_mock_api();
+        api.sys_host_ctx = Some(runtime_sys_host_ctx);
+
+        // SAFETY: `api` and `init_ctx_ptr` are valid stack addresses for the test duration.
+        let init_host = unsafe { Host::from_raw(&raw const api, init_ctx_ptr) }.unwrap();
+        let mut instance = GuestInstance::new(init_host, "ctx_refresh_mod");
+
+        let (sys_fn, user_data) = allocate_system_trampoline(&mut instance, 0, 0, None, |inv| {
+            let observed = inv.host().host_ctx().addr();
+            OBSERVED_ADDRS.store(observed, Ordering::SeqCst);
+            assert_eq!(inv.commands_mut().host().host_ctx().addr(), observed);
+            FfiResult::OK
+        });
+
+        let mut dummy_sys_ctx = 99u8;
+        // SAFETY: `dummy_sys_ctx` and `user_data` are valid for this synchronous system call.
+        let rc = unsafe { sys_fn((&raw mut dummy_sys_ctx).cast::<BamSystemCtx>(), user_data) };
+        assert_eq!(rc, FfiResult::OK);
+        assert_eq!(
+            OBSERVED_ADDRS.load(Ordering::SeqCst),
+            runtime_ctx_mut.addr()
+        );
+        assert_ne!(OBSERVED_ADDRS.load(Ordering::SeqCst), init_ctx_ptr.addr());
+    }
+
+    #[test]
+    fn register_dynamic_mod_component_symbols_and_moved_command_error_drops_cleanly() {
+        use bevy_abi_mod_sys::{ModComponent, SymbolEntry};
+
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Default)]
+        struct DynMockComp {
+            label: String,
+        }
+
+        impl Drop for DynMockComp {
+            fn drop(&mut self) {
+                let _ = self.label.len();
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        #[repr(C)]
+        #[derive(Copy, Clone)]
+        struct DynMockVTable {
+            header: VTableHeader,
+        }
+
+        static DYN_MOCK_UUID: ComponentUuid = ComponentUuid::from_canonical_name("DynMockComp");
+        static DYN_MOCK_VT: DynMockVTable = DynMockVTable {
+            header: VTableHeader::from_raw_parts(
+                core::mem::size_of::<DynMockVTable>() as u32,
+                DYN_MOCK_UUID,
+                core::mem::size_of::<DynMockComp>(),
+                core::mem::align_of::<DynMockComp>(),
+            ),
+        };
+        static DYN_MOCK_SYMS: [SymbolEntry; 1] = [SymbolEntry {
+            name: "bam.v0.DynMockComp.vtable",
+            ptr: (&raw const DYN_MOCK_VT).cast::<c_void>(),
+        }];
+
+        impl ModComponent for DynMockComp {
+            const CANONICAL_NAME: &'static str = "DynMockComp";
+            const COMPONENT_CSTR: &'static CStr = c"DynMockComp";
+            const UUID: ComponentUuid = DYN_MOCK_UUID;
+            type VTable = DynMockVTable;
+            fn vtable() -> &'static Self::VTable {
+                &DYN_MOCK_VT
+            }
+            fn symbols() -> &'static [SymbolEntry] {
+                &DYN_MOCK_SYMS
+            }
+        }
+
+        DROP_COUNT.store(0, Ordering::SeqCst);
+        let mut dummy_world = 0u64;
+        let api = make_mock_api();
+        // SAFETY: `api` and `dummy_world` stack pointers remain valid for this test.
+        let host =
+            unsafe { Host::from_raw(&raw const api, (&raw const dummy_world).cast()) }.unwrap();
+        let mut instance = GuestInstance::new(host, "dyn_mod");
+        let host_copy = *instance.host();
+        // SAFETY: `dummy_world` acts as an opaque non-null mock load context for `mock_register_component`.
+        let load_ctx =
+            unsafe { ValidatedLoadCtx::from_raw((&raw mut dummy_world).cast(), &host_copy) }
+                .unwrap();
+
+        let handle = load_ctx
+            .register_dynamic_mod_component::<DynMockComp>(&mut instance, 0)
+            .expect("register_dynamic_mod_component succeeds");
+        assert!(handle.is_valid());
+
+        let inst_ptr = (&raw const instance).cast::<BamInstance>();
+        // SAFETY: `inst_ptr` points to live `instance` and symbol names are NUL-terminated.
+        let vt_canon = unsafe {
+            resolve_guest_instance_symbol(inst_ptr, c"bam.v0.DynMockComp.vtable".as_ptr())
+        };
+        // SAFETY: Same as above.
+        let vt_qual = unsafe {
+            resolve_guest_instance_symbol(inst_ptr, c"bam.v0.dyn_mod::DynMockComp.vtable".as_ptr())
+        };
+        assert!(core::ptr::eq(vt_canon, DynMockComp::erased_vtable_ptr()));
+        assert!(core::ptr::eq(vt_qual, DynMockComp::erased_vtable_ptr()));
+
+        // SAFETY: Same as above.
+        let init_ptr = unsafe {
+            resolve_guest_instance_symbol(
+                inst_ptr,
+                c"bam.v0.dyn_mod::DynMockComp.init_default".as_ptr(),
+            )
+        };
+        assert!(!init_ptr.is_null());
+        // SAFETY: `init_default` symbol has signature `unsafe extern "C" fn(*mut c_void) -> FfiResult`.
+        let init_fn: unsafe extern "C" fn(*mut c_void) -> FfiResult =
+            unsafe { core::mem::transmute(init_ptr) };
+        let mut uninit_slot = core::mem::MaybeUninit::<DynMockComp>::uninit();
+        let init_status =
+            // SAFETY: `uninit_slot` has `DynMockComp` layout and alignment.
+            unsafe { init_fn(uninit_slot.as_mut_ptr().cast::<c_void>()) };
+        assert_eq!(init_status, FfiResult::OK);
+        // SAFETY: `init_fn` returned `FfiResult::OK`, initializing `uninit_slot`.
+        unsafe { uninit_slot.assume_init_drop() };
+        assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 1);
+
+        // Failed `insert_moved` / `spawn_moved` on an empty/null command buffer must drop `T` cleanly!
+        let mut empty_cmds = ValidatedCommands::empty(instance.host());
+        let rc = empty_cmds.insert_moved(
+            FfiEntity::from_bits(1),
+            handle,
+            DynMockComp {
+                label: String::from("dropped_on_insert_err"),
+            },
+        );
+        assert_eq!(rc, FfiResult::NULL_POINTER);
+        assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 2);
+
+        let spawn_res = empty_cmds.spawn_moved(
+            handle,
+            DynMockComp {
+                label: String::from("dropped_on_spawn_err"),
+            },
+            &[],
+            false,
+        );
+        assert_eq!(spawn_res, Err(FfiResult::NULL_POINTER));
+        assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 3);
     }
 }
