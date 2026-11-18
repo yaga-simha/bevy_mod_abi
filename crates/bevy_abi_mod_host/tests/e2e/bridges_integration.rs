@@ -1210,3 +1210,287 @@ fn cross_bridge_cdylib_mods_drive_std_types_isolated_assets_and_state_machine() 
         );
     }
 }
+
+#[cfg(all(feature = "bridge-bsn", feature = "bridge-reflect"))]
+#[test]
+fn wave3_cdylib_bsn_scene_ready_observer_unload_cleanup_and_reflect_brp() {
+    use bevy_abi_mod_host::bridges::bsn::{ModBsnAppExt, ModBsnPlugin};
+    use bevy_abi_mod_host::bridges::reflect::{
+        BRP_METHOD_GET_COMPONENTS, BRP_METHOD_MUTATE_COMPONENTS, ModReflectPlugin,
+        ModReflectWorldExt, handle_mod_brp_request,
+    };
+    use bevy_ecs::entity::Entity;
+    use bevy_ecs::hierarchy::Children;
+    use bevy_remote::BrpRequest;
+    use bevy_scene::bsn;
+    use serde_json::json;
+
+    #[repr(C)]
+    #[derive(Resource, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+    #[mod_component(name = "wave3_e2e::Wave3Telemetry")]
+    struct Wave3Telemetry {
+        spawned_root_bits: u64,
+        prop_entity_bits: u64,
+        ready_count: u32,
+        init_ok: u32,
+    }
+
+    const WAVE3_MOD_SRC: &str = r#"
+#![forbid(unsafe_code)]
+
+use std::ffi::CStr;
+use std::sync::atomic::{AtomicU32, Ordering};
+use bevy_abi_mod_guest::bridges::bsn::{GuestCommandsBsnExt, GuestScene};
+use bevy_abi_mod_guest::prelude::*;
+
+static READY_HITS: AtomicU32 = AtomicU32::new(0);
+
+#[repr(C)]
+#[derive(ModComponent, Clone, Copy, Default)]
+#[mod_component(name = "wave3_e2e::Wave3Telemetry")]
+pub struct Wave3Telemetry {
+    pub spawned_root_bits: u64,
+    pub prop_entity_bits: u64,
+    pub ready_count: u32,
+    pub init_ok: u32,
+}
+
+impl GuestComponent for Wave3Telemetry {
+    const NAME: &'static CStr = c"wave3_e2e::Wave3Telemetry";
+    const UUID: ComponentUuid = <Self as ModComponent>::UUID;
+}
+
+#[derive(Default, ModComponent)]
+#[mod_component(name = "wave3_bridge_mod::PropStats")]
+pub struct PropStats {
+    pub hp: f32,
+    pub label: String,
+}
+
+fn spawn_and_sync(ctx: &mut SystemContext<'_>) -> Result<(), FfiResult> {
+    let host = *ctx.host();
+    let mut spawned_root_bits = 0u64;
+    let mut prop_entity_bits = 0u64;
+    let already_spawned = {
+        let tel = ctx
+            .resource_mut::<Wave3Telemetry>(0)
+            .ok_or(FfiResult::OUT_OF_RANGE)?;
+        tel.spawned_root_bits != 0
+    };
+    if !already_spawned {
+        let scene = GuestScene::resolve(&host, "wave3_e2e::prop_tower")?;
+        let cmds = ctx.commands();
+        let root = cmds.spawn_scene(&scene)?;
+        let prop_e = cmds.spawn_empty()?;
+        let rc = cmds.insert_dynamic_component(
+            prop_e,
+            PropStats {
+                hp: 42.5,
+                label: String::from("Beacon"),
+            },
+        );
+        if rc.is_err() {
+            return Err(rc);
+        }
+        spawned_root_bits = root.to_bits();
+        prop_entity_bits = prop_e.to_bits();
+    }
+    let tel = ctx
+        .resource_mut::<Wave3Telemetry>(0)
+        .ok_or(FfiResult::OUT_OF_RANGE)?;
+    if spawned_root_bits != 0 {
+        tel.spawned_root_bits = spawned_root_bits;
+        tel.prop_entity_bits = prop_entity_bits;
+    }
+    tel.ready_count = READY_HITS.load(Ordering::Acquire);
+    tel.init_ok = 1;
+    Ok(())
+}
+
+#[derive(Default)]
+pub struct Wave3BridgeMod;
+
+impl GuestPlugin for Wave3BridgeMod {
+    const NAME: &'static CStr = c"wave3_bridge_mod";
+    const VERSION: &'static CStr = c"0.1.0";
+
+    fn build(&mut self, app: &mut GuestApp<'_>) -> FfiResult {
+        if let Err(err) = app.register_dynamic_component::<PropStats>() {
+            return err;
+        }
+        if let Err(err) = app.observe_ready("wave3_ready", FfiEntity::NULL, |_target, _cmds| {
+            READY_HITS.fetch_add(1, Ordering::AcqRel);
+        }) {
+            return err;
+        }
+        let sys_res = app
+            .system(c"wave3_spawn_and_sync")
+            .schedule(ScheduleId::UPDATE)
+            .resource_write::<Wave3Telemetry>()
+            .build(spawn_and_sync);
+        if sys_res.is_ok() { FfiResult::OK } else { sys_res }
+    }
+}
+
+export_mod!(plugin: Wave3BridgeMod);
+"#;
+
+    let ws = workspace_root();
+    let guest_crate_dir = ws.join("crates").join("bevy_abi_mod_guest");
+    let lockfile = ws.join("Cargo.lock");
+    let shared_target = ws.join("target").join("bridges_e2e_guest_target");
+    let build_root = std::env::temp_dir().join(format!(
+        "bam_wave3_e2e_mod_{}_{}",
+        std::process::id(),
+        TEMP_DIR_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = fs::remove_dir_all(&build_root);
+    fs::create_dir_all(&build_root).expect("create temp wave3 mod root");
+
+    let dylib = build_temp_guest_cdylib(
+        &build_root,
+        "wave3_bridge_mod",
+        &guest_crate_dir,
+        &lockfile,
+        &shared_target,
+        WAVE3_MOD_SRC,
+    );
+
+    let mut app = App::new();
+    app.add_plugins((
+        TaskPoolPlugin::default(),
+        AssetPlugin::default(),
+        AbiModPlugin,
+        ModBsnPlugin,
+        ModReflectPlugin,
+    ));
+    app.register_mod_resource::<Wave3Telemetry>()
+        .expect("register Wave3Telemetry");
+    app.insert_resource(Wave3Telemetry::default());
+    app.expose_mod_scene_bsn(
+        "wave3_e2e::prop_tower",
+        bsn! {
+            #TowerRoot
+            Children [
+                #TowerChild
+            ]
+        },
+    )
+    .expect("expose wave3_e2e::prop_tower");
+
+    app.finish();
+    app.cleanup();
+
+    let mod_id = app
+        .load_mod_with(&dylib, LoadOptions::new().with_shadow_copy(true))
+        .expect("load wave3_bridge_mod");
+
+    // Frame 1 spawns the BSN scene + PropStats entity (Ready observer fires on spawn flush).
+    // Frame 2 syncs `READY_HITS` into `Wave3Telemetry`.
+    app.update();
+    app.update();
+
+    let tel = *app.world().resource::<Wave3Telemetry>();
+    assert_ne!(tel.spawned_root_bits, 0);
+    assert_ne!(tel.prop_entity_bits, 0);
+    assert!(
+        tel.ready_count >= 2,
+        "expected Ready for TowerRoot + TowerChild, got {}",
+        tel.ready_count
+    );
+
+    let root_entity = Entity::from_bits(tel.spawned_root_bits);
+    let prop_entity = Entity::from_bits(tel.prop_entity_bits);
+    assert_eq!(
+        app.world().get::<Name>(root_entity).map(Name::as_str),
+        Some("TowerRoot")
+    );
+    assert_eq!(
+        app.world().get::<ModScoped>(root_entity),
+        Some(&ModScoped(mod_id))
+    );
+    let child_entity = app
+        .world()
+        .get::<Children>(root_entity)
+        .expect("TowerRoot Children")[0];
+    assert_eq!(
+        app.world().get::<Name>(child_entity).map(Name::as_str),
+        Some("TowerChild")
+    );
+
+    // Inspect and mutate the guest's `PropStats` witness component via BRP!
+    let prop_h = app
+        .world()
+        .resource::<ModRegistry>()
+        .get_by_name("wave3_bridge_mod::PropStats")
+        .expect("PropStats registered by guest")
+        .handle;
+    app.world_mut()
+        .register_witness_reflection(prop_h)
+        .expect("register PropStats witness reflection");
+
+    let inspect_resp = handle_mod_brp_request(
+        app.world_mut(),
+        &BrpRequest {
+            method: BRP_METHOD_GET_COMPONENTS.to_owned(),
+            id: Some(json!(1)),
+            params: Some(json!({
+                "entity": prop_entity.to_bits(),
+                "components": ["wave3_bridge_mod::PropStats"]
+            })),
+        },
+    )
+    .expect("BRP inspect PropStats");
+    assert_eq!(
+        inspect_resp["components"]["wave3_bridge_mod::PropStats"]["label"],
+        json!("Beacon")
+    );
+
+    let mutate_resp = handle_mod_brp_request(
+        app.world_mut(),
+        &BrpRequest {
+            method: BRP_METHOD_MUTATE_COMPONENTS.to_owned(),
+            id: Some(json!(2)),
+            params: Some(json!({
+                "entity": prop_entity.to_bits(),
+                "components": {
+                    "wave3_bridge_mod::PropStats": {
+                        "hp": 99.0,
+                        "label": "SuperBeacon"
+                    }
+                }
+            })),
+        },
+    )
+    .expect("BRP mutate PropStats");
+    assert_eq!(mutate_resp, json!(null));
+
+    let after_resp = handle_mod_brp_request(
+        app.world_mut(),
+        &BrpRequest {
+            method: BRP_METHOD_GET_COMPONENTS.to_owned(),
+            id: Some(json!(3)),
+            params: Some(json!({
+                "entity": prop_entity.to_bits(),
+                "components": ["wave3_bridge_mod::PropStats"]
+            })),
+        },
+    )
+    .expect("BRP re-inspect PropStats");
+    assert_eq!(
+        after_resp["components"]["wave3_bridge_mod::PropStats"]["hp"],
+        json!(99.0)
+    );
+    assert_eq!(
+        after_resp["components"]["wave3_bridge_mod::PropStats"]["label"],
+        json!("SuperBeacon")
+    );
+
+    // Unload the mod and verify both BSN root and child entities are cleaned up via `ModScoped`.
+    app.unload_mod(mod_id).expect("unload wave3_bridge_mod");
+    assert!(app.world().get_entity(root_entity).is_err());
+    assert!(app.world().get_entity(child_entity).is_err());
+    assert!(app.world().get_entity(prop_entity).is_err());
+
+    let _ = fs::remove_dir_all(&build_root);
+}

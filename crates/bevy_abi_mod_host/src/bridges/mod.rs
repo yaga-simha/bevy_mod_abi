@@ -14,6 +14,19 @@ pub mod std_types;
 
 #[cfg(feature = "bridge-asset")]
 pub use asset::{ModAssetAppExt, ModAssetPlugin, ModAssetRegistry, ModAssetWorldExt};
+#[cfg(feature = "bridge-bsn")]
+pub use bsn::{
+    CANONICAL_READY_NAME, HostSceneRegistry, ModBsnAppExt, ModBsnPlugin, ModBsnWorldExt,
+    SCENE_PATCH_ALIAS,
+};
+#[cfg(feature = "bridge-reflect")]
+pub use reflect::{
+    BRP_METHOD_GET_COMPONENTS, BRP_METHOD_GET_RESOURCES, BRP_METHOD_INSERT_COMPONENTS,
+    BRP_METHOD_LIST_COMPONENTS, BRP_METHOD_MUTATE_COMPONENTS, BRP_METHOD_MUTATE_RESOURCES,
+    ModReflectAppExt, ModReflectError, ModReflectPlugin, ModReflectRegistry, ModReflectRemoteExt,
+    ModReflectWorldExt, ModSettingsError, ModSettingsRegistry, TypedReflectBridgeEntry,
+    WitnessReflectSchema, handle_mod_brp_request, install_mod_brp_methods,
+};
 #[cfg(feature = "bridge-state")]
 pub use state::{ModNextState, ModStateError, ModStateExt, ModStateSpec};
 #[cfg(feature = "bridge-std-types")]
