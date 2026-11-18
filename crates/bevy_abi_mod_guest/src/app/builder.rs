@@ -7,9 +7,10 @@ use bevy_abi_mod_guest_sys::{
     ValidatedSystemInvocation, resolve_component,
 };
 use bevy_abi_mod_sys::{
-    AbiPod, AccessMode, BAM_SYSTEM_FLAG_MAIN_THREAD, BamComponent, BamHostApi, BamLoadCtx,
-    BamTermDesc, ComponentDropFn, ComponentUuid, FfiEntity, FfiResult, MAX_QUERIES_PER_SYSTEM,
-    MAX_TERMS_PER_QUERY, ScheduleId,
+    AbiPod, AccessMode, BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET,
+    BAM_COMPONENT_FLAG_SUMMARY_TICK, BAM_SYSTEM_FLAG_MAIN_THREAD, BamComponent, BamHostApi,
+    BamLoadCtx, BamTermDesc, ComponentDropFn, ComponentUuid, FfiEntity, FfiResult,
+    MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ScheduleId,
 };
 
 use crate::{
@@ -80,9 +81,154 @@ impl IntoSystemResult for Result<(), FfiResult> {
 ///     let _ = app.register_component::<String>();
 /// }
 /// ```
+/// Fluent registration options for [`GuestApp::register_component_with_options`], supporting
+/// storage flags (`summary_tick`, `sparse_set`, `immutable`), `EntityCloner` support (`clone`),
+/// full lifecycle hooks (`on_add`, `on_insert`, `on_discard`, `on_remove`, `on_despawn`), and
+/// transitive required components (`require::<R>()`).
+pub struct GuestComponentOptions<T: AbiPod> {
+    flags: u32,
+    hooks: GuestComponentHooks<T>,
+    required_resolvers: Vec<fn(&Host, &str) -> Result<BamComponent, FfiResult>>,
+}
+
+impl<T: AbiPod> Default for GuestComponentOptions<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: AbiPod> GuestComponentOptions<T> {
+    /// Creates default registration options (`flags = 0`, no clone/hooks/requirements).
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            flags: 0,
+            hooks: GuestComponentHooks::new(),
+            required_resolvers: Vec::new(),
+        }
+    }
+
+    /// Adds explicit `BAM_COMPONENT_FLAG_*` flags (merged with `T::FLAGS`).
+    #[inline]
+    pub const fn flags(mut self, flags: u32) -> Self {
+        self.flags |= flags;
+        self
+    }
+
+    /// Configures `StorageType::SparseSet` (`BAM_COMPONENT_FLAG_SPARSE_SET`).
+    #[inline]
+    pub const fn sparse_set(mut self) -> Self {
+        self.flags |= BAM_COMPONENT_FLAG_SPARSE_SET;
+        self
+    }
+
+    /// Marks the component as immutable (`BAM_COMPONENT_FLAG_IMMUTABLE`).
+    #[inline]
+    pub const fn immutable(mut self) -> Self {
+        self.flags |= BAM_COMPONENT_FLAG_IMMUTABLE;
+        self
+    }
+
+    /// Enables Bevy 0.20 per-table `summary_tick` acceleration (`BAM_COMPONENT_FLAG_SUMMARY_TICK`).
+    #[inline]
+    pub const fn summary_tick(mut self) -> Self {
+        self.flags |= BAM_COMPONENT_FLAG_SUMMARY_TICK;
+        self
+    }
+
+    /// Enables bitwise `EntityCloner` (`clone_fn`) support for `T: AbiPod`.
+    #[inline]
+    pub fn clone(mut self) -> Self {
+        self.hooks = self.hooks.with_clone(true);
+        self
+    }
+
+    /// Attaches a pre-built [`GuestComponentHooks<T>`] configuration, preserving any `clone` or
+    /// required handles already set on `self` or `hooks`.
+    pub fn hooks(mut self, hooks: GuestComponentHooks<T>) -> Self {
+        let enable_clone = self.hooks.inner.enable_clone || hooks.inner.enable_clone;
+        let mut reqs = self.hooks.inner.required_components;
+        reqs.extend_from_slice(&hooks.inner.required_components);
+        self.hooks = hooks;
+        self.hooks.inner.enable_clone = enable_clone;
+        self.hooks.inner.required_components = reqs;
+        self
+    }
+
+    /// Attaches an `on_add` lifecycle hook.
+    #[inline]
+    pub fn on_add<F: FnMut(FfiEntity, &T) + Send + 'static>(mut self, callback: F) -> Self {
+        self.hooks = self.hooks.on_add(callback);
+        self
+    }
+
+    /// Attaches an `on_insert` lifecycle hook.
+    #[inline]
+    pub fn on_insert<F: FnMut(FfiEntity, &T) + Send + 'static>(mut self, callback: F) -> Self {
+        self.hooks = self.hooks.on_insert(callback);
+        self
+    }
+
+    /// Attaches an `on_discard` lifecycle hook.
+    #[inline]
+    pub fn on_discard<F: FnMut(FfiEntity, &T) + Send + 'static>(mut self, callback: F) -> Self {
+        self.hooks = self.hooks.on_discard(callback);
+        self
+    }
+
+    /// Attaches an `on_remove` lifecycle hook.
+    #[inline]
+    pub fn on_remove<F: FnMut(FfiEntity, &T) + Send + 'static>(mut self, callback: F) -> Self {
+        self.hooks = self.hooks.on_remove(callback);
+        self
+    }
+
+    /// Attaches an `on_despawn` lifecycle hook.
+    #[inline]
+    pub fn on_despawn<F: FnMut(FfiEntity, &T) + Send + 'static>(mut self, callback: F) -> Self {
+        self.hooks = self.hooks.on_despawn(callback);
+        self
+    }
+
+    /// Declares a required [`GuestComponent`] `R` resolved on the host when registering `T`.
+    #[inline]
+    pub fn require<R: GuestComponent>(mut self) -> Self {
+        self.required_resolvers.push(resolve_guest_component::<R>);
+        self
+    }
+
+    /// Declares a pre-resolved required [`BamComponent`] handle.
+    #[inline]
+    pub fn require_handle(mut self, component: BamComponent) -> Self {
+        self.hooks = self.hooks.with_required_handle(component);
+        self
+    }
+}
+
+/// Safe per-World mod initialization builder passed to [`GuestPlugin::build`](crate::GuestPlugin::build)
+/// and [`export_mod!`](crate::export_mod).
+///
+/// Constructing `GuestApp` directly from raw C pointers in safe Rust is rejected at compile time:
+///
+/// ```compile_fail
+/// use bevy_abi_mod_guest::GuestApp;
+///
+/// let _app = GuestApp::from_raw(core::ptr::null(), core::ptr::null_mut());
+/// ```
+///
+/// Registering non-`AbiPod` types (such as `String` or `Vec<u8>`) via `register_component` is
+/// rejected at compile time:
+///
+/// ```compile_fail
+/// use bevy_abi_mod_guest::GuestApp;
+///
+/// fn register_bad(app: &mut GuestApp<'_>) {
+///     let _ = app.register_component::<String>();
+/// }
+/// ```
 pub struct GuestApp<'a> {
-    instance: &'a mut GuestInstance,
-    load_ctx: ValidatedLoadCtx<'a>,
+    pub(crate) instance: &'a mut GuestInstance,
+    pub(crate) load_ctx: ValidatedLoadCtx<'a>,
 }
 
 impl<'a> GuestApp<'a> {
@@ -201,8 +347,7 @@ impl<'a> GuestApp<'a> {
         self.register_component_with_flags_and_hooks::<T>(T::FLAGS, hooks)
     }
 
-    /// Registers `T: GuestComponent` with explicit `flags` and optional `on_add` / `on_remove`
-    /// hooks.
+    /// Registers `T: GuestComponent` with explicit `flags` and optional lifecycle hooks.
     pub fn register_component_with_flags_and_hooks<T: GuestComponent>(
         &mut self,
         flags: u32,
@@ -217,6 +362,24 @@ impl<'a> GuestApp<'a> {
             flags,
             hooks.inner,
         )
+    }
+
+    /// Registers `T: GuestComponent` with [`GuestComponentOptions`] (`summary_tick`, `clone`,
+    /// full lifecycle hooks, and transitive `require::<R>()`).
+    pub fn register_component_with_options<T: GuestComponent>(
+        &mut self,
+        mut options: GuestComponentOptions<T>,
+    ) -> Result<BamComponent, FfiResult> {
+        let host = *self.instance.host();
+        let manifest_name = self.instance.manifest_name();
+        for resolver in options.required_resolvers {
+            let handle = resolver(&host, manifest_name)?;
+            if !options.hooks.inner.required_components.contains(&handle) {
+                options.hooks.inner.required_components.push(handle);
+            }
+        }
+        let combined_flags = T::FLAGS | options.flags;
+        self.register_component_with_flags_and_hooks::<T>(combined_flags, options.hooks)
     }
 
     /// Registers a runtime layout-defined dynamic component (`name`, `size`, `align`, `drop_fn`)
@@ -357,10 +520,10 @@ impl<'a> GuestApp<'a> {
 
 /// Declarative query-clause builder passed to [`SystemBuilder::query`].
 pub struct QueryBuilder<'b> {
-    host: &'b Host,
-    manifest_name: &'b str,
-    terms: Vec<BamTermDesc>,
-    first_error: Option<FfiResult>,
+    pub(crate) host: &'b Host,
+    pub(crate) manifest_name: &'b str,
+    pub(crate) terms: Vec<BamTermDesc>,
+    pub(crate) first_error: Option<FfiResult>,
 }
 
 impl<'b> QueryBuilder<'b> {
@@ -449,6 +612,56 @@ impl<'b> QueryBuilder<'b> {
     #[inline]
     pub fn added<T: GuestComponent>(mut self) -> Self {
         self.push_guest_term::<T>(AccessMode::ADDED);
+        self
+    }
+
+    /// Appends an entity-disabling filter bypass (`Allow<T>`) term.
+    #[inline]
+    pub fn allow<T: GuestComponent>(mut self) -> Self {
+        self.push_guest_term::<T>(AccessMode::ALLOW);
+        self
+    }
+
+    /// Appends an archetypal presence indicator (`Has<T>`) term yielding an `FfiBool` column.
+    #[inline]
+    pub fn has<T: GuestComponent>(mut self) -> Self {
+        self.push_guest_term::<T>(AccessMode::HAS);
+        self
+    }
+
+    /// Appends a `RemovedComponents<T>` removal-stream reader (`AccessMode::REMOVED_READ`) term.
+    #[inline]
+    pub fn removed<T: GuestComponent>(mut self) -> Self {
+        self.push_guest_term::<T>(AccessMode::REMOVED_READ);
+        self
+    }
+
+    /// Appends a disjunctive `Or<(...)>` filter group (`group_id`, `1..=255`) whose terms are
+    /// configured via `configure`.
+    pub fn or_group(
+        mut self,
+        group_id: u8,
+        configure: impl for<'q> FnOnce(QueryBuilder<'q>) -> QueryBuilder<'q>,
+    ) -> Self {
+        let sub = QueryBuilder {
+            host: self.host,
+            manifest_name: self.manifest_name,
+            terms: Vec::new(),
+            first_error: None,
+        };
+        let finished = configure(sub);
+        if let Some(err) = finished.first_error {
+            self.record_error(err);
+            return self;
+        }
+        for mut term in finished.terms {
+            if self.terms.len() >= MAX_TERMS_PER_QUERY {
+                self.record_error(FfiResult::CAPACITY_EXCEEDED);
+                break;
+            }
+            term.or_group = group_id;
+            self.terms.push(term);
+        }
         self
     }
 

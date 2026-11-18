@@ -634,6 +634,16 @@ impl RegisteredComponent {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ExtendedDynamicFlags {
+    pub(crate) has_on_add_effective: bool,
+    pub(crate) has_on_insert: bool,
+    pub(crate) has_on_discard: bool,
+    pub(crate) has_on_remove: bool,
+    pub(crate) has_on_despawn: bool,
+    pub(crate) has_clone_fn: bool,
+}
+
 /// Immutable dense snapshot shared via `Arc` across `ModRegistry`, `HostContext`, and `GuestSystem`
 ///.
 #[derive(Clone, Default)]
@@ -643,6 +653,8 @@ pub struct RegistrySnapshot {
     pub(crate) by_uuid: HashMap<ComponentUuid, BamComponent>,
     pub(crate) by_component_id: HashMap<ComponentId, BamComponent>,
     pub(crate) symbols: HashMap<Arc<str>, SymbolRecord>,
+    pub(crate) required_components: HashMap<BamComponent, Box<[BamComponent]>>,
+    pub(crate) extended_hook_flags: HashMap<BamComponent, ExtendedDynamicFlags>,
     asset_backend: Option<Arc<dyn HostAssetBackend>>,
     scene_backend: Option<Arc<dyn HostSceneBackend>>,
 }
@@ -718,6 +730,14 @@ impl RegistrySnapshot {
     #[inline]
     pub fn scene_backend(&self) -> Option<&Arc<dyn HostSceneBackend>> {
         self.scene_backend.as_ref()
+    }
+
+    /// Returns the required [`BamComponent`] handles registered for `handle` (empty if none).
+    #[inline]
+    pub fn required_components(&self, handle: BamComponent) -> &[BamComponent] {
+        self.required_components
+            .get(&handle)
+            .map_or(&[], |boxed| boxed.as_ref())
     }
 }
 
@@ -954,6 +974,58 @@ impl ModRegistry {
                     reason: format!(
                         "hook presence mismatch on re-registration (existing=({}, {}), new=({has_on_add}, {has_on_remove}))",
                         existing.has_on_add_hook, existing.has_on_remove_hook
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates that dynamically re-registering `name` matches all extended lifecycle hooks,
+    /// `clone_fn`, and `required_components` presence permanently wired into Bevy's `ComponentInfo`.
+    pub fn check_dynamic_extended_hook_compatibility(
+        &self,
+        name: &str,
+        desc: &ComponentDesc,
+    ) -> Result<(), ComponentCollisionError> {
+        let new_flags = ExtendedDynamicFlags {
+            has_on_add_effective: desc.on_add.is_some() || desc.required_component_count > 0,
+            has_on_insert: desc.on_insert.is_some(),
+            has_on_discard: desc.on_discard.is_some(),
+            has_on_remove: desc.on_remove.is_some(),
+            has_on_despawn: desc.on_despawn.is_some(),
+            has_clone_fn: desc.clone_fn.is_some(),
+        };
+        if let Some(existing) = self.snapshot.get_by_name(name) {
+            if !existing.is_dynamic
+                && (new_flags.has_on_add_effective
+                    || new_flags.has_on_insert
+                    || new_flags.has_on_discard
+                    || new_flags.has_on_remove
+                    || new_flags.has_on_despawn
+                    || new_flags.has_clone_fn)
+            {
+                return Err(ComponentCollisionError::MetadataMismatch {
+                    name: name.to_string(),
+                    reason: "cannot attach foreign hooks/clone/required_components to host-owned component"
+                        .to_string(),
+                });
+            }
+            let existing_flags = self
+                .snapshot
+                .extended_hook_flags
+                .get(&existing.handle)
+                .copied()
+                .unwrap_or(ExtendedDynamicFlags {
+                    has_on_add_effective: existing.has_on_add_hook,
+                    has_on_remove: existing.has_on_remove_hook,
+                    ..ExtendedDynamicFlags::default()
+                });
+            if existing_flags != new_flags {
+                return Err(ComponentCollisionError::MetadataMismatch {
+                    name: name.to_string(),
+                    reason: format!(
+                        "extended hook/clone presence mismatch on re-registration (existing={existing_flags:?}, new={new_flags:?})"
                     ),
                 });
             }
@@ -1395,6 +1467,7 @@ impl ModRegistry {
 
     /// Registers a guest-owned dynamic component from a validated [`ComponentDesc`], returning its
     /// 1-based [`BamComponent`] handle.
+    #[allow(dead_code)]
     pub(crate) fn register_dynamic_component_owned(
         &mut self,
         comp_id: ComponentId,
@@ -1404,36 +1477,76 @@ impl ModRegistry {
         drop_slot: Option<usize>,
         hook_slot: Option<usize>,
     ) -> Result<BamComponent, ComponentCollisionError> {
+        self.register_dynamic_component_owned_with_required(
+            comp_id,
+            desc,
+            name,
+            owner,
+            drop_slot,
+            hook_slot,
+            Box::new([]),
+        )
+    }
+
+    /// Registers a guest-owned dynamic component with optional validated `required_components`,
+    /// returning its 1-based [`BamComponent`] handle.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn register_dynamic_component_owned_with_required(
+        &mut self,
+        comp_id: ComponentId,
+        desc: &ComponentDesc,
+        name: &str,
+        owner: Option<ModId>,
+        drop_slot: Option<usize>,
+        hook_slot: Option<usize>,
+        required_components: Box<[BamComponent]>,
+    ) -> Result<BamComponent, ComponentCollisionError> {
         let storage_flags = component_flags_to_storage_flags(desc.flags);
+        let expected_comp_id = self
+            .snapshot
+            .get_by_name(name)
+            .filter(|entry| entry.is_dynamic)
+            .map_or(comp_id, |entry| entry.component_id);
         self.check_registration_collision(
             name,
             desc.uuid,
             desc.size,
             desc.align,
             storage_flags,
-            Some(comp_id),
+            Some(expected_comp_id),
         )?;
         self.check_dynamic_drop_compatibility(name, desc.drop_fn.is_some())?;
-        self.check_dynamic_hook_compatibility(
-            name,
-            desc.on_add.is_some(),
-            desc.on_remove.is_some(),
-        )?;
+        self.check_dynamic_extended_hook_compatibility(name, desc)?;
+
+        let ext_flags = ExtendedDynamicFlags {
+            has_on_add_effective: desc.on_add.is_some() || !required_components.is_empty(),
+            has_on_insert: desc.on_insert.is_some(),
+            has_on_discard: desc.on_discard.is_some(),
+            has_on_remove: desc.on_remove.is_some(),
+            has_on_despawn: desc.on_despawn.is_some(),
+            has_clone_fn: desc.clone_fn.is_some(),
+        };
 
         let sym_addr = SymbolAddress::new(desc.vtable_ptr);
         let handle = {
             let snap = Arc::make_mut(&mut self.snapshot);
             let mut is_dynamic_entry = true;
+            let mut replaced_comp_id: Option<(ComponentId, ComponentId)> = None;
             let handle = if let Some(&existing_handle) = snap.by_name.get(name) {
                 let idx = (existing_handle.0 - 1) as usize;
                 let entry = &mut snap.entries[idx];
                 is_dynamic_entry = entry.is_dynamic;
                 if entry.is_dynamic {
+                    if entry.component_id != comp_id {
+                        replaced_comp_id = Some((entry.component_id, comp_id));
+                    }
+                    entry.component_id = comp_id;
                     entry.vtable_ptr = sym_addr;
                     entry.drop_fn = desc.drop_fn;
-                    if drop_slot.is_some() {
-                        entry.drop_slot = drop_slot;
-                    }
+                    entry.drop_slot = drop_slot;
+                    // SAFETY: `comp_id` was registered in `world` with `(desc.size, desc.align)`
+                    // and is safe for dynamic event dispatch.
+                    entry.event_key = Some(unsafe { EventKey::new(comp_id) });
                     if hook_slot.is_some() {
                         entry.hook_slot = hook_slot;
                     }
@@ -1461,8 +1574,8 @@ impl ModRegistry {
                     drop_fn: desc.drop_fn,
                     drop_slot,
                     hook_slot,
-                    has_on_add_hook: desc.on_add.is_some(),
-                    has_on_remove_hook: desc.on_remove.is_some(),
+                    has_on_add_hook: ext_flags.has_on_add_effective,
+                    has_on_remove_hook: ext_flags.has_on_remove,
                     create_msg_cursor_fn: None,
                     msg_read_batch_fn: None,
                     msg_send_fn: None,
@@ -1484,7 +1597,18 @@ impl ModRegistry {
                 handle
             };
 
+            if let Some((old_comp_id, new_comp_id)) = replaced_comp_id {
+                snap.by_component_id.remove(&old_comp_id);
+                snap.by_component_id.insert(new_comp_id, handle);
+            }
+
             if is_dynamic_entry {
+                snap.extended_hook_flags.insert(handle, ext_flags);
+                if required_components.is_empty() {
+                    snap.required_components.remove(&handle);
+                } else {
+                    snap.required_components.insert(handle, required_components);
+                }
                 let vtable_key: Arc<str> = Arc::from(format!("bam.v0.{name}.vtable").as_str());
                 if !sym_addr.is_null() {
                     snap.symbols.insert(
@@ -1597,5 +1721,11 @@ impl ModRegistry {
     #[inline]
     pub fn resolve_symbol(&self, name: &str) -> Option<*const c_void> {
         self.snapshot.resolve_symbol(name)
+    }
+
+    /// Returns the required [`BamComponent`] handles registered for `handle` (empty if none).
+    #[inline]
+    pub fn required_components(&self, handle: BamComponent) -> &[BamComponent] {
+        self.snapshot.required_components(handle)
     }
 }
