@@ -748,7 +748,6 @@ size_t align,
 BamComponentDropFn drop_fn
 ) {
 BamComponentDesc d;
-memset(&d, 0, sizeof(d));
 d.struct_size = (uint32_t)sizeof(BamComponentDesc);
 d.flags = 0u;
 d.name = name;
@@ -756,6 +755,10 @@ d.uuid = bam_uuid_from_parts(name, size, align, 0ull);
 d.size = size;
 d.align = align;
 d.drop_fn = drop_fn;
+d.vtable_ptr = NULL;
+d.on_add = NULL;
+d.on_remove = NULL;
+d.hook_user_data = NULL;
 return d;
 }
 
@@ -766,11 +769,13 @@ BamObserverFn callback,
 void* user_data
 ) {
 BamObserverDesc d;
-memset(&d, 0, sizeof(d));
 d.struct_size = (uint32_t)sizeof(BamObserverDesc);
+d.flags = 0u;
+d.name = NULL;
 d.event = event;
 d.entity_lo = (uint32_t)(entity & 0xFFFFFFFFull);
 d.entity_hi = (uint32_t)((entity >> 32) & 0xFFFFFFFFull);
+d.reserved0 = 0u;
 d.callback = callback;
 d.user_data = user_data;
 return d;

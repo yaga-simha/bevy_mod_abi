@@ -1647,7 +1647,6 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
              BamComponentDropFn drop_fn\n\
          ) {\n\
              BamComponentDesc d;\n\
-             memset(&d, 0, sizeof(d));\n\
              d.struct_size = (uint32_t)sizeof(BamComponentDesc);\n\
              d.flags = 0u;\n\
              d.name = name;\n\
@@ -1655,6 +1654,10 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
              d.size = size;\n\
              d.align = align;\n\
              d.drop_fn = drop_fn;\n\
+             d.vtable_ptr = NULL;\n\
+             d.on_add = NULL;\n\
+             d.on_remove = NULL;\n\
+             d.hook_user_data = NULL;\n\
              return d;\n\
          }\n\n\
          static BAM_UNUSED inline BamObserverDesc bam_observer_desc(\n\
@@ -1664,11 +1667,13 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
              void* user_data\n\
          ) {\n\
              BamObserverDesc d;\n\
-             memset(&d, 0, sizeof(d));\n\
              d.struct_size = (uint32_t)sizeof(BamObserverDesc);\n\
+             d.flags = 0u;\n\
+             d.name = NULL;\n\
              d.event = event;\n\
              d.entity_lo = (uint32_t)(entity & 0xFFFFFFFFull);\n\
              d.entity_hi = (uint32_t)((entity >> 32) & 0xFFFFFFFFull);\n\
+             d.reserved0 = 0u;\n\
              d.callback = callback;\n\
              d.user_data = user_data;\n\
              return d;\n\

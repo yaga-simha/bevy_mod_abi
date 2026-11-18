@@ -844,12 +844,12 @@ fn siphash24_128_vectors_and_component_uuid() {
     );
 
     // Explicit UUID hex parsing & `u128` round-trip:
-    let parsed_hyphen = ComponentUuid::parse_hex("01234567-89ab-cdef-FEDC-BA9876543210");
-    let parsed_compact = ComponentUuid::parse_hex("0123456789abcdefFEDCBA9876543210");
+    let parsed_hyphen = ComponentUuid::parse_hex("01234567-89ab-cdef-FEDC-9876543210CD");
+    let parsed_compact = ComponentUuid::parse_hex("0123456789abcdefFEDC9876543210CD");
     assert_eq!(parsed_hyphen, parsed_compact);
     assert_eq!(
         parsed_hyphen.to_u128(),
-        0x0123_4567_89ab_cdef_fedc_ba98_7654_3210
+        0x0123_4567_89ab_cdef_fedc_9876_5432_10cd
     );
     assert_eq!(
         ComponentUuid::from_u128(parsed_hyphen.to_u128()),
@@ -857,8 +857,8 @@ fn siphash24_128_vectors_and_component_uuid() {
     );
 
     assert!(ComponentUuid::try_parse_hex("too-short").is_none());
-    assert!(ComponentUuid::try_parse_hex("0123456789abcdef-fedcba9876543210xxxx").is_none());
-    assert!(ComponentUuid::try_parse_hex("01234567-89ab-cdef-fedc-ba987654321g").is_none());
+    assert!(ComponentUuid::try_parse_hex("0123456789abcdef-fedc9876543210cdxxxx").is_none());
+    assert!(ComponentUuid::try_parse_hex("01234567-89ab-cdef-fedc-9876543210cg").is_none());
 }
 
 #[test]
