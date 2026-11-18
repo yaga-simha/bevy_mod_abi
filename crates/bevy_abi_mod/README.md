@@ -36,6 +36,7 @@ fn main() {
 
 - **`strict-ffi-checks`**: Enables extra runtime FFI pointer, alignment, and handle-generation validation in `bevy_abi_mod_host`.
 - **`diagnostics`**: Publishes Bevy `Diagnostics` counters for loaded mod counts, active systems, and faulted invocations.
+- **`signature-verification`**: Enables optional pure-Rust OpenSSH `SSHSIG` (`.sig` sidecars), Ed25519 CA certificate verification (`ModTrustPolicy`, `VerifiedModSignature`), OpenSSH `SSHKRL` / signed KRL revocation lists (`KrlBuilder`, `with_min_krl_version`) with runtime `evict_revoked_mods()`, and strict Ed25519 curve validation prior to `dlopen` / `LoadLibraryW`. Manage keys, certs, KRLs, and signatures via standard `ssh-keygen -Y`/`-k`/`-Q` or `cargo xtask sign <keygen|cert|file|krl|verify>`.
 
 ## Documentation
 

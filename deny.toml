@@ -8,9 +8,16 @@ exclude-dev = false
 [advisories]
 version = 2
 yanked = "warn"
+unused-ignored-advisory = "allow"
 ignore = [
     # Transitive via `ratatui 0.29.0` (`example_04_visual_game`); no safe upstream upgrade exists.
     "RUSTSEC-2024-0436",
+    # Transitive weak optional dependency in `ssh-key 0.6.7` lockfile (`rsa?/std`); RSA is
+    # disabled at compile time (`features = ["std", "ed25519"]`) and rejected at runtime.
+    "RUSTSEC-2023-0071",
+    # Transitive weak optional dependency in `ssh-key 0.6.7` lockfile (ECDSA crates);
+    # never compiled under `ed25519`-only feature selection.
+    "RUSTSEC-2026-0387",
 ]
 
 [licenses]

@@ -23,6 +23,7 @@ jobs:
           - fuzz_system_desc
           - fuzz_commands
           - fuzz_cstr_array
+          - fuzz_sshsig_and_krl
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -147,4 +148,5 @@ jobs:
           cargo +nightly test -p bevy_abi_mod_sys -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest
           cargo +nightly test -p bevy_abi_mod_macros --lib --test mod_component_vtable
           cargo +nightly test -p bevy_abi_mod_host_sys --lib
+          cargo +nightly test -p bevy_abi_mod_host_sys --lib --features signature-verification
           cargo +nightly test -p bevy_abi_mod_host

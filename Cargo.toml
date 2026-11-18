@@ -108,3 +108,7 @@ quote = "1.0"
 proc-macro2 = "1.0"
 proc-macro-crate = "3"
 trybuild = "1.0"
+ssh-key = { version = "0.6.7", default-features = false, features = ["std", "ed25519"] }
+ssh-encoding = { version = "0.2", default-features = false, features = ["std", "pem", "sha2"] }
+signature = { version = "2", default-features = false, features = ["std"] }
+ed25519-dalek = { version = "2", default-features = false }

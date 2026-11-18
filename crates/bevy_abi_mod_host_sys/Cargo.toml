@@ -18,6 +18,12 @@ workspace = true
 strict-ffi-checks = []
 test-utils = []
 diagnostics = []
+signature-verification = [
+    "dep:ssh-key",
+    "dep:ssh-encoding",
+    "dep:signature",
+    "dep:ed25519-dalek",
+]
 
 [dependencies]
 bevy_abi_mod_sys = { workspace = true }
@@ -30,7 +36,13 @@ nonmax = { workspace = true }
 arc-swap = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+ssh-key = { workspace = true, optional = true }
+ssh-encoding = { workspace = true, optional = true }
+signature = { workspace = true, optional = true }
+ed25519-dalek = { workspace = true, optional = true }
 
 [dev-dependencies]
 bevy_abi_mod_macros = { workspace = true }
 loom = { workspace = true }
+proptest = { workspace = true }
+ssh-key = { workspace = true, features = ["getrandom"] }

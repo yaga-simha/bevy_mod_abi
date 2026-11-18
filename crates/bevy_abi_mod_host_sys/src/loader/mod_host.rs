@@ -11,6 +11,8 @@ use crate::loader::error::{ModLoadError, is_abi_version_compatible};
 use crate::loader::shared_lib::{
     LoadOptions, LoadedLibrary, SharedLibState, shared_lib_state_for_path,
 };
+#[cfg(feature = "signature-verification")]
+use crate::loader::signing::{ModTrustPolicy, VerifiedModSignature, default_signature_path_for};
 use crate::loader::transaction::LoadTransaction;
 use crate::registry::{ModRegistry, RegistrySnapshot};
 use crate::schedule::{ModNamedSystemSet, ModSystemSet};
@@ -128,6 +130,8 @@ pub struct LoadedMod {
     instance: GuestInstancePtr,
     is_active: Arc<AtomicBool>,
     lib_state: Arc<Mutex<SharedLibState>>,
+    #[cfg(feature = "signature-verification")]
+    verified_signature: Option<VerifiedModSignature>,
     pub(crate) registered_named_sets: Vec<(InternedScheduleLabel, ModNamedSystemSet)>,
     pub(crate) observer_entities: Vec<Entity>,
 }
@@ -267,6 +271,14 @@ impl LoadedMod {
     #[inline]
     pub fn is_active(&self) -> bool {
         self.is_active.load(Ordering::Acquire)
+    }
+
+    /// Returns the verified cryptographic signature metadata for this mod, if signature
+    /// verification was enforced during load.
+    #[cfg(feature = "signature-verification")]
+    #[inline]
+    pub const fn verified_signature(&self) -> Option<&VerifiedModSignature> {
+        self.verified_signature.as_ref()
     }
 }
 
@@ -408,7 +420,13 @@ impl ModHost {
         options: &LoadOptions,
         registry: ModRegistry,
         world_ptr: *mut World,
+        #[cfg(feature = "signature-verification")] trust_policy: Option<&ModTrustPolicy>,
     ) -> Result<(ModId, Vec<GuestSystem>), ModLoadError> {
+        #[cfg(feature = "signature-verification")]
+        // SAFETY: Stage shadow copy (verified bytes when enforced) and open shared library via `libloading`.
+        let (loaded_lib, actual_path, verified_signature) =
+            unsafe { LoadedLibrary::open(source_path, options, trust_policy)? };
+        #[cfg(not(feature = "signature-verification"))]
         // SAFETY: Stage shadow copy if requested and open shared library via `libloading`.
         let (loaded_lib, actual_path) = unsafe { LoadedLibrary::open(source_path, options)? };
 
@@ -507,6 +525,21 @@ impl ModHost {
 
         let manifest_name: Arc<str> = Arc::from(manifest_name_str);
         let manifest_version: Arc<str> = Arc::from(manifest_version_str);
+
+        #[cfg(feature = "signature-verification")]
+        if let (Some(policy), Some(receipt)) = (trust_policy, verified_signature.as_ref())
+            && let Err(source) = policy.verify_manifest_principal(receipt, manifest_name_str)
+        {
+            let signature_path = options
+                .signature_path
+                .clone()
+                .unwrap_or_else(|| default_signature_path_for(source_path));
+            return Err(ModLoadError::SignatureVerification {
+                path: source_path.to_path_buf(),
+                signature_path,
+                source,
+            });
+        }
 
         // 2. Mandatory `bevy_abi_mod_init` and `bevy_abi_mod_shutdown`.
         // SAFETY: Resolving `bevy_abi_mod_init`.
@@ -632,6 +665,8 @@ impl ModHost {
             instance: GuestInstancePtr::new(instance_ptr),
             is_active,
             lib_state,
+            #[cfg(feature = "signature-verification")]
+            verified_signature,
             registered_named_sets: Vec::new(),
             observer_entities,
         });
@@ -720,9 +755,21 @@ pub fn load_mod_in_world(
             .get_resource::<ModRegistry>()
             .cloned()
             .unwrap_or_default();
+        #[cfg(feature = "signature-verification")]
+        let trust_policy = world.get_resource::<ModTrustPolicy>().cloned();
         let world_ptr = world as *mut World;
-        // SAFETY: `world` is exclusively borrowed (`&mut World`) while loading `path`.
-        unsafe { mod_host.load_mod_core(path, options, registry, world_ptr) }
+        #[cfg(feature = "signature-verification")]
+        {
+            // SAFETY: `world` is exclusively borrowed (`&mut World`) while loading `path`.
+            unsafe {
+                mod_host.load_mod_core(path, options, registry, world_ptr, trust_policy.as_ref())
+            }
+        }
+        #[cfg(not(feature = "signature-verification"))]
+        {
+            // SAFETY: `world` is exclusively borrowed (`&mut World`) while loading `path`.
+            unsafe { mod_host.load_mod_core(path, options, registry, world_ptr) }
+        }
     })
 }
 

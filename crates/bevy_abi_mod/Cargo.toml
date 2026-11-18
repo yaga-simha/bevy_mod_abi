@@ -17,6 +17,7 @@ workspace = true
 [features]
 strict-ffi-checks = ["bevy_abi_mod_host/strict-ffi-checks"]
 diagnostics = ["bevy_abi_mod_host/diagnostics"]
+signature-verification = ["bevy_abi_mod_host/signature-verification"]
 
 [dependencies]
 bevy_abi_mod_sys = { workspace = true }

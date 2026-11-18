@@ -10,6 +10,13 @@
 //! All `unsafe` FFI internals are isolated inside `bevy_abi_mod_host_sys`; this crate enforces
 //! `#![forbid(unsafe_code)]`.
 //!
+//! # Optional Features
+//!
+//! - `strict-ffi-checks`: Extra FFI pointer, alignment, and handle-generation validation.
+//! - `diagnostics`: Publishes per-mod and aggregate `bevy_diagnostic` counters.
+//! - `signature-verification`: Pure-Rust OpenSSH `SSHSIG` + Ed25519 CA certificate verification
+//!   of shared libraries prior to `dlopen` / `LoadLibraryW` (`ModTrustPolicy`, `VerifiedModSignature`).
+//!
 //! # Quickstart
 //!
 //! ```no_run
@@ -50,6 +57,15 @@ pub use bevy_abi_mod_macros::{AbiPod, ModComponent};
 pub use bevy_abi_mod_sys;
 
 pub use app_ext::ModAppExt;
+#[cfg(feature = "signature-verification")]
+pub use bevy_abi_mod_host_sys::{
+    CertificateValidityPolicy, DEFAULT_KRL_SIGNATURE_NAMESPACE, DEFAULT_MAX_MOD_BINARY_BYTES,
+    DEFAULT_SIGNATURE_NAMESPACE, KrlBuilder, MAX_KRL_BYTES, MAX_SIGNATURE_SIDECAR_BYTES,
+    ModSigningError, ModTrustConfigError, ModTrustPolicy, SignatureEnforcement,
+    SignatureVerificationError, VerifiedModSignature, default_signature_path_for,
+    preverify_mod_on_disk, sign_mod_bytes_with_certificate, sign_mod_bytes_with_key,
+    sign_mod_bytes_with_openssh_certificate,
+};
 pub use bevy_abi_mod_host_sys::{
     ComponentCollisionError, ComponentOptions, LoadOptions, LoadedMod, ModErrorPolicy,
     ModErrorPolicyConfig, ModHost, ModId, ModLoadError, ModQuarantine, ModRegistry,
@@ -69,6 +85,8 @@ pub use world_ext::ModWorldExt;
 pub mod prelude {
     pub use crate::app_ext::ModAppExt;
     pub use crate::commands_ext::ModCommandsExt;
+    #[cfg(feature = "signature-verification")]
+    pub use crate::events::VerifiedModSignature;
     pub use crate::events::{
         LoadedModInfo, ModLoaded, ModSystemError, ModSystemFaulted, ModUnloaded, SystemInitError,
     };
@@ -80,6 +98,15 @@ pub mod prelude {
     pub use crate::{
         AbiPod, ComponentCollisionError, ComponentOptions, LoadOptions, LoadedMod, ModComponent,
         ModErrorPolicy, ModHost, ModId, ModLoadError, ModQuarantine, ModRegistry, TargetEntity,
+    };
+    #[cfg(feature = "signature-verification")]
+    pub use crate::{
+        CertificateValidityPolicy, DEFAULT_KRL_SIGNATURE_NAMESPACE, DEFAULT_MAX_MOD_BINARY_BYTES,
+        DEFAULT_SIGNATURE_NAMESPACE, KrlBuilder, MAX_KRL_BYTES, MAX_SIGNATURE_SIDECAR_BYTES,
+        ModSigningError, ModTrustConfigError, ModTrustPolicy, SignatureEnforcement,
+        SignatureVerificationError, default_signature_path_for, preverify_mod_on_disk,
+        sign_mod_bytes_with_certificate, sign_mod_bytes_with_key,
+        sign_mod_bytes_with_openssh_certificate,
     };
     pub use bevy_abi_mod_sys::{
         ABI_VERSION, AccessMode, BamChangeTicks, BamColumnInfo, BamComponent, BamObserverDesc,

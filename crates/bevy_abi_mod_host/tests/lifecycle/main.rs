@@ -27,4 +27,6 @@ mod drop_trampolines;
 mod handshake_and_strict_load;
 mod hot_reload_and_excision;
 mod isolation_and_rollback;
+#[cfg(feature = "signature-verification")]
+mod signature_verification;
 mod state_hooks_and_observers;

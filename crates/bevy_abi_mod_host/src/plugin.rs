@@ -7,6 +7,8 @@ pub use crate::schedule_sets::{ModNamedSystemSet, ModScheduleMap, ModVisibleSets
 pub use crate::world_ext::ModWorldExt;
 
 use crate::commands_ext::{PendingModLifecycleOps, flush_pending_mod_lifecycle_ops};
+#[cfg(feature = "signature-verification")]
+use bevy_abi_mod_host_sys::ModTrustPolicy;
 use bevy_abi_mod_host_sys::{
     ModErrorPolicy, ModErrorPolicyConfig, ModHost, ModQuarantine, ModRegistry, ModSystemFaulted,
     StartupCompleted, WorldDropGuard, mark_startup_completed,
@@ -25,7 +27,8 @@ pub(crate) fn ensure_startup_tracker(app: &mut App) {
 ///
 /// Kept as a zero-sized unit struct so both `app.add_plugins(AbiModPlugin)` and
 /// `app.add_plugins(AbiModPlugin::default())` work idiomatically, while
-/// [`AbiModPlugin::with_error_policy`] configures custom fault handling.
+/// [`AbiModPlugin::with_error_policy`] (and `AbiModPlugin::with_trust_policy` when
+/// `signature-verification` is enabled) configure custom policies.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct AbiModPlugin;
 
@@ -34,6 +37,17 @@ impl AbiModPlugin {
     pub const fn with_error_policy(policy: ModErrorPolicy) -> ConfiguredAbiModPlugin {
         ConfiguredAbiModPlugin {
             error_policy: policy,
+            #[cfg(feature = "signature-verification")]
+            trust_policy: None,
+        }
+    }
+
+    /// Returns a configured plugin enforcing the given [`ModTrustPolicy`] at load time.
+    #[cfg(feature = "signature-verification")]
+    pub fn with_trust_policy(policy: ModTrustPolicy) -> ConfiguredAbiModPlugin {
+        ConfiguredAbiModPlugin {
+            error_policy: ModErrorPolicy::default(),
+            trust_policy: Some(policy),
         }
     }
 }
@@ -44,11 +58,33 @@ impl Plugin for AbiModPlugin {
     }
 }
 
-/// Configurable variant of [`AbiModPlugin`] created via [`AbiModPlugin::with_error_policy`].
-#[derive(Default, Debug, Clone, Copy)]
+/// Configurable variant of [`AbiModPlugin`] created via [`AbiModPlugin::with_error_policy`]
+/// or `AbiModPlugin::with_trust_policy`.
+#[derive(Default, Debug, Clone)]
+#[cfg_attr(not(feature = "signature-verification"), derive(Copy))]
 pub struct ConfiguredAbiModPlugin {
     /// Default [`ModErrorPolicy`] inserted into [`ModErrorPolicyConfig`].
     pub error_policy: ModErrorPolicy,
+    /// Optional [`ModTrustPolicy`] inserted into `World` on plugin build.
+    #[cfg(feature = "signature-verification")]
+    pub trust_policy: Option<ModTrustPolicy>,
+}
+
+impl ConfiguredAbiModPlugin {
+    /// Overrides the [`ModErrorPolicy`] applied to guest systems.
+    #[must_use]
+    pub const fn with_error_policy(mut self, policy: ModErrorPolicy) -> Self {
+        self.error_policy = policy;
+        self
+    }
+
+    /// Overrides the [`ModTrustPolicy`] inserted into `World` when building the plugin.
+    #[cfg(feature = "signature-verification")]
+    #[must_use]
+    pub fn with_trust_policy(mut self, policy: ModTrustPolicy) -> Self {
+        self.trust_policy = Some(policy);
+        self
+    }
 }
 
 impl Plugin for ConfiguredAbiModPlugin {
@@ -70,6 +106,12 @@ impl Plugin for ConfiguredAbiModPlugin {
         }
         if !app.world().contains_resource::<ModVisibleSets>() {
             app.insert_resource(ModVisibleSets::new());
+        }
+        #[cfg(feature = "signature-verification")]
+        if let Some(policy) = &self.trust_policy {
+            app.insert_resource(policy.clone());
+        } else if !app.world().contains_resource::<ModTrustPolicy>() {
+            app.insert_resource(ModTrustPolicy::disabled());
         }
         app.insert_resource(ModErrorPolicyConfig(self.error_policy));
         app.init_schedule(Update);

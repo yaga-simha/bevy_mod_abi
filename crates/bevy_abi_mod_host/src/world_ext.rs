@@ -14,6 +14,8 @@ use bevy_abi_mod_host_sys::{
     excise_and_unload_mod_in_world, load_mod_in_world, restore_mod_state_in_world,
     rollback_unscheduled_mod_in_world, save_mod_state_in_world, unload_all_mods_in_world,
 };
+#[cfg(feature = "signature-verification")]
+use bevy_abi_mod_host_sys::{ModTrustPolicy, default_signature_path_for, preverify_mod_on_disk};
 use bevy_abi_mod_sys::{
     AbiPod, BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_SPARSE_SET, BamComponent, ModComponent,
     ScheduleId,
@@ -58,6 +60,10 @@ pub(crate) fn ensure_world_mod_resources(world: &mut World) {
     }
     if !world.contains_resource::<ModVisibleSets>() {
         world.insert_resource(ModVisibleSets::new());
+    }
+    #[cfg(feature = "signature-verification")]
+    if !world.contains_resource::<ModTrustPolicy>() {
+        world.insert_resource(ModTrustPolicy::disabled());
     }
     #[cfg(feature = "diagnostics")]
     ensure_diagnostics_resources(world);
@@ -141,6 +147,17 @@ fn finalize_mod_load_in_world(
             },
         ))
         .id();
+
+    #[cfg(feature = "signature-verification")]
+    if let Some(verified) = world
+        .get_resource::<ModHost>()
+        .and_then(|host| host.get_mod(mod_id))
+        .and_then(|loaded| loaded.verified_signature())
+        .cloned()
+        && let Ok(mut entity_mut) = world.get_entity_mut(entity)
+    {
+        entity_mut.insert(verified);
+    }
 
     if let Some(mut host) = world.get_resource_mut::<ModHost>() {
         host.set_mod_entity_and_system_count(mod_id, entity, system_count);
@@ -284,6 +301,17 @@ pub trait ModWorldExt {
     /// Sets the default [`ModErrorPolicy`] applied to newly initialized guest systems in this [`World`].
     fn set_mod_error_policy(&mut self, policy: ModErrorPolicy) -> &mut Self;
 
+    /// Configures the [`ModTrustPolicy`] enforced when loading or reloading native mods in this
+    /// [`World`].
+    #[cfg(feature = "signature-verification")]
+    fn set_mod_trust_policy(&mut self, policy: ModTrustPolicy) -> &mut Self;
+
+    /// Re-evaluates all currently loaded mods against the active [`ModTrustPolicy`] (after loading
+    /// a KRL, revoking keys/serials/`key_id`s, or rotating anchors/principals) and unloads any mod
+    /// whose verification receipt is no longer trusted, returning the evicted [`ModId`]s.
+    #[cfg(feature = "signature-verification")]
+    fn evict_revoked_mods(&mut self) -> Vec<ModId>;
+
     /// Loads a native shared-library mod using [`LoadOptions::default()`], returning its [`ModId`].
     fn load_mod<P: AsRef<Path>>(&mut self, path: P) -> Result<ModId, ModLoadError>;
 
@@ -420,6 +448,53 @@ impl ModWorldExt for World {
         self
     }
 
+    #[cfg(feature = "signature-verification")]
+    fn set_mod_trust_policy(&mut self, policy: ModTrustPolicy) -> &mut Self {
+        self.insert_resource(policy);
+        self
+    }
+
+    #[cfg(feature = "signature-verification")]
+    fn evict_revoked_mods(&mut self) -> Vec<ModId> {
+        ensure_world_mod_resources(self);
+        let Some(policy) = self
+            .get_resource::<ModTrustPolicy>()
+            .filter(|p| p.is_enforced())
+            .cloned()
+        else {
+            return Vec::new();
+        };
+
+        let to_evict: Vec<ModId> = self
+            .get_resource::<ModHost>()
+            .map(|host| {
+                host.loaded_mods()
+                    .iter()
+                    .filter_map(|loaded| {
+                        let still_valid = match loaded.verified_signature() {
+                            Some(receipt) => {
+                                policy.verify_receipt_still_trusted(receipt).is_ok()
+                                    && policy
+                                        .verify_manifest_principal(receipt, loaded.name())
+                                        .is_ok()
+                            }
+                            None => false,
+                        };
+                        (!still_valid).then_some(loaded.id())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut evicted = Vec::with_capacity(to_evict.len());
+        for id in to_evict {
+            if self.unload_mod(id).is_ok() {
+                evicted.push(id);
+            }
+        }
+        evicted
+    }
+
     fn load_mod<P: AsRef<Path>>(&mut self, path: P) -> Result<ModId, ModLoadError> {
         self.load_mod_with(path, LoadOptions::default())
     }
@@ -458,6 +533,8 @@ impl ModWorldExt for World {
 
     fn reload_mod_with(&mut self, id: ModId, options: LoadOptions) -> Result<ModId, ModLoadError> {
         ensure_world_mod_resources(self);
+        #[cfg(feature = "signature-verification")]
+        preverify_reload_target(self, id, None, &options)?;
         let (source_path, saved_blob) = save_mod_state_in_world(self, id)?;
         self.unload_mod(id)?;
         load_mod_with_optional_state(self, &source_path, options, saved_blob.as_deref())
@@ -470,8 +547,44 @@ impl ModWorldExt for World {
         options: LoadOptions,
     ) -> Result<ModId, ModLoadError> {
         ensure_world_mod_resources(self);
+        let replacement_path = path.as_ref();
+        #[cfg(feature = "signature-verification")]
+        preverify_reload_target(self, id, Some(replacement_path), &options)?;
         let (_old_path, saved_blob) = save_mod_state_in_world(self, id)?;
         self.unload_mod(id)?;
-        load_mod_with_optional_state(self, path.as_ref(), options, saved_blob.as_deref())
+        load_mod_with_optional_state(self, replacement_path, options, saved_blob.as_deref())
     }
+}
+
+#[cfg(feature = "signature-verification")]
+fn preverify_reload_target(
+    world: &World,
+    id: ModId,
+    override_path: Option<&Path>,
+    options: &LoadOptions,
+) -> Result<(), ModLoadError> {
+    let Some(policy) = world
+        .get_resource::<ModTrustPolicy>()
+        .filter(|p| p.is_enforced())
+    else {
+        return Ok(());
+    };
+    let loaded = world
+        .get_resource::<ModHost>()
+        .and_then(|h| h.get_mod(id))
+        .ok_or(ModLoadError::ModNotFound { id })?;
+    let target_path = override_path.unwrap_or_else(|| loaded.source_path());
+    let receipt = preverify_mod_on_disk(target_path, options, policy)?;
+    if let Err(source) = policy.verify_manifest_principal(&receipt, loaded.name()) {
+        let signature_path = options
+            .signature_path
+            .clone()
+            .unwrap_or_else(|| default_signature_path_for(target_path));
+        return Err(ModLoadError::SignatureVerification {
+            path: target_path.to_path_buf(),
+            signature_path,
+            source,
+        });
+    }
+    Ok(())
 }

@@ -27,6 +27,21 @@ pub enum ModLoadError {
         source: std::io::Error,
     },
 
+    /// Cryptographic signature or CA certificate verification failed prior to execution.
+    #[cfg(feature = "signature-verification")]
+    #[error(
+        "signature verification failed for mod '{path}' (signature '{signature_path}'): {source}"
+    )]
+    SignatureVerification {
+        /// Source mod shared library path.
+        path: PathBuf,
+        /// Detached `.sig` sidecar path evaluated for this mod.
+        signature_path: PathBuf,
+        /// Structured cryptographic or policy verification failure.
+        #[source]
+        source: crate::loader::signing::SignatureVerificationError,
+    },
+
     /// Failed to open the shared library via OS dynamic linker (`dlopen` / `LoadLibrary`).
     #[error("failed to load mod '{path}': {source}")]
     DlOpen {

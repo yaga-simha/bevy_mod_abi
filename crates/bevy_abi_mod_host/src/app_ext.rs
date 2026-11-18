@@ -2,6 +2,8 @@
 
 use crate::plugin::ensure_startup_tracker;
 use crate::world_ext::ModWorldExt;
+#[cfg(feature = "signature-verification")]
+use bevy_abi_mod_host_sys::ModTrustPolicy;
 use bevy_abi_mod_host_sys::{
     ComponentCollisionError, ComponentOptions, LoadOptions, ModErrorPolicy, ModId, ModLoadError,
 };
@@ -80,6 +82,16 @@ pub trait ModAppExt {
 
     /// Sets the default [`ModErrorPolicy`] for guest systems in this [`App`].
     fn set_mod_error_policy(&mut self, policy: ModErrorPolicy) -> &mut Self;
+
+    /// Configures the [`ModTrustPolicy`] enforced when loading or reloading native mods in this
+    /// [`App`].
+    #[cfg(feature = "signature-verification")]
+    fn set_mod_trust_policy(&mut self, policy: ModTrustPolicy) -> &mut Self;
+
+    /// Re-evaluates all currently loaded mods against the active [`ModTrustPolicy`] and unloads
+    /// any mod whose verification receipt is no longer trusted, returning the evicted [`ModId`]s.
+    #[cfg(feature = "signature-verification")]
+    fn evict_revoked_mods(&mut self) -> Vec<ModId>;
 
     /// Loads a native shared-library mod using [`LoadOptions::default()`], returning its [`ModId`].
     fn load_mod<P: AsRef<Path>>(&mut self, path: P) -> Result<ModId, ModLoadError>;
@@ -183,6 +195,19 @@ impl ModAppExt for App {
     fn set_mod_error_policy(&mut self, policy: ModErrorPolicy) -> &mut Self {
         self.world_mut().set_mod_error_policy(policy);
         self
+    }
+
+    #[cfg(feature = "signature-verification")]
+    #[inline]
+    fn set_mod_trust_policy(&mut self, policy: ModTrustPolicy) -> &mut Self {
+        self.world_mut().set_mod_trust_policy(policy);
+        self
+    }
+
+    #[cfg(feature = "signature-verification")]
+    #[inline]
+    fn evict_revoked_mods(&mut self) -> Vec<ModId> {
+        self.world_mut().evict_revoked_mods()
     }
 
     #[inline]

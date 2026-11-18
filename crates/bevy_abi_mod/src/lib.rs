@@ -171,6 +171,8 @@
 //! - `strict-ffi-checks`: Enables additional runtime FFI layout and pointer validation in
 //!   `bevy_abi_mod_host`.
 //! - `diagnostics`: Enables optional diagnostic instrumentation in `bevy_abi_mod_host`.
+//! - `signature-verification`: Enables optional pure-Rust OpenSSH `SSHSIG` and Ed25519 CA
+//!   certificate verification (`ModTrustPolicy`) prior to mapping native shared libraries.
 
 pub use bevy_abi_mod_host;
 pub use bevy_abi_mod_host::*;

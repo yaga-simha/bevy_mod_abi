@@ -10,6 +10,10 @@ publish = false
 [dependencies]
 bevy_abi_mod_macros = { workspace = true }
 bevy_abi_mod_sys = { workspace = true }
+ssh-key = { workspace = true, features = ["getrandom"] }
+ssh-encoding = { workspace = true }
+signature = { workspace = true }
+ed25519-dalek = { workspace = true }
 
 [lints]
 workspace = true

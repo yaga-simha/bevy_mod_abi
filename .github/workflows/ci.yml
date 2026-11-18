@@ -48,7 +48,9 @@ jobs:
       - name: Strict rustdoc warnings check
         env:
           RUSTDOCFLAGS: "-D warnings"
-        run: cargo doc --workspace --no-deps
+        run: |
+          cargo doc --workspace --no-deps
+          cargo doc --workspace --no-deps --all-features
 
       - name: 32-bit (`i686`) & `wasm32` ABI contract layout checks
         run: |

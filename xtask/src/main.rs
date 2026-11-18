@@ -4,6 +4,7 @@
 
 mod component_header_gen;
 mod header_gen;
+mod signing_cli;
 
 use std::env;
 use std::fs;
@@ -89,8 +90,9 @@ fn run(args: &[String]) -> Result<(), String> {
         "bench" => cmd_bench(rest),
         "miri" => cmd_miri(rest),
         "hook" => cmd_hook(rest),
+        "sign" => signing_cli::cmd_sign(rest),
         other => Err(format!(
-            "unknown subcommand `{other}` (expected `fixtures`, `lint`, `ci`, `header`, `gen-component-headers`, `bench`, `miri`, or `hook`)"
+            "unknown subcommand `{other}` (expected `fixtures`, `lint`, `ci`, `header`, `gen-component-headers`, `bench`, `miri`, `hook`, or `sign`)"
         )),
     }
 }
@@ -122,6 +124,9 @@ fn print_help() {
     );
     println!(
         "  hook <install|uninstall>                    Install or remove git pre-commit hook for automated lint checks"
+    );
+    println!(
+        "  sign <keygen|cert|file|krl|verify> [...]  Generate Ed25519 CA/signer keys, certs, KRLs, and sign & verify mods"
     );
 }
 
@@ -858,6 +863,29 @@ fn cmd_gen_component_headers(args: &[String]) -> Result<(), String> {
     )
 }
 
+fn run_sig_verification_clippy(root: &Path) -> Result<(), String> {
+    let mut sig_clippy_cmd = Command::new(cargo_bin());
+    sig_clippy_cmd.current_dir(root).args([
+        "clippy",
+        "-p",
+        "bevy_abi_mod_host_sys",
+        "-p",
+        "bevy_abi_mod_host",
+        "-p",
+        "bevy_abi_mod",
+        "--features",
+        "signature-verification",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings",
+    ]);
+    run_cmd(
+        &mut sig_clippy_cmd,
+        "cargo clippy --features signature-verification --all-targets -- -D warnings",
+    )
+}
+
 fn cmd_lint(args: &[String]) -> Result<(), String> {
     let mut quick = false;
     for arg in args {
@@ -892,6 +920,8 @@ fn cmd_lint(args: &[String]) -> Result<(), String> {
         &mut clippy_cmd,
         "cargo clippy --workspace --all-targets -- -D warnings",
     )?;
+
+    run_sig_verification_clippy(&root)?;
 
     verify_zero_bevy_deps(&root)?;
     verify_forbid_unsafe(&root)?;
@@ -933,6 +963,8 @@ fn cmd_ci(args: &[String]) -> Result<(), String> {
         "cargo clippy --workspace --all-targets -- -D warnings",
     )?;
 
+    run_sig_verification_clippy(&root)?;
+
     verify_zero_bevy_deps(&root)?;
 
     let fixtures_dir = build_fixtures_internal(&root, false, false)?;
@@ -946,6 +978,26 @@ fn cmd_ci(args: &[String]) -> Result<(), String> {
         .env("BAM_FIXTURE_DIR", &fixtures_dir)
         .args(["test"]);
     run_cmd(&mut test_cmd, "cargo test")?;
+
+    let mut sig_test_cmd = Command::new(cargo_bin());
+    sig_test_cmd
+        .current_dir(&root)
+        .env("BAM_FIXTURE_DIR", &fixtures_dir)
+        .args([
+            "test",
+            "-p",
+            "bevy_abi_mod_host_sys",
+            "-p",
+            "bevy_abi_mod_host",
+            "-p",
+            "bevy_abi_mod",
+            "--features",
+            "signature-verification",
+        ]);
+    run_cmd(
+        &mut sig_test_cmd,
+        "cargo test --features signature-verification",
+    )?;
 
     Ok(())
 }

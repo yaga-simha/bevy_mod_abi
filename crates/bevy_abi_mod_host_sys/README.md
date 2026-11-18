@@ -10,6 +10,6 @@ Isolates all host-side `unsafe` code behind audited safety invariants (`#![deny(
 - **`HostIter` & `host_par_for_each_chunk`**: Zero-copy `Table` column slices, batched `SparseSet` indirect row pointers, resource change-detection ticks (`BamChangeTicks`), and parallel chunk dispatch.
 - **`HostCommands` & `CommandArena`**: Per-system bump-allocated deferred command queue applying spawns, inserts, removes, despawns, and triggers via `EntityWorldMut` (`ComponentHooks`, `#[require(...)]`, `ChildOf` / `Children`).
 - **`DROP_SLOTS` & `WorldDropGuard`**: `ArcSwapOption` foreign component drop trampolines with two-condition reclamation preventing use-after-`dlclose`.
-- **`ModHost` & `LoadTransaction`**: Shadow-copy library loading (`LoadOptions`), transactional init rollback, deterministic 5-step unload, and state-preserving hot reload (`save_state` / `restore_state`).
+- **`ModHost` & `LoadTransaction`**: Shadow-copy library loading (`LoadOptions`), optional `signature-verification` (`ModTrustPolicy` strict Curve25519 `SSHSIG` + `SSHKRL` / signed KRL anti-rollback verification prior to staging into `0o700` non-symlink shadow directories), transactional init rollback, deterministic 5-step unload, and state-preserving hot reload (`save_state` / `restore_state`).
 
 Application authors should depend on `bevy_abi_mod` rather than using this `-sys` crate directly.
