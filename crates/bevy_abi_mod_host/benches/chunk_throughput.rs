@@ -14,30 +14,44 @@
 //!    `10k` entities.
 //! 5. **`spawn_with_4`** — Batched single-archetype `host_cmd_spawn` with 4 components vs.
 //!    sequential `host_cmd_spawn_empty` + 4x `host_cmd_insert`.
+//! 6. **`query_filters`** — Baseline vs `Allow<Disabled>` (`AccessMode::ALLOW`), `Has<T>`
+//!    (`AccessMode::HAS` `[FfiBool]` mask), and `Or<(...)>` (`or_group`) union filters at `10k`.
+//! 7. **`batch_commands`** — `host_cmd_spawn_batch` SoA bulk spawn vs per-entity `host_cmd_spawn`
+//!    loop (`1k` & `10k` entities) plus `host_cmd_despawn_all` vs per-entity `host_cmd_despawn`.
+//! 8. **`summary_tick`** — `BAM_COMPONENT_FLAG_SUMMARY_TICK` `Changed<T>` table-skip throughput at
+//!    `0%`, `1%`, and `100%` dirty ratios (`10k` entities across `100` tables).
+//! 9. **`entity_children`** — Zero-copy `host_sys_entity_children` (`&[FfiEntity]`) parent->child
+//!    fan-out traversal (`1k` parents × `10` = `10k` edges) vs Native Bevy `Query<&Children>`.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![allow(clippy::cast_ptr_alignment, unreachable_pub)]
 
 use bevy_abi_mod_host::{AbiModPlugin, ComponentOptions, ModAppExt, ModComponent, ModRegistry};
 use bevy_abi_mod_host_sys::{
-    BamQuerySpecOwned, GuestSystem, host_cmd_insert, host_cmd_spawn, host_cmd_spawn_empty,
-    host_iter_column_mutable, host_iter_column_readonly, host_iter_column_rows_mutable,
-    host_iter_entities, host_iter_next_chunk, host_sys_commands, host_sys_query,
+    BamQuerySpecOwned, GuestSystem, HostWireBridge, LoadContext, host_cmd_despawn,
+    host_cmd_despawn_all, host_cmd_insert, host_cmd_spawn, host_cmd_spawn_batch,
+    host_cmd_spawn_empty, host_iter_column_mutable, host_iter_column_readonly,
+    host_iter_column_rows_mutable, host_iter_entities, host_iter_next_chunk,
+    host_register_component, host_sys_commands, host_sys_entity_children, host_sys_query,
 };
 use bevy_abi_mod_sys::{
-    AccessMode, BamCommands, BamComponent, BamIter, BamSystemCtx, BamTermDesc, FfiBool, FfiEntity,
+    AccessMode, BAM_CHILDREN_NAME, BAM_COMPONENT_FLAG_SUMMARY_TICK, BamCommands, BamComponent,
+    BamIter, BamSystemCtx, BamTermDesc, ComponentDesc, ComponentUuid, FfiBool, FfiEntity,
     FfiResult,
 };
 use bevy_app::{App, Update};
 use bevy_ecs::component::{Component, ComponentId};
 use bevy_ecs::entity::Entity;
+use bevy_ecs::entity_disabling::Disabled;
+use bevy_ecs::hierarchy::{ChildOf, Children};
 use bevy_ecs::ptr::OwningPtr;
-use bevy_ecs::query::Changed;
+use bevy_ecs::query::{Allow, Changed, Has, Or, With};
 use bevy_ecs::system::{Commands, Query};
 use core::ffi::c_void;
 use std::env;
 use std::hint::black_box;
 use std::path::PathBuf;
+use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{Duration, Instant};
 
 // ============================================================================
@@ -110,6 +124,54 @@ pub struct SparseBuff {
 struct RawRuntimePayload {
     primary: f32,
     secondary: u32,
+}
+
+/// Zero-sized filter marker tag A (`StorageType::Table`).
+#[repr(C)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Default, ModComponent)]
+#[mod_component(name = "bench::FilterTagA")]
+pub struct FilterTagA;
+
+/// Zero-sized filter marker tag B (`StorageType::Table`).
+#[repr(C)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Default, ModComponent)]
+#[mod_component(name = "bench::FilterTagB")]
+pub struct FilterTagB;
+
+/// Archetype fan-out bit markers used to partition 10k entities across 100 distinct tables.
+#[derive(Component, Default, Clone, Copy)]
+struct TableBit0;
+#[derive(Component, Default, Clone, Copy)]
+struct TableBit1;
+#[derive(Component, Default, Clone, Copy)]
+struct TableBit2;
+#[derive(Component, Default, Clone, Copy)]
+struct TableBit3;
+#[derive(Component, Default, Clone, Copy)]
+struct TableBit4;
+#[derive(Component, Default, Clone, Copy)]
+struct TableBit5;
+#[derive(Component, Default, Clone, Copy)]
+struct TableBit6;
+
+struct DisabledBridge;
+
+impl HostWireBridge<Disabled> for DisabledBridge {
+    type Wire = FfiBool;
+    const CANONICAL_NAME: &'static str = "bevy_ecs::entity_disabling::Disabled";
+    const ALIAS: Option<&'static str> = Some("Disabled");
+    const SUPPORTS_SET: bool = false;
+
+    fn to_wire(_value: &Disabled) -> Self::Wire {
+        FfiBool::TRUE
+    }
+}
+
+fn register_disabled_bridge(app: &mut App) -> BamComponent {
+    let cid = app.world_mut().register_component::<Disabled>();
+    let mut reg = app.world_mut().resource_mut::<ModRegistry>();
+    reg.register_bridged_component::<Disabled, DisabledBridge>(cid, 0, None)
+        .expect("register Disabled bridge")
 }
 
 // ============================================================================
@@ -1171,6 +1233,1071 @@ fn bench_spawn_with_4(cfg: &BenchConfig) {
     println!("  -> Batched cmd_spawn speedup over sequential spawn+insert: {speedup:.2}x");
 }
 
+// ============================================================================
+// Scenario 6: Wave 1 Query Filter Throughput (`Allow`, `Has`, `Or` @ 10k)
+// ============================================================================
+
+unsafe extern "C" fn c_abi_query_allow_cb(
+    sys_ctx: *mut BamSystemCtx,
+    user_data: *mut c_void,
+) -> FfiResult {
+    let mut iter: *mut BamIter = core::ptr::null_mut();
+    // SAFETY: Query 0 (`&mut Position`, `&Velocity`, `Allow<Disabled>`) is registered on `sys_ctx`.
+    let rc = unsafe { host_sys_query(sys_ctx, 0, &mut iter) };
+    if rc.is_err() {
+        return rc;
+    }
+    let mut total = 0usize;
+    let mut len = 0usize;
+    // SAFETY: Iterates dense matched tables in `iter`.
+    while unsafe { host_iter_next_chunk(iter, &mut len) }.get() {
+        // SAFETY: Term 0 is writable dense `Position`.
+        let pos_ptr = unsafe { host_iter_column_mutable(iter, 0) }.cast::<Position>();
+        // SAFETY: Term 1 is readonly dense `Velocity`.
+        let vel_ptr = unsafe { host_iter_column_readonly(iter, 1) }.cast::<Velocity>();
+        if pos_ptr.is_null() || vel_ptr.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        // SAFETY: `pos_ptr` and `vel_ptr` are valid disjoint slices of length `len`.
+        let pos = unsafe { core::slice::from_raw_parts_mut(pos_ptr, len) };
+        // SAFETY: `vel_ptr` covers `len` elements.
+        let vel = unsafe { core::slice::from_raw_parts(vel_ptr, len) };
+        for i in 0..len {
+            pos[i].x += vel[i].x;
+        }
+        total += len;
+    }
+    if !user_data.is_null() {
+        // SAFETY: `user_data` points to `usize` counter in caller.
+        unsafe { *user_data.cast::<usize>() = total };
+    }
+    FfiResult::OK
+}
+
+unsafe extern "C" fn c_abi_query_has_cb(
+    sys_ctx: *mut BamSystemCtx,
+    user_data: *mut c_void,
+) -> FfiResult {
+    let mut iter: *mut BamIter = core::ptr::null_mut();
+    // SAFETY: Query 0 (`&mut Position`, `Has<FilterTagA>`) is registered on `sys_ctx`.
+    let rc = unsafe { host_sys_query(sys_ctx, 0, &mut iter) };
+    if rc.is_err() {
+        return rc;
+    }
+    let mut tagged = 0usize;
+    let mut len = 0usize;
+    // SAFETY: Iterates matched tables in `iter`.
+    while unsafe { host_iter_next_chunk(iter, &mut len) }.get() {
+        // SAFETY: Term 0 is writable dense `Position`.
+        let pos_ptr = unsafe { host_iter_column_mutable(iter, 0) }.cast::<Position>();
+        // SAFETY: Term 1 (`AccessMode::HAS`) yields synthesized `[FfiBool; len]`.
+        let has_ptr = unsafe { host_iter_column_readonly(iter, 1) }.cast::<FfiBool>();
+        if pos_ptr.is_null() || has_ptr.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        // SAFETY: `pos_ptr` covers `len` `Position` elements.
+        let pos = unsafe { core::slice::from_raw_parts_mut(pos_ptr, len) };
+        // SAFETY: `has_ptr` covers `len` `FfiBool` entries.
+        let has = unsafe { core::slice::from_raw_parts(has_ptr, len) };
+        for i in 0..len {
+            if has[i].get() {
+                pos[i].x += 1.0;
+                tagged += 1;
+            }
+        }
+    }
+    if !user_data.is_null() {
+        // SAFETY: `user_data` points to `usize` counter in caller.
+        unsafe { *user_data.cast::<usize>() = tagged };
+    }
+    FfiResult::OK
+}
+
+unsafe extern "C" fn c_abi_query_or_cb(
+    sys_ctx: *mut BamSystemCtx,
+    user_data: *mut c_void,
+) -> FfiResult {
+    let mut iter: *mut BamIter = core::ptr::null_mut();
+    // SAFETY: Query 0 (`&mut Position`, `Or<(With<FilterTagA>, With<FilterTagB>)>`) is registered.
+    let rc = unsafe { host_sys_query(sys_ctx, 0, &mut iter) };
+    if rc.is_err() {
+        return rc;
+    }
+    let mut total = 0usize;
+    let mut len = 0usize;
+    // SAFETY: Iterates matched tables in `iter`.
+    while unsafe { host_iter_next_chunk(iter, &mut len) }.get() {
+        // SAFETY: Term 0 is writable dense `Position`.
+        let pos_ptr = unsafe { host_iter_column_mutable(iter, 0) }.cast::<Position>();
+        if pos_ptr.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        // SAFETY: `pos_ptr` covers `len` `Position` elements.
+        let pos = unsafe { core::slice::from_raw_parts_mut(pos_ptr, len) };
+        for p in pos.iter_mut() {
+            p.x += 1.0;
+        }
+        total += len;
+    }
+    if !user_data.is_null() {
+        // SAFETY: `user_data` points to `usize` counter in caller.
+        unsafe { *user_data.cast::<usize>() = total };
+    }
+    FfiResult::OK
+}
+
+fn spawn_filter_bench_world(world: &mut bevy_ecs::world::World, count: usize) {
+    // 50% `(Pos, Vel, FilterTagA)`, 25% `(Pos, Vel, FilterTagB)`, 25% `(Pos, Vel, FilterTagA, Disabled)`.
+    for i in 0..count {
+        let pos = Position {
+            x: i as f32,
+            y: 1.0,
+            z: 2.0,
+        };
+        let vel = Velocity {
+            x: 0.5,
+            y: 0.0,
+            z: 0.0,
+        };
+        match i % 4 {
+            0 | 1 => {
+                world.spawn((pos, vel, FilterTagA));
+            }
+            2 => {
+                world.spawn((pos, vel, FilterTagB));
+            }
+            _ => {
+                world.spawn((pos, vel, FilterTagA, Disabled));
+            }
+        }
+    }
+}
+
+fn bench_query_filters(cfg: &BenchConfig) {
+    let count = cfg.scale_count(10_000);
+    println!("\n================================================================================");
+    println!(
+        " SCENARIO 6: Wave 1 Query Filters (Baseline vs Allow<Disabled>, Has<T>, Or<...>, {count} ents)"
+    );
+    println!("================================================================================");
+
+    // 6a. Baseline C-ABI (&mut Position, &Velocity) — excludes Disabled (75% visible)
+    let expected_enabled = (count * 3) / 4;
+    let mut base_visited = Box::new(0usize);
+    let base_stats = {
+        let mut app = App::new();
+        app.add_plugins(AbiModPlugin);
+        let pos_h = app
+            .register_mod_component::<Position>(ComponentOptions::new().with_raw_insert())
+            .unwrap();
+        let vel_h = app
+            .register_mod_component::<Velocity>(ComponentOptions::new().with_raw_insert())
+            .unwrap();
+        spawn_filter_bench_world(app.world_mut(), count);
+        let reg = app.world().resource::<ModRegistry>().clone();
+        let spec = BamQuerySpecOwned::new(vec![
+            BamTermDesc::new(pos_h, AccessMode::WRITE),
+            BamTermDesc::new(vel_h, AccessMode::READ),
+        ]);
+        let ptr = (&mut *base_visited as *mut usize).cast::<c_void>();
+        app.add_systems(
+            Update,
+            GuestSystem::new(
+                "bench_filter_base",
+                vec![spec],
+                c_abi_query_allow_cb,
+                ptr,
+                reg,
+            ),
+        );
+        measure_fn(
+            || timed_update(&mut app),
+            cfg.warmup,
+            cfg.rounds,
+            expected_enabled,
+        )
+    };
+    assert_eq!(*base_visited, expected_enabled);
+    print_row("C-ABI Baseline (Pos, Vel) [enabled]", base_stats, "ent");
+
+    // 6b. Native Allow<Disabled> vs C-ABI Allow<Disabled> (yields 100% = `count`)
+    let native_allow_stats = {
+        let mut app = App::new();
+        spawn_filter_bench_world(app.world_mut(), count);
+        app.add_systems(
+            Update,
+            |mut q: Query<(&mut Position, &Velocity), Allow<Disabled>>| {
+                for (mut p, v) in &mut q {
+                    p.x += v.x;
+                }
+            },
+        );
+        measure_fn(|| timed_update(&mut app), cfg.warmup, cfg.rounds, count)
+    };
+    print_row("Native Bevy Allow<Disabled>", native_allow_stats, "ent");
+
+    let mut allow_visited = Box::new(0usize);
+    let cabi_allow_stats = {
+        let mut app = App::new();
+        app.add_plugins(AbiModPlugin);
+        let pos_h = app
+            .register_mod_component::<Position>(ComponentOptions::new().with_raw_insert())
+            .unwrap();
+        let vel_h = app
+            .register_mod_component::<Velocity>(ComponentOptions::new().with_raw_insert())
+            .unwrap();
+        let disabled_h = register_disabled_bridge(&mut app);
+        spawn_filter_bench_world(app.world_mut(), count);
+        let reg = app.world().resource::<ModRegistry>().clone();
+        let spec = BamQuerySpecOwned::new(vec![
+            BamTermDesc::new(pos_h, AccessMode::WRITE),
+            BamTermDesc::new(vel_h, AccessMode::READ),
+            BamTermDesc::new(disabled_h, AccessMode::ALLOW),
+        ]);
+        let ptr = (&mut *allow_visited as *mut usize).cast::<c_void>();
+        app.add_systems(
+            Update,
+            GuestSystem::new(
+                "bench_filter_allow",
+                vec![spec],
+                c_abi_query_allow_cb,
+                ptr,
+                reg,
+            ),
+        );
+        measure_fn(|| timed_update(&mut app), cfg.warmup, cfg.rounds, count)
+    };
+    assert_eq!(*allow_visited, count);
+    print_row(
+        "C-ABI AccessMode::ALLOW (Disabled)",
+        cabi_allow_stats,
+        "ent",
+    );
+
+    // 6c. Native Has<FilterTagA> vs C-ABI AccessMode::HAS
+    let native_has_stats = {
+        let mut app = App::new();
+        spawn_filter_bench_world(app.world_mut(), count);
+        app.add_systems(Update, |mut q: Query<(&mut Position, Has<FilterTagA>)>| {
+            for (mut p, has_a) in &mut q {
+                if has_a {
+                    p.x += 1.0;
+                }
+            }
+        });
+        measure_fn(
+            || timed_update(&mut app),
+            cfg.warmup,
+            cfg.rounds,
+            expected_enabled,
+        )
+    };
+    print_row("Native Bevy Has<FilterTagA>", native_has_stats, "ent");
+
+    let mut has_tagged = Box::new(0usize);
+    let cabi_has_stats = {
+        let mut app = App::new();
+        app.add_plugins(AbiModPlugin);
+        let pos_h = app
+            .register_mod_component::<Position>(ComponentOptions::new().with_raw_insert())
+            .unwrap();
+        let tag_a_h = app
+            .register_mod_component::<FilterTagA>(ComponentOptions::new())
+            .unwrap();
+        spawn_filter_bench_world(app.world_mut(), count);
+        let reg = app.world().resource::<ModRegistry>().clone();
+        let spec = BamQuerySpecOwned::new(vec![
+            BamTermDesc::new(pos_h, AccessMode::WRITE),
+            BamTermDesc::new(tag_a_h, AccessMode::HAS),
+        ]);
+        let ptr = (&mut *has_tagged as *mut usize).cast::<c_void>();
+        app.add_systems(
+            Update,
+            GuestSystem::new("bench_filter_has", vec![spec], c_abi_query_has_cb, ptr, reg),
+        );
+        measure_fn(
+            || timed_update(&mut app),
+            cfg.warmup,
+            cfg.rounds,
+            expected_enabled,
+        )
+    };
+    assert_eq!(*has_tagged, count / 2);
+    print_row(
+        "C-ABI AccessMode::HAS ([FfiBool] mask)",
+        cabi_has_stats,
+        "ent",
+    );
+
+    // 6d. Native Or<(With<FilterTagA>, With<FilterTagB>)> vs C-ABI or_group
+    let native_or_stats = {
+        let mut app = App::new();
+        spawn_filter_bench_world(app.world_mut(), count);
+        app.add_systems(
+            Update,
+            |mut q: Query<&mut Position, Or<(With<FilterTagA>, With<FilterTagB>)>>| {
+                for mut p in &mut q {
+                    p.x += 1.0;
+                }
+            },
+        );
+        measure_fn(
+            || timed_update(&mut app),
+            cfg.warmup,
+            cfg.rounds,
+            expected_enabled,
+        )
+    };
+    print_row("Native Bevy Or<(With<A>, With<B>)>", native_or_stats, "ent");
+
+    let mut or_visited = Box::new(0usize);
+    let cabi_or_stats = {
+        let mut app = App::new();
+        app.add_plugins(AbiModPlugin);
+        let pos_h = app
+            .register_mod_component::<Position>(ComponentOptions::new().with_raw_insert())
+            .unwrap();
+        let tag_a_h = app
+            .register_mod_component::<FilterTagA>(ComponentOptions::new())
+            .unwrap();
+        let tag_b_h = app
+            .register_mod_component::<FilterTagB>(ComponentOptions::new())
+            .unwrap();
+        spawn_filter_bench_world(app.world_mut(), count);
+        let reg = app.world().resource::<ModRegistry>().clone();
+        let spec = BamQuerySpecOwned::new(vec![
+            BamTermDesc::new(pos_h, AccessMode::WRITE),
+            BamTermDesc::new(tag_a_h, AccessMode::FILTER_ONLY).with_or_group(1),
+            BamTermDesc::new(tag_b_h, AccessMode::FILTER_ONLY).with_or_group(1),
+        ]);
+        let ptr = (&mut *or_visited as *mut usize).cast::<c_void>();
+        app.add_systems(
+            Update,
+            GuestSystem::new("bench_filter_or", vec![spec], c_abi_query_or_cb, ptr, reg),
+        );
+        measure_fn(
+            || timed_update(&mut app),
+            cfg.warmup,
+            cfg.rounds,
+            expected_enabled,
+        )
+    };
+    assert_eq!(*or_visited, expected_enabled);
+    print_row("C-ABI or_group (With<A> || With<B>)", cabi_or_stats, "ent");
+}
+
+// ============================================================================
+// Scenario 7: Wave 2 Batch Commands (`cmd_spawn_batch` & `cmd_despawn_all`)
+// ============================================================================
+
+struct SoaSpawnBenchCtx {
+    comps: [BamComponent; 4],
+    pos_col: Vec<Position>,
+    vel_col: Vec<Velocity>,
+    vit_col: Vec<Vitality>,
+    arm_col: Vec<Armor>,
+    out_entities: Vec<FfiEntity>,
+    count: usize,
+}
+
+unsafe extern "C" fn c_abi_soa_spawn_batch_cb(
+    sys_ctx: *mut BamSystemCtx,
+    user_data: *mut c_void,
+) -> FfiResult {
+    // SAFETY: `user_data` points to `SoaSpawnBenchCtx` owned by the benchmark loop.
+    let cfg = unsafe { &mut *user_data.cast::<SoaSpawnBenchCtx>() };
+    let mut cmds: *mut BamCommands = core::ptr::null_mut();
+    // SAFETY: `sys_ctx` is active.
+    let rc = unsafe { host_sys_commands(sys_ctx, &mut cmds) };
+    if rc.is_err() {
+        return rc;
+    }
+    let ptrs = [
+        cfg.pos_col.as_ptr().cast::<u8>(),
+        cfg.vel_col.as_ptr().cast::<u8>(),
+        cfg.vit_col.as_ptr().cast::<u8>(),
+        cfg.arm_col.as_ptr().cast::<u8>(),
+    ];
+    // SAFETY: `cmds` is active and all 4 SoA columns have length `cfg.count`.
+    unsafe {
+        host_cmd_spawn_batch(
+            cmds,
+            cfg.comps.as_ptr(),
+            ptrs.as_ptr(),
+            4,
+            cfg.count,
+            cfg.out_entities.as_mut_ptr(),
+        )
+    }
+}
+
+struct DespawnBenchCtx {
+    tag_h: BamComponent,
+}
+
+unsafe extern "C" fn c_abi_despawn_all_cb(
+    sys_ctx: *mut BamSystemCtx,
+    user_data: *mut c_void,
+) -> FfiResult {
+    // SAFETY: `user_data` points to `DespawnBenchCtx`.
+    let cfg = unsafe { &*user_data.cast::<DespawnBenchCtx>() };
+    let mut cmds: *mut BamCommands = core::ptr::null_mut();
+    // SAFETY: `sys_ctx` is active.
+    let rc = unsafe { host_sys_commands(sys_ctx, &mut cmds) };
+    if rc.is_err() {
+        return rc;
+    }
+    let terms = [BamTermDesc::new(cfg.tag_h, AccessMode::FILTER_ONLY)];
+    // SAFETY: `cmds` is active and `terms` is a valid 1-element filter slice.
+    unsafe { host_cmd_despawn_all(cmds, terms.as_ptr(), 1) }
+}
+
+unsafe extern "C" fn c_abi_despawn_loop_cb(
+    sys_ctx: *mut BamSystemCtx,
+    _user_data: *mut c_void,
+) -> FfiResult {
+    let mut cmds: *mut BamCommands = core::ptr::null_mut();
+    // SAFETY: `sys_ctx` is active.
+    let rc = unsafe { host_sys_commands(sys_ctx, &mut cmds) };
+    if rc.is_err() {
+        return rc;
+    }
+    let mut iter: *mut BamIter = core::ptr::null_mut();
+    // SAFETY: Query 0 (`With<FilterTagA>`) is registered on `sys_ctx`.
+    let rc = unsafe { host_sys_query(sys_ctx, 0, &mut iter) };
+    if rc.is_err() {
+        return rc;
+    }
+    let mut len = 0usize;
+    // SAFETY: Iterates matched chunks.
+    while unsafe { host_iter_next_chunk(iter, &mut len) }.get() {
+        // SAFETY: `entities` covers `len` `FfiEntity` values.
+        let ents = unsafe { host_iter_entities(iter) };
+        if ents.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        // SAFETY: `ents` slice covers `len` elements.
+        let slice = unsafe { core::slice::from_raw_parts(ents, len) };
+        for &e in slice {
+            // SAFETY: Queues individual `host_cmd_despawn`.
+            let r = unsafe { host_cmd_despawn(cmds, e) };
+            if r.is_err() {
+                return r;
+            }
+        }
+    }
+    FfiResult::OK
+}
+
+fn bench_batch_commands(cfg: &BenchConfig) {
+    let scales: &[usize] = if cfg.test_mode {
+        &[64]
+    } else {
+        &[1_000, 10_000]
+    };
+    println!("\n================================================================================");
+    println!(
+        " SCENARIO 7: Batch Commands (`cmd_spawn_batch` SoA vs `cmd_spawn` loop & `cmd_despawn_all`)"
+    );
+    println!("================================================================================");
+
+    for &count in scales {
+        println!(
+            "\n--- batch_commands/{count} ({} measured frames) ---",
+            cfg.rounds
+        );
+
+        // 7a. Native Bevy `Commands::spawn_batch`
+        let native_spawn_stats = {
+            let mut app = App::new();
+            app.add_systems(Update, move |mut cmds: Commands| {
+                cmds.spawn_batch((0..count).map(|i| {
+                    (
+                        Position {
+                            x: i as f32,
+                            y: 0.0,
+                            z: 0.0,
+                        },
+                        Velocity {
+                            x: 1.0,
+                            y: 0.5,
+                            z: 0.0,
+                        },
+                        Vitality {
+                            hp: 100.0,
+                            shield: 50,
+                        },
+                        Armor {
+                            plating: 12.0,
+                            faction: 1,
+                        },
+                    )
+                }));
+            });
+            measure_fn(
+                || {
+                    let elapsed = timed_update(&mut app);
+                    despawn_all_with_position(app.world_mut());
+                    elapsed
+                },
+                cfg.warmup,
+                cfg.rounds,
+                count,
+            )
+        };
+        print_row(
+            &format!("Native Bevy Commands::spawn_batch ({count})"),
+            native_spawn_stats,
+            "ent",
+        );
+
+        // 7b. C-ABI `host_cmd_spawn_batch` (SoA 4-column bulk spawn in 1 FFI call)
+        let mut soa_ctx = Box::new(SoaSpawnBenchCtx {
+            comps: [BamComponent::INVALID; 4],
+            pos_col: (0..count)
+                .map(|i| Position {
+                    x: i as f32,
+                    y: 0.0,
+                    z: 0.0,
+                })
+                .collect(),
+            vel_col: vec![
+                Velocity {
+                    x: 1.0,
+                    y: 0.5,
+                    z: 0.0,
+                };
+                count
+            ],
+            vit_col: vec![
+                Vitality {
+                    hp: 100.0,
+                    shield: 50,
+                };
+                count
+            ],
+            arm_col: vec![
+                Armor {
+                    plating: 12.0,
+                    faction: 1,
+                };
+                count
+            ],
+            out_entities: vec![FfiEntity::NULL; count],
+            count,
+        });
+        let soa_stats = {
+            let mut app = App::new();
+            app.add_plugins(AbiModPlugin);
+            soa_ctx.comps = [
+                app.register_mod_component::<Position>(ComponentOptions::new().with_raw_insert())
+                    .unwrap(),
+                app.register_mod_component::<Velocity>(ComponentOptions::new().with_raw_insert())
+                    .unwrap(),
+                app.register_mod_component::<Vitality>(ComponentOptions::new().with_raw_insert())
+                    .unwrap(),
+                app.register_mod_component::<Armor>(ComponentOptions::new().with_raw_insert())
+                    .unwrap(),
+            ];
+            let reg = app.world().resource::<ModRegistry>().clone();
+            let ptr = (&mut *soa_ctx as *mut SoaSpawnBenchCtx).cast::<c_void>();
+            app.add_systems(
+                Update,
+                GuestSystem::new(
+                    "bench_soa_spawn",
+                    Vec::new(),
+                    c_abi_soa_spawn_batch_cb,
+                    ptr,
+                    reg,
+                ),
+            );
+            measure_fn(
+                || {
+                    let elapsed = timed_update(&mut app);
+                    despawn_all_with_position(app.world_mut());
+                    elapsed
+                },
+                cfg.warmup,
+                cfg.rounds,
+                count,
+            )
+        };
+        print_row(
+            &format!("C-ABI host_cmd_spawn_batch SoA ({count})"),
+            soa_stats,
+            "ent",
+        );
+
+        // 7c. C-ABI per-entity `host_cmd_spawn` loop (4 components each)
+        let mut loop_ctx = Box::new(SpawnBenchCtx {
+            pos: BamComponent::INVALID,
+            vel: BamComponent::INVALID,
+            vit: BamComponent::INVALID,
+            arm: BamComponent::INVALID,
+            spawn_count: count,
+        });
+        let loop_stats = {
+            let mut app = App::new();
+            app.add_plugins(AbiModPlugin);
+            loop_ctx.pos = app
+                .register_mod_component::<Position>(ComponentOptions::new().with_raw_insert())
+                .unwrap();
+            loop_ctx.vel = app
+                .register_mod_component::<Velocity>(ComponentOptions::new().with_raw_insert())
+                .unwrap();
+            loop_ctx.vit = app
+                .register_mod_component::<Vitality>(ComponentOptions::new().with_raw_insert())
+                .unwrap();
+            loop_ctx.arm = app
+                .register_mod_component::<Armor>(ComponentOptions::new().with_raw_insert())
+                .unwrap();
+            let reg = app.world().resource::<ModRegistry>().clone();
+            let ptr = (&mut *loop_ctx as *mut SpawnBenchCtx).cast::<c_void>();
+            app.add_systems(
+                Update,
+                GuestSystem::new(
+                    "bench_loop_spawn",
+                    Vec::new(),
+                    c_abi_batched_spawn4_cb,
+                    ptr,
+                    reg,
+                ),
+            );
+            measure_fn(
+                || {
+                    let elapsed = timed_update(&mut app);
+                    despawn_all_with_position(app.world_mut());
+                    elapsed
+                },
+                cfg.warmup,
+                cfg.rounds,
+                count,
+            )
+        };
+        print_row(
+            &format!("C-ABI host_cmd_spawn loop ({count})"),
+            loop_stats,
+            "ent",
+        );
+
+        let spawn_speedup = loop_stats.median_ms / soa_stats.median_ms.max(1e-9);
+        println!("  -> cmd_spawn_batch SoA speedup over cmd_spawn loop: {spawn_speedup:.2}x");
+
+        // 7d. `cmd_despawn_all` vs per-entity `cmd_despawn` loop
+        let despawn_all_stats = {
+            let mut app = App::new();
+            app.add_plugins(AbiModPlugin);
+            let tag_h = app
+                .register_mod_component::<FilterTagA>(ComponentOptions::new())
+                .unwrap();
+            let ctx = Box::new(DespawnBenchCtx { tag_h });
+            let ptr = Box::into_raw(ctx).cast::<c_void>();
+            let reg = app.world().resource::<ModRegistry>().clone();
+            app.add_systems(
+                Update,
+                GuestSystem::new(
+                    "bench_despawn_all",
+                    Vec::new(),
+                    c_abi_despawn_all_cb,
+                    ptr,
+                    reg,
+                ),
+            );
+            let res = measure_fn(
+                || {
+                    app.world_mut().spawn_batch(vec![FilterTagA; count]);
+                    timed_update(&mut app)
+                },
+                cfg.warmup,
+                cfg.rounds,
+                count,
+            );
+            // SAFETY: `ptr` came from `Box::into_raw(ctx)` above and system is no longer running.
+            let _ = unsafe { Box::from_raw(ptr.cast::<DespawnBenchCtx>()) };
+            res
+        };
+        print_row(
+            &format!("C-ABI host_cmd_despawn_all ({count})"),
+            despawn_all_stats,
+            "ent",
+        );
+
+        let despawn_loop_stats = {
+            let mut app = App::new();
+            app.add_plugins(AbiModPlugin);
+            let tag_h = app
+                .register_mod_component::<FilterTagA>(ComponentOptions::new())
+                .unwrap();
+            let reg = app.world().resource::<ModRegistry>().clone();
+            let spec =
+                BamQuerySpecOwned::new(vec![BamTermDesc::new(tag_h, AccessMode::FILTER_ONLY)]);
+            app.add_systems(
+                Update,
+                GuestSystem::new(
+                    "bench_despawn_loop",
+                    vec![spec],
+                    c_abi_despawn_loop_cb,
+                    core::ptr::null_mut(),
+                    reg,
+                ),
+            );
+            measure_fn(
+                || {
+                    app.world_mut().spawn_batch(vec![FilterTagA; count]);
+                    timed_update(&mut app)
+                },
+                cfg.warmup,
+                cfg.rounds,
+                count,
+            )
+        };
+        print_row(
+            &format!("C-ABI host_cmd_despawn loop ({count})"),
+            despawn_loop_stats,
+            "ent",
+        );
+    }
+}
+
+// ============================================================================
+// Scenario 8: `BAM_COMPONENT_FLAG_SUMMARY_TICK` Multi-Table Skip (10k / 100 tables)
+// ============================================================================
+
+fn spawn_100_table_entities(
+    world: &mut bevy_ecs::world::World,
+    comp_id: ComponentId,
+    count: usize,
+) -> Vec<Entity> {
+    let mut entities = Vec::with_capacity(count);
+    let tables = 100usize;
+    for i in 0..count {
+        let tid = i % tables;
+        let mut e = world.spawn_empty();
+        // SAFETY: `comp_id` is a 12-byte `(f32, f32, f32)` dynamic component registered in `world`.
+        unsafe {
+            OwningPtr::make([i as f32, 1.0f32, 2.0f32], |ptr| {
+                e.insert_by_id(comp_id, ptr);
+            });
+        }
+        if (tid & 1) != 0 {
+            e.insert(TableBit0);
+        }
+        if (tid & 2) != 0 {
+            e.insert(TableBit1);
+        }
+        if (tid & 4) != 0 {
+            e.insert(TableBit2);
+        }
+        if (tid & 8) != 0 {
+            e.insert(TableBit3);
+        }
+        if (tid & 16) != 0 {
+            e.insert(TableBit4);
+        }
+        if (tid & 32) != 0 {
+            e.insert(TableBit5);
+        }
+        if (tid & 64) != 0 {
+            e.insert(TableBit6);
+        }
+        entities.push(e.id());
+    }
+    entities
+}
+
+fn mark_dynamic_rows_dirty(
+    world: &mut bevy_ecs::world::World,
+    comp_id: ComponentId,
+    entities: &[Entity],
+    pct: usize,
+) {
+    if pct == 0 {
+        return;
+    }
+    if pct == 1 {
+        // Dirty table 0 (`entities` at indices `0, 100, 200, ...`, i.e., 1% of tables & 1% of rows).
+        for &e in entities.iter().step_by(100) {
+            if let Ok(mut em) = world.get_entity_mut(e)
+                && let Ok(untyped) = em.get_mut_by_id(comp_id)
+            {
+                // SAFETY: `comp_id` holds `[f32; 3]`; `Mut<[f32; 3]>` also updates `summary_tick`
+                // (unlike `MutUntyped::set_changed` in Bevy 0.20.1).
+                let mut arr = unsafe { untyped.with_type::<[f32; 3]>() };
+                arr[0] += 1.0;
+            }
+        }
+        return;
+    }
+    for &e in entities {
+        if let Ok(mut em) = world.get_entity_mut(e)
+            && let Ok(untyped) = em.get_mut_by_id(comp_id)
+        {
+            // SAFETY: `comp_id` holds `[f32; 3]`.
+            let mut arr = unsafe { untyped.with_type::<[f32; 3]>() };
+            arr[0] += 1.0;
+        }
+    }
+}
+
+fn bench_summary_tick(cfg: &BenchConfig) {
+    let total_entities = cfg.scale_count(10_000);
+    println!("\n================================================================================");
+    println!(
+        " SCENARIO 8: `BAM_COMPONENT_FLAG_SUMMARY_TICK` Table-Skip ({total_entities} ents, 100 tables)"
+    );
+    println!("================================================================================");
+
+    let cases: [(&str, usize); 3] = [("0%", 0), ("1%", 1), ("100%", 100)];
+
+    for (label, pct) in cases {
+        println!(
+            "\n--- summary_tick/{label} ({} measured frames) ---",
+            cfg.rounds
+        );
+
+        for (variant_label, use_summary) in [
+            ("Non-SummaryTick Changed<T>", false),
+            ("SummaryTick (FLAG_SUMMARY_TICK) Changed<T>", true),
+        ] {
+            let mut last_visited = Box::new(0usize);
+            let stats = {
+                let mut app = App::new();
+                app.add_plugins(AbiModPlugin);
+                let mut h = BamComponent::INVALID;
+                let cname = if use_summary {
+                    c"bench::DynSummaryPos"
+                } else {
+                    c"bench::DynPlainPos"
+                };
+                let uuid = ComponentUuid::from_parts(
+                    if use_summary {
+                        "bench::DynSummaryPos"
+                    } else {
+                        "bench::DynPlainPos"
+                    },
+                    12,
+                    4,
+                    if use_summary { 1 } else { 2 },
+                );
+                let mut desc = ComponentDesc::new(cname.as_ptr(), uuid, 12, 4);
+                if use_summary {
+                    desc = desc.with_flags(BAM_COMPONENT_FLAG_SUMMARY_TICK);
+                }
+                {
+                    let reg = app.world().resource::<ModRegistry>().clone();
+                    let active = Arc::new(AtomicBool::new(true));
+                    let mut lctx = LoadContext::with_world_and_mod_id(
+                        reg,
+                        active,
+                        app.world_mut() as *mut bevy_ecs::world::World,
+                        None,
+                    );
+                    // SAFETY: Valid `LoadContext` and `ComponentDesc`.
+                    let rc = unsafe { host_register_component(lctx.as_ffi_ptr(), &desc, &mut h) };
+                    assert_eq!(rc, FfiResult::OK);
+                    let updated = lctx.registry.clone();
+                    lctx.finish_init();
+                    *app.world_mut().resource_mut::<ModRegistry>() = updated;
+                }
+                let comp_id = app
+                    .world()
+                    .resource::<ModRegistry>()
+                    .get_by_handle(h)
+                    .unwrap()
+                    .component_id;
+                let entities = spawn_100_table_entities(app.world_mut(), comp_id, total_entities);
+                let reg = app.world().resource::<ModRegistry>().clone();
+                let spec = BamQuerySpecOwned::new(vec![BamTermDesc::new(h, AccessMode::CHANGED)]);
+                let visited_ptr = (&mut *last_visited as *mut usize).cast::<c_void>();
+                app.add_systems(
+                    Update,
+                    GuestSystem::new(
+                        "bench_summary_tick",
+                        vec![spec],
+                        c_abi_changed_filter_cb,
+                        visited_ptr,
+                        reg,
+                    ),
+                );
+                let _ = timed_update(&mut app);
+
+                measure_fn(
+                    || {
+                        mark_dynamic_rows_dirty(app.world_mut(), comp_id, &entities, pct);
+                        timed_update(&mut app)
+                    },
+                    cfg.warmup,
+                    cfg.rounds,
+                    total_entities,
+                )
+            };
+            let expected = match pct {
+                0 => 0,
+                1 => total_entities.div_ceil(100),
+                _ => total_entities,
+            };
+            assert_eq!(*last_visited, expected);
+            print_row(&format!("{variant_label} ({label})"), stats, "ent");
+        }
+    }
+}
+
+// ============================================================================
+// Scenario 9: Zero-Copy `sys_entity_children` Fan-Out Traversal
+// ============================================================================
+
+struct ChildrenBenchCtx {
+    children_h: BamComponent,
+    edges_visited: usize,
+    checksum: u64,
+}
+
+unsafe extern "C" fn c_abi_entity_children_cb(
+    sys_ctx: *mut BamSystemCtx,
+    user_data: *mut c_void,
+) -> FfiResult {
+    // SAFETY: `user_data` points to `ChildrenBenchCtx`.
+    let state = unsafe { &mut *user_data.cast::<ChildrenBenchCtx>() };
+    let mut iter: *mut BamIter = core::ptr::null_mut();
+    // SAFETY: Query 0 (`&Children`) is registered on `sys_ctx`.
+    let rc = unsafe { host_sys_query(sys_ctx, 0, &mut iter) };
+    if rc.is_err() {
+        return rc;
+    }
+    let mut edges = 0usize;
+    let mut sum = 0u64;
+    let mut len = 0usize;
+    // SAFETY: Iterates matched parent chunks.
+    while unsafe { host_iter_next_chunk(iter, &mut len) }.get() {
+        // SAFETY: `entities` covers `len` parent handles.
+        let ents = unsafe { host_iter_entities(iter) };
+        if ents.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        // SAFETY: `ents` covers `len` elements.
+        let parents = unsafe { core::slice::from_raw_parts(ents, len) };
+        for &parent in parents {
+            let mut children_ptr: *const FfiEntity = core::ptr::null();
+            let mut children_len = 0usize;
+            // SAFETY: Query 0 declared read access on `Children` (`state.children_h`).
+            let r = unsafe {
+                host_sys_entity_children(
+                    sys_ctx,
+                    parent,
+                    state.children_h,
+                    &mut children_ptr,
+                    &mut children_len,
+                )
+            };
+            if r.is_err() {
+                return r;
+            }
+            if children_len > 0 && !children_ptr.is_null() {
+                // SAFETY: `children_ptr` is a zero-copy `&[FfiEntity]` slice of `Children` storage.
+                let children = unsafe { core::slice::from_raw_parts(children_ptr, children_len) };
+                for &c in children {
+                    sum = sum.wrapping_add(c.to_bits());
+                }
+                edges += children_len;
+            }
+        }
+    }
+    state.edges_visited = edges;
+    state.checksum = sum;
+    FfiResult::OK
+}
+
+fn spawn_hierarchy_fanout(
+    world: &mut bevy_ecs::world::World,
+    parents: usize,
+    children_per_parent: usize,
+) {
+    for _ in 0..parents {
+        let p = world.spawn(FilterTagA).id();
+        for _ in 0..children_per_parent {
+            world.spawn(ChildOf(p));
+        }
+    }
+}
+
+fn bench_entity_children(cfg: &BenchConfig) {
+    let parents = if cfg.test_mode { 20 } else { 1_000 };
+    let children_per_parent = 10usize;
+    let total_edges = parents * children_per_parent;
+    println!("\n================================================================================");
+    println!(
+        " SCENARIO 9: Zero-Copy `sys_entity_children` Traversal ({parents} parents x {children_per_parent} = {total_edges} edges)"
+    );
+    println!("================================================================================");
+
+    // 9a. Native Bevy `Query<&Children>`
+    let native_stats = {
+        let mut app = App::new();
+        spawn_hierarchy_fanout(app.world_mut(), parents, children_per_parent);
+        app.add_systems(Update, |q: Query<&Children>| {
+            let mut sum = 0u64;
+            for children in &q {
+                for &child in children {
+                    sum = sum.wrapping_add(child.to_bits());
+                }
+            }
+            black_box(sum);
+        });
+        measure_fn(
+            || timed_update(&mut app),
+            cfg.warmup,
+            cfg.rounds,
+            total_edges,
+        )
+    };
+    print_row("Native Bevy Query<&Children>", native_stats, "edge");
+
+    // 9b. C-ABI `host_sys_entity_children` zero-copy `&[FfiEntity]`
+    let mut ctx = Box::new(ChildrenBenchCtx {
+        children_h: BamComponent::INVALID,
+        edges_visited: 0,
+        checksum: 0,
+    });
+    let cabi_stats = {
+        let mut app = App::new();
+        app.add_plugins(AbiModPlugin);
+        spawn_hierarchy_fanout(app.world_mut(), parents, children_per_parent);
+        let children_h = app
+            .world()
+            .resource::<ModRegistry>()
+            .get_by_name(BAM_CHILDREN_NAME)
+            .expect("AbiModPlugin pre-registers Children")
+            .handle;
+        ctx.children_h = children_h;
+        let reg = app.world().resource::<ModRegistry>().clone();
+        let spec = BamQuerySpecOwned::new(vec![BamTermDesc::new(children_h, AccessMode::READ)]);
+        let ptr = (&mut *ctx as *mut ChildrenBenchCtx).cast::<c_void>();
+        app.add_systems(
+            Update,
+            GuestSystem::new(
+                "bench_entity_children",
+                vec![spec],
+                c_abi_entity_children_cb,
+                ptr,
+                reg,
+            ),
+        );
+        measure_fn(
+            || timed_update(&mut app),
+            cfg.warmup,
+            cfg.rounds,
+            total_edges,
+        )
+    };
+    assert_eq!(ctx.edges_visited, total_edges);
+    black_box(ctx.checksum);
+    print_row(
+        "C-ABI host_sys_entity_children (&[FfiEntity])",
+        cabi_stats,
+        "edge",
+    );
+}
+
 fn main() {
     let cfg = BenchConfig::from_args();
     let dylibs = try_get_dylib_paths();
@@ -1208,6 +2335,18 @@ fn main() {
     }
     if cfg.matches("spawn_with_4") {
         bench_spawn_with_4(&cfg);
+    }
+    if cfg.matches("query_filters") {
+        bench_query_filters(&cfg);
+    }
+    if cfg.matches("batch_commands") {
+        bench_batch_commands(&cfg);
+    }
+    if cfg.matches("summary_tick") {
+        bench_summary_tick(&cfg);
+    }
+    if cfg.matches("entity_children") {
+        bench_entity_children(&cfg);
     }
 
     println!("\nCanonical benchmark suite completed cleanly.");
