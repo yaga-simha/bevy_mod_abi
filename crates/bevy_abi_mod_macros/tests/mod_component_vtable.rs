@@ -1674,3 +1674,334 @@ fn witness_field_info_export_and_import_migration_is_miri_clean() {
         FfiResult::INVALID_STATE
     );
 }
+
+#[derive(Debug, Clone, Default, PartialEq, ModComponent)]
+#[mod_component(name = "edge::TupleMixed", export_symbols)]
+pub struct TupleMixed(pub Vec<u32>, pub FfiOption<u32>, pub String, pub bool);
+
+#[repr(i64)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ModComponent)]
+#[mod_component(name = "edge::SignedWideEnum", export_symbols)]
+pub enum SignedWideEnum {
+    Min = -9223372036854775808,
+    NegOne = -1,
+    #[default]
+    Zero = 0,
+    Max = 9223372036854775807,
+}
+
+#[repr(C, u64)]
+#[derive(Debug, Clone, Default, PartialEq, ModComponent)]
+#[mod_component(name = "edge::UnsignedWideTagged", export_symbols)]
+pub enum UnsignedWideTagged {
+    #[default]
+    Idle = 0,
+    Extreme {
+        code: u64,
+        label: String,
+        bonus: FfiOption<u32>,
+    } = 18446744073709551615,
+}
+
+#[test]
+fn tuple_struct_mixed_fields_vtable_and_witness_roundtrip() {
+    let vt_ref = unsafe { &*<TupleMixed as ModComponent>::vtable_ptr().cast::<TupleMixedVTable>() };
+    let mut val = TupleMixed(
+        vec![1, 2],
+        FfiOption::some(42),
+        String::from("tuple_init"),
+        true,
+    );
+    let mut_ptr = (&raw mut val).cast::<c_void>();
+    let const_ptr = (&raw const val).cast::<c_void>();
+
+    unsafe {
+        assert_eq!((vt_ref.push_0.unwrap())(mut_ptr, 99), FfiResult::OK);
+        assert_eq!((vt_ref.len_0.unwrap())(const_ptr), 3);
+        let opt = (vt_ref.get_1.unwrap())(const_ptr);
+        assert_eq!(opt.is_some, FfiBool::TRUE);
+        assert_eq!(opt.value, 42);
+        assert_eq!(
+            (vt_ref.set_2.unwrap())(mut_ptr, StrView::from_str("tuple_updated")),
+            FfiResult::OK
+        );
+        assert_eq!(
+            (vt_ref.set_3.unwrap())(mut_ptr, FfiBool::FALSE),
+            FfiResult::OK
+        );
+    }
+    assert_eq!(
+        val,
+        TupleMixed(
+            vec![1, 2, 99],
+            FfiOption::some(42),
+            String::from("tuple_updated"),
+            false
+        )
+    );
+
+    // Witness `field_info`, `export_fields`, and `import_field` on tuple fields `"0"`..`"3"`.
+    assert!(TupleMixed::resolve_symbol("bam.v0.edge::TupleMixed.vtable").is_some());
+    let info_fn: FieldInfoFn = unsafe {
+        core::mem::transmute(
+            TupleMixed::resolve_symbol("bam.v0.edge::TupleMixed.field_info")
+                .expect("TupleMixed field_info"),
+        )
+    };
+    let export_fn: ExportFieldsFn = unsafe {
+        core::mem::transmute(
+            TupleMixed::resolve_symbol("bam.v0.edge::TupleMixed.export_fields")
+                .expect("TupleMixed export_fields"),
+        )
+    };
+    let import_fn: ImportFieldFn = unsafe {
+        core::mem::transmute(
+            TupleMixed::resolve_symbol("bam.v0.edge::TupleMixed.import_field")
+                .expect("TupleMixed import_field"),
+        )
+    };
+
+    let mut names = Vec::new();
+    let mut idx = 0usize;
+    let mut name_sv = StrView::empty();
+    let mut tag_sv = StrView::empty();
+    let mut off = 0usize;
+    while unsafe { info_fn(idx, &raw mut name_sv, &raw mut tag_sv, &raw mut off) }.get() {
+        names.push(unsafe { name_sv.try_as_str() }.unwrap().to_owned());
+        idx += 1;
+    }
+    assert_eq!(names, vec!["0", "1", "2", "3"]);
+
+    unsafe extern "C" fn sink(
+        ctx: *mut c_void,
+        field_name: StrView,
+        type_tag: StrView,
+        payload: FfiSlice<u8>,
+    ) -> FfiResult {
+        let out = unsafe { &mut *ctx.cast::<Vec<(String, String, Vec<u8>)>>() };
+        let bytes = if payload.len == 0 {
+            Vec::new()
+        } else {
+            unsafe { payload.as_slice() }.to_vec()
+        };
+        out.push((
+            unsafe { field_name.try_as_str() }.unwrap().to_owned(),
+            unsafe { type_tag.try_as_str() }.unwrap().to_owned(),
+            bytes,
+        ));
+        FfiResult::OK
+    }
+
+    let mut captured: Vec<(String, String, Vec<u8>)> = Vec::new();
+    assert_eq!(
+        unsafe {
+            export_fn(
+                (&raw const val).cast::<c_void>(),
+                Some(sink),
+                (&raw mut captured).cast::<c_void>(),
+            )
+        },
+        FfiResult::OK
+    );
+
+    let mut dst = TupleMixed::default();
+    for (f_name, t_tag, bytes) in &captured {
+        assert_eq!(
+            unsafe {
+                import_fn(
+                    (&raw mut dst).cast::<c_void>(),
+                    StrView::from_str(f_name),
+                    StrView::from_str(t_tag),
+                    FfiSlice::from_slice(bytes),
+                )
+            },
+            FfiResult::OK
+        );
+    }
+    assert_eq!(dst, val);
+
+    // Export with `FfiOption::none()` clears previously populated `dst.1`.
+    let src_none = TupleMixed(Vec::new(), FfiOption::none(), String::new(), false);
+    captured.clear();
+    assert_eq!(
+        unsafe {
+            export_fn(
+                (&raw const src_none).cast::<c_void>(),
+                Some(sink),
+                (&raw mut captured).cast::<c_void>(),
+            )
+        },
+        FfiResult::OK
+    );
+    for (f_name, t_tag, bytes) in &captured {
+        assert_eq!(
+            unsafe {
+                import_fn(
+                    (&raw mut dst).cast::<c_void>(),
+                    StrView::from_str(f_name),
+                    StrView::from_str(t_tag),
+                    FfiSlice::from_slice(bytes),
+                )
+            },
+            FfiResult::OK
+        );
+    }
+    assert_eq!(dst, src_none);
+}
+
+#[test]
+fn wide_i64_and_u64_enums_discriminants_vtables_and_witness_roundtrip() {
+    assert!(SignedWideEnum::resolve_symbol("bam.v0.edge::SignedWideEnum.vtable").is_some());
+    assert!(UnsignedWideTagged::resolve_symbol("bam.v0.edge::UnsignedWideTagged.vtable").is_some());
+
+    let s_vt =
+        unsafe { &*<SignedWideEnum as ModComponent>::vtable_ptr().cast::<SignedWideEnumVTable>() };
+    let mut s_val = SignedWideEnum::Zero;
+    unsafe {
+        assert_eq!((s_vt.tag.unwrap())((&raw const s_val).cast()), 0i64);
+        assert_eq!(
+            (s_vt.set_min.unwrap())((&raw mut s_val).cast()),
+            FfiResult::OK
+        );
+        assert_eq!((s_vt.tag.unwrap())((&raw const s_val).cast()), i64::MIN);
+        assert_eq!(
+            (s_vt.set_neg_one.unwrap())((&raw mut s_val).cast()),
+            FfiResult::OK
+        );
+        assert_eq!((s_vt.tag.unwrap())((&raw const s_val).cast()), -1i64);
+        assert_eq!(
+            (s_vt.set_max.unwrap())((&raw mut s_val).cast()),
+            FfiResult::OK
+        );
+        assert_eq!((s_vt.tag.unwrap())((&raw const s_val).cast()), i64::MAX);
+    }
+    assert!(SignedWideEnum::C_DECL.contains("int64_t"));
+    assert!(SignedWideEnum::ZIG_DECL.contains("i64"));
+
+    let u_vt = unsafe {
+        &*<UnsignedWideTagged as ModComponent>::vtable_ptr().cast::<UnsignedWideTaggedVTable>()
+    };
+    let mut u_val = UnsignedWideTagged::Idle;
+    unsafe {
+        assert_eq!((u_vt.tag.unwrap())((&raw const u_val).cast()), 0u64);
+        assert_eq!(
+            (u_vt.set_extreme.unwrap())(
+                (&raw mut u_val).cast(),
+                0xCAFE_BABE_DEAD_BEEFu64,
+                StrView::from_str("extreme"),
+                FfiOption::some(999),
+            ),
+            FfiResult::OK
+        );
+        assert_eq!((u_vt.tag.unwrap())((&raw const u_val).cast()), u64::MAX);
+        let mut out_code = 0u64;
+        assert_eq!(
+            (u_vt.try_get_extreme_code.unwrap())((&raw const u_val).cast(), &raw mut out_code),
+            FfiResult::OK
+        );
+        assert_eq!(out_code, 0xCAFE_BABE_DEAD_BEEFu64);
+    }
+    assert!(UnsignedWideTagged::C_DECL.contains("uint64_t"));
+    assert!(UnsignedWideTagged::ZIG_DECL.contains("u64"));
+
+    // Witness roundtrip for wide enums
+    let export_s: ExportFieldsFn = unsafe {
+        core::mem::transmute(
+            SignedWideEnum::resolve_symbol("bam.v0.edge::SignedWideEnum.export_fields")
+                .expect("SignedWideEnum export_fields"),
+        )
+    };
+    let import_s: ImportFieldFn = unsafe {
+        core::mem::transmute(
+            SignedWideEnum::resolve_symbol("bam.v0.edge::SignedWideEnum.import_field")
+                .expect("SignedWideEnum import_field"),
+        )
+    };
+    let export_u: ExportFieldsFn = unsafe {
+        core::mem::transmute(
+            UnsignedWideTagged::resolve_symbol("bam.v0.edge::UnsignedWideTagged.export_fields")
+                .expect("UnsignedWideTagged export_fields"),
+        )
+    };
+    let import_u: ImportFieldFn = unsafe {
+        core::mem::transmute(
+            UnsignedWideTagged::resolve_symbol("bam.v0.edge::UnsignedWideTagged.import_field")
+                .expect("UnsignedWideTagged import_field"),
+        )
+    };
+
+    unsafe extern "C" fn sink(
+        ctx: *mut c_void,
+        field_name: StrView,
+        type_tag: StrView,
+        payload: FfiSlice<u8>,
+    ) -> FfiResult {
+        let out = unsafe { &mut *ctx.cast::<Vec<(String, String, Vec<u8>)>>() };
+        let bytes = if payload.len == 0 {
+            Vec::new()
+        } else {
+            unsafe { payload.as_slice() }.to_vec()
+        };
+        out.push((
+            unsafe { field_name.try_as_str() }.unwrap().to_owned(),
+            unsafe { type_tag.try_as_str() }.unwrap().to_owned(),
+            bytes,
+        ));
+        FfiResult::OK
+    }
+
+    let mut captured: Vec<(String, String, Vec<u8>)> = Vec::new();
+    let s_src = SignedWideEnum::Min;
+    assert_eq!(
+        unsafe {
+            export_s(
+                (&raw const s_src).cast::<c_void>(),
+                Some(sink),
+                (&raw mut captured).cast::<c_void>(),
+            )
+        },
+        FfiResult::OK
+    );
+    let mut s_dst = SignedWideEnum::Zero;
+    for (f_name, t_tag, bytes) in &captured {
+        assert_eq!(
+            unsafe {
+                import_s(
+                    (&raw mut s_dst).cast::<c_void>(),
+                    StrView::from_str(f_name),
+                    StrView::from_str(t_tag),
+                    FfiSlice::from_slice(bytes),
+                )
+            },
+            FfiResult::OK
+        );
+    }
+    assert_eq!(s_dst, s_src);
+
+    captured.clear();
+    assert_eq!(
+        unsafe {
+            export_u(
+                (&raw const u_val).cast::<c_void>(),
+                Some(sink),
+                (&raw mut captured).cast::<c_void>(),
+            )
+        },
+        FfiResult::OK
+    );
+    let mut u_dst = UnsignedWideTagged::Idle;
+    for (f_name, t_tag, bytes) in &captured {
+        assert_eq!(
+            unsafe {
+                import_u(
+                    (&raw mut u_dst).cast::<c_void>(),
+                    StrView::from_str(f_name),
+                    StrView::from_str(t_tag),
+                    FfiSlice::from_slice(bytes),
+                )
+            },
+            FfiResult::OK
+        );
+    }
+    assert_eq!(u_dst, u_val);
+}

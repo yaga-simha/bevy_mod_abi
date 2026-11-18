@@ -6,8 +6,8 @@ use bevy_abi_mod_sys::{FfiBool, FfiOption, FfiResult};
 use bevy_app::App;
 use bevy_ecs::message::Messages;
 use example_07_cpp17_guest::{
-    ActorStats, BehaviorMode, Position, SimConfig, Velocity, render_example_components_header,
-    resolve_or_build_cpp17_mod,
+    ActorStats, BehaviorMode, CppTelemetry, Position, SimConfig, Velocity,
+    render_example_components_header, resolve_or_build_cpp17_mod,
 };
 use std::path::PathBuf;
 
@@ -179,6 +179,71 @@ fn cpp17_guest_typed_views_host_vec_ffi_option_and_enum_roundtrip() {
         *app.world().get::<BehaviorMode>(entity).unwrap(),
         BehaviorMode::Attack(99)
     );
+
+    app.unload_mod(mod_id).expect("unload C++17 mod");
+}
+
+#[test]
+fn cpp17_guest_wave2_has_filter_lifecycle_observer_hierarchy_and_batch_spawn() {
+    let dylib_path = resolve_or_build_cpp17_mod();
+    let mut app = build_configured_app();
+    app.register_mod_component::<ActorStats>(ComponentOptions::new().with_default())
+        .expect("register ActorStats");
+    app.register_mod_component::<BehaviorMode>(ComponentOptions::new().with_default())
+        .expect("register BehaviorMode");
+    app.insert_resource(CppTelemetry {
+        spawn_batch_count: 3,
+        ..Default::default()
+    });
+    app.register_mod_resource::<CppTelemetry>()
+        .expect("register CppTelemetry");
+
+    let parent = app.world_mut().spawn(Position::new(0.0, 0.0, 0.0)).id();
+    let child_without_stats = app
+        .world_mut()
+        .spawn((
+            Position::new(1.0, 0.0, 0.0),
+            bevy_ecs::hierarchy::ChildOf(parent),
+        ))
+        .id();
+
+    let mod_id = app
+        .load_mod_with(
+            &dylib_path,
+            LoadOptions {
+                shadow_copy: true,
+                strict: true,
+                ..Default::default()
+            },
+        )
+        .expect("load C++17 mod");
+
+    // Spawn an ActorStats entity after load so `BAM_EVENT_KIND_ADD` lifecycle observer fires.
+    let _observed_actor = app
+        .world_mut()
+        .spawn((
+            Position::new(2.0, 0.0, 0.0),
+            ActorStats::default(),
+            BehaviorMode::Idle,
+        ))
+        .id();
+
+    // Tick 1: sees 3 Position entities (1 with ActorStats, 2 without), 1 ChildOf, 1 Add<ActorStats>,
+    // and queues `cmd_spawn_batch` of 3 Position entities.
+    app.update();
+    let t1 = *app.world().resource::<CppTelemetry>();
+    assert_eq!(t1.observed_adds, 1);
+    assert_eq!(t1.entities_with_stats, 1);
+    assert_eq!(t1.entities_without_stats, 2);
+    assert_eq!(t1.child_entities_seen, 1);
+    assert_eq!(t1.batch_spawned, FfiBool::TRUE);
+
+    // Tick 2: includes the 3 newly batch-spawned Position entities (now 5 without ActorStats).
+    app.update();
+    let t2 = *app.world().resource::<CppTelemetry>();
+    assert_eq!(t2.entities_with_stats, 1);
+    assert_eq!(t2.entities_without_stats, 5);
+    assert!(app.world().get::<Position>(child_without_stats).is_some());
 
     app.unload_mod(mod_id).expect("unload C++17 mod");
 }

@@ -2,19 +2,21 @@
 // mod.cpp — Strict ISO C++17 Guest Mod for `bevy_abi_mod` Example 07 (`ABI 0.2.0`)
 //
 // Demonstrates:
-// 1. Including macro-generated `example_components.h` (`ModComponent::C_DECL`) with
-//    C++17 `noexcept` RAII & typed view classes (`ActorStatsView`, `HostVecView`,
-//    `BehaviorModeView`, `bam::VTableHandle`, `bam::UniqueGuest`).
+// 1. Idiomatic `bam::GuestApp`, `bam::SystemContext`, `bam::Chunk`, and `bam::Commands`
+//    wrappers (`bam_cpp17_sdk.hpp`) paired with macro-generated `example_components.h`
+//    (`ModComponent::C_DECL`) typed views (`ActorStatsView`, `HostVecView`, `BehaviorModeView`).
 // 2. Per-`World` RAII `CppModInstance` managed by `bam::UniqueGuest` with zero
 //    process globals.
 // 3. Catching all C++ exceptions at the `extern "C"` (`nounwind`) boundary via
 //    `try { ... } catch (...) { return BAM_RESULT_PANIC_CAUGHT; }` (`spec.md` §3.4).
 // 4. Zero-serialization contiguous SoA chunk iteration over `example::Position` and
 //    `example::Velocity` alongside `example::SimConfig` singleton resource reads.
-// 5. Optional typed VTable view mutation over `example::ActorStats` (`Vec<u32>`,
-//    `String`, `FfiOption<u32>`, `bool`) and `example::BehaviorMode` (`#[repr(C, u8)]`).
+// 5. Optional typed VTable view mutation (`ActorStatsView`, `BehaviorModeView`),
+//    `BAM_ACCESS_HAS` (`Has<ActorStats>`), `BAM_CHILD_OF_NAME` hierarchy reads,
+//    `BAM_EVENT_KIND_ADD` lifecycle observer, and `cmd_spawn_batch` SoA bulk spawn.
 // ============================================================================
 
+#include "bam_cpp17_sdk.hpp"
 #include "example_components.h"
 
 #include <cmath>
@@ -23,6 +25,7 @@
 #include <cstring>
 #include <memory>
 #include <stdexcept>
+#include <vector>
 
 namespace {
 
@@ -33,6 +36,8 @@ static_assert(sizeof(Velocity) == 12u, "Velocity must be 12 bytes");
 static_assert(alignof(Velocity) == 4u, "Velocity must be 4-byte aligned");
 static_assert(sizeof(SimConfig) == 12u, "SimConfig must be 12 bytes");
 static_assert(alignof(SimConfig) == 4u, "SimConfig must be 4-byte aligned");
+static_assert(sizeof(CppTelemetry) == 24u, "CppTelemetry must be 24 bytes");
+static_assert(alignof(CppTelemetry) == 4u, "CppTelemetry must be 4-byte aligned");
 
 constexpr BamManifest kManifest = {
     static_cast<uint32_t>(sizeof(BamManifest)),
@@ -69,20 +74,20 @@ public:
             return BAM_RESULT_NULL_POINTER;
         }
 
-        const BamHostCtx* host_ctx = api_.load_host_ctx(load_ctx);
-        if (host_ctx == nullptr) {
+        bam::GuestApp app(api_, load_ctx);
+        if (!app.valid()) {
             return BAM_RESULT_NULL_POINTER;
         }
 
-        BamResult res = api_.resolve_component(host_ctx, "example::Position", nullptr, &pos_comp_);
+        BamResult res = app.resolve_component("example::Position", pos_comp_);
         if (res != BAM_RESULT_OK) {
             return res;
         }
-        res = api_.resolve_component(host_ctx, "example::Velocity", nullptr, &vel_comp_);
+        res = app.resolve_component("example::Velocity", vel_comp_);
         if (res != BAM_RESULT_OK) {
             return res;
         }
-        res = api_.resolve_component(host_ctx, "example::SimConfig", nullptr, &cfg_res_);
+        res = app.resolve_component("example::SimConfig", cfg_res_);
         if (res != BAM_RESULT_OK) {
             return res;
         }
@@ -92,35 +97,24 @@ public:
             bam_term_desc(vel_comp_, BAM_ACCESS_WRITE, 0u),
             bam_term_desc(cfg_res_, BAM_ACCESS_RESOURCE_READ, 0u),
         };
-
-        BamQueryDesc query{};
-        query.struct_size = static_cast<uint32_t>(sizeof(BamQueryDesc));
-        query.flags       = 0u;
-        query.terms       = kinematics_terms;
-        query.term_count  = 3u;
-
-        BamSystemDesc sys_desc{};
-        sys_desc.struct_size = static_cast<uint32_t>(sizeof(BamSystemDesc));
-        sys_desc.flags       = 0u;
-        sys_desc.name        = "cpp17_damped_kinematics";
-        sys_desc.queries     = &query;
-        sys_desc.query_count = 1u;
-        sys_desc.callback    = &CppModInstance::kinematics_trampoline;
-        sys_desc.user_data   = this;
-        sys_desc.schedule    = BAM_SCHEDULE_UPDATE;
-
-        res = api_.register_system(load_ctx, &sys_desc);
+        res = app.register_system(
+            "cpp17_damped_kinematics",
+            kinematics_terms,
+            3u,
+            &CppModInstance::kinematics_trampoline,
+            this,
+            BAM_SCHEDULE_UPDATE);
         if (res != BAM_RESULT_OK) {
             return res;
         }
 
         // Optionally bind `ActorStats` + `BehaviorMode` VTables using `bam::VTableHandle`.
-        if (api_.resolve_component(host_ctx, "example::ActorStats", nullptr, &stats_comp_) == BAM_RESULT_OK &&
-            api_.resolve_component(host_ctx, "example::BehaviorMode", nullptr, &mode_comp_) == BAM_RESULT_OK) {
+        if (app.try_resolve_component("example::ActorStats", stats_comp_) &&
+            app.try_resolve_component("example::BehaviorMode", mode_comp_)) {
             stats_vt_ = bam::VTableHandle<ActorStatsVTable>::resolve(
-                api_, host_ctx, "bam.v0.example::ActorStats.vtable");
+                api_, app.host_ctx(), "bam.v0.example::ActorStats.vtable");
             mode_vt_ = bam::VTableHandle<BehaviorModeVTable>::resolve(
-                api_, host_ctx, "bam.v0.example::BehaviorMode.vtable");
+                api_, app.host_ctx(), "bam.v0.example::BehaviorMode.vtable");
             if (!stats_vt_ || !mode_vt_) {
                 return BAM_RESULT_NOT_FOUND;
             }
@@ -129,21 +123,48 @@ public:
                 bam_term_desc(stats_comp_, BAM_ACCESS_WRITE, 0u),
                 bam_term_desc(mode_comp_, BAM_ACCESS_WRITE, 0u),
             };
-            BamQueryDesc actor_query{};
-            actor_query.struct_size = static_cast<uint32_t>(sizeof(BamQueryDesc));
-            actor_query.terms       = actor_terms;
-            actor_query.term_count  = 2u;
+            res = app.register_system(
+                "cpp17_actor_views",
+                actor_terms,
+                2u,
+                &CppModInstance::actor_views_trampoline,
+                this,
+                BAM_SCHEDULE_UPDATE);
+            if (res != BAM_RESULT_OK) {
+                return res;
+            }
 
-            BamSystemDesc actor_sys{};
-            actor_sys.struct_size = static_cast<uint32_t>(sizeof(BamSystemDesc));
-            actor_sys.name        = "cpp17_actor_views";
-            actor_sys.queries     = &actor_query;
-            actor_sys.query_count = 1u;
-            actor_sys.callback    = &CppModInstance::actor_views_trampoline;
-            actor_sys.user_data   = this;
-            actor_sys.schedule    = BAM_SCHEDULE_UPDATE;
+            // Optionally bind Wave 1-2 showcase: `BAM_EVENT_KIND_ADD` lifecycle observer,
+            // `BAM_ACCESS_HAS`, `BamChildOf` optional hierarchy read, and `cmd_spawn_batch`.
+            if (app.try_resolve_component("example::CppTelemetry", telemetry_res_) &&
+                app.try_resolve_component(BAM_CHILD_OF_NAME, child_of_comp_)) {
+                res = app.register_lifecycle_observer(
+                    "cpp17_on_actor_added",
+                    BAM_EVENT_KIND_ADD,
+                    stats_comp_,
+                    &CppModInstance::on_actor_added_trampoline,
+                    this);
+                if (res != BAM_RESULT_OK) {
+                    return res;
+                }
 
-            return api_.register_system(load_ctx, &actor_sys);
+                const BamTermDesc has_terms[4] = {
+                    bam_term_desc(pos_comp_, BAM_ACCESS_READ, 0u),
+                    bam_term_desc(stats_comp_, BAM_ACCESS_HAS, 0u),
+                    bam_term_desc(child_of_comp_, BAM_ACCESS_OPTIONAL_READ, 0u),
+                    bam_term_desc(telemetry_res_, BAM_ACCESS_RESOURCE_WRITE, 0u),
+                };
+                res = app.register_system(
+                    "cpp17_has_hierarchy_and_batch",
+                    has_terms,
+                    4u,
+                    &CppModInstance::has_hierarchy_trampoline,
+                    this,
+                    BAM_SCHEDULE_UPDATE);
+                if (res != BAM_RESULT_OK) {
+                    return res;
+                }
+            }
         }
 
         return BAM_RESULT_OK;
@@ -175,18 +196,47 @@ private:
         }
     }
 
-    BamResult run_kinematics(BamSystemCtx* sys_ctx) {
+    static BamResult has_hierarchy_trampoline(BamSystemCtx* sys_ctx, void* user_data) noexcept {
+        if (sys_ctx == nullptr || user_data == nullptr) {
+            return BAM_RESULT_NULL_POINTER;
+        }
+        try {
+            auto* self = static_cast<CppModInstance*>(user_data);
+            return self->run_has_hierarchy_and_batch(sys_ctx);
+        } catch (...) {
+            return BAM_RESULT_PANIC_CAUGHT;
+        }
+    }
+
+    static BamResult on_actor_added_trampoline(
+        BamEntity    target,
+        const void*  event_data,
+        BamCommands* commands,
+        void*        user_data
+    ) noexcept {
+        (void)target;
+        (void)event_data;
+        (void)commands;
+        if (user_data == nullptr) {
+            return BAM_RESULT_NULL_POINTER;
+        }
+        auto* self = static_cast<CppModInstance*>(user_data);
+        self->observed_adds_ += 1u;
+        return BAM_RESULT_OK;
+    }
+
+    BamResult run_kinematics(BamSystemCtx* raw_ctx) {
+        bam::SystemContext ctx(api_, raw_ctx);
         BamIter* iter = nullptr;
-        BamResult res = api_.sys_query(sys_ctx, 0u, &iter);
+        BamResult res = ctx.query(0u, iter);
         if (res != BAM_RESULT_OK) {
             return res;
         }
 
-        const uint8_t* raw_cfg = api_.res_ptr(iter, 2u);
-        if (raw_cfg == nullptr) {
+        const auto* cfg = ctx.res_ptr<SimConfig>(iter, 2u);
+        if (cfg == nullptr) {
             return BAM_RESULT_NULL_POINTER;
         }
-        const auto* cfg = reinterpret_cast<const SimConfig*>(raw_cfg);
         if (cfg->trigger_exception != BAM_FALSE) {
             throw std::runtime_error("simulated C++17 domain exception caught at ABI boundary");
         }
@@ -196,11 +246,11 @@ private:
 
         BamColumnInfo pos_info{};
         BamColumnInfo vel_info{};
-        res = api_.iter_column_info(iter, 0u, &pos_info);
+        res = ctx.column_info(iter, 0u, pos_info);
         if (res != BAM_RESULT_OK) {
             return res;
         }
-        res = api_.iter_column_info(iter, 1u, &vel_info);
+        res = ctx.column_info(iter, 1u, vel_info);
         if (res != BAM_RESULT_OK) {
             return res;
         }
@@ -210,17 +260,15 @@ private:
         }
 
         size_t chunk_len = 0u;
-        while (api_.iter_next_chunk(iter, &chunk_len) != BAM_FALSE) {
-            uint8_t* pos_bytes = api_.iter_column_mutable(iter, 0u);
-            uint8_t* vel_bytes = api_.iter_column_mutable(iter, 1u);
-            if (pos_bytes == nullptr || vel_bytes == nullptr) {
+        while (ctx.next_chunk(iter, chunk_len)) {
+            bam::Chunk chunk(api_, iter, chunk_len);
+            auto* positions  = chunk.column_mutable<Position>(0u);
+            auto* velocities = chunk.column_mutable<Velocity>(1u);
+            if (positions == nullptr || velocities == nullptr) {
                 return BAM_RESULT_NULL_POINTER;
             }
 
-            auto* positions  = reinterpret_cast<Position*>(pos_bytes);
-            auto* velocities = reinterpret_cast<Velocity*>(vel_bytes);
-
-            for (size_t i = 0u; i < chunk_len; ++i) {
+            for (size_t i = 0u; i < chunk.len(); ++i) {
                 velocities[i].x *= cfg->damping;
                 velocities[i].y *= cfg->damping;
                 velocities[i].z *= cfg->damping;
@@ -234,23 +282,24 @@ private:
         return BAM_RESULT_OK;
     }
 
-    BamResult run_actor_views(BamSystemCtx* sys_ctx) {
+    BamResult run_actor_views(BamSystemCtx* raw_ctx) {
         if (!stats_vt_ || !mode_vt_ || api_.iter_column_mutable == nullptr) {
             return BAM_RESULT_NULL_POINTER;
         }
+        bam::SystemContext ctx(api_, raw_ctx);
         BamIter* iter = nullptr;
-        BamResult res = api_.sys_query(sys_ctx, 0u, &iter);
+        BamResult res = ctx.query(0u, iter);
         if (res != BAM_RESULT_OK) {
             return res;
         }
 
         BamColumnInfo stats_info{};
         BamColumnInfo mode_info{};
-        res = api_.iter_column_info(iter, 0u, &stats_info);
+        res = ctx.column_info(iter, 0u, stats_info);
         if (res != BAM_RESULT_OK) {
             return res;
         }
-        res = api_.iter_column_info(iter, 1u, &mode_info);
+        res = ctx.column_info(iter, 1u, mode_info);
         if (res != BAM_RESULT_OK) {
             return res;
         }
@@ -259,22 +308,23 @@ private:
         }
 
         size_t chunk_len = 0u;
-        while (api_.iter_next_chunk(iter, &chunk_len) != BAM_FALSE) {
-            uint8_t* stats_base = api_.iter_column_mutable(iter, 0u);
-            uint8_t* mode_base  = api_.iter_column_mutable(iter, 1u);
-            if (stats_base == nullptr || mode_base == nullptr) {
-                return BAM_RESULT_NULL_POINTER;
-            }
+        while (ctx.next_chunk(iter, chunk_len)) {
+            bam::Chunk chunk(api_, iter, chunk_len);
+            for (size_t i = 0u; i < chunk.len(); ++i) {
+                uint8_t* stats_ptr = chunk.rows_mutable(0u, i, stats_info.size);
+                uint8_t* mode_ptr  = chunk.rows_mutable(1u, i, mode_info.size);
+                if (stats_ptr == nullptr || mode_ptr == nullptr) {
+                    return BAM_RESULT_NULL_POINTER;
+                }
 
-            for (size_t i = 0u; i < chunk_len; ++i) {
-                ActorStatsView stats(stats_base + i * stats_info.size, stats_vt_.raw());
-                BehaviorModeView mode(mode_base + i * mode_info.size, mode_vt_.raw());
+                ActorStatsView stats(stats_ptr, stats_vt_.raw());
+                BehaviorModeView mode(mode_ptr, mode_vt_.raw());
 
                 if (!stats || !mode) {
                     return BAM_RESULT_NULL_POINTER;
                 }
 
-                // Exercise `HostVecView` methods: reserve, push, pop, remove, swap_remove, range-for
+                // Exercise `HostVecView` methods: reserve, push, pop, mutable range-for (`as_mut_slice`)
                 auto scores = stats.scores();
                 res = scores.reserve(8u);
                 if (res != BAM_RESULT_OK) return res;
@@ -288,12 +338,10 @@ private:
                     return BAM_RESULT_INTERNAL_ERROR;
                 }
 
-                // Increment every score in-place via mutable range-for (`as_mut_slice`)
                 for (uint32_t& val : scores) {
                     val += 5u;
                 }
 
-                // Update `bool`, `String`, and `FfiOption<u32>` via typed C++17 `noexcept` view
                 res = stats.set_active(true);
                 if (res != BAM_RESULT_OK) return res;
                 res = stats.set_tag("cpp17_view_updated");
@@ -301,7 +349,6 @@ private:
                 res = stats.set_bonus_some(777u);
                 if (res != BAM_RESULT_OK) return res;
 
-                // Exercise tagged `#[repr(C, u8)]` enum view (`tag`, `set_patrol`, `try_get_patrol_*`)
                 if (mode.tag() == BehaviorMode_Tag_Idle) {
                     res = mode.set_patrol(14.5f, true);
                     if (res != BAM_RESULT_OK) return res;
@@ -322,14 +369,82 @@ private:
         return BAM_RESULT_OK;
     }
 
+    BamResult run_has_hierarchy_and_batch(BamSystemCtx* raw_ctx) {
+        bam::SystemContext ctx(api_, raw_ctx);
+        BamIter* iter = nullptr;
+        BamResult res = ctx.query(0u, iter);
+        if (res != BAM_RESULT_OK) {
+            return res;
+        }
+
+        auto* telemetry = ctx.res_mut_ptr<CppTelemetry>(iter, 3u);
+        if (telemetry == nullptr) {
+            return BAM_RESULT_NULL_POINTER;
+        }
+
+        uint32_t with_stats    = 0u;
+        uint32_t without_stats = 0u;
+        uint32_t children_seen = 0u;
+
+        size_t chunk_len = 0u;
+        while (ctx.next_chunk(iter, chunk_len)) {
+            bam::Chunk chunk(api_, iter, chunk_len);
+            const auto* has_stats = chunk.has_column(1u);
+            const auto* child_ofs = chunk.column_readonly<BamChildOf>(2u);
+            if (has_stats == nullptr) {
+                return BAM_RESULT_NULL_POINTER;
+            }
+            for (size_t i = 0u; i < chunk.len(); ++i) {
+                if (has_stats[i] != BAM_FALSE) {
+                    with_stats += 1u;
+                } else {
+                    without_stats += 1u;
+                }
+                if (child_ofs != nullptr && child_ofs[i].parent != BAM_ENTITY_NULL) {
+                    children_seen += 1u;
+                }
+            }
+        }
+
+        telemetry->observed_adds          = observed_adds_;
+        telemetry->entities_with_stats    = with_stats;
+        telemetry->entities_without_stats = without_stats;
+        telemetry->child_entities_seen    = children_seen;
+
+        if (telemetry->spawn_batch_count > 0u && telemetry->batch_spawned == BAM_FALSE) {
+            BamResult cmd_res = BAM_RESULT_OK;
+            bam::Commands cmds = ctx.commands(&cmd_res);
+            if (cmd_res != BAM_RESULT_OK || !cmds.valid()) {
+                return cmd_res != BAM_RESULT_OK ? cmd_res : BAM_RESULT_NULL_POINTER;
+            }
+            const size_t count = static_cast<size_t>(telemetry->spawn_batch_count);
+            std::vector<Position> batch_positions(count);
+            for (size_t i = 0u; i < count; ++i) {
+                batch_positions[i] = Position{static_cast<float>(i) + 1.0f, 0.0f, 0.0f};
+            }
+            const BamComponent comps[1] = {pos_comp_};
+            const uint8_t* cols[1] = {reinterpret_cast<const uint8_t*>(batch_positions.data())};
+            res = cmds.spawn_batch(comps, cols, 1u, count, nullptr);
+            if (res != BAM_RESULT_OK) {
+                return res;
+            }
+            telemetry->batch_spawned = BAM_TRUE;
+        }
+
+        return BAM_RESULT_OK;
+    }
+
     BamHostApi                            api_{};
     BamComponent                          pos_comp_{BAM_COMPONENT_INVALID};
     BamComponent                          vel_comp_{BAM_COMPONENT_INVALID};
     BamComponent                          cfg_res_{BAM_COMPONENT_INVALID};
     BamComponent                          stats_comp_{BAM_COMPONENT_INVALID};
     BamComponent                          mode_comp_{BAM_COMPONENT_INVALID};
+    BamComponent                          child_of_comp_{BAM_COMPONENT_INVALID};
+    BamComponent                          telemetry_res_{BAM_COMPONENT_INVALID};
     bam::VTableHandle<ActorStatsVTable>   stats_vt_{};
     bam::VTableHandle<BehaviorModeVTable> mode_vt_{};
+    uint32_t                              observed_adds_{0u};
 };
 
 using UniqueCppInstance = bam::UniqueGuest<CppModInstance, &CppModInstance::destroy>;
