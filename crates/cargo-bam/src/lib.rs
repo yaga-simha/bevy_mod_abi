@@ -5,6 +5,7 @@
 
 pub mod builder;
 pub mod dag;
+pub mod doctor;
 pub mod scaffold;
 pub mod sdk;
 pub mod signing;
@@ -68,6 +69,7 @@ enum Commands {
         guest_sdk_path: Option<PathBuf>,
     },
     /// Export `bevy_abi_mod.h`, `bevy_abi_mod.hpp`, and `bevy_abi_mod.zig` SDK headers.
+    #[command(visible_alias = "header")]
     ExportSdk {
         /// Output directory for exported headers.
         #[arg(long)]
@@ -98,6 +100,15 @@ enum Commands {
     CheckMods {
         /// Mods directory containing `mod.toml` or `<mod>/mod.toml` subdirectories.
         dir: PathBuf,
+    },
+    /// Diagnose host ABI, Rust/C99/C++17/Zig toolchains, embedded SDK headers, and optional mods directory.
+    Doctor {
+        /// Optional mods directory to validate during the diagnostic pass.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Fail if a C99 or C++17 compiler is not available on PATH.
+        #[arg(long)]
+        require_c: bool,
     },
     /// Generate an OpenSSH Ed25519 keypair (`<out>` + `<out>.pub`).
     Keygen {
@@ -222,6 +233,27 @@ where
             );
             for (idx, m) in order.iter().enumerate() {
                 println!("  {}. {} {}", idx + 1, m.id, m.version);
+            }
+            Ok(())
+        }
+        Commands::Doctor { dir, require_c } => {
+            let report = doctor::run_doctor(dir.as_deref(), require_c)?;
+            println!("cargo-bam doctor (host ABI {})", report.host_abi_version);
+            for check in &report.tools {
+                let status = if check.available {
+                    "ok"
+                } else if check.required {
+                    "MISSING"
+                } else {
+                    "absent (optional)"
+                };
+                println!("  [{status}] {}: {}", check.name, check.detail);
+            }
+            if let Some(mods) = &report.validated_mods {
+                println!(
+                    "  [ok] validated_mods: {} manifest(s) in DAG order",
+                    mods.len()
+                );
             }
             Ok(())
         }
@@ -556,5 +588,104 @@ mod tests {
         assert!(zig_proj.join("build.zig").is_file());
         assert!(zig_proj.join("src/root.zig").is_file());
         assert!(zig_proj.join("include/bevy_abi_mod.zig").is_file());
+    }
+
+    #[test]
+    fn cli_header_alias_and_doctor_validate_environment_and_mods() {
+        let tmp = TempDir::new().unwrap();
+        let out_dir = tmp.path().join("headers");
+        run_cli(["cargo", "bam", "header", "--out", out_dir.to_str().unwrap()]).unwrap();
+        assert!(out_dir.join("bevy_abi_mod.h").is_file());
+        assert!(out_dir.join("bevy_abi_mod.hpp").is_file());
+        assert!(out_dir.join("bevy_abi_mod.zig").is_file());
+
+        let mods_dir = tmp.path().join("mods");
+        fs::create_dir_all(mods_dir.join("core")).unwrap();
+        fs::write(
+            mods_dir.join("core/mod.toml"),
+            "[mod]\nid = \"core\"\nversion = \"0.2.0\"\nabi_version = \"^0.2.0\"\n",
+        )
+        .unwrap();
+
+        run_cli(["cargo-bam", "doctor", "--dir", mods_dir.to_str().unwrap()]).unwrap();
+
+        let report = doctor::run_doctor(Some(&mods_dir), false).unwrap();
+        assert!(report.ok);
+        assert_eq!(report.host_abi_version, "0.2.0");
+        assert!(
+            report
+                .tools
+                .iter()
+                .any(|t| t.name == "cargo" && t.available)
+        );
+        assert!(
+            report
+                .tools
+                .iter()
+                .any(|t| t.name == "rustc" && t.available)
+        );
+        assert!(
+            report
+                .tools
+                .iter()
+                .any(|t| t.name == "sdk_headers" && t.available)
+        );
+        assert_eq!(report.validated_mods.as_ref().map(Vec::len), Some(1));
+
+        // Corrupt ABI version in mod.toml must fail doctor --dir
+        fs::write(
+            mods_dir.join("core/mod.toml"),
+            "[mod]\nid = \"core\"\nversion = \"0.2.0\"\nabi_version = \"^99.0.0\"\n",
+        )
+        .unwrap();
+        let err =
+            run_cli(["cargo-bam", "doctor", "--dir", mods_dir.to_str().unwrap()]).unwrap_err();
+        assert!(
+            err.to_string().contains("0.2.0"),
+            "expected ABI compatibility error mentioning 0.2.0, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cli_rejects_missing_sign_key_and_invalid_mod_id() {
+        let tmp = TempDir::new().unwrap();
+        let invalid_id_err = run_cli([
+            "cargo-bam",
+            "new",
+            "../escape",
+            "--dir",
+            tmp.path().to_str().unwrap(),
+        ])
+        .unwrap_err();
+        assert!(
+            matches!(invalid_id_err, CliError::InvalidArgument(_)),
+            "expected InvalidArgument, got {invalid_id_err:?}"
+        );
+
+        let proj = tmp.path().join("c_sample");
+        run_cli([
+            "cargo-bam",
+            "new",
+            "c_sample",
+            "--lang",
+            "c99",
+            "--dir",
+            tmp.path().to_str().unwrap(),
+        ])
+        .unwrap();
+        let missing_key = tmp.path().join("does_not_exist.key");
+        let build_err = run_cli([
+            "cargo-bam",
+            "build",
+            "--dir",
+            proj.to_str().unwrap(),
+            "--sign-key",
+            missing_key.to_str().unwrap(),
+        ])
+        .unwrap_err();
+        assert!(
+            matches!(build_err, CliError::Io(_) | CliError::Crypto(_)),
+            "expected missing key error, got {build_err:?}"
+        );
     }
 }
