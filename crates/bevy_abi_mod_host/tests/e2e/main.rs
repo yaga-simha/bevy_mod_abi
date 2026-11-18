@@ -17,4 +17,11 @@
 mod support;
 
 pub mod asymmetric_mods;
+#[cfg(all(
+    feature = "bridge-std-types",
+    feature = "bridge-asset",
+    feature = "bridge-state"
+))]
+#[forbid(unsafe_code)]
+pub mod bridges_integration;
 pub mod example_pipelines;

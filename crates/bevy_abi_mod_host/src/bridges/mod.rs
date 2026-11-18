@@ -18,3 +18,35 @@ pub use std_types::{
     FfiTimeReal, FfiTimeVirtual, FfiTransform, FfiVisibility, StdTypesBridgePlugin,
     register_std_types_bridges,
 };
+
+/// Convenience umbrella plugin installing [`StdTypesBridgePlugin`], [`ModAssetPlugin`], and
+/// `bevy_state::app::StatesPlugin` (when all three bridge features are enabled).
+///
+/// Add this plugin **before** Bevy's `AssetPlugin` so the isolated `"mod"` asset source is
+/// registered prior to `AssetServer` construction.
+#[cfg(all(
+    feature = "bridge-std-types",
+    feature = "bridge-asset",
+    feature = "bridge-state"
+))]
+#[derive(Default, Debug, Clone, Copy)]
+pub struct ModBridgesPlugin;
+
+#[cfg(all(
+    feature = "bridge-std-types",
+    feature = "bridge-asset",
+    feature = "bridge-state"
+))]
+impl bevy_app::Plugin for ModBridgesPlugin {
+    fn build(&self, app: &mut bevy_app::App) {
+        if !app.is_plugin_added::<bevy_state::app::StatesPlugin>() {
+            app.add_plugins(bevy_state::app::StatesPlugin);
+        }
+        if !app.is_plugin_added::<StdTypesBridgePlugin>() {
+            app.add_plugins(StdTypesBridgePlugin);
+        }
+        if !app.is_plugin_added::<ModAssetPlugin>() {
+            app.add_plugins(ModAssetPlugin);
+        }
+    }
+}
