@@ -18,7 +18,8 @@ use bevy_abi_mod_host_sys::loader::{
 };
 use bevy_abi_mod_host_sys::{
     ComponentCollisionError, ComponentOptions, LoadOptions, LoadedMod, ModErrorPolicy,
-    ModErrorPolicyConfig, ModHost, ModId, ModLoadError, ModQuarantine, ModRegistry, WorldDropGuard,
+    ModErrorPolicyConfig, ModHost, ModId, ModLoadError, ModQuarantine, ModRegistry,
+    PersistentMessageCursors, WorldDropGuard, ensure_children_registered_in_world,
     ensure_dynamic_hook_map_in_world, excise_and_unload_mod_in_world, load_mod_in_world,
     restore_mod_state_in_world, rollback_unscheduled_mod_in_world, save_mod_state_in_world,
     unload_all_mods_in_world,
@@ -50,6 +51,9 @@ pub(crate) fn ensure_hierarchy_registered(world: &mut World) {
     let _ = with_world_registry(world, |reg| {
         reg.register_hierarchy(child_of_id, child_of_immutable)
     });
+    // Register Bevy's built-in `Children` upfront (handle `2`) alongside `ChildOf` (handle `1`) so
+    // zero-copy `sys_entity_children` traversal never mutates the registry mid-session.
+    ensure_children_registered_in_world(world);
 }
 
 pub(crate) fn ensure_world_mod_resources(world: &mut World) {
@@ -57,6 +61,9 @@ pub(crate) fn ensure_world_mod_resources(world: &mut World) {
         world.insert_resource(WorldDropGuard::new());
     }
     ensure_dynamic_hook_map_in_world(world);
+    if !world.contains_resource::<PersistentMessageCursors>() {
+        world.insert_resource(PersistentMessageCursors::default());
+    }
     if !world.contains_resource::<ModRegistry>() {
         world.insert_resource(ModRegistry::new());
     }
@@ -491,6 +498,14 @@ pub trait ModWorldExt {
         &mut self,
     ) -> Result<BamComponent, ComponentCollisionError>;
 
+    /// Registers a VTable-backed non-POD Bevy [`Message`] type (`Messages<M>`, e.g. containing
+    /// `String` or `Vec<T>` fields), initializing `Messages<M>` if absent and returning its 1-based
+    /// [`BamComponent`] handle. Guests read items through the `"bam.v0.<M>.export_fields"` witness
+    /// and send field packets reconstructed on the host allocator via `"bam.v0.<M>.import_field"`.
+    fn register_mod_non_pod_message<M: Message + ModComponent + Default>(
+        &mut self,
+    ) -> Result<BamComponent, ComponentCollisionError>;
+
     /// Registers a triggerable host Bevy [`Event`] implementing [`ModComponent`] + [`Copy`],
     /// returning its 1-based [`BamComponent`] handle for deferred triggers and guest observers.
     fn register_mod_event<E>(&mut self) -> Result<BamComponent, ComponentCollisionError>
@@ -626,6 +641,18 @@ impl ModWorldExt for World {
         }
         let messages_res_id = self.register_component::<Messages<M>>();
         with_world_registry(self, |reg| reg.register_message::<M>(messages_res_id))
+    }
+
+    fn register_mod_non_pod_message<M: Message + ModComponent + Default>(
+        &mut self,
+    ) -> Result<BamComponent, ComponentCollisionError> {
+        if !self.contains_resource::<Messages<M>>() {
+            self.init_resource::<Messages<M>>();
+        }
+        let messages_res_id = self.register_component::<Messages<M>>();
+        with_world_registry(self, |reg| {
+            reg.register_non_pod_message::<M>(messages_res_id)
+        })
     }
 
     fn register_mod_event<E>(&mut self) -> Result<BamComponent, ComponentCollisionError>

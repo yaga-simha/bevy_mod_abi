@@ -24,6 +24,7 @@ signature-verification = [
     "dep:signature",
     "dep:ed25519-dalek",
 ]
+bridge-reflect = ["dep:bevy_reflect", "bevy_ecs/bevy_reflect"]
 
 [dependencies]
 bevy_abi_mod_sys = { workspace = true }
@@ -31,6 +32,7 @@ bevy_ecs = { workspace = true }
 bevy_app = { workspace = true }
 bevy_platform = { workspace = true }
 bevy_tasks = { workspace = true }
+bevy_reflect = { workspace = true, optional = true }
 libloading = { workspace = true }
 nonmax = { workspace = true }
 arc-swap = { workspace = true }

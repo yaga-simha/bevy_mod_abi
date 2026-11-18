@@ -140,6 +140,23 @@ impl DynamicComponentHookMap {
             .map_or(&[], Vec::as_slice)
     }
 
+    pub(crate) fn active_clone_binding(
+        &self,
+        comp_id: ComponentId,
+        expected_layout: Layout,
+    ) -> Option<(ComponentCloneFn, *mut c_void)> {
+        self.clone_by_id
+            .get(&comp_id)
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .rev()
+                    .find(|e| e.is_active.load(Ordering::Acquire))
+            })
+            .filter(|entry| entry.layout == expected_layout)
+            .map(|entry| (entry.clone_fn.0, entry.user_data.as_ptr()))
+    }
+
     fn insert_or_update(&mut self, component_id: ComponentId, binding: DynamicHookBinding) {
         let entries = self.by_id.entry(component_id).or_default();
         entries.retain(|e| e.is_active.load(Ordering::Acquire));

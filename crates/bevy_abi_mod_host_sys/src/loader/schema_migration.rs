@@ -666,6 +666,10 @@ mod tests {
 
     #[test]
     fn snapshot_migrate_and_restore_v1_to_v2_under_miri() {
+        // Serialize against other global `DROP_SLAB` LIFO/free-count assertions.
+        let _serial = crate::drop_trampoline::TEST_DROP_SLAB_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         static V1_DROPS: AtomicUsize = AtomicUsize::new(0);
         static V2_DROPS: AtomicUsize = AtomicUsize::new(0);
 

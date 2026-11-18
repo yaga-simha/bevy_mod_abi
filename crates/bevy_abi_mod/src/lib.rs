@@ -176,6 +176,9 @@
 //! - `bridge-std-types`: Enables Bevy standard component/resource/input bridges (`StdTypesBridgePlugin`).
 //! - `bridge-asset`: Enables isolated `mod://<namespace>/...` Bevy asset sourcing (`ModAssetPlugin`).
 //! - `bridge-state`: Enables Bevy `States` exposure (`ModStateExt`).
+//! - `bridge-reflect`: Enables dynamic `bevy_reflect`, `bevy_remote` BRP, and `bevy_settings` bridges.
+//! - `bridge-bsn`: Enables Bevy Scene Notation (`bevy_scene`) scene spawning (`cmd_spawn_scene`).
+//! - `sub-app-extract`: Enables `SubApp` (`RenderApp`) extraction and custom shader/material support.
 //! - `hot-reload-watcher`: Enables debounced filesystem hot-reload watching (`ModHotReloadPlugin`).
 
 pub use bevy_abi_mod_host;

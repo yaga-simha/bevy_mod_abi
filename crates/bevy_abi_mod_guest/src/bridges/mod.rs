@@ -2,6 +2,8 @@
 //! components, resources, isolated mod assets, and state machines.
 
 pub mod asset;
+pub mod bsn;
+pub mod reflect;
 pub mod state;
 pub mod std_types;
 

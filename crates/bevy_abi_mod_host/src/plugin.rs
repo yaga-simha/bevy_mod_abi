@@ -17,7 +17,8 @@ use crate::mod_dag::ModDependencyGraph;
 use bevy_abi_mod_host_sys::ModTrustPolicy;
 use bevy_abi_mod_host_sys::{
     ModErrorPolicy, ModErrorPolicyConfig, ModHost, ModQuarantine, ModRegistry, ModSystemFaulted,
-    StartupCompleted, WorldDropGuard, ensure_dynamic_hook_map_in_world, mark_startup_completed,
+    PersistentMessageCursors, StartupCompleted, WorldDropGuard, ensure_dynamic_hook_map_in_world,
+    mark_startup_completed,
 };
 use bevy_app::{App, Last, Plugin, PostStartup, Update};
 use bevy_ecs::message::Messages;
@@ -99,6 +100,9 @@ impl Plugin for ConfiguredAbiModPlugin {
             app.insert_resource(WorldDropGuard::new());
         }
         ensure_dynamic_hook_map_in_world(app.world_mut());
+        if !app.world().contains_resource::<PersistentMessageCursors>() {
+            app.insert_resource(PersistentMessageCursors::default());
+        }
         if !app.world().contains_resource::<ModDependencyGraph>() {
             app.insert_resource(ModDependencyGraph::new());
         }

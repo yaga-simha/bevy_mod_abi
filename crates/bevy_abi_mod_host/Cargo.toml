@@ -31,9 +31,28 @@ bridge-std-types = [
 ]
 bridge-asset = ["dep:bevy_asset"]
 bridge-state = ["dep:bevy_state"]
-bridge-reflect = ["dep:bevy_reflect"]
-bridge-bsn = ["dep:bevy_scene", "bridge-asset"]
-sub-app-extract = ["dep:bevy_extract"]
+bridge-reflect = [
+    "bevy_abi_mod_host_sys/bridge-reflect",
+    "bevy_ecs/bevy_reflect",
+    "bevy_app/bevy_reflect",
+    "dep:bevy_reflect",
+    "dep:bevy_remote",
+    "dep:bevy-settings",
+    "dep:serde_json",
+]
+bridge-bsn = ["dep:bevy_scene", "dep:bevy_reflect", "bevy_ecs/bevy_reflect", "bridge-asset"]
+sub-app-extract = [
+    "dep:bevy_extract",
+    "dep:bevy_shader",
+    "dep:bevy_material",
+    "dep:bevy_render",
+    "dep:bevy_sprite",
+    "dep:bevy_sprite_render",
+    "dep:bevy_pbr",
+    "dep:bevy_mesh",
+    "dep:bevy_image",
+    "bridge-asset",
+]
 hot-reload-watcher = ["dep:notify-debouncer-full"]
 
 [dependencies]
@@ -54,8 +73,19 @@ bevy_input = { workspace = true, optional = true }
 bevy_asset = { workspace = true, optional = true }
 bevy_state = { workspace = true, optional = true }
 bevy_reflect = { workspace = true, optional = true }
+bevy_remote = { workspace = true, optional = true }
+bevy-settings = { workspace = true, optional = true }
 bevy_scene = { workspace = true, optional = true }
 bevy_extract = { workspace = true, optional = true }
+bevy_shader = { workspace = true, optional = true }
+bevy_material = { workspace = true, optional = true }
+bevy_render = { workspace = true, optional = true }
+bevy_sprite = { workspace = true, optional = true }
+bevy_sprite_render = { workspace = true, optional = true }
+bevy_pbr = { workspace = true, optional = true }
+bevy_mesh = { workspace = true, optional = true }
+bevy_image = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 notify-debouncer-full = { workspace = true, optional = true }
 toml = { workspace = true }
 semver = { workspace = true }

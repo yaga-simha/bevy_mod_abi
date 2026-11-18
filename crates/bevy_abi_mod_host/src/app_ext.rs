@@ -53,6 +53,13 @@ pub trait ModAppExt {
         &mut self,
     ) -> Result<BamComponent, ComponentCollisionError>;
 
+    /// Registers a VTable-backed non-POD Bevy [`Message`] type (`Messages<M>`, e.g. containing
+    /// `String` or `Vec<T>` fields), adding `Messages<M>` frame maintenance to this [`App`] and
+    /// returning its 1-based [`BamComponent`] handle.
+    fn register_mod_non_pod_message<M: Message + ModComponent + Default>(
+        &mut self,
+    ) -> Result<BamComponent, ComponentCollisionError>;
+
     /// Registers a triggerable host Bevy [`Event`] implementing [`ModComponent`] + [`Copy`],
     /// returning its 1-based [`BamComponent`] handle.
     fn register_mod_event<E>(&mut self) -> Result<BamComponent, ComponentCollisionError>
@@ -167,6 +174,15 @@ impl ModAppExt for App {
             self.add_message::<M>();
         }
         self.world_mut().register_mod_message::<M>()
+    }
+
+    fn register_mod_non_pod_message<M: Message + ModComponent + Default>(
+        &mut self,
+    ) -> Result<BamComponent, ComponentCollisionError> {
+        if !self.world().contains_resource::<Messages<M>>() {
+            self.add_message::<M>();
+        }
+        self.world_mut().register_mod_non_pod_message::<M>()
     }
 
     #[inline]

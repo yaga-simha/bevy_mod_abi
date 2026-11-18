@@ -117,13 +117,14 @@ pub use app::{
 pub use bridges::{
     FfiGlobalTransform, FfiKeyCode, FfiKeyboardInput, FfiMouseButton, FfiMouseInput, FfiTimeFixed,
     FfiTimeReal, FfiTimeVirtual, FfiTransform, FfiVisibility, GuestAssetHandle, GuestAssetHostExt,
-    GuestAssetServer, GuestCommandsStateExt, GuestNameBridge, GuestStateBridge,
-    GuestStateSystemBuilderExt, TypedAssetHandle, on_enter_schedule, on_exit_schedule,
-    on_transition_schedule,
+    GuestAssetServer, GuestBridgesHostExt, GuestCommandsStateExt, GuestNameBridge,
+    GuestStateBridge, GuestStateHandles, GuestStateQueryBuilderExt, GuestStateSystemBuilderExt,
+    GuestStdCommandsExt, GuestStdHandles, GuestStdQueryBuilderExt, TypedAssetHandle,
+    on_enter_schedule, on_exit_schedule, on_transition_schedule,
 };
 #[cfg(feature = "derive")]
 pub use bridges::{
-    GuestGlobalTransformBridge, GuestKeyboardInputBridge, GuestMouseInputBridge,
+    GuestGlobalTransformBridge, GuestKeyboardInputBridge, GuestMouseInputBridge, GuestStdTypes,
     GuestTimeFixedBridge, GuestTimeRealBridge, GuestTimeVirtualBridge, GuestTransformBridge,
     GuestVisibilityBridge, GuestWireBridge,
 };

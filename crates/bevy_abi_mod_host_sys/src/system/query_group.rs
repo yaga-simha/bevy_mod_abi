@@ -104,7 +104,6 @@ impl CachedQueryGroup {
     /// Records the owning `(mod_namespace, system_name)` identity so any active message or
     /// removed-component cursors are saved into [`PersistentMessageCursors`] when dropped and
     /// restored when re-initialized after a hot reload.
-    #[allow(dead_code)]
     pub(crate) fn set_system_identity(
         &mut self,
         mod_namespace: Option<Arc<str>>,

@@ -1096,6 +1096,18 @@ impl System for GuestSystem {
             self.registry = world_reg.clone();
         }
 
+        // Bind each query group to this system's `(mod_namespace, system_name)` identity so
+        // message / removed-component cursors persist across `reload_mod` through
+        // `PersistentMessageCursors`. Unscoped (host-constructed) systems never persist cursors,
+        // preventing accidental cross-system cursor sharing between same-named host systems.
+        for group in &mut self.query_groups {
+            if let Some(ns) = self.mod_namespace.as_ref() {
+                group.set_system_identity(Some(Arc::clone(ns)), Arc::clone(&self.name));
+            } else {
+                group.owner_system_key = None;
+            }
+        }
+
         match initialize_query_groups_in_world(world, &self.snapshot, &mut self.query_groups) {
             Ok(access_set) => {
                 #[cfg(feature = "diagnostics")]

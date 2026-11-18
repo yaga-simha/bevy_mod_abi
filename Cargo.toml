@@ -108,8 +108,18 @@ bevy_input = { version = "0.20.1", default-features = false, features = ["std", 
 bevy_asset = { version = "0.20.1", default-features = false, features = ["multi_threaded"] }
 bevy_state = { version = "0.20.1", default-features = false, features = ["std", "bevy_app"] }
 bevy_reflect = { version = "0.20.1", default-features = false, features = ["std"] }
+bevy_remote = { version = "0.20.1", default-features = false }
+bevy-settings = { version = "0.20.1", default-features = false }
 bevy_scene = { version = "0.20.1", default-features = false }
 bevy_extract = { version = "0.20.1", default-features = false }
+bevy_shader = { version = "0.20.1", default-features = false }
+bevy_material = { version = "0.20.1", default-features = false }
+bevy_render = { version = "0.20.1", default-features = false }
+bevy_sprite = { version = "0.20.1", default-features = false }
+bevy_sprite_render = { version = "0.20.1", default-features = false }
+bevy_pbr = { version = "0.20.1", default-features = false }
+bevy_mesh = { version = "0.20.1", default-features = false }
+bevy_image = { version = "0.20.1", default-features = false }
 toml = "0.8"
 semver = "1"
 serde = { version = "1", features = ["derive"] }

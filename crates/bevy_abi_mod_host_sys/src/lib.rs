@@ -34,7 +34,7 @@ pub use ffi::commands::{
 pub use ffi::commands_ext::{
     host_cmd_despawn_all, host_cmd_insert_if_new, host_cmd_spawn_batch, host_cmd_spawn_persistent,
 };
-pub use ffi::hierarchy_ext::host_sys_entity_children;
+pub use ffi::hierarchy_ext::{ensure_children_registered_in_world, host_sys_entity_children};
 pub use ffi::host_api::HOST_API;
 pub use ffi::iter::{
     HostIter, QueryPlan, QueryTermMeta, SparseRowScratch, TickFilterTerm, host_iter_column_info,
@@ -50,6 +50,18 @@ pub use ffi::proc_address::host_get_proc_address;
 pub use ffi::register::{
     GuestObserverBinding, LoadContext, ensure_dynamic_hook_map_in_world, host_load_host_ctx,
     host_register_component, host_register_observer, host_register_system, host_resolve_component,
+};
+pub use ffi::wave3_helpers::{
+    WitnessFieldDescriptor, apply_entity_component_fields, apply_resource_fields,
+    ensure_component_in_target_world, export_entity_component_fields, export_resource_fields,
+    extract_component_between_worlds, extract_resource_between_worlds,
+    insert_entity_component_from_fields, insert_or_apply_entity_component_fields,
+    inspect_component_witness_fields, inspect_component_witness_fields_in_registry,
+    read_entity_pod_bytes, write_entity_pod_bytes,
+};
+#[cfg(feature = "bridge-reflect")]
+pub use ffi::wave3_helpers::{
+    empty_reflect_unchecked_mut, reflect_entity_component, reflect_entity_component_mut,
 };
 pub use handle_header::{
     COMMANDS_MAGIC, HOST_CTX_MAGIC, HandleHeader, HostContext, ITER_MAGIC, LOAD_CTX_MAGIC,
@@ -85,9 +97,10 @@ pub use schedule::{
 pub use sync_ptr::{GuestFnPtr, GuestInstancePtr, GuestUserData, SymbolAddress};
 pub use system::{
     BamQuerySpecOwned, GuestSystem, HostSystemCtx, MAX_SYSTEM_QUERIES, ModErrorPolicy,
-    ModErrorPolicyConfig, ModQuarantine, ModSystemError, ModSystemFaulted, SystemInitError,
-    host_sys_commands, host_sys_entity_get, host_sys_entity_get_mut, host_sys_host_ctx,
-    host_sys_query, host_sys_res_mut_ptr, host_sys_res_ptr,
+    ModErrorPolicyConfig, ModQuarantine, ModSystemError, ModSystemFaulted,
+    PersistentMessageCursors, SystemInitError, host_sys_commands, host_sys_entity_get,
+    host_sys_entity_get_mut, host_sys_host_ctx, host_sys_query, host_sys_res_mut_ptr,
+    host_sys_res_ptr,
 };
 #[cfg(feature = "diagnostics")]
 pub use system::{ModDiagnosticsCollector, ModDiagnosticsSample};

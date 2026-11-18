@@ -3,6 +3,10 @@
 
 #[cfg(feature = "bridge-asset")]
 pub mod asset;
+#[cfg(feature = "bridge-bsn")]
+pub mod bsn;
+#[cfg(feature = "bridge-reflect")]
+pub mod reflect;
 #[cfg(feature = "bridge-state")]
 pub mod state;
 #[cfg(feature = "bridge-std-types")]

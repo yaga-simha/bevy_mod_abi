@@ -22,6 +22,11 @@
 //!   host backend (`ModAssetPlugin`).
 //! - `bridge-state`: Bevy `States` exposure (`ModStateExt::expose_mod_state`), transition schedules,
 //!   and `in_state` run conditions.
+//! - `bridge-reflect`: Dynamic `bevy_reflect` registration, Bevy Remote Protocol (`bevy_remote`)
+//!   methods, and `bevy_settings` exposure for C-ABI components/resources.
+//! - `bridge-bsn`: Bevy Scene Notation (`bevy_scene`) spawning and `Ready` observer integration.
+//! - `sub-app-extract`: Safe `SubApp` (`RenderApp`) extraction, custom `Shader`, and custom
+//!   `Material` / `Material2d` modding support.
 //! - `hot-reload-watcher`: Debounced filesystem hot-reload watcher (`ModHotReloadPlugin`).
 //!
 //! # Quickstart
@@ -60,6 +65,8 @@ pub mod events;
 pub mod mod_dag;
 pub mod plugin;
 pub mod schedule_sets;
+#[cfg(feature = "sub-app-extract")]
+pub mod sub_app_materials;
 pub mod watcher;
 pub mod world_ext;
 
@@ -67,11 +74,21 @@ pub use bevy_abi_mod_macros::{AbiPod, ModComponent};
 pub use bevy_abi_mod_sys;
 
 pub use app_ext::ModAppExt;
+pub use bevy_abi_mod_host_sys::PersistentMessageCursors;
+pub use bevy_abi_mod_host_sys::loader::{
+    ExportedFieldRecord, ReloadColumnSnapshot, SnapshotComponentColumn, SnapshotEntityFields,
+};
 pub use bevy_abi_mod_host_sys::{
     BinaryFormat, ComponentCollisionError, ComponentOptions, LibraryResidencyInfo, LoadOptions,
     LoadedMod, ModErrorPolicy, ModErrorPolicyConfig, ModHost, ModId, ModLoadError, ModQuarantine,
-    ModRegistry, ModScoped, RegisteredComponent, RegistrySnapshot, TargetEntity, WorldDropGuard,
+    ModRegistry, ModScoped, RegisteredComponent, RegistrySnapshot, TargetEntity,
+    WitnessFieldDescriptor, WorldDropGuard, apply_entity_component_fields, apply_resource_fields,
+    ensure_component_in_target_world, export_entity_component_fields, export_resource_fields,
+    extract_component_between_worlds, extract_resource_between_worlds,
+    insert_entity_component_from_fields, insert_or_apply_entity_component_fields,
+    inspect_component_witness_fields, inspect_component_witness_fields_in_registry,
     inspect_library_residency, inspect_library_residency_file, is_abi_version_compatible,
+    read_entity_pod_bytes, write_entity_pod_bytes,
 };
 #[cfg(feature = "signature-verification")]
 pub use bevy_abi_mod_host_sys::{
@@ -82,6 +99,16 @@ pub use bevy_abi_mod_host_sys::{
     preverify_mod_on_disk, sign_mod_bytes_with_certificate, sign_mod_bytes_with_key,
     sign_mod_bytes_with_openssh_certificate,
 };
+#[cfg(feature = "bridge-reflect")]
+pub use bevy_abi_mod_host_sys::{
+    empty_reflect_unchecked_mut, reflect_entity_component, reflect_entity_component_mut,
+};
+#[cfg(all(
+    feature = "bridge-std-types",
+    feature = "bridge-asset",
+    feature = "bridge-state"
+))]
+pub use bridges::ModBridgesPlugin;
 #[cfg(feature = "bridge-std-types")]
 pub use bridges::{
     FfiGlobalTransform, FfiKeyCode, FfiKeyboardInput, FfiMouseButton, FfiMouseInput, FfiTimeFixed,
@@ -115,6 +142,12 @@ pub use world_ext::ModWorldExt;
 /// Convenient prelude module for Bevy games hosting native C-ABI mods (`ABI 0.2.0`).
 pub mod prelude {
     pub use crate::app_ext::ModAppExt;
+    #[cfg(all(
+        feature = "bridge-std-types",
+        feature = "bridge-asset",
+        feature = "bridge-state"
+    ))]
+    pub use crate::bridges::ModBridgesPlugin;
     #[cfg(feature = "bridge-std-types")]
     pub use crate::bridges::{
         FfiGlobalTransform, FfiKeyCode, FfiKeyboardInput, FfiMouseButton, FfiMouseInput,
@@ -148,7 +181,7 @@ pub mod prelude {
     pub use crate::{
         AbiPod, ComponentCollisionError, ComponentOptions, LoadOptions, LoadedMod, ModComponent,
         ModErrorPolicy, ModHost, ModId, ModLoadError, ModQuarantine, ModRegistry, ModScoped,
-        TargetEntity,
+        PersistentMessageCursors, TargetEntity,
     };
     #[cfg(feature = "signature-verification")]
     pub use crate::{
@@ -232,15 +265,21 @@ mod tests {
             .unwrap();
         let grav_h = app.register_mod_resource::<Gravity>().unwrap();
 
-        assert_eq!(health_h, BamComponent::from_raw(2));
-        assert_eq!(tag_h, BamComponent::from_raw(3));
-        assert_eq!(grav_h, BamComponent::from_raw(4));
+        // Handles `1` (`ChildOf`) and `2` (`Children`) are reserved by `AbiModPlugin`.
+        assert_eq!(health_h, BamComponent::from_raw(3));
+        assert_eq!(tag_h, BamComponent::from_raw(4));
+        assert_eq!(grav_h, BamComponent::from_raw(5));
 
         let reg = app.world().resource::<ModRegistry>();
         assert_eq!(
             reg.get_by_name(bevy_abi_mod_sys::BAM_CHILD_OF_NAME)
                 .map(|c| c.handle),
             Some(BamComponent::from_raw(1))
+        );
+        assert_eq!(
+            reg.get_by_name(bevy_abi_mod_sys::BAM_CHILDREN_NAME)
+                .map(|c| c.handle),
+            Some(BamComponent::from_raw(2))
         );
         let health_meta = reg.get_by_handle(health_h).unwrap();
         assert!(health_meta.insert_raw_fn.is_some());

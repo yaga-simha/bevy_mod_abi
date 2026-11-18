@@ -15,4 +15,4 @@ pub use guest_system::{
 };
 #[cfg(feature = "diagnostics")]
 pub use guest_system::{ModDiagnosticsCollector, ModDiagnosticsSample};
-pub use query_group::{BamQuerySpecOwned, MAX_SYSTEM_QUERIES};
+pub use query_group::{BamQuerySpecOwned, MAX_SYSTEM_QUERIES, PersistentMessageCursors};

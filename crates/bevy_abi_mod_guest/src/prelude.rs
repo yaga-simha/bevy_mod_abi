@@ -17,7 +17,7 @@ pub use bevy_abi_mod_macros::{AbiPod, ModComponent};
 
 #[cfg(feature = "derive")]
 pub use crate::bridges::{
-    GuestGlobalTransformBridge, GuestKeyboardInputBridge, GuestMouseInputBridge,
+    GuestGlobalTransformBridge, GuestKeyboardInputBridge, GuestMouseInputBridge, GuestStdTypes,
     GuestTimeFixedBridge, GuestTimeRealBridge, GuestTimeVirtualBridge, GuestTransformBridge,
     GuestVisibilityBridge, GuestWireBridge,
 };
@@ -29,9 +29,10 @@ pub use crate::{
     bridges::{
         FfiGlobalTransform, FfiKeyCode, FfiKeyboardInput, FfiMouseButton, FfiMouseInput,
         FfiTimeFixed, FfiTimeReal, FfiTimeVirtual, FfiTransform, FfiVisibility, GuestAssetHandle,
-        GuestAssetHostExt, GuestAssetServer, GuestCommandsStateExt, GuestNameBridge,
-        GuestStateBridge, GuestStateSystemBuilderExt, TypedAssetHandle, on_enter_schedule,
-        on_exit_schedule, on_transition_schedule,
+        GuestAssetHostExt, GuestAssetServer, GuestBridgesHostExt, GuestCommandsStateExt,
+        GuestNameBridge, GuestStateBridge, GuestStateHandles, GuestStateQueryBuilderExt,
+        GuestStateSystemBuilderExt, GuestStdCommandsExt, GuestStdHandles, GuestStdQueryBuilderExt,
+        TypedAssetHandle, on_enter_schedule, on_exit_schedule, on_transition_schedule,
     },
     commands::GuestCommands,
     component::{GuestComponent, GuestComponentHooks, guest_component_uuid},

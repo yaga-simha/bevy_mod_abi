@@ -10,3 +10,4 @@ pub mod iter_ext;
 pub mod observers_ext;
 pub mod proc_address;
 pub mod register;
+pub mod wave3_helpers;

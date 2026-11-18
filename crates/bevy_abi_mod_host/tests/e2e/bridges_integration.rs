@@ -105,6 +105,10 @@ struct BetaTelemetry {
     asset_cross_mod_rejected: u32,
     asset_traversal_rejected: u32,
     init_error_code: i32,
+    /// Set to `1` once the guest's `Update`-tick `h.is_loaded(ctx.host())` observes `LOADED`.
+    asset_update_tick_loaded: u32,
+    /// Most recent non-OK `FfiResult` code from `Update`-tick `ctx.host().asset_get_load_state`.
+    asset_update_tick_error: u32,
 }
 
 #[repr(C)]
@@ -782,6 +786,8 @@ struct BetaTelemetry {
     asset_cross_mod_rejected: u32,
     asset_traversal_rejected: u32,
     init_error_code: i32,
+    asset_update_tick_loaded: u32,
+    asset_update_tick_error: u32,
 }
 
 impl GuestComponent for BetaTelemetry {
@@ -816,7 +822,13 @@ fn build_beta(app: &mut GuestApp<'_>) -> Result<(), FfiResult> {
         .schedule(ScheduleId::UPDATE)
         .resource_write::<BetaTelemetry>()
         .build(move |ctx| -> Result<(), FfiResult> {
-            let has_handle = BETA_ASSET.lock().expect("lock beta asset").is_some_and(|h| h.is_some());
+            let handle = *BETA_ASSET.lock().expect("lock beta asset");
+            let has_handle = handle.is_some_and(|h| h.is_some());
+            // `Update`-tick load-state polling through the live per-invocation `ctx.host()`
+            // (refreshed via `sys_host_ctx`, never the poisoned init-time `LoadContext` host ctx).
+            let tick_state = handle
+                .filter(GuestAssetHandle::is_some)
+                .map(|h| h.is_loaded(ctx.host()));
             let tel = ctx
                 .resource_mut::<BetaTelemetry>(0)
                 .ok_or(FfiResult::OUT_OF_RANGE)?;
@@ -824,6 +836,11 @@ fn build_beta(app: &mut GuestApp<'_>) -> Result<(), FfiResult> {
             tel.asset_traversal_rejected = traversal_rejected;
             if has_handle {
                 tel.asset_loaded_beta_ok = 1;
+            }
+            match tick_state {
+                Some(Ok(true)) => tel.asset_update_tick_loaded = 1,
+                Some(Err(err)) => tel.asset_update_tick_error = err.0,
+                _ => {}
             }
             Ok(())
         });
@@ -1098,20 +1115,27 @@ fn cross_bridge_cdylib_mods_drive_std_types_isolated_assets_and_state_machine() 
     );
     assert_eq!(app.world().resource::<BridgeTelemetry>().enter_menu, 2);
 
-    // Poll host Assets<TextAsset> until async mod:// asset loads complete (guest `Update`-tick
-    // `h.is_loaded(ctx.host())` polling will also be wired at Wave 2 merge once `sys_host_ctx`
-    // refresh lands in `guest_sys`), and check multi-mod isolation + handle release on unload.
+    // Poll host Assets<TextAsset> until async mod:// asset loads complete, and verify the guest's
+    // `Update`-tick `h.is_loaded(ctx.host())` (live `sys_host_ctx`) observes `LOADED` too, then
+    // check multi-mod isolation + handle release on unload.
     #[cfg(feature = "bridge-reflect")]
     {
         let mut both_texts_loaded = false;
-        for _ in 0..40 {
+        let mut guest_tick_observed_loaded = false;
+        for _ in 0..80 {
             app.update();
             let assets = app
                 .world()
                 .resource::<bevy_asset::Assets<reflect_assets::TextAsset>>();
             let texts: Vec<&str> = assets.iter().map(|(_, a)| a.0.as_str()).collect();
-            if texts.contains(&"hello alpha mod!") && texts.contains(&"beta secret asset!") {
-                both_texts_loaded = true;
+            both_texts_loaded |=
+                texts.contains(&"hello alpha mod!") && texts.contains(&"beta secret asset!");
+            guest_tick_observed_loaded = app
+                .world()
+                .resource::<BetaTelemetry>()
+                .asset_update_tick_loaded
+                == 1;
+            if both_texts_loaded && guest_tick_observed_loaded {
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -1119,6 +1143,17 @@ fn cross_bridge_cdylib_mods_drive_std_types_isolated_assets_and_state_machine() 
         assert!(
             both_texts_loaded,
             "expected both isolated mod:// TextAssets to finish loading on AssetServer"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<BetaTelemetry>()
+                .asset_update_tick_error,
+            0,
+            "Update-tick ctx.host().asset_get_load_state must use the live sys_host_ctx"
+        );
+        assert!(
+            guest_tick_observed_loaded,
+            "guest Update-tick h.is_loaded(ctx.host()) must observe LOADED via sys_host_ctx"
         );
         assert_eq!(
             app.world()
