@@ -2,14 +2,14 @@
 //! (`GuestStateBridge`, deterministic `OnEnter`/`OnExit`/`OnTransition` schedule IDs,
 //! `.run_if_in_state(...)`, `set_state_if_different`, and `DespawnOnExit`/`DespawnOnEnter`).
 
-use bevy_abi_mod_guest_sys::{Host, ValidatedSystemRef, ValidatedWireVTable};
+use bevy_abi_mod_guest_sys::{Host, ValidatedSystemRef, ValidatedWireVTable, resolve_component};
 use bevy_abi_mod_sys::{
-    BamChangeTicks, BamComponent, ComponentUuid, FfiEntity, FfiResult, ScheduleId,
+    AccessMode, BamChangeTicks, BamComponent, ComponentUuid, FfiEntity, FfiResult, ScheduleId,
 };
 use core::ffi::CStr;
 use std::ffi::CString;
 
-use crate::app::{SystemBuilder, SystemContext};
+use crate::app::{QueryBuilder, SystemBuilder, SystemContext};
 use crate::commands::GuestCommands;
 
 /// Computes the deterministic `OnEnter(variant)` custom [`ScheduleId`] for `variant_index`
@@ -46,6 +46,8 @@ pub const fn on_transition_schedule(
 #[derive(Clone, Copy)]
 pub struct GuestStateBridge {
     state_slot: usize,
+    state_handle: BamComponent,
+    next_state_handle: BamComponent,
     state_vtable: ValidatedWireVTable<u32>,
     next_state_vtable: ValidatedWireVTable<u32>,
 }
@@ -62,6 +64,10 @@ impl GuestStateBridge {
     pub fn resolve_slot(host: &Host, slot: usize) -> Result<Self, FfiResult> {
         let state_canonical = format!("bevy_state::State#{slot}");
         let next_canonical = format!("bevy_abi_mod::ModNextState#{slot}");
+        let state_comp_cstr =
+            CString::new(state_canonical.as_str()).map_err(|_| FfiResult::INVALID_ARGUMENT)?;
+        let next_comp_cstr =
+            CString::new(next_canonical.as_str()).map_err(|_| FfiResult::INVALID_ARGUMENT)?;
         let state_sym = CString::new(format!("bam.v0.{state_canonical}.vtable"))
             .map_err(|_| FfiResult::INVALID_ARGUMENT)?;
         let next_sym = CString::new(format!("bam.v0.{next_canonical}.vtable"))
@@ -69,6 +75,9 @@ impl GuestStateBridge {
 
         let state_uuid = ComponentUuid::from_canonical_name(&state_canonical);
         let next_uuid = ComponentUuid::from_canonical_name(&next_canonical);
+
+        let state_handle = resolve_component(host, Some(&state_comp_cstr), Some(state_uuid))?;
+        let next_state_handle = resolve_component(host, Some(&next_comp_cstr), Some(next_uuid))?;
 
         let state_vtable = host
             .resolve_mapped_wire_vtable::<u32>(&state_sym, state_uuid)
@@ -91,6 +100,8 @@ impl GuestStateBridge {
 
         Ok(Self {
             state_slot: slot,
+            state_handle,
+            next_state_handle,
             state_vtable,
             next_state_vtable,
         })
@@ -100,6 +111,18 @@ impl GuestStateBridge {
     #[inline]
     pub const fn state_slot(&self) -> usize {
         self.state_slot
+    }
+
+    /// Returns the resolved [`BamComponent`] resource handle for `State<S>` in this slot.
+    #[inline]
+    pub const fn state_handle(&self) -> BamComponent {
+        self.state_handle
+    }
+
+    /// Returns the resolved [`BamComponent`] resource handle for `ModNextState<S>` in this slot.
+    #[inline]
+    pub const fn next_state_handle(&self) -> BamComponent {
+        self.next_state_handle
     }
 
     /// Reads the current `State<S>` `u32` discriminant declared in query `0` at `term_index`.
@@ -253,6 +276,99 @@ impl GuestCommandsStateExt for GuestCommands<'_> {
     #[inline]
     fn despawn_on_enter(&mut self, entity: FfiEntity, enter_marker: BamComponent) -> FfiResult {
         self.insert_default(entity, enter_marker)
+    }
+}
+
+/// Extension trait on [`QueryBuilder`] adding bridged `State<S>` and `ModNextState<S>` resource
+/// terms.
+pub trait GuestStateQueryBuilderExt {
+    /// Appends a shared resource read (`Res<State<S>>`) term using `bridge`.
+    fn read_state(self, bridge: &GuestStateBridge) -> Self;
+    /// Appends an exclusive resource write (`ResMut<ModNextState<S>>`) term using `bridge`.
+    fn write_next_state(self, bridge: &GuestStateBridge) -> Self;
+    /// Appends a shared resource read (`Res<State<S>>`) term for primary state slot `0`.
+    fn read_primary_state(self) -> Self;
+    /// Appends an exclusive resource write (`ResMut<ModNextState<S>>`) term for primary slot `0`.
+    fn write_primary_next_state(self) -> Self;
+}
+
+impl GuestStateQueryBuilderExt for QueryBuilder<'_> {
+    #[inline]
+    fn read_state(self, bridge: &GuestStateBridge) -> Self {
+        self.resource_read_handle(bridge.state_handle())
+    }
+
+    #[inline]
+    fn write_next_state(self, bridge: &GuestStateBridge) -> Self {
+        self.resource_write_handle(bridge.next_state_handle())
+    }
+
+    #[inline]
+    fn read_primary_state(self) -> Self {
+        self.term_named(
+            c"bevy_state::State#0",
+            Some(ComponentUuid::from_canonical_name("bevy_state::State#0")),
+            AccessMode::RESOURCE_READ,
+        )
+    }
+
+    #[inline]
+    fn write_primary_next_state(self) -> Self {
+        self.term_named(
+            c"bevy_abi_mod::ModNextState#0",
+            Some(ComponentUuid::from_canonical_name(
+                "bevy_abi_mod::ModNextState#0",
+            )),
+            AccessMode::RESOURCE_WRITE,
+        )
+    }
+}
+
+/// Bundled state bridge + pre-resolved `DespawnOnExit` / `DespawnOnEnter` marker handles
+/// (`0..variant_count`) for one host-exposed state slot.
+#[derive(Clone)]
+pub struct GuestStateHandles {
+    /// Resolved state VTable and resource handle bridge.
+    pub bridge: GuestStateBridge,
+    /// `DespawnOnExit(variant)` marker handles indexed by `variant_slot`.
+    pub despawn_on_exit: Vec<BamComponent>,
+    /// `DespawnOnEnter(variant)` marker handles indexed by `variant_slot`.
+    pub despawn_on_enter: Vec<BamComponent>,
+}
+
+impl GuestStateHandles {
+    /// Resolves primary state slot `0` and all `variant_count` `DespawnOnExit` /
+    /// `DespawnOnEnter` handles.
+    pub fn resolve_primary(host: &Host, variant_count: usize) -> Result<Self, FfiResult> {
+        Self::resolve_slot(host, 0, variant_count)
+    }
+
+    /// Resolves `slot` and all `variant_count` `DespawnOnExit` / `DespawnOnEnter` handles.
+    pub fn resolve_slot(host: &Host, slot: usize, variant_count: usize) -> Result<Self, FfiResult> {
+        let bridge = GuestStateBridge::resolve_slot(host, slot)?;
+        let mut despawn_on_exit = Vec::with_capacity(variant_count);
+        let mut despawn_on_enter = Vec::with_capacity(variant_count);
+        for idx in 0..variant_count {
+            despawn_on_exit.push(bridge.resolve_despawn_on_exit(host, idx)?);
+            despawn_on_enter.push(bridge.resolve_despawn_on_enter(host, idx)?);
+        }
+        Ok(Self {
+            bridge,
+            despawn_on_exit,
+            despawn_on_enter,
+        })
+    }
+
+    /// Returns the `DespawnOnExit` handle for `variant_slot`, if present.
+    #[inline]
+    pub fn exit_marker(&self, variant_slot: usize) -> Option<BamComponent> {
+        self.despawn_on_exit.get(variant_slot).copied()
+    }
+
+    /// Returns the `DespawnOnEnter` handle for `variant_slot`, if present.
+    #[inline]
+    pub fn enter_marker(&self, variant_slot: usize) -> Option<BamComponent> {
+        self.despawn_on_enter.get(variant_slot).copied()
     }
 }
 

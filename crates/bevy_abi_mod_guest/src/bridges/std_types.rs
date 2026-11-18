@@ -3,20 +3,22 @@
 //!
 //! Enforces `#![forbid(unsafe_code)]` with zero Bevy dependencies.
 
-use bevy_abi_mod_guest_sys::{Host, ValidatedIter, ValidatedStringVTable};
+use bevy_abi_mod_guest_sys::{Host, ValidatedIter, ValidatedStringVTable, resolve_component};
 #[cfg(feature = "derive")]
 use bevy_abi_mod_guest_sys::{ValidatedSystemRef, ValidatedWireVTable};
 #[cfg(feature = "derive")]
 use bevy_abi_mod_macros::AbiPod;
 #[cfg(feature = "derive")]
-use bevy_abi_mod_sys::{AbiPod, BamChangeTicks, BamComponent};
-use bevy_abi_mod_sys::{ComponentUuid, FfiBool, FfiResult};
+use bevy_abi_mod_sys::{AbiPod, BamChangeTicks};
+use bevy_abi_mod_sys::{AccessMode, BamComponent, ComponentUuid, FfiBool, FfiEntity, FfiResult};
 use core::ffi::CStr;
 #[cfg(feature = "derive")]
 use core::marker::PhantomData;
 
+use crate::app::QueryBuilder;
 #[cfg(feature = "derive")]
 use crate::app::SystemContext;
+use crate::commands::GuestCommands;
 use crate::iter::{Chunk, ChunkIter};
 
 /// Canonical ABI name for bridged host `Transform`.
@@ -991,6 +993,301 @@ pub fn resolve_string_vtable(
     canonical_name: &str,
 ) -> Result<ValidatedStringVTable, FfiResult> {
     host.resolve_mapped_string_vtable(symbol, ComponentUuid::from_canonical_name(canonical_name))
+}
+
+/// Extension trait on [`QueryBuilder`] adding bridged standard Bevy component and resource
+/// terms (`Transform`, `GlobalTransform`, `Visibility`, `Name`, `Time<*>`, `ButtonInput<*>`).
+pub trait GuestStdQueryBuilderExt {
+    /// Appends a shared read (`&Transform` wire projection) term.
+    fn read_transform(self) -> Self;
+    /// Appends an exclusive write (`&mut Transform` wire projection) term.
+    fn write_transform(self) -> Self;
+    /// Appends a shared read (`&GlobalTransform` wire projection) term.
+    fn read_global_transform(self) -> Self;
+    /// Appends a shared read (`&Visibility` wire projection) term.
+    fn read_visibility(self) -> Self;
+    /// Appends an exclusive write (`&mut Visibility` wire projection) term.
+    fn write_visibility(self) -> Self;
+    /// Appends a shared read (`&Name` wire projection) term.
+    fn read_name(self) -> Self;
+    /// Appends an exclusive write (`&mut Name` wire projection) term.
+    fn write_name(self) -> Self;
+    /// Appends a shared resource read (`Res<Time<Virtual>>`) term.
+    fn read_time_virtual(self) -> Self;
+    /// Appends a shared resource read (`Res<Time<Fixed>>`) term.
+    fn read_time_fixed(self) -> Self;
+    /// Appends a shared resource read (`Res<Time<Real>>`) term.
+    fn read_time_real(self) -> Self;
+    /// Appends a shared resource read (`Res<ButtonInput<KeyCode>>`) term.
+    fn read_keyboard_input(self) -> Self;
+    /// Appends a shared resource read (`Res<ButtonInput<MouseButton>>`) term.
+    fn read_mouse_input(self) -> Self;
+}
+
+impl GuestStdQueryBuilderExt for QueryBuilder<'_> {
+    #[inline]
+    fn read_transform(self) -> Self {
+        self.term_named(
+            c"bevy_transform::components::transform::Transform",
+            Some(ComponentUuid::from_canonical_name(CANONICAL_TRANSFORM_NAME)),
+            AccessMode::READ,
+        )
+    }
+
+    #[inline]
+    fn write_transform(self) -> Self {
+        self.term_named(
+            c"bevy_transform::components::transform::Transform",
+            Some(ComponentUuid::from_canonical_name(CANONICAL_TRANSFORM_NAME)),
+            AccessMode::WRITE,
+        )
+    }
+
+    #[inline]
+    fn read_global_transform(self) -> Self {
+        self.term_named(
+            c"bevy_transform::components::global_transform::GlobalTransform",
+            Some(ComponentUuid::from_canonical_name(
+                CANONICAL_GLOBAL_TRANSFORM_NAME,
+            )),
+            AccessMode::READ,
+        )
+    }
+
+    #[inline]
+    fn read_visibility(self) -> Self {
+        self.term_named(
+            c"bevy_camera::visibility::Visibility",
+            Some(ComponentUuid::from_canonical_name(
+                CANONICAL_VISIBILITY_NAME,
+            )),
+            AccessMode::READ,
+        )
+    }
+
+    #[inline]
+    fn write_visibility(self) -> Self {
+        self.term_named(
+            c"bevy_camera::visibility::Visibility",
+            Some(ComponentUuid::from_canonical_name(
+                CANONICAL_VISIBILITY_NAME,
+            )),
+            AccessMode::WRITE,
+        )
+    }
+
+    #[inline]
+    fn read_name(self) -> Self {
+        self.term_named(
+            c"bevy_ecs::name::Name",
+            Some(ComponentUuid::from_canonical_name(CANONICAL_NAME_NAME)),
+            AccessMode::READ,
+        )
+    }
+
+    #[inline]
+    fn write_name(self) -> Self {
+        self.term_named(
+            c"bevy_ecs::name::Name",
+            Some(ComponentUuid::from_canonical_name(CANONICAL_NAME_NAME)),
+            AccessMode::WRITE,
+        )
+    }
+
+    #[inline]
+    fn read_time_virtual(self) -> Self {
+        self.term_named(
+            c"bevy_time::Time<Virtual>",
+            Some(ComponentUuid::from_canonical_name(
+                CANONICAL_TIME_VIRTUAL_NAME,
+            )),
+            AccessMode::RESOURCE_READ,
+        )
+    }
+
+    #[inline]
+    fn read_time_fixed(self) -> Self {
+        self.term_named(
+            c"bevy_time::Time<Fixed>",
+            Some(ComponentUuid::from_canonical_name(
+                CANONICAL_TIME_FIXED_NAME,
+            )),
+            AccessMode::RESOURCE_READ,
+        )
+    }
+
+    #[inline]
+    fn read_time_real(self) -> Self {
+        self.term_named(
+            c"bevy_time::Time<Real>",
+            Some(ComponentUuid::from_canonical_name(CANONICAL_TIME_REAL_NAME)),
+            AccessMode::RESOURCE_READ,
+        )
+    }
+
+    #[inline]
+    fn read_keyboard_input(self) -> Self {
+        self.term_named(
+            c"bevy_input::ButtonInput<KeyCode>",
+            Some(ComponentUuid::from_canonical_name(
+                CANONICAL_KEYBOARD_INPUT_NAME,
+            )),
+            AccessMode::RESOURCE_READ,
+        )
+    }
+
+    #[inline]
+    fn read_mouse_input(self) -> Self {
+        self.term_named(
+            c"bevy_input::ButtonInput<MouseButton>",
+            Some(ComponentUuid::from_canonical_name(
+                CANONICAL_MOUSE_INPUT_NAME,
+            )),
+            AccessMode::RESOURCE_READ,
+        )
+    }
+}
+
+/// Pre-resolved [`BamComponent`] handles for standard bridged Bevy components.
+///
+/// Useful with [`GuestCommands::insert_default`](crate::commands::GuestCommands::insert_default)
+/// and [`GuestStdCommandsExt`] even when `feature = "derive"` is disabled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GuestStdHandles {
+    /// Handle for bridged `Transform` (`default_inserter` supported).
+    pub transform: BamComponent,
+    /// Handle for bridged read-only `GlobalTransform`.
+    pub global_transform: BamComponent,
+    /// Handle for bridged `Visibility` (`default_inserter` supported).
+    pub visibility: BamComponent,
+    /// Handle for bridged `Name` (`default_inserter` supported).
+    pub name: BamComponent,
+}
+
+impl GuestStdHandles {
+    /// Resolves all four standard component handles from `host`.
+    pub fn resolve(host: &Host) -> Result<Self, FfiResult> {
+        let transform = resolve_component(
+            host,
+            Some(c"bevy_transform::components::transform::Transform"),
+            Some(ComponentUuid::from_canonical_name(CANONICAL_TRANSFORM_NAME)),
+        )?;
+        let global_transform = resolve_component(
+            host,
+            Some(c"bevy_transform::components::global_transform::GlobalTransform"),
+            Some(ComponentUuid::from_canonical_name(
+                CANONICAL_GLOBAL_TRANSFORM_NAME,
+            )),
+        )?;
+        let visibility = resolve_component(
+            host,
+            Some(c"bevy_camera::visibility::Visibility"),
+            Some(ComponentUuid::from_canonical_name(
+                CANONICAL_VISIBILITY_NAME,
+            )),
+        )?;
+        let name = resolve_component(
+            host,
+            Some(c"bevy_ecs::name::Name"),
+            Some(ComponentUuid::from_canonical_name(CANONICAL_NAME_NAME)),
+        )?;
+        Ok(Self {
+            transform,
+            global_transform,
+            visibility,
+            name,
+        })
+    }
+}
+
+/// Extension trait on [`GuestCommands`] for inserting host-defaulted standard bridged components
+/// (`Transform::IDENTITY`, `Visibility::Inherited`, `Name::default()`).
+pub trait GuestStdCommandsExt {
+    /// Queues `Transform::default()` insertion on `entity`.
+    fn insert_default_transform(
+        &mut self,
+        entity: FfiEntity,
+        handles: &GuestStdHandles,
+    ) -> FfiResult;
+    /// Queues `Visibility::default()` insertion on `entity`.
+    fn insert_default_visibility(
+        &mut self,
+        entity: FfiEntity,
+        handles: &GuestStdHandles,
+    ) -> FfiResult;
+    /// Queues `Name::default()` insertion on `entity`.
+    fn insert_default_name(&mut self, entity: FfiEntity, handles: &GuestStdHandles) -> FfiResult;
+}
+
+impl GuestStdCommandsExt for GuestCommands<'_> {
+    #[inline]
+    fn insert_default_transform(
+        &mut self,
+        entity: FfiEntity,
+        handles: &GuestStdHandles,
+    ) -> FfiResult {
+        self.insert_default(entity, handles.transform)
+    }
+
+    #[inline]
+    fn insert_default_visibility(
+        &mut self,
+        entity: FfiEntity,
+        handles: &GuestStdHandles,
+    ) -> FfiResult {
+        self.insert_default(entity, handles.visibility)
+    }
+
+    #[inline]
+    fn insert_default_name(&mut self, entity: FfiEntity, handles: &GuestStdHandles) -> FfiResult {
+        self.insert_default(entity, handles.name)
+    }
+}
+
+/// Bundle of all standard Bevy component/resource guest bridges and [`GuestStdHandles`],
+/// resolved together during mod initialization (`init_mod`).
+#[cfg(feature = "derive")]
+#[derive(Clone, Copy)]
+pub struct GuestStdTypes {
+    /// Pre-resolved component handles (`Transform`, `GlobalTransform`, `Visibility`, `Name`).
+    pub handles: GuestStdHandles,
+    /// `Transform` wire VTable bridge.
+    pub transform: GuestTransformBridge,
+    /// `GlobalTransform` read-only wire VTable bridge.
+    pub global_transform: GuestGlobalTransformBridge,
+    /// `Visibility` wire VTable bridge.
+    pub visibility: GuestVisibilityBridge,
+    /// `Name` UTF-8 string VTable bridge.
+    pub name: GuestNameBridge,
+    /// `Time<Virtual>` wire VTable bridge.
+    pub time_virtual: GuestTimeVirtualBridge,
+    /// `Time<Fixed>` wire VTable bridge.
+    pub time_fixed: GuestTimeFixedBridge,
+    /// `Time<Real>` wire VTable bridge.
+    pub time_real: GuestTimeRealBridge,
+    /// `ButtonInput<KeyCode>` wire VTable bridge.
+    pub keyboard: GuestKeyboardInputBridge,
+    /// `ButtonInput<MouseButton>` wire VTable bridge.
+    pub mouse: GuestMouseInputBridge,
+}
+
+#[cfg(feature = "derive")]
+impl GuestStdTypes {
+    /// Resolves every standard Bevy bridge registered by `StdTypesBridgePlugin` from `host`.
+    pub fn resolve_all(host: &Host) -> Result<Self, FfiResult> {
+        Ok(Self {
+            handles: GuestStdHandles::resolve(host)?,
+            transform: GuestTransformBridge::resolve_std(host)?,
+            global_transform: GuestGlobalTransformBridge::resolve_std(host)?,
+            visibility: GuestVisibilityBridge::resolve_std(host)?,
+            name: GuestNameBridge::resolve(host)?,
+            time_virtual: GuestTimeVirtualBridge::resolve_std(host)?,
+            time_fixed: GuestTimeFixedBridge::resolve_std(host)?,
+            time_real: GuestTimeRealBridge::resolve_std(host)?,
+            keyboard: GuestKeyboardInputBridge::resolve_std(host)?,
+            mouse: GuestMouseInputBridge::resolve_std(host)?,
+        })
+    }
 }
 
 #[cfg(test)]
