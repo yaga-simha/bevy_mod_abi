@@ -48,7 +48,7 @@ cargo bam build --manifest-path ./mods/my_mod/mod.toml --sign-key ./keys/mod_dev
 - `--release`: Build with release optimizations.
 - `--out-dir <path>`: Stage `<out-dir>/<mod_id>/` with the compiled shared library, `mod.toml`, and optional `.sig`.
 - `--sign-key <path>`: OpenSSH Ed25519 private key to detach-sign the built shared library.
-- `--sign-namespace <ns>`: `SSHSIG` namespace used when `--sign-key` is passed (default: `bevy-abi-mod`).
+- `--sign-namespace <ns>`: `SSHSIG` namespace used when `--sign-key` is passed (default: `bevy_abi_mod.v1`).
 
 ### `check-mods`
 Discover `mod.toml` manifests inside `<dir>`, validate host `abi_version` (`0.2.0`), verify required/optional SemVer dependencies, reject dependency cycles, and print the deterministic topological load order:
