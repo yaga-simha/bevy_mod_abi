@@ -3,6 +3,7 @@
 
 pub mod builder;
 pub mod context;
+pub mod hierarchy;
 pub mod observers;
 
 pub use builder::{GuestApp, GuestComponentOptions, IntoSystemResult, QueryBuilder, SystemBuilder};

@@ -164,6 +164,32 @@ impl<'w> HostSystemCtx<'w> {
     pub fn as_ffi_ptr(&mut self) -> *mut BamSystemCtx {
         (self as *mut Self).cast::<BamSystemCtx>()
     }
+
+    /// Borrows the system's active [`RegistrySnapshot`] and [`UnsafeWorldCell`].
+    #[inline]
+    pub(crate) fn snapshot_and_world(&self) -> (&RegistrySnapshot, Option<UnsafeWorldCell<'w>>) {
+        (self.host_ctx.snapshot(), self.world)
+    }
+
+    /// Returns `true` if any declared query in this system holds entity-column read/write access
+    /// (`READ`, `WRITE`, `OPTIONAL_READ`, `OPTIONAL_WRITE`, `CHANGED`, or `ADDED`) on `component_id`.
+    #[inline]
+    pub(crate) fn has_component_read_access(
+        &self,
+        component_id: bevy_ecs::component::ComponentId,
+    ) -> bool {
+        self.query_views[..self.query_count]
+            .iter()
+            .flatten()
+            .any(|view| {
+                view.plan.terms.iter().any(|term| {
+                    !term.is_resource()
+                        && !term.is_message()
+                        && term.component_id == component_id
+                        && term.mode.has_entity_column_data()
+                })
+            })
+    }
 }
 
 impl Drop for HostSystemCtx<'_> {

@@ -109,6 +109,9 @@ pub(crate) struct DynamicComponentHookMap {
     by_id: HashMap<ComponentId, Vec<DynamicHookBinding>>,
     drop_slot_by_id: HashMap<ComponentId, usize>,
     clone_by_id: HashMap<ComponentId, Vec<CloneBindingEntry>>,
+    rel_to_target: HashMap<ComponentId, ComponentId>,
+    target_to_rel: HashMap<ComponentId, ComponentId>,
+    rel_targets: HashMap<(ComponentId, Entity), Vec<FfiEntity>>,
 }
 
 /// Ensures the per-`World` dynamic component hook/clone dispatch table is pre-initialized so
@@ -121,6 +124,22 @@ pub fn ensure_dynamic_hook_map_in_world(world: &mut World) {
 }
 
 impl DynamicComponentHookMap {
+    #[inline]
+    pub(crate) fn is_relationship_target(&self, target_comp_id: ComponentId) -> bool {
+        self.target_to_rel.contains_key(&target_comp_id)
+    }
+
+    #[inline]
+    pub(crate) fn relationship_targets_for(
+        &self,
+        target_comp_id: ComponentId,
+        entity: Entity,
+    ) -> &[FfiEntity] {
+        self.rel_targets
+            .get(&(target_comp_id, entity))
+            .map_or(&[], Vec::as_slice)
+    }
+
     fn insert_or_update(&mut self, component_id: ComponentId, binding: DynamicHookBinding) {
         let entries = self.by_id.entry(component_id).or_default();
         entries.retain(|e| e.is_active.load(Ordering::Acquire));
@@ -151,7 +170,17 @@ impl DynamicComponentHookMap {
         }
     }
 
-    fn rollback_for_guard(&mut self, is_active: &Arc<AtomicBool>, fresh_comp_ids: &[ComponentId]) {
+    fn bind_relationship_pair(&mut self, rel_cid: ComponentId, tgt_cid: ComponentId) {
+        self.rel_to_target.insert(rel_cid, tgt_cid);
+        self.target_to_rel.insert(tgt_cid, rel_cid);
+    }
+
+    fn rollback_for_guard(
+        &mut self,
+        is_active: &Arc<AtomicBool>,
+        fresh_comp_ids: &[ComponentId],
+        fresh_rel_bindings: &[(ComponentId, ComponentId)],
+    ) {
         self.by_id.retain(|_, entries| {
             entries.retain(|e| {
                 !Arc::ptr_eq(&e.is_active, is_active) && e.is_active.load(Ordering::Acquire)
@@ -166,6 +195,10 @@ impl DynamicComponentHookMap {
         });
         for comp_id in fresh_comp_ids {
             self.drop_slot_by_id.remove(comp_id);
+        }
+        for &(rel_cid, tgt_cid) in fresh_rel_bindings {
+            self.rel_to_target.remove(&rel_cid);
+            self.target_to_rel.remove(&tgt_cid);
         }
     }
 }
@@ -330,7 +363,170 @@ fn dynamic_on_add_hook(mut world: DeferredWorld<'_>, ctx: HookContext) {
     invoke_dynamic_hook(&world, ctx, |e| e.on_add);
 }
 
-fn dynamic_on_insert_hook(world: DeferredWorld<'_>, ctx: HookContext) {
+fn dynamic_rel_on_insert(world: &mut DeferredWorld<'_>, ctx: HookContext) {
+    let Some(tgt_cid) = world
+        .get_resource::<DynamicComponentHookMap>()
+        .and_then(|map| map.rel_to_target.get(&ctx.component_id).copied())
+    else {
+        return;
+    };
+    let target_ffi = {
+        let Ok(ptr) = world.entity(ctx.entity).get_by_id(ctx.component_id) else {
+            return;
+        };
+        // SAFETY: Dynamic relationship source components are validated as `(size = 8, align = 8)`
+        // storing an `FfiEntity` target handle at offset 0.
+        let bits = unsafe { core::ptr::read_unaligned(ptr.as_ptr().cast::<u64>()) };
+        FfiEntity::from_bits(bits)
+    };
+    let valid_target = (!target_ffi.is_null())
+        .then(|| Entity::try_from_bits(target_ffi.to_bits()))
+        .flatten()
+        .filter(|&t| t != Entity::PLACEHOLDER && t != ctx.entity && world.entities().contains(t));
+    let Some(target_entity) = valid_target else {
+        let source_entity = ctx.entity;
+        let rel_cid = ctx.component_id;
+        world.commands().queue(move |w: &mut World| {
+            if let Ok(mut e) = w.get_entity_mut(source_entity) {
+                e.remove_by_id(rel_cid);
+            }
+        });
+        return;
+    };
+
+    let source_ffi = FfiEntity::from_bits(ctx.entity.to_bits());
+    if let Some(mut map) = world.get_resource_mut::<DynamicComponentHookMap>() {
+        let vec = map.rel_targets.entry((tgt_cid, target_entity)).or_default();
+        if !vec.contains(&source_ffi) {
+            vec.push(source_ffi);
+        }
+    }
+    if world
+        .get_entity(target_entity)
+        .is_ok_and(|ent| !ent.contains_id(tgt_cid))
+    {
+        world.commands().queue(move |w: &mut World| {
+            let should_insert = w
+                .get_resource::<DynamicComponentHookMap>()
+                .is_some_and(|m| {
+                    !m.relationship_targets_for(tgt_cid, target_entity)
+                        .is_empty()
+                });
+            if should_insert
+                && let Ok(mut target_ent) = w.get_entity_mut(target_entity)
+                && !target_ent.contains_id(tgt_cid)
+            {
+                // SAFETY: `tgt_cid` was registered with zero-sized `(0, 1)` layout.
+                let owning = unsafe { OwningPtr::new(core::ptr::NonNull::<u8>::dangling()) };
+                // SAFETY: `tgt_cid` is a valid zero-sized component in `w`.
+                unsafe {
+                    target_ent.insert_by_id(tgt_cid, owning);
+                }
+            }
+        });
+    }
+}
+
+fn dynamic_rel_on_discard(world: &mut DeferredWorld<'_>, ctx: HookContext) {
+    let Some(tgt_cid) = world
+        .get_resource::<DynamicComponentHookMap>()
+        .and_then(|map| map.rel_to_target.get(&ctx.component_id).copied())
+    else {
+        return;
+    };
+    let old_target_ffi = {
+        let Ok(ptr) = world.entity(ctx.entity).get_by_id(ctx.component_id) else {
+            return;
+        };
+        // SAFETY: Dynamic relationship source components are validated as `(size = 8, align = 8)`
+        // storing an `FfiEntity` target handle at offset 0.
+        let bits = unsafe { core::ptr::read_unaligned(ptr.as_ptr().cast::<u64>()) };
+        FfiEntity::from_bits(bits)
+    };
+    let Some(old_target) = (!old_target_ffi.is_null())
+        .then(|| Entity::try_from_bits(old_target_ffi.to_bits()))
+        .flatten()
+        .filter(|&t| t != Entity::PLACEHOLDER)
+    else {
+        return;
+    };
+
+    let source_ffi = FfiEntity::from_bits(ctx.entity.to_bits());
+    let became_empty = if let Some(mut map) = world.get_resource_mut::<DynamicComponentHookMap>() {
+        if let Some(vec) = map.rel_targets.get_mut(&(tgt_cid, old_target)) {
+            vec.retain(|&e| e != source_ffi);
+            if vec.is_empty() {
+                map.rel_targets.remove(&(tgt_cid, old_target));
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if became_empty && world.entities().contains(old_target) {
+        world.commands().queue(move |w: &mut World| {
+            let still_empty = w
+                .get_resource::<DynamicComponentHookMap>()
+                .is_some_and(|m| m.relationship_targets_for(tgt_cid, old_target).is_empty());
+            if still_empty
+                && let Ok(mut target_ent) = w.get_entity_mut(old_target)
+                && target_ent.contains_id(tgt_cid)
+            {
+                target_ent.remove_by_id(tgt_cid);
+            }
+        });
+    }
+}
+
+fn dynamic_rel_target_on_despawn(world: &mut DeferredWorld<'_>, ctx: HookContext) {
+    let (rel_cid, sources) = {
+        let Some(mut map) = world.get_resource_mut::<DynamicComponentHookMap>() else {
+            return;
+        };
+        let Some(rel_cid) = map.target_to_rel.get(&ctx.component_id).copied() else {
+            return;
+        };
+        let sources = map
+            .rel_targets
+            .remove(&(ctx.component_id, ctx.entity))
+            .unwrap_or_default();
+        (rel_cid, sources)
+    };
+    if sources.is_empty() {
+        return;
+    }
+    let expected_bits = ctx.entity.to_bits();
+    world.commands().queue(move |w: &mut World| {
+        for src_ffi in sources {
+            let Some(src_ent) = (!src_ffi.is_null())
+                .then(|| Entity::try_from_bits(src_ffi.to_bits()))
+                .flatten()
+                .filter(|&e| e != Entity::PLACEHOLDER)
+            else {
+                continue;
+            };
+            let matches = w
+                .get_entity(src_ent)
+                .ok()
+                .and_then(|ent| ent.get_by_id(rel_cid).ok())
+                .is_some_and(|ptr| {
+                    // SAFETY: `rel_cid` stores an 8-byte `FfiEntity` target handle at offset 0.
+                    unsafe {
+                        core::ptr::read_unaligned(ptr.as_ptr().cast::<u64>()) == expected_bits
+                    }
+                });
+            if matches && let Ok(mut ent_mut) = w.get_entity_mut(src_ent) {
+                ent_mut.remove_by_id(rel_cid);
+            }
+        }
+    });
+}
+
+fn dynamic_on_insert_hook(mut world: DeferredWorld<'_>, ctx: HookContext) {
     // Increment unconditionally regardless of `is_active` because `ComponentDescriptor` permanently
     // binds `drop_trampoline::<SLOT>` to `ctx.component_id`, which always decrements `live_values`
     // on despawn / `World::drop`.
@@ -340,10 +536,12 @@ fn dynamic_on_insert_hook(world: DeferredWorld<'_>, ctx: HookContext) {
     {
         increment_drop_slot_live_values(slot);
     }
+    dynamic_rel_on_insert(&mut world, ctx);
     invoke_dynamic_hook(&world, ctx, |e| e.on_insert);
 }
 
-fn dynamic_on_discard_hook(world: DeferredWorld<'_>, ctx: HookContext) {
+fn dynamic_on_discard_hook(mut world: DeferredWorld<'_>, ctx: HookContext) {
+    dynamic_rel_on_discard(&mut world, ctx);
     invoke_dynamic_hook(&world, ctx, |e| e.on_discard);
 }
 
@@ -351,7 +549,8 @@ fn dynamic_on_remove_hook(world: DeferredWorld<'_>, ctx: HookContext) {
     invoke_dynamic_hook(&world, ctx, |e| e.on_remove);
 }
 
-fn dynamic_on_despawn_hook(world: DeferredWorld<'_>, ctx: HookContext) {
+fn dynamic_on_despawn_hook(mut world: DeferredWorld<'_>, ctx: HookContext) {
+    dynamic_rel_target_on_despawn(&mut world, ctx);
     invoke_dynamic_hook(&world, ctx, |e| e.on_despawn);
 }
 
@@ -487,6 +686,7 @@ pub struct LoadContext {
     staged_drop_bindings: Arc<Mutex<Vec<StagedDropBinding>>>,
     staged_hook_bindings: Arc<Mutex<Vec<StagedHookBinding>>>,
     fresh_dynamic_comp_ids: Vec<ComponentId>,
+    fresh_rel_bindings: Vec<(ComponentId, ComponentId)>,
     in_init: bool,
 }
 
@@ -515,7 +715,7 @@ impl LoadContext {
         let pre_snapshot = registry.snapshot_arc();
         let host_ctx =
             HostContext::new(Arc::clone(&pre_snapshot)).with_namespace(manifest_name.clone());
-        Self {
+        let mut ctx = Self {
             header: HandleHeader::new(LOAD_CTX_MAGIC),
             host_ctx,
             registry,
@@ -531,8 +731,35 @@ impl LoadContext {
             staged_drop_bindings: Arc::new(Mutex::new(Vec::new())),
             staged_hook_bindings: Arc::new(Mutex::new(Vec::new())),
             fresh_dynamic_comp_ids: Vec::new(),
+            fresh_rel_bindings: Vec::new(),
             in_init: true,
+        };
+        if !ctx.world_ptr.is_null()
+            && (ctx.mod_id.is_some()
+                || ctx
+                    .registry
+                    .get_by_name(bevy_abi_mod_sys::BAM_CHILD_OF_NAME)
+                    .is_some())
+        {
+            let children_id = ctx
+                .world_mut()
+                .register_component::<bevy_ecs::hierarchy::Children>();
+            if ctx
+                .registry
+                .get_by_name(bevy_abi_mod_sys::BAM_CHILDREN_NAME)
+                .is_none()
+            {
+                let _ = ctx.registry.register_children_hierarchy(children_id);
+                let updated_reg = ctx.registry.clone();
+                if let Some(mut world_reg) = ctx.world_mut().get_resource_mut::<ModRegistry>() {
+                    *world_reg = updated_reg;
+                }
+                let new_snap = ctx.registry.snapshot_arc();
+                ctx.pre_snapshot = Arc::clone(&new_snap);
+                ctx.host_ctx.set_snapshot(new_snap);
+            }
         }
+        ctx
     }
 
     /// Shares the transaction's [`StagedDropBinding`] and [`StagedHookBinding`] logs so
@@ -592,6 +819,7 @@ impl LoadContext {
             core::mem::take(&mut *guard)
         };
         let fresh_comp_ids = core::mem::take(&mut self.fresh_dynamic_comp_ids);
+        let fresh_rels = core::mem::take(&mut self.fresh_rel_bindings);
         let active_guard = Arc::clone(&self.is_active);
         if let Some(mut drop_guard) = self.world_mut().get_resource_mut::<WorldDropGuard>() {
             drop_guard.rollback_staged_bindings(&bindings);
@@ -601,7 +829,7 @@ impl LoadContext {
             .world_mut()
             .get_resource_mut::<DynamicComponentHookMap>()
         {
-            hook_map.rollback_for_guard(&active_guard, &fresh_comp_ids);
+            hook_map.rollback_for_guard(&active_guard, &fresh_comp_ids, &fresh_rels);
         }
         prune_drop_trampolines_for_guard(&self.is_active);
         let pre = Arc::clone(&self.pre_snapshot);
@@ -786,6 +1014,161 @@ pub unsafe extern "C" fn host_resolve_component(
     FfiResult::OK
 }
 
+const BAM_REL_BIND_PREFIX: &str = "__bam_rel_bind::";
+
+/// Binds a dynamic `(Relationship, RelationshipTarget)` pair when guest code registers the
+/// synthetic `"__bam_rel_bind::<rel_handle>::<target_handle>"` marker descriptor.
+///
+/// # Safety
+/// `out_component` must be a non-null, aligned, writable `*mut BamComponent`.
+unsafe fn bind_dynamic_relationship_descriptor(
+    ctx: &mut LoadContext,
+    pair_spec: &str,
+    desc: &ComponentDesc,
+    out_component: *mut BamComponent,
+) -> FfiResult {
+    if desc.size != 0
+        || desc.align != 1
+        || desc.drop_fn.is_some()
+        || desc.clone_fn.is_some()
+        || desc.has_hooks()
+        || desc.required_component_count != 0
+    {
+        ctx.host_ctx
+            .set_last_error("__bam_rel_bind marker must be a zero-sized hookless descriptor");
+        return FfiResult::INVALID_ARGUMENT;
+    }
+    let Some((rel_str, tgt_str)) = pair_spec.split_once("::") else {
+        ctx.host_ctx
+            .set_last_error("malformed __bam_rel_bind relationship descriptor");
+        return FfiResult::INVALID_ARGUMENT;
+    };
+    let (Ok(rel_raw), Ok(tgt_raw)) = (rel_str.parse::<u32>(), tgt_str.parse::<u32>()) else {
+        ctx.host_ctx
+            .set_last_error("malformed __bam_rel_bind component handle integer");
+        return FfiResult::INVALID_ARGUMENT;
+    };
+    if rel_raw == 0 || tgt_raw == 0 {
+        return FfiResult::INVALID_COMPONENT;
+    }
+    let rel_handle = BamComponent::from_raw(rel_raw);
+    let tgt_handle = BamComponent::from_raw(tgt_raw);
+
+    let Some(rel_meta) = ctx.registry.get_by_handle(rel_handle).cloned() else {
+        ctx.host_ctx.set_last_error(format!(
+            "relationship source handle {} is not registered",
+            rel_handle.0
+        ));
+        return FfiResult::INVALID_COMPONENT;
+    };
+    let Some(tgt_meta) = ctx.registry.get_by_handle(tgt_handle).cloned() else {
+        ctx.host_ctx.set_last_error(format!(
+            "relationship target handle {} is not registered",
+            tgt_handle.0
+        ));
+        return FfiResult::INVALID_COMPONENT;
+    };
+    if !rel_meta.is_dynamic
+        || !tgt_meta.is_dynamic
+        || rel_meta.is_resource()
+        || rel_meta.is_message()
+        || rel_meta.is_event()
+        || tgt_meta.is_resource()
+        || tgt_meta.is_message()
+        || tgt_meta.is_event()
+    {
+        ctx.host_ctx.set_last_error(
+            "dynamic relationship pairs require dynamic non-resource/non-message/non-event components",
+        );
+        return FfiResult::PERMISSION_DENIED;
+    }
+    if rel_meta.size != core::mem::size_of::<FfiEntity>()
+        || rel_meta.align != core::mem::align_of::<FfiEntity>()
+        || rel_meta.drop_fn.is_some()
+    {
+        ctx.host_ctx.set_last_error(format!(
+            "relationship source '{}' must have 8-byte FfiEntity layout without drop_fn",
+            rel_meta.name
+        ));
+        return FfiResult::TYPE_MISMATCH;
+    }
+    if tgt_meta.size != 0 || tgt_meta.drop_fn.is_some() {
+        ctx.host_ctx.set_last_error(format!(
+            "relationship target '{}' must be a zero-sized marker component without drop_fn",
+            tgt_meta.name
+        ));
+        return FfiResult::TYPE_MISMATCH;
+    }
+    let rel_cid = rel_meta.component_id;
+    let tgt_cid = tgt_meta.component_id;
+    if rel_cid == tgt_cid {
+        ctx.host_ctx
+            .set_last_error("relationship source and target components must be distinct");
+        return FfiResult::INVALID_ARGUMENT;
+    }
+
+    let world = ctx.world_mut();
+    ensure_dynamic_hook_map_in_world(world);
+    {
+        let map = world.resource::<DynamicComponentHookMap>();
+        if let Some(&existing_tgt) = map.rel_to_target.get(&rel_cid) {
+            if existing_tgt == tgt_cid {
+                // SAFETY: Caller guarantees `out_component` is non-null, aligned, and writable.
+                unsafe {
+                    *out_component = tgt_handle;
+                }
+                return FfiResult::OK;
+            }
+            ctx.host_ctx.set_last_error(format!(
+                "relationship source '{}' is already bound to a different target component",
+                rel_meta.name
+            ));
+            return FfiResult::TYPE_MISMATCH;
+        }
+        if map
+            .target_to_rel
+            .get(&tgt_cid)
+            .is_some_and(|&existing_rel| existing_rel != rel_cid)
+        {
+            ctx.host_ctx.set_last_error(format!(
+                "relationship target '{}' is already bound to a different source component",
+                tgt_meta.name
+            ));
+            return FfiResult::TYPE_MISMATCH;
+        }
+    }
+
+    if world
+        .archetypes()
+        .iter()
+        .any(|a| a.contains(rel_cid) || a.contains(tgt_cid))
+    {
+        ctx.host_ctx.set_last_error(
+            "cannot bind relationship hooks after source or target components exist in archetypes",
+        );
+        return FfiResult::INVALID_STATE;
+    }
+
+    if let Some(hooks) = world.register_component_hooks_by_id(rel_cid) {
+        hooks.try_on_insert(dynamic_on_insert_hook);
+        hooks.try_on_discard(dynamic_on_discard_hook);
+    }
+    if let Some(hooks) = world.register_component_hooks_by_id(tgt_cid) {
+        hooks.try_on_despawn(dynamic_on_despawn_hook);
+    }
+
+    world
+        .resource_mut::<DynamicComponentHookMap>()
+        .bind_relationship_pair(rel_cid, tgt_cid);
+    ctx.fresh_rel_bindings.push((rel_cid, tgt_cid));
+
+    // SAFETY: Caller guarantees `out_component` is non-null, aligned, and writable.
+    unsafe {
+        *out_component = tgt_handle;
+    }
+    FfiResult::OK
+}
+
 /// Registers a dynamic component described by `desc_ptr` inside `load_ctx` and writes its 1-based
 /// [`BamComponent`] handle into `*out_component`.
 ///
@@ -855,6 +1238,13 @@ pub unsafe extern "C" fn host_register_component(
             std::borrow::Cow::Borrowed(name_str)
         };
     let name_ref = canonical_name.as_ref();
+
+    if let Some(pair_spec) = name_ref.strip_prefix(BAM_REL_BIND_PREFIX) {
+        // SAFETY: `out_component` was verified non-null above and caller guarantees writable `BamComponent`.
+        return unsafe {
+            bind_dynamic_relationship_descriptor(ctx, pair_spec, &desc, out_component)
+        };
+    }
 
     // Validate `required_components[0..required_component_count]` handles and default constructors.
     let mut required_handles = Vec::with_capacity(desc.required_component_count);

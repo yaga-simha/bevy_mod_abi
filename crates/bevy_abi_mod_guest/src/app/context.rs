@@ -81,7 +81,7 @@ impl<'a> RunConditionContext<'a> {
 /// (`resource`, `resource_mut`), and handle/batched [`GuestCommands`].
 pub struct SystemContext<'a> {
     host: &'a Host,
-    sys_ref: ValidatedSystemRef<'a>,
+    pub(crate) sys_ref: ValidatedSystemRef<'a>,
     user_query_count: usize,
     queries: [Option<ChunkIter<'a>>; MAX_QUERIES_PER_SYSTEM],
     resource_query: Option<ChunkIter<'a>>,
