@@ -395,7 +395,7 @@ All core engine operations reside directly in `BamHostApi` (`408` B on 64-bit / 
 ## 8. Verification & Quality Gates
 
 1. **Dependency & Safety Gates:**
-   - `cargo tree -p bevy_abi_mod_sys -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest -p bevy_abi_mod_macros -p cargo-bam | grep -v bevy_abi_mod | grep -i bevy` prints nothing.
+   - `cargo tree -p bevy_abi_mod_sys -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest -p bevy_abi_mod_macros -p cargo-bam | sed 's/ (.*//' | grep -v bevy_abi_mod | grep -i bevy` prints nothing.
    - `cargo check -p bevy_abi_mod_sys --target thumbv7em-none-eabihf` and 32-bit target checks verify `#![no_std]` purity and 32-bit layout assertions.
    - `#![forbid(unsafe_code)]` enforced at line 1 of `bevy_abi_mod`, `bevy_abi_mod_host`, `bevy_abi_mod_guest`, `bevy_abi_mod_macros`, `cargo-bam`, and `xtask`.
 2. **Single-Source C99, C++17, & Zig SDK Parity:**

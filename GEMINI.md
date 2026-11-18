@@ -48,7 +48,7 @@ Repository guide defining architectural invariants, crate boundaries, verificati
 
 ```bash
 # Verify zero Bevy dependencies in ABI, macro, guest, & CLI crates (must print NOTHING)
-cargo tree -p bevy_abi_mod_sys -p bevy_abi_mod_macros -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest -p cargo-bam | grep -v bevy_abi_mod | grep -i bevy
+cargo tree -p bevy_abi_mod_sys -p bevy_abi_mod_macros -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest -p cargo-bam | sed 's/ (.*//' | grep -v bevy_abi_mod | grep -i bevy
 
 # Run full lint, header, fixture build, & workspace test suite
 cargo xtask ci

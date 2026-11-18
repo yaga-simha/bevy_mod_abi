@@ -796,11 +796,7 @@ fn verify_zero_bevy_deps(root: &Path) -> Result<(), String> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let leaked: Vec<&str> = stdout
-        .lines()
-        .filter(|line| !line.contains("bevy_abi_mod"))
-        .filter(|line| line.to_ascii_lowercase().contains("bevy"))
-        .collect();
+    let leaked = find_leaked_bevy_lines(&stdout);
 
     if !leaked.is_empty() {
         return Err(format!(
@@ -809,6 +805,18 @@ fn verify_zero_bevy_deps(root: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Filters `cargo tree` output lines for unexpected `bevy` crate names while ignoring
+/// filesystem checkout path suffixes like `(/home/runner/work/bevy_mod_abi/...)`.
+fn find_leaked_bevy_lines(stdout: &str) -> Vec<&str> {
+    stdout
+        .lines()
+        .filter(|line| {
+            let crate_part = line.split(" (").next().unwrap_or(line);
+            !crate_part.contains("bevy_abi_mod") && crate_part.to_ascii_lowercase().contains("bevy")
+        })
+        .collect()
 }
 
 fn verify_c99_header_and_tests(root: &Path, run_standalone_test: bool) -> Result<(), String> {
@@ -1368,5 +1376,23 @@ fn cmd_hook(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         _ => Err("usage: cargo xtask hook <install|uninstall>".to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_leaked_bevy_lines;
+
+    #[test]
+    fn find_leaked_bevy_lines_ignores_repo_path_and_catches_real_bevy_deps() {
+        let sample = "\
+bevy_abi_mod_sys v0.2.0 (/home/runner/work/bevy_mod_abi/bevy_mod_abi/crates/bevy_abi_mod_sys)
+cargo-bam v0.2.0 (/Users/runner/work/bevy_mod_abi/bevy_mod_abi/crates/cargo-bam)
+cargo-bam v0.2.0 (D:\\a\\bevy_mod_abi\\bevy_mod_abi\\crates\\cargo-bam)
+├── bevy_ecs v0.20.1
+└── syn v2.0.119
+";
+        let leaked = find_leaked_bevy_lines(sample);
+        assert_eq!(leaked, vec!["├── bevy_ecs v0.20.1"]);
     }
 }

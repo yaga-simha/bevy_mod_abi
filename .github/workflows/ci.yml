@@ -17,9 +17,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
+
+      - name: Install Linux X11 / Wayland / ALSA / udev system headers for Bevy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libudev-dev libx11-dev libxi-dev libxkbcommon-dev libwayland-dev pkg-config
 
       - name: Install stable Rust toolchain + 32-bit & Wasm targets
         uses: dtolnay/rust-toolchain@stable
@@ -44,7 +50,7 @@ jobs:
           cargo xtask lint
           cargo xtask header --check --test-c99
           cargo xtask gen-component-headers --check
-          if cargo tree -p bevy_abi_mod_sys -p bevy_abi_mod_macros -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest -p cargo-bam | grep -v bevy_abi_mod | grep -i bevy; then
+          if cargo tree -p bevy_abi_mod_sys -p bevy_abi_mod_macros -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest -p cargo-bam | sed 's/ (.*//' | grep -v bevy_abi_mod | grep -i bevy; then
             echo "ERROR: Unexpected Bevy dependency found in isolated ABI/macro/guest/CLI crates!"
             exit 1
           fi
@@ -70,10 +76,10 @@ jobs:
           package: bevy_abi_mod_sys
           baseline-rev: ${{ github.event.pull_request.base.sha || 'HEAD~1' }}
 
-      - name: Build mdBook developer guide
-        uses: peaceiris/actions-mdbook@v2
+      - name: Install `mdbook`
+        uses: taiki-e/install-action@v2
         with:
-          mdbook-version: "0.4.48"
+          tool: mdbook@0.4.48
       - name: Render `docs/book`
         run: mdbook build docs/book
 
@@ -89,7 +95,14 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+
+      - name: Install Linux X11 / Wayland / ALSA / udev system headers for Bevy
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libudev-dev libx11-dev libxi-dev libxkbcommon-dev libwayland-dev pkg-config
 
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -122,7 +135,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Linux X11 / Wayland / ALSA / udev system headers for Bevy
         run: |
@@ -177,7 +190,7 @@ jobs:
             panic_mode: "abort"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install stable host toolchain + ${{ matrix.guest_toolchain }} guest toolchain
         run: |
@@ -243,17 +256,65 @@ jobs:
             cxx: g++
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+
+      - name: Install Linux X11 / Wayland / ALSA / udev system headers for Bevy
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libudev-dev libx11-dev libxi-dev libxkbcommon-dev libwayland-dev pkg-config
 
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
 
-      - name: Install Zig toolchain (`goto-bus-stop/setup-zig`)
-        uses: goto-bus-stop/setup-zig@v2
-        with:
-          version: 0.14.0
+      - name: Install Zig 0.16.0 toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIG_VER="0.16.0"
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64)
+              ZIG_TARBALL="zig-x86_64-linux-${ZIG_VER}.tar.xz"
+              ZIG_SHA256="70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+              ;;
+            macOS-ARM64)
+              ZIG_TARBALL="zig-aarch64-macos-${ZIG_VER}.tar.xz"
+              ZIG_SHA256="b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489"
+              ;;
+            macOS-X64)
+              ZIG_TARBALL="zig-x86_64-macos-${ZIG_VER}.tar.xz"
+              ZIG_SHA256="0387557ed1877bc6a2e1802c8391953baddba76081876301c522f52977b52ba7"
+              ;;
+            Windows-X64)
+              ZIG_TARBALL="zig-x86_64-windows-${ZIG_VER}.zip"
+              ZIG_SHA256="68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e"
+              ;;
+            *)
+              echo "Unsupported runner OS/arch: ${{ runner.os }}-${{ runner.arch }}" >&2
+              exit 1
+              ;;
+          esac
+          ZIG_ARCHIVE="${RUNNER_TEMP}/${ZIG_TARBALL}"
+          curl -fsSL --retry 3 "https://ziglang.org/download/${ZIG_VER}/${ZIG_TARBALL}" -o "${ZIG_ARCHIVE}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "${ZIG_SHA256}  ${ZIG_ARCHIVE}" | sha256sum -c -
+          else
+            echo "${ZIG_SHA256}  ${ZIG_ARCHIVE}" | shasum -a 256 -c -
+          fi
+          if [[ "${ZIG_TARBALL}" == *.zip ]]; then
+            unzip -q -o "${ZIG_ARCHIVE}" -d "${RUNNER_TEMP}"
+            ZIG_DIR="${RUNNER_TEMP}/${ZIG_TARBALL%.zip}"
+            test -f "${ZIG_DIR}/zig.exe"
+            cygpath -w "${ZIG_DIR}" >> "${GITHUB_PATH}"
+          else
+            tar -xf "${ZIG_ARCHIVE}" -C "${RUNNER_TEMP}"
+            ZIG_DIR="${RUNNER_TEMP}/${ZIG_TARBALL%.tar.xz}"
+            test -x "${ZIG_DIR}/zig"
+            echo "${ZIG_DIR}" >> "${GITHUB_PATH}"
+          fi
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2
@@ -294,7 +355,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Valgrind + `iai-callgrind-runner`
         uses: dtolnay/rust-toolchain@stable
@@ -325,12 +386,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install stable Rust with `llvm-tools-preview`
         uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
+
+      - name: Install Linux X11 / Wayland / ALSA / udev system headers for Bevy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libudev-dev libx11-dev libxi-dev libxkbcommon-dev libwayland-dev pkg-config
 
       - name: Install `cargo-llvm-cov`
         uses: taiki-e/install-action@v2
@@ -351,7 +418,7 @@ jobs:
               -p bevy_abi_mod_host_sys \
               -p bevy_abi_mod_host
           cargo llvm-cov report \
-            --ignore-filename-regex '(crates/bevy_abi_mod_host_sys/src/(drop_trampoline|handle_header|lib|loader|registry|schedule|sync_ptr)|crates/bevy_abi_mod_(host|macros|sys|guest|guest_sys)/|tests/)' \
+            --ignore-filename-regex '(crates/bevy_abi_mod_host_sys/src/(drop_trampoline|handle_header|lib|loader|registry|schedule|sync_ptr|ffi/wave3_helpers)|crates/bevy_abi_mod_(host|macros|sys|guest|guest_sys)/|tests/)' \
             --fail-under-lines 85
 
   # ============================================================================
@@ -364,7 +431,7 @@ jobs:
       MIRIFLAGS: "-Zmiri-tree-borrows"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install nightly Rust with Miri
         uses: dtolnay/rust-toolchain@nightly
@@ -387,7 +454,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -405,7 +472,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable

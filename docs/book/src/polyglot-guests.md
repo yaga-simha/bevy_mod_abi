@@ -122,7 +122,7 @@ See [`examples/07_cpp17_guest/cpp_mod/mod.cpp`](../../../examples/07_cpp17_guest
 
 ## 4. Zig Guest Pattern (`examples/08_zig_guest`)
 
-Zig (`0.14+`) imports `include/bevy_abi_mod.h` directly via `@cImport` with zero manual bindings. Use `errdefer` with `std.heap.c_allocator` in `init` and map Zig error unions to `c.BamResult` inside `callconv(.c)` callbacks:
+Zig (`0.14`–`0.16`, `0.16.0` recommended) imports `include/bevy_abi_mod.h` directly via `@cImport` with zero manual bindings. Use `errdefer` with `std.heap.c_allocator` in `init` and map Zig error unions to `c.BamResult` inside `callconv(.c)` callbacks:
 
 ```zig
 const c = @cImport({ @cInclude("bevy_abi_mod.h"); });

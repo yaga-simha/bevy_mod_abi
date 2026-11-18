@@ -6,7 +6,7 @@
 
 ## Build Prerequisites
 
-- A Zig toolchain (`zig 0.14+`, providing `callconv(.c)`)
+- A Zig toolchain (`zig` `0.14`–`0.16`, `0.16.0` recommended and required on macOS 26+, providing `callconv(.c)`)
 - Rust toolchain (`cargo`) for the Bevy host application and test harness
 
 *(If `zig` is not installed on `PATH`, the Rust host integration tests verify `ZIG_DECL` synchronization and host component registration and skip only the dynamic library load step.)*
