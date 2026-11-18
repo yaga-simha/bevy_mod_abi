@@ -1,9 +1,16 @@
-//! Static 38-slot `HOST_API: BamHostApi` function table passed to `bevy_abi_mod_init`.
+//! Static 50-slot `HOST_API: BamHostApi` function table passed to `bevy_abi_mod_init`.
 
+use crate::ffi::assets_scene::{
+    host_asset_get_load_state, host_asset_load, host_asset_release, host_cmd_spawn_scene,
+};
 use crate::ffi::commands::{
     host_cmd_despawn, host_cmd_insert, host_cmd_insert_default, host_cmd_remove, host_cmd_spawn,
     host_cmd_spawn_empty, host_cmd_trigger,
 };
+use crate::ffi::commands_ext::{
+    host_cmd_despawn_all, host_cmd_insert_if_new, host_cmd_spawn_batch, host_cmd_spawn_persistent,
+};
+use crate::ffi::hierarchy_ext::host_sys_entity_children;
 use crate::ffi::iter::{
     host_iter_column_info, host_iter_column_mutable, host_iter_column_mutable_untracked,
     host_iter_column_readonly, host_iter_column_rows_mutable, host_iter_column_rows_readonly,
@@ -11,6 +18,8 @@ use crate::ffi::iter::{
     host_msg_read_batch, host_msg_send, host_msg_write_batch, host_par_for_each_chunk,
     host_res_mut_ptr, host_res_ptr, host_res_ticks,
 };
+use crate::ffi::iter_ext::host_iter_read_removed;
+use crate::ffi::observers_ext::{host_cmd_observe, host_cmd_trigger_ex};
 use crate::ffi::proc_address::host_get_proc_address;
 use crate::ffi::register::{
     host_load_host_ctx, host_register_component, host_register_observer, host_register_system,
@@ -23,7 +32,7 @@ use crate::system::{
 };
 use bevy_abi_mod_sys::{ABI_VERSION, BamHostApi};
 
-/// Global immutable 38-slot C-ABI v0.2 host function table.
+/// Global immutable 50-slot C-ABI v0.2 host function table.
 pub static HOST_API: BamHostApi = BamHostApi {
     struct_size: core::mem::size_of::<BamHostApi>() as u32,
     abi_version: ABI_VERSION,
@@ -81,6 +90,20 @@ pub static HOST_API: BamHostApi = BamHostApi {
     sys_res_mut_ptr: Some(host_sys_res_mut_ptr),
     register_observer: Some(host_register_observer),
     cmd_trigger: Some(host_cmd_trigger),
+
+    // Extended entity commands, lifecycle observers, removed components, hierarchy, assets & scenes
+    cmd_spawn_persistent: Some(host_cmd_spawn_persistent),
+    cmd_spawn_batch: Some(host_cmd_spawn_batch),
+    cmd_despawn_all: Some(host_cmd_despawn_all),
+    cmd_insert_if_new: Some(host_cmd_insert_if_new),
+    cmd_trigger_ex: Some(host_cmd_trigger_ex),
+    cmd_observe: Some(host_cmd_observe),
+    iter_read_removed: Some(host_iter_read_removed),
+    sys_entity_children: Some(host_sys_entity_children),
+    asset_load: Some(host_asset_load),
+    asset_get_load_state: Some(host_asset_get_load_state),
+    asset_release: Some(host_asset_release),
+    cmd_spawn_scene: Some(host_cmd_spawn_scene),
 };
 
 const _: () = assert!(HOST_API.has_all_v0_2_slots());

@@ -54,11 +54,24 @@ impl AccessMode {
     pub const MESSAGE_READ: Self = Self(10);
     /// Buffered Bevy `Messages<M>` writer/mutator access (`MessageWriter<M>`, C `BAM_ACCESS_MESSAGE_WRITE`).
     pub const MESSAGE_WRITE: Self = Self(11);
+    /// Archetype filter bypass (`Allow<T>`, C `BAM_ACCESS_ALLOW`) suppressing default disabling
+    /// filters (such as `Disabled`) for `T` without requiring `T` to be present on matched entities.
+    pub const ALLOW: Self = Self(12);
+    /// Archetype presence indicator (`Has<T>`, C `BAM_ACCESS_HAS`).
+    ///
+    /// Declares archetypal metadata access (`add_archetypal`) without borrowing `&T` component
+    /// storage, matching all archetypes regardless of whether `T` is present and synthesizing a
+    /// per-chunk [`crate::FfiBool`] presence indicator (`1` when present in the chunk's archetype,
+    /// `0` when absent) rather than raw `T` column bytes.
+    pub const HAS: Self = Self(13);
+    /// Lifecycle removal stream reader (`RemovedComponents<T>`, C `BAM_ACCESS_REMOVED_READ`)
+    /// consumed via `BamHostApi::iter_read_removed`.
+    pub const REMOVED_READ: Self = Self(14);
 
-    /// Returns `true` if this mode is one of the recognized variants (`0..=11`).
+    /// Returns `true` if this mode is one of the recognized variants (`0..=14`).
     #[inline]
     pub const fn is_valid(self) -> bool {
-        self.0 <= Self::MESSAGE_WRITE.0
+        self.0 <= Self::REMOVED_READ.0
     }
 
     /// Returns `true` if this mode requires exclusive mutable access (`WRITE`, `OPTIONAL_WRITE`,
@@ -81,6 +94,25 @@ impl AccessMode {
     #[inline]
     pub const fn is_without(self) -> bool {
         self.0 == Self::WITHOUT.0
+    }
+
+    /// Returns `true` if this mode is an entity-disabling filter bypass (`Allow<T>`).
+    #[inline]
+    pub const fn is_allow(self) -> bool {
+        self.0 == Self::ALLOW.0
+    }
+
+    /// Returns `true` if this mode is an archetypal presence indicator (`Has<T>`), yielding a
+    /// synthesized [`crate::FfiBool`] presence check rather than borrowing `&T` component storage.
+    #[inline]
+    pub const fn is_has(self) -> bool {
+        self.0 == Self::HAS.0
+    }
+
+    /// Returns `true` if this mode reads lifecycle `RemovedComponents<T>` events (`REMOVED_READ`).
+    #[inline]
+    pub const fn is_removed_read(self) -> bool {
+        self.0 == Self::REMOVED_READ.0
     }
 
     /// Returns `true` if this mode is optional (`Option<&T>` or `Option<&mut T>`).
@@ -107,8 +139,11 @@ impl AccessMode {
         self.0 == Self::MESSAGE_READ.0 || self.0 == Self::MESSAGE_WRITE.0
     }
 
-    /// Returns `true` if this mode reads or writes per-entity component data (`READ`, `WRITE`,
-    /// `OPTIONAL_READ`, `OPTIONAL_WRITE`, `CHANGED`, or `ADDED`).
+    /// Returns `true` if this mode reads or writes per-entity `T` component payload storage
+    /// (`READ`, `WRITE`, `OPTIONAL_READ`, `OPTIONAL_WRITE`, `CHANGED`, or `ADDED`).
+    ///
+    /// Note: [`Self::HAS`] returns `false` here because `Has<T>` declares only archetypal metadata
+    /// access and synthesizes an [`crate::FfiBool`] presence flag without borrowing `&T` payloads.
     #[inline]
     pub const fn has_entity_column_data(self) -> bool {
         matches!(self.0, 0 | 1 | 4 | 5 | 6 | 7)
@@ -166,7 +201,7 @@ impl ScheduleId {
 }
 
 /// Mask of recognized [`BamTermDesc::flags`] bits in ABI `0.2` (`0`).
-pub const BAM_TERM_KNOWN_FLAGS: u32 = 0;
+pub const BAM_TERM_KNOWN_FLAGS: u16 = 0;
 
 /// Handle-based query or resource term declaration inside [`crate::BamQueryDesc`].
 ///
@@ -176,27 +211,41 @@ pub const BAM_TERM_KNOWN_FLAGS: u32 = 0;
 pub struct BamTermDesc {
     /// Pre-resolved non-zero [`BamComponent`] handle (`0` is rejected with [`FfiResult::INVALID_COMPONENT`]).
     pub component: BamComponent,
-    /// Access mode (`READ`..=`RESOURCE_WRITE`).
+    /// Access mode (`READ`..=`REMOVED_READ`).
     pub mode: AccessMode,
     /// Term bitflags (`0` in ABI `0.2`; unknown bits are rejected with [`FfiResult::UNSUPPORTED`]).
-    pub flags: u32,
+    pub flags: u16,
+    /// Disjunctive `Or<(...)>` filter group (`0` = conjunctive top-level term; `1..=255` groups
+    /// terms sharing the same `or_group` ID into a single `Or<(...)>` filter clause).
+    pub or_group: u8,
+    /// Explicit zero-reserved padding byte (`must be 0`, rejected with [`FfiResult::INVALID_ARGUMENT`]).
+    pub reserved0: u8,
 }
 
 impl BamTermDesc {
-    /// Constructs a term descriptor with `flags = 0`.
+    /// Constructs a conjunctive (`or_group = 0`) term descriptor with `flags = 0`.
     #[inline]
     pub const fn new(component: BamComponent, mode: AccessMode) -> Self {
         Self {
             component,
             mode,
             flags: 0,
+            or_group: 0,
+            reserved0: 0,
         }
     }
 
-    /// Attaches explicit term flags.
+    /// Attaches explicit 16-bit term flags.
     #[inline]
-    pub const fn with_flags(mut self, flags: u32) -> Self {
+    pub const fn with_flags(mut self, flags: u16) -> Self {
         self.flags = flags;
+        self
+    }
+
+    /// Assigns this filter term to disjunctive `Or<(...)>` group `or_group` (`1..=255`, or `0` for conjunctive).
+    #[inline]
+    pub const fn with_or_group(mut self, or_group: u8) -> Self {
+        self.or_group = or_group;
         self
     }
 
@@ -272,11 +321,32 @@ impl BamTermDesc {
         Self::new(component, AccessMode::MESSAGE_WRITE)
     }
 
-    /// Validates `flags`, `component != INVALID`, and `mode` discriminant range.
+    /// Creates an entity-disabling bypass filter (`Allow<T>`) term descriptor.
+    #[inline]
+    pub const fn allow(component: BamComponent) -> Self {
+        Self::new(component, AccessMode::ALLOW)
+    }
+
+    /// Creates an archetypal presence indicator (`Has<T>`) term descriptor.
+    #[inline]
+    pub const fn has(component: BamComponent) -> Self {
+        Self::new(component, AccessMode::HAS)
+    }
+
+    /// Creates a lifecycle removal stream reader (`RemovedComponents<T>`) term descriptor.
+    #[inline]
+    pub const fn removed_read(component: BamComponent) -> Self {
+        Self::new(component, AccessMode::REMOVED_READ)
+    }
+
+    /// Validates `flags`, `reserved0 == 0`, `component != INVALID`, and `mode` discriminant range.
     #[inline]
     pub const fn validate(&self) -> FfiResult {
         if (self.flags & !BAM_TERM_KNOWN_FLAGS) != 0 {
             return FfiResult::UNSUPPORTED;
+        }
+        if self.reserved0 != 0 {
+            return FfiResult::INVALID_ARGUMENT;
         }
         if !self.component.is_valid() {
             return FfiResult::INVALID_COMPONENT;
@@ -298,4 +368,6 @@ const _: () = {
     assert!(core::mem::offset_of!(BamTermDesc, component) == 0);
     assert!(core::mem::offset_of!(BamTermDesc, mode) == 4);
     assert!(core::mem::offset_of!(BamTermDesc, flags) == 8);
+    assert!(core::mem::offset_of!(BamTermDesc, or_group) == 10);
+    assert!(core::mem::offset_of!(BamTermDesc, reserved0) == 11);
 };

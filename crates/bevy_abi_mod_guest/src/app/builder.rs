@@ -828,6 +828,9 @@ impl<'b, 'a> SystemBuilder<'b, 'a> {
             after: &self.after,
             before: &self.before,
             in_sets: &self.in_sets,
+            after_weak: &[],
+            before_weak: &[],
+            ambiguous_with: &[],
         };
         self.app.load_ctx.register_system(
             self.app.instance,

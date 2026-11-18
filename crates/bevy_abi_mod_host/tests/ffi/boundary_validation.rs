@@ -281,10 +281,10 @@ mod fuzz_boundaries {
                     assert_eq!(res, FfiResult::INVALID_ARGUMENT, "step {step}");
                 }
                 4 => {
-                    // Invalid `AccessMode(10..=u32::MAX)` inside `BamTermDesc` -> `INVALID_ARGUMENT`
+                    // Invalid `AccessMode(15..=u32::MAX)` inside `BamTermDesc` -> `INVALID_ARGUMENT`
                     let t_len = 1 + rng.range(8);
                     let bad_idx = rng.range(t_len);
-                    let bad_mode = 10u32.saturating_add(rng.next_u32()).max(10);
+                    let bad_mode = 15u32.saturating_add(rng.next_u32()).max(15);
                     let terms: Vec<BamTermDesc> = (0..t_len)
                         .map(|i| BamTermDesc {
                             component: valid_handles[i],
@@ -294,6 +294,8 @@ mod fuzz_boundaries {
                                 AccessMode(rng.range(4) as u32)
                             },
                             flags: 0,
+                            or_group: 0,
+                            reserved0: 0,
                         })
                         .collect();
                     let q = BamQueryDesc::new(terms.as_ptr(), terms.len());
@@ -313,6 +315,8 @@ mod fuzz_boundaries {
                         component: valid_handles[0],
                         mode: AccessMode::READ,
                         flags: if rng.gen_bool() { 1 } else { 0 },
+                        or_group: 0,
+                        reserved0: 0,
                     };
                     let mut q = BamQueryDesc::new(&term, 1);
                     if term.flags == 0 {
@@ -440,6 +444,8 @@ mod fuzz_boundaries {
                             component: h,
                             mode: AccessMode(rng.range(4) as u32),
                             flags: 0,
+                            or_group: 0,
+                            reserved0: 0,
                         })
                         .collect();
                     let q = BamQueryDesc::new(terms.as_ptr(), terms.len());

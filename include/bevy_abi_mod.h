@@ -103,6 +103,7 @@ extern "C" {
 #define BAM_SIPHASH_KEY_1 0x56305f3253495048ull
 #define BAM_MAX_CHANGE_AGE 0xC233B000u
 #define BAM_CHILD_OF_NAME "bevy_ecs::hierarchy::ChildOf"
+#define BAM_CHILDREN_NAME "bevy_ecs::hierarchy::Children"
 
 /* ==========================================================================
 * 3. Primitive Newtypes, Handles, Status Codes, Modes & Flags
@@ -150,6 +151,28 @@ typedef uint32_t BamAccessMode;
 #define BAM_ACCESS_RESOURCE_WRITE ((BamAccessMode)9u)
 #define BAM_ACCESS_MESSAGE_READ   ((BamAccessMode)10u)
 #define BAM_ACCESS_MESSAGE_WRITE  ((BamAccessMode)11u)
+#define BAM_ACCESS_ALLOW          ((BamAccessMode)12u)
+#define BAM_ACCESS_HAS            ((BamAccessMode)13u)
+#define BAM_ACCESS_REMOVED_READ   ((BamAccessMode)14u)
+
+typedef uint32_t BamEventKind;
+#define BAM_EVENT_KIND_CUSTOM  ((BamEventKind)0u)
+#define BAM_EVENT_KIND_ADD     ((BamEventKind)1u)
+#define BAM_EVENT_KIND_INSERT  ((BamEventKind)2u)
+#define BAM_EVENT_KIND_DISCARD ((BamEventKind)3u)
+#define BAM_EVENT_KIND_REMOVE  ((BamEventKind)4u)
+#define BAM_EVENT_KIND_DESPAWN ((BamEventKind)5u)
+#define BAM_EVENT_KIND_READY   ((BamEventKind)6u)
+
+#define BAM_ASSET_HANDLE_KIND_NONE  ((uint8_t)0u)
+#define BAM_ASSET_HANDLE_KIND_INDEX ((uint8_t)1u)
+#define BAM_ASSET_HANDLE_KIND_UUID  ((uint8_t)2u)
+
+typedef uint32_t BamAssetLoadState;
+#define BAM_ASSET_LOAD_STATE_NOT_LOADED ((BamAssetLoadState)0u)
+#define BAM_ASSET_LOAD_STATE_LOADING    ((BamAssetLoadState)1u)
+#define BAM_ASSET_LOAD_STATE_LOADED     ((BamAssetLoadState)2u)
+#define BAM_ASSET_LOAD_STATE_FAILED     ((BamAssetLoadState)3u)
 
 typedef uint32_t BamScheduleId;
 #define BAM_SCHEDULE_UPDATE       ((BamScheduleId)0u)
@@ -160,21 +183,27 @@ typedef uint32_t BamScheduleId;
 #define BAM_SCHEDULE_LAST         ((BamScheduleId)5u)
 #define BAM_SCHEDULE_CUSTOM_BASE  ((BamScheduleId)1024u)
 
-#define BAM_MANIFEST_KNOWN_FLAGS       0x00000000u
-#define BAM_TERM_KNOWN_FLAGS           0x00000000u
-#define BAM_QUERY_KNOWN_FLAGS          0x00000000u
-#define BAM_SYSTEM_FLAG_MAIN_THREAD    0x00000001u
-#define BAM_SYSTEM_KNOWN_FLAGS         0x00000001u
-#define BAM_OBSERVER_KNOWN_FLAGS       0x00000000u
-#define BAM_COMPONENT_FLAG_SPARSE_SET  0x00000001u
-#define BAM_COMPONENT_FLAG_IMMUTABLE   0x00000002u
-#define BAM_COMPONENT_KNOWN_FLAGS      0x00000003u
-#define BAM_STORAGE_FLAG_SPARSE_SET    0x00000001u
-#define BAM_STORAGE_FLAG_IMMUTABLE     0x00000002u
-#define BAM_STORAGE_FLAG_RESOURCE      0x00000004u
-#define BAM_STORAGE_FLAG_MESSAGE       0x00000008u
-#define BAM_STORAGE_FLAG_EVENT         0x00000010u
-#define BAM_STORAGE_FLAG_ENTITY_EVENT  0x00000020u
+#define BAM_MANIFEST_KNOWN_FLAGS            0x00000000u
+#define BAM_TERM_KNOWN_FLAGS                0x0000u
+#define BAM_QUERY_KNOWN_FLAGS               0x00000000u
+#define BAM_SYSTEM_FLAG_MAIN_THREAD         0x00000001u
+#define BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL  0x00000002u
+#define BAM_SYSTEM_KNOWN_FLAGS              0x00000003u
+#define BAM_OBSERVER_FLAG_PROPAGATE         0x00000001u
+#define BAM_OBSERVER_KNOWN_FLAGS            0x00000001u
+#define BAM_TRIGGER_FLAG_PROPAGATE          0x00000001u
+#define BAM_TRIGGER_KNOWN_FLAGS             0x00000001u
+#define BAM_COMPONENT_FLAG_SPARSE_SET       0x00000001u
+#define BAM_COMPONENT_FLAG_IMMUTABLE        0x00000002u
+#define BAM_COMPONENT_FLAG_SUMMARY_TICK     0x00000004u
+#define BAM_COMPONENT_KNOWN_FLAGS           0x00000007u
+#define BAM_STORAGE_FLAG_SPARSE_SET         0x00000001u
+#define BAM_STORAGE_FLAG_IMMUTABLE          0x00000002u
+#define BAM_STORAGE_FLAG_RESOURCE           0x00000004u
+#define BAM_STORAGE_FLAG_MESSAGE            0x00000008u
+#define BAM_STORAGE_FLAG_EVENT              0x00000010u
+#define BAM_STORAGE_FLAG_ENTITY_EVENT       0x00000020u
+#define BAM_STORAGE_FLAG_SUMMARY_TICK       0x00000040u
 
 /* ==========================================================================
 * 4. Opaque Context Handles, Wire Descriptors & Function Pointer Typedefs
@@ -198,6 +227,21 @@ typedef BamStrView BamByteSlice;
 typedef struct BamComponentUuid {
 uint8_t bytes[16];
 } BamComponentUuid;
+
+#define BAM_OPTION_STRUCT(ElemType, StructName) \
+typedef struct StructName {                 \
+BamBool  is_some;                       \
+ElemType value;                         \
+} StructName
+
+typedef struct BamAssetHandle {
+uint8_t          kind;
+uint8_t          reserved0[3];
+BamComponent     asset_type;
+uint32_t         index;
+uint32_t         generation;
+BamComponentUuid uuid;
+} BamAssetHandle;
 
 typedef struct BamChildOf {
 BamEntity parent;
@@ -232,14 +276,18 @@ BamRestoreStateFn restore_state;
 
 typedef void      (*BamComponentDropFn)(void* ptr);
 typedef void      (*BamComponentHookFn)(BamEntity entity, const void* data_ptr, void* user_data);
+typedef BamResult (*BamComponentCloneFn)(const void* src, void* dst, void* user_data);
 typedef BamResult (*BamSystemFn)(BamSystemCtx* sys_ctx, void* user_data);
 typedef BamBool   (*BamRunIfFn)(void* user_data);
 typedef BamResult (*BamObserverFn)(BamEntity entity, const void* event_data, BamCommands* commands, void* user_data);
+typedef BamResult (*BamObserverMutFn)(BamEntity entity, uint8_t* event_data, BamBool* propagate, BamCommands* commands, void* user_data);
 
 typedef struct BamTermDesc {
 BamComponent  component;
 BamAccessMode mode;
-uint32_t      flags;
+uint16_t      flags;
+uint8_t       or_group;
+uint8_t       reserved0;
 } BamTermDesc;
 
 typedef struct BamQueryDesc {
@@ -266,11 +314,23 @@ size_t              before_count;
 BamRunIfFn          run_if;
 void*               run_if_user_data;
 #if defined(__cplusplus) && (__cplusplus >= 201402L)
-const char* const*  in_sets          = nullptr;
-size_t              in_set_count     = 0;
+const char* const*  in_sets              = nullptr;
+size_t              in_set_count         = 0;
+const char* const*  after_weak           = nullptr;
+size_t              after_weak_count     = 0;
+const char* const*  before_weak          = nullptr;
+size_t              before_weak_count    = 0;
+const char* const*  ambiguous_with       = nullptr;
+size_t              ambiguous_with_count = 0;
 #else
 const char* const*  in_sets;
 size_t              in_set_count;
+const char* const*  after_weak;
+size_t              after_weak_count;
+const char* const*  before_weak;
+size_t              before_weak_count;
+const char* const*  ambiguous_with;
+size_t              ambiguous_with_count;
 #endif
 } BamSystemDesc;
 
@@ -284,7 +344,39 @@ uint32_t      entity_hi;
 uint32_t      reserved0;
 BamObserverFn callback;
 void*         user_data;
+#if defined(__cplusplus) && (__cplusplus >= 201402L)
+BamEventKind        event_kind              = BAM_EVENT_KIND_CUSTOM;
+uint32_t            reserved1               = 0;
+const BamComponent* watched_components      = nullptr;
+size_t              watched_component_count = 0;
+BamObserverMutFn    mut_callback            = nullptr;
+BamComponent        propagate_relationship  = BAM_COMPONENT_INVALID;
+uint32_t            reserved2               = 0;
+#else
+BamEventKind        event_kind;
+uint32_t            reserved1;
+const BamComponent* watched_components;
+size_t              watched_component_count;
+BamObserverMutFn    mut_callback;
+BamComponent        propagate_relationship;
+uint32_t            reserved2;
+#endif
 } BamObserverDesc;
+
+typedef struct BamTriggerDesc {
+uint32_t            struct_size;
+uint32_t            flags;
+BamComponent        event;
+BamEventKind        event_kind;
+uint32_t            entity_lo;
+uint32_t            entity_hi;
+uint8_t*            data_ptr;
+size_t              data_len;
+const BamComponent* watched_components;
+size_t              watched_component_count;
+BamComponent        propagate_relationship;
+uint32_t            reserved0;
+} BamTriggerDesc;
 
 typedef struct BamComponentDesc {
 uint32_t           struct_size;
@@ -296,13 +388,25 @@ size_t             align;
 BamComponentDropFn drop_fn;
 const void*        vtable_ptr;
 #if defined(__cplusplus) && (__cplusplus >= 201402L)
-BamComponentHookFn on_add         = nullptr;
-BamComponentHookFn on_remove      = nullptr;
-void*              hook_user_data = nullptr;
+BamComponentHookFn  on_add                   = nullptr;
+BamComponentHookFn  on_remove                = nullptr;
+void*               hook_user_data           = nullptr;
+BamComponentHookFn  on_insert                = nullptr;
+BamComponentHookFn  on_discard               = nullptr;
+BamComponentHookFn  on_despawn               = nullptr;
+BamComponentCloneFn clone_fn                 = nullptr;
+const BamComponent* required_components      = nullptr;
+size_t              required_component_count = 0;
 #else
-BamComponentHookFn on_add;
-BamComponentHookFn on_remove;
-void*              hook_user_data;
+BamComponentHookFn  on_add;
+BamComponentHookFn  on_remove;
+void*               hook_user_data;
+BamComponentHookFn  on_insert;
+BamComponentHookFn  on_discard;
+BamComponentHookFn  on_despawn;
+BamComponentCloneFn clone_fn;
+const BamComponent* required_components;
+size_t              required_component_count;
 #endif
 } BamComponentDesc;
 
@@ -323,6 +427,22 @@ BamComponentUuid uuid;
 size_t           size;
 size_t           align;
 } BamVTableHeader;
+
+#define BAM_MAPPED_WIRE_VTABLE_STRUCT(WireType, StructName) \
+typedef struct StructName {                             \
+BamVTableHeader header;                             \
+BamResult (*get)(const void* ptr, WireType* out);   \
+BamResult (*set)(void* ptr, const WireType* in_v);  \
+} StructName
+
+typedef BamStrView (*BamMappedStringGetFn)(const void* ptr);
+typedef BamResult  (*BamMappedStringSetFn)(void* ptr, BamStrView view);
+
+typedef struct BamMappedStringVTable {
+BamVTableHeader      header;
+BamMappedStringGetFn get;
+BamMappedStringSetFn set;
+} BamMappedStringVTable;
 
 /* --- Mandatory Guest Entry-Point Typedefs --- */
 typedef const BamManifest* (*BamManifestFn)(void);
@@ -381,6 +501,16 @@ typedef const uint8_t* (*BamSysResPtrFn)(const BamSystemCtx* sys_ctx, BamCompone
 typedef uint8_t*       (*BamSysResMutPtrFn)(BamSystemCtx* sys_ctx, BamComponent component, BamChangeTicks* out_ticks);
 typedef BamResult      (*BamRegisterObserverFn)(BamLoadCtx* load_ctx, const BamObserverDesc* desc);
 typedef BamResult      (*BamCmdTriggerFn)(BamCommands* commands, BamComponent event, BamEntity target, const uint8_t* data_ptr, size_t data_len);
+typedef BamResult      (*BamCmdSpawnBatchFn)(BamCommands* commands, const BamComponent* components, const uint8_t* const* column_ptrs, size_t component_count, size_t entity_count, BamEntity* out_entities);
+typedef BamResult      (*BamCmdDespawnAllFn)(BamCommands* commands, const BamTermDesc* terms, size_t term_count);
+typedef BamResult      (*BamCmdTriggerExFn)(BamCommands* commands, const BamTriggerDesc* desc);
+typedef BamResult      (*BamCmdObserveFn)(BamCommands* commands, const BamObserverDesc* desc, BamEntity* out_entity);
+typedef BamResult      (*BamIterReadRemovedFn)(BamIter* iter, size_t term_index, BamEntity* out_entities, size_t max_count, size_t* out_read);
+typedef BamResult      (*BamSysEntityChildrenFn)(const BamSystemCtx* sys_ctx, BamEntity entity, BamComponent relationship_target, const BamEntity** out_entities, size_t* out_len);
+typedef BamResult      (*BamAssetLoadFn)(const BamHostCtx* ctx, BamComponent asset_type, BamStrView path, BamAssetHandle* out_handle);
+typedef BamResult      (*BamAssetGetLoadStateFn)(const BamHostCtx* ctx, const BamAssetHandle* handle, BamAssetLoadState* out_state);
+typedef BamResult      (*BamAssetReleaseFn)(const BamHostCtx* ctx, const BamAssetHandle* handle);
+typedef BamResult      (*BamCmdSpawnSceneFn)(BamCommands* commands, const BamAssetHandle* scene_handle, BamEntity parent, BamEntity* out_entity);
 
 struct BamHostApi {
 uint32_t struct_size;
@@ -426,23 +556,36 @@ BamCmdInsertDefaultFn cmd_insert_default;
 BamCmdRemoveFn        cmd_remove;
 
 /* Optional extended engine slots (appended after `BAM_HOST_API_MIN_V0_2_SIZE`) */
-BamParForEachChunkFn  par_for_each_chunk;
-BamSysEntityGetFn     sys_entity_get;
-BamSysEntityGetMutFn  sys_entity_get_mut;
-BamMsgReadBatchFn     msg_read_batch;
-BamMsgSendFn          msg_send;
-BamMsgWriteBatchFn    msg_write_batch;
-BamResTicksFn         res_ticks;
-BamSysResPtrFn        sys_res_ptr;
-BamSysResMutPtrFn     sys_res_mut_ptr;
-BamRegisterObserverFn register_observer;
-BamCmdTriggerFn       cmd_trigger;
+BamParForEachChunkFn    par_for_each_chunk;
+BamSysEntityGetFn       sys_entity_get;
+BamSysEntityGetMutFn    sys_entity_get_mut;
+BamMsgReadBatchFn       msg_read_batch;
+BamMsgSendFn            msg_send;
+BamMsgWriteBatchFn      msg_write_batch;
+BamResTicksFn           res_ticks;
+BamSysResPtrFn          sys_res_ptr;
+BamSysResMutPtrFn       sys_res_mut_ptr;
+BamRegisterObserverFn   register_observer;
+BamCmdTriggerFn         cmd_trigger;
+BamCmdSpawnFn           cmd_spawn_persistent;
+BamCmdSpawnBatchFn      cmd_spawn_batch;
+BamCmdDespawnAllFn      cmd_despawn_all;
+BamCmdInsertFn          cmd_insert_if_new;
+BamCmdTriggerExFn       cmd_trigger_ex;
+BamCmdObserveFn         cmd_observe;
+BamIterReadRemovedFn    iter_read_removed;
+BamSysEntityChildrenFn  sys_entity_children;
+BamAssetLoadFn          asset_load;
+BamAssetGetLoadStateFn  asset_get_load_state;
+BamAssetReleaseFn       asset_release;
+BamCmdSpawnSceneFn      cmd_spawn_scene;
 };
 
 #define BAM_MANIFEST_MIN_V0_2_SIZE       (offsetof(BamManifest, reserved0) + sizeof(uint32_t))
 #define BAM_QUERY_DESC_MIN_V0_2_SIZE     (offsetof(BamQueryDesc, term_count) + sizeof(size_t))
 #define BAM_SYSTEM_DESC_MIN_V0_2_SIZE    (offsetof(BamSystemDesc, run_if_user_data) + sizeof(void*))
 #define BAM_OBSERVER_DESC_MIN_V0_2_SIZE  (offsetof(BamObserverDesc, user_data) + sizeof(void*))
+#define BAM_TRIGGER_DESC_MIN_V0_2_SIZE   (offsetof(BamTriggerDesc, reserved0) + sizeof(uint32_t))
 #define BAM_COMPONENT_DESC_MIN_V0_2_SIZE (offsetof(BamComponentDesc, vtable_ptr) + sizeof(const void*))
 #define BAM_VTABLE_HEADER_MIN_V0_2_SIZE  (offsetof(BamVTableHeader, align) + sizeof(size_t))
 #define BAM_HOST_API_MIN_V0_2_SIZE       (offsetof(BamHostApi, cmd_remove) + sizeof(BamCmdRemoveFn))
@@ -523,12 +666,68 @@ static BAM_UNUSED inline int bam_component_is_valid(BamComponent component) {
 return component != BAM_COMPONENT_INVALID;
 }
 
-static BAM_UNUSED inline BamTermDesc bam_term_desc(BamComponent component, BamAccessMode mode, uint32_t flags) {
+static BAM_UNUSED inline BamTermDesc bam_term_desc(BamComponent component, BamAccessMode mode, uint16_t flags) {
 BamTermDesc t;
 t.component = component;
 t.mode = mode;
 t.flags = flags;
+t.or_group = 0u;
+t.reserved0 = 0u;
 return t;
+}
+
+static BAM_UNUSED inline BamTermDesc bam_term_desc_or(
+BamComponent component,
+BamAccessMode mode,
+uint16_t flags,
+uint8_t or_group
+) {
+BamTermDesc t;
+t.component = component;
+t.mode = mode;
+t.flags = flags;
+t.or_group = or_group;
+t.reserved0 = 0u;
+return t;
+}
+
+static BAM_UNUSED inline BamAssetHandle bam_asset_handle_none(void) {
+BamAssetHandle h;
+memset(&h, 0, sizeof(BamAssetHandle));
+h.kind = BAM_ASSET_HANDLE_KIND_NONE;
+return h;
+}
+
+static BAM_UNUSED inline BamAssetHandle bam_asset_handle_from_index(
+BamComponent asset_type,
+uint32_t index,
+uint32_t generation
+) {
+BamAssetHandle h = bam_asset_handle_none();
+h.kind = BAM_ASSET_HANDLE_KIND_INDEX;
+h.asset_type = asset_type;
+h.index = index;
+h.generation = generation;
+return h;
+}
+
+static BAM_UNUSED inline BamAssetHandle bam_asset_handle_from_uuid(
+BamComponent asset_type,
+BamComponentUuid uuid
+) {
+BamAssetHandle h = bam_asset_handle_none();
+h.kind = BAM_ASSET_HANDLE_KIND_UUID;
+h.asset_type = asset_type;
+h.uuid = uuid;
+return h;
+}
+
+static BAM_UNUSED inline int bam_asset_handle_is_none(const BamAssetHandle* h) {
+return (h == NULL) || (h->kind == BAM_ASSET_HANDLE_KIND_NONE);
+}
+
+static BAM_UNUSED inline int bam_asset_handle_is_some(const BamAssetHandle* h) {
+return (h != NULL) && (h->kind == BAM_ASSET_HANDLE_KIND_INDEX || h->kind == BAM_ASSET_HANDLE_KIND_UUID);
 }
 
 static BAM_UNUSED inline uint32_t bam_host_api_raw_struct_size(const BamHostApi* api) {
@@ -759,6 +958,12 @@ d.vtable_ptr = NULL;
 d.on_add = NULL;
 d.on_remove = NULL;
 d.hook_user_data = NULL;
+d.on_insert = NULL;
+d.on_discard = NULL;
+d.on_despawn = NULL;
+d.clone_fn = NULL;
+d.required_components = NULL;
+d.required_component_count = 0u;
 return d;
 }
 
@@ -778,6 +983,35 @@ d.entity_hi = (uint32_t)((entity >> 32) & 0xFFFFFFFFull);
 d.reserved0 = 0u;
 d.callback = callback;
 d.user_data = user_data;
+d.event_kind = BAM_EVENT_KIND_CUSTOM;
+d.reserved1 = 0u;
+d.watched_components = NULL;
+d.watched_component_count = 0u;
+d.mut_callback = NULL;
+d.propagate_relationship = BAM_COMPONENT_INVALID;
+d.reserved2 = 0u;
+return d;
+}
+
+static BAM_UNUSED inline BamTriggerDesc bam_trigger_desc(
+BamComponent event,
+BamEntity entity,
+uint8_t* data_ptr,
+size_t data_len
+) {
+BamTriggerDesc d;
+d.struct_size = (uint32_t)sizeof(BamTriggerDesc);
+d.flags = 0u;
+d.event = event;
+d.event_kind = BAM_EVENT_KIND_CUSTOM;
+d.entity_lo = (uint32_t)(entity & 0xFFFFFFFFull);
+d.entity_hi = (uint32_t)((entity >> 32) & 0xFFFFFFFFull);
+d.data_ptr = data_ptr;
+d.data_len = data_len;
+d.watched_components = NULL;
+d.watched_component_count = 0u;
+d.propagate_relationship = BAM_COMPONENT_INVALID;
+d.reserved0 = 0u;
 return d;
 }
 
@@ -798,6 +1032,10 @@ BAM_STATIC_ASSERT(sizeof(BamAccessMode) == 4u, bam_access_mode_size);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamAccessMode) == 4u, bam_access_mode_align);
 BAM_STATIC_ASSERT(sizeof(BamScheduleId) == 4u, bam_schedule_id_size);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamScheduleId) == 4u, bam_schedule_id_align);
+BAM_STATIC_ASSERT(sizeof(BamEventKind) == 4u, bam_event_kind_size);
+BAM_STATIC_ASSERT(BAM_ALIGNOF(BamEventKind) == 4u, bam_event_kind_align);
+BAM_STATIC_ASSERT(sizeof(BamAssetLoadState) == 4u, bam_asset_load_state_size);
+BAM_STATIC_ASSERT(BAM_ALIGNOF(BamAssetLoadState) == 4u, bam_asset_load_state_align);
 
 #if UINTPTR_MAX == 0xffffffffffffffffULL
 BAM_STATIC_ASSERT(sizeof(BamComponentUuid) == 16u, bam_component_uuid_size_64);
@@ -817,18 +1055,28 @@ BAM_STATIC_ASSERT(offsetof(BamManifest, flags) == 24u, bam_manifest_off_flags_64
 BAM_STATIC_ASSERT(offsetof(BamManifest, reserved0) == 28u, bam_manifest_off_reserved0_64);
 BAM_STATIC_ASSERT(offsetof(BamManifest, save_state) == 32u, bam_manifest_off_save_state_64);
 BAM_STATIC_ASSERT(offsetof(BamManifest, restore_state) == 40u, bam_manifest_off_restore_state_64);
+BAM_STATIC_ASSERT(sizeof(BamAssetHandle) == 32u, bam_asset_handle_size_64);
+BAM_STATIC_ASSERT(BAM_ALIGNOF(BamAssetHandle) == 4u, bam_asset_handle_align_64);
+BAM_STATIC_ASSERT(offsetof(BamAssetHandle, kind) == 0u, bam_asset_handle_off_kind_64);
+BAM_STATIC_ASSERT(offsetof(BamAssetHandle, reserved0) == 1u, bam_asset_handle_off_reserved0_64);
+BAM_STATIC_ASSERT(offsetof(BamAssetHandle, asset_type) == 4u, bam_asset_handle_off_asset_type_64);
+BAM_STATIC_ASSERT(offsetof(BamAssetHandle, index) == 8u, bam_asset_handle_off_index_64);
+BAM_STATIC_ASSERT(offsetof(BamAssetHandle, generation) == 12u, bam_asset_handle_off_generation_64);
+BAM_STATIC_ASSERT(offsetof(BamAssetHandle, uuid) == 16u, bam_asset_handle_off_uuid_64);
 BAM_STATIC_ASSERT(sizeof(BamTermDesc) == 12u, bam_term_desc_size_64);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamTermDesc) == 4u, bam_term_desc_align_64);
 BAM_STATIC_ASSERT(offsetof(BamTermDesc, component) == 0u, bam_term_desc_off_component_64);
 BAM_STATIC_ASSERT(offsetof(BamTermDesc, mode) == 4u, bam_term_desc_off_mode_64);
 BAM_STATIC_ASSERT(offsetof(BamTermDesc, flags) == 8u, bam_term_desc_off_flags_64);
+BAM_STATIC_ASSERT(offsetof(BamTermDesc, or_group) == 10u, bam_term_desc_off_or_group_64);
+BAM_STATIC_ASSERT(offsetof(BamTermDesc, reserved0) == 11u, bam_term_desc_off_reserved0_64);
 BAM_STATIC_ASSERT(sizeof(BamQueryDesc) == 24u, bam_query_desc_size_64);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamQueryDesc) == 8u, bam_query_desc_align_64);
 BAM_STATIC_ASSERT(offsetof(BamQueryDesc, struct_size) == 0u, bam_query_desc_off_struct_size_64);
 BAM_STATIC_ASSERT(offsetof(BamQueryDesc, flags) == 4u, bam_query_desc_off_flags_64);
 BAM_STATIC_ASSERT(offsetof(BamQueryDesc, terms) == 8u, bam_query_desc_off_terms_64);
 BAM_STATIC_ASSERT(offsetof(BamQueryDesc, term_count) == 16u, bam_query_desc_off_term_count_64);
-BAM_STATIC_ASSERT(sizeof(BamSystemDesc) == 120u, bam_system_desc_size_64);
+BAM_STATIC_ASSERT(sizeof(BamSystemDesc) == 168u, bam_system_desc_size_64);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamSystemDesc) == 8u, bam_system_desc_align_64);
 BAM_STATIC_ASSERT(offsetof(BamSystemDesc, struct_size) == 0u, bam_system_desc_off_struct_size_64);
 BAM_STATIC_ASSERT(offsetof(BamSystemDesc, flags) == 4u, bam_system_desc_off_flags_64);
@@ -847,7 +1095,13 @@ BAM_STATIC_ASSERT(offsetof(BamSystemDesc, run_if) == 88u, bam_system_desc_off_ru
 BAM_STATIC_ASSERT(offsetof(BamSystemDesc, run_if_user_data) == 96u, bam_system_desc_off_run_if_user_data_64);
 BAM_STATIC_ASSERT(offsetof(BamSystemDesc, in_sets) == 104u, bam_system_desc_off_in_sets_64);
 BAM_STATIC_ASSERT(offsetof(BamSystemDesc, in_set_count) == 112u, bam_system_desc_off_in_set_count_64);
-BAM_STATIC_ASSERT(sizeof(BamObserverDesc) == 48u, bam_observer_desc_size_64);
+BAM_STATIC_ASSERT(offsetof(BamSystemDesc, after_weak) == 120u, bam_system_desc_off_after_weak_64);
+BAM_STATIC_ASSERT(offsetof(BamSystemDesc, after_weak_count) == 128u, bam_system_desc_off_after_weak_count_64);
+BAM_STATIC_ASSERT(offsetof(BamSystemDesc, before_weak) == 136u, bam_system_desc_off_before_weak_64);
+BAM_STATIC_ASSERT(offsetof(BamSystemDesc, before_weak_count) == 144u, bam_system_desc_off_before_weak_count_64);
+BAM_STATIC_ASSERT(offsetof(BamSystemDesc, ambiguous_with) == 152u, bam_system_desc_off_ambiguous_with_64);
+BAM_STATIC_ASSERT(offsetof(BamSystemDesc, ambiguous_with_count) == 160u, bam_system_desc_off_ambiguous_with_count_64);
+BAM_STATIC_ASSERT(sizeof(BamObserverDesc) == 88u, bam_observer_desc_size_64);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamObserverDesc) == 8u, bam_observer_desc_align_64);
 BAM_STATIC_ASSERT(offsetof(BamObserverDesc, struct_size) == 0u, bam_observer_desc_off_struct_size_64);
 BAM_STATIC_ASSERT(offsetof(BamObserverDesc, flags) == 4u, bam_observer_desc_off_flags_64);
@@ -858,13 +1112,34 @@ BAM_STATIC_ASSERT(offsetof(BamObserverDesc, entity_hi) == 24u, bam_observer_desc
 BAM_STATIC_ASSERT(offsetof(BamObserverDesc, reserved0) == 28u, bam_observer_desc_off_reserved0_64);
 BAM_STATIC_ASSERT(offsetof(BamObserverDesc, callback) == 32u, bam_observer_desc_off_callback_64);
 BAM_STATIC_ASSERT(offsetof(BamObserverDesc, user_data) == 40u, bam_observer_desc_off_user_data_64);
+BAM_STATIC_ASSERT(offsetof(BamObserverDesc, event_kind) == 48u, bam_observer_desc_off_event_kind_64);
+BAM_STATIC_ASSERT(offsetof(BamObserverDesc, reserved1) == 52u, bam_observer_desc_off_reserved1_64);
+BAM_STATIC_ASSERT(offsetof(BamObserverDesc, watched_components) == 56u, bam_observer_desc_off_watched_components_64);
+BAM_STATIC_ASSERT(offsetof(BamObserverDesc, watched_component_count) == 64u, bam_observer_desc_off_watched_component_count_64);
+BAM_STATIC_ASSERT(offsetof(BamObserverDesc, mut_callback) == 72u, bam_observer_desc_off_mut_callback_64);
+BAM_STATIC_ASSERT(offsetof(BamObserverDesc, propagate_relationship) == 80u, bam_observer_desc_off_propagate_relationship_64);
+BAM_STATIC_ASSERT(offsetof(BamObserverDesc, reserved2) == 84u, bam_observer_desc_off_reserved2_64);
+BAM_STATIC_ASSERT(sizeof(BamTriggerDesc) == 64u, bam_trigger_desc_size_64);
+BAM_STATIC_ASSERT(BAM_ALIGNOF(BamTriggerDesc) == 8u, bam_trigger_desc_align_64);
+BAM_STATIC_ASSERT(offsetof(BamTriggerDesc, struct_size) == 0u, bam_trigger_desc_off_struct_size_64);
+BAM_STATIC_ASSERT(offsetof(BamTriggerDesc, flags) == 4u, bam_trigger_desc_off_flags_64);
+BAM_STATIC_ASSERT(offsetof(BamTriggerDesc, event) == 8u, bam_trigger_desc_off_event_64);
+BAM_STATIC_ASSERT(offsetof(BamTriggerDesc, event_kind) == 12u, bam_trigger_desc_off_event_kind_64);
+BAM_STATIC_ASSERT(offsetof(BamTriggerDesc, entity_lo) == 16u, bam_trigger_desc_off_entity_lo_64);
+BAM_STATIC_ASSERT(offsetof(BamTriggerDesc, entity_hi) == 20u, bam_trigger_desc_off_entity_hi_64);
+BAM_STATIC_ASSERT(offsetof(BamTriggerDesc, data_ptr) == 24u, bam_trigger_desc_off_data_ptr_64);
+BAM_STATIC_ASSERT(offsetof(BamTriggerDesc, data_len) == 32u, bam_trigger_desc_off_data_len_64);
+BAM_STATIC_ASSERT(offsetof(BamTriggerDesc, watched_components) == 40u, bam_trigger_desc_off_watched_components_64);
+BAM_STATIC_ASSERT(offsetof(BamTriggerDesc, watched_component_count) == 48u, bam_trigger_desc_off_watched_component_count_64);
+BAM_STATIC_ASSERT(offsetof(BamTriggerDesc, propagate_relationship) == 56u, bam_trigger_desc_off_propagate_relationship_64);
+BAM_STATIC_ASSERT(offsetof(BamTriggerDesc, reserved0) == 60u, bam_trigger_desc_off_reserved0_64);
 BAM_STATIC_ASSERT(sizeof(BamChangeTicks) == 16u, bam_change_ticks_size_64);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamChangeTicks) == 4u, bam_change_ticks_align_64);
 BAM_STATIC_ASSERT(offsetof(BamChangeTicks, added) == 0u, bam_change_ticks_off_added_64);
 BAM_STATIC_ASSERT(offsetof(BamChangeTicks, changed) == 4u, bam_change_ticks_off_changed_64);
 BAM_STATIC_ASSERT(offsetof(BamChangeTicks, last_run) == 8u, bam_change_ticks_off_last_run_64);
 BAM_STATIC_ASSERT(offsetof(BamChangeTicks, this_run) == 12u, bam_change_ticks_off_this_run_64);
-BAM_STATIC_ASSERT(sizeof(BamComponentDesc) == 88u, bam_component_desc_size_64);
+BAM_STATIC_ASSERT(sizeof(BamComponentDesc) == 136u, bam_component_desc_size_64);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamComponentDesc) == 8u, bam_component_desc_align_64);
 BAM_STATIC_ASSERT(offsetof(BamComponentDesc, struct_size) == 0u, bam_component_desc_off_struct_size_64);
 BAM_STATIC_ASSERT(offsetof(BamComponentDesc, flags) == 4u, bam_component_desc_off_flags_64);
@@ -877,6 +1152,12 @@ BAM_STATIC_ASSERT(offsetof(BamComponentDesc, vtable_ptr) == 56u, bam_component_d
 BAM_STATIC_ASSERT(offsetof(BamComponentDesc, on_add) == 64u, bam_component_desc_off_on_add_64);
 BAM_STATIC_ASSERT(offsetof(BamComponentDesc, on_remove) == 72u, bam_component_desc_off_on_remove_64);
 BAM_STATIC_ASSERT(offsetof(BamComponentDesc, hook_user_data) == 80u, bam_component_desc_off_hook_user_data_64);
+BAM_STATIC_ASSERT(offsetof(BamComponentDesc, on_insert) == 88u, bam_component_desc_off_on_insert_64);
+BAM_STATIC_ASSERT(offsetof(BamComponentDesc, on_discard) == 96u, bam_component_desc_off_on_discard_64);
+BAM_STATIC_ASSERT(offsetof(BamComponentDesc, on_despawn) == 104u, bam_component_desc_off_on_despawn_64);
+BAM_STATIC_ASSERT(offsetof(BamComponentDesc, clone_fn) == 112u, bam_component_desc_off_clone_fn_64);
+BAM_STATIC_ASSERT(offsetof(BamComponentDesc, required_components) == 120u, bam_component_desc_off_required_components_64);
+BAM_STATIC_ASSERT(offsetof(BamComponentDesc, required_component_count) == 128u, bam_component_desc_off_required_component_count_64);
 BAM_STATIC_ASSERT(sizeof(BamColumnInfo) == 48u, bam_column_info_size_64);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamColumnInfo) == 8u, bam_column_info_align_64);
 BAM_STATIC_ASSERT(offsetof(BamColumnInfo, component) == 0u, bam_column_info_off_component_64);
@@ -893,7 +1174,12 @@ BAM_STATIC_ASSERT(offsetof(BamVTableHeader, abi_version) == 4u, bam_vtable_heade
 BAM_STATIC_ASSERT(offsetof(BamVTableHeader, uuid) == 8u, bam_vtable_header_off_uuid_64);
 BAM_STATIC_ASSERT(offsetof(BamVTableHeader, size) == 24u, bam_vtable_header_off_size_64);
 BAM_STATIC_ASSERT(offsetof(BamVTableHeader, align) == 32u, bam_vtable_header_off_align_64);
-BAM_STATIC_ASSERT(sizeof(BamHostApi) == 312u, bam_host_api_size_64);
+BAM_STATIC_ASSERT(sizeof(BamMappedStringVTable) == 56u, bam_mapped_string_vtable_size_64);
+BAM_STATIC_ASSERT(BAM_ALIGNOF(BamMappedStringVTable) == 8u, bam_mapped_string_vtable_align_64);
+BAM_STATIC_ASSERT(offsetof(BamMappedStringVTable, header) == 0u, bam_mapped_string_vtable_off_header_64);
+BAM_STATIC_ASSERT(offsetof(BamMappedStringVTable, get) == 40u, bam_mapped_string_vtable_off_get_64);
+BAM_STATIC_ASSERT(offsetof(BamMappedStringVTable, set) == 48u, bam_mapped_string_vtable_off_set_64);
+BAM_STATIC_ASSERT(sizeof(BamHostApi) == 408u, bam_host_api_size_64);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamHostApi) == 8u, bam_host_api_align_64);
 BAM_STATIC_ASSERT(offsetof(BamHostApi, struct_size) == 0u, bam_host_api_off_struct_size_64);
 BAM_STATIC_ASSERT(offsetof(BamHostApi, abi_version) == 4u, bam_host_api_off_abi_version_64);
@@ -935,10 +1221,23 @@ BAM_STATIC_ASSERT(offsetof(BamHostApi, sys_res_ptr) == 280u, bam_host_api_off_sy
 BAM_STATIC_ASSERT(offsetof(BamHostApi, sys_res_mut_ptr) == 288u, bam_host_api_off_sys_res_mut_ptr_64);
 BAM_STATIC_ASSERT(offsetof(BamHostApi, register_observer) == 296u, bam_host_api_off_register_observer_64);
 BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_trigger) == 304u, bam_host_api_off_cmd_trigger_64);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_spawn_persistent) == 312u, bam_host_api_off_cmd_spawn_persistent_64);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_spawn_batch) == 320u, bam_host_api_off_cmd_spawn_batch_64);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_despawn_all) == 328u, bam_host_api_off_cmd_despawn_all_64);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_insert_if_new) == 336u, bam_host_api_off_cmd_insert_if_new_64);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_trigger_ex) == 344u, bam_host_api_off_cmd_trigger_ex_64);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_observe) == 352u, bam_host_api_off_cmd_observe_64);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, iter_read_removed) == 360u, bam_host_api_off_iter_read_removed_64);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, sys_entity_children) == 368u, bam_host_api_off_sys_entity_children_64);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, asset_load) == 376u, bam_host_api_off_asset_load_64);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, asset_get_load_state) == 384u, bam_host_api_off_asset_get_load_state_64);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, asset_release) == 392u, bam_host_api_off_asset_release_64);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_spawn_scene) == 400u, bam_host_api_off_cmd_spawn_scene_64);
 BAM_STATIC_ASSERT(BAM_MANIFEST_MIN_V0_2_SIZE == 32u, bam_manifest_min_64);
 BAM_STATIC_ASSERT(BAM_QUERY_DESC_MIN_V0_2_SIZE == 24u, bam_query_desc_min_64);
 BAM_STATIC_ASSERT(BAM_SYSTEM_DESC_MIN_V0_2_SIZE == 104u, bam_system_desc_min_64);
 BAM_STATIC_ASSERT(BAM_OBSERVER_DESC_MIN_V0_2_SIZE == 48u, bam_observer_desc_min_64);
+BAM_STATIC_ASSERT(BAM_TRIGGER_DESC_MIN_V0_2_SIZE == 64u, bam_trigger_desc_min_64);
 BAM_STATIC_ASSERT(BAM_COMPONENT_DESC_MIN_V0_2_SIZE == 64u, bam_component_desc_min_64);
 BAM_STATIC_ASSERT(BAM_VTABLE_HEADER_MIN_V0_2_SIZE == 40u, bam_vtable_header_min_64);
 BAM_STATIC_ASSERT(BAM_HOST_API_MIN_V0_2_SIZE == 224u, bam_host_api_min_64);
@@ -961,18 +1260,28 @@ BAM_STATIC_ASSERT(offsetof(BamManifest, flags) == 16u, bam_manifest_off_flags_32
 BAM_STATIC_ASSERT(offsetof(BamManifest, reserved0) == 20u, bam_manifest_off_reserved0_32);
 BAM_STATIC_ASSERT(offsetof(BamManifest, save_state) == 24u, bam_manifest_off_save_state_32);
 BAM_STATIC_ASSERT(offsetof(BamManifest, restore_state) == 28u, bam_manifest_off_restore_state_32);
+BAM_STATIC_ASSERT(sizeof(BamAssetHandle) == 32u, bam_asset_handle_size_32);
+BAM_STATIC_ASSERT(BAM_ALIGNOF(BamAssetHandle) == 4u, bam_asset_handle_align_32);
+BAM_STATIC_ASSERT(offsetof(BamAssetHandle, kind) == 0u, bam_asset_handle_off_kind_32);
+BAM_STATIC_ASSERT(offsetof(BamAssetHandle, reserved0) == 1u, bam_asset_handle_off_reserved0_32);
+BAM_STATIC_ASSERT(offsetof(BamAssetHandle, asset_type) == 4u, bam_asset_handle_off_asset_type_32);
+BAM_STATIC_ASSERT(offsetof(BamAssetHandle, index) == 8u, bam_asset_handle_off_index_32);
+BAM_STATIC_ASSERT(offsetof(BamAssetHandle, generation) == 12u, bam_asset_handle_off_generation_32);
+BAM_STATIC_ASSERT(offsetof(BamAssetHandle, uuid) == 16u, bam_asset_handle_off_uuid_32);
 BAM_STATIC_ASSERT(sizeof(BamTermDesc) == 12u, bam_term_desc_size_32);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamTermDesc) == 4u, bam_term_desc_align_32);
 BAM_STATIC_ASSERT(offsetof(BamTermDesc, component) == 0u, bam_term_desc_off_component_32);
 BAM_STATIC_ASSERT(offsetof(BamTermDesc, mode) == 4u, bam_term_desc_off_mode_32);
 BAM_STATIC_ASSERT(offsetof(BamTermDesc, flags) == 8u, bam_term_desc_off_flags_32);
+BAM_STATIC_ASSERT(offsetof(BamTermDesc, or_group) == 10u, bam_term_desc_off_or_group_32);
+BAM_STATIC_ASSERT(offsetof(BamTermDesc, reserved0) == 11u, bam_term_desc_off_reserved0_32);
 BAM_STATIC_ASSERT(sizeof(BamQueryDesc) == 16u, bam_query_desc_size_32);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamQueryDesc) == 4u, bam_query_desc_align_32);
 BAM_STATIC_ASSERT(offsetof(BamQueryDesc, struct_size) == 0u, bam_query_desc_off_struct_size_32);
 BAM_STATIC_ASSERT(offsetof(BamQueryDesc, flags) == 4u, bam_query_desc_off_flags_32);
 BAM_STATIC_ASSERT(offsetof(BamQueryDesc, terms) == 8u, bam_query_desc_off_terms_32);
 BAM_STATIC_ASSERT(offsetof(BamQueryDesc, term_count) == 12u, bam_query_desc_off_term_count_32);
-BAM_STATIC_ASSERT(sizeof(BamSystemDesc) == 68u, bam_system_desc_size_32);
+BAM_STATIC_ASSERT(sizeof(BamSystemDesc) == 92u, bam_system_desc_size_32);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamSystemDesc) == 4u, bam_system_desc_align_32);
 BAM_STATIC_ASSERT(offsetof(BamSystemDesc, struct_size) == 0u, bam_system_desc_off_struct_size_32);
 BAM_STATIC_ASSERT(offsetof(BamSystemDesc, flags) == 4u, bam_system_desc_off_flags_32);
@@ -991,7 +1300,13 @@ BAM_STATIC_ASSERT(offsetof(BamSystemDesc, run_if) == 52u, bam_system_desc_off_ru
 BAM_STATIC_ASSERT(offsetof(BamSystemDesc, run_if_user_data) == 56u, bam_system_desc_off_run_if_user_data_32);
 BAM_STATIC_ASSERT(offsetof(BamSystemDesc, in_sets) == 60u, bam_system_desc_off_in_sets_32);
 BAM_STATIC_ASSERT(offsetof(BamSystemDesc, in_set_count) == 64u, bam_system_desc_off_in_set_count_32);
-BAM_STATIC_ASSERT(sizeof(BamObserverDesc) == 36u, bam_observer_desc_size_32);
+BAM_STATIC_ASSERT(offsetof(BamSystemDesc, after_weak) == 68u, bam_system_desc_off_after_weak_32);
+BAM_STATIC_ASSERT(offsetof(BamSystemDesc, after_weak_count) == 72u, bam_system_desc_off_after_weak_count_32);
+BAM_STATIC_ASSERT(offsetof(BamSystemDesc, before_weak) == 76u, bam_system_desc_off_before_weak_32);
+BAM_STATIC_ASSERT(offsetof(BamSystemDesc, before_weak_count) == 80u, bam_system_desc_off_before_weak_count_32);
+BAM_STATIC_ASSERT(offsetof(BamSystemDesc, ambiguous_with) == 84u, bam_system_desc_off_ambiguous_with_32);
+BAM_STATIC_ASSERT(offsetof(BamSystemDesc, ambiguous_with_count) == 88u, bam_system_desc_off_ambiguous_with_count_32);
+BAM_STATIC_ASSERT(sizeof(BamObserverDesc) == 64u, bam_observer_desc_size_32);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamObserverDesc) == 4u, bam_observer_desc_align_32);
 BAM_STATIC_ASSERT(offsetof(BamObserverDesc, struct_size) == 0u, bam_observer_desc_off_struct_size_32);
 BAM_STATIC_ASSERT(offsetof(BamObserverDesc, flags) == 4u, bam_observer_desc_off_flags_32);
@@ -1002,13 +1317,34 @@ BAM_STATIC_ASSERT(offsetof(BamObserverDesc, entity_hi) == 20u, bam_observer_desc
 BAM_STATIC_ASSERT(offsetof(BamObserverDesc, reserved0) == 24u, bam_observer_desc_off_reserved0_32);
 BAM_STATIC_ASSERT(offsetof(BamObserverDesc, callback) == 28u, bam_observer_desc_off_callback_32);
 BAM_STATIC_ASSERT(offsetof(BamObserverDesc, user_data) == 32u, bam_observer_desc_off_user_data_32);
+BAM_STATIC_ASSERT(offsetof(BamObserverDesc, event_kind) == 36u, bam_observer_desc_off_event_kind_32);
+BAM_STATIC_ASSERT(offsetof(BamObserverDesc, reserved1) == 40u, bam_observer_desc_off_reserved1_32);
+BAM_STATIC_ASSERT(offsetof(BamObserverDesc, watched_components) == 44u, bam_observer_desc_off_watched_components_32);
+BAM_STATIC_ASSERT(offsetof(BamObserverDesc, watched_component_count) == 48u, bam_observer_desc_off_watched_component_count_32);
+BAM_STATIC_ASSERT(offsetof(BamObserverDesc, mut_callback) == 52u, bam_observer_desc_off_mut_callback_32);
+BAM_STATIC_ASSERT(offsetof(BamObserverDesc, propagate_relationship) == 56u, bam_observer_desc_off_propagate_relationship_32);
+BAM_STATIC_ASSERT(offsetof(BamObserverDesc, reserved2) == 60u, bam_observer_desc_off_reserved2_32);
+BAM_STATIC_ASSERT(sizeof(BamTriggerDesc) == 48u, bam_trigger_desc_size_32);
+BAM_STATIC_ASSERT(BAM_ALIGNOF(BamTriggerDesc) == 4u, bam_trigger_desc_align_32);
+BAM_STATIC_ASSERT(offsetof(BamTriggerDesc, struct_size) == 0u, bam_trigger_desc_off_struct_size_32);
+BAM_STATIC_ASSERT(offsetof(BamTriggerDesc, flags) == 4u, bam_trigger_desc_off_flags_32);
+BAM_STATIC_ASSERT(offsetof(BamTriggerDesc, event) == 8u, bam_trigger_desc_off_event_32);
+BAM_STATIC_ASSERT(offsetof(BamTriggerDesc, event_kind) == 12u, bam_trigger_desc_off_event_kind_32);
+BAM_STATIC_ASSERT(offsetof(BamTriggerDesc, entity_lo) == 16u, bam_trigger_desc_off_entity_lo_32);
+BAM_STATIC_ASSERT(offsetof(BamTriggerDesc, entity_hi) == 20u, bam_trigger_desc_off_entity_hi_32);
+BAM_STATIC_ASSERT(offsetof(BamTriggerDesc, data_ptr) == 24u, bam_trigger_desc_off_data_ptr_32);
+BAM_STATIC_ASSERT(offsetof(BamTriggerDesc, data_len) == 28u, bam_trigger_desc_off_data_len_32);
+BAM_STATIC_ASSERT(offsetof(BamTriggerDesc, watched_components) == 32u, bam_trigger_desc_off_watched_components_32);
+BAM_STATIC_ASSERT(offsetof(BamTriggerDesc, watched_component_count) == 36u, bam_trigger_desc_off_watched_component_count_32);
+BAM_STATIC_ASSERT(offsetof(BamTriggerDesc, propagate_relationship) == 40u, bam_trigger_desc_off_propagate_relationship_32);
+BAM_STATIC_ASSERT(offsetof(BamTriggerDesc, reserved0) == 44u, bam_trigger_desc_off_reserved0_32);
 BAM_STATIC_ASSERT(sizeof(BamChangeTicks) == 16u, bam_change_ticks_size_32);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamChangeTicks) == 4u, bam_change_ticks_align_32);
 BAM_STATIC_ASSERT(offsetof(BamChangeTicks, added) == 0u, bam_change_ticks_off_added_32);
 BAM_STATIC_ASSERT(offsetof(BamChangeTicks, changed) == 4u, bam_change_ticks_off_changed_32);
 BAM_STATIC_ASSERT(offsetof(BamChangeTicks, last_run) == 8u, bam_change_ticks_off_last_run_32);
 BAM_STATIC_ASSERT(offsetof(BamChangeTicks, this_run) == 12u, bam_change_ticks_off_this_run_32);
-BAM_STATIC_ASSERT(sizeof(BamComponentDesc) == 56u, bam_component_desc_size_32);
+BAM_STATIC_ASSERT(sizeof(BamComponentDesc) == 80u, bam_component_desc_size_32);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamComponentDesc) == 4u, bam_component_desc_align_32);
 BAM_STATIC_ASSERT(offsetof(BamComponentDesc, struct_size) == 0u, bam_component_desc_off_struct_size_32);
 BAM_STATIC_ASSERT(offsetof(BamComponentDesc, flags) == 4u, bam_component_desc_off_flags_32);
@@ -1021,6 +1357,12 @@ BAM_STATIC_ASSERT(offsetof(BamComponentDesc, vtable_ptr) == 40u, bam_component_d
 BAM_STATIC_ASSERT(offsetof(BamComponentDesc, on_add) == 44u, bam_component_desc_off_on_add_32);
 BAM_STATIC_ASSERT(offsetof(BamComponentDesc, on_remove) == 48u, bam_component_desc_off_on_remove_32);
 BAM_STATIC_ASSERT(offsetof(BamComponentDesc, hook_user_data) == 52u, bam_component_desc_off_hook_user_data_32);
+BAM_STATIC_ASSERT(offsetof(BamComponentDesc, on_insert) == 56u, bam_component_desc_off_on_insert_32);
+BAM_STATIC_ASSERT(offsetof(BamComponentDesc, on_discard) == 60u, bam_component_desc_off_on_discard_32);
+BAM_STATIC_ASSERT(offsetof(BamComponentDesc, on_despawn) == 64u, bam_component_desc_off_on_despawn_32);
+BAM_STATIC_ASSERT(offsetof(BamComponentDesc, clone_fn) == 68u, bam_component_desc_off_clone_fn_32);
+BAM_STATIC_ASSERT(offsetof(BamComponentDesc, required_components) == 72u, bam_component_desc_off_required_components_32);
+BAM_STATIC_ASSERT(offsetof(BamComponentDesc, required_component_count) == 76u, bam_component_desc_off_required_component_count_32);
 BAM_STATIC_ASSERT(sizeof(BamColumnInfo) == 40u, bam_column_info_size_32);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamColumnInfo) == 4u, bam_column_info_align_32);
 BAM_STATIC_ASSERT(offsetof(BamColumnInfo, component) == 0u, bam_column_info_off_component_32);
@@ -1037,7 +1379,12 @@ BAM_STATIC_ASSERT(offsetof(BamVTableHeader, abi_version) == 4u, bam_vtable_heade
 BAM_STATIC_ASSERT(offsetof(BamVTableHeader, uuid) == 8u, bam_vtable_header_off_uuid_32);
 BAM_STATIC_ASSERT(offsetof(BamVTableHeader, size) == 24u, bam_vtable_header_off_size_32);
 BAM_STATIC_ASSERT(offsetof(BamVTableHeader, align) == 28u, bam_vtable_header_off_align_32);
-BAM_STATIC_ASSERT(sizeof(BamHostApi) == 160u, bam_host_api_size_32);
+BAM_STATIC_ASSERT(sizeof(BamMappedStringVTable) == 40u, bam_mapped_string_vtable_size_32);
+BAM_STATIC_ASSERT(BAM_ALIGNOF(BamMappedStringVTable) == 4u, bam_mapped_string_vtable_align_32);
+BAM_STATIC_ASSERT(offsetof(BamMappedStringVTable, header) == 0u, bam_mapped_string_vtable_off_header_32);
+BAM_STATIC_ASSERT(offsetof(BamMappedStringVTable, get) == 32u, bam_mapped_string_vtable_off_get_32);
+BAM_STATIC_ASSERT(offsetof(BamMappedStringVTable, set) == 36u, bam_mapped_string_vtable_off_set_32);
+BAM_STATIC_ASSERT(sizeof(BamHostApi) == 208u, bam_host_api_size_32);
 BAM_STATIC_ASSERT(BAM_ALIGNOF(BamHostApi) == 4u, bam_host_api_align_32);
 BAM_STATIC_ASSERT(offsetof(BamHostApi, struct_size) == 0u, bam_host_api_off_struct_size_32);
 BAM_STATIC_ASSERT(offsetof(BamHostApi, abi_version) == 4u, bam_host_api_off_abi_version_32);
@@ -1079,10 +1426,23 @@ BAM_STATIC_ASSERT(offsetof(BamHostApi, sys_res_ptr) == 144u, bam_host_api_off_sy
 BAM_STATIC_ASSERT(offsetof(BamHostApi, sys_res_mut_ptr) == 148u, bam_host_api_off_sys_res_mut_ptr_32);
 BAM_STATIC_ASSERT(offsetof(BamHostApi, register_observer) == 152u, bam_host_api_off_register_observer_32);
 BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_trigger) == 156u, bam_host_api_off_cmd_trigger_32);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_spawn_persistent) == 160u, bam_host_api_off_cmd_spawn_persistent_32);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_spawn_batch) == 164u, bam_host_api_off_cmd_spawn_batch_32);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_despawn_all) == 168u, bam_host_api_off_cmd_despawn_all_32);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_insert_if_new) == 172u, bam_host_api_off_cmd_insert_if_new_32);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_trigger_ex) == 176u, bam_host_api_off_cmd_trigger_ex_32);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_observe) == 180u, bam_host_api_off_cmd_observe_32);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, iter_read_removed) == 184u, bam_host_api_off_iter_read_removed_32);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, sys_entity_children) == 188u, bam_host_api_off_sys_entity_children_32);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, asset_load) == 192u, bam_host_api_off_asset_load_32);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, asset_get_load_state) == 196u, bam_host_api_off_asset_get_load_state_32);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, asset_release) == 200u, bam_host_api_off_asset_release_32);
+BAM_STATIC_ASSERT(offsetof(BamHostApi, cmd_spawn_scene) == 204u, bam_host_api_off_cmd_spawn_scene_32);
 BAM_STATIC_ASSERT(BAM_MANIFEST_MIN_V0_2_SIZE == 24u, bam_manifest_min_32);
 BAM_STATIC_ASSERT(BAM_QUERY_DESC_MIN_V0_2_SIZE == 16u, bam_query_desc_min_32);
 BAM_STATIC_ASSERT(BAM_SYSTEM_DESC_MIN_V0_2_SIZE == 60u, bam_system_desc_min_32);
 BAM_STATIC_ASSERT(BAM_OBSERVER_DESC_MIN_V0_2_SIZE == 36u, bam_observer_desc_min_32);
+BAM_STATIC_ASSERT(BAM_TRIGGER_DESC_MIN_V0_2_SIZE == 48u, bam_trigger_desc_min_32);
 BAM_STATIC_ASSERT(BAM_COMPONENT_DESC_MIN_V0_2_SIZE == 44u, bam_component_desc_min_32);
 BAM_STATIC_ASSERT(BAM_VTABLE_HEADER_MIN_V0_2_SIZE == 32u, bam_vtable_header_min_32);
 BAM_STATIC_ASSERT(BAM_HOST_API_MIN_V0_2_SIZE == 116u, bam_host_api_min_32);

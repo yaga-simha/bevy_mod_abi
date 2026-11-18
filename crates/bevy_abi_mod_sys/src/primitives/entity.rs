@@ -95,6 +95,10 @@ use crate::primitives::ComponentUuid;
 /// (`bevy_ecs::hierarchy::ChildOf`).
 pub const BAM_CHILD_OF_NAME: &str = "bevy_ecs::hierarchy::ChildOf";
 
+/// Canonical namespaced component name for Bevy's built-in hierarchy children relationship-target
+/// component (`bevy_ecs::hierarchy::Children`).
+pub const BAM_CHILDREN_NAME: &str = "bevy_ecs::hierarchy::Children";
+
 /// FFI-safe wire representation of Bevy's `ChildOf(Entity)` hierarchy relationship component
 /// (`typedef struct BamChildOf { BamEntity parent; } BamChildOf;`).
 ///

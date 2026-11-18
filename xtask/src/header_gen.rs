@@ -11,16 +11,19 @@ use std::path::Path;
 
 use bevy_abi_mod_sys::{
     ABI_VERSION, ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PATCH, AccessMode,
-    BAM_CHILD_OF_NAME, BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET,
-    BAM_COMPONENT_KNOWN_FLAGS, BAM_MANIFEST_KNOWN_FLAGS, BAM_MAX_CHANGE_AGE,
+    BAM_CHILD_OF_NAME, BAM_CHILDREN_NAME, BAM_COMPONENT_FLAG_IMMUTABLE,
+    BAM_COMPONENT_FLAG_SPARSE_SET, BAM_COMPONENT_FLAG_SUMMARY_TICK, BAM_COMPONENT_KNOWN_FLAGS,
+    BAM_MANIFEST_KNOWN_FLAGS, BAM_MAX_CHANGE_AGE, BAM_OBSERVER_FLAG_PROPAGATE,
     BAM_OBSERVER_KNOWN_FLAGS, BAM_QUERY_KNOWN_FLAGS, BAM_STORAGE_FLAG_ENTITY_EVENT,
     BAM_STORAGE_FLAG_EVENT, BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE,
-    BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET, BAM_SYSTEM_FLAG_MAIN_THREAD,
-    BAM_SYSTEM_KNOWN_FLAGS, BAM_TERM_KNOWN_FLAGS, BamChangeTicks, BamColumnInfo, BamComponent,
-    BamHostApi, BamManifest, BamObserverDesc, BamQueryDesc, BamSystemDesc, BamTermDesc,
-    ComponentDesc, ComponentUuid, FfiBool, FfiChildOf, FfiEntity, FfiResult,
-    MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, SIPHASH_KEY_0, SIPHASH_KEY_1, ScheduleId, StrView,
-    VTableHeader,
+    BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_SUMMARY_TICK,
+    BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL, BAM_SYSTEM_FLAG_MAIN_THREAD, BAM_SYSTEM_KNOWN_FLAGS,
+    BAM_TERM_KNOWN_FLAGS, BAM_TRIGGER_FLAG_PROPAGATE, BAM_TRIGGER_KNOWN_FLAGS, BamChangeTicks,
+    BamColumnInfo, BamComponent, BamEventKind, BamHostApi, BamManifest, BamObserverDesc,
+    BamQueryDesc, BamSystemDesc, BamTermDesc, BamTriggerDesc, ComponentDesc, ComponentUuid,
+    FfiAssetHandle, FfiAssetLoadState, FfiBool, FfiChildOf, FfiEntity, FfiOption, FfiResult,
+    MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, MappedStringVTable, SIPHASH_KEY_0, SIPHASH_KEY_1,
+    ScheduleId, StrView, VTableHeader,
 };
 
 struct FieldLayoutSpec {
@@ -145,6 +148,54 @@ fn wire_struct_specs() -> Vec<StructLayoutSpec> {
             ],
         },
         StructLayoutSpec {
+            c_name: "BamAssetHandle",
+            assert_stem: "bam_asset_handle",
+            size_64: 32,
+            align_64: 4,
+            size_32: 32,
+            align_32: 4,
+            rust_host_size: size_of::<FfiAssetHandle>(),
+            rust_host_align: align_of::<FfiAssetHandle>(),
+            fields: &[
+                FieldLayoutSpec {
+                    c_name: "kind",
+                    offset_64: 0,
+                    offset_32: 0,
+                    rust_host_offset: offset_of!(FfiAssetHandle, kind),
+                },
+                FieldLayoutSpec {
+                    c_name: "reserved0",
+                    offset_64: 1,
+                    offset_32: 1,
+                    rust_host_offset: offset_of!(FfiAssetHandle, reserved0),
+                },
+                FieldLayoutSpec {
+                    c_name: "asset_type",
+                    offset_64: 4,
+                    offset_32: 4,
+                    rust_host_offset: offset_of!(FfiAssetHandle, asset_type),
+                },
+                FieldLayoutSpec {
+                    c_name: "index",
+                    offset_64: 8,
+                    offset_32: 8,
+                    rust_host_offset: offset_of!(FfiAssetHandle, index),
+                },
+                FieldLayoutSpec {
+                    c_name: "generation",
+                    offset_64: 12,
+                    offset_32: 12,
+                    rust_host_offset: offset_of!(FfiAssetHandle, generation),
+                },
+                FieldLayoutSpec {
+                    c_name: "uuid",
+                    offset_64: 16,
+                    offset_32: 16,
+                    rust_host_offset: offset_of!(FfiAssetHandle, uuid),
+                },
+            ],
+        },
+        StructLayoutSpec {
             c_name: "BamTermDesc",
             assert_stem: "bam_term_desc",
             size_64: 12,
@@ -171,6 +222,18 @@ fn wire_struct_specs() -> Vec<StructLayoutSpec> {
                     offset_64: 8,
                     offset_32: 8,
                     rust_host_offset: offset_of!(BamTermDesc, flags),
+                },
+                FieldLayoutSpec {
+                    c_name: "or_group",
+                    offset_64: 10,
+                    offset_32: 10,
+                    rust_host_offset: offset_of!(BamTermDesc, or_group),
+                },
+                FieldLayoutSpec {
+                    c_name: "reserved0",
+                    offset_64: 11,
+                    offset_32: 11,
+                    rust_host_offset: offset_of!(BamTermDesc, reserved0),
                 },
             ],
         },
@@ -213,9 +276,9 @@ fn wire_struct_specs() -> Vec<StructLayoutSpec> {
         StructLayoutSpec {
             c_name: "BamSystemDesc",
             assert_stem: "bam_system_desc",
-            size_64: 120,
+            size_64: 168,
             align_64: 8,
-            size_32: 68,
+            size_32: 92,
             align_32: 4,
             rust_host_size: size_of::<BamSystemDesc>(),
             rust_host_align: align_of::<BamSystemDesc>(),
@@ -322,14 +385,50 @@ fn wire_struct_specs() -> Vec<StructLayoutSpec> {
                     offset_32: 64,
                     rust_host_offset: offset_of!(BamSystemDesc, in_set_count),
                 },
+                FieldLayoutSpec {
+                    c_name: "after_weak",
+                    offset_64: 120,
+                    offset_32: 68,
+                    rust_host_offset: offset_of!(BamSystemDesc, after_weak),
+                },
+                FieldLayoutSpec {
+                    c_name: "after_weak_count",
+                    offset_64: 128,
+                    offset_32: 72,
+                    rust_host_offset: offset_of!(BamSystemDesc, after_weak_count),
+                },
+                FieldLayoutSpec {
+                    c_name: "before_weak",
+                    offset_64: 136,
+                    offset_32: 76,
+                    rust_host_offset: offset_of!(BamSystemDesc, before_weak),
+                },
+                FieldLayoutSpec {
+                    c_name: "before_weak_count",
+                    offset_64: 144,
+                    offset_32: 80,
+                    rust_host_offset: offset_of!(BamSystemDesc, before_weak_count),
+                },
+                FieldLayoutSpec {
+                    c_name: "ambiguous_with",
+                    offset_64: 152,
+                    offset_32: 84,
+                    rust_host_offset: offset_of!(BamSystemDesc, ambiguous_with),
+                },
+                FieldLayoutSpec {
+                    c_name: "ambiguous_with_count",
+                    offset_64: 160,
+                    offset_32: 88,
+                    rust_host_offset: offset_of!(BamSystemDesc, ambiguous_with_count),
+                },
             ],
         },
         StructLayoutSpec {
             c_name: "BamObserverDesc",
             assert_stem: "bam_observer_desc",
-            size_64: 48,
+            size_64: 88,
             align_64: 8,
-            size_32: 36,
+            size_32: 64,
             align_32: 4,
             rust_host_size: size_of::<BamObserverDesc>(),
             rust_host_align: align_of::<BamObserverDesc>(),
@@ -388,6 +487,132 @@ fn wire_struct_specs() -> Vec<StructLayoutSpec> {
                     offset_32: 32,
                     rust_host_offset: offset_of!(BamObserverDesc, user_data),
                 },
+                FieldLayoutSpec {
+                    c_name: "event_kind",
+                    offset_64: 48,
+                    offset_32: 36,
+                    rust_host_offset: offset_of!(BamObserverDesc, event_kind),
+                },
+                FieldLayoutSpec {
+                    c_name: "reserved1",
+                    offset_64: 52,
+                    offset_32: 40,
+                    rust_host_offset: offset_of!(BamObserverDesc, reserved1),
+                },
+                FieldLayoutSpec {
+                    c_name: "watched_components",
+                    offset_64: 56,
+                    offset_32: 44,
+                    rust_host_offset: offset_of!(BamObserverDesc, watched_components),
+                },
+                FieldLayoutSpec {
+                    c_name: "watched_component_count",
+                    offset_64: 64,
+                    offset_32: 48,
+                    rust_host_offset: offset_of!(BamObserverDesc, watched_component_count),
+                },
+                FieldLayoutSpec {
+                    c_name: "mut_callback",
+                    offset_64: 72,
+                    offset_32: 52,
+                    rust_host_offset: offset_of!(BamObserverDesc, mut_callback),
+                },
+                FieldLayoutSpec {
+                    c_name: "propagate_relationship",
+                    offset_64: 80,
+                    offset_32: 56,
+                    rust_host_offset: offset_of!(BamObserverDesc, propagate_relationship),
+                },
+                FieldLayoutSpec {
+                    c_name: "reserved2",
+                    offset_64: 84,
+                    offset_32: 60,
+                    rust_host_offset: offset_of!(BamObserverDesc, reserved2),
+                },
+            ],
+        },
+        StructLayoutSpec {
+            c_name: "BamTriggerDesc",
+            assert_stem: "bam_trigger_desc",
+            size_64: 64,
+            align_64: 8,
+            size_32: 48,
+            align_32: 4,
+            rust_host_size: size_of::<BamTriggerDesc>(),
+            rust_host_align: align_of::<BamTriggerDesc>(),
+            fields: &[
+                FieldLayoutSpec {
+                    c_name: "struct_size",
+                    offset_64: 0,
+                    offset_32: 0,
+                    rust_host_offset: offset_of!(BamTriggerDesc, struct_size),
+                },
+                FieldLayoutSpec {
+                    c_name: "flags",
+                    offset_64: 4,
+                    offset_32: 4,
+                    rust_host_offset: offset_of!(BamTriggerDesc, flags),
+                },
+                FieldLayoutSpec {
+                    c_name: "event",
+                    offset_64: 8,
+                    offset_32: 8,
+                    rust_host_offset: offset_of!(BamTriggerDesc, event),
+                },
+                FieldLayoutSpec {
+                    c_name: "event_kind",
+                    offset_64: 12,
+                    offset_32: 12,
+                    rust_host_offset: offset_of!(BamTriggerDesc, event_kind),
+                },
+                FieldLayoutSpec {
+                    c_name: "entity_lo",
+                    offset_64: 16,
+                    offset_32: 16,
+                    rust_host_offset: offset_of!(BamTriggerDesc, entity_lo),
+                },
+                FieldLayoutSpec {
+                    c_name: "entity_hi",
+                    offset_64: 20,
+                    offset_32: 20,
+                    rust_host_offset: offset_of!(BamTriggerDesc, entity_hi),
+                },
+                FieldLayoutSpec {
+                    c_name: "data_ptr",
+                    offset_64: 24,
+                    offset_32: 24,
+                    rust_host_offset: offset_of!(BamTriggerDesc, data_ptr),
+                },
+                FieldLayoutSpec {
+                    c_name: "data_len",
+                    offset_64: 32,
+                    offset_32: 28,
+                    rust_host_offset: offset_of!(BamTriggerDesc, data_len),
+                },
+                FieldLayoutSpec {
+                    c_name: "watched_components",
+                    offset_64: 40,
+                    offset_32: 32,
+                    rust_host_offset: offset_of!(BamTriggerDesc, watched_components),
+                },
+                FieldLayoutSpec {
+                    c_name: "watched_component_count",
+                    offset_64: 48,
+                    offset_32: 36,
+                    rust_host_offset: offset_of!(BamTriggerDesc, watched_component_count),
+                },
+                FieldLayoutSpec {
+                    c_name: "propagate_relationship",
+                    offset_64: 56,
+                    offset_32: 40,
+                    rust_host_offset: offset_of!(BamTriggerDesc, propagate_relationship),
+                },
+                FieldLayoutSpec {
+                    c_name: "reserved0",
+                    offset_64: 60,
+                    offset_32: 44,
+                    rust_host_offset: offset_of!(BamTriggerDesc, reserved0),
+                },
             ],
         },
         StructLayoutSpec {
@@ -429,9 +654,9 @@ fn wire_struct_specs() -> Vec<StructLayoutSpec> {
         StructLayoutSpec {
             c_name: "BamComponentDesc",
             assert_stem: "bam_component_desc",
-            size_64: 88,
+            size_64: 136,
             align_64: 8,
-            size_32: 56,
+            size_32: 80,
             align_32: 4,
             rust_host_size: size_of::<ComponentDesc>(),
             rust_host_align: align_of::<ComponentDesc>(),
@@ -501,6 +726,42 @@ fn wire_struct_specs() -> Vec<StructLayoutSpec> {
                     offset_64: 80,
                     offset_32: 52,
                     rust_host_offset: offset_of!(ComponentDesc, hook_user_data),
+                },
+                FieldLayoutSpec {
+                    c_name: "on_insert",
+                    offset_64: 88,
+                    offset_32: 56,
+                    rust_host_offset: offset_of!(ComponentDesc, on_insert),
+                },
+                FieldLayoutSpec {
+                    c_name: "on_discard",
+                    offset_64: 96,
+                    offset_32: 60,
+                    rust_host_offset: offset_of!(ComponentDesc, on_discard),
+                },
+                FieldLayoutSpec {
+                    c_name: "on_despawn",
+                    offset_64: 104,
+                    offset_32: 64,
+                    rust_host_offset: offset_of!(ComponentDesc, on_despawn),
+                },
+                FieldLayoutSpec {
+                    c_name: "clone_fn",
+                    offset_64: 112,
+                    offset_32: 68,
+                    rust_host_offset: offset_of!(ComponentDesc, clone_fn),
+                },
+                FieldLayoutSpec {
+                    c_name: "required_components",
+                    offset_64: 120,
+                    offset_32: 72,
+                    rust_host_offset: offset_of!(ComponentDesc, required_components),
+                },
+                FieldLayoutSpec {
+                    c_name: "required_component_count",
+                    offset_64: 128,
+                    offset_32: 76,
+                    rust_host_offset: offset_of!(ComponentDesc, required_component_count),
                 },
             ],
         },
@@ -601,11 +862,41 @@ fn wire_struct_specs() -> Vec<StructLayoutSpec> {
             ],
         },
         StructLayoutSpec {
+            c_name: "BamMappedStringVTable",
+            assert_stem: "bam_mapped_string_vtable",
+            size_64: 56,
+            align_64: 8,
+            size_32: 40,
+            align_32: 4,
+            rust_host_size: size_of::<MappedStringVTable>(),
+            rust_host_align: align_of::<MappedStringVTable>(),
+            fields: &[
+                FieldLayoutSpec {
+                    c_name: "header",
+                    offset_64: 0,
+                    offset_32: 0,
+                    rust_host_offset: offset_of!(MappedStringVTable, header),
+                },
+                FieldLayoutSpec {
+                    c_name: "get",
+                    offset_64: 40,
+                    offset_32: 32,
+                    rust_host_offset: offset_of!(MappedStringVTable, get),
+                },
+                FieldLayoutSpec {
+                    c_name: "set",
+                    offset_64: 48,
+                    offset_32: 36,
+                    rust_host_offset: offset_of!(MappedStringVTable, set),
+                },
+            ],
+        },
+        StructLayoutSpec {
             c_name: "BamHostApi",
             assert_stem: "bam_host_api",
-            size_64: 312,
+            size_64: 408,
             align_64: 8,
-            size_32: 160,
+            size_32: 208,
             align_32: 4,
             rust_host_size: size_of::<BamHostApi>(),
             rust_host_align: align_of::<BamHostApi>(),
@@ -850,6 +1141,78 @@ fn wire_struct_specs() -> Vec<StructLayoutSpec> {
                     offset_32: 156,
                     rust_host_offset: offset_of!(BamHostApi, cmd_trigger),
                 },
+                FieldLayoutSpec {
+                    c_name: "cmd_spawn_persistent",
+                    offset_64: 312,
+                    offset_32: 160,
+                    rust_host_offset: offset_of!(BamHostApi, cmd_spawn_persistent),
+                },
+                FieldLayoutSpec {
+                    c_name: "cmd_spawn_batch",
+                    offset_64: 320,
+                    offset_32: 164,
+                    rust_host_offset: offset_of!(BamHostApi, cmd_spawn_batch),
+                },
+                FieldLayoutSpec {
+                    c_name: "cmd_despawn_all",
+                    offset_64: 328,
+                    offset_32: 168,
+                    rust_host_offset: offset_of!(BamHostApi, cmd_despawn_all),
+                },
+                FieldLayoutSpec {
+                    c_name: "cmd_insert_if_new",
+                    offset_64: 336,
+                    offset_32: 172,
+                    rust_host_offset: offset_of!(BamHostApi, cmd_insert_if_new),
+                },
+                FieldLayoutSpec {
+                    c_name: "cmd_trigger_ex",
+                    offset_64: 344,
+                    offset_32: 176,
+                    rust_host_offset: offset_of!(BamHostApi, cmd_trigger_ex),
+                },
+                FieldLayoutSpec {
+                    c_name: "cmd_observe",
+                    offset_64: 352,
+                    offset_32: 180,
+                    rust_host_offset: offset_of!(BamHostApi, cmd_observe),
+                },
+                FieldLayoutSpec {
+                    c_name: "iter_read_removed",
+                    offset_64: 360,
+                    offset_32: 184,
+                    rust_host_offset: offset_of!(BamHostApi, iter_read_removed),
+                },
+                FieldLayoutSpec {
+                    c_name: "sys_entity_children",
+                    offset_64: 368,
+                    offset_32: 188,
+                    rust_host_offset: offset_of!(BamHostApi, sys_entity_children),
+                },
+                FieldLayoutSpec {
+                    c_name: "asset_load",
+                    offset_64: 376,
+                    offset_32: 192,
+                    rust_host_offset: offset_of!(BamHostApi, asset_load),
+                },
+                FieldLayoutSpec {
+                    c_name: "asset_get_load_state",
+                    offset_64: 384,
+                    offset_32: 196,
+                    rust_host_offset: offset_of!(BamHostApi, asset_get_load_state),
+                },
+                FieldLayoutSpec {
+                    c_name: "asset_release",
+                    offset_64: 392,
+                    offset_32: 200,
+                    rust_host_offset: offset_of!(BamHostApi, asset_release),
+                },
+                FieldLayoutSpec {
+                    c_name: "cmd_spawn_scene",
+                    offset_64: 400,
+                    offset_32: 204,
+                    rust_host_offset: offset_of!(BamHostApi, cmd_spawn_scene),
+                },
             ],
         },
     ]
@@ -864,6 +1227,11 @@ fn verify_host_rust_layouts(specs: &[StructLayoutSpec]) -> Result<(), String> {
         || size_of::<FfiResult>() != 4
         || size_of::<AccessMode>() != 4
         || size_of::<ScheduleId>() != 4
+        || size_of::<BamEventKind>() != 4
+        || size_of::<FfiAssetLoadState>() != 4
+        || size_of::<FfiOption<u32>>() != 8
+        || offset_of!(FfiOption<u32>, is_some) != 0
+        || offset_of!(FfiOption<u32>, value) != 4
     {
         return Err("primitive newtype layout mismatch in bevy_abi_mod_sys".to_owned());
     }
@@ -1015,7 +1383,8 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
          #define BAM_SIPHASH_KEY_0 0x{SIPHASH_KEY_0:016x}ull\n\
          #define BAM_SIPHASH_KEY_1 0x{SIPHASH_KEY_1:016x}ull\n\
          #define BAM_MAX_CHANGE_AGE 0x{BAM_MAX_CHANGE_AGE:08X}u\n\
-         #define BAM_CHILD_OF_NAME \"{BAM_CHILD_OF_NAME}\"\n"
+         #define BAM_CHILD_OF_NAME \"{BAM_CHILD_OF_NAME}\"\n\
+         #define BAM_CHILDREN_NAME \"{BAM_CHILDREN_NAME}\"\n"
     );
 
     // Primitives, Result taxonomy, AccessMode, ScheduleId, Flags
@@ -1061,7 +1430,26 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
          #define BAM_ACCESS_RESOURCE_READ  ((BamAccessMode){}u)\n\
          #define BAM_ACCESS_RESOURCE_WRITE ((BamAccessMode){}u)\n\
          #define BAM_ACCESS_MESSAGE_READ   ((BamAccessMode){}u)\n\
-         #define BAM_ACCESS_MESSAGE_WRITE  ((BamAccessMode){}u)\n\n\
+         #define BAM_ACCESS_MESSAGE_WRITE  ((BamAccessMode){}u)\n\
+         #define BAM_ACCESS_ALLOW          ((BamAccessMode){}u)\n\
+         #define BAM_ACCESS_HAS            ((BamAccessMode){}u)\n\
+         #define BAM_ACCESS_REMOVED_READ   ((BamAccessMode){}u)\n\n\
+         typedef uint32_t BamEventKind;\n\
+         #define BAM_EVENT_KIND_CUSTOM  ((BamEventKind){}u)\n\
+         #define BAM_EVENT_KIND_ADD     ((BamEventKind){}u)\n\
+         #define BAM_EVENT_KIND_INSERT  ((BamEventKind){}u)\n\
+         #define BAM_EVENT_KIND_DISCARD ((BamEventKind){}u)\n\
+         #define BAM_EVENT_KIND_REMOVE  ((BamEventKind){}u)\n\
+         #define BAM_EVENT_KIND_DESPAWN ((BamEventKind){}u)\n\
+         #define BAM_EVENT_KIND_READY   ((BamEventKind){}u)\n\n\
+         #define BAM_ASSET_HANDLE_KIND_NONE  ((uint8_t){}u)\n\
+         #define BAM_ASSET_HANDLE_KIND_INDEX ((uint8_t){}u)\n\
+         #define BAM_ASSET_HANDLE_KIND_UUID  ((uint8_t){}u)\n\n\
+         typedef uint32_t BamAssetLoadState;\n\
+         #define BAM_ASSET_LOAD_STATE_NOT_LOADED ((BamAssetLoadState){}u)\n\
+         #define BAM_ASSET_LOAD_STATE_LOADING    ((BamAssetLoadState){}u)\n\
+         #define BAM_ASSET_LOAD_STATE_LOADED     ((BamAssetLoadState){}u)\n\
+         #define BAM_ASSET_LOAD_STATE_FAILED     ((BamAssetLoadState){}u)\n\n\
          typedef uint32_t BamScheduleId;\n\
          #define BAM_SCHEDULE_UPDATE       ((BamScheduleId){}u)\n\
          #define BAM_SCHEDULE_STARTUP      ((BamScheduleId){}u)\n\
@@ -1070,21 +1458,27 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
          #define BAM_SCHEDULE_FIXED_UPDATE ((BamScheduleId){}u)\n\
          #define BAM_SCHEDULE_LAST         ((BamScheduleId){}u)\n\
          #define BAM_SCHEDULE_CUSTOM_BASE  ((BamScheduleId){}u)\n\n\
-         #define BAM_MANIFEST_KNOWN_FLAGS       0x{BAM_MANIFEST_KNOWN_FLAGS:08X}u\n\
-         #define BAM_TERM_KNOWN_FLAGS           0x{BAM_TERM_KNOWN_FLAGS:08X}u\n\
-         #define BAM_QUERY_KNOWN_FLAGS          0x{BAM_QUERY_KNOWN_FLAGS:08X}u\n\
-         #define BAM_SYSTEM_FLAG_MAIN_THREAD    0x{BAM_SYSTEM_FLAG_MAIN_THREAD:08X}u\n\
-         #define BAM_SYSTEM_KNOWN_FLAGS         0x{BAM_SYSTEM_KNOWN_FLAGS:08X}u\n\
-         #define BAM_OBSERVER_KNOWN_FLAGS       0x{BAM_OBSERVER_KNOWN_FLAGS:08X}u\n\
-         #define BAM_COMPONENT_FLAG_SPARSE_SET  0x{BAM_COMPONENT_FLAG_SPARSE_SET:08X}u\n\
-         #define BAM_COMPONENT_FLAG_IMMUTABLE   0x{BAM_COMPONENT_FLAG_IMMUTABLE:08X}u\n\
-         #define BAM_COMPONENT_KNOWN_FLAGS      0x{BAM_COMPONENT_KNOWN_FLAGS:08X}u\n\
-         #define BAM_STORAGE_FLAG_SPARSE_SET    0x{BAM_STORAGE_FLAG_SPARSE_SET:08X}u\n\
-         #define BAM_STORAGE_FLAG_IMMUTABLE     0x{BAM_STORAGE_FLAG_IMMUTABLE:08X}u\n\
-         #define BAM_STORAGE_FLAG_RESOURCE      0x{BAM_STORAGE_FLAG_RESOURCE:08X}u\n\
-         #define BAM_STORAGE_FLAG_MESSAGE       0x{BAM_STORAGE_FLAG_MESSAGE:08X}u\n\
-         #define BAM_STORAGE_FLAG_EVENT         0x{BAM_STORAGE_FLAG_EVENT:08X}u\n\
-         #define BAM_STORAGE_FLAG_ENTITY_EVENT  0x{BAM_STORAGE_FLAG_ENTITY_EVENT:08X}u\n",
+         #define BAM_MANIFEST_KNOWN_FLAGS            0x{BAM_MANIFEST_KNOWN_FLAGS:08X}u\n\
+         #define BAM_TERM_KNOWN_FLAGS                0x{BAM_TERM_KNOWN_FLAGS:04X}u\n\
+         #define BAM_QUERY_KNOWN_FLAGS               0x{BAM_QUERY_KNOWN_FLAGS:08X}u\n\
+         #define BAM_SYSTEM_FLAG_MAIN_THREAD         0x{BAM_SYSTEM_FLAG_MAIN_THREAD:08X}u\n\
+         #define BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL  0x{BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL:08X}u\n\
+         #define BAM_SYSTEM_KNOWN_FLAGS              0x{BAM_SYSTEM_KNOWN_FLAGS:08X}u\n\
+         #define BAM_OBSERVER_FLAG_PROPAGATE         0x{BAM_OBSERVER_FLAG_PROPAGATE:08X}u\n\
+         #define BAM_OBSERVER_KNOWN_FLAGS            0x{BAM_OBSERVER_KNOWN_FLAGS:08X}u\n\
+         #define BAM_TRIGGER_FLAG_PROPAGATE          0x{BAM_TRIGGER_FLAG_PROPAGATE:08X}u\n\
+         #define BAM_TRIGGER_KNOWN_FLAGS             0x{BAM_TRIGGER_KNOWN_FLAGS:08X}u\n\
+         #define BAM_COMPONENT_FLAG_SPARSE_SET       0x{BAM_COMPONENT_FLAG_SPARSE_SET:08X}u\n\
+         #define BAM_COMPONENT_FLAG_IMMUTABLE        0x{BAM_COMPONENT_FLAG_IMMUTABLE:08X}u\n\
+         #define BAM_COMPONENT_FLAG_SUMMARY_TICK     0x{BAM_COMPONENT_FLAG_SUMMARY_TICK:08X}u\n\
+         #define BAM_COMPONENT_KNOWN_FLAGS           0x{BAM_COMPONENT_KNOWN_FLAGS:08X}u\n\
+         #define BAM_STORAGE_FLAG_SPARSE_SET         0x{BAM_STORAGE_FLAG_SPARSE_SET:08X}u\n\
+         #define BAM_STORAGE_FLAG_IMMUTABLE          0x{BAM_STORAGE_FLAG_IMMUTABLE:08X}u\n\
+         #define BAM_STORAGE_FLAG_RESOURCE           0x{BAM_STORAGE_FLAG_RESOURCE:08X}u\n\
+         #define BAM_STORAGE_FLAG_MESSAGE            0x{BAM_STORAGE_FLAG_MESSAGE:08X}u\n\
+         #define BAM_STORAGE_FLAG_EVENT              0x{BAM_STORAGE_FLAG_EVENT:08X}u\n\
+         #define BAM_STORAGE_FLAG_ENTITY_EVENT       0x{BAM_STORAGE_FLAG_ENTITY_EVENT:08X}u\n\
+         #define BAM_STORAGE_FLAG_SUMMARY_TICK       0x{BAM_STORAGE_FLAG_SUMMARY_TICK:08X}u\n",
         FfiBool::FALSE.0,
         FfiBool::TRUE.0,
         BamComponent::INVALID.0,
@@ -1118,6 +1512,23 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
         AccessMode::RESOURCE_WRITE.0,
         AccessMode::MESSAGE_READ.0,
         AccessMode::MESSAGE_WRITE.0,
+        AccessMode::ALLOW.0,
+        AccessMode::HAS.0,
+        AccessMode::REMOVED_READ.0,
+        BamEventKind::CUSTOM.0,
+        BamEventKind::ADD.0,
+        BamEventKind::INSERT.0,
+        BamEventKind::DISCARD.0,
+        BamEventKind::REMOVE.0,
+        BamEventKind::DESPAWN.0,
+        BamEventKind::READY.0,
+        FfiAssetHandle::KIND_NONE,
+        FfiAssetHandle::KIND_INDEX,
+        FfiAssetHandle::KIND_UUID,
+        FfiAssetLoadState::NOT_LOADED.0,
+        FfiAssetLoadState::LOADING.0,
+        FfiAssetLoadState::LOADED.0,
+        FfiAssetLoadState::FAILED.0,
         ScheduleId::UPDATE.0,
         ScheduleId::STARTUP.0,
         ScheduleId::PRE_UPDATE.0,
@@ -1147,6 +1558,19 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
          typedef struct BamComponentUuid {\n\
              uint8_t bytes[16];\n\
          } BamComponentUuid;\n\n\
+         #define BAM_OPTION_STRUCT(ElemType, StructName) \\\n\
+             typedef struct StructName {                 \\\n\
+                 BamBool  is_some;                       \\\n\
+                 ElemType value;                         \\\n\
+             } StructName\n\n\
+         typedef struct BamAssetHandle {\n\
+             uint8_t          kind;\n\
+             uint8_t          reserved0[3];\n\
+             BamComponent     asset_type;\n\
+             uint32_t         index;\n\
+             uint32_t         generation;\n\
+             BamComponentUuid uuid;\n\
+         } BamAssetHandle;\n\n\
          typedef struct BamChildOf {\n\
              BamEntity parent;\n\
          } BamChildOf;\n\n\
@@ -1176,13 +1600,17 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
          } BamManifest;\n\n\
          typedef void      (*BamComponentDropFn)(void* ptr);\n\
          typedef void      (*BamComponentHookFn)(BamEntity entity, const void* data_ptr, void* user_data);\n\
+         typedef BamResult (*BamComponentCloneFn)(const void* src, void* dst, void* user_data);\n\
          typedef BamResult (*BamSystemFn)(BamSystemCtx* sys_ctx, void* user_data);\n\
          typedef BamBool   (*BamRunIfFn)(void* user_data);\n\
-         typedef BamResult (*BamObserverFn)(BamEntity entity, const void* event_data, BamCommands* commands, void* user_data);\n\n\
+         typedef BamResult (*BamObserverFn)(BamEntity entity, const void* event_data, BamCommands* commands, void* user_data);\n\
+         typedef BamResult (*BamObserverMutFn)(BamEntity entity, uint8_t* event_data, BamBool* propagate, BamCommands* commands, void* user_data);\n\n\
          typedef struct BamTermDesc {\n\
              BamComponent  component;\n\
              BamAccessMode mode;\n\
-             uint32_t      flags;\n\
+             uint16_t      flags;\n\
+             uint8_t       or_group;\n\
+             uint8_t       reserved0;\n\
          } BamTermDesc;\n\n\
          typedef struct BamQueryDesc {\n\
              uint32_t           struct_size;\n\
@@ -1207,11 +1635,23 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
              BamRunIfFn          run_if;\n\
              void*               run_if_user_data;\n\
          #if defined(__cplusplus) && (__cplusplus >= 201402L)\n\
-             const char* const*  in_sets          = nullptr;\n\
-             size_t              in_set_count     = 0;\n\
+             const char* const*  in_sets              = nullptr;\n\
+             size_t              in_set_count         = 0;\n\
+             const char* const*  after_weak           = nullptr;\n\
+             size_t              after_weak_count     = 0;\n\
+             const char* const*  before_weak          = nullptr;\n\
+             size_t              before_weak_count    = 0;\n\
+             const char* const*  ambiguous_with       = nullptr;\n\
+             size_t              ambiguous_with_count = 0;\n\
          #else\n\
              const char* const*  in_sets;\n\
              size_t              in_set_count;\n\
+             const char* const*  after_weak;\n\
+             size_t              after_weak_count;\n\
+             const char* const*  before_weak;\n\
+             size_t              before_weak_count;\n\
+             const char* const*  ambiguous_with;\n\
+             size_t              ambiguous_with_count;\n\
          #endif\n\
          } BamSystemDesc;\n\n\
          typedef struct BamObserverDesc {\n\
@@ -1224,7 +1664,38 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
              uint32_t      reserved0;\n\
              BamObserverFn callback;\n\
              void*         user_data;\n\
+         #if defined(__cplusplus) && (__cplusplus >= 201402L)\n\
+             BamEventKind        event_kind              = BAM_EVENT_KIND_CUSTOM;\n\
+             uint32_t            reserved1               = 0;\n\
+             const BamComponent* watched_components      = nullptr;\n\
+             size_t              watched_component_count = 0;\n\
+             BamObserverMutFn    mut_callback            = nullptr;\n\
+             BamComponent        propagate_relationship  = BAM_COMPONENT_INVALID;\n\
+             uint32_t            reserved2               = 0;\n\
+         #else\n\
+             BamEventKind        event_kind;\n\
+             uint32_t            reserved1;\n\
+             const BamComponent* watched_components;\n\
+             size_t              watched_component_count;\n\
+             BamObserverMutFn    mut_callback;\n\
+             BamComponent        propagate_relationship;\n\
+             uint32_t            reserved2;\n\
+         #endif\n\
          } BamObserverDesc;\n\n\
+         typedef struct BamTriggerDesc {\n\
+             uint32_t            struct_size;\n\
+             uint32_t            flags;\n\
+             BamComponent        event;\n\
+             BamEventKind        event_kind;\n\
+             uint32_t            entity_lo;\n\
+             uint32_t            entity_hi;\n\
+             uint8_t*            data_ptr;\n\
+             size_t              data_len;\n\
+             const BamComponent* watched_components;\n\
+             size_t              watched_component_count;\n\
+             BamComponent        propagate_relationship;\n\
+             uint32_t            reserved0;\n\
+         } BamTriggerDesc;\n\n\
          typedef struct BamComponentDesc {\n\
              uint32_t           struct_size;\n\
              uint32_t           flags;\n\
@@ -1235,13 +1706,25 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
              BamComponentDropFn drop_fn;\n\
              const void*        vtable_ptr;\n\
          #if defined(__cplusplus) && (__cplusplus >= 201402L)\n\
-             BamComponentHookFn on_add         = nullptr;\n\
-             BamComponentHookFn on_remove      = nullptr;\n\
-             void*              hook_user_data = nullptr;\n\
+             BamComponentHookFn  on_add                   = nullptr;\n\
+             BamComponentHookFn  on_remove                = nullptr;\n\
+             void*               hook_user_data           = nullptr;\n\
+             BamComponentHookFn  on_insert                = nullptr;\n\
+             BamComponentHookFn  on_discard               = nullptr;\n\
+             BamComponentHookFn  on_despawn               = nullptr;\n\
+             BamComponentCloneFn clone_fn                 = nullptr;\n\
+             const BamComponent* required_components      = nullptr;\n\
+             size_t              required_component_count = 0;\n\
          #else\n\
-             BamComponentHookFn on_add;\n\
-             BamComponentHookFn on_remove;\n\
-             void*              hook_user_data;\n\
+             BamComponentHookFn  on_add;\n\
+             BamComponentHookFn  on_remove;\n\
+             void*               hook_user_data;\n\
+             BamComponentHookFn  on_insert;\n\
+             BamComponentHookFn  on_discard;\n\
+             BamComponentHookFn  on_despawn;\n\
+             BamComponentCloneFn clone_fn;\n\
+             const BamComponent* required_components;\n\
+             size_t              required_component_count;\n\
          #endif\n\
          } BamComponentDesc;\n\n\
          typedef struct BamColumnInfo {\n\
@@ -1259,7 +1742,20 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
              BamComponentUuid uuid;\n\
              size_t           size;\n\
              size_t           align;\n\
-         } BamVTableHeader;\n\n",
+         } BamVTableHeader;\n\n\
+         #define BAM_MAPPED_WIRE_VTABLE_STRUCT(WireType, StructName) \\\n\
+             typedef struct StructName {                             \\\n\
+                 BamVTableHeader header;                             \\\n\
+                 BamResult (*get)(const void* ptr, WireType* out);   \\\n\
+                 BamResult (*set)(void* ptr, const WireType* in_v);  \\\n\
+             } StructName\n\n\
+         typedef BamStrView (*BamMappedStringGetFn)(const void* ptr);\n\
+         typedef BamResult  (*BamMappedStringSetFn)(void* ptr, BamStrView view);\n\n\
+         typedef struct BamMappedStringVTable {\n\
+             BamVTableHeader      header;\n\
+             BamMappedStringGetFn get;\n\
+             BamMappedStringSetFn set;\n\
+         } BamMappedStringVTable;\n\n",
     );
 
     // BamHostApi function pointer typedefs + struct
@@ -1313,7 +1809,17 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
          typedef const uint8_t* (*BamSysResPtrFn)(const BamSystemCtx* sys_ctx, BamComponent component, BamChangeTicks* out_ticks);\n\
          typedef uint8_t*       (*BamSysResMutPtrFn)(BamSystemCtx* sys_ctx, BamComponent component, BamChangeTicks* out_ticks);\n\
          typedef BamResult      (*BamRegisterObserverFn)(BamLoadCtx* load_ctx, const BamObserverDesc* desc);\n\
-         typedef BamResult      (*BamCmdTriggerFn)(BamCommands* commands, BamComponent event, BamEntity target, const uint8_t* data_ptr, size_t data_len);\n\n\
+         typedef BamResult      (*BamCmdTriggerFn)(BamCommands* commands, BamComponent event, BamEntity target, const uint8_t* data_ptr, size_t data_len);\n\
+         typedef BamResult      (*BamCmdSpawnBatchFn)(BamCommands* commands, const BamComponent* components, const uint8_t* const* column_ptrs, size_t component_count, size_t entity_count, BamEntity* out_entities);\n\
+         typedef BamResult      (*BamCmdDespawnAllFn)(BamCommands* commands, const BamTermDesc* terms, size_t term_count);\n\
+         typedef BamResult      (*BamCmdTriggerExFn)(BamCommands* commands, const BamTriggerDesc* desc);\n\
+         typedef BamResult      (*BamCmdObserveFn)(BamCommands* commands, const BamObserverDesc* desc, BamEntity* out_entity);\n\
+         typedef BamResult      (*BamIterReadRemovedFn)(BamIter* iter, size_t term_index, BamEntity* out_entities, size_t max_count, size_t* out_read);\n\
+         typedef BamResult      (*BamSysEntityChildrenFn)(const BamSystemCtx* sys_ctx, BamEntity entity, BamComponent relationship_target, const BamEntity** out_entities, size_t* out_len);\n\
+         typedef BamResult      (*BamAssetLoadFn)(const BamHostCtx* ctx, BamComponent asset_type, BamStrView path, BamAssetHandle* out_handle);\n\
+         typedef BamResult      (*BamAssetGetLoadStateFn)(const BamHostCtx* ctx, const BamAssetHandle* handle, BamAssetLoadState* out_state);\n\
+         typedef BamResult      (*BamAssetReleaseFn)(const BamHostCtx* ctx, const BamAssetHandle* handle);\n\
+         typedef BamResult      (*BamCmdSpawnSceneFn)(BamCommands* commands, const BamAssetHandle* scene_handle, BamEntity parent, BamEntity* out_entity);\n\n\
          struct BamHostApi {\n\
              uint32_t struct_size;\n\
              uint32_t abi_version;\n\n\
@@ -1351,22 +1857,35 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
              BamCmdInsertDefaultFn cmd_insert_default;\n\
              BamCmdRemoveFn        cmd_remove;\n\n\
              /* Optional extended engine slots (appended after `BAM_HOST_API_MIN_V0_2_SIZE`) */\n\
-             BamParForEachChunkFn  par_for_each_chunk;\n\
-             BamSysEntityGetFn     sys_entity_get;\n\
-             BamSysEntityGetMutFn  sys_entity_get_mut;\n\
-             BamMsgReadBatchFn     msg_read_batch;\n\
-             BamMsgSendFn          msg_send;\n\
-             BamMsgWriteBatchFn    msg_write_batch;\n\
-             BamResTicksFn         res_ticks;\n\
-             BamSysResPtrFn        sys_res_ptr;\n\
-             BamSysResMutPtrFn     sys_res_mut_ptr;\n\
-             BamRegisterObserverFn register_observer;\n\
-             BamCmdTriggerFn       cmd_trigger;\n\
+             BamParForEachChunkFn    par_for_each_chunk;\n\
+             BamSysEntityGetFn       sys_entity_get;\n\
+             BamSysEntityGetMutFn    sys_entity_get_mut;\n\
+             BamMsgReadBatchFn       msg_read_batch;\n\
+             BamMsgSendFn            msg_send;\n\
+             BamMsgWriteBatchFn      msg_write_batch;\n\
+             BamResTicksFn           res_ticks;\n\
+             BamSysResPtrFn          sys_res_ptr;\n\
+             BamSysResMutPtrFn       sys_res_mut_ptr;\n\
+             BamRegisterObserverFn   register_observer;\n\
+             BamCmdTriggerFn         cmd_trigger;\n\
+             BamCmdSpawnFn           cmd_spawn_persistent;\n\
+             BamCmdSpawnBatchFn      cmd_spawn_batch;\n\
+             BamCmdDespawnAllFn      cmd_despawn_all;\n\
+             BamCmdInsertFn          cmd_insert_if_new;\n\
+             BamCmdTriggerExFn       cmd_trigger_ex;\n\
+             BamCmdObserveFn         cmd_observe;\n\
+             BamIterReadRemovedFn    iter_read_removed;\n\
+             BamSysEntityChildrenFn  sys_entity_children;\n\
+             BamAssetLoadFn          asset_load;\n\
+             BamAssetGetLoadStateFn  asset_get_load_state;\n\
+             BamAssetReleaseFn       asset_release;\n\
+             BamCmdSpawnSceneFn      cmd_spawn_scene;\n\
          };\n\n\
          #define BAM_MANIFEST_MIN_V0_2_SIZE       (offsetof(BamManifest, reserved0) + sizeof(uint32_t))\n\
          #define BAM_QUERY_DESC_MIN_V0_2_SIZE     (offsetof(BamQueryDesc, term_count) + sizeof(size_t))\n\
          #define BAM_SYSTEM_DESC_MIN_V0_2_SIZE    (offsetof(BamSystemDesc, run_if_user_data) + sizeof(void*))\n\
          #define BAM_OBSERVER_DESC_MIN_V0_2_SIZE  (offsetof(BamObserverDesc, user_data) + sizeof(void*))\n\
+         #define BAM_TRIGGER_DESC_MIN_V0_2_SIZE   (offsetof(BamTriggerDesc, reserved0) + sizeof(uint32_t))\n\
          #define BAM_COMPONENT_DESC_MIN_V0_2_SIZE (offsetof(BamComponentDesc, vtable_ptr) + sizeof(const void*))\n\
          #define BAM_VTABLE_HEADER_MIN_V0_2_SIZE  (offsetof(BamVTableHeader, align) + sizeof(size_t))\n\
          #define BAM_HOST_API_MIN_V0_2_SIZE       (offsetof(BamHostApi, cmd_remove) + sizeof(BamCmdRemoveFn))\n\n",
@@ -1439,12 +1958,62 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
          static BAM_UNUSED inline int bam_component_is_valid(BamComponent component) {\n\
              return component != BAM_COMPONENT_INVALID;\n\
          }\n\n\
-         static BAM_UNUSED inline BamTermDesc bam_term_desc(BamComponent component, BamAccessMode mode, uint32_t flags) {\n\
+         static BAM_UNUSED inline BamTermDesc bam_term_desc(BamComponent component, BamAccessMode mode, uint16_t flags) {\n\
              BamTermDesc t;\n\
              t.component = component;\n\
              t.mode = mode;\n\
              t.flags = flags;\n\
+             t.or_group = 0u;\n\
+             t.reserved0 = 0u;\n\
              return t;\n\
+         }\n\n\
+         static BAM_UNUSED inline BamTermDesc bam_term_desc_or(\n\
+             BamComponent component,\n\
+             BamAccessMode mode,\n\
+             uint16_t flags,\n\
+             uint8_t or_group\n\
+         ) {\n\
+             BamTermDesc t;\n\
+             t.component = component;\n\
+             t.mode = mode;\n\
+             t.flags = flags;\n\
+             t.or_group = or_group;\n\
+             t.reserved0 = 0u;\n\
+             return t;\n\
+         }\n\n\
+         static BAM_UNUSED inline BamAssetHandle bam_asset_handle_none(void) {\n\
+             BamAssetHandle h;\n\
+             memset(&h, 0, sizeof(BamAssetHandle));\n\
+             h.kind = BAM_ASSET_HANDLE_KIND_NONE;\n\
+             return h;\n\
+         }\n\n\
+         static BAM_UNUSED inline BamAssetHandle bam_asset_handle_from_index(\n\
+             BamComponent asset_type,\n\
+             uint32_t index,\n\
+             uint32_t generation\n\
+         ) {\n\
+             BamAssetHandle h = bam_asset_handle_none();\n\
+             h.kind = BAM_ASSET_HANDLE_KIND_INDEX;\n\
+             h.asset_type = asset_type;\n\
+             h.index = index;\n\
+             h.generation = generation;\n\
+             return h;\n\
+         }\n\n\
+         static BAM_UNUSED inline BamAssetHandle bam_asset_handle_from_uuid(\n\
+             BamComponent asset_type,\n\
+             BamComponentUuid uuid\n\
+         ) {\n\
+             BamAssetHandle h = bam_asset_handle_none();\n\
+             h.kind = BAM_ASSET_HANDLE_KIND_UUID;\n\
+             h.asset_type = asset_type;\n\
+             h.uuid = uuid;\n\
+             return h;\n\
+         }\n\n\
+         static BAM_UNUSED inline int bam_asset_handle_is_none(const BamAssetHandle* h) {\n\
+             return (h == NULL) || (h->kind == BAM_ASSET_HANDLE_KIND_NONE);\n\
+         }\n\n\
+         static BAM_UNUSED inline int bam_asset_handle_is_some(const BamAssetHandle* h) {\n\
+             return (h != NULL) && (h->kind == BAM_ASSET_HANDLE_KIND_INDEX || h->kind == BAM_ASSET_HANDLE_KIND_UUID);\n\
          }\n\n\
          static BAM_UNUSED inline uint32_t bam_host_api_raw_struct_size(const BamHostApi* api) {\n\
              if (api == NULL) {\n\
@@ -1658,6 +2227,12 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
              d.on_add = NULL;\n\
              d.on_remove = NULL;\n\
              d.hook_user_data = NULL;\n\
+             d.on_insert = NULL;\n\
+             d.on_discard = NULL;\n\
+             d.on_despawn = NULL;\n\
+             d.clone_fn = NULL;\n\
+             d.required_components = NULL;\n\
+             d.required_component_count = 0u;\n\
              return d;\n\
          }\n\n\
          static BAM_UNUSED inline BamObserverDesc bam_observer_desc(\n\
@@ -1676,6 +2251,34 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
              d.reserved0 = 0u;\n\
              d.callback = callback;\n\
              d.user_data = user_data;\n\
+             d.event_kind = BAM_EVENT_KIND_CUSTOM;\n\
+             d.reserved1 = 0u;\n\
+             d.watched_components = NULL;\n\
+             d.watched_component_count = 0u;\n\
+             d.mut_callback = NULL;\n\
+             d.propagate_relationship = BAM_COMPONENT_INVALID;\n\
+             d.reserved2 = 0u;\n\
+             return d;\n\
+         }\n\n\
+         static BAM_UNUSED inline BamTriggerDesc bam_trigger_desc(\n\
+             BamComponent event,\n\
+             BamEntity entity,\n\
+             uint8_t* data_ptr,\n\
+             size_t data_len\n\
+         ) {\n\
+             BamTriggerDesc d;\n\
+             d.struct_size = (uint32_t)sizeof(BamTriggerDesc);\n\
+             d.flags = 0u;\n\
+             d.event = event;\n\
+             d.event_kind = BAM_EVENT_KIND_CUSTOM;\n\
+             d.entity_lo = (uint32_t)(entity & 0xFFFFFFFFull);\n\
+             d.entity_hi = (uint32_t)((entity >> 32) & 0xFFFFFFFFull);\n\
+             d.data_ptr = data_ptr;\n\
+             d.data_len = data_len;\n\
+             d.watched_components = NULL;\n\
+             d.watched_component_count = 0u;\n\
+             d.propagate_relationship = BAM_COMPONENT_INVALID;\n\
+             d.reserved0 = 0u;\n\
              return d;\n\
          }\n\n",
     );
@@ -1697,7 +2300,11 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
          BAM_STATIC_ASSERT(sizeof(BamAccessMode) == 4u, bam_access_mode_size);\n\
          BAM_STATIC_ASSERT(BAM_ALIGNOF(BamAccessMode) == 4u, bam_access_mode_align);\n\
          BAM_STATIC_ASSERT(sizeof(BamScheduleId) == 4u, bam_schedule_id_size);\n\
-         BAM_STATIC_ASSERT(BAM_ALIGNOF(BamScheduleId) == 4u, bam_schedule_id_align);\n\n",
+         BAM_STATIC_ASSERT(BAM_ALIGNOF(BamScheduleId) == 4u, bam_schedule_id_align);\n\
+         BAM_STATIC_ASSERT(sizeof(BamEventKind) == 4u, bam_event_kind_size);\n\
+         BAM_STATIC_ASSERT(BAM_ALIGNOF(BamEventKind) == 4u, bam_event_kind_align);\n\
+         BAM_STATIC_ASSERT(sizeof(BamAssetLoadState) == 4u, bam_asset_load_state_size);\n\
+         BAM_STATIC_ASSERT(BAM_ALIGNOF(BamAssetLoadState) == 4u, bam_asset_load_state_align);\n\n",
     );
 
     // 64-bit assertions
@@ -1726,6 +2333,7 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
          BAM_STATIC_ASSERT(BAM_QUERY_DESC_MIN_V0_2_SIZE == 24u, bam_query_desc_min_64);\n\
          BAM_STATIC_ASSERT(BAM_SYSTEM_DESC_MIN_V0_2_SIZE == 104u, bam_system_desc_min_64);\n\
          BAM_STATIC_ASSERT(BAM_OBSERVER_DESC_MIN_V0_2_SIZE == 48u, bam_observer_desc_min_64);\n\
+         BAM_STATIC_ASSERT(BAM_TRIGGER_DESC_MIN_V0_2_SIZE == 64u, bam_trigger_desc_min_64);\n\
          BAM_STATIC_ASSERT(BAM_COMPONENT_DESC_MIN_V0_2_SIZE == 64u, bam_component_desc_min_64);\n\
          BAM_STATIC_ASSERT(BAM_VTABLE_HEADER_MIN_V0_2_SIZE == 40u, bam_vtable_header_min_64);\n\
          BAM_STATIC_ASSERT(BAM_HOST_API_MIN_V0_2_SIZE == 224u, bam_host_api_min_64);\n\
@@ -1758,6 +2366,7 @@ pub(crate) fn render_c99_header() -> Result<String, String> {
          BAM_STATIC_ASSERT(BAM_QUERY_DESC_MIN_V0_2_SIZE == 16u, bam_query_desc_min_32);\n\
          BAM_STATIC_ASSERT(BAM_SYSTEM_DESC_MIN_V0_2_SIZE == 60u, bam_system_desc_min_32);\n\
          BAM_STATIC_ASSERT(BAM_OBSERVER_DESC_MIN_V0_2_SIZE == 36u, bam_observer_desc_min_32);\n\
+         BAM_STATIC_ASSERT(BAM_TRIGGER_DESC_MIN_V0_2_SIZE == 48u, bam_trigger_desc_min_32);\n\
          BAM_STATIC_ASSERT(BAM_COMPONENT_DESC_MIN_V0_2_SIZE == 44u, bam_component_desc_min_32);\n\
          BAM_STATIC_ASSERT(BAM_VTABLE_HEADER_MIN_V0_2_SIZE == 32u, bam_vtable_header_min_32);\n\
          BAM_STATIC_ASSERT(BAM_HOST_API_MIN_V0_2_SIZE == 116u, bam_host_api_min_32);\n",
@@ -1821,10 +2430,10 @@ mod tests {
         assert!(first.contains("#define BAM_ABI_VERSION 0x00020000u"));
         assert!(first.contains("typedef struct BamHostApi   BamHostApi;"));
         assert!(
-            first.contains("BAM_STATIC_ASSERT(sizeof(BamHostApi) == 312u, bam_host_api_size_64);")
+            first.contains("BAM_STATIC_ASSERT(sizeof(BamHostApi) == 408u, bam_host_api_size_64);")
         );
         assert!(
-            first.contains("BAM_STATIC_ASSERT(sizeof(BamHostApi) == 160u, bam_host_api_size_32);")
+            first.contains("BAM_STATIC_ASSERT(sizeof(BamHostApi) == 208u, bam_host_api_size_32);")
         );
         assert!(first.contains("BAM_STATIC_ASSERT(BAM_HOST_API_MIN_V0_2_SIZE == 224u"));
         // Verify old v0.1 unprefixed C typedefs are completely absent:

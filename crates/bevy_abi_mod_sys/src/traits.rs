@@ -4,7 +4,11 @@ use core::ffi::c_void;
 
 use crate::{
     BamChangeTicks,
-    primitives::{BamComponent, ComponentUuid, FfiBool, FfiChildOf, FfiEntity},
+    primitives::{
+        BamComponent, ComponentUuid, FfiAssetHandle, FfiAssetLoadState, FfiBool, FfiChildOf,
+        FfiEntity, FfiOption,
+    },
+    system::BamEventKind,
 };
 
 /// Marker trait for types without internal heap ownership, drop glue, or invalid bit patterns
@@ -115,6 +119,9 @@ impl_abi_pod_primitives!(
     FfiChildOf,
     BamChangeTicks,
     ComponentUuid,
+    FfiAssetHandle,
+    FfiAssetLoadState,
+    BamEventKind,
 );
 
 impl_raw_insertable_only!(u128, i128, usize, isize);
@@ -123,6 +130,13 @@ impl_raw_insertable_only!(u128, i128, usize, isize);
 unsafe impl<T: RawInsertable, const N: usize> RawInsertable for [T; N] {}
 // SAFETY: `[T; N]` matches C's `T[N]` layout identically when `T: AbiPod`.
 unsafe impl<T: AbiPod, const N: usize> AbiPod for [T; N] {}
+
+// SAFETY: `FfiOption<T>` is `#[repr(C)]` over `FfiBool` (`u8`) and `T: RawInsertable` with no
+// heap pointers, drop glue, or invalid bit-pattern hazards.
+unsafe impl<T: RawInsertable> RawInsertable for FfiOption<T> {}
+// SAFETY: `FfiOption<T>` is a non-packed `#[repr(C)]` struct whose fields (`FfiBool` and `T: AbiPod`)
+// both satisfy `AbiPod`.
+unsafe impl<T: AbiPod> AbiPod for FfiOption<T> {}
 
 /// Host-side symbol table entry mapping a `"bam.v0.*"` symbol name to its static VTable or fn pointer.
 ///

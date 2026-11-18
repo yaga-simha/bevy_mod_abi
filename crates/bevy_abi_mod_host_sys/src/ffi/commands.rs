@@ -20,10 +20,11 @@
 use crate::drop_trampoline::run_uncommitted_slot_drop;
 use crate::handle_header::{COMMANDS_MAGIC, HandleHeader, validate_handle_mut};
 use crate::registry::{InsertDefaultFn, RegistrySnapshot};
-use bevy_abi_mod_sys::{BamCommands, BamComponent, FfiEntity, FfiResult};
+use bevy_abi_mod_sys::{BamCommands, BamComponent, FfiAssetHandle, FfiEntity, FfiResult};
 use bevy_ecs::component::ComponentId;
 use bevy_ecs::entity::{Entity, EntityAllocator};
 use bevy_ecs::event::{EntityTrigger, GlobalTrigger};
+use bevy_ecs::hierarchy::ChildOf;
 use bevy_ecs::ptr::{OwningPtr, PtrMut};
 use bevy_ecs::world::World;
 use core::ffi::c_void;
@@ -241,6 +242,11 @@ enum RecordedCommand {
         component: BamComponent,
         target: Option<Entity>,
         slice: ArenaSlice,
+    },
+    SpawnScene {
+        entity: Entity,
+        parent: Option<Entity>,
+        handle: FfiAssetHandle,
     },
 }
 
@@ -559,6 +565,23 @@ impl HostCommandsStorage {
                         }
                     }
                 }
+                RecordedCommand::SpawnScene {
+                    entity,
+                    parent,
+                    handle,
+                } => {
+                    let valid_parent =
+                        parent.filter(|&p| p != entity && world.entities().contains(p));
+                    if let Ok(mut entity_mut) = world.spawn_empty_at(entity) {
+                        if let Some(p) = valid_parent {
+                            entity_mut.insert(ChildOf(p));
+                        }
+                        if let Some(backend) = snapshot.scene_backend() {
+                            let _ =
+                                backend.spawn_scene(world, snapshot, entity, valid_parent, &handle);
+                        }
+                    }
+                }
             }
         }
 
@@ -620,6 +643,26 @@ impl<'a> HostCommands<'a> {
     #[inline]
     pub fn as_ffi_ptr(&mut self) -> *mut BamCommands {
         (self as *mut Self).cast::<BamCommands>()
+    }
+
+    pub(crate) fn queue_spawn_scene(
+        &mut self,
+        handle: FfiAssetHandle,
+        parent: Option<Entity>,
+    ) -> Result<Entity, FfiResult> {
+        let Some(backend) = self.snapshot.scene_backend() else {
+            return Err(FfiResult::UNSUPPORTED);
+        };
+        if let Err((code, _msg)) = backend.validate_scene_handle(self.snapshot, &handle) {
+            return Err(code);
+        }
+        let entity = self.allocator.alloc();
+        self.storage.commands.push(RecordedCommand::SpawnScene {
+            entity,
+            parent,
+            handle,
+        });
+        Ok(entity)
     }
 }
 

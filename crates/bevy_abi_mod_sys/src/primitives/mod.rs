@@ -1,13 +1,17 @@
 //! Core FFI primitive types, handles, and status codes.
 
+mod asset;
 mod bool;
 mod entity;
+mod option;
 mod slice;
 mod uuid;
 
 pub use self::{
+    asset::{FfiAssetHandle, FfiAssetLoadState},
     bool::FfiBool,
-    entity::{BAM_CHILD_OF_NAME, BamComponent, FfiChildOf, FfiEntity},
+    entity::{BAM_CHILD_OF_NAME, BAM_CHILDREN_NAME, BamComponent, FfiChildOf, FfiEntity},
+    option::FfiOption,
     slice::{FfiSlice, StrView},
     uuid::{ComponentUuid, SIPHASH_KEY_0, SIPHASH_KEY_1, siphash24_128},
 };

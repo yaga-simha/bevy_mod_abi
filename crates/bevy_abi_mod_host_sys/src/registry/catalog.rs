@@ -1,16 +1,18 @@
 //! Copy-on-Write (`CoW`) component, resource, VTable, and `"bam.v0.*"` symbol catalog
 //!.
 
+use crate::ffi::assets_scene::{HostAssetBackend, HostSceneBackend};
 use crate::loader::ModId;
+use crate::registry::bridge::ExtractRelationshipTargetsFn;
 use crate::registry::collision::ComponentCollisionError;
 use crate::sync_ptr::SymbolAddress;
 use arc_swap::ArcSwap;
 use bevy_abi_mod_sys::{
     AbiPod, BAM_CHILD_OF_NAME, BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET,
-    BAM_STORAGE_FLAG_ENTITY_EVENT, BAM_STORAGE_FLAG_EVENT, BAM_STORAGE_FLAG_IMMUTABLE,
-    BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET, BamComponent,
-    ComponentDesc, ComponentDropFn, ComponentUuid, FfiChildOf, FfiEntity, FfiResult, ModComponent,
-    RawInsertable,
+    BAM_COMPONENT_FLAG_SUMMARY_TICK, BAM_STORAGE_FLAG_ENTITY_EVENT, BAM_STORAGE_FLAG_EVENT,
+    BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE,
+    BAM_STORAGE_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_SUMMARY_TICK, BamComponent, ComponentDesc,
+    ComponentDropFn, ComponentUuid, FfiChildOf, FfiEntity, FfiResult, ModComponent, RawInsertable,
 };
 use bevy_ecs::change_detection::Tick;
 use bevy_ecs::component::ComponentId;
@@ -514,13 +516,16 @@ pub(crate) const fn component_flags_to_storage_flags(component_flags: u32) -> u3
     if (component_flags & BAM_COMPONENT_FLAG_IMMUTABLE) != 0 {
         out |= BAM_STORAGE_FLAG_IMMUTABLE;
     }
+    if (component_flags & BAM_COMPONENT_FLAG_SUMMARY_TICK) != 0 {
+        out |= BAM_STORAGE_FLAG_SUMMARY_TICK;
+    }
     out
 }
 
 #[derive(Clone, Copy, Debug)]
-struct SymbolRecord {
-    addr: SymbolAddress,
-    owner: Option<ModId>,
+pub(crate) struct SymbolRecord {
+    pub(crate) addr: SymbolAddress,
+    pub(crate) owner: Option<ModId>,
 }
 
 /// Catalog record stored for each component or singleton resource in [`RegistrySnapshot`].
@@ -570,12 +575,17 @@ pub struct RegisteredComponent {
     pub msg_write_batch_fn: Option<MsgWriteBatchFn>,
     /// Whether raw 8-byte entity payloads (such as `ChildOf`) must be validated before insert.
     pub validates_entity_payload: bool,
+    /// Whether `guest_observer_runner` synthesizes an aligned stack [`FfiEntity`] wire payload
+    /// instead of forwarding raw `&E` bytes (used for bridged `#[repr(Rust)]` entity events like `bevy_scene::Ready`).
+    pub synthesizes_ffi_entity_payload: bool,
     /// Bevy [`EventKey`] when registered as a triggerable host [`Event`] / [`EntityEvent`] or dynamic event.
     pub event_key: Option<EventKey>,
     /// Monomorphized typed `world.trigger(...)` dispatcher for host-registered events.
     pub trigger_event_fn: Option<TriggerEventFn>,
     /// Extractor returning the target entity from raw `EntityEvent` payload bytes.
     pub extract_event_target_fn: Option<ExtractEventTargetFn>,
+    /// Optional extractor reading `RelationshipTarget` entities (such as `Children`) into an [`FfiEntity`] slice.
+    pub extract_relationship_targets_fn: Option<ExtractRelationshipTargetsFn>,
     /// Optional [`ModId`] owning a dynamic component's VTable and drop callback.
     pub owner: Option<ModId>,
 }
@@ -616,17 +626,25 @@ impl RegisteredComponent {
     pub const fn is_immutable(&self) -> bool {
         (self.storage_flags & BAM_STORAGE_FLAG_IMMUTABLE) != 0
     }
+
+    /// Returns `true` if `BAM_STORAGE_FLAG_SUMMARY_TICK` is set.
+    #[inline]
+    pub const fn is_summary_tick(&self) -> bool {
+        (self.storage_flags & BAM_STORAGE_FLAG_SUMMARY_TICK) != 0
+    }
 }
 
 /// Immutable dense snapshot shared via `Arc` across `ModRegistry`, `HostContext`, and `GuestSystem`
 ///.
 #[derive(Clone, Default)]
 pub struct RegistrySnapshot {
-    entries: Vec<RegisteredComponent>,
-    by_name: HashMap<Arc<str>, BamComponent>,
-    by_uuid: HashMap<ComponentUuid, BamComponent>,
-    by_component_id: HashMap<ComponentId, BamComponent>,
-    symbols: HashMap<Arc<str>, SymbolRecord>,
+    pub(crate) entries: Vec<RegisteredComponent>,
+    pub(crate) by_name: HashMap<Arc<str>, BamComponent>,
+    pub(crate) by_uuid: HashMap<ComponentUuid, BamComponent>,
+    pub(crate) by_component_id: HashMap<ComponentId, BamComponent>,
+    pub(crate) symbols: HashMap<Arc<str>, SymbolRecord>,
+    asset_backend: Option<Arc<dyn HostAssetBackend>>,
+    scene_backend: Option<Arc<dyn HostSceneBackend>>,
 }
 
 impl RegistrySnapshot {
@@ -689,6 +707,18 @@ impl RegistrySnapshot {
     pub fn entries(&self) -> &[RegisteredComponent] {
         &self.entries
     }
+
+    /// Borrows the optional [`HostAssetBackend`] registered on this snapshot.
+    #[inline]
+    pub fn asset_backend(&self) -> Option<&Arc<dyn HostAssetBackend>> {
+        self.asset_backend.as_ref()
+    }
+
+    /// Borrows the optional [`HostSceneBackend`] registered on this snapshot.
+    #[inline]
+    pub fn scene_backend(&self) -> Option<&Arc<dyn HostSceneBackend>> {
+        self.scene_backend.as_ref()
+    }
 }
 
 struct RegistryTracker {
@@ -703,7 +733,7 @@ struct RegistryTracker {
 /// when the registry actually changes.
 #[derive(Resource, Clone)]
 pub struct ModRegistry {
-    snapshot: Arc<RegistrySnapshot>,
+    pub(super) snapshot: Arc<RegistrySnapshot>,
     generation: u64,
     tracker: Arc<RegistryTracker>,
 }
@@ -775,7 +805,7 @@ impl ModRegistry {
     }
 
     #[inline]
-    fn publish_after_mutation(&mut self) {
+    pub(crate) fn publish_after_mutation(&mut self) {
         self.tracker.latest.store(Arc::clone(&self.snapshot));
         let next_gen = self
             .tracker
@@ -783,6 +813,32 @@ impl ModRegistry {
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1);
         self.generation = next_gen;
+    }
+
+    /// Installs or replaces the world-scoped [`HostAssetBackend`] servicing `asset_*` FFI slots.
+    pub fn set_asset_backend(&mut self, backend: Arc<dyn HostAssetBackend>) {
+        let snap = Arc::make_mut(&mut self.snapshot);
+        snap.asset_backend = Some(backend);
+        self.publish_after_mutation();
+    }
+
+    /// Borrows the installed [`HostAssetBackend`], if any.
+    #[inline]
+    pub fn asset_backend(&self) -> Option<&Arc<dyn HostAssetBackend>> {
+        self.snapshot.asset_backend()
+    }
+
+    /// Installs or replaces the world-scoped [`HostSceneBackend`] servicing `cmd_spawn_scene`.
+    pub fn set_scene_backend(&mut self, backend: Arc<dyn HostSceneBackend>) {
+        let snap = Arc::make_mut(&mut self.snapshot);
+        snap.scene_backend = Some(backend);
+        self.publish_after_mutation();
+    }
+
+    /// Borrows the installed [`HostSceneBackend`], if any.
+    #[inline]
+    pub fn scene_backend(&self) -> Option<&Arc<dyn HostSceneBackend>> {
+        self.snapshot.scene_backend()
     }
 
     /// Validates that registering `(name, uuid, size, align, storage_flags, expected_comp_id)` does
@@ -1010,9 +1066,11 @@ impl ModRegistry {
                     msg_send_fn: Some(msg_send_impl::<M>),
                     msg_write_batch_fn: Some(msg_write_batch_impl::<M>),
                     validates_entity_payload: false,
+                    synthesizes_ffi_entity_payload: false,
                     event_key: None,
                     trigger_event_fn: None,
                     extract_event_target_fn: None,
+                    extract_relationship_targets_fn: None,
                     owner: None,
                 };
                 snap.entries.push(entry);
@@ -1087,9 +1145,11 @@ impl ModRegistry {
                     msg_send_fn: None,
                     msg_write_batch_fn: None,
                     validates_entity_payload: true,
+                    synthesizes_ffi_entity_payload: false,
                     event_key: None,
                     trigger_event_fn: None,
                     extract_event_target_fn: None,
+                    extract_relationship_targets_fn: None,
                     owner: None,
                 };
                 snap.entries.push(entry);
@@ -1200,9 +1260,11 @@ impl ModRegistry {
                     msg_send_fn: None,
                     msg_write_batch_fn: None,
                     validates_entity_payload: false,
+                    synthesizes_ffi_entity_payload: false,
                     event_key: Some(event_key),
                     trigger_event_fn,
                     extract_event_target_fn,
+                    extract_relationship_targets_fn: None,
                     owner: None,
                 };
                 snap.entries.push(entry);
@@ -1277,9 +1339,11 @@ impl ModRegistry {
                     msg_send_fn: None,
                     msg_write_batch_fn: None,
                     validates_entity_payload: false,
+                    synthesizes_ffi_entity_payload: false,
                     event_key: None,
                     trigger_event_fn: None,
                     extract_event_target_fn: None,
+                    extract_relationship_targets_fn: None,
                     owner: None,
                 };
                 snap.entries.push(entry);
@@ -1404,11 +1468,13 @@ impl ModRegistry {
                     msg_send_fn: None,
                     msg_write_batch_fn: None,
                     validates_entity_payload: false,
+                    synthesizes_ffi_entity_payload: false,
                     // SAFETY: `comp_id` was registered via `world.register_component_with_descriptor`
                     // with layout `(desc.size, desc.align)` and is safe for dynamic event dispatch.
                     event_key: Some(unsafe { EventKey::new(comp_id) }),
                     trigger_event_fn: None,
                     extract_event_target_fn: None,
+                    extract_relationship_targets_fn: None,
                     owner,
                 };
                 snap.entries.push(entry);

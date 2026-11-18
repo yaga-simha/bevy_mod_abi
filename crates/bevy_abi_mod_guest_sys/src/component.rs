@@ -4,36 +4,134 @@ use core::ffi::{CStr, c_void};
 use std::ffi::CString;
 
 use bevy_abi_mod_sys::{
-    AbiPod, BamComponent, BamLoadCtx, ComponentDesc, ComponentDropFn, ComponentHookFn,
-    ComponentUuid, FfiEntity, FfiResult,
+    AbiPod, BamComponent, BamLoadCtx, ComponentCloneFn, ComponentDesc, ComponentDropFn,
+    ComponentHookFn, ComponentUuid, FfiEntity, FfiResult,
 };
 
 use crate::{
-    host::Host, instance::GuestInstance, panic::catch_guest_unit, trampoline::ReentrantCell,
+    host::Host,
+    instance::GuestInstance,
+    panic::{catch_guest_result, catch_guest_unit},
+    trampoline::ReentrantCell,
 };
 
 type PodHookCallback<T> = Box<dyn FnMut(FfiEntity, &T) + Send + 'static>;
 
-/// Optional `on_add` and `on_remove` lifecycle callbacks for a dynamic POD component.
+/// Optional lifecycle callbacks, clone capability, and required component dependencies for a
+/// dynamic POD component.
 pub struct PodComponentHooks<T: AbiPod> {
-    /// Optional callback invoked when `T` is added to an entity.
+    /// Optional callback invoked when `T` is added to an entity (`on_add`).
     pub on_add: Option<PodHookCallback<T>>,
-    /// Optional callback invoked before `T` is removed from an entity.
+    /// Optional callback invoked when `T` is inserted onto an entity (`on_insert`).
+    pub on_insert: Option<PodHookCallback<T>>,
+    /// Optional callback invoked before `T` is overwritten or removed (`on_discard`).
+    pub on_discard: Option<PodHookCallback<T>>,
+    /// Optional callback invoked before `T` is removed from an entity (`on_remove`).
     pub on_remove: Option<PodHookCallback<T>>,
+    /// Optional callback invoked when an entity carrying `T` is despawned (`on_despawn`).
+    pub on_despawn: Option<PodHookCallback<T>>,
+    /// Whether to wire a bitwise `ComponentCloneFn` trampoline for `EntityCloner` support.
+    pub enable_clone: bool,
+    /// Optional 1-based [`BamComponent`] handles automatically inserted (`#[require(...)]`) when
+    /// `T` is added to an entity lacking them.
+    pub required_components: Vec<BamComponent>,
 }
 
 impl<T: AbiPod> Default for PodComponentHooks<T> {
     fn default() -> Self {
         Self {
             on_add: None,
+            on_insert: None,
+            on_discard: None,
             on_remove: None,
+            on_despawn: None,
+            enable_clone: false,
+            required_components: Vec::new(),
         }
+    }
+}
+
+impl<T: AbiPod> PodComponentHooks<T> {
+    /// Creates an empty [`PodComponentHooks`] builder.
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the `on_add` lifecycle callback.
+    pub fn with_on_add<F: FnMut(FfiEntity, &T) + Send + 'static>(mut self, f: F) -> Self {
+        self.on_add = Some(Box::new(f));
+        self
+    }
+
+    /// Sets the `on_insert` lifecycle callback.
+    pub fn with_on_insert<F: FnMut(FfiEntity, &T) + Send + 'static>(mut self, f: F) -> Self {
+        self.on_insert = Some(Box::new(f));
+        self
+    }
+
+    /// Sets the `on_discard` lifecycle callback.
+    pub fn with_on_discard<F: FnMut(FfiEntity, &T) + Send + 'static>(mut self, f: F) -> Self {
+        self.on_discard = Some(Box::new(f));
+        self
+    }
+
+    /// Sets the `on_remove` lifecycle callback.
+    pub fn with_on_remove<F: FnMut(FfiEntity, &T) + Send + 'static>(mut self, f: F) -> Self {
+        self.on_remove = Some(Box::new(f));
+        self
+    }
+
+    /// Sets the `on_despawn` lifecycle callback.
+    pub fn with_on_despawn<F: FnMut(FfiEntity, &T) + Send + 'static>(mut self, f: F) -> Self {
+        self.on_despawn = Some(Box::new(f));
+        self
+    }
+
+    /// Enables or disables bitwise `ComponentCloneFn` registration for `T`.
+    #[inline]
+    pub fn with_clone(mut self, enabled: bool) -> Self {
+        self.enable_clone = enabled;
+        self
+    }
+
+    /// Appends required component handles (`#[require(...)]`) to this registration.
+    pub fn with_required_components(mut self, components: &[BamComponent]) -> Self {
+        self.required_components.extend_from_slice(components);
+        self
     }
 }
 
 struct HookTrampolineState<T: AbiPod> {
     on_add: Option<ReentrantCell<PodHookCallback<T>>>,
+    on_insert: Option<ReentrantCell<PodHookCallback<T>>>,
+    on_discard: Option<ReentrantCell<PodHookCallback<T>>>,
     on_remove: Option<ReentrantCell<PodHookCallback<T>>>,
+    on_despawn: Option<ReentrantCell<PodHookCallback<T>>>,
+}
+
+fn dispatch_pod_hook<T: AbiPod>(
+    entity: FfiEntity,
+    component_ptr: *const c_void,
+    cell_opt: &Option<ReentrantCell<PodHookCallback<T>>>,
+) {
+    let Some(cell) = cell_opt else {
+        return;
+    };
+    let val_ref: &T = if core::mem::size_of::<T>() == 0 {
+        // SAFETY: Zero-sized `T: AbiPod` may be referenced via `NonNull::dangling()`.
+        unsafe { core::ptr::NonNull::<T>::dangling().as_ref() }
+    } else {
+        if component_ptr.is_null()
+            || !(component_ptr as usize).is_multiple_of(core::mem::align_of::<T>())
+        {
+            return;
+        }
+        // SAFETY: Host guarantees `component_ptr` points to an initialized `T` on `entity`
+        // for the duration of the lifecycle hook call.
+        unsafe { &*component_ptr.cast::<T>() }
+    };
+    let _ = cell.try_with_mut(|cb| cb(entity, val_ref));
 }
 
 unsafe extern "C" fn pod_on_add_trampoline<T: AbiPod>(
@@ -49,23 +147,37 @@ unsafe extern "C" fn pod_on_add_trampoline<T: AbiPod>(
         // `HookTrampolineState<T>`, and the host disarms `HOOK_SLOTS` via `ArcSwapOption` prior
         // to `bevy_abi_mod_shutdown`.
         let state = unsafe { &*user_data.cast::<HookTrampolineState<T>>() };
-        let Some(ref cell) = state.on_add else {
-            return;
-        };
-        let val_ref: &T = if core::mem::size_of::<T>() == 0 {
-            // SAFETY: Zero-sized `T: AbiPod` may be referenced via `NonNull::dangling()`.
-            unsafe { core::ptr::NonNull::<T>::dangling().as_ref() }
-        } else {
-            if component_ptr.is_null()
-                || !(component_ptr as usize).is_multiple_of(core::mem::align_of::<T>())
-            {
-                return;
-            }
-            // SAFETY: Host guarantees `component_ptr` points to an initialized `T` on `entity`
-            // for the duration of the `on_add` hook call.
-            unsafe { &*component_ptr.cast::<T>() }
-        };
-        let _ = cell.try_with_mut(|cb| cb(entity, val_ref));
+        dispatch_pod_hook::<T>(entity, component_ptr, &state.on_add);
+    });
+}
+
+unsafe extern "C" fn pod_on_insert_trampoline<T: AbiPod>(
+    entity: FfiEntity,
+    component_ptr: *const c_void,
+    user_data: *mut c_void,
+) {
+    if user_data.is_null() {
+        return;
+    }
+    catch_guest_unit(|| {
+        // SAFETY: `user_data` points to `HookTrampolineState<T>` owned by `GuestInstance`.
+        let state = unsafe { &*user_data.cast::<HookTrampolineState<T>>() };
+        dispatch_pod_hook::<T>(entity, component_ptr, &state.on_insert);
+    });
+}
+
+unsafe extern "C" fn pod_on_discard_trampoline<T: AbiPod>(
+    entity: FfiEntity,
+    component_ptr: *const c_void,
+    user_data: *mut c_void,
+) {
+    if user_data.is_null() {
+        return;
+    }
+    catch_guest_unit(|| {
+        // SAFETY: `user_data` points to `HookTrampolineState<T>` owned by `GuestInstance`.
+        let state = unsafe { &*user_data.cast::<HookTrampolineState<T>>() };
+        dispatch_pod_hook::<T>(entity, component_ptr, &state.on_discard);
     });
 }
 
@@ -82,24 +194,50 @@ unsafe extern "C" fn pod_on_remove_trampoline<T: AbiPod>(
         // `HookTrampolineState<T>`, and the host disarms `HOOK_SLOTS` via `ArcSwapOption` prior
         // to `bevy_abi_mod_shutdown`.
         let state = unsafe { &*user_data.cast::<HookTrampolineState<T>>() };
-        let Some(ref cell) = state.on_remove else {
-            return;
-        };
-        let val_ref: &T = if core::mem::size_of::<T>() == 0 {
-            // SAFETY: Zero-sized `T: AbiPod` may be referenced via `NonNull::dangling()`.
-            unsafe { core::ptr::NonNull::<T>::dangling().as_ref() }
-        } else {
-            if component_ptr.is_null()
-                || !(component_ptr as usize).is_multiple_of(core::mem::align_of::<T>())
-            {
-                return;
-            }
-            // SAFETY: Host guarantees `component_ptr` points to the initialized `T` on `entity`
-            // immediately prior to removal/drop.
-            unsafe { &*component_ptr.cast::<T>() }
-        };
-        let _ = cell.try_with_mut(|cb| cb(entity, val_ref));
+        dispatch_pod_hook::<T>(entity, component_ptr, &state.on_remove);
     });
+}
+
+unsafe extern "C" fn pod_on_despawn_trampoline<T: AbiPod>(
+    entity: FfiEntity,
+    component_ptr: *const c_void,
+    user_data: *mut c_void,
+) {
+    if user_data.is_null() {
+        return;
+    }
+    catch_guest_unit(|| {
+        // SAFETY: `user_data` points to `HookTrampolineState<T>` owned by `GuestInstance`.
+        let state = unsafe { &*user_data.cast::<HookTrampolineState<T>>() };
+        dispatch_pod_hook::<T>(entity, component_ptr, &state.on_despawn);
+    });
+}
+
+/// Panic-safe `extern "C"` bitwise [`ComponentCloneFn`] trampoline for `T: AbiPod`.
+///
+/// # Safety
+/// When `size_of::<T>() > 0`, `src` and `dst` must be non-null, non-overlapping, and valid for
+/// `size_of::<T>()` bytes (`src` readable, `dst` writable).
+pub unsafe extern "C" fn pod_clone_trampoline<T: AbiPod>(
+    src: *const c_void,
+    dst: *mut c_void,
+    _user_data: *mut c_void,
+) -> FfiResult {
+    catch_guest_result(|| {
+        let size = core::mem::size_of::<T>();
+        if size == 0 {
+            return FfiResult::OK;
+        }
+        if src.is_null() || dst.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        // SAFETY: `T: AbiPod` is `Copy` without drop glue; copying `size` bytes via `u8` pointers
+        // preserves uninitialized padding provenance cleanly without forming `&[u8]`.
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.cast::<u8>(), dst.cast::<u8>(), size);
+        }
+        FfiResult::OK
+    })
 }
 
 /// Panic-safe `extern "C"` destructor trampoline for non-POD dynamic components registered via
@@ -235,11 +373,17 @@ pub unsafe fn register_pod_component_with_hooks<T: AbiPod>(
     .with_vtable(vtable_ptr);
 
     let has_on_add = hooks.on_add.is_some();
+    let has_on_insert = hooks.on_insert.is_some();
+    let has_on_discard = hooks.on_discard.is_some();
     let has_on_remove = hooks.on_remove.is_some();
-    if has_on_add || has_on_remove {
+    let has_on_despawn = hooks.on_despawn.is_some();
+    if has_on_add || has_on_insert || has_on_discard || has_on_remove || has_on_despawn {
         let state = HookTrampolineState {
             on_add: hooks.on_add.map(ReentrantCell::new),
+            on_insert: hooks.on_insert.map(ReentrantCell::new),
+            on_discard: hooks.on_discard.map(ReentrantCell::new),
             on_remove: hooks.on_remove.map(ReentrantCell::new),
+            on_despawn: hooks.on_despawn.map(ReentrantCell::new),
         };
         let raw_state = instance.track_allocation(Box::new(state));
         desc = desc.with_hooks(
@@ -247,6 +391,26 @@ pub unsafe fn register_pod_component_with_hooks<T: AbiPod>(
             has_on_remove.then_some(pod_on_remove_trampoline::<T> as ComponentHookFn),
             raw_state.cast::<c_void>(),
         );
+        if has_on_insert {
+            desc = desc.with_on_insert(pod_on_insert_trampoline::<T> as ComponentHookFn);
+        }
+        if has_on_discard {
+            desc = desc.with_on_discard(pod_on_discard_trampoline::<T> as ComponentHookFn);
+        }
+        if has_on_despawn {
+            desc = desc.with_on_despawn(pod_on_despawn_trampoline::<T> as ComponentHookFn);
+        }
+    }
+    if hooks.enable_clone {
+        desc = desc.with_clone_fn(pod_clone_trampoline::<T> as ComponentCloneFn);
+    }
+    if !hooks.required_components.is_empty() {
+        let boxed_req: Box<[BamComponent]> = hooks.required_components.into_boxed_slice();
+        let req_len = boxed_req.len();
+        let raw_req = instance.track_allocation(Box::new(boxed_req));
+        // SAFETY: `raw_req` stays pinned inside `instance` until `bevy_abi_mod_shutdown`.
+        let req_ptr = unsafe { (*raw_req).as_ptr() };
+        desc = desc.with_required_components(req_ptr, req_len);
     }
 
     let host = *instance.host();

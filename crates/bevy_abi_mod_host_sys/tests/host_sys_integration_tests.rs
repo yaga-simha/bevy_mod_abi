@@ -273,6 +273,8 @@ fn handle_headers_reject_mismatched_and_poisoned_handles() {
             component: BamComponent::from_raw(1),
             mode: AccessMode::READ,
             flags: 0,
+            or_group: 0,
+            reserved0: 0,
         }],
     };
     let mut sys = GuestSystem::new(
@@ -350,6 +352,8 @@ fn sparse_set_batching_untracked_mutation_tick_skip_resources_and_column_info() 
             component: team_comp,
             mode: AccessMode::WRITE,
             flags: 0,
+            or_group: 0,
+            reserved0: 0,
         };
         let bad_query = BamQueryDesc {
             struct_size: BamQueryDesc::MIN_V0_2_SIZE as u32,
@@ -509,6 +513,8 @@ fn sparse_set_batching_untracked_mutation_tick_skip_resources_and_column_info() 
                 component: vel_comp,
                 mode: AccessMode::CHANGED,
                 flags: 0,
+                or_group: 0,
+                reserved0: 0,
             }],
         }],
         changed_vel_reader_cb,
@@ -533,21 +539,29 @@ fn sparse_set_batching_untracked_mutation_tick_skip_resources_and_column_info() 
                     component: vel_comp,
                     mode: AccessMode::WRITE,
                     flags: 0,
+                    or_group: 0,
+                    reserved0: 0,
                 },
                 BamTermDesc {
                     component: shield_comp,
                     mode: AccessMode::WRITE,
                     flags: 0,
+                    or_group: 0,
+                    reserved0: 0,
                 },
                 BamTermDesc {
                     component: team_comp,
                     mode: AccessMode::READ,
                     flags: 0,
+                    or_group: 0,
+                    reserved0: 0,
                 },
                 BamTermDesc {
                     component: clock_comp,
                     mode: AccessMode::RESOURCE_WRITE,
                     flags: 0,
+                    or_group: 0,
+                    reserved0: 0,
                 },
             ],
         }],
@@ -1097,4 +1111,266 @@ fn failed_load_rollback_reclaims_fresh_slots_and_restores_hot_updated_snapshots(
 
     assert_eq!(RELOADED_DROPS.load(Ordering::SeqCst), 0);
     assert_eq!(available_drop_trampoline_slots(), baseline_free);
+}
+
+#[test]
+fn wave0_extended_host_api_slots_asset_scene_backends_and_wire_bridges() {
+    use bevy_abi_mod_host_sys::{
+        HostAssetBackend, HostSceneBackend, HostStringBridge, HostWireBridge,
+        host_asset_get_load_state, host_asset_load, host_asset_release,
+    };
+    use bevy_abi_mod_sys::{
+        ABI_VERSION, FfiAssetHandle, FfiAssetLoadState, MappedStringVTable, MappedWireVTable,
+        StrView,
+    };
+
+    // 1. All 50 slots of `HOST_API` are populated (`Some`) and pass `validate_for_guest`.
+    assert_eq!(HOST_API.validate_for_guest(ABI_VERSION), FfiResult::OK);
+    assert!(HOST_API.cmd_spawn_persistent.is_some());
+    assert!(HOST_API.cmd_spawn_batch.is_some());
+    assert!(HOST_API.cmd_despawn_all.is_some());
+    assert!(HOST_API.cmd_insert_if_new.is_some());
+    assert!(HOST_API.cmd_trigger_ex.is_some());
+    assert!(HOST_API.cmd_observe.is_some());
+    assert!(HOST_API.iter_read_removed.is_some());
+    assert!(HOST_API.sys_entity_children.is_some());
+    assert!(HOST_API.asset_load.is_some());
+    assert!(HOST_API.asset_get_load_state.is_some());
+    assert!(HOST_API.asset_release.is_some());
+    assert!(HOST_API.cmd_spawn_scene.is_some());
+
+    // 2. Without backends installed, `host_asset_load` returns `UNSUPPORTED`.
+    let mut world = World::new();
+    let mut reg = ModRegistry::new();
+    let dummy_asset_id = world.register_component::<Vel>();
+    let tex_handle = reg
+        .register_asset_type("bevy_image::Image", Some("Image"), dummy_asset_id)
+        .unwrap();
+
+    let ctx_no_backend = bevy_abi_mod_host_sys::HostContext::new(reg.snapshot_arc());
+    let mut out_asset = FfiAssetHandle::NONE;
+    // SAFETY: Valid `ctx_no_backend` and `out_asset`.
+    unsafe {
+        assert_eq!(
+            host_asset_load(
+                ctx_no_backend.as_ffi_ptr(),
+                tex_handle,
+                StrView::from_str("mods://hero.png"),
+                &mut out_asset,
+            ),
+            FfiResult::UNSUPPORTED
+        );
+    }
+
+    // 3. Install mock `HostAssetBackend` & `HostSceneBackend` and verify delegation.
+    struct MockAssetBackend;
+    impl HostAssetBackend for MockAssetBackend {
+        fn load_asset(
+            &self,
+            _snapshot: &bevy_abi_mod_host_sys::RegistrySnapshot,
+            _owner_namespace: Option<&str>,
+            asset_type: BamComponent,
+            path: &str,
+        ) -> Result<FfiAssetHandle, (FfiResult, String)> {
+            assert_eq!(path, "mods://hero.png");
+            Ok(FfiAssetHandle::from_index(asset_type, 7, 1))
+        }
+        fn get_load_state(
+            &self,
+            _snapshot: &bevy_abi_mod_host_sys::RegistrySnapshot,
+            handle: &FfiAssetHandle,
+        ) -> Result<FfiAssetLoadState, (FfiResult, String)> {
+            assert_eq!(handle.index, 7);
+            Ok(FfiAssetLoadState::LOADED)
+        }
+        fn release_asset(
+            &self,
+            _snapshot: &bevy_abi_mod_host_sys::RegistrySnapshot,
+            _owner_namespace: Option<&str>,
+            handle: &FfiAssetHandle,
+        ) -> Result<(), (FfiResult, String)> {
+            assert_eq!(handle.index, 7);
+            Ok(())
+        }
+    }
+
+    struct MockSceneBackend;
+    impl HostSceneBackend for MockSceneBackend {
+        fn spawn_scene(
+            &self,
+            _world: &mut World,
+            _snapshot: &bevy_abi_mod_host_sys::RegistrySnapshot,
+            _root_entity: bevy_ecs::entity::Entity,
+            _parent: Option<bevy_ecs::entity::Entity>,
+            _scene_handle: &FfiAssetHandle,
+        ) -> Result<(), FfiResult> {
+            Ok(())
+        }
+    }
+
+    reg.set_asset_backend(std::sync::Arc::new(MockAssetBackend));
+    reg.set_scene_backend(std::sync::Arc::new(MockSceneBackend));
+    assert!(reg.asset_backend().is_some());
+    assert!(reg.scene_backend().is_some());
+
+    let ctx_with_backend = bevy_abi_mod_host_sys::HostContext::new(reg.snapshot_arc());
+    let mut loaded_state = FfiAssetLoadState::NOT_LOADED;
+    // SAFETY: Valid `ctx_with_backend`, `out_asset`, and `loaded_state`.
+    unsafe {
+        assert_eq!(
+            host_asset_load(
+                ctx_with_backend.as_ffi_ptr(),
+                tex_handle,
+                StrView::from_str("mods://hero.png"),
+                &mut out_asset,
+            ),
+            FfiResult::OK
+        );
+        assert_eq!(out_asset.index, 7);
+        assert_eq!(
+            host_asset_get_load_state(ctx_with_backend.as_ffi_ptr(), &out_asset, &mut loaded_state),
+            FfiResult::OK
+        );
+        assert_eq!(loaded_state, FfiAssetLoadState::LOADED);
+        assert_eq!(
+            host_asset_release(ctx_with_backend.as_ffi_ptr(), &out_asset),
+            FfiResult::OK
+        );
+    }
+
+    // 4. Verify `HostWireBridge` and `HostStringBridge` registration and VTable round-trip.
+    #[derive(bevy_ecs::prelude::Component)]
+    struct OpaqueScale(f32);
+    struct ScaleBridge;
+    impl HostWireBridge<OpaqueScale> for ScaleBridge {
+        type Wire = f32;
+        const CANONICAL_NAME: &'static str = "test_host::OpaqueScale";
+        const ALIAS: Option<&'static str> = Some("OpaqueScale");
+        fn to_wire(value: &OpaqueScale) -> f32 {
+            value.0
+        }
+        fn apply_wire(value: &mut OpaqueScale, wire: f32) -> FfiResult {
+            value.0 = wire;
+            FfiResult::OK
+        }
+    }
+
+    #[derive(bevy_ecs::prelude::Component)]
+    struct OpaqueLabel(String);
+    struct LabelBridge;
+    impl HostStringBridge<OpaqueLabel> for LabelBridge {
+        const CANONICAL_NAME: &'static str = "test_host::OpaqueLabel";
+        const ALIAS: Option<&'static str> = Some("OpaqueLabel");
+        fn as_str(value: &OpaqueLabel) -> &str {
+            &value.0
+        }
+        fn set_str(value: &mut OpaqueLabel, text: &str) -> FfiResult {
+            value.0.clear();
+            value.0.push_str(text);
+            FfiResult::OK
+        }
+    }
+
+    let scale_id = world.register_component::<OpaqueScale>();
+    let label_id = world.register_component::<OpaqueLabel>();
+    reg.register_bridged_component::<OpaqueScale, ScaleBridge>(scale_id, 0, None)
+        .unwrap();
+    reg.register_bridged_string_component::<OpaqueLabel, LabelBridge>(label_id, 0, None)
+        .unwrap();
+
+    let bridge_ctx = bevy_abi_mod_host_sys::HostContext::new(reg.snapshot_arc());
+    // SAFETY: Valid `bridge_ctx` and NUL-terminated symbol names.
+    let (scale_vt_addr, label_vt_addr) = unsafe {
+        (
+            host_get_proc_address(
+                bridge_ctx.as_ffi_ptr(),
+                c"bam.v0.OpaqueScale.vtable".as_ptr(),
+            ),
+            host_get_proc_address(
+                bridge_ctx.as_ffi_ptr(),
+                c"bam.v0.OpaqueLabel.vtable".as_ptr(),
+            ),
+        )
+    };
+    assert!(!scale_vt_addr.is_null());
+    assert!(!label_vt_addr.is_null());
+
+    let mut s_val = OpaqueScale(2.5);
+    let mut s_out = 0.0f32;
+    let mut l_val = OpaqueLabel("hello".to_owned());
+    // SAFETY: VTable pointers come directly from `ModRegistry` static bridge factories.
+    unsafe {
+        let s_vt = &*scale_vt_addr.cast::<MappedWireVTable<f32>>();
+        assert_eq!(
+            (s_vt.get.unwrap())((&raw const s_val).cast::<c_void>(), &mut s_out),
+            FfiResult::OK
+        );
+        assert_eq!(s_out, 2.5);
+        assert_eq!(
+            (s_vt.set.unwrap())((&raw mut s_val).cast::<c_void>(), &8.0f32),
+            FfiResult::OK
+        );
+        assert_eq!(s_val.0, 8.0);
+
+        let l_vt = &*label_vt_addr.cast::<MappedStringVTable>();
+        let view = (l_vt.get.unwrap())((&raw const l_val).cast::<c_void>());
+        assert_eq!(view.try_as_str().unwrap(), "hello");
+        // Verify self-aliasing `set_str(get_str)` safety!
+        assert_eq!(
+            (l_vt.set.unwrap())((&raw mut l_val).cast::<c_void>(), view),
+            FfiResult::OK
+        );
+        assert_eq!(l_val.0, "hello");
+    }
+
+    // 5. Verify zero-copy `register_children_hierarchy` slice extraction and synthesized `FfiEntity`
+    //    on `register_bridged_entity_event` for a `#[repr(Rust)]` entity event.
+    let children_id = world.register_component::<bevy_ecs::hierarchy::Children>();
+    let children_handle = reg.register_children_hierarchy(children_id).unwrap();
+    let parent_ent = world.spawn_empty().id();
+    let child_a = world.spawn(bevy_ecs::hierarchy::ChildOf(parent_ent)).id();
+    let child_b = world.spawn(bevy_ecs::hierarchy::ChildOf(parent_ent)).id();
+    let extract_fn = reg
+        .get_by_handle(children_handle)
+        .unwrap()
+        .extract_relationship_targets_fn
+        .unwrap();
+    let children_ref = world
+        .get::<bevy_ecs::hierarchy::Children>(parent_ent)
+        .unwrap();
+    // SAFETY: `children_ref` is an initialized `Children` component valid for this borrow.
+    let (raw_children_ptr, raw_children_len) =
+        unsafe { extract_fn(core::ptr::from_ref(children_ref).cast::<u8>()) };
+    assert_eq!(raw_children_len, 2);
+    // SAFETY: `raw_children_ptr` points to `Children`'s contiguous `[Entity; 2]` slice.
+    let zero_copy_slice =
+        unsafe { core::slice::from_raw_parts(raw_children_ptr, raw_children_len) };
+    assert_eq!(
+        zero_copy_slice,
+        &[
+            bevy_abi_mod_sys::FfiEntity::from_bits(child_a.to_bits()),
+            bevy_abi_mod_sys::FfiEntity::from_bits(child_b.to_bits()),
+        ]
+    );
+
+    #[derive(Clone, Copy, bevy_ecs::event::EntityEvent)]
+    struct MockRustReady {
+        #[event_target]
+        entity: bevy_ecs::entity::Entity,
+    }
+    impl From<bevy_ecs::entity::Entity> for MockRustReady {
+        fn from(entity: bevy_ecs::entity::Entity) -> Self {
+            Self { entity }
+        }
+    }
+    let ready_handle = reg
+        .register_bridged_entity_event::<MockRustReady>(
+            &mut world,
+            "test_host::Ready",
+            Some("Ready"),
+        )
+        .unwrap();
+    let ready_meta = reg.get_by_handle(ready_handle).unwrap();
+    assert!(ready_meta.synthesizes_ffi_entity_payload);
+    assert!(ready_meta.is_immutable());
 }

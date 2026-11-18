@@ -943,12 +943,153 @@ static void test_hierarchy_ticks_layout_and_observer_descriptors(void) {
     assert(api.cmd_trigger == NULL);
 }
 
+BAM_OPTION_STRUCT(uint32_t, BamOptionU32);
+BAM_OPTION_STRUCT(BamEntity, BamOptionEntity);
+BAM_MAPPED_WIRE_VTABLE_STRUCT(MockPosition, MockPositionMappedVTable);
+
+static BamResult mock_clone_cb(const void* src, void* dst, void* user_data) {
+    (void)user_data;
+    if (src == NULL || dst == NULL) {
+        return BAM_RESULT_NULL_POINTER;
+    }
+    memcpy(dst, src, sizeof(float));
+    return BAM_RESULT_OK;
+}
+
+static BamResult mock_mut_observer_cb(
+    BamEntity entity,
+    uint8_t* event_data,
+    BamBool* propagate,
+    BamCommands* commands,
+    void* user_data
+) {
+    (void)entity;
+    (void)event_data;
+    (void)commands;
+    (void)user_data;
+    if (propagate != NULL) {
+        *propagate = BAM_FALSE;
+    }
+    return BAM_RESULT_OK;
+}
+
+static void test_wave0_wire_extensions(void) {
+    BamOptionU32 opt_u32;
+    BamOptionEntity opt_ent;
+    BamAssetHandle h_none;
+    BamAssetHandle h_idx;
+    BamAssetHandle h_uuid;
+    BamComponentUuid sample_uuid;
+    BamTermDesc t_plain;
+    BamTermDesc t_or;
+    BamComponentDesc comp_desc;
+    BamComponent req_comps[2] = { 1u, 2u };
+    BamObserverDesc obs_desc;
+    BamTriggerDesc trig_desc;
+    BamSystemDesc sys_desc;
+    const char* weak_sets[1] = { "host::PhysicsSet" };
+    BamHostApi api;
+    uint32_t trig_payload = 99u;
+
+    /* 1. BAM_OPTION_STRUCT layout */
+    BAM_STATIC_ASSERT(sizeof(BamOptionU32) == 8u, opt_u32_size);
+    BAM_STATIC_ASSERT(offsetof(BamOptionU32, is_some) == 0u, opt_u32_is_some);
+    BAM_STATIC_ASSERT(offsetof(BamOptionU32, value) == 4u, opt_u32_value);
+    opt_u32.is_some = BAM_TRUE;
+    opt_u32.value = 42u;
+    assert(opt_u32.is_some == BAM_TRUE && opt_u32.value == 42u);
+
+    opt_ent.is_some = BAM_FALSE;
+    opt_ent.value = BAM_ENTITY_NULL;
+    assert(opt_ent.is_some == BAM_FALSE);
+
+    /* 2. BamAssetHandle & BamAssetLoadState */
+    h_none = bam_asset_handle_none();
+    assert(bam_asset_handle_is_none(&h_none));
+    assert(!bam_asset_handle_is_some(&h_none));
+
+    h_idx = bam_asset_handle_from_index(7u, 12u, 3u);
+    assert(bam_asset_handle_is_some(&h_idx));
+    assert(h_idx.asset_type == 7u && h_idx.index == 12u && h_idx.generation == 3u);
+
+    sample_uuid = bam_uuid_from_canonical_name("bevy_scene::ScenePatch");
+    h_uuid = bam_asset_handle_from_uuid(9u, sample_uuid);
+    assert(bam_asset_handle_is_some(&h_uuid));
+    assert(bam_uuid_equals(h_uuid.uuid, sample_uuid));
+
+    assert(BAM_ASSET_LOAD_STATE_NOT_LOADED == 0u);
+    assert(BAM_ASSET_LOAD_STATE_LOADING == 1u);
+    assert(BAM_ASSET_LOAD_STATE_LOADED == 2u);
+    assert(BAM_ASSET_LOAD_STATE_FAILED == 3u);
+
+    /* 3. Extended AccessMode & BamTermDesc or_group */
+    assert(BAM_ACCESS_ALLOW == 12u);
+    assert(BAM_ACCESS_HAS == 13u);
+    assert(BAM_ACCESS_REMOVED_READ == 14u);
+    t_plain = bam_term_desc(3u, BAM_ACCESS_HAS, 0u);
+    assert(t_plain.or_group == 0u && t_plain.reserved0 == 0u);
+    t_or = bam_term_desc_or(4u, BAM_ACCESS_FILTER_ONLY, 0u, 2u);
+    assert(t_or.or_group == 2u && t_or.reserved0 == 0u);
+
+    /* 4. Extended BamComponentDesc */
+    comp_desc = bam_desc_component_with_layout("c_mod::ExtendedComp", sizeof(float), BAM_ALIGNOF(float), NULL);
+    comp_desc.flags = BAM_COMPONENT_FLAG_SUMMARY_TICK;
+    comp_desc.clone_fn = mock_clone_cb;
+    comp_desc.required_components = req_comps;
+    comp_desc.required_component_count = 2u;
+    assert((comp_desc.flags & BAM_COMPONENT_KNOWN_FLAGS) == BAM_COMPONENT_FLAG_SUMMARY_TICK);
+    assert(comp_desc.on_insert == NULL && comp_desc.on_discard == NULL && comp_desc.on_despawn == NULL);
+    assert(comp_desc.required_component_count == 2u);
+
+    /* 5. Extended BamObserverDesc & BamTriggerDesc */
+    assert(BAM_EVENT_KIND_CUSTOM == 0u);
+    assert(BAM_EVENT_KIND_READY == 6u);
+    obs_desc = bam_observer_desc(BAM_COMPONENT_INVALID, BAM_ENTITY_NULL, mock_observer_cb, NULL);
+    obs_desc.flags = BAM_OBSERVER_FLAG_PROPAGATE;
+    obs_desc.event_kind = BAM_EVENT_KIND_INSERT;
+    obs_desc.watched_components = req_comps;
+    obs_desc.watched_component_count = 2u;
+    obs_desc.mut_callback = mock_mut_observer_cb;
+    obs_desc.propagate_relationship = 5u;
+    assert(obs_desc.reserved1 == 0u && obs_desc.reserved2 == 0u);
+
+    trig_desc = bam_trigger_desc(11u, 99ull, (uint8_t*)&trig_payload, sizeof(trig_payload));
+    trig_desc.flags = BAM_TRIGGER_FLAG_PROPAGATE;
+    assert(trig_desc.struct_size == (uint32_t)sizeof(BamTriggerDesc));
+    assert(trig_desc.entity_lo == 99u && trig_desc.reserved0 == 0u);
+
+    /* 6. Extended BamSystemDesc & 50-slot BamHostApi */
+    assert(strcmp(BAM_CHILDREN_NAME, "bevy_ecs::hierarchy::Children") == 0);
+    memset(&sys_desc, 0, sizeof(sys_desc));
+    sys_desc.struct_size = (uint32_t)sizeof(BamSystemDesc);
+    sys_desc.flags = BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL;
+    sys_desc.after_weak = weak_sets;
+    sys_desc.after_weak_count = 1u;
+    assert((sys_desc.flags & BAM_SYSTEM_KNOWN_FLAGS) == BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL);
+
+    api = build_mock_host_api();
+    assert(api.struct_size >= (uint32_t)(offsetof(BamHostApi, cmd_spawn_scene) + sizeof(BamCmdSpawnSceneFn)));
+    assert(api.cmd_spawn_persistent == NULL);
+    assert(api.cmd_spawn_batch == NULL);
+    assert(api.cmd_despawn_all == NULL);
+    assert(api.cmd_insert_if_new == NULL);
+    assert(api.cmd_trigger_ex == NULL);
+    assert(api.cmd_observe == NULL);
+    assert(api.iter_read_removed == NULL);
+    assert(api.sys_entity_children == NULL);
+    assert(api.asset_load == NULL);
+    assert(api.asset_get_load_state == NULL);
+    assert(api.asset_release == NULL);
+    assert(api.cmd_spawn_scene == NULL);
+}
+
 int main(void) {
     test_versions_and_result_names();
     test_cross_language_siphash_uuids();
     test_extensible_host_api_copy_bounded();
     test_end_to_end_c99_lifecycle_and_vtable();
     test_hierarchy_ticks_layout_and_observer_descriptors();
+    test_wave0_wire_extensions();
 
     printf("All ABI v0.2.0 ISO C99 conformance & layout checks passed.\n");
     return 0;

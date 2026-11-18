@@ -170,12 +170,30 @@ pub(crate) fn validate_system_queries_against_snapshot(
                     system_res_writes.insert(comp_id);
                     system_res_order.push((comp_id, Arc::clone(&reg.name)));
                 }
+                AccessMode::ALLOW | AccessMode::HAS | AccessMode::REMOVED_READ => {
+                    return Err((
+                        FfiResult::UNSUPPORTED,
+                        format!(
+                            "AccessMode({}) is not yet active in this build",
+                            term.mode.0
+                        ),
+                    ));
+                }
                 _ => {
                     return Err((
                         FfiResult::INVALID_ARGUMENT,
                         format!("invalid AccessMode({})", term.mode.0),
                     ));
                 }
+            }
+            if term.or_group != 0 {
+                return Err((
+                    FfiResult::UNSUPPORTED,
+                    format!(
+                        "query {q_idx} term {t_idx} uses or_group={} (not yet active in this build)",
+                        term.or_group
+                    ),
+                ));
             }
 
             resolved.push((comp_id, term.mode));

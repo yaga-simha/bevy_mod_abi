@@ -177,9 +177,13 @@ Every opaque handle has a strict lexical or session scope and **must never be ca
 | Rust Type (`bevy_abi_mod_sys`) | C99 Type (`bevy_abi_mod.h`) | 64-bit Size / Align | 32-bit Size / Align | Implicit Padding |
 |---|---|---|---|---|
 | `FfiBool(pub u8)` | `BamBool` | 1 B / 1 B | 1 B / 1 B | 0 B |
+| `FfiOption<T>` | `BAM_OPTION_STRUCT(T, Name)` | `align_to(1 + sizeof(T), alignof(T))` / `alignof(T)` | same | explicit `is_some: FfiBool` + `T` |
 | `BamComponent(pub u32)` | `BamComponent` | 4 B / 4 B | 4 B / 4 B | 0 B |
 | `FfiEntity(pub u64)` | `BamEntity` | 8 B / 8 B | 8 B / 4–8 B | 0 B |
 | `FfiChildOf` | `BamChildOf` | 8 B / 8 B | 8 B / 4–8 B | 0 B |
+| `FfiAssetHandle` | `BamAssetHandle` | 32 B / 4 B | 32 B / 4 B | 0 B (`reserved0: [u8; 3]`) |
+| `FfiAssetLoadState(pub u32)` | `BamAssetLoadState` | 4 B / 4 B | 4 B / 4 B | 0 B |
+| `BamEventKind(pub u32)` | `BamEventKind` | 4 B / 4 B | 4 B / 4 B | 0 B |
 | `BamChangeTicks` | `BamChangeTicks` | 16 B / 4 B | 16 B / 4 B | 0 B |
 | `FfiResult(pub u32)` | `BamResult` | 4 B / 4 B | 4 B / 4 B | 0 B |
 | `AccessMode(pub u32)` | `BamAccessMode` | 4 B / 4 B | 4 B / 4 B | 0 B |
@@ -187,23 +191,28 @@ Every opaque handle has a strict lexical or session scope and **must never be ca
 | `ComponentUuid` | `BamComponentUuid` | 16 B / 1 B | 16 B / 1 B | 0 B |
 | `FfiSlice<T>` / `StrView` | `BamStrView` / `BamByteSlice` | 16 B / 8 B | 8 B / 4 B | 0 B |
 | `BamManifest` | `BamManifest` | 48 B (`MIN_V0_2_SIZE = 32` B) / 8 B | 32 B (`MIN_V0_2_SIZE = 24` B) / 4 B | 0 B (`reserved0`) |
-| `BamTermDesc` | `BamTermDesc` | 12 B / 4 B | 12 B / 4 B | 0 B |
+| `BamTermDesc` | `BamTermDesc` | 12 B / 4 B | 12 B / 4 B | 0 B (`flags: u16, or_group: u8, reserved0: u8`) |
 | `BamQueryDesc` | `BamQueryDesc` | 24 B / 8 B | 16 B / 4 B | 0 B |
-| `BamSystemDesc` | `BamSystemDesc` | 120 B (`MIN_V0_2_SIZE = 104` B) / 8 B | 68 B (`MIN_V0_2_SIZE = 60` B) / 4 B | 0 B (`reserved0`) |
-| `BamObserverDesc` | `BamObserverDesc` | 48 B (`MIN_V0_2_SIZE = 48` B) / 8 B | 36 B (`MIN_V0_2_SIZE = 36` B) / 4 B | 0 B (`reserved0`) |
-| `ComponentDesc` | `BamComponentDesc` | 88 B (`MIN_V0_2_SIZE = 64` B) / 8 B | 56 B (`MIN_V0_2_SIZE = 44` B) / 4 B | 0 B |
+| `BamSystemDesc` | `BamSystemDesc` | 168 B (`MIN_V0_2_SIZE = 104` B) / 8 B | 92 B (`MIN_V0_2_SIZE = 60` B) / 4 B | 0 B (`reserved0`) |
+| `BamObserverDesc` | `BamObserverDesc` | 88 B (`MIN_V0_2_SIZE = 48` B) / 8 B | 64 B (`MIN_V0_2_SIZE = 36` B) / 4 B | 0 B (`reserved0..2`) |
+| `BamTriggerDesc` | `BamTriggerDesc` | 64 B (`MIN_V0_2_SIZE = 64` B) / 8 B | 48 B (`MIN_V0_2_SIZE = 48` B) / 4 B | 0 B (`reserved0`) |
+| `ComponentDesc` | `BamComponentDesc` | 136 B (`MIN_V0_2_SIZE = 64` B) / 8 B | 80 B (`MIN_V0_2_SIZE = 44` B) / 4 B | 0 B |
 | `BamColumnInfo` | `BamColumnInfo` | 48 B / 8 B | 40 B / 4 B | 0 B (`reserved0`) |
 | `VTableHeader` | `BamVTableHeader` | 40 B / 8 B | 32 B / 4 B | 0 B |
-| `BamHostApi` | `BamHostApi` | 312 B (`MIN_V0_2_SIZE = 224` B) / 8 B | 160 B (`MIN_V0_2_SIZE = 116` B) / 4 B | 0 B |
+| `MappedStringVTable` | `BamMappedStringVTable` | 56 B / 8 B | 40 B / 4 B | 0 B |
+| `BamHostApi` | `BamHostApi` | 408 B (`MIN_V0_2_SIZE = 224` B) / 8 B | 208 B (`MIN_V0_2_SIZE = 116` B) / 4 B | 0 B |
 
 ### 4.2 Primitives, Handles, Status Codes & Modes
 
 - **`BamComponent(pub u32)`:** 1-based per-`World` registry handle covering both entity components and singleton resources. `BamComponent::INVALID = Self(0)` (`BAM_COMPONENT_INVALID = 0u`) is the uninitialized/invalid sentinel.
 - **`FfiEntity(pub u64)`:** Matches `bevy_ecs::entity::Entity::to_bits()`, verified via compile-time size/alignment assertions and bit-pattern parity tests. `FfiEntity::NULL = Self(0)` (`BAM_ENTITY_NULL = 0ull`) is the canonical invalid entity sentinel (`Entity::try_from_bits(0) == None` in Bevy 0.20+; `Entity::PLACEHOLDER` is rejected on command paths with `FfiResult::INVALID_ENTITY`).
+- **`FfiOption<T>` (`BAM_OPTION_STRUCT`):** `#[repr(C)] pub struct FfiOption<T> { pub is_some: FfiBool, pub value: T }` implementing `RawInsertable` and `AbiPod` whenever `T` does (`none()` zero-initializes `MaybeUninit<T>` for `T: AbiPod`).
+- **`FfiAssetHandle` (`BamAssetHandle`, `32` B / `align = 4`) & `FfiAssetLoadState(pub u32)` (`BamAssetLoadState`):** Represents an `Option<AssetId>` across FFI with zero implicit padding (`kind: u8` in `{ KIND_NONE = 0, KIND_INDEX = 1, KIND_UUID = 2 }`, `reserved0: [u8; 3]`, `asset_type: BamComponent`, `index: u32`, `generation: u32`, `uuid: ComponentUuid`) and load states `NOT_LOADED (0)`, `LOADING (1)`, `LOADED (2)`, `FAILED (3)`. Disengaged handles use `KIND_NONE = 0` (`Default`) rather than any `AssetId::invalid()` sentinel.
+- **`BamEventKind(pub u32)` (`BamEventKind`):** Discriminates observer and trigger event kinds: `CUSTOM (0)`, `ADD (1)`, `INSERT (2)`, `DISCARD (3)`, `REMOVE (4)`, `DESPAWN (5)`, `READY (6)`.
 - **`FfiResult(pub u32)` (`BamResult`):**
   - `OK (0)`, `INVALID_COMPONENT (1)`, `ACCESS_CONFLICT (2)`, `PANIC_CAUGHT (3)`, `NULL_POINTER (4)`, `INVALID_UTF8 (5)`, `PERMISSION_DENIED (6)`, `INVALID_VERSION (7)`, `INVALID_ARGUMENT (8)`, `OUT_OF_RANGE (9)`, `NOT_FOUND (10)`, `INVALID_STATE (11)`, `INVALID_ENTITY (12)`, `CAPACITY_EXCEEDED (13)`, `UNSUPPORTED (14)`, `TYPE_MISMATCH (15)`, `INTERNAL_ERROR (99)`.
 - **`AccessMode(pub u32)` (`BamAccessMode`):**
-  - `READ (0)` (`&T`), `WRITE (1)` (`&mut T`), `FILTER_ONLY (2)` (`With<T>`), `WITHOUT (3)` (`Without<T>`), `OPTIONAL_READ (4)` (`Option<&T>`), `OPTIONAL_WRITE (5)` (`Option<&mut T>`), `CHANGED (6)` (`Changed<T> + &T`), `ADDED (7)` (`Added<T> + &T`), `RESOURCE_READ (8)` (`Res<R>`), `RESOURCE_WRITE (9)` (`ResMut<R>`), `MESSAGE_READ (10)` (`MessageReader<M>`), `MESSAGE_WRITE (11)` (`MessageWriter<M>`).
+  - `READ (0)` (`&T`), `WRITE (1)` (`&mut T`), `FILTER_ONLY (2)` (`With<T>`), `WITHOUT (3)` (`Without<T>`), `OPTIONAL_READ (4)` (`Option<&T>`), `OPTIONAL_WRITE (5)` (`Option<&mut T>`), `CHANGED (6)` (`Changed<T> + &T`), `ADDED (7)` (`Added<T> + &T`), `RESOURCE_READ (8)` (`Res<R>`), `RESOURCE_WRITE (9)` (`ResMut<R>`), `MESSAGE_READ (10)` (`MessageReader<M>`), `MESSAGE_WRITE (11)` (`MessageWriter<M>`), `ALLOW (12)` (`Allow<T>`), `HAS (13)` (`Has<T>` — archetypal metadata access synthesizing a 1-byte `FfiBool` presence indicator via `iter_column_readonly`), `REMOVED_READ (14)` (`RemovedComponents<T>` consumed via `iter_read_removed`).
 - **`ScheduleId(pub u32)` (`BamScheduleId`):**
   - Built-in schedules: `UPDATE (0)`, `STARTUP (1)`, `PRE_UPDATE (2)`, `POST_UPDATE (3)`, `FIXED_UPDATE (4)`, `LAST (5)`.
   - `6..1024`: Reserved for future built-in Bevy schedules (rejected by `ScheduleId::is_valid()`).
@@ -227,8 +236,8 @@ Every guest shared library must export three `extern "C"` entry points:
 2. `bevy_abi_mod_init(api: *const BamHostApi, load_ctx: *mut BamLoadCtx, instance_out: *mut *mut BamInstance) -> FfiResult`: Initializes the mod for a single Bevy `World` and writes an optional guest-heap `*mut BamInstance` into `*instance_out`. On non-`OK` return, the guest frees partial guest allocations before returning and the host's `LoadTransaction` rolls back all staged registrations without calling `shutdown`.
 3. `bevy_abi_mod_shutdown(instance: *mut BamInstance)`: Invoked once per successful `bevy_abi_mod_init` when that load session unloads from its `World` (or when that `World` drops), strictly after systems, component hooks, and drop trampolines are disarmed and strictly before `dlclose`.
 
-### 4.5 Complete 38-Slot `BamHostApi`
-All core engine operations reside directly in `BamHostApi` (`312` B on 64-bit / `160` B on 32-bit, with `MIN_V0_2_SIZE = 224` B / `116` B covering the 27 core ABI `0.2` slots and 11 optional extended slots appended at offsets `224..312` on 64-bit):
+### 4.5 Complete 50-Slot `BamHostApi`
+All core engine operations reside directly in `BamHostApi` (`408` B on 64-bit / `208` B on 32-bit, with `MIN_V0_2_SIZE = 224` B / `116` B covering the 27 core ABI `0.2` slots and 23 optional extended slots appended at offsets `224..408` on 64-bit / `116..208` on 32-bit):
 
 | Group | Slot (`BamHostApi`) | Signature Summary & Purpose |
 |---|---|---|
@@ -270,16 +279,28 @@ All core engine operations reside directly in `BamHostApi` (`312` B on 64-bit / 
 | | `sys_res_mut_ptr` | `(sys_ctx: *mut BamSystemCtx, component: BamComponent, out_ticks: *mut BamChangeTicks) -> *mut u8` — looks up an exclusive mutable resource by pre-resolved handle (`ResourceWrite`), captures prior ticks, and stamps `changed = this_run`. |
 | | `register_observer` | `(load_ctx: *mut BamLoadCtx, desc: *const BamObserverDesc) -> FfiResult` — spawns a dynamic `Observer::with_dynamic_runner` watching global `Event`s or target-scoped `EntityEvent`s, flushed immediately into `World` and disarmed/despawned on unload. |
 | | `cmd_trigger` | `(cmds: *mut BamCommands, event: BamComponent, target: FfiEntity, data_ptr: *const u8, data_len: usize) -> FfiResult` — queues deferred `world.trigger(...)` or `world.trigger_dynamic*` for pre-resolved host or dynamic events. |
+| **9. Extended Entity, Hierarchy, Lifecycle, Asset & Scene Slots (`covers_slot`)** | `cmd_spawn_persistent` | `(cmds: *mut BamCommands, comps: *const BamComponent, data_ptrs: *const *const u8, count: usize, out_entity: *mut FfiEntity) -> FfiResult` — spawns an entity exempt from automatic mod-unload despawn. |
+| | `cmd_spawn_batch` | `(cmds: *mut BamCommands, comps: *const BamComponent, column_ptrs: *const *const u8, comp_count: usize, entity_count: usize, out_entities: *mut FfiEntity) -> FfiResult` — columnar multi-entity batch spawn. |
+| | `cmd_despawn_all` | `(cmds: *mut BamCommands, terms: *const BamTermDesc, term_count: usize) -> FfiResult` — bulk deferred despawn of entities matching filter-only terms. |
+| | `cmd_insert_if_new` | `(cmds: *mut BamCommands, entity: FfiEntity, comp: BamComponent, data: *const u8, len: usize) -> FfiResult` — conditional deferred insertion skipped if `comp` is already present. |
+| | `cmd_trigger_ex` | `(cmds: *mut BamCommands, desc: *const BamTriggerDesc) -> FfiResult` — extended custom/lifecycle/propagating trigger dispatch. |
+| | `cmd_observe` | `(cmds: *mut BamCommands, desc: *const BamObserverDesc, out_entity: *mut FfiEntity) -> FfiResult` — runtime observer entity spawn disarmed on mod unload. |
+| | `iter_read_removed` | `(iter: *mut BamIter, term_index: usize, out_entities: *mut FfiEntity, max_count: usize, out_read: *mut usize) -> FfiResult` — drains `RemovedComponents<T>` entity IDs for `REMOVED_READ` terms. |
+| | `sys_entity_children` | `(sys_ctx: *const BamSystemCtx, entity: FfiEntity, relationship_target: BamComponent, out_entities: *mut *const FfiEntity, out_len: *mut usize) -> FfiResult` — zero-copy borrow of contiguous `Children` / `RelationshipTarget` entities (`INVALID` defaults to `Children`) under declared read access. |
+| | `asset_load` | `(ctx: *const BamHostCtx, asset_type: BamComponent, path: StrView, out_handle: *mut FfiAssetHandle) -> FfiResult` — initiates an asynchronous untyped asset load pinned to the mod instance. |
+| | `asset_get_load_state` | `(ctx: *const BamHostCtx, handle: *const FfiAssetHandle, out_state: *mut FfiAssetLoadState) -> FfiResult` — queries `FfiAssetLoadState` for `handle`. |
+| | `asset_release` | `(ctx: *const BamHostCtx, handle: *const FfiAssetHandle) -> FfiResult` — releases a mod-pinned strong asset handle. |
+| | `cmd_spawn_scene` | `(cmds: *mut BamCommands, scene_handle: *const FfiAssetHandle, parent: FfiEntity, out_entity: *mut FfiEntity) -> FfiResult` — spawns a BSN / dynamic scene instance and returns its reserved root `FfiEntity`. |
 
-### 4.6 Unified Descriptors (`BamSystemDesc`, `BamObserverDesc`, `BamQueryDesc`, `BamTermDesc`, `ComponentDesc`, `BamColumnInfo`, `VTableHeader`)
-1. **`BamTermDesc` (`12` B):** `{ component: BamComponent, mode: AccessMode, flags: u32 }`.
+### 4.6 Unified Descriptors (`BamSystemDesc`, `BamObserverDesc`, `BamTriggerDesc`, `BamQueryDesc`, `BamTermDesc`, `ComponentDesc`, `BamColumnInfo`, `VTableHeader`)
+1. **`BamTermDesc` (`12` B):** `{ component: BamComponent, mode: AccessMode, flags: u16, or_group: u8, reserved0: u8 }` (`or_group == 0` = conjunctive `AND`; terms sharing `or_group >= 1` form a disjunctive `Or<(...)>` filter clause).
 2. **`BamQueryDesc` (`24` B / `16` B):** `{ struct_size: u32, flags: u32, terms: *const BamTermDesc, term_count: usize }` (`term_count <= 32`). Resource/message-only queries (all terms `RESOURCE_*` or `MESSAGE_*`) register `FilteredAccessSet` resource locks and immediately serve `res_ptr` / `res_mut_ptr` / `res_ticks` / `sys_res_ptr` / `sys_res_mut_ptr` / `msg_read_batch` / `msg_send` / `msg_write_batch` without chunk iteration (`iter_next_chunk` returns `FfiBool::FALSE`).
-3. **`BamSystemDesc` (`120` B / `68` B, `MIN_V0_2_SIZE = 104` B / `60` B):** Unifies single-query, multi-query (`0..=8` queries), scheduled (`schedule: ScheduleId`), ordered (`after`/`before` C-string arrays + `in_sets`/`in_set_count` membership supporting same-mod `"sys"`, cross-mod `"other_mod::sys"`, and host sets `"host::<name>"` via `ModVisibleSets`), main-thread (`BAM_SYSTEM_FLAG_MAIN_THREAD`), and conditional (`run_if: Option<BamRunIfFn>`, `run_if_user_data`) systems into a single descriptor passed to `register_system`. `run_if` executes before advancing `last_run` so `Changed<T>` / `Added<T>` ticks accumulated across skipped frames are preserved.
-4. **`BamObserverDesc` (`48` B / `36` B):** `{ struct_size, flags, name, event, entity_lo, entity_hi, reserved0, callback, user_data }` (constructed via `BamObserverDesc::new` / C99 `bam_observer_desc`). Registers dynamic `Event` and `EntityEvent` callbacks executing safely via `Observer::with_dynamic_runner` and disarmed before `unload_mod`.
-5. **`ComponentDesc` (`88` B / `56` B, `MIN_V0_2_SIZE = 64` B / `44` B):** `{ struct_size, flags, name, uuid, size, align, drop_fn: Option<ComponentDropFn>, vtable_ptr, on_add: Option<ComponentHookFn>, on_remove: Option<ComponentHookFn>, hook_user_data }` (with C99 helper `bam_desc_component_with_layout`). Supports `BAM_COMPONENT_FLAG_SPARSE_SET` (`1 << 0`, `StorageType::SparseSet`), `BAM_COMPONENT_FLAG_IMMUTABLE` (`1 << 1`, rejects mutable access modes with `PERMISSION_DENIED`), zero-sized marker components (`size == 0`, power-of-two `align >= 1`), and optional `on_add` / `on_remove` hooks disarmed via `ArcSwapOption` (`HOOK_SLOTS`) before `shutdown` / `dlclose`. When `drop_fn.is_some()`, the host sets `ComponentCloneBehavior::Ignore` so Bevy's `EntityCloner` never bitwise-duplicates foreign-owned allocations.
-6. **`BamColumnInfo` (`48` B / `40` B):** `{ component, mode, uuid, size, align, storage_flags, reserved0 }` with `BAM_STORAGE_FLAG_SPARSE_SET (1 << 0)`, `BAM_STORAGE_FLAG_IMMUTABLE (1 << 1)`, `BAM_STORAGE_FLAG_RESOURCE (1 << 2)`, `BAM_STORAGE_FLAG_MESSAGE (1 << 3)`, `BAM_STORAGE_FLAG_EVENT (1 << 4)`, and `BAM_STORAGE_FLAG_ENTITY_EVENT (1 << 5)`. Returned via out-pointer to avoid cross-platform 48-byte struct-return ABI subtle differences.
-7. **`VTableHeader` (`40` B / `32` B):** `{ struct_size, abi_version, uuid, size, align }` placed at byte offset `0` of every `<Struct>VTable` emitted by `#[derive(ModComponent)]`.
-8. **Built-in Hierarchy (`FfiChildOf` / `BamChildOf`):** `bevy_ecs::hierarchy::ChildOf` (`BAM_CHILD_OF_NAME = "bevy_ecs::hierarchy::ChildOf"`, plus `"ChildOf"` alias) is pre-registered in `ModRegistry` (`ensure_world_mod_resources`) so mods can attach children and trigger Bevy's `Children` relationship hooks through `EntityWorldMut` paths, with parent-entity validation on `cmd_spawn` and `cmd_insert`.
+3. **`BamSystemDesc` (`168` B / `92` B, `MIN_V0_2_SIZE = 104` B / `60` B):** Unifies single-query, multi-query (`0..=8` queries), scheduled (`schedule: ScheduleId`), ordered (`after`/`before`, `in_sets`, weak ordering `after_weak`/`before_weak`, and `ambiguous_with` C-string arrays + `BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL`), main-thread (`BAM_SYSTEM_FLAG_MAIN_THREAD`), and conditional (`run_if: Option<BamRunIfFn>`, `run_if_user_data`) systems into a single descriptor passed to `register_system`. `run_if` executes before advancing `last_run` so `Changed<T>` / `Added<T>` ticks accumulated across skipped frames are preserved.
+4. **`BamObserverDesc` (`88` B / `64` B, `MIN_V0_2_SIZE = 48` B / `36` B) & `BamTriggerDesc` (`64` B / `48` B):** `BamObserverDesc` supports custom events (`BamEventKind::CUSTOM`), component lifecycle observers (`ADD`, `INSERT`, `DISCARD`, `REMOVE`, `DESPAWN` with `watched_components`), scene `READY` observers, mutable payload/propagation callbacks (`mut_callback: Option<BamObserverMutFn>`), and relationship propagation (`BAM_OBSERVER_FLAG_PROPAGATE`, `propagate_relationship`). `BamTriggerDesc` provides matching extensible custom, lifecycle, and propagating trigger metadata for `cmd_trigger_ex`.
+5. **`ComponentDesc` (`136` B / `80` B, `MIN_V0_2_SIZE = 64` B / `44` B):** Extends the base descriptor (`struct_size, flags, name, uuid, size, align, drop_fn, vtable_ptr, on_add, on_remove, hook_user_data`) with `on_insert`, `on_discard`, `on_despawn`, `clone_fn: Option<ComponentCloneFn>`, and `required_components[0..required_component_count]`, plus `BAM_COMPONENT_FLAG_SUMMARY_TICK` (`1 << 2`, valid only for `Table` storage; `SPARSE_SET | SUMMARY_TICK` is rejected with `INVALID_ARGUMENT`).
+6. **`BamColumnInfo` (`48` B / `40` B):** `{ component, mode, uuid, size, align, storage_flags, reserved0 }` with `BAM_STORAGE_FLAG_SPARSE_SET (1 << 0)`, `BAM_STORAGE_FLAG_IMMUTABLE (1 << 1)`, `BAM_STORAGE_FLAG_RESOURCE (1 << 2)`, `BAM_STORAGE_FLAG_MESSAGE (1 << 3)`, `BAM_STORAGE_FLAG_EVENT (1 << 4)`, `BAM_STORAGE_FLAG_ENTITY_EVENT (1 << 5)`, and `BAM_STORAGE_FLAG_SUMMARY_TICK (1 << 6)`. Returned via out-pointer to avoid cross-platform 48-byte struct-return ABI subtle differences.
+7. **`VTableHeader` (`40` B / `32` B), `MappedWireVTable<W>`, & `MappedStringVTable` (`56` B / `40` B):** `VTableHeader { struct_size, abi_version, uuid, size, align }` sits at byte offset `0` of every `<Struct>VTable` emitted by `#[derive(ModComponent)]` as well as host-bridged `MappedWireVTable<W>` (`BAM_MAPPED_WIRE_VTABLE_STRUCT`) and `MappedStringVTable` (`BamMappedStringVTable`).
+8. **Built-in Hierarchy (`FfiChildOf` / `BamChildOf` & `BAM_CHILDREN_NAME`):** `bevy_ecs::hierarchy::ChildOf` (`BAM_CHILD_OF_NAME = "bevy_ecs::hierarchy::ChildOf"`, plus `"ChildOf"` alias) and `bevy_ecs::hierarchy::Children` (`BAM_CHILDREN_NAME = "bevy_ecs::hierarchy::Children"`, plus `"Children"` alias) support parent attachment and read-only child traversal (`sys_entity_children`) across FFI.
 
 ---
 

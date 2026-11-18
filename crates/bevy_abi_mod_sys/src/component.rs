@@ -1,10 +1,11 @@
-//! Component registration descriptors (`ComponentDesc`), flags, destructors, and `VTableHeader`.
+//! Component registration descriptors (`ComponentDesc`), flags, destructors, clone hooks, and `VTableHeader`.
 
 use core::ffi::{c_char, c_void};
 
 use crate::{
     extensible::ExtensibleStruct,
-    primitives::{ComponentUuid, FfiEntity, FfiResult},
+    primitives::{BamComponent, ComponentUuid, FfiEntity, FfiResult, StrView},
+    traits::AbiPod,
     version::{ABI_VERSION, abi_version_is_compatible},
 };
 
@@ -16,8 +17,9 @@ use crate::{
 /// - The callback must never unwind across the `extern "C"` boundary.
 pub type ComponentDropFn = unsafe extern "C" fn(ptr: *mut c_void);
 
-/// Lifecycle hook callback (`on_add` / `on_remove`) invoked by the host when a dynamic component
-/// is added to or removed from an entity (`typedef void (*BamComponentHookFn)(BamEntity entity, const void* data_ptr, void* user_data);`).
+/// Lifecycle hook callback (`on_add` / `on_insert` / `on_discard` / `on_remove` / `on_despawn`)
+/// invoked by the host when a dynamic component transitions on an entity
+/// (`typedef void (*BamComponentHookFn)(BamEntity entity, const void* data_ptr, void* user_data);`).
 ///
 /// # Safety
 /// - `data_ptr` points to the entity's component payload while present in Bevy storage (valid only
@@ -27,6 +29,17 @@ pub type ComponentDropFn = unsafe extern "C" fn(ptr: *mut c_void);
 pub type ComponentHookFn =
     unsafe extern "C" fn(entity: FfiEntity, data_ptr: *const c_void, user_data: *mut c_void);
 
+/// Custom component clone callback invoked by Bevy's `EntityCloner` when cloning a dynamic component
+/// (`typedef BamResult (*BamComponentCloneFn)(const void* src, void* dst, void* user_data);`).
+///
+/// # Safety
+/// - `src` points to an initialized source component payload of `(size, align)` valid for the call.
+/// - `dst` points to uninitialized writable storage of `(size, align)` to be initialized on `OK`.
+/// - `user_data` is the opaque pointer registered in [`ComponentDesc::hook_user_data`].
+/// - The callback must never unwind across the `extern "C"` boundary.
+pub type ComponentCloneFn =
+    unsafe extern "C" fn(src: *const c_void, dst: *mut c_void, user_data: *mut c_void) -> FfiResult;
+
 /// Register component with `StorageType::SparseSet` instead of `StorageType::Table`.
 pub const BAM_COMPONENT_FLAG_SPARSE_SET: u32 = 1 << 0;
 
@@ -34,15 +47,19 @@ pub const BAM_COMPONENT_FLAG_SPARSE_SET: u32 = 1 << 0;
 /// with [`FfiResult::PERMISSION_DENIED`]).
 pub const BAM_COMPONENT_FLAG_IMMUTABLE: u32 = 1 << 1;
 
+/// Enable per-table Bevy 0.20 `summary_tick` acceleration for `Changed<T>` / `Added<T>` scans
+/// (valid only on `Table`-stored components; rejected when combined with [`BAM_COMPONENT_FLAG_SPARSE_SET`]).
+pub const BAM_COMPONENT_FLAG_SUMMARY_TICK: u32 = 1 << 2;
+
 /// Bitmask of all recognized [`ComponentDesc::flags`] bits in ABI `0.2`.
 pub const BAM_COMPONENT_KNOWN_FLAGS: u32 =
-    BAM_COMPONENT_FLAG_SPARSE_SET | BAM_COMPONENT_FLAG_IMMUTABLE;
+    BAM_COMPONENT_FLAG_SPARSE_SET | BAM_COMPONENT_FLAG_IMMUTABLE | BAM_COMPONENT_FLAG_SUMMARY_TICK;
 
 /// Runtime component registration descriptor (`typedef struct BamComponentDesc BamComponentDesc;`).
 ///
 /// Layout:
-/// - 64-bit: `MIN_V0_2_SIZE = 64` bytes (`size_of = 88` bytes with optional hook slots), `8`-byte alignment, zero implicit padding.
-/// - 32-bit: `MIN_V0_2_SIZE = 44` bytes (`size_of = 56` bytes with optional hook slots), `4`-byte alignment, zero implicit padding.
+/// - 64-bit: `MIN_V0_2_SIZE = 64` bytes (`size_of = 136` bytes with lifecycle hooks, clone, and required components), `8`-byte alignment, zero implicit padding.
+/// - 32-bit: `MIN_V0_2_SIZE = 44` bytes (`size_of = 80` bytes with lifecycle hooks, clone, and required components), `4`-byte alignment, zero implicit padding.
 ///
 /// # Example
 ///
@@ -78,8 +95,20 @@ pub struct ComponentDesc {
     pub on_add: Option<ComponentHookFn>,
     /// Optional guest `on_remove` lifecycle hook (`offset 72` on 64-bit / `48` on 32-bit).
     pub on_remove: Option<ComponentHookFn>,
-    /// Opaque context pointer passed to `on_add` and `on_remove` (`offset 80` on 64-bit / `52` on 32-bit).
+    /// Opaque context pointer passed to lifecycle hooks and `clone_fn` (`offset 80` on 64-bit / `52` on 32-bit).
     pub hook_user_data: *mut c_void,
+    /// Optional guest `on_insert` lifecycle hook (`offset 88` on 64-bit / `56` on 32-bit).
+    pub on_insert: Option<ComponentHookFn>,
+    /// Optional guest `on_discard` (replacement) lifecycle hook (`offset 96` on 64-bit / `60` on 32-bit).
+    pub on_discard: Option<ComponentHookFn>,
+    /// Optional guest `on_despawn` lifecycle hook (`offset 104` on 64-bit / `64` on 32-bit).
+    pub on_despawn: Option<ComponentHookFn>,
+    /// Optional custom `EntityCloner` callback (`offset 112` on 64-bit / `68` on 32-bit).
+    pub clone_fn: Option<ComponentCloneFn>,
+    /// Optional array of required [`BamComponent`] handles (`required_components[0..required_component_count]`, `offset 120` on 64-bit / `72` on 32-bit).
+    pub required_components: *const BamComponent,
+    /// Number of entries in `required_components` (`offset 128` on 64-bit / `76` on 32-bit).
+    pub required_component_count: usize,
 }
 
 impl ComponentDesc {
@@ -88,7 +117,7 @@ impl ComponentDesc {
         core::mem::offset_of!(Self, vtable_ptr) + core::mem::size_of::<*const c_void>();
 
     /// Constructs a Plain Old Data component descriptor with `flags = 0`, `drop_fn = None`,
-    /// `vtable_ptr = null`, and no lifecycle hooks.
+    /// `vtable_ptr = null`, no lifecycle/clone hooks, and no required components.
     #[inline]
     pub const fn new(name: *const c_char, uuid: ComponentUuid, size: usize, align: usize) -> Self {
         Self {
@@ -103,6 +132,12 @@ impl ComponentDesc {
             on_add: None,
             on_remove: None,
             hook_user_data: core::ptr::null_mut(),
+            on_insert: None,
+            on_discard: None,
+            on_despawn: None,
+            clone_fn: None,
+            required_components: core::ptr::null(),
+            required_component_count: 0,
         }
     }
 
@@ -119,6 +154,13 @@ impl ComponentDesc {
     #[inline]
     pub const fn with_flags(mut self, flags: u32) -> Self {
         self.flags = flags;
+        self
+    }
+
+    /// Enables `BAM_COMPONENT_FLAG_SUMMARY_TICK` on this descriptor.
+    #[inline]
+    pub const fn with_summary_tick(mut self) -> Self {
+        self.flags |= BAM_COMPONENT_FLAG_SUMMARY_TICK;
         self
     }
 
@@ -143,10 +185,38 @@ impl ComponentDesc {
         self
     }
 
+    /// Attaches an `on_insert` lifecycle hook callback.
+    #[inline]
+    pub const fn with_on_insert(mut self, on_insert: ComponentHookFn) -> Self {
+        self.on_insert = Some(on_insert);
+        self
+    }
+
+    /// Attaches an `on_discard` lifecycle hook callback.
+    #[inline]
+    pub const fn with_on_discard(mut self, on_discard: ComponentHookFn) -> Self {
+        self.on_discard = Some(on_discard);
+        self
+    }
+
     /// Attaches an `on_remove` lifecycle hook callback.
     #[inline]
     pub const fn with_on_remove(mut self, on_remove: ComponentHookFn) -> Self {
         self.on_remove = Some(on_remove);
+        self
+    }
+
+    /// Attaches an `on_despawn` lifecycle hook callback.
+    #[inline]
+    pub const fn with_on_despawn(mut self, on_despawn: ComponentHookFn) -> Self {
+        self.on_despawn = Some(on_despawn);
+        self
+    }
+
+    /// Sets the shared `hook_user_data` pointer passed to lifecycle hooks and `clone_fn`.
+    #[inline]
+    pub const fn with_hook_user_data(mut self, user_data: *mut c_void) -> Self {
+        self.hook_user_data = user_data;
         self
     }
 
@@ -164,10 +234,33 @@ impl ComponentDesc {
         self
     }
 
-    /// Returns `true` if either `on_add` or `on_remove` is set.
+    /// Attaches a custom `clone_fn` callback for Bevy's `EntityCloner`.
+    #[inline]
+    pub const fn with_clone_fn(mut self, clone_fn: ComponentCloneFn) -> Self {
+        self.clone_fn = Some(clone_fn);
+        self
+    }
+
+    /// Declares required [`BamComponent`] handles (`required_components[0..count]`).
+    #[inline]
+    pub const fn with_required_components(
+        mut self,
+        required_components: *const BamComponent,
+        required_component_count: usize,
+    ) -> Self {
+        self.required_components = required_components;
+        self.required_component_count = required_component_count;
+        self
+    }
+
+    /// Returns `true` if any lifecycle hook (`on_add`, `on_insert`, `on_discard`, `on_remove`, or `on_despawn`) is set.
     #[inline]
     pub const fn has_hooks(&self) -> bool {
-        self.on_add.is_some() || self.on_remove.is_some()
+        self.on_add.is_some()
+            || self.on_insert.is_some()
+            || self.on_discard.is_some()
+            || self.on_remove.is_some()
+            || self.on_despawn.is_some()
     }
 
     /// Returns `true` if `BAM_COMPONENT_FLAG_SPARSE_SET` is set.
@@ -180,6 +273,12 @@ impl ComponentDesc {
     #[inline]
     pub const fn is_immutable(&self) -> bool {
         (self.flags & BAM_COMPONENT_FLAG_IMMUTABLE) != 0
+    }
+
+    /// Returns `true` if `BAM_COMPONENT_FLAG_SUMMARY_TICK` is set.
+    #[inline]
+    pub const fn is_summary_tick(&self) -> bool {
+        (self.flags & BAM_COMPONENT_FLAG_SUMMARY_TICK) != 0
     }
 
     /// Returns `true` if `self.size == 0` (marker component).
@@ -204,7 +303,8 @@ impl ComponentDesc {
         core::alloc::Layout::from_size_align(self.size, self.align).ok()
     }
 
-    /// Validates `struct_size`, known `flags`, non-null `name`, and `(size, align)` invariants.
+    /// Validates `struct_size`, known `flags`, incompatible `SPARSE_SET | SUMMARY_TICK`,
+    /// non-null `name` / `required_components`, and `(size, align)` invariants.
     #[inline]
     pub fn validate(&self) -> FfiResult {
         if (self.struct_size as usize) < Self::MIN_V0_2_SIZE {
@@ -213,7 +313,13 @@ impl ComponentDesc {
         if (self.flags & !BAM_COMPONENT_KNOWN_FLAGS) != 0 {
             return FfiResult::UNSUPPORTED;
         }
+        if self.is_sparse_set() && self.is_summary_tick() {
+            return FfiResult::INVALID_ARGUMENT;
+        }
         if self.name.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if self.required_component_count > 0 && self.required_components.is_null() {
             return FfiResult::NULL_POINTER;
         }
         if self.layout().is_none() {
@@ -249,7 +355,7 @@ const _: () = {
     #[cfg(target_pointer_width = "64")]
     {
         assert!(ComponentDesc::MIN_V0_2_SIZE == 64);
-        assert!(core::mem::size_of::<ComponentDesc>() == 88);
+        assert!(core::mem::size_of::<ComponentDesc>() == 136);
         assert!(core::mem::align_of::<ComponentDesc>() == 8);
         assert!(core::mem::offset_of!(ComponentDesc, struct_size) == 0);
         assert!(core::mem::offset_of!(ComponentDesc, flags) == 4);
@@ -262,11 +368,17 @@ const _: () = {
         assert!(core::mem::offset_of!(ComponentDesc, on_add) == 64);
         assert!(core::mem::offset_of!(ComponentDesc, on_remove) == 72);
         assert!(core::mem::offset_of!(ComponentDesc, hook_user_data) == 80);
+        assert!(core::mem::offset_of!(ComponentDesc, on_insert) == 88);
+        assert!(core::mem::offset_of!(ComponentDesc, on_discard) == 96);
+        assert!(core::mem::offset_of!(ComponentDesc, on_despawn) == 104);
+        assert!(core::mem::offset_of!(ComponentDesc, clone_fn) == 112);
+        assert!(core::mem::offset_of!(ComponentDesc, required_components) == 120);
+        assert!(core::mem::offset_of!(ComponentDesc, required_component_count) == 128);
     }
     #[cfg(target_pointer_width = "32")]
     {
         assert!(ComponentDesc::MIN_V0_2_SIZE == 44);
-        assert!(core::mem::size_of::<ComponentDesc>() == 56);
+        assert!(core::mem::size_of::<ComponentDesc>() == 80);
         assert!(core::mem::align_of::<ComponentDesc>() == 4);
         assert!(core::mem::offset_of!(ComponentDesc, struct_size) == 0);
         assert!(core::mem::offset_of!(ComponentDesc, flags) == 4);
@@ -279,6 +391,12 @@ const _: () = {
         assert!(core::mem::offset_of!(ComponentDesc, on_add) == 44);
         assert!(core::mem::offset_of!(ComponentDesc, on_remove) == 48);
         assert!(core::mem::offset_of!(ComponentDesc, hook_user_data) == 52);
+        assert!(core::mem::offset_of!(ComponentDesc, on_insert) == 56);
+        assert!(core::mem::offset_of!(ComponentDesc, on_discard) == 60);
+        assert!(core::mem::offset_of!(ComponentDesc, on_despawn) == 64);
+        assert!(core::mem::offset_of!(ComponentDesc, clone_fn) == 68);
+        assert!(core::mem::offset_of!(ComponentDesc, required_components) == 72);
+        assert!(core::mem::offset_of!(ComponentDesc, required_component_count) == 76);
     }
 };
 
@@ -399,4 +517,68 @@ const _: () = {
 // fields are valid when zero-filled.
 unsafe impl ExtensibleStruct for VTableHeader {
     const MIN_V0_2_SIZE: usize = Self::MIN_V0_2_SIZE;
+}
+
+/// Callback reading an opaque host component/resource at `ptr` into a wire `W: AbiPod` struct at `out_wire`.
+///
+/// # Safety
+/// - `ptr` must point to a valid initialized host instance of the bridged type.
+/// - `out_wire` must point to aligned writable `W` storage.
+pub type MappedWireGetFn<W> =
+    unsafe extern "C" fn(ptr: *const c_void, out_wire: *mut W) -> FfiResult;
+
+/// Callback updating an opaque host component/resource at `ptr` from a wire `W: AbiPod` struct at `in_wire`.
+///
+/// # Safety
+/// - `ptr` must point to a valid exclusively borrowed host instance of the bridged type.
+/// - `in_wire` must point to aligned readable `W` storage.
+pub type MappedWireSetFn<W> =
+    unsafe extern "C" fn(ptr: *mut c_void, in_wire: *const W) -> FfiResult;
+
+/// Generic `#[repr(C)]` VTable bridging an opaque `#[repr(Rust)]` host component or resource
+/// (such as Bevy `Transform`, `Visibility`, `Time`, `ButtonInput`, or `State<S>`) to a fixed-layout
+/// `W: AbiPod` wire representation.
+#[repr(C)]
+pub struct MappedWireVTable<W: AbiPod> {
+    /// Leading [`VTableHeader`] at byte offset `0`.
+    pub header: VTableHeader,
+    /// Reads the host value into `*out_wire`.
+    pub get: Option<MappedWireGetFn<W>>,
+    /// Writes `*in_wire` into the mutable host value (`None` for read-only types like `GlobalTransform`).
+    pub set: Option<MappedWireSetFn<W>>,
+}
+
+impl<W: AbiPod> Copy for MappedWireVTable<W> {}
+
+impl<W: AbiPod> Clone for MappedWireVTable<W> {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+/// Callback borrowing a UTF-8 [`StrView`] from an opaque host string component/resource at `ptr`.
+///
+/// # Safety
+/// `ptr` must point to a valid initialized host instance valid for the returned borrow's lifetime.
+pub type MappedStringGetFn = unsafe extern "C" fn(ptr: *const c_void) -> StrView;
+
+/// Callback updating an opaque host string component/resource at `ptr` from a UTF-8 [`StrView`].
+///
+/// # Safety
+/// - `ptr` must point to a valid exclusively borrowed host instance.
+/// - `view` must reference valid initialized bytes when `view.len > 0`.
+pub type MappedStringSetFn = unsafe extern "C" fn(ptr: *mut c_void, view: StrView) -> FfiResult;
+
+/// Generic `#[repr(C)]` VTable bridging an opaque UTF-8 string host component or resource
+/// (such as `bevy_ecs::name::Name`) via [`StrView`].
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct MappedStringVTable {
+    /// Leading [`VTableHeader`] at byte offset `0`.
+    pub header: VTableHeader,
+    /// Borrows the current UTF-8 string slice.
+    pub get: Option<MappedStringGetFn>,
+    /// Replaces the UTF-8 string value in place (`None` when read-only).
+    pub set: Option<MappedStringSetFn>,
 }

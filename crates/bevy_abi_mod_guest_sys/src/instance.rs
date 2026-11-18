@@ -41,6 +41,54 @@ unsafe fn drop_boxed<T>(ptr: *mut c_void) {
     drop(unsafe { Box::from_raw(ptr.cast::<T>()) });
 }
 
+/// Thread-safe append-only tracker for runtime observer/closure allocations created after
+/// `bevy_abi_mod_init` (such as `ValidatedCommands::observe`), owned by [`GuestInstance`] and
+/// drained in LIFO order during `bevy_abi_mod_shutdown` prior to init-time allocations.
+pub(crate) struct RuntimeAllocTracker {
+    allocations: std::sync::Mutex<Vec<ErasedAllocation>>,
+}
+
+impl RuntimeAllocTracker {
+    fn new() -> Self {
+        Self {
+            allocations: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn track<T: Send + 'static>(&self, boxed: Box<T>) -> *mut T {
+        let raw = Box::into_raw(boxed);
+        let mut guard = self
+            .allocations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.push(ErasedAllocation {
+            ptr: raw.cast::<c_void>(),
+            drop_fn: drop_boxed::<T>,
+        });
+        raw
+    }
+
+    fn len(&self) -> usize {
+        self.allocations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    fn drain_lifo(&self) {
+        let mut drained = {
+            let mut guard = self
+                .allocations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            core::mem::take(&mut *guard)
+        };
+        while let Some(alloc) = drained.pop() {
+            drop(alloc);
+        }
+    }
+}
+
 struct OwnedManifestBytes {
     ptr: *mut u8,
     len: usize,
@@ -93,6 +141,7 @@ pub struct GuestInstance {
     restore_state_hook: Option<ReentrantCell<RestoreStateHook>>,
     // Declared last so field drop runs strictly after `GuestInstance::drop` tears down every
     // closure/hook holding a copy of `host`.
+    _runtime_allocs: Box<RuntimeAllocTracker>,
     _manifest_bytes: OwnedManifestBytes,
 }
 
@@ -100,17 +149,22 @@ impl GuestInstance {
     /// Creates an empty [`GuestInstance`] bound to `host` and `manifest_name`.
     pub fn new(host: Host, manifest_name: impl Into<String>) -> Self {
         let manifest_bytes = OwnedManifestBytes::new(manifest_name.into());
+        let runtime_allocs = Box::new(RuntimeAllocTracker::new());
         // SAFETY: When `manifest_bytes.len > 0`, `manifest_bytes.ptr` points to immutable, valid
         // UTF-8 heap bytes that remain pinned at stable provenance until `_manifest_bytes` drops
-        // after all `shutdown_hooks` and `allocations`.
-        let host =
-            unsafe { host.with_manifest_name(manifest_bytes.ptr.cast_const(), manifest_bytes.len) };
+        // after all `shutdown_hooks`, `_runtime_allocs`, and `allocations`. Similarly,
+        // `runtime_allocs` stays heap-pinned until after all closures holding `host` finish dropping.
+        let host = unsafe {
+            host.with_manifest_name(manifest_bytes.ptr.cast_const(), manifest_bytes.len)
+                .with_runtime_allocs(core::ptr::from_ref(&*runtime_allocs))
+        };
         Self {
             host,
             allocations: Vec::new(),
             shutdown_hooks: Vec::new(),
             save_state_hook: None,
             restore_state_hook: None,
+            _runtime_allocs: runtime_allocs,
             _manifest_bytes: manifest_bytes,
         }
     }
@@ -169,7 +223,7 @@ impl GuestInstance {
     /// Returns the number of tracked heap allocations owned by this instance.
     #[inline]
     pub fn allocation_count(&self) -> usize {
-        self.allocations.len()
+        self.allocations.len() + self._runtime_allocs.len()
     }
 
     /// Invokes all registered per-instance shutdown hooks in LIFO order, catching any panics.
@@ -188,6 +242,7 @@ impl Drop for GuestInstance {
         self.shutdown_hooks.clear();
         self.save_state_hook = None;
         self.restore_state_hook = None;
+        self._runtime_allocs.drain_lifo();
         while let Some(alloc) = self.allocations.pop() {
             drop(alloc);
         }

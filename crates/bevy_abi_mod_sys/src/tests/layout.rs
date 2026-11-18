@@ -8,27 +8,33 @@ use core::{
 
 use crate::{
     ABI_VERSION, ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PATCH, AccessMode,
-    BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_ENTITY_EVENT,
-    BAM_STORAGE_FLAG_EVENT, BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE,
-    BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET, BAM_SYSTEM_FLAG_MAIN_THREAD,
-    BamChangeTicks, BamChunkTaskFn, BamCmdDespawnFn, BamCmdInsertDefaultFn, BamCmdInsertFn,
-    BamCmdRemoveFn, BamCmdSpawnEmptyFn, BamCmdSpawnFn, BamCmdTriggerFn, BamColumnInfo, BamCommands,
-    BamComponent, BamGetProcAddressFn, BamHostApi, BamHostCtx, BamInitFn, BamInstance, BamIter,
-    BamIterColumnInfoFn, BamIterColumnMutableFn, BamIterColumnMutableUntrackedFn,
-    BamIterColumnReadonlyFn, BamIterColumnRowsMutableFn, BamIterColumnRowsReadonlyFn,
-    BamIterEntitiesFn, BamIterMarkChangedRangeFn, BamIterNextChunkFn, BamIterResetFn,
+    BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_COMPONENT_FLAG_SUMMARY_TICK,
+    BAM_OBSERVER_FLAG_PROPAGATE, BAM_STORAGE_FLAG_ENTITY_EVENT, BAM_STORAGE_FLAG_EVENT,
+    BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE,
+    BAM_STORAGE_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_SUMMARY_TICK, BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL,
+    BAM_SYSTEM_FLAG_MAIN_THREAD, BAM_TRIGGER_FLAG_PROPAGATE, BamAssetGetLoadStateFn,
+    BamAssetLoadFn, BamAssetReleaseFn, BamChangeTicks, BamChunkTaskFn, BamCmdDespawnAllFn,
+    BamCmdDespawnFn, BamCmdInsertDefaultFn, BamCmdInsertFn, BamCmdObserveFn, BamCmdRemoveFn,
+    BamCmdSpawnBatchFn, BamCmdSpawnEmptyFn, BamCmdSpawnFn, BamCmdSpawnSceneFn, BamCmdTriggerExFn,
+    BamCmdTriggerFn, BamColumnInfo, BamCommands, BamComponent, BamEventKind, BamGetProcAddressFn,
+    BamHostApi, BamHostCtx, BamInitFn, BamInstance, BamIter, BamIterColumnInfoFn,
+    BamIterColumnMutableFn, BamIterColumnMutableUntrackedFn, BamIterColumnReadonlyFn,
+    BamIterColumnRowsMutableFn, BamIterColumnRowsReadonlyFn, BamIterEntitiesFn,
+    BamIterMarkChangedRangeFn, BamIterNextChunkFn, BamIterReadRemovedFn, BamIterResetFn,
     BamLastErrorFn, BamLoadCtx, BamLoadHostCtxFn, BamManifest, BamManifestFn, BamMsgReadBatchFn,
-    BamMsgSendFn, BamMsgWriteBatchFn, BamObserverDesc, BamObserverFn, BamParForEachChunkFn,
-    BamQueryDesc, BamRegisterComponentFn, BamRegisterObserverFn, BamRegisterSystemFn,
-    BamResMutPtrFn, BamResPtrFn, BamResTicksFn, BamResolveComponentFn, BamRestoreStateFn,
-    BamRunIfFn, BamSaveStateFn, BamShutdownFn, BamStateWriterFn, BamSysCommandsFn,
-    BamSysEntityGetFn, BamSysEntityGetMutFn, BamSysHostCtxFn, BamSysQueryFn, BamSysResMutPtrFn,
-    BamSysResPtrFn, BamSystemCtx, BamSystemDesc, BamSystemFn, BamTermDesc, ComponentDesc,
-    ComponentHookFn, ComponentUuid, ExtensibleStruct, FfiBool, FfiChildOf, FfiEntity, FfiResult,
-    FfiSlice, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent, SIPHASH_KEY_0,
-    SIPHASH_KEY_1, ScheduleId, StrView, SymbolEntry, VTableHeader, abi_version_is_compatible,
-    abi_version_major, abi_version_minor, abi_version_patch, assert_abi_pod, assert_raw_insertable,
-    pack_abi_version, read_descriptor, read_extensible_struct, siphash24_128, unpack_abi_version,
+    BamMsgSendFn, BamMsgWriteBatchFn, BamObserverDesc, BamObserverFn, BamObserverMutFn,
+    BamParForEachChunkFn, BamQueryDesc, BamRegisterComponentFn, BamRegisterObserverFn,
+    BamRegisterSystemFn, BamResMutPtrFn, BamResPtrFn, BamResTicksFn, BamResolveComponentFn,
+    BamRestoreStateFn, BamRunIfFn, BamSaveStateFn, BamShutdownFn, BamStateWriterFn,
+    BamSysCommandsFn, BamSysEntityChildrenFn, BamSysEntityGetFn, BamSysEntityGetMutFn,
+    BamSysHostCtxFn, BamSysQueryFn, BamSysResMutPtrFn, BamSysResPtrFn, BamSystemCtx, BamSystemDesc,
+    BamSystemFn, BamTermDesc, BamTriggerDesc, ComponentCloneFn, ComponentDesc, ComponentHookFn,
+    ComponentUuid, ExtensibleStruct, FfiAssetHandle, FfiAssetLoadState, FfiBool, FfiChildOf,
+    FfiEntity, FfiOption, FfiResult, FfiSlice, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY,
+    ModComponent, SIPHASH_KEY_0, SIPHASH_KEY_1, ScheduleId, StrView, SymbolEntry, VTableHeader,
+    abi_version_is_compatible, abi_version_major, abi_version_minor, abi_version_patch,
+    assert_abi_pod, assert_raw_insertable, pack_abi_version, read_descriptor,
+    read_extensible_struct, siphash24_128, unpack_abi_version,
 };
 
 struct StackFmtBuf<const N: usize> {
@@ -313,6 +319,18 @@ fn populated_host_api() -> BamHostApi {
         sys_res_mut_ptr: None,
         register_observer: None,
         cmd_trigger: None,
+        cmd_spawn_persistent: None,
+        cmd_spawn_batch: None,
+        cmd_despawn_all: None,
+        cmd_insert_if_new: None,
+        cmd_trigger_ex: None,
+        cmd_observe: None,
+        iter_read_removed: None,
+        sys_entity_children: None,
+        asset_load: None,
+        asset_get_load_state: None,
+        asset_release: None,
+        cmd_spawn_scene: None,
     }
 }
 
@@ -332,6 +350,18 @@ fn abi_v0_2_exact_sizes_alignments_and_offsets() {
     assert_eq!(align_of::<AccessMode>(), 4);
     assert_eq!(size_of::<ScheduleId>(), 4);
     assert_eq!(align_of::<ScheduleId>(), 4);
+    assert_eq!(size_of::<BamEventKind>(), 4);
+    assert_eq!(align_of::<BamEventKind>(), 4);
+    assert_eq!(size_of::<FfiAssetLoadState>(), 4);
+    assert_eq!(align_of::<FfiAssetLoadState>(), 4);
+    assert_eq!(size_of::<FfiAssetHandle>(), 32);
+    assert_eq!(align_of::<FfiAssetHandle>(), 4);
+    assert_eq!(offset_of!(FfiAssetHandle, kind), 0);
+    assert_eq!(offset_of!(FfiAssetHandle, reserved0), 1);
+    assert_eq!(offset_of!(FfiAssetHandle, asset_type), 4);
+    assert_eq!(offset_of!(FfiAssetHandle, index), 8);
+    assert_eq!(offset_of!(FfiAssetHandle, generation), 12);
+    assert_eq!(offset_of!(FfiAssetHandle, uuid), 16);
     assert_eq!(size_of::<ComponentUuid>(), 16);
     assert_eq!(align_of::<ComponentUuid>(), 1);
     assert_eq!(size_of::<BamTermDesc>(), 12);
@@ -339,6 +369,8 @@ fn abi_v0_2_exact_sizes_alignments_and_offsets() {
     assert_eq!(offset_of!(BamTermDesc, component), 0);
     assert_eq!(offset_of!(BamTermDesc, mode), 4);
     assert_eq!(offset_of!(BamTermDesc, flags), 8);
+    assert_eq!(offset_of!(BamTermDesc, or_group), 10);
+    assert_eq!(offset_of!(BamTermDesc, reserved0), 11);
 
     // Every `Option<unsafe extern "C" fn(...)>` and opaque pointer must equal one pointer width.
     let ptr_sz = size_of::<*const ()>();
@@ -393,6 +425,18 @@ fn abi_v0_2_exact_sizes_alignments_and_offsets() {
     assert_eq!(size_of::<Option<BamSaveStateFn>>(), ptr_sz);
     assert_eq!(size_of::<Option<BamRestoreStateFn>>(), ptr_sz);
     assert_eq!(size_of::<Option<ComponentHookFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<ComponentCloneFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamObserverMutFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamCmdSpawnBatchFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamCmdDespawnAllFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamCmdTriggerExFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamCmdObserveFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamIterReadRemovedFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamSysEntityChildrenFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamAssetLoadFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamAssetGetLoadStateFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamAssetReleaseFn>>(), ptr_sz);
+    assert_eq!(size_of::<Option<BamCmdSpawnSceneFn>>(), ptr_sz);
 
     #[cfg(target_pointer_width = "64")]
     {
@@ -402,16 +446,18 @@ fn abi_v0_2_exact_sizes_alignments_and_offsets() {
         assert_eq!(BamManifest::MIN_V0_2_SIZE, 32);
         assert_eq!(size_of::<BamQueryDesc>(), 24);
         assert_eq!(BamQueryDesc::MIN_V0_2_SIZE, 24);
-        assert_eq!(size_of::<BamSystemDesc>(), 120);
+        assert_eq!(size_of::<BamSystemDesc>(), 168);
         assert_eq!(BamSystemDesc::MIN_V0_2_SIZE, 104);
-        assert_eq!(size_of::<BamObserverDesc>(), 48);
+        assert_eq!(size_of::<BamObserverDesc>(), 88);
         assert_eq!(BamObserverDesc::MIN_V0_2_SIZE, 48);
-        assert_eq!(size_of::<ComponentDesc>(), 88);
+        assert_eq!(size_of::<BamTriggerDesc>(), 64);
+        assert_eq!(BamTriggerDesc::MIN_V0_2_SIZE, 64);
+        assert_eq!(size_of::<ComponentDesc>(), 136);
         assert_eq!(ComponentDesc::MIN_V0_2_SIZE, 64);
         assert_eq!(size_of::<BamColumnInfo>(), 48);
         assert_eq!(size_of::<VTableHeader>(), 40);
         assert_eq!(VTableHeader::MIN_V0_2_SIZE, 40);
-        assert_eq!(size_of::<BamHostApi>(), 312);
+        assert_eq!(size_of::<BamHostApi>(), 408);
         assert_eq!(BamHostApi::MIN_V0_2_SIZE, 224);
     }
 
@@ -423,16 +469,18 @@ fn abi_v0_2_exact_sizes_alignments_and_offsets() {
         assert_eq!(BamManifest::MIN_V0_2_SIZE, 24);
         assert_eq!(size_of::<BamQueryDesc>(), 16);
         assert_eq!(BamQueryDesc::MIN_V0_2_SIZE, 16);
-        assert_eq!(size_of::<BamSystemDesc>(), 68);
+        assert_eq!(size_of::<BamSystemDesc>(), 92);
         assert_eq!(BamSystemDesc::MIN_V0_2_SIZE, 60);
-        assert_eq!(size_of::<BamObserverDesc>(), 36);
+        assert_eq!(size_of::<BamObserverDesc>(), 64);
         assert_eq!(BamObserverDesc::MIN_V0_2_SIZE, 36);
-        assert_eq!(size_of::<ComponentDesc>(), 56);
+        assert_eq!(size_of::<BamTriggerDesc>(), 48);
+        assert_eq!(BamTriggerDesc::MIN_V0_2_SIZE, 48);
+        assert_eq!(size_of::<ComponentDesc>(), 80);
         assert_eq!(ComponentDesc::MIN_V0_2_SIZE, 44);
         assert_eq!(size_of::<BamColumnInfo>(), 40);
         assert_eq!(size_of::<VTableHeader>(), 32);
         assert_eq!(VTableHeader::MIN_V0_2_SIZE, 32);
-        assert_eq!(size_of::<BamHostApi>(), 160);
+        assert_eq!(size_of::<BamHostApi>(), 208);
         assert_eq!(BamHostApi::MIN_V0_2_SIZE, 116);
     }
 }
@@ -724,8 +772,19 @@ fn unknown_flags_and_nonzero_reserved_rejected() {
     let c_name = unsafe { comp_desc.name_cstr() };
     assert_eq!(c_name.unwrap().to_bytes(), b"combat_mod::Health");
 
+    // Summary tick on Table component succeeds; SPARSE_SET | SUMMARY_TICK -> INVALID_ARGUMENT; unknown bit -> UNSUPPORTED
+    let summary_desc = ComponentDesc::new(c"combat_mod::FastTick".as_ptr(), uuid, 4, 4)
+        .with_flags(BAM_COMPONENT_FLAG_SUMMARY_TICK);
+    assert!(summary_desc.is_summary_tick());
+    assert_eq!(summary_desc.validate(), FfiResult::OK);
     assert_eq!(
-        comp_desc.with_flags(1 << 2).validate(),
+        comp_desc
+            .with_flags(BAM_COMPONENT_FLAG_SPARSE_SET | BAM_COMPONENT_FLAG_SUMMARY_TICK)
+            .validate(),
+        FfiResult::INVALID_ARGUMENT
+    );
+    assert_eq!(
+        comp_desc.with_flags(1 << 3).validate(),
         FfiResult::UNSUPPORTED
     );
 
@@ -1161,4 +1220,167 @@ fn ffi_slice_and_str_view_null_zero_and_alignment_safety() {
     // SAFETY: `bad_utf8` is initialized on the local stack.
     let bad_utf8_res = unsafe { bad_view.try_as_str() };
     assert_eq!(bad_utf8_res.unwrap_err(), FfiResult::INVALID_UTF8);
+}
+
+#[test]
+fn wave0_ffi_option_asset_handles_triggers_lifecycle_observers_and_modes() {
+    // 1. FfiOption<T>
+    assert_abi_pod::<FfiOption<u32>>();
+    assert_abi_pod::<FfiOption<FfiEntity>>();
+    assert_raw_insertable::<FfiOption<usize>>();
+
+    let mut opt_some = FfiOption::some(77u32);
+    assert!(opt_some.is_some());
+    assert!(!opt_some.is_none());
+    assert_eq!(opt_some.as_ref(), Some(&77));
+    if let Some(slot) = opt_some.as_mut() {
+        *slot = 88;
+    }
+    assert_eq!(opt_some.into_option(), Some(88));
+
+    let opt_none = FfiOption::<u32>::none();
+    assert!(opt_none.is_none());
+    assert_eq!(opt_none.as_ref(), None);
+    assert_eq!(opt_none.into_option(), None);
+    assert_eq!(FfiOption::<u32>::default(), opt_none);
+    assert_eq!(FfiOption::from_option(Some(5u32)), FfiOption::some(5u32));
+    assert_eq!(FfiOption::<u32>::from_option(None), opt_none);
+
+    // 2. FfiAssetHandle & FfiAssetLoadState
+    assert_abi_pod::<FfiAssetHandle>();
+    assert_abi_pod::<FfiAssetLoadState>();
+    let h_none = FfiAssetHandle::default();
+    assert!(h_none.is_none());
+    assert!(!h_none.is_some());
+    assert_eq!(h_none.validate(), FfiResult::OK);
+    assert_eq!(h_none.to_index_bits(), None);
+
+    let asset_ty = BamComponent::from_raw(9);
+    let h_idx = FfiAssetHandle::from_index(asset_ty, 12, 3);
+    assert!(h_idx.is_some());
+    assert_eq!(h_idx.validate(), FfiResult::OK);
+    let bits = h_idx.to_index_bits().unwrap();
+    assert_eq!(FfiAssetHandle::from_index_bits(asset_ty, bits), h_idx);
+
+    let h_uuid = FfiAssetHandle::from_uuid(
+        asset_ty,
+        ComponentUuid::parse_hex("00112233-4455-6677-8899-aabbccddeeff"),
+    );
+    assert!(h_uuid.is_some());
+    assert_eq!(h_uuid.validate(), FfiResult::OK);
+
+    let mut bad_handle = h_idx;
+    bad_handle.asset_type = BamComponent::INVALID;
+    assert_eq!(bad_handle.validate(), FfiResult::INVALID_COMPONENT);
+    bad_handle = h_idx;
+    bad_handle.reserved0[1] = 1;
+    assert_eq!(bad_handle.validate(), FfiResult::INVALID_ARGUMENT);
+    bad_handle = h_idx;
+    bad_handle.kind = 99;
+    assert_eq!(bad_handle.validate(), FfiResult::INVALID_ARGUMENT);
+
+    assert!(FfiAssetLoadState::NOT_LOADED.is_valid());
+    assert!(FfiAssetLoadState::LOADING.is_valid());
+    assert!(FfiAssetLoadState::LOADED.is_loaded());
+    assert!(FfiAssetLoadState::FAILED.is_failed());
+    assert!(!FfiAssetLoadState(4).is_valid());
+
+    // 3. AccessMode ALLOW / HAS / REMOVED_READ & BamTermDesc or_group
+    assert!(AccessMode::ALLOW.is_valid());
+    assert!(AccessMode::ALLOW.is_allow());
+    assert!(!AccessMode::ALLOW.has_entity_column_data());
+    assert!(AccessMode::HAS.is_valid());
+    assert!(AccessMode::HAS.is_has());
+    assert!(!AccessMode::HAS.has_entity_column_data());
+    assert!(AccessMode::REMOVED_READ.is_valid());
+    assert!(AccessMode::REMOVED_READ.is_removed_read());
+    assert!(!AccessMode(15).is_valid());
+
+    let or_term = BamTermDesc::filter_only(asset_ty).with_or_group(2);
+    assert_eq!(or_term.or_group, 2);
+    assert_eq!(or_term.validate(), FfiResult::OK);
+    let mut bad_res_term = or_term;
+    bad_res_term.reserved0 = 1;
+    assert_eq!(bad_res_term.validate(), FfiResult::INVALID_ARGUMENT);
+
+    // 4. Lifecycle & mutable BamObserverDesc + BamTriggerDesc
+    unsafe extern "C" fn stub_obs_ro(
+        _entity: FfiEntity,
+        _event_data: *const c_void,
+        _commands: *mut BamCommands,
+        _user_data: *mut c_void,
+    ) -> FfiResult {
+        FfiResult::OK
+    }
+    unsafe extern "C" fn stub_obs_mut(
+        _entity: FfiEntity,
+        _event_data: *mut u8,
+        _propagate: *mut FfiBool,
+        _commands: *mut BamCommands,
+        _user_data: *mut c_void,
+    ) -> FfiResult {
+        FfiResult::OK
+    }
+
+    let watched = [BamComponent::from_raw(2), BamComponent::from_raw(3)];
+    let life_obs = BamObserverDesc::new_lifecycle(
+        BamEventKind::ADD,
+        watched.as_ptr(),
+        watched.len(),
+        stub_obs_ro,
+        core::ptr::null_mut(),
+    );
+    assert_eq!(life_obs.validate(), FfiResult::OK);
+
+    let ready_obs = BamObserverDesc::new_lifecycle(
+        BamEventKind::READY,
+        core::ptr::null(),
+        0,
+        stub_obs_ro,
+        core::ptr::null_mut(),
+    );
+    assert_eq!(ready_obs.validate(), FfiResult::OK);
+
+    let mut_obs = BamObserverDesc::new_mut(asset_ty, stub_obs_mut, core::ptr::null_mut())
+        .with_propagate(BamComponent::from_raw(1));
+    assert!(mut_obs.is_propagating());
+    assert_eq!(mut_obs.flags, BAM_OBSERVER_FLAG_PROPAGATE);
+    assert_eq!(mut_obs.validate(), FfiResult::OK);
+
+    let mut payload = 42u32;
+    let trig = BamTriggerDesc::new(asset_ty, (&raw mut payload).cast::<u8>(), size_of::<u32>())
+        .with_entity(FfiEntity::from_bits(1234))
+        .with_propagate(BamComponent::INVALID);
+    assert!(trig.is_propagating());
+    assert_eq!(trig.flags, BAM_TRIGGER_FLAG_PROPAGATE);
+    assert_eq!(trig.entity().to_bits(), 1234);
+    assert_eq!(trig.validate(), FfiResult::OK);
+
+    // 5. Extended BamSystemDesc & BamColumnInfo summary_tick
+    let weak_sets = [c"host::Physics".as_ptr()];
+    let sys_ext = BamSystemDesc::new(
+        c"ext_sys".as_ptr(),
+        core::ptr::null(),
+        0,
+        stub_system_cb,
+        core::ptr::null_mut(),
+    )
+    .with_ambiguous_with_all()
+    .with_after_weak(weak_sets.as_ptr(), weak_sets.len())
+    .with_before_weak(weak_sets.as_ptr(), weak_sets.len())
+    .with_ambiguous_with(weak_sets.as_ptr(), weak_sets.len());
+    assert!(sys_ext.is_ambiguous_with_all());
+    assert_eq!(sys_ext.flags, BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL);
+    assert_eq!(sys_ext.validate(), FfiResult::OK);
+
+    let col_summary = BamColumnInfo {
+        component: asset_ty,
+        mode: AccessMode::READ,
+        uuid: ComponentUuid::ZERO,
+        size: 4,
+        align: 4,
+        storage_flags: BAM_STORAGE_FLAG_SUMMARY_TICK,
+        reserved0: 0,
+    };
+    assert!(col_summary.is_summary_tick());
 }

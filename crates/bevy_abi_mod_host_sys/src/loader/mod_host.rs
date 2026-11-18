@@ -181,7 +181,10 @@ unsafe fn guest_observer_runner(
         let allocator = cell.entity_allocator();
         let mut host_cmds = HostCommands::new(&mut storage, allocator, &snap);
         let GuestFnPtr(callback) = binding.callback;
-        let data_ptr = if binding.event_size == 0 {
+        let wire_entity = target_ffi;
+        let data_ptr = if binding.synthesizes_ffi_entity_payload {
+            (&raw const wire_entity).cast::<c_void>()
+        } else if binding.event_size == 0 {
             core::ptr::null()
         } else {
             event_ptr.as_ptr().cast::<c_void>()
@@ -942,14 +945,26 @@ pub fn excise_and_unload_mod_in_world<F: FnOnce(&mut World)>(
 
     before_dlclose(world);
 
-    let (mod_name, unloaded_path) = {
+    let (mod_name, unloaded_path, still_has_same_name) = {
         let mut mod_host = world
             .get_resource_mut::<ModHost>()
             .ok_or(ModLoadError::ModNotFound { id })?;
         // SAFETY: `world` is exclusively borrowed, drop trampolines are disarmed, schedule sets
         // are excised, and guest VTable/symbol pointers are evicted prior to `shutdown` + `dlclose`.
-        unsafe { mod_host.try_unload_mod(id, true)? }
+        let (name, path) = unsafe { mod_host.try_unload_mod(id, true)? };
+        let shared = mod_host
+            .loaded_libraries
+            .iter()
+            .any(|m| m.is_active() && m.name == name);
+        (name, path, shared)
     };
+
+    if !still_has_same_name
+        && let Some(registry) = world.get_resource::<ModRegistry>()
+        && let Some(asset_backend) = registry.asset_backend()
+    {
+        asset_backend.release_all_for_owner(mod_name.as_ref());
+    }
 
     Ok((mod_name, unloaded_path, removed_systems))
 }

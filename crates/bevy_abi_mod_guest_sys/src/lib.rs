@@ -30,13 +30,15 @@ pub mod trampoline;
 
 pub use bevy_abi_mod_sys::{BamSystemCtx, FfiBool, FfiResult};
 
-pub use commands::{SpawnEntry, ValidatedCommands};
+pub use commands::{SpawnBatchColumn, SpawnEntry, ValidatedCommands};
 pub use component::{
-    PodComponentHooks, generic_drop_trampoline, register_component_raw,
+    PodComponentHooks, generic_drop_trampoline, pod_clone_trampoline, register_component_raw,
     register_component_with_layout, register_dynamic_component_with_drop, register_pod_component,
     register_pod_component_with_hooks, resolve_component,
 };
-pub use host::{CUSTOM_SYMBOL_PREFIX, Host, ValidatedLoadCtx};
+pub use host::{
+    CUSTOM_SYMBOL_PREFIX, Host, ValidatedLoadCtx, ValidatedStringVTable, ValidatedWireVTable,
+};
 pub use instance::{
     GuestInstance, guest_restore_state_trampoline, guest_save_state_trampoline,
     init_guest_instance, shutdown_guest_instance,
@@ -49,7 +51,8 @@ pub use panic::{catch_guest_bool, catch_guest_result, catch_guest_unit};
 pub use trampoline::{
     PreparedRunIf, ReentrantCell, SystemRegistrationConfig, ValidatedSystemInvocation,
     ValidatedSystemRef, allocate_run_if_trampoline, allocate_system_trampoline,
-    register_observer_closure, register_system_closure,
+    register_lifecycle_observer_closure, register_observer_closure,
+    register_observer_closure_with_options, register_observer_mut_closure, register_system_closure,
 };
 
 #[cfg(test)]
@@ -399,6 +402,18 @@ mod tests {
             sys_res_mut_ptr: None,
             register_observer: None,
             cmd_trigger: None,
+            cmd_spawn_persistent: None,
+            cmd_spawn_batch: None,
+            cmd_despawn_all: None,
+            cmd_insert_if_new: None,
+            cmd_trigger_ex: None,
+            cmd_observe: None,
+            iter_read_removed: None,
+            sys_entity_children: None,
+            asset_load: None,
+            asset_get_load_state: None,
+            asset_release: None,
+            cmd_spawn_scene: None,
         }
     }
 
@@ -715,5 +730,106 @@ mod tests {
 
         let _ = BAM_STORAGE_FLAG_SPARSE_SET;
         let _ = AccessMode::READ;
+    }
+
+    #[test]
+    fn wave0_runtime_observer_alloc_tracking_and_unsupported_fallbacks() {
+        static OBS_DROPS: AtomicUsize = AtomicUsize::new(0);
+        struct ObsDropGuard;
+        impl Drop for ObsDropGuard {
+            fn drop(&mut self) {
+                OBS_DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let mut api = make_mock_api();
+        unsafe extern "C" fn mock_cmd_observe(
+            _cmds: *mut BamCommands,
+            desc: *const bevy_abi_mod_sys::BamObserverDesc,
+            out_entity: *mut FfiEntity,
+        ) -> FfiResult {
+            if desc.is_null() || out_entity.is_null() {
+                return FfiResult::NULL_POINTER;
+            }
+            // SAFETY: `desc` and `out_entity` are valid in this unit test.
+            unsafe {
+                let st = (*desc).validate();
+                if !st.is_ok() {
+                    return st;
+                }
+                *out_entity = FfiEntity::from_bits(77);
+            }
+            FfiResult::OK
+        }
+        api.cmd_observe = Some(mock_cmd_observe);
+
+        let mut world = MockWorldCtx {
+            error_msg: b"",
+            spawned: 0,
+            last_inserted_val: 0,
+        };
+        let manifest = BamManifest::new(c"obs_mod".as_ptr(), c"0.2.0".as_ptr());
+        let mut raw_inst: *mut BamInstance = core::ptr::null_mut();
+
+        // SAFETY: Valid mock pointers.
+        let status = unsafe {
+            init_guest_instance(
+                &api,
+                (&raw mut world).cast::<BamLoadCtx>(),
+                &mut raw_inst,
+                &manifest,
+                |inst, _load| {
+                    let host = *inst.host();
+                    // Both typed and untyped (`BamComponent::INVALID`) asset loads forward to the
+                    // host slot (returning `UNSUPPORTED` when the mock slot is `None`).
+                    assert_eq!(
+                        host.asset_load(BamComponent::from_raw(1), "mods://a.png"),
+                        Err(FfiResult::UNSUPPORTED)
+                    );
+                    assert_eq!(
+                        host.asset_load(BamComponent::INVALID, "mods://untyped.bsn"),
+                        Err(FfiResult::UNSUPPORTED)
+                    );
+                    // Zero-copy `entity_children` accepts `BamComponent::INVALID` (defaulting to `Children`).
+                    let inv = ValidatedSystemInvocation::from_raw(
+                        (&raw mut world).cast(),
+                        &host,
+                        0,
+                        0,
+                        None,
+                    );
+                    assert_eq!(
+                        inv.system_ref()
+                            .entity_children(FfiEntity::from_bits(5), BamComponent::INVALID),
+                        Err(FfiResult::UNSUPPORTED)
+                    );
+                    let mut cmds = ValidatedCommands::from_raw((&raw mut world).cast(), &host);
+                    let guard = ObsDropGuard;
+                    let ent = cmds
+                        .observe::<u32, _>(
+                            Some("runtime_obs"),
+                            BamComponent::from_raw(3),
+                            FfiEntity::NULL,
+                            0,
+                            BamComponent::INVALID,
+                            move |_e, _val, _c| {
+                                let _ = &guard;
+                                FfiResult::OK
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(ent.to_bits(), 77);
+                    assert_eq!(inst.allocation_count(), 2);
+                    FfiResult::OK
+                },
+            )
+        };
+        assert_eq!(status, FfiResult::OK);
+        assert_eq!(OBS_DROPS.load(Ordering::SeqCst), 0);
+
+        // Shutting down the instance drops the runtime observer closure cleanly!
+        // SAFETY: `raw_inst` was produced by `init_guest_instance`.
+        unsafe { shutdown_guest_instance(raw_inst) };
+        assert_eq!(OBS_DROPS.load(Ordering::SeqCst), 1);
     }
 }

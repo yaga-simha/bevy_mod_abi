@@ -807,6 +807,12 @@ mod archetype_and_permission_boundaries {
             run_if_user_data: core::ptr::null_mut(),
             in_sets: core::ptr::null(),
             in_set_count: 0,
+            after_weak: core::ptr::null(),
+            after_weak_count: 0,
+            before_weak: core::ptr::null(),
+            before_weak_count: 0,
+            ambiguous_with: core::ptr::null(),
+            ambiguous_with_count: 0,
         };
         assert_eq!(
             unsafe { host_register_system(core::ptr::null_mut(), &valid_sys_desc) },
@@ -877,6 +883,12 @@ mod archetype_and_permission_boundaries {
             run_if_user_data: core::ptr::null_mut(),
             in_sets: core::ptr::null(),
             in_set_count: 0,
+            after_weak: core::ptr::null(),
+            after_weak_count: 0,
+            before_weak: core::ptr::null(),
+            before_weak_count: 0,
+            ambiguous_with: core::ptr::null(),
+            ambiguous_with_count: 0,
         };
         let mut load_ctx = LoadContext::new(registry);
         assert_eq!(

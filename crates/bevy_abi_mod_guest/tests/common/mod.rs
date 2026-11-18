@@ -1411,5 +1411,17 @@ pub fn make_mock_host_api() -> BamHostApi {
         sys_res_mut_ptr: None,
         register_observer: None,
         cmd_trigger: None,
+        cmd_spawn_persistent: None,
+        cmd_spawn_batch: None,
+        cmd_despawn_all: None,
+        cmd_insert_if_new: None,
+        cmd_trigger_ex: None,
+        cmd_observe: None,
+        iter_read_removed: None,
+        sys_entity_children: None,
+        asset_load: None,
+        asset_get_load_state: None,
+        asset_release: None,
+        cmd_spawn_scene: None,
     }
 }

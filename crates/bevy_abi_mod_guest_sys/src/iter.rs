@@ -5,11 +5,15 @@ use core::{ffi::c_void, marker::PhantomData, mem::MaybeUninit, ops::Index};
 
 use bevy_abi_mod_sys::{
     AbiPod, AccessMode, BamChangeTicks, BamColumnInfo, BamComponent, BamHostApi, BamIter,
-    BamMsgReadBatchFn, BamMsgSendFn, BamMsgWriteBatchFn, BamParForEachChunkFn, BamResTicksFn,
-    ComponentUuid, FfiEntity, FfiResult, MAX_TERMS_PER_QUERY,
+    BamIterReadRemovedFn, BamMsgReadBatchFn, BamMsgSendFn, BamMsgWriteBatchFn,
+    BamParForEachChunkFn, BamResTicksFn, ComponentUuid, FfiBool, FfiEntity, FfiResult,
+    MAX_TERMS_PER_QUERY, StrView,
 };
 
-use crate::{host::Host, panic::catch_guest_result};
+use crate::{
+    host::{Host, ValidatedStringVTable, ValidatedWireVTable},
+    panic::catch_guest_result,
+};
 
 /// Expected [`ComponentUuid`] predicate for typed column and resource introspection.
 ///
@@ -1936,6 +1940,412 @@ impl<'a> ValidatedIter<'a> {
         // `MESSAGE_WRITE`, and `data_ptr` covers `messages.len() * size_of::<M>()` initialized bytes.
         unsafe { write_fn(self.raw, term_index, data_ptr, messages.len()) }
     }
+
+    /// Reads the synthesized per-chunk [`AccessMode::HAS`] boolean presence indicator for
+    /// `term_index` (`Some(true)` if present in the active chunk's archetype, `Some(false)` if
+    /// absent, or `None` if `term_index` was not declared with `AccessMode::HAS` or no chunk is active).
+    #[inline]
+    pub fn has_column(&self, term_index: usize) -> Option<bool> {
+        if self.raw.is_null() || self.current_len == 0 {
+            return None;
+        }
+        let info = self.column_info(term_index).ok()?;
+        if info.mode != AccessMode::HAS || info.is_resource() || info.is_message() {
+            return None;
+        }
+        let ptr = self.column_readonly_ptr(term_index);
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: For `AccessMode::HAS` on an active chunk, `iter_column_readonly` returns a
+        // non-null pointer to a 1-byte `FfiBool` (`0` or `1`).
+        Some(unsafe { (*ptr.cast::<FfiBool>()).get() })
+    }
+
+    /// Reads up to `out_entities.len()` entity IDs from a `RemovedComponents<T>` stream declared
+    /// with [`AccessMode::REMOVED_READ`] at `term_index` via `BamHostApi::iter_read_removed`.
+    pub fn read_removed_batch(
+        &mut self,
+        term_index: usize,
+        out_entities: &mut [FfiEntity],
+    ) -> Result<usize, FfiResult> {
+        if self.raw.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        if !self.host.api().covers_slot(
+            core::mem::offset_of!(BamHostApi, iter_read_removed),
+            core::mem::size_of::<Option<BamIterReadRemovedFn>>(),
+        ) {
+            return Err(FfiResult::UNSUPPORTED);
+        }
+        let Some(read_fn) = self.host.api().iter_read_removed else {
+            return Err(FfiResult::UNSUPPORTED);
+        };
+        let info = self.column_info(term_index)?;
+        if info.mode != AccessMode::REMOVED_READ || info.is_resource() || info.is_message() {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        if out_entities.is_empty() {
+            return Ok(0);
+        }
+        let mut read_count = 0usize;
+        // SAFETY: `self.raw` is active, `out_entities` provides `out_entities.len()` writable
+        // `FfiEntity` slots, and `read_count` is aligned writable stack storage.
+        let status = unsafe {
+            read_fn(
+                self.raw,
+                term_index,
+                out_entities.as_mut_ptr(),
+                out_entities.len(),
+                &mut read_count,
+            )
+        };
+        if status.is_ok() {
+            Ok(read_count.min(out_entities.len()))
+        } else {
+            Err(status)
+        }
+    }
+
+    /// Drains all unread `RemovedComponents<T>` entity IDs from `term_index` (`REMOVED_READ`).
+    pub fn drain_removed(&mut self, term_index: usize) -> Result<Vec<FfiEntity>, FfiResult> {
+        const BATCH_SIZE: usize = 64;
+        let mut all = Vec::new();
+        let mut batch = [FfiEntity::NULL; BATCH_SIZE];
+        loop {
+            let count = self.read_removed_batch(term_index, &mut batch)?;
+            all.extend_from_slice(&batch[..count]);
+            if count < BATCH_SIZE {
+                break;
+            }
+        }
+        Ok(all)
+    }
+
+    #[inline]
+    fn raw_bridged_row_ptr_ro(
+        &mut self,
+        term_index: usize,
+        row: usize,
+        expected_uuid: ComponentUuid,
+        host_size: usize,
+        host_align: usize,
+    ) -> Result<Option<*const c_void>, FfiResult> {
+        if row >= self.current_len {
+            return Err(FfiResult::OUT_OF_RANGE);
+        }
+        let info = self.column_info(term_index)?;
+        if !info.mode.has_entity_column_data()
+            || info.is_resource()
+            || info.is_message()
+            || info.uuid != expected_uuid
+            || info.size != host_size
+            || info.align != host_align
+        {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        if info.is_sparse_set() {
+            let rows_fn = self
+                .host
+                .api()
+                .iter_column_rows_readonly
+                .ok_or(FfiResult::NULL_POINTER)?;
+            // SAFETY: `self.raw` is active at `self.current_len` rows.
+            let ptrs = unsafe { rows_fn(self.raw, term_index) };
+            if ptrs.is_null() {
+                if info.mode.is_optional() {
+                    return Ok(None);
+                }
+                return Err(FfiResult::NULL_POINTER);
+            }
+            // SAFETY: `row < self.current_len` and `ptrs` covers `self.current_len` pointers.
+            let row_ptr = unsafe { *ptrs.add(row) };
+            if row_ptr.is_null() {
+                if info.mode.is_optional() {
+                    return Ok(None);
+                }
+                return Err(FfiResult::NULL_POINTER);
+            }
+            if host_size > 0 && !(row_ptr as usize).is_multiple_of(host_align) {
+                return Err(FfiResult::TYPE_MISMATCH);
+            }
+            Ok(Some(row_ptr.cast::<c_void>()))
+        } else {
+            let base = self.column_readonly_ptr(term_index);
+            if base.is_null() {
+                if info.mode.is_optional() {
+                    return Ok(None);
+                }
+                return Err(FfiResult::NULL_POINTER);
+            }
+            if host_size == 0 {
+                return Ok(Some(base.cast::<c_void>()));
+            }
+            if !(base as usize).is_multiple_of(host_align) {
+                return Err(FfiResult::TYPE_MISMATCH);
+            }
+            let offset = row.checked_mul(host_size).ok_or(FfiResult::OUT_OF_RANGE)?;
+            // SAFETY: `row < self.current_len` and `base` covers `self.current_len * host_size` bytes.
+            Ok(Some(unsafe { base.add(offset) }.cast::<c_void>()))
+        }
+    }
+
+    #[inline]
+    fn raw_bridged_row_ptr_mut(
+        &mut self,
+        term_index: usize,
+        row: usize,
+        expected_uuid: ComponentUuid,
+        host_size: usize,
+        host_align: usize,
+    ) -> Result<Option<*mut c_void>, FfiResult> {
+        if row >= self.current_len {
+            return Err(FfiResult::OUT_OF_RANGE);
+        }
+        let info = self.column_info(term_index)?;
+        if !info.mode.is_mutable()
+            || !info.mode.has_entity_column_data()
+            || info.is_immutable()
+            || info.is_resource()
+            || info.is_message()
+            || info.uuid != expected_uuid
+            || info.size != host_size
+            || info.align != host_align
+        {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        if info.is_sparse_set() {
+            let rows_fn = self
+                .host
+                .api()
+                .iter_column_rows_mutable
+                .ok_or(FfiResult::NULL_POINTER)?;
+            // SAFETY: `self.raw` is active at `self.current_len` rows under `&mut self`.
+            let ptrs = unsafe { rows_fn(self.raw, term_index) };
+            if ptrs.is_null() {
+                if info.mode.is_optional() {
+                    return Ok(None);
+                }
+                return Err(FfiResult::NULL_POINTER);
+            }
+            // SAFETY: `row < self.current_len` and `ptrs` covers `self.current_len` writable pointers.
+            let row_ptr = unsafe { *ptrs.add(row) };
+            if row_ptr.is_null() {
+                if info.mode.is_optional() {
+                    return Ok(None);
+                }
+                return Err(FfiResult::NULL_POINTER);
+            }
+            if host_size > 0 && !(row_ptr as usize).is_multiple_of(host_align) {
+                return Err(FfiResult::TYPE_MISMATCH);
+            }
+            Ok(Some(row_ptr.cast::<c_void>()))
+        } else {
+            let base = self.column_mutable_ptr(term_index);
+            if base.is_null() {
+                if info.mode.is_optional() {
+                    return Ok(None);
+                }
+                return Err(FfiResult::NULL_POINTER);
+            }
+            if host_size == 0 {
+                return Ok(Some(base.cast::<c_void>()));
+            }
+            if !(base as usize).is_multiple_of(host_align) {
+                return Err(FfiResult::TYPE_MISMATCH);
+            }
+            let offset = row.checked_mul(host_size).ok_or(FfiResult::OUT_OF_RANGE)?;
+            // SAFETY: `row < self.current_len` and `base` covers `self.current_len * host_size` bytes.
+            Ok(Some(unsafe { base.add(offset) }.cast::<c_void>()))
+        }
+    }
+
+    /// Reads row `row` of an opaque host-bridged component at `term_index` into wire `W: AbiPod`
+    /// (`Ok(None)` when absent on an optional column).
+    pub fn read_mapped_wire_row<W: AbiPod>(
+        &mut self,
+        term_index: usize,
+        row: usize,
+        vtable: &ValidatedWireVTable<W>,
+    ) -> Result<Option<W>, FfiResult> {
+        let Some(vt_get) = vtable.raw.get else {
+            return Err(FfiResult::UNSUPPORTED);
+        };
+        let Some(ptr) = self.raw_bridged_row_ptr_ro(
+            term_index,
+            row,
+            vtable.uuid(),
+            vtable.host_size(),
+            vtable.host_align(),
+        )?
+        else {
+            return Ok(None);
+        };
+        let mut out = MaybeUninit::<W>::zeroed();
+        // SAFETY: `ptr` was layout- and UUID-verified against `vtable`, and `out` is aligned writable `W`.
+        let status = unsafe { vt_get(ptr, out.as_mut_ptr()) };
+        if status.is_ok() {
+            // SAFETY: `vt_get` returned `OK`, initializing `out`.
+            Ok(Some(unsafe { out.assume_init() }))
+        } else {
+            Err(status)
+        }
+    }
+
+    /// Writes `value` (`W: AbiPod`) into row `row` of an opaque host-bridged mutable component at
+    /// `term_index`.
+    pub fn write_mapped_wire_row<W: AbiPod>(
+        &mut self,
+        term_index: usize,
+        row: usize,
+        vtable: &ValidatedWireVTable<W>,
+        value: &W,
+    ) -> FfiResult {
+        let Some(vt_set) = vtable.raw.set else {
+            return FfiResult::PERMISSION_DENIED;
+        };
+        let ptr_opt = match self.raw_bridged_row_ptr_mut(
+            term_index,
+            row,
+            vtable.uuid(),
+            vtable.host_size(),
+            vtable.host_align(),
+        ) {
+            Ok(p) => p,
+            Err(err) => return err,
+        };
+        let Some(ptr) = ptr_opt else {
+            return FfiResult::NOT_FOUND;
+        };
+        // SAFETY: `ptr` is exclusively borrowed and layout/UUID verified against `vtable`.
+        unsafe { vt_set(ptr, value) }
+    }
+
+    /// Reads an opaque host-bridged singleton resource declared at `term_index` into wire `W: AbiPod`.
+    pub fn read_mapped_wire_resource<W: AbiPod>(
+        &self,
+        term_index: usize,
+        vtable: &ValidatedWireVTable<W>,
+    ) -> Result<W, FfiResult> {
+        let Some(vt_get) = vtable.raw.get else {
+            return Err(FfiResult::UNSUPPORTED);
+        };
+        let info = self.column_info(term_index)?;
+        if !info.mode.is_resource()
+            || info.uuid != vtable.uuid()
+            || info.size != vtable.host_size()
+            || info.align != vtable.host_align()
+        {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        let ptr = self.res_ptr(term_index);
+        if ptr.is_null() {
+            return Err(FfiResult::NOT_FOUND);
+        }
+        if vtable.host_size() > 0 && !(ptr as usize).is_multiple_of(vtable.host_align()) {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        let mut out = MaybeUninit::<W>::zeroed();
+        // SAFETY: `ptr` points to the verified host resource for `&self` and `out` is writable `W`.
+        let status = unsafe { vt_get(ptr.cast::<c_void>(), out.as_mut_ptr()) };
+        if status.is_ok() {
+            // SAFETY: `vt_get` returned `OK`, initializing `out`.
+            Ok(unsafe { out.assume_init() })
+        } else {
+            Err(status)
+        }
+    }
+
+    /// Writes `value` (`W: AbiPod`) into an opaque host-bridged singleton resource declared with
+    /// `RESOURCE_WRITE` at `term_index`.
+    pub fn write_mapped_wire_resource<W: AbiPod>(
+        &mut self,
+        term_index: usize,
+        vtable: &ValidatedWireVTable<W>,
+        value: &W,
+    ) -> FfiResult {
+        let Some(vt_set) = vtable.raw.set else {
+            return FfiResult::PERMISSION_DENIED;
+        };
+        let info = match self.column_info(term_index) {
+            Ok(i) => i,
+            Err(err) => return err,
+        };
+        if info.mode != AccessMode::RESOURCE_WRITE
+            || info.is_immutable()
+            || info.uuid != vtable.uuid()
+            || info.size != vtable.host_size()
+            || info.align != vtable.host_align()
+        {
+            return FfiResult::TYPE_MISMATCH;
+        }
+        let ptr = self.res_mut_ptr(term_index);
+        if ptr.is_null() {
+            return FfiResult::NOT_FOUND;
+        }
+        if vtable.host_size() > 0 && !(ptr as usize).is_multiple_of(vtable.host_align()) {
+            return FfiResult::TYPE_MISMATCH;
+        }
+        // SAFETY: `ptr` is exclusively borrowed under `&mut self` and verified against `vtable`.
+        unsafe { vt_set(ptr.cast::<c_void>(), value) }
+    }
+
+    /// Reads row `row` of an opaque host-bridged UTF-8 string component (such as `Name`) at
+    /// `term_index` into a guest-owned `String` (`Ok(None)` when absent on an optional column).
+    pub fn read_mapped_string_row(
+        &mut self,
+        term_index: usize,
+        row: usize,
+        vtable: &ValidatedStringVTable,
+    ) -> Result<Option<String>, FfiResult> {
+        let Some(vt_get) = vtable.raw.get else {
+            return Err(FfiResult::UNSUPPORTED);
+        };
+        let Some(ptr) = self.raw_bridged_row_ptr_ro(
+            term_index,
+            row,
+            vtable.uuid(),
+            vtable.host_size(),
+            vtable.host_align(),
+        )?
+        else {
+            return Ok(None);
+        };
+        // SAFETY: `ptr` is valid for the borrow window and `vt_get` returns a borrowed `StrView`.
+        let view: StrView = unsafe { vt_get(ptr) };
+        // SAFETY: `try_as_str` validates pointer alignment, non-nullness, and UTF-8 before copying.
+        let s = unsafe { view.try_as_str() }?;
+        Ok(Some(String::from(s)))
+    }
+
+    /// Writes `text` into row `row` of an opaque host-bridged mutable UTF-8 string component at
+    /// `term_index`.
+    pub fn write_mapped_string_row(
+        &mut self,
+        term_index: usize,
+        row: usize,
+        vtable: &ValidatedStringVTable,
+        text: &str,
+    ) -> FfiResult {
+        let Some(vt_set) = vtable.raw.set else {
+            return FfiResult::PERMISSION_DENIED;
+        };
+        let ptr_opt = match self.raw_bridged_row_ptr_mut(
+            term_index,
+            row,
+            vtable.uuid(),
+            vtable.host_size(),
+            vtable.host_align(),
+        ) {
+            Ok(p) => p,
+            Err(err) => return err,
+        };
+        let Some(ptr) = ptr_opt else {
+            return FfiResult::NOT_FOUND;
+        };
+        // SAFETY: `ptr` is exclusively borrowed and `StrView::from_str(text)` is valid for this call.
+        unsafe { vt_set(ptr, StrView::from_str(text)) }
+    }
 }
 
 struct ParChunkTaskContext<'h, F> {
@@ -2324,7 +2734,7 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
         }))
     }
 
-    /// Validates and advances past a pure filter term (`FILTER_ONLY` / `WITHOUT`).
+    /// Validates and advances past a pure filter term (`FILTER_ONLY` / `WITHOUT` / `ALLOW`).
     pub fn next_filter<T: AbiPod>(
         &mut self,
         expected_mode: AccessMode,
@@ -2345,5 +2755,71 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
             return Err(FfiResult::TYPE_MISMATCH);
         }
         Ok(())
+    }
+
+    /// Validates and advances past an untyped/bridged filter term (`FILTER_ONLY` / `WITHOUT` / `ALLOW`)
+    /// without comparing `T`'s guest layout against opaque host `size`/`align`.
+    pub fn next_filter_untyped(
+        &mut self,
+        expected_mode: AccessMode,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<(), FfiResult> {
+        let term_index = self.next_term_index;
+        self.next_term_index += 1;
+        let info = self.iter.column_info(term_index)?;
+        if info.mode != expected_mode || info.is_resource() || info.is_message() {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        if let Some(filter) = expected_uuid
+            && !filter.matches(info.uuid)
+        {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        Ok(())
+    }
+
+    /// Dispenses the next `AccessMode::HAS` presence indicator for `T: AbiPod`.
+    pub fn next_has<T: AbiPod>(
+        &mut self,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<bool, FfiResult> {
+        let term_index = self.next_term_index;
+        self.next_term_index += 1;
+        let info = self.iter.column_info(term_index)?;
+        if info.mode != AccessMode::HAS || info.is_resource() || info.is_message() {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        if info.size != core::mem::size_of::<T>() || info.align != core::mem::align_of::<T>() {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        if let Some(filter) = expected_uuid
+            && !filter.matches(info.uuid)
+        {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        self.iter
+            .has_column(term_index)
+            .ok_or(FfiResult::NULL_POINTER)
+    }
+
+    /// Dispenses the next `AccessMode::HAS` presence indicator for an opaque/bridged component.
+    pub fn next_has_untyped(
+        &mut self,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<bool, FfiResult> {
+        let term_index = self.next_term_index;
+        self.next_term_index += 1;
+        let info = self.iter.column_info(term_index)?;
+        if info.mode != AccessMode::HAS || info.is_resource() || info.is_message() {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        if let Some(filter) = expected_uuid
+            && !filter.matches(info.uuid)
+        {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        self.iter
+            .has_column(term_index)
+            .ok_or(FfiResult::NULL_POINTER)
     }
 }

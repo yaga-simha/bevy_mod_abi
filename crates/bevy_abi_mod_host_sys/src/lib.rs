@@ -22,11 +22,19 @@ pub mod sync_ptr;
 pub mod system;
 
 pub use drop_trampoline::{MAX_DROP_TRAMPOLINES, WorldDropGuard};
+pub use ffi::assets_scene::{
+    HostAssetBackend, HostSceneBackend, host_asset_get_load_state, host_asset_load,
+    host_asset_release, host_cmd_spawn_scene,
+};
 pub use ffi::commands::{
     CommandArena, HostCommands, HostCommandsStorage, host_cmd_despawn, host_cmd_insert,
     host_cmd_insert_default, host_cmd_remove, host_cmd_spawn, host_cmd_spawn_empty,
     host_cmd_trigger,
 };
+pub use ffi::commands_ext::{
+    host_cmd_despawn_all, host_cmd_insert_if_new, host_cmd_spawn_batch, host_cmd_spawn_persistent,
+};
+pub use ffi::hierarchy_ext::host_sys_entity_children;
 pub use ffi::host_api::HOST_API;
 pub use ffi::iter::{
     HostIter, QueryPlan, QueryTermMeta, SparseRowScratch, TickFilterTerm, host_iter_column_info,
@@ -36,6 +44,8 @@ pub use ffi::iter::{
     host_msg_send, host_msg_write_batch, host_par_for_each_chunk, host_res_mut_ptr, host_res_ptr,
     host_res_ticks,
 };
+pub use ffi::iter_ext::host_iter_read_removed;
+pub use ffi::observers_ext::{host_cmd_observe, host_cmd_trigger_ex};
 pub use ffi::proc_address::host_get_proc_address;
 pub use ffi::register::{
     GuestObserverBinding, LoadContext, host_load_host_ctx, host_register_component,
@@ -62,8 +72,9 @@ pub use loader::{
 };
 pub use registry::{
     ComponentCollisionError, ComponentOptions, CreateMsgCursorFn, ExtractEventTargetFn,
-    InsertDefaultFn, InsertRawFn, ModRegistry, MsgReadBatchFn, MsgSendFn, MsgWriteBatchFn,
-    RegisteredComponent, RegistrySnapshot, TargetEntity, TriggerEventFn,
+    ExtractRelationshipTargetsFn, HostStringBridge, HostWireBridge, InsertDefaultFn, InsertRawFn,
+    ModRegistry, MsgReadBatchFn, MsgSendFn, MsgWriteBatchFn, RegisteredComponent, RegistrySnapshot,
+    TargetEntity, TriggerEventFn,
 };
 pub use schedule::{
     ModNamedSystemSet, ModScheduleMap, ModSystemSet, ModVisibleSets, StartupCompleted,

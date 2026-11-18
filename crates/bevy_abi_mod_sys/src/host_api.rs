@@ -7,8 +7,9 @@ use core::{
 
 use crate::{
     commands::{
-        BamCmdDespawnFn, BamCmdInsertDefaultFn, BamCmdInsertFn, BamCmdRemoveFn, BamCmdSpawnEmptyFn,
-        BamCmdSpawnFn, BamCmdTriggerFn, BamCommands,
+        BamCmdDespawnAllFn, BamCmdDespawnFn, BamCmdInsertDefaultFn, BamCmdInsertFn,
+        BamCmdObserveFn, BamCmdRemoveFn, BamCmdSpawnBatchFn, BamCmdSpawnEmptyFn, BamCmdSpawnFn,
+        BamCmdSpawnSceneFn, BamCmdTriggerExFn, BamCmdTriggerFn, BamCommands,
     },
     component::ComponentDesc,
     extensible::ExtensibleStruct,
@@ -16,10 +17,13 @@ use crate::{
         BamChangeTicks, BamIter, BamIterColumnInfoFn, BamIterColumnMutableFn,
         BamIterColumnMutableUntrackedFn, BamIterColumnReadonlyFn, BamIterColumnRowsMutableFn,
         BamIterColumnRowsReadonlyFn, BamIterEntitiesFn, BamIterMarkChangedRangeFn,
-        BamIterNextChunkFn, BamIterResetFn, BamMsgReadBatchFn, BamMsgSendFn, BamMsgWriteBatchFn,
-        BamParForEachChunkFn, BamResMutPtrFn, BamResPtrFn, BamResTicksFn,
+        BamIterNextChunkFn, BamIterReadRemovedFn, BamIterResetFn, BamMsgReadBatchFn, BamMsgSendFn,
+        BamMsgWriteBatchFn, BamParForEachChunkFn, BamResMutPtrFn, BamResPtrFn, BamResTicksFn,
     },
-    primitives::{BamComponent, ComponentUuid, FfiEntity, FfiResult},
+    primitives::{
+        BamComponent, ComponentUuid, FfiAssetHandle, FfiAssetLoadState, FfiEntity, FfiResult,
+        StrView,
+    },
     system::{BamHostCtx, BamLoadCtx, BamObserverDesc, BamSystemCtx, BamSystemDesc},
     version::{ABI_VERSION, abi_version_is_compatible},
 };
@@ -428,6 +432,67 @@ pub type BamSysResMutPtrFn = unsafe extern "C" fn(
 pub type BamRegisterObserverFn =
     unsafe extern "C" fn(load_ctx: *mut BamLoadCtx, desc: *const BamObserverDesc) -> FfiResult;
 
+/// Borrows the contiguous slice of child or relationship-target [`FfiEntity`] identifiers attached
+/// to `entity` under `relationship_target` (`BamComponent::INVALID` defaults to Bevy's built-in
+/// `Children` component), writing the zero-copy pointer and element count into `*out_entities` and
+/// `*out_len`.
+///
+/// When `entity` has zero children/targets, writes `*out_len = 0` and returns [`FfiResult::OK`]
+/// (`*out_entities` may be null when `*out_len == 0`). When `*out_len > 0`, `*out_entities` is
+/// non-null, 8-byte aligned, and valid for shared reads throughout the enclosing [`BamSystemFn`]
+/// invocation (or until a mutable borrow of the same component).
+///
+/// Requires declared shared read (or write) access to `Children` / `relationship_target` in the
+/// running system's `FilteredAccessSet`.
+///
+/// # Safety
+/// - `sys_ctx` must point to an active [`BamSystemCtx`].
+/// - `out_entities` must point to writable `*const FfiEntity` storage.
+/// - `out_len` must point to writable `usize` storage.
+pub type BamSysEntityChildrenFn = unsafe extern "C" fn(
+    sys_ctx: *const BamSystemCtx,
+    entity: FfiEntity,
+    relationship_target: BamComponent,
+    out_entities: *mut *const FfiEntity,
+    out_len: *mut usize,
+) -> FfiResult;
+
+/// Requests asynchronous asset loading for `path` (`StrView`, e.g. `"mod://combat/sword.png"`) of
+/// pre-resolved `asset_type` (`BamComponent::INVALID` for untyped load when supported), retaining a
+/// strong handle on the host and writing its [`FfiAssetHandle`] into `*out_handle`.
+///
+/// # Safety
+/// - `ctx` must point to an active [`BamHostCtx`].
+/// - `path` must point to valid UTF-8 bytes when `path.len > 0`.
+/// - `out_handle` must point to writable [`FfiAssetHandle`] storage.
+pub type BamAssetLoadFn = unsafe extern "C" fn(
+    ctx: *const BamHostCtx,
+    asset_type: BamComponent,
+    path: StrView,
+    out_handle: *mut FfiAssetHandle,
+) -> FfiResult;
+
+/// Queries the current [`FfiAssetLoadState`] of `handle` from the host `AssetServer`, writing it
+/// into `*out_state`.
+///
+/// # Safety
+/// - `ctx` must point to an active [`BamHostCtx`].
+/// - `handle` must point to a readable [`FfiAssetHandle`].
+/// - `out_state` must point to writable [`FfiAssetLoadState`] storage.
+pub type BamAssetGetLoadStateFn = unsafe extern "C" fn(
+    ctx: *const BamHostCtx,
+    handle: *const FfiAssetHandle,
+    out_state: *mut FfiAssetLoadState,
+) -> FfiResult;
+
+/// Releases the host-retained strong handle for `handle`.
+///
+/// # Safety
+/// - `ctx` must point to an active [`BamHostCtx`].
+/// - `handle` must point to a readable [`FfiAssetHandle`].
+pub type BamAssetReleaseFn =
+    unsafe extern "C" fn(ctx: *const BamHostCtx, handle: *const FfiAssetHandle) -> FfiResult;
+
 /// Complete versioned host function table passed to `bevy_abi_mod_init`
 /// (`typedef struct BamHostApi BamHostApi;`).
 ///
@@ -435,8 +500,8 @@ pub type BamRegisterObserverFn =
 /// null-pointer checks are sound without raw pointer byte-probing.
 ///
 /// Layout:
-/// - 64-bit: `MIN_V0_2_SIZE = 224` bytes (`8`B header + `27 * 8`B core slots; `size_of = 312` bytes with 11 optional extended slots), `8`-byte alignment.
-/// - 32-bit: `MIN_V0_2_SIZE = 116` bytes (`8`B header + `27 * 4`B core slots; `size_of = 160` bytes with 11 optional extended slots), `4`-byte alignment.
+/// - 64-bit: `MIN_V0_2_SIZE = 224` bytes (`8`B header + `27 * 8`B core slots; `size_of = 408` bytes with 23 optional extended slots), `8`-byte alignment.
+/// - 32-bit: `MIN_V0_2_SIZE = 116` bytes (`8`B header + `27 * 4`B core slots; `size_of = 208` bytes with 23 optional extended slots), `4`-byte alignment.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct BamHostApi {
@@ -534,6 +599,32 @@ pub struct BamHostApi {
     pub register_observer: Option<BamRegisterObserverFn>,
     /// Deferred `world.trigger(...)` event emission (`offset 304` / `156`).
     pub cmd_trigger: Option<BamCmdTriggerFn>,
+
+    // Extended entity commands, lifecycle observers, removed components, hierarchy, assets & scenes
+    /// Spawn an entity that persists across mod unload (`offset 312` / `160`).
+    pub cmd_spawn_persistent: Option<BamCmdSpawnFn>,
+    /// Bulk SoA multi-entity spawn (`offset 320` / `164`).
+    pub cmd_spawn_batch: Option<BamCmdSpawnBatchFn>,
+    /// Bulk filter-matched `World::despawn_all` (`offset 328` / `168`).
+    pub cmd_despawn_all: Option<BamCmdDespawnAllFn>,
+    /// Conditional component insertion (`InsertMode::Keep`, `offset 336` / `172`).
+    pub cmd_insert_if_new: Option<BamCmdInsertFn>,
+    /// Extended trigger with lifecycle, component targets, and propagation (`offset 344` / `176`).
+    pub cmd_trigger_ex: Option<BamCmdTriggerExFn>,
+    /// Deferred runtime observer spawning (`offset 352` / `180`).
+    pub cmd_observe: Option<BamCmdObserveFn>,
+    /// Lifecycle `RemovedComponents<T>` batch entity reader (`offset 360` / `184`).
+    pub iter_read_removed: Option<BamIterReadRemovedFn>,
+    /// Read `Children` or custom `RelationshipTarget` entities on `entity` (`offset 368` / `188`).
+    pub sys_entity_children: Option<BamSysEntityChildrenFn>,
+    /// Request async asset load via `AssetServer` (`offset 376` / `192`).
+    pub asset_load: Option<BamAssetLoadFn>,
+    /// Query `FfiAssetLoadState` for an `FfiAssetHandle` (`offset 384` / `196`).
+    pub asset_get_load_state: Option<BamAssetGetLoadStateFn>,
+    /// Release host-retained strong `FfiAssetHandle` (`offset 392` / `200`).
+    pub asset_release: Option<BamAssetReleaseFn>,
+    /// Deferred scene asset spawning (`offset 400` / `204`).
+    pub cmd_spawn_scene: Option<BamCmdSpawnSceneFn>,
 }
 
 impl BamHostApi {
@@ -613,7 +704,7 @@ impl BamHostApi {
             && self.cmd_remove.is_some()
     }
 
-    /// Returns `true` if all 38 ABI `0.2` core and extended function-pointer slots are `Some`.
+    /// Returns `true` if all 50 ABI `0.2` core and extended function-pointer slots are `Some`.
     #[inline]
     pub const fn has_all_slots(&self) -> bool {
         self.has_all_v0_2_slots()
@@ -628,6 +719,18 @@ impl BamHostApi {
             && self.sys_res_mut_ptr.is_some()
             && self.register_observer.is_some()
             && self.cmd_trigger.is_some()
+            && self.cmd_spawn_persistent.is_some()
+            && self.cmd_spawn_batch.is_some()
+            && self.cmd_despawn_all.is_some()
+            && self.cmd_insert_if_new.is_some()
+            && self.cmd_trigger_ex.is_some()
+            && self.cmd_observe.is_some()
+            && self.iter_read_removed.is_some()
+            && self.sys_entity_children.is_some()
+            && self.asset_load.is_some()
+            && self.asset_get_load_state.is_some()
+            && self.asset_release.is_some()
+            && self.cmd_spawn_scene.is_some()
     }
 
     /// Validates `struct_size >= MIN_V0_2_SIZE`, SemVer compatibility against `guest_version`,
@@ -652,7 +755,7 @@ const _: () = {
     #[cfg(target_pointer_width = "64")]
     {
         assert!(BamHostApi::MIN_V0_2_SIZE == 224);
-        assert!(core::mem::size_of::<BamHostApi>() == 312);
+        assert!(core::mem::size_of::<BamHostApi>() == 408);
         assert!(core::mem::align_of::<BamHostApi>() == 8);
         assert!(core::mem::offset_of!(BamHostApi, struct_size) == 0);
         assert!(core::mem::offset_of!(BamHostApi, abi_version) == 4);
@@ -694,11 +797,23 @@ const _: () = {
         assert!(core::mem::offset_of!(BamHostApi, sys_res_mut_ptr) == 288);
         assert!(core::mem::offset_of!(BamHostApi, register_observer) == 296);
         assert!(core::mem::offset_of!(BamHostApi, cmd_trigger) == 304);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_spawn_persistent) == 312);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_spawn_batch) == 320);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_despawn_all) == 328);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_insert_if_new) == 336);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_trigger_ex) == 344);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_observe) == 352);
+        assert!(core::mem::offset_of!(BamHostApi, iter_read_removed) == 360);
+        assert!(core::mem::offset_of!(BamHostApi, sys_entity_children) == 368);
+        assert!(core::mem::offset_of!(BamHostApi, asset_load) == 376);
+        assert!(core::mem::offset_of!(BamHostApi, asset_get_load_state) == 384);
+        assert!(core::mem::offset_of!(BamHostApi, asset_release) == 392);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_spawn_scene) == 400);
     }
     #[cfg(target_pointer_width = "32")]
     {
         assert!(BamHostApi::MIN_V0_2_SIZE == 116);
-        assert!(core::mem::size_of::<BamHostApi>() == 160);
+        assert!(core::mem::size_of::<BamHostApi>() == 208);
         assert!(core::mem::align_of::<BamHostApi>() == 4);
         assert!(core::mem::offset_of!(BamHostApi, struct_size) == 0);
         assert!(core::mem::offset_of!(BamHostApi, abi_version) == 4);
@@ -740,6 +855,18 @@ const _: () = {
         assert!(core::mem::offset_of!(BamHostApi, sys_res_mut_ptr) == 148);
         assert!(core::mem::offset_of!(BamHostApi, register_observer) == 152);
         assert!(core::mem::offset_of!(BamHostApi, cmd_trigger) == 156);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_spawn_persistent) == 160);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_spawn_batch) == 164);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_despawn_all) == 168);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_insert_if_new) == 172);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_trigger_ex) == 176);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_observe) == 180);
+        assert!(core::mem::offset_of!(BamHostApi, iter_read_removed) == 184);
+        assert!(core::mem::offset_of!(BamHostApi, sys_entity_children) == 188);
+        assert!(core::mem::offset_of!(BamHostApi, asset_load) == 192);
+        assert!(core::mem::offset_of!(BamHostApi, asset_get_load_state) == 196);
+        assert!(core::mem::offset_of!(BamHostApi, asset_release) == 200);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_spawn_scene) == 204);
     }
 };
 

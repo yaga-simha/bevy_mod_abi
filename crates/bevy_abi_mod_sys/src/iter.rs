@@ -35,6 +35,9 @@ pub const BAM_STORAGE_FLAG_EVENT: u32 = 1 << 4;
 /// Registered type is an entity-targeted Bevy `EntityEvent`.
 pub const BAM_STORAGE_FLAG_ENTITY_EVENT: u32 = 1 << 5;
 
+/// Dense `Table` column maintains a Bevy 0.20 per-table `summary_tick` for fast tick-filter skipping.
+pub const BAM_STORAGE_FLAG_SUMMARY_TICK: u32 = 1 << 6;
+
 /// Maximum change-tick relative age matching `bevy_ecs::change_detection::MAX_CHANGE_AGE`.
 pub const BAM_MAX_CHANGE_AGE: u32 = u32::MAX - (2 * 518_400_000 - 1);
 
@@ -158,6 +161,12 @@ impl BamColumnInfo {
         (self.storage_flags & BAM_STORAGE_FLAG_ENTITY_EVENT) != 0
     }
 
+    /// Returns `true` if `BAM_STORAGE_FLAG_SUMMARY_TICK` is set.
+    #[inline]
+    pub const fn is_summary_tick(&self) -> bool {
+        (self.storage_flags & BAM_STORAGE_FLAG_SUMMARY_TICK) != 0
+    }
+
     /// Returns `true` if `(uuid, size, align)` match the expected guest type metadata.
     #[inline]
     pub fn matches_layout(&self, expected_uuid: ComponentUuid, size: usize, align: usize) -> bool {
@@ -215,6 +224,10 @@ pub type BamIterEntitiesFn = unsafe extern "C" fn(iter: *const BamIter) -> *cons
 
 /// Returns a read-only byte pointer to dense column `term_index` in the current chunk, or null
 /// if out of bounds, absent on an optional term, sparse-set stored, or non-column filter/resource.
+///
+/// For [`AccessMode::HAS`](crate::AccessMode::HAS) terms on an active chunk, returns a non-null
+/// pointer to a 1-byte [`crate::FfiBool`] (`1` when the component is present in the chunk's
+/// archetype, `0` when absent) for both `Table` and `SparseSet` components without borrowing `&T`.
 ///
 /// # Safety
 /// `iter` must point to an active [`BamIter`] positioned at a valid chunk.
@@ -372,4 +385,21 @@ pub type BamResTicksFn = unsafe extern "C" fn(
     iter: *const BamIter,
     term_index: usize,
     out_ticks: *mut BamChangeTicks,
+) -> FfiResult;
+
+/// Reads up to `max_count` removed-component [`FfiEntity`] identifiers from the lifecycle
+/// `RemovedComponents<T>` stream declared with [`AccessMode::REMOVED_READ`] at `term_index` into
+/// `out_entities[0..max_count]`, advancing the per-system removal cursor and writing the count of
+/// entities copied into `*out_read`.
+///
+/// # Safety
+/// - `iter` must point to an active [`BamIter`] belonging to the running system invocation.
+/// - `out_read` must point to writable `usize` storage.
+/// - When `max_count > 0`, `out_entities` must point to at least `max_count` writable [`FfiEntity`] slots.
+pub type BamIterReadRemovedFn = unsafe extern "C" fn(
+    iter: *mut BamIter,
+    term_index: usize,
+    out_entities: *mut FfiEntity,
+    max_count: usize,
+    out_read: *mut usize,
 ) -> FfiResult;

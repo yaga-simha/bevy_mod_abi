@@ -42,6 +42,9 @@ pub struct GuestObserverBinding {
     pub event_key: EventKey,
     /// Payload size (`size_of::<E>()`).
     pub event_size: usize,
+    /// Whether `guest_observer_runner` synthesizes an aligned [`bevy_abi_mod_sys::FfiEntity`] payload
+    /// on the stack rather than passing raw `&E` bytes.
+    pub synthesizes_ffi_entity_payload: bool,
     /// Optional watched target entity (`None` for global observers).
     pub target_entity: Option<Entity>,
     /// Extractor returning the target entity from typed host `EntityEvent` payloads.
@@ -417,6 +420,18 @@ pub unsafe extern "C" fn host_register_component(
         return val_status;
     }
 
+    if desc.on_insert.is_some()
+        || desc.on_discard.is_some()
+        || desc.on_despawn.is_some()
+        || desc.clone_fn.is_some()
+        || desc.required_component_count > 0
+    {
+        ctx.host_ctx.set_last_error(
+            "extended ComponentDesc hooks/clone/required_components not yet active in this build",
+        );
+        return FfiResult::UNSUPPORTED;
+    }
+
     let Some(layout) = desc.layout() else {
         ctx.host_ctx
             .set_last_error("ComponentDesc size/align violates C struct layout invariants");
@@ -786,6 +801,36 @@ pub unsafe extern "C" fn host_register_system(
             return status;
         }
     };
+    // SAFETY: `desc.validate()` verified `after_weak` is non-null when `after_weak_count > 0`.
+    let after_weak_res = unsafe { parse_ordering_targets(desc.after_weak, desc.after_weak_count) };
+    if let Err((status, msg)) = after_weak_res {
+        ctx.host_ctx.set_last_error(msg);
+        return status;
+    }
+    // SAFETY: `desc.validate()` verified `before_weak` is non-null when `before_weak_count > 0`.
+    let before_weak_res =
+        unsafe { parse_ordering_targets(desc.before_weak, desc.before_weak_count) };
+    if let Err((status, msg)) = before_weak_res {
+        ctx.host_ctx.set_last_error(msg);
+        return status;
+    }
+    // SAFETY: `desc.validate()` verified `ambiguous_with` is non-null when `ambiguous_with_count > 0`.
+    let ambiguous_res =
+        unsafe { parse_ordering_targets(desc.ambiguous_with, desc.ambiguous_with_count) };
+    if let Err((status, msg)) = ambiguous_res {
+        ctx.host_ctx.set_last_error(msg);
+        return status;
+    }
+    if desc.is_ambiguous_with_all()
+        || desc.after_weak_count > 0
+        || desc.before_weak_count > 0
+        || desc.ambiguous_with_count > 0
+    {
+        ctx.host_ctx.set_last_error(
+            "weak ordering and schedule ambiguity flags are not yet active in this build",
+        );
+        return FfiResult::UNSUPPORTED;
+    }
 
     let run_if = desc.run_if.map(|cb| (cb, desc.run_if_user_data));
 
@@ -858,6 +903,17 @@ pub unsafe extern "C" fn host_register_observer(
         return validation;
     }
 
+    if !desc.event_kind.is_custom()
+        || desc.mut_callback.is_some()
+        || desc.watched_component_count > 0
+        || desc.is_propagating()
+    {
+        ctx.host_ctx.set_last_error(
+            "lifecycle, watched-component, mutable, and propagating observers are not yet active in this build",
+        );
+        return FfiResult::UNSUPPORTED;
+    }
+
     let obs_name: Arc<str> = if desc.name.is_null() {
         Arc::from("<unnamed_observer>")
     } else {
@@ -920,6 +976,7 @@ pub unsafe extern "C" fn host_register_observer(
         event_id: meta.component_id,
         event_key,
         event_size: meta.size,
+        synthesizes_ffi_entity_payload: meta.synthesizes_ffi_entity_payload,
         target_entity,
         extract_target_fn: meta.extract_event_target_fn,
         callback: GuestFnPtr(callback),

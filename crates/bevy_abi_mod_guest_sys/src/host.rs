@@ -4,8 +4,10 @@
 use core::ffi::{CStr, c_void};
 
 use bevy_abi_mod_sys::{
-    ABI_VERSION, AbiPod, BamComponent, BamHostApi, BamHostCtx, BamLoadCtx, ComponentUuid,
-    FfiResult, VTableHeader, read_descriptor,
+    ABI_VERSION, AbiPod, BamAssetGetLoadStateFn, BamAssetLoadFn, BamAssetReleaseFn, BamComponent,
+    BamEventKind, BamHostApi, BamHostCtx, BamLoadCtx, ComponentUuid, FfiAssetHandle,
+    FfiAssetLoadState, FfiResult, MappedStringVTable, MappedWireVTable, StrView, VTableHeader,
+    read_descriptor,
 };
 
 use crate::{
@@ -13,10 +15,12 @@ use crate::{
         PodComponentHooks, register_component_with_layout, register_pod_component,
         register_pod_component_with_hooks,
     },
-    instance::GuestInstance,
+    instance::{GuestInstance, RuntimeAllocTracker},
     trampoline::{
         PreparedRunIf, SystemRegistrationConfig, ValidatedSystemInvocation,
-        register_observer_closure, register_system_closure,
+        register_lifecycle_observer_closure, register_observer_closure,
+        register_observer_closure_with_options, register_observer_mut_closure,
+        register_system_closure,
     },
 };
 
@@ -45,6 +49,89 @@ unsafe impl Send for ManifestNamePtr {}
 // SAFETY: Shared read-only UTF-8 byte pointer safe to read concurrently across worker threads.
 unsafe impl Sync for ManifestNamePtr {}
 
+#[derive(Clone, Copy, Debug)]
+struct RuntimeAllocsPtr(*const RuntimeAllocTracker);
+
+// SAFETY: When non-null, points to a `Mutex`-synchronized `RuntimeAllocTracker` pinned on the heap
+// inside `GuestInstance` that outlives all closures/commands holding `Host`.
+unsafe impl Send for RuntimeAllocsPtr {}
+// SAFETY: `RuntimeAllocTracker` uses internal `Mutex` synchronization for concurrent `track` calls.
+unsafe impl Sync for RuntimeAllocsPtr {}
+
+/// Validated wrapper around a host-exported [`MappedWireVTable<W>`] whose [`VTableHeader`] and
+/// [`ComponentUuid`] were verified at symbol resolution time.
+pub struct ValidatedWireVTable<W: AbiPod> {
+    pub(crate) raw: MappedWireVTable<W>,
+}
+
+impl<W: AbiPod> Copy for ValidatedWireVTable<W> {}
+
+impl<W: AbiPod> Clone for ValidatedWireVTable<W> {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<W: AbiPod> ValidatedWireVTable<W> {
+    /// Verified [`ComponentUuid`] recorded in the VTable header.
+    #[inline]
+    pub const fn uuid(&self) -> ComponentUuid {
+        self.raw.header.uuid
+    }
+
+    /// Host-side `size_of::<T>()` recorded in the VTable header.
+    #[inline]
+    pub const fn host_size(&self) -> usize {
+        self.raw.header.size
+    }
+
+    /// Host-side `align_of::<T>()` recorded in the VTable header.
+    #[inline]
+    pub const fn host_align(&self) -> usize {
+        self.raw.header.align
+    }
+
+    /// Returns `true` if this bridged type supports mutable `set` writes.
+    #[inline]
+    pub const fn supports_set(&self) -> bool {
+        self.raw.set.is_some()
+    }
+}
+
+/// Validated wrapper around a host-exported [`MappedStringVTable`] whose [`VTableHeader`] and
+/// [`ComponentUuid`] were verified at symbol resolution time.
+#[derive(Clone, Copy)]
+pub struct ValidatedStringVTable {
+    pub(crate) raw: MappedStringVTable,
+}
+
+impl ValidatedStringVTable {
+    /// Verified [`ComponentUuid`] recorded in the VTable header.
+    #[inline]
+    pub const fn uuid(&self) -> ComponentUuid {
+        self.raw.header.uuid
+    }
+
+    /// Host-side `size_of::<T>()` recorded in the VTable header.
+    #[inline]
+    pub const fn host_size(&self) -> usize {
+        self.raw.header.size
+    }
+
+    /// Host-side `align_of::<T>()` recorded in the VTable header.
+    #[inline]
+    pub const fn host_align(&self) -> usize {
+        self.raw.header.align
+    }
+
+    /// Returns `true` if this bridged string type supports mutable `set` writes.
+    #[inline]
+    pub const fn supports_set(&self) -> bool {
+        self.raw.set.is_some()
+    }
+}
+
 /// Validated, per-instance cached copy of [`BamHostApi`] paired with its world-scoped
 /// [`BamHostCtx`] token and optional owning manifest name.
 ///
@@ -57,6 +144,7 @@ pub struct Host {
     host_ctx: HostCtxPtr,
     manifest_name_ptr: ManifestNamePtr,
     manifest_name_len: usize,
+    runtime_allocs_ptr: RuntimeAllocsPtr,
 }
 
 impl Host {
@@ -89,6 +177,7 @@ impl Host {
             host_ctx: HostCtxPtr(host_ctx),
             manifest_name_ptr: ManifestNamePtr(core::ptr::NonNull::<u8>::dangling().as_ptr()),
             manifest_name_len: 0,
+            runtime_allocs_ptr: RuntimeAllocsPtr(core::ptr::null()),
         })
     }
 
@@ -127,6 +216,7 @@ impl Host {
             host_ctx: HostCtxPtr(host_ctx),
             manifest_name_ptr: ManifestNamePtr(core::ptr::NonNull::<u8>::dangling().as_ptr()),
             manifest_name_len: 0,
+            runtime_allocs_ptr: RuntimeAllocsPtr(core::ptr::null()),
         })
     }
 
@@ -141,6 +231,34 @@ impl Host {
         self.manifest_name_ptr = ManifestNamePtr(ptr);
         self.manifest_name_len = len;
         self
+    }
+
+    /// Binds a heap-pinned [`RuntimeAllocTracker`] owned by [`GuestInstance`] so runtime
+    /// `ValidatedCommands::observe*` closures are tracked and freed cleanly on shutdown.
+    ///
+    /// # Safety
+    /// If `ptr` is non-null, it must point to a valid [`RuntimeAllocTracker`] that outlives every
+    /// copy of the returned [`Host`].
+    #[inline]
+    pub(crate) const unsafe fn with_runtime_allocs(
+        mut self,
+        ptr: *const RuntimeAllocTracker,
+    ) -> Self {
+        self.runtime_allocs_ptr = RuntimeAllocsPtr(ptr);
+        self
+    }
+
+    #[inline]
+    pub(crate) fn track_runtime_allocation<T: Send + 'static>(
+        &self,
+        boxed: Box<T>,
+    ) -> Option<*mut T> {
+        if self.runtime_allocs_ptr.0.is_null() {
+            return None;
+        }
+        // SAFETY: `with_runtime_allocs` guarantees `runtime_allocs_ptr.0` points to a live
+        // `RuntimeAllocTracker` inside `GuestInstance` outliving `&self`.
+        Some(unsafe { (&*self.runtime_allocs_ptr.0).track(boxed) })
     }
 
     /// Returns the owning mod instance's manifest name (`""` when constructed standalone via
@@ -280,6 +398,128 @@ impl Host {
         // exact `expected_uuid` identity; `raw` is aligned for `V` and valid for `'a`.
         Ok(unsafe { &*raw.cast::<V>() })
     }
+
+    /// Resolves a host-bridged [`MappedWireVTable<W>`] under `"bam.v0.<name>.vtable"` and verifies
+    /// its [`VTableHeader`] and `expected_uuid`.
+    pub fn resolve_mapped_wire_vtable<W: AbiPod>(
+        &self,
+        symbol: &CStr,
+        expected_uuid: ComponentUuid,
+    ) -> Result<ValidatedWireVTable<W>, FfiResult> {
+        if !symbol.to_bytes().starts_with(CUSTOM_SYMBOL_PREFIX) {
+            return Err(FfiResult::INVALID_ARGUMENT);
+        }
+        // SAFETY: `MappedWireVTable<W>` is `#[repr(C)]` prefixed at byte offset 0 by `VTableHeader`,
+        // and the host only exports static `MappedWireVTable` symbols matching `expected_uuid`.
+        let vt = unsafe { self.resolve_vtable::<MappedWireVTable<W>>(symbol, expected_uuid) }?;
+        if vt.get.is_none() {
+            return Err(FfiResult::INVALID_ARGUMENT);
+        }
+        Ok(ValidatedWireVTable { raw: *vt })
+    }
+
+    /// Resolves a host-bridged [`MappedStringVTable`] under `"bam.v0.<name>.vtable"` and verifies
+    /// its [`VTableHeader`] and `expected_uuid`.
+    pub fn resolve_mapped_string_vtable(
+        &self,
+        symbol: &CStr,
+        expected_uuid: ComponentUuid,
+    ) -> Result<ValidatedStringVTable, FfiResult> {
+        if !symbol.to_bytes().starts_with(CUSTOM_SYMBOL_PREFIX) {
+            return Err(FfiResult::INVALID_ARGUMENT);
+        }
+        // SAFETY: `MappedStringVTable` is `#[repr(C)]` prefixed at byte offset 0 by `VTableHeader`,
+        // and the host only exports static `MappedStringVTable` symbols matching `expected_uuid`.
+        let vt = unsafe { self.resolve_vtable::<MappedStringVTable>(symbol, expected_uuid) }?;
+        if vt.get.is_none() {
+            return Err(FfiResult::INVALID_ARGUMENT);
+        }
+        Ok(ValidatedStringVTable { raw: *vt })
+    }
+
+    /// Initiates an asynchronous typed or untyped (`asset_type == BamComponent::INVALID`) asset
+    /// load via `BamHostApi::asset_load`, returning a strong [`FfiAssetHandle`] tracked by the
+    /// host for this mod instance.
+    pub fn asset_load(
+        &self,
+        asset_type: BamComponent,
+        path: &str,
+    ) -> Result<FfiAssetHandle, FfiResult> {
+        if path.is_empty() {
+            return Err(FfiResult::INVALID_ARGUMENT);
+        }
+        if !self.api.covers_slot(
+            core::mem::offset_of!(BamHostApi, asset_load),
+            core::mem::size_of::<Option<BamAssetLoadFn>>(),
+        ) {
+            return Err(FfiResult::UNSUPPORTED);
+        }
+        let Some(load_fn) = self.api.asset_load else {
+            return Err(FfiResult::UNSUPPORTED);
+        };
+        let mut out = FfiAssetHandle::NONE;
+        // SAFETY: `self.host_ctx.0` is an active `BamHostCtx`, `StrView::from_str(path)` borrows
+        // valid UTF-8 for this call, and `out` is aligned writable stack storage.
+        let status = unsafe {
+            load_fn(
+                self.host_ctx.0,
+                asset_type,
+                StrView::from_str(path),
+                &mut out,
+            )
+        };
+        if status.is_ok() { Ok(out) } else { Err(status) }
+    }
+
+    /// Queries the current [`FfiAssetLoadState`] of `handle` via `BamHostApi::asset_get_load_state`.
+    pub fn asset_get_load_state(
+        &self,
+        handle: &FfiAssetHandle,
+    ) -> Result<FfiAssetLoadState, FfiResult> {
+        let validation = handle.validate();
+        if !validation.is_ok() {
+            return Err(validation);
+        }
+        if handle.is_none() {
+            return Ok(FfiAssetLoadState::NOT_LOADED);
+        }
+        if !self.api.covers_slot(
+            core::mem::offset_of!(BamHostApi, asset_get_load_state),
+            core::mem::size_of::<Option<BamAssetGetLoadStateFn>>(),
+        ) {
+            return Err(FfiResult::UNSUPPORTED);
+        }
+        let Some(state_fn) = self.api.asset_get_load_state else {
+            return Err(FfiResult::UNSUPPORTED);
+        };
+        let mut out = FfiAssetLoadState::NOT_LOADED;
+        // SAFETY: `self.host_ctx.0` is valid and `handle`/`&mut out` are aligned stack references.
+        let status = unsafe { state_fn(self.host_ctx.0, handle, &mut out) };
+        if status.is_ok() { Ok(out) } else { Err(status) }
+    }
+
+    /// Releases a strong host-side asset pin previously acquired for `handle` via
+    /// `BamHostApi::asset_release`.
+    pub fn asset_release(&self, handle: &FfiAssetHandle) -> FfiResult {
+        let validation = handle.validate();
+        if !validation.is_ok() {
+            return validation;
+        }
+        if handle.is_none() {
+            return FfiResult::OK;
+        }
+        if !self.api.covers_slot(
+            core::mem::offset_of!(BamHostApi, asset_release),
+            core::mem::size_of::<Option<BamAssetReleaseFn>>(),
+        ) {
+            return FfiResult::UNSUPPORTED;
+        }
+        let Some(release_fn) = self.api.asset_release else {
+            return FfiResult::UNSUPPORTED;
+        };
+        // SAFETY: `self.host_ctx.0` is valid and `handle` is an aligned shared reference.
+        unsafe { release_fn(self.host_ctx.0, handle) }
+    }
 }
 
 /// Validated init-only [`BamLoadCtx`] wrapper tied to the duration of `bevy_abi_mod_init`.
@@ -396,6 +636,124 @@ impl<'a> ValidatedLoadCtx<'a> {
         // SAFETY: `self.raw` was validated as an active `BamLoadCtx` in `ValidatedLoadCtx::from_raw`.
         unsafe {
             register_observer_closure::<E, F>(instance, self.raw, name, event, target, callback)
+        }
+    }
+
+    /// Registers a custom [`BamObserverDesc`](bevy_abi_mod_sys::BamObserverDesc) callback with
+    /// explicit propagation flags and optional `propagate_relationship` component handle.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_observer_with_options<E, F>(
+        &self,
+        instance: &mut GuestInstance,
+        name: &str,
+        event: BamComponent,
+        target: bevy_abi_mod_sys::FfiEntity,
+        flags: u32,
+        propagate_relationship: BamComponent,
+        callback: F,
+    ) -> FfiResult
+    where
+        E: AbiPod,
+        F: FnMut(
+                bevy_abi_mod_sys::FfiEntity,
+                &E,
+                &mut crate::commands::ValidatedCommands<'_>,
+            ) -> FfiResult
+            + Send
+            + 'static,
+    {
+        // SAFETY: `self.raw` was validated as an active `BamLoadCtx` in `ValidatedLoadCtx::from_raw`.
+        unsafe {
+            register_observer_closure_with_options::<E, F>(
+                instance,
+                self.raw,
+                name,
+                event,
+                target,
+                flags,
+                propagate_relationship,
+                callback,
+            )
+        }
+    }
+
+    /// Registers a mutable [`BamObserverDesc`](bevy_abi_mod_sys::BamObserverDesc) callback (`&mut E`
+    /// plus `&mut bool` propagation flag) on this validated load context.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_observer_mut<E, F>(
+        &self,
+        instance: &mut GuestInstance,
+        name: &str,
+        event: BamComponent,
+        target: bevy_abi_mod_sys::FfiEntity,
+        flags: u32,
+        propagate_relationship: BamComponent,
+        callback: F,
+    ) -> FfiResult
+    where
+        E: AbiPod,
+        F: FnMut(
+                bevy_abi_mod_sys::FfiEntity,
+                &mut E,
+                &mut bool,
+                &mut crate::commands::ValidatedCommands<'_>,
+            ) -> FfiResult
+            + Send
+            + 'static,
+    {
+        // SAFETY: `self.raw` was validated as an active `BamLoadCtx` in `ValidatedLoadCtx::from_raw`.
+        unsafe {
+            register_observer_mut_closure::<E, F>(
+                instance,
+                self.raw,
+                name,
+                event,
+                target,
+                flags,
+                propagate_relationship,
+                callback,
+            )
+        }
+    }
+
+    /// Registers a component lifecycle or scene `Ready` observer (`ADD`, `INSERT`, `DISCARD`,
+    /// `REMOVE`, `DESPAWN`, `READY`) on this validated load context.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_lifecycle_observer<F>(
+        &self,
+        instance: &mut GuestInstance,
+        name: &str,
+        event_kind: BamEventKind,
+        watched_components: &[BamComponent],
+        target: bevy_abi_mod_sys::FfiEntity,
+        flags: u32,
+        propagate_relationship: BamComponent,
+        callback: F,
+    ) -> FfiResult
+    where
+        F: FnMut(
+                bevy_abi_mod_sys::FfiEntity,
+                &mut crate::commands::ValidatedCommands<'_>,
+            ) -> FfiResult
+            + Send
+            + 'static,
+    {
+        // SAFETY: `self.raw` was validated as an active `BamLoadCtx` in `ValidatedLoadCtx::from_raw`.
+        unsafe {
+            register_lifecycle_observer_closure(
+                instance,
+                self.raw,
+                name,
+                event_kind,
+                watched_components,
+                target,
+                flags,
+                propagate_relationship,
+                callback,
+            )
         }
     }
 

@@ -59,7 +59,7 @@ int main(void) {
     printf("[C99 ABI v0.2 Layout Verification]\n");
 
     assert(BAM_COMPONENT_DESC_MIN_V0_2_SIZE == 64u);
-    assert(sizeof(BamComponentDesc) == 88u);
+    assert(sizeof(BamComponentDesc) == 136u);
     assert(BAM_ALIGNOF(BamComponentDesc) == 8u);
     assert(offsetof(BamComponentDesc, struct_size) == 0u);
     assert(offsetof(BamComponentDesc, flags) == 4u);
@@ -72,9 +72,15 @@ int main(void) {
     assert(offsetof(BamComponentDesc, on_add) == 64u);
     assert(offsetof(BamComponentDesc, on_remove) == 72u);
     assert(offsetof(BamComponentDesc, hook_user_data) == 80u);
+    assert(offsetof(BamComponentDesc, on_insert) == 88u);
+    assert(offsetof(BamComponentDesc, on_discard) == 96u);
+    assert(offsetof(BamComponentDesc, on_despawn) == 104u);
+    assert(offsetof(BamComponentDesc, clone_fn) == 112u);
+    assert(offsetof(BamComponentDesc, required_components) == 120u);
+    assert(offsetof(BamComponentDesc, required_component_count) == 128u);
 
     assert(BAM_HOST_API_MIN_V0_2_SIZE == 224u);
-    assert(sizeof(BamHostApi) == 264u);
+    assert(sizeof(BamHostApi) == 408u);
     assert(BAM_ALIGNOF(BamHostApi) == 8u);
 
     memset(&desc, 0, sizeof(desc));
