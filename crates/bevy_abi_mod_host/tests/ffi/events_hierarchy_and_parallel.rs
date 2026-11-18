@@ -1353,11 +1353,13 @@ fn messages_batch_write_and_cmd_trigger_entity_events() {
     );
 }
 
+#[cfg(not(feature = "bridge-bsn"))]
 #[derive(EntityEvent, Clone, Copy, Debug)]
 struct HostReadyEvent {
     entity: Entity,
 }
 
+#[cfg(not(feature = "bridge-bsn"))]
 impl From<Entity> for HostReadyEvent {
     fn from(entity: Entity) -> Self {
         Self { entity }
@@ -1378,6 +1380,18 @@ fn test_ready_observers_global_entity_scoped_and_child_of_propagation() {
 
     let ready_handle = {
         let mut reg = app.world().resource::<ModRegistry>().clone();
+        #[cfg(feature = "bridge-bsn")]
+        let h = reg
+            .register_bridged_entity_event_with::<bevy_scene::Ready>(
+                app.world_mut(),
+                "bevy_scene::Ready",
+                Some("Ready"),
+                |world, entity| {
+                    world.trigger(bevy_scene::Ready { entity });
+                },
+            )
+            .expect("register bridged bevy_scene::Ready event");
+        #[cfg(not(feature = "bridge-bsn"))]
         let h = reg
             .register_bridged_entity_event::<HostReadyEvent>(
                 app.world_mut(),
