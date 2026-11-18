@@ -36,7 +36,7 @@ All baseline measurements below were recorded on the same local Apple Silicon wo
 
 ## 2. Canonical Benchmark Suite (`crates/bevy_abi_mod_host/benches/chunk_throughput.rs`)
 
-`chunk_throughput.rs` unifies the five core `ABI 0.2.0` runtime paths into a single reproducible suite.
+`chunk_throughput.rs` unifies the nine core `ABI 0.2.0` runtime paths into a single reproducible suite (`--bench`, `30` measured frames per scenario on `Apple M4 Pro`, `14` cores, `rustc 1.98.1`, `bench` profile `opt-level = 3`).
 
 ### 2.1 Scenario 1: Dense SoA Chunk Iteration (`1k` / `10k` / `100k` Entities)
 Compares native Bevy `Query<(&mut Position, &Velocity)>`, direct C-ABI `GuestSystem` contiguous SoA slice iteration (`host_iter_column_mutable` + `host_iter_column_readonly`), and loaded `.cdylib`/`.dylib` dynamic components (`RustModCustomData` and `CModCustomData`):
@@ -96,6 +96,55 @@ Spawns `2,500` 4-component entities (`Position`, `Velocity`, `Vitality`, `Armor`
 | Native Bevy 4-Component Tuple Bundle | `0.0563 ms` | `0.0716 ms` | `43.9M ent/s` | `22.52 ns` | `1.00x` (static bundle) |
 | **C-ABI Batched `host_cmd_spawn` (4 comps)** | **`0.2432 ms`** | `0.2648 ms` | **`10.1M ent/s`** | **`97.28 ns`** | **`1.66x` faster than seq** |
 | C-ABI Sequential `spawn_empty` + `4x insert` | `0.4047 ms` | `0.5419 ms` | `5.97M ent/s` | `161.88 ns` | `1.00x` |
+
+### 2.6 Scenario 6: Wave 1 Query Filter Throughput (`Allow`, `Has`, `Or` @ `10,000` Entities)
+Measured on `10,000` entities (`50%` `Pos+Vel+FilterTagA`, `25%` `Pos+Vel+FilterTagB`, `25%` `Pos+Vel+FilterTagA+Disabled`) comparing default `DefaultQueryFilters` visibility against `Allow<Disabled>`, synthesized `[FfiBool]` chunk presence masks (`AccessMode::HAS`), and `or_group` disjunctions:
+
+| Filter Variant (`10k` Entities) | Median Frame | p95 Frame | Throughput (`ent/s`) | `ns / entity` |
+|---|---:|---:|---:|---:|
+| C-ABI Baseline (`Pos, Vel`) [enabled `7,500`] | `0.0094 ms` | `0.0096 ms` | `800.1M ent/s` | `1.25 ns` |
+| Native Bevy `Allow<Disabled>` (`10,000`) | `0.0117 ms` | `0.0118 ms` | `856.6M ent/s` | `1.17 ns` |
+| **C-ABI `AccessMode::ALLOW` (`Disabled`)** | **`0.0112 ms`** | `0.0377 ms` | **`742.8M ent/s`** | **`1.12 ns`** |
+| Native Bevy `Has<FilterTagA>` (`7,500`) | `0.0100 ms` | `0.0101 ms` | `752.4M ent/s` | `1.33 ns` |
+| **C-ABI `AccessMode::HAS` (`[FfiBool]` mask)** | **`0.0090 ms`** | `0.0092 ms` | **`831.3M ent/s`** | **`1.20 ns`** |
+| Native Bevy `Or<(With<A>, With<B>)>` (`7,500`) | `0.0088 ms` | `0.0090 ms` | `850.8M ent/s` | `1.17 ns` |
+| **C-ABI `or_group` (`With<A> \|\| With<B>`)** | **`0.0073 ms`** | `0.0074 ms` | **`1.03B ent/s`** | **`0.97 ns`** |
+
+### 2.7 Scenario 7: Wave 2 Batch Commands (`cmd_spawn_batch` SoA & `cmd_despawn_all`)
+Compares single-call Structure-of-Arrays `host_cmd_spawn_batch` (4 components) against per-entity `host_cmd_spawn` loops and Native Bevy `Commands::spawn_batch`, plus single-call `host_cmd_despawn_all` against per-entity `host_cmd_despawn` loops at `1,000` and `10,000` entities:
+
+| Scale | Operation | Median Frame | p95 Frame | Throughput (`ent/s`) | `ns / entity` | Speedup |
+|---:|---|---:|---:|---:|---:|---:|
+| **`1,000`** | Native Bevy `Commands::spawn_batch` | `0.0338 ms` | `0.0340 ms` | `29.5M ent/s` | `33.83 ns` | — |
+| **`1,000`** | **C-ABI `host_cmd_spawn_batch` (SoA)** | **`0.1319 ms`** | `0.2335 ms` | **`6.92M ent/s`** | **`131.92 ns`** | **`2.58x`** vs loop |
+| **`1,000`** | C-ABI `host_cmd_spawn` loop | `0.3410 ms` | `0.4373 ms` | `2.83M ent/s` | `341.00 ns` | `1.00x` |
+| **`1,000`** | **C-ABI `host_cmd_despawn_all`** | **`0.0375 ms`** | `0.0380 ms` | **`26.6M ent/s`** | **`37.54 ns`** | **`1.24x`** vs loop |
+| **`1,000`** | C-ABI `host_cmd_despawn` loop | `0.0464 ms` | `0.1073 ms` | `18.7M ent/s` | `46.42 ns` | `1.00x` |
+| **`10,000`** | Native Bevy `Commands::spawn_batch` | `0.3087 ms` | `0.3707 ms` | `31.2M ent/s` | `30.87 ns` | — |
+| **`10,000`** | **C-ABI `host_cmd_spawn_batch` (SoA)** | **`1.3037 ms`** | `1.6614 ms` | **`7.46M ent/s`** | **`130.38 ns`** | **`2.66x`** vs loop |
+| **`10,000`** | C-ABI `host_cmd_spawn` loop | `3.4690 ms` | `3.8037 ms` | `2.85M ent/s` | `346.90 ns` | `1.00x` |
+| **`10,000`** | **C-ABI `host_cmd_despawn_all`** | **`0.3141 ms`** | `0.3327 ms` | **`31.2M ent/s`** | **`31.41 ns`** | **`1.35x`** vs loop |
+| **`10,000`** | C-ABI `host_cmd_despawn` loop | `0.4244 ms` | `0.5316 ms` | `23.0M ent/s` | `42.44 ns` | `1.00x` |
+
+### 2.8 Scenario 8: `BAM_COMPONENT_FLAG_SUMMARY_TICK` Multi-Table Skip (`10,000` Entities, `100` Tables)
+Compares `AccessMode::CHANGED` across `100` distinct tables (`100` entities/table = `10,000` total) for dynamic dense components registered without vs. with `BAM_COMPONENT_FLAG_SUMMARY_TICK` at `0%`, `1%` (`1/100` dirty tables = `100` entities), and `100%` dirty ratios:
+
+| Dirty Ratio | Variant | Median Frame | p95 Frame | Effective Scan Rate | `ns / entity` |
+|---|---|---:|---:|---:|---:|
+| **`0%`** | Non-`SummaryTick` `Changed<T>` | `0.0239 ms` | `0.0243 ms` | `418.1M ent/s` | `2.39 ns` |
+| **`0%`** | **`BAM_COMPONENT_FLAG_SUMMARY_TICK`** | **`0.0067 ms`** | `0.0068 ms` | **`1.50B ent/s`** | **`0.67 ns` (`3.57x` faster)** |
+| **`1%`** | Non-`SummaryTick` `Changed<T>` | `0.0243 ms` | `0.0244 ms` | `411.8M ent/s` | `2.43 ns` |
+| **`1%`** | **`BAM_COMPONENT_FLAG_SUMMARY_TICK`** | **`0.0072 ms`** | `0.0073 ms` | **`1.39B ent/s`** | **`0.72 ns` (`3.38x` faster)** |
+| **`100%`** | Non-`SummaryTick` `Changed<T>` | `0.0393 ms` | `0.0576 ms` | `242.4M ent/s` | `3.93 ns` |
+| **`100%`** | **`BAM_COMPONENT_FLAG_SUMMARY_TICK`** | **`0.0396 ms`** | `0.0405 ms` | **`248.5M ent/s`** | **`3.96 ns`** |
+
+### 2.9 Scenario 9: Zero-Copy `sys_entity_children` Traversal (`1,000` Parents × `10` = `10,000` Edges)
+Compares Native Bevy `Query<&Children>` against C-ABI `host_sys_entity_children` borrowing `&[FfiEntity]` directly from Bevy's `Children` storage:
+
+| Traversal (`10,000` Parent->Child Edges) | Median Frame | p95 Frame | Throughput (`edge/s`) | `ns / edge` |
+|---|---:|---:|---:|---:|
+| Native Bevy `Query<&Children>` | `0.0162 ms` | `0.0163 ms` | `616.1M edge/s` | `1.62 ns` |
+| **C-ABI `host_sys_entity_children` (`&[FfiEntity]`)** | **`0.0217 ms`** | `0.0225 ms` | **`459.4M edge/s`** | **`2.17 ns`** |
 
 ---
 
