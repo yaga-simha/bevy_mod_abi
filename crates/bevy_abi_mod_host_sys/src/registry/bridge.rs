@@ -22,8 +22,8 @@ use bevy_ecs::{
 
 use crate::{
     registry::{
-        ComponentCollisionError, InsertDefaultFn, InsertRawFn, ModRegistry, RegisteredComponent,
-        SymbolRecord,
+        ComponentCollisionError, EntityEventTriggerFn, InsertDefaultFn, InsertRawFn, ModRegistry,
+        RegisteredComponent, SymbolRecord,
     },
     sync_ptr::SymbolAddress,
 };
@@ -185,32 +185,6 @@ fn insert_default_bridged<T: Component + Default>(world: &mut World, entity: Ent
     if let Ok(mut e) = world.get_entity_mut(entity) {
         e.insert(T::default());
     }
-}
-
-unsafe fn trigger_entity_only_event_impl<E>(
-    world: &mut World,
-    target: Option<Entity>,
-    data: *const u8,
-) -> Result<(), FfiResult>
-where
-    E: EntityEvent + Event + Copy + From<Entity>,
-    for<'a> E::Trigger<'a>: Default,
-{
-    let target_entity = if let Some(t) = target {
-        t
-    } else {
-        if data.is_null() {
-            return Err(FfiResult::NULL_POINTER);
-        }
-        // SAFETY: `data` points to an 8-byte `FfiEntity` payload.
-        let bits = unsafe { core::ptr::read_unaligned(data.cast::<u64>()) };
-        Entity::try_from_bits(bits).ok_or(FfiResult::INVALID_ENTITY)?
-    };
-    if target_entity == Entity::PLACEHOLDER || !world.entities().contains(target_entity) {
-        return Err(FfiResult::INVALID_ENTITY);
-    }
-    world.trigger(E::from(target_entity));
-    Ok(())
 }
 
 unsafe fn extract_entity_only_target_impl<E: EntityEvent + Copy>(
@@ -431,7 +405,7 @@ impl ModRegistry {
         ))
     }
 
-    /// Registers an entity-only Bevy [`EntityEvent`] `E` (such as `bevy_scene::Ready`) in `world`
+    /// Registers an entity-only Bevy [`EntityEvent`] `E` implementing `From<Entity>` in `world`
     /// under `canonical_name` and optional `alias`, synthesizing a guaranteed `#[repr(C)]`
     /// [`FfiEntity`] payload for guest observers regardless of `E`'s Rust layout.
     pub fn register_bridged_entity_event<E>(
@@ -442,6 +416,26 @@ impl ModRegistry {
     ) -> Result<BamComponent, ComponentCollisionError>
     where
         E: EntityEvent + Event + Copy + From<Entity>,
+        for<'a> E::Trigger<'a>: Default,
+    {
+        self.register_bridged_entity_event_with::<E>(world, canonical_name, alias, |w, entity| {
+            w.trigger(E::from(entity));
+        })
+    }
+
+    /// Registers an entity-only Bevy [`EntityEvent`] `E` (such as `bevy_scene::Ready`, which does
+    /// not implement `From<Entity>`) in `world` under `canonical_name` and optional `alias` using
+    /// a caller-supplied `trigger_entity_fn`, synthesizing a guaranteed `#[repr(C)]` [`FfiEntity`]
+    /// payload for guest observers regardless of `E`'s Rust layout.
+    pub fn register_bridged_entity_event_with<E>(
+        &mut self,
+        world: &mut World,
+        canonical_name: &str,
+        alias: Option<&str>,
+        trigger_entity_fn: EntityEventTriggerFn,
+    ) -> Result<BamComponent, ComponentCollisionError>
+    where
+        E: EntityEvent + Event + Copy,
         for<'a> E::Trigger<'a>: Default,
     {
         let event_key = world.register_event_key::<E>();
@@ -481,7 +475,8 @@ impl ModRegistry {
             let idx = (handle.0 - 1) as usize;
             snap.entries[idx].synthesizes_ffi_entity_payload = true;
             snap.entries[idx].event_key = Some(event_key);
-            snap.entries[idx].trigger_event_fn = Some(trigger_entity_only_event_impl::<E>);
+            snap.entries[idx].entity_event_trigger_fn = Some(trigger_entity_fn);
+            snap.entries[idx].trigger_event_fn = None;
             snap.entries[idx].extract_event_target_fn = Some(extract_entity_only_target_impl::<E>);
         }
         self.publish_after_mutation();
@@ -600,6 +595,7 @@ impl ModRegistry {
                     validates_entity_payload: false,
                     synthesizes_ffi_entity_payload: false,
                     event_key: None,
+                    entity_event_trigger_fn: None,
                     trigger_event_fn: None,
                     extract_event_target_fn: None,
                     extract_relationship_targets_fn,

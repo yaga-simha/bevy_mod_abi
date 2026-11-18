@@ -85,10 +85,10 @@ pub use loader::{
     sign_mod_bytes_with_openssh_certificate,
 };
 pub use registry::{
-    ComponentCollisionError, ComponentOptions, CreateMsgCursorFn, ExtractEventTargetFn,
-    ExtractRelationshipTargetsFn, HostStringBridge, HostWireBridge, InsertDefaultFn, InsertRawFn,
-    ModRegistry, MsgReadBatchFn, MsgSendFn, MsgWriteBatchFn, RegisteredComponent, RegistrySnapshot,
-    TargetEntity, TriggerEventFn,
+    ComponentCollisionError, ComponentOptions, CreateMsgCursorFn, EntityEventTriggerFn,
+    ExtractEventTargetFn, ExtractRelationshipTargetsFn, HostStringBridge, HostWireBridge,
+    InsertDefaultFn, InsertRawFn, ModRegistry, MsgReadBatchFn, MsgSendFn, MsgWriteBatchFn,
+    RegisteredComponent, RegistrySnapshot, TargetEntity, TriggerEventFn,
 };
 pub use schedule::{
     ModNamedSystemSet, ModScheduleMap, ModSystemSet, ModVisibleSets, StartupCompleted,

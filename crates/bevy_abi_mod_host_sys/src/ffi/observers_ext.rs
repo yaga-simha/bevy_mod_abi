@@ -32,7 +32,7 @@ use crate::{
     },
     handle_header::{COMMANDS_MAGIC, validate_handle_mut},
     loader::{ModHost, ModId},
-    registry::{ModRegistry, TriggerEventFn},
+    registry::{EntityEventTriggerFn, ModRegistry, TriggerEventFn},
     sync_ptr::GuestFnPtr,
 };
 
@@ -361,9 +361,11 @@ fn next_propagation_parent(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_custom_at_target(
     world: &mut World,
     event_key: EventKey,
+    entity_trigger_fn: Option<EntityEventTriggerFn>,
     trigger_fn: Option<TriggerEventFn>,
     target: Option<Entity>,
     watched_ids: &[ComponentId],
@@ -378,7 +380,14 @@ fn dispatch_custom_at_target(
         },
     );
     let w = guard.world_mut();
-    if !watched_ids.is_empty()
+    if let Some(et_fn) = entity_trigger_fn {
+        if let Some(t) = target
+            && t != Entity::PLACEHOLDER
+            && w.entities().contains(t)
+        {
+            et_fn(w, t);
+        }
+    } else if !watched_ids.is_empty()
         && let Some(t) = target
     {
         let mut trigger = EntityComponentsTrigger {
@@ -611,7 +620,21 @@ pub unsafe extern "C" fn host_cmd_trigger_ex(
             return FfiResult::INVALID_ARGUMENT;
         }
         if meta.is_entity_event() && target_entity.is_none() {
-            if let Some(extract_fn) = meta.extract_event_target_fn {
+            if meta.synthesizes_ffi_entity_payload {
+                if parsed.data_len != core::mem::size_of::<FfiEntity>() || parsed.data_ptr.is_null()
+                {
+                    return FfiResult::INVALID_ARGUMENT;
+                }
+                // SAFETY: `parsed.data_ptr` is non-null and readable for 8 bytes (`size_of::<FfiEntity>()`).
+                let bits = unsafe { core::ptr::read_unaligned(parsed.data_ptr.cast::<u64>()) };
+                let Some(extracted) = Entity::try_from_bits(bits) else {
+                    return FfiResult::INVALID_ENTITY;
+                };
+                if extracted == Entity::PLACEHOLDER {
+                    return FfiResult::INVALID_ENTITY;
+                }
+                target_entity = Some(extracted);
+            } else if let Some(extract_fn) = meta.extract_event_target_fn {
                 // SAFETY: `parsed.data_ptr` holds `meta.size` initialized bytes matching `EntityEvent`.
                 let Some(extracted) = (unsafe { extract_fn(parsed.data_ptr) }) else {
                     return FfiResult::INVALID_ENTITY;
@@ -634,6 +657,7 @@ pub unsafe extern "C" fn host_cmd_trigger_ex(
                 Err(err) => return err,
             };
         let event_key = meta.event_key.expect("checked Some above");
+        let entity_trigger_fn = meta.entity_event_trigger_fn;
         let trigger_fn = meta.trigger_event_fn;
 
         host_cmds.queue_custom(move |world, _snap| {
@@ -646,6 +670,7 @@ pub unsafe extern "C" fn host_cmd_trigger_ex(
                 let _ = dispatch_custom_at_target(
                     world,
                     event_key,
+                    entity_trigger_fn,
                     trigger_fn,
                     target_entity,
                     &watched_ids,
@@ -663,6 +688,7 @@ pub unsafe extern "C" fn host_cmd_trigger_ex(
                 let cont = dispatch_custom_at_target(
                     world,
                     event_key,
+                    entity_trigger_fn,
                     trigger_fn,
                     Some(current),
                     &watched_ids,
@@ -774,6 +800,7 @@ pub unsafe extern "C" fn host_cmd_trigger_ex(
             return FfiResult::INVALID_ENTITY;
         };
         let event_key = meta.event_key.expect("checked Some above");
+        let entity_trigger_fn = meta.entity_event_trigger_fn;
         let trigger_fn = meta.trigger_event_fn;
         let ffi_bytes = FfiEntity::from_bits(start_target.to_bits()).to_bits();
         let mut payload = match unsafe {
@@ -796,6 +823,7 @@ pub unsafe extern "C" fn host_cmd_trigger_ex(
                 let _ = dispatch_custom_at_target(
                     world,
                     event_key,
+                    entity_trigger_fn,
                     trigger_fn,
                     Some(start_target),
                     &watched_ids,
@@ -811,6 +839,7 @@ pub unsafe extern "C" fn host_cmd_trigger_ex(
                 let cont = dispatch_custom_at_target(
                     world,
                     event_key,
+                    entity_trigger_fn,
                     trigger_fn,
                     Some(current),
                     &watched_ids,
@@ -1541,5 +1570,127 @@ mod tests {
         }
         storage3.apply_to_world(&mut world, &snap);
         assert_eq!(obs_ctx.seen.lock().unwrap().len(), 2);
+    }
+
+    #[derive(bevy_ecs::event::EntityEvent, Clone, Copy, Debug)]
+    struct NonFromReady {
+        #[event_target]
+        entity: Entity,
+        extra_rust_tag: u128,
+    }
+
+    #[test]
+    fn non_from_ready_bridged_entity_event_with_supports_ready_trigger_and_propagation() {
+        let mut world = World::new();
+        let child_of_id = world.register_component::<ChildOf>();
+        let mut reg = ModRegistry::new();
+        reg.register_hierarchy(child_of_id, false).unwrap();
+        let ready_handle = reg
+            .register_bridged_entity_event_with::<NonFromReady>(
+                &mut world,
+                "bevy_scene::Ready",
+                Some("Ready"),
+                |w, entity| {
+                    w.trigger(NonFromReady {
+                        entity,
+                        extra_rust_tag: 0xCAFE_BABE_1234_5678,
+                    });
+                },
+            )
+            .unwrap();
+
+        let active = Arc::new(AtomicBool::new(true));
+        let log = Box::new(LogCtx {
+            events: Mutex::new(Vec::new()),
+        });
+        let log_ptr = (&*log as *const LogCtx).cast_mut().cast::<c_void>();
+
+        let registered_observers = {
+            let mut ctx = LoadContext::with_world_and_mod_id(
+                reg.clone(),
+                Arc::clone(&active),
+                &mut world as *mut World,
+                Some(ModId(7)),
+            );
+            let ready_desc = BamObserverDesc::new_lifecycle(
+                BamEventKind::READY,
+                core::ptr::null(),
+                0,
+                record_ready,
+                log_ptr,
+            )
+            .with_name(c"on_non_from_ready".as_ptr());
+            // SAFETY: Valid `LoadContext` and `BamObserverDesc`.
+            let rr = unsafe { host_register_observer(ctx.as_ffi_ptr(), &ready_desc) };
+            assert_eq!(rr, FfiResult::OK);
+            reg = ctx.registry.clone();
+            ctx.finish_init();
+            core::mem::take(&mut ctx.registered_observers)
+        };
+
+        let _obs =
+            spawn_registered_observers_in_world(&mut world, registered_observers, &reg, ModId(7));
+        world.add_observer(|ev: bevy_ecs::observer::On<NonFromReady>| {
+            assert_ne!(ev.extra_rust_tag, 0);
+        });
+
+        let parent = world.spawn_empty().id();
+        let child = world.spawn(ChildOf(parent)).id();
+        let parent_ffi = FfiEntity::from_bits(parent.to_bits());
+        let child_ffi = FfiEntity::from_bits(child.to_bits());
+
+        // 1. Direct host `world.trigger(NonFromReady { ... })` delivers synthesized 8-byte `FfiEntity`.
+        world.trigger(NonFromReady {
+            entity: child,
+            extra_rust_tag: 99,
+        });
+        assert_eq!(*log.events.lock().unwrap(), vec![("ready", child_ffi)]);
+        log.events.lock().unwrap().clear();
+
+        // 2. `host_cmd_trigger` with `target == FfiEntity::NULL` + 8-byte `FfiEntity` wire payload
+        //    must NOT read `size_of::<NonFromReady>()` (24 bytes) out of bounds.
+        let snap = reg.snapshot_arc();
+        let mut storage = HostCommandsStorage::new();
+        {
+            let mut cmds = HostCommands::new(&mut storage, world.entity_allocator(), &snap)
+                .with_mod_context(Some(ModId(7)), Some(Arc::clone(&active)))
+                .with_registry(&reg);
+            let wire_bits = child_ffi.to_bits();
+            // SAFETY: `cmds` is valid and `wire_bits` is an initialized 8-byte `FfiEntity` payload.
+            let rc = unsafe {
+                crate::ffi::commands::host_cmd_trigger(
+                    cmds.as_ffi_ptr(),
+                    ready_handle,
+                    FfiEntity::NULL,
+                    (&raw const wire_bits).cast::<u8>(),
+                    core::mem::size_of::<FfiEntity>(),
+                )
+            };
+            assert_eq!(rc, FfiResult::OK);
+        }
+        storage.apply_to_world(&mut world, &snap);
+        assert_eq!(*log.events.lock().unwrap(), vec![("ready", child_ffi)]);
+        log.events.lock().unwrap().clear();
+
+        // 3. `host_cmd_trigger_ex` with `BamEventKind::READY` + upward `ChildOf` propagation
+        //    fires `NonFromReady` on `child` and then `parent`.
+        let mut storage2 = HostCommandsStorage::new();
+        {
+            let mut cmds = HostCommands::new(&mut storage2, world.entity_allocator(), &snap)
+                .with_mod_context(Some(ModId(7)), Some(Arc::clone(&active)))
+                .with_registry(&reg);
+            let trig = BamTriggerDesc::new(BamComponent::INVALID, core::ptr::null_mut(), 0)
+                .with_event_kind(BamEventKind::READY)
+                .with_entity(child_ffi)
+                .with_propagate(BamComponent::INVALID);
+            // SAFETY: Valid `HostCommands` and `BamTriggerDesc`.
+            let rt = unsafe { host_cmd_trigger_ex(cmds.as_ffi_ptr(), &trig) };
+            assert_eq!(rt, FfiResult::OK);
+        }
+        storage2.apply_to_world(&mut world, &snap);
+        assert_eq!(
+            *log.events.lock().unwrap(),
+            vec![("ready", child_ffi), ("ready", parent_ffi)]
+        );
     }
 }

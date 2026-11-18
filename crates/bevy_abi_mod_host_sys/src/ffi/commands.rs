@@ -827,7 +827,24 @@ impl HostCommandsStorage {
                         continue;
                     }
                     let nn = self.arena.ptr_mut(slice);
-                    if let Some(trigger_fn) = meta.trigger_event_fn {
+                    if let Some(entity_trigger_fn) = meta.entity_event_trigger_fn {
+                        let resolved_target = if let Some(t) = target {
+                            Some(t)
+                        } else if meta.size == core::mem::size_of::<FfiEntity>() {
+                            // SAFETY: `nn` holds `meta.size == 8` initialized `FfiEntity` bytes in `self.arena`.
+                            let bits =
+                                unsafe { core::ptr::read_unaligned(nn.as_ptr().cast::<u64>()) };
+                            Entity::try_from_bits(bits)
+                        } else {
+                            None
+                        };
+                        if let Some(t) = resolved_target
+                            && t != Entity::PLACEHOLDER
+                            && world.entities().contains(t)
+                        {
+                            entity_trigger_fn(world, t);
+                        }
+                    } else if let Some(trigger_fn) = meta.trigger_event_fn {
                         // SAFETY: `nn` holds `meta.size` bytes for `meta`'s registered event type.
                         unsafe {
                             let _ = trigger_fn(world, target, nn.as_ptr().cast_const());
@@ -1820,7 +1837,20 @@ pub unsafe extern "C" fn host_cmd_trigger(
     };
 
     if meta.is_entity_event() && target_entity.is_none() {
-        if let Some(extract_fn) = meta.extract_event_target_fn {
+        if meta.synthesizes_ffi_entity_payload {
+            if data_len != core::mem::size_of::<FfiEntity>() || data_ptr.is_null() {
+                return FfiResult::INVALID_ARGUMENT;
+            }
+            // SAFETY: `data_ptr` is non-null and readable for 8 bytes (`size_of::<FfiEntity>()`).
+            let bits = unsafe { core::ptr::read_unaligned(data_ptr.cast::<u64>()) };
+            let Some(extracted) = Entity::try_from_bits(bits) else {
+                return FfiResult::INVALID_ENTITY;
+            };
+            if extracted == Entity::PLACEHOLDER {
+                return FfiResult::INVALID_ENTITY;
+            }
+            target_entity = Some(extracted);
+        } else if let Some(extract_fn) = meta.extract_event_target_fn {
             // SAFETY: `data_ptr` has `meta.size` bytes matching the `EntityEvent` layout.
             let Some(extracted) = (unsafe { extract_fn(data_ptr) }) else {
                 return FfiResult::INVALID_ENTITY;
