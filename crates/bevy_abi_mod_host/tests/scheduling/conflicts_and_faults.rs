@@ -77,12 +77,8 @@ fn test_disjoint_systems_concurrency_execution() {
     world.insert_resource(registry.clone());
 
     let is_active = Arc::new(AtomicBool::new(true));
-    let mut load_ctx = LoadContext::with_world_and_mod_id(
-        registry,
-        Arc::clone(&is_active),
-        &mut world as *mut World,
-        None,
-    );
+    let mut load_ctx =
+        LoadContext::with_world_and_mod_id(registry, is_active, &mut world as *mut World, None);
 
     let desc_a = ComponentDesc::new(
         c"sched_conflicts::DisjointCompA".as_ptr(),
@@ -365,12 +361,8 @@ fn test_write_write_and_write_read_conflict_detection() {
     world.insert_resource(registry.clone());
 
     let is_active = Arc::new(AtomicBool::new(true));
-    let mut load_ctx = LoadContext::with_world_and_mod_id(
-        registry,
-        Arc::clone(&is_active),
-        &mut world as *mut World,
-        None,
-    );
+    let mut load_ctx =
+        LoadContext::with_world_and_mod_id(registry, is_active, &mut world as *mut World, None);
 
     let desc = ComponentDesc::new(
         c"sched_conflicts::DynamicHealth".as_ptr(),
@@ -586,12 +578,8 @@ fn test_intra_query_conflict_detection() {
     world.insert_resource(registry.clone());
 
     let is_active = Arc::new(AtomicBool::new(true));
-    let mut load_ctx = LoadContext::with_world_and_mod_id(
-        registry,
-        Arc::clone(&is_active),
-        &mut world as *mut World,
-        None,
-    );
+    let mut load_ctx =
+        LoadContext::with_world_and_mod_id(registry, is_active, &mut world as *mut World, None);
 
     let desc = ComponentDesc::new(
         c"sched_conflicts::CombatStat".as_ptr(),
@@ -667,12 +655,8 @@ fn test_unknown_component_disables_single_and_multi_query_systems() {
     world.insert_resource(registry.clone());
 
     let is_active = Arc::new(AtomicBool::new(true));
-    let mut load_ctx = LoadContext::with_world_and_mod_id(
-        registry,
-        Arc::clone(&is_active),
-        &mut world as *mut World,
-        None,
-    );
+    let mut load_ctx =
+        LoadContext::with_world_and_mod_id(registry, is_active, &mut world as *mut World, None);
 
     let desc = ComponentDesc::new(
         c"sched_conflicts::KnownComp".as_ptr(),

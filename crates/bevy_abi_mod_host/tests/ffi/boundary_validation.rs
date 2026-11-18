@@ -827,7 +827,7 @@ mod fuzz_boundaries {
         let mut rng = Rng::new(0xFACE_FEED_0003_3333);
         let mut load_ctx = LoadContext::with_world_and_mod_id(
             world.resource::<ModRegistry>().clone(),
-            Arc::clone(&is_active),
+            is_active,
             &mut world as *mut World,
             None,
         );

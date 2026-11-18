@@ -753,12 +753,8 @@ fn uncommitted_dynamic_drop_payloads_cleaned_on_fault_missing_entity_and_storage
         let reg = ModRegistry::new();
         let is_active = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(true));
 
-        let mut load_ctx = LoadContext::with_world_and_mod_id(
-            reg,
-            std::sync::Arc::clone(&is_active),
-            &mut world as *mut World,
-            None,
-        );
+        let mut load_ctx =
+            LoadContext::with_world_and_mod_id(reg, is_active, &mut world as *mut World, None);
         let desc = ComponentDesc::new(
             c"drop_cmd::OwnedItem".as_ptr(),
             ComponentUuid::from_parts("drop_cmd::OwnedItem", 4, 4, 1),
@@ -1043,7 +1039,7 @@ fn failed_load_rollback_reclaims_fresh_slots_and_restores_hot_updated_snapshots(
         let initial_guard = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(true));
         let mut initial_ctx = LoadContext::with_world_and_mod_id(
             world.resource::<ModRegistry>().clone(),
-            std::sync::Arc::clone(&initial_guard),
+            initial_guard,
             &mut world as *mut World,
             None,
         );

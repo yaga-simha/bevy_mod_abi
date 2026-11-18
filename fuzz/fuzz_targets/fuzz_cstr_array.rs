@@ -117,6 +117,16 @@ fuzz_target!(|data: &[u8]| {
         before_ptrs.as_mut_ptr().cast_const()
     };
     desc.before_count = before_ptrs.len();
+    if data[0] & 0x40 != 0 && !after_ptrs.is_empty() {
+        desc.after_weak = after_ptrs.as_ptr();
+        desc.after_weak_count = after_ptrs.len();
+    }
+    if data[0] & 0x80 != 0 && !before_ptrs.is_empty() {
+        desc.before_weak = before_ptrs.as_ptr();
+        desc.before_weak_count = before_ptrs.len();
+        desc.ambiguous_with = before_ptrs.as_ptr();
+        desc.ambiguous_with_count = before_ptrs.len();
+    }
 
     // SAFETY: `load_ptr` is active; `sys_name_c`, `after_ptrs`, and `before_ptrs` live on stack.
     let reg_res = unsafe { host_register_system(load_ptr, &desc) };

@@ -2035,7 +2035,6 @@ dependencies = [
  "ed25519-dalek",
  "semver",
  "serde",
- "serde_json",
  "sha2",
  "signature",
  "ssh-encoding",
@@ -2043,7 +2042,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "toml 0.8.23",
- "walkdir",
 ]
 
 [[package]]

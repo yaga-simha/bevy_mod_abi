@@ -40,6 +40,9 @@ struct HookedAuraMirror {
 
 #[test]
 fn hot_reload_transfers_state_handles_errors_and_supports_legacy_manifests() {
+    let _pool_guard = crate::DROP_SLOT_POOL_RWLOCK
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     let ext_dylib = TempDylibCopy::new(
         &fixture_dylib("state_hooks_and_observers_mod"),
         "hot_reload_state",
@@ -88,9 +91,8 @@ fn hot_reload_transfers_state_handles_errors_and_supports_legacy_manifests() {
 
     // 2. Deferred `Commands::reload_mod` inside a Bevy system also preserves state (`epoch -> 2`)!
     let trigger_deferred = std::sync::Arc::new(AtomicUsize::new(1));
-    let trigger_c = std::sync::Arc::clone(&trigger_deferred);
     app.add_systems(Update, move |mut commands: Commands<'_, '_>| {
-        if trigger_c.swap(0, Ordering::SeqCst) == 1 {
+        if trigger_deferred.swap(0, Ordering::SeqCst) == 1 {
             commands.reload_mod(mod_v2);
         }
     });
@@ -173,6 +175,9 @@ fn hot_reload_transfers_state_handles_errors_and_supports_legacy_manifests() {
 
 #[test]
 fn dynamic_component_hooks_fire_and_disarm_safely_on_unload() {
+    let _pool_guard = crate::DROP_SLOT_POOL_RWLOCK
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     static HOOK_EVENTS: Mutex<Vec<(u64, u32, u32)>> = Mutex::new(Vec::new());
 
     unsafe extern "C" fn record_hook_event(entity: FfiEntity, is_remove: u32, strength: u32) {
@@ -308,6 +313,9 @@ struct CDamagedMark {
 
 #[test]
 fn c99_dynamic_layout_and_entity_event_observers_lifecycle() {
+    let _pool_guard = crate::DROP_SLOT_POOL_RWLOCK
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     static OBS_EVENTS: Mutex<Vec<(u32, u64, u32, i32)>> = Mutex::new(Vec::new());
     static WATCHED_BITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 

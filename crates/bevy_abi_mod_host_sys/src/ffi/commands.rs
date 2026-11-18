@@ -2088,7 +2088,7 @@ mod tests {
             let reg = world.resource::<ModRegistry>().clone();
             let mut ctx = LoadContext::with_world_and_mod_id(
                 reg,
-                Arc::clone(&active_b),
+                active_b,
                 &mut world as *mut World,
                 Some(mod_b),
             );

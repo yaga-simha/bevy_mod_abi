@@ -134,6 +134,9 @@ fn real_dylib_loaded_mod_entity_lifecycle_messages_and_strict_validation_work() 
 
 #[test]
 fn truncated_descriptors_and_null_callbacks_rejected_without_ub() {
+    let _pool_guard = DROP_SLOT_POOL_RWLOCK
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     let mut load_ctx = LoadContext::new(ModRegistry::new());
     let ctx_ptr = load_ctx.as_ffi_ptr();
 
@@ -154,9 +157,9 @@ fn truncated_descriptors_and_null_callbacks_rejected_without_ub() {
 
     // 2. Zero-initialized C `BamSystemDesc` buffer with `callback == None` (`0`)
     #[repr(align(8))]
-    struct AlignedBuf([u8; 128]);
+    struct AlignedBuf([u8; core::mem::size_of::<BamSystemDesc>()]);
 
-    let mut zeroed_sys = AlignedBuf([0u8; 128]);
+    let mut zeroed_sys = AlignedBuf([0u8; core::mem::size_of::<BamSystemDesc>()]);
     let sys_sz = (core::mem::size_of::<BamSystemDesc>() as u32).to_ne_bytes();
     zeroed_sys.0[..4].copy_from_slice(&sys_sz);
     // SAFETY: Aligned, initialized byte buffer of size >= `BamSystemDesc` with null `name`/`callback`.
@@ -169,6 +172,9 @@ fn truncated_descriptors_and_null_callbacks_rejected_without_ub() {
 
 #[test]
 fn test_invalid_lifecycle_operations() {
+    let _pool_guard = DROP_SLOT_POOL_RWLOCK
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
 

@@ -37,6 +37,9 @@ struct HostMarker(u32);
 
 #[test]
 fn mod_scoped_entities_including_disabled_despawn_on_unload_while_persistent_survives() {
+    let _pool_guard = DROP_SLOT_POOL_RWLOCK
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     let ordered_dylib = TempDylibCopy::new(&fixture_dylib("ordered_sets_mod"), "scoped_cleanup");
 
     let mut app = App::new();
@@ -281,6 +284,9 @@ impl HostAssetBackend for MockAssetBackend {
 
 #[test]
 fn is_resource_excluded_from_despawn_all_and_assets_released_on_unload() {
+    let _pool_guard = DROP_SLOT_POOL_RWLOCK
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     let ordered_dylib =
         TempDylibCopy::new(&fixture_dylib("ordered_sets_mod"), "is_resource_cleanup");
 
@@ -469,7 +475,7 @@ fn paged_slab_grows_lazily_past_1024_up_to_3000_distinct_live_slots_in_one_world
         let active = Arc::new(AtomicBool::new(true));
         let world_ptr = &mut world as *mut World;
         let reg = world.resource::<ModRegistry>().clone();
-        let mut ctx = LoadContext::with_world_and_mod_id(reg, Arc::clone(&active), world_ptr, None);
+        let mut ctx = LoadContext::with_world_and_mod_id(reg, active, world_ptr, None);
 
         let mut names = Vec::with_capacity(3_000);
         for i in 0..3_000 {

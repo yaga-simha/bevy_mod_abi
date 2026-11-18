@@ -24,6 +24,9 @@ unsafe extern "C" fn count_runs_cb(_ctx: *mut BamSystemCtx, user_data: *mut c_vo
 
 #[test]
 fn hot_reload_1000_cycles_remove_systems_in_set_keeps_schedule_graph_constant() {
+    let _pool_guard = crate::DROP_SLOT_POOL_RWLOCK
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     #[cfg(not(miri))]
     const CYCLES: u64 = 1000;
     #[cfg(miri)]
@@ -78,6 +81,9 @@ fn hot_reload_1000_cycles_remove_systems_in_set_keeps_schedule_graph_constant() 
 
 #[test]
 fn test_50_cycle_hot_reload_lifecycle_stress() {
+    let _pool_guard = crate::DROP_SLOT_POOL_RWLOCK
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     let (rust_dylib, c_dylib) = ensure_guest_mods_built();
 
     let mut app = App::new();
@@ -145,6 +151,9 @@ fn test_50_cycle_hot_reload_lifecycle_stress() {
 
 #[test]
 fn test_post_unload_execution_safety() {
+    let _pool_guard = crate::DROP_SLOT_POOL_RWLOCK
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     let (rust_dylib, c_dylib) = ensure_guest_mods_built();
 
     let mut app = App::new();
@@ -208,6 +217,9 @@ fn test_post_unload_execution_safety() {
 
 #[test]
 fn test_world_consistency_after_guest_failure() {
+    let _pool_guard = crate::DROP_SLOT_POOL_RWLOCK
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     let (shared_rust_dylib, c_dylib) = ensure_guest_mods_built();
     // Private copy so mutating `PANIC_TRIGGER` never races with parallel tests.
     let isolated_rust = TempDylibCopy::new(&shared_rust_dylib, "world_consistency_panic");
@@ -313,6 +325,9 @@ fn test_world_consistency_after_guest_failure() {
 
 #[test]
 fn test_asymmetric_unload_interleaving_and_unload_all() {
+    let _pool_guard = crate::DROP_SLOT_POOL_RWLOCK
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     let (rust_dylib, c_dylib) = ensure_guest_mods_built();
 
     let mut app = App::new();
@@ -425,6 +440,9 @@ fn test_asymmetric_unload_interleaving_and_unload_all() {
 
 #[test]
 fn test_cdylib_panic_containment_and_continued_execution() {
+    let _pool_guard = crate::DROP_SLOT_POOL_RWLOCK
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     let (shared_rust_dylib, c_dylib) = ensure_guest_mods_built();
     // Private copy so `trigger_panic` is 100% isolated under parallel `cargo test`.
     let isolated_rust = TempDylibCopy::new(&shared_rust_dylib, "cdylib_panic_containment");
@@ -514,6 +532,9 @@ fn test_cdylib_panic_containment_and_continued_execution() {
 
 #[test]
 fn test_massive_post_unload_entity_churn() {
+    let _pool_guard = crate::DROP_SLOT_POOL_RWLOCK
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     let (rust_dylib, c_dylib) = ensure_guest_mods_built();
 
     let mut app = App::new();
@@ -598,6 +619,9 @@ fn test_massive_post_unload_entity_churn() {
 
 #[test]
 fn test_concurrent_multi_app_threads_load_tick_unload() {
+    let _pool_guard = crate::DROP_SLOT_POOL_RWLOCK
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     let (rust_dylib, c_dylib) = ensure_guest_mods_built();
 
     const NUM_THREADS: usize = 8;
@@ -684,6 +708,9 @@ fn test_concurrent_multi_app_threads_load_tick_unload() {
 
 #[test]
 fn test_multilanguage_mod_unload_and_post_unload_update_stress() {
+    let _pool_guard = crate::DROP_SLOT_POOL_RWLOCK
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     let (rust_dylib, c_dylib) = ensure_guest_mods_built();
 
     let mut app = App::new();

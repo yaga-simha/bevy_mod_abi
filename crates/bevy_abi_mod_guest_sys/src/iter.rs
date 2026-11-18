@@ -3384,8 +3384,8 @@ mod tests {
         // SAFETY: `iter` points to `MockMsgWorld`.
         let world = unsafe { &*iter.cast::<MockMsgWorld>() };
         let take = world.stored.len().min(max_count);
-        for i in 0..take {
-            let msg_ptr = core::ptr::from_ref(&world.stored[i]).cast::<c_void>();
+        for (i, stored_msg) in world.stored.iter().enumerate().take(take) {
+            let msg_ptr = core::ptr::from_ref(stored_msg).cast::<c_void>();
             // SAFETY: `out_buf` is writable for `take * size_of::<*const c_void>()` bytes;
             // `write_unaligned` preserves full pointer provenance.
             #[allow(clippy::cast_ptr_alignment)]

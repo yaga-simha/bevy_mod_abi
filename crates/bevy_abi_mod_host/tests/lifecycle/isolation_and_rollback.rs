@@ -217,6 +217,9 @@ fn init_or_strict_validation_failure_rolls_back() {
 
 #[test]
 fn register_outside_init_context_rejected() {
+    let _pool_guard = DROP_SLOT_POOL_RWLOCK
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     let mut world = World::new();
     let reg = ModRegistry::new();
     let active = Arc::new(AtomicBool::new(true));
@@ -332,6 +335,9 @@ fn register_outside_init_context_rejected() {
 
 #[test]
 fn multi_world_per_instance_isolation() {
+    let _pool_guard = DROP_SLOT_POOL_RWLOCK
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     let (rust_dylib, c_dylib) = ensure_guest_mods_built();
 
     let mut app_a = App::new();

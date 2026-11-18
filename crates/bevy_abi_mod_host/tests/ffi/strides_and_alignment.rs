@@ -333,12 +333,8 @@ mod dynamic_component_lifecycle {
         world.insert_resource(registry.clone());
 
         let is_active = Arc::new(AtomicBool::new(true));
-        let mut load_ctx = LoadContext::with_world_and_mod_id(
-            registry,
-            Arc::clone(&is_active),
-            &mut world as *mut World,
-            None,
-        );
+        let mut load_ctx =
+            LoadContext::with_world_and_mod_id(registry, is_active, &mut world as *mut World, None);
 
         let name = c"dyn_life::CustomDynamicHealth";
         let uuid = ComponentUuid::from_parts("dyn_life::CustomDynamicHealth", 8, 4, 0);

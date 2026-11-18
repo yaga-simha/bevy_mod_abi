@@ -57,6 +57,10 @@ impl TempCdylibCrate {
             let _ = fs::copy(&lock_src, dir.join("Cargo.lock"));
         }
 
+        let guest_escaped = guest_path.display().to_string().replace('\\', "/");
+        let guest_clean = guest_escaped.strip_prefix("//?/").unwrap_or(&guest_escaped);
+        let sys_escaped = sys_path.display().to_string().replace('\\', "/");
+        let sys_clean = sys_escaped.strip_prefix("//?/").unwrap_or(&sys_escaped);
         let cargo_toml = format!(
             r#"[workspace]
 
@@ -72,8 +76,8 @@ crate-type = ["cdylib"]
 bevy_abi_mod_guest = {{ path = "{guest}", features = ["derive"] }}
 bevy_abi_mod_sys = {{ path = "{sys}" }}
 "#,
-            guest = guest_path.display(),
-            sys = sys_path.display(),
+            guest = guest_clean,
+            sys = sys_clean,
         );
         fs::write(dir.join("Cargo.toml"), cargo_toml).expect("write temp Cargo.toml");
         fs::write(src_dir.join("lib.rs"), lib_rs).expect("write temp src/lib.rs");
@@ -122,6 +126,9 @@ impl Drop for TempCdylibCrate {
 
 #[test]
 fn register_dynamic_component_non_pod_lifecycle_and_zero_leak_drops() {
+    let _pool_guard = crate::DROP_SLOT_POOL_RWLOCK
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
     static TICK_SNAPSHOTS: Mutex<Vec<(u64, bool, i32, String, Vec<u32>, u32)>> =
         Mutex::new(Vec::new());
@@ -424,6 +431,9 @@ bevy_abi_mod_guest::export_mod!(name: c"dyn_profile_mod", version: c"0.1.0", log
 
 #[test]
 fn live_reload_mod_schema_evolution_v1_to_v2() {
+    let _pool_guard = crate::DROP_SLOT_POOL_RWLOCK
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     static V1_DROPS: AtomicUsize = AtomicUsize::new(0);
     static V2_DROPS: AtomicUsize = AtomicUsize::new(0);
     static V1_SPAWNED: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());

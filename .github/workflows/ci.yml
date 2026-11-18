@@ -274,9 +274,9 @@ jobs:
           if [ "${{ runner.os }}" = "Windows" ]; then
             "$CXX" -std=c++17 -Wall -Wextra -Wpedantic -Werror -Iinclude -O3 -shared examples/07_cpp17_guest/cpp_mod/mod.cpp -o examples/07_cpp17_guest/cpp_mod/cpp17_mod.dll
           elif [ "${{ runner.os }}" = "macOS" ]; then
-            "$CXX" -std=c++17 -Wall -Wextra -Wpedantic -Werror -Iinclude -O3 -shared -fPIC examples/07_cpp17_guest/cpp_mod/mod.cpp -o examples/07_cpp17_guest/cpp_mod/libcpp17_mod.dylib
+            "$CXX" -std=c++17 -Wall -Wextra -Wpedantic -Werror -Iinclude -O3 -shared -fPIC -fvisibility=hidden -fvisibility-inlines-hidden examples/07_cpp17_guest/cpp_mod/mod.cpp -o examples/07_cpp17_guest/cpp_mod/libcpp17_mod.dylib
           else
-            "$CXX" -std=c++17 -Wall -Wextra -Wpedantic -Werror -Iinclude -O3 -shared -fPIC examples/07_cpp17_guest/cpp_mod/mod.cpp -o examples/07_cpp17_guest/cpp_mod/libcpp17_mod.so
+            "$CXX" -std=c++17 -Wall -Wextra -Wpedantic -Werror -Iinclude -O3 -shared -fPIC -fvisibility=hidden -fvisibility-inlines-hidden examples/07_cpp17_guest/cpp_mod/mod.cpp -o examples/07_cpp17_guest/cpp_mod/libcpp17_mod.so
           fi
           (cd examples/08_zig_guest/zig_mod && zig build -Doptimize=ReleaseFast)
           BAM_FIXTURE_DIR="${{ github.workspace }}/target/fixtures" \
@@ -333,7 +333,9 @@ jobs:
           components: llvm-tools-preview
 
       - name: Install `cargo-llvm-cov`
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2
@@ -345,6 +347,7 @@ jobs:
           cargo xtask fixtures
           BAM_FIXTURE_DIR="${{ github.workspace }}/target/fixtures" \
             cargo llvm-cov --no-report \
+              --all-features \
               -p bevy_abi_mod_host_sys \
               -p bevy_abi_mod_host
           cargo llvm-cov report \

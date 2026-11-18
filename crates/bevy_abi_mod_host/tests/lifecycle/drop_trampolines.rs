@@ -236,7 +236,7 @@ fn test_drop_trampoline_saturation_and_reclamation() {
         let world_reg = world.resource::<ModRegistry>().clone();
         let mut load_ctx_2 = LoadContext::with_world_and_mod_id(
             world_reg,
-            Arc::clone(&is_active_2),
+            is_active_2,
             &mut world as *mut World,
             None,
         );
@@ -382,7 +382,7 @@ fn test_drop_trampoline_slot_reuse_cross_talk() {
             let reg_reload = world.resource::<ModRegistry>().clone();
             let mut ctx_reload = LoadContext::with_world_and_mod_id(
                 reg_reload,
-                Arc::clone(&is_active_a_reload),
+                is_active_a_reload,
                 &mut world as *mut World,
                 None,
             );
@@ -417,12 +417,8 @@ fn test_pod_components_consume_zero_drop_trampoline_slots() {
         world.insert_resource(registry.clone());
 
         let is_active = Arc::new(AtomicBool::new(true));
-        let mut load_ctx = LoadContext::with_world_and_mod_id(
-            registry,
-            Arc::clone(&is_active),
-            &mut world as *mut World,
-            None,
-        );
+        let mut load_ctx =
+            LoadContext::with_world_and_mod_id(registry, is_active, &mut world as *mut World, None);
 
         let desc_rust = ComponentDesc::new(
             c"pod::PodPowerData".as_ptr(),
@@ -517,12 +513,8 @@ fn test_non_pod_panic_containment_in_drop_trampoline() {
     world.insert_resource(registry.clone());
 
     let is_active = Arc::new(AtomicBool::new(true));
-    let mut load_ctx = LoadContext::with_world_and_mod_id(
-        registry,
-        Arc::clone(&is_active),
-        &mut world as *mut World,
-        None,
-    );
+    let mut load_ctx =
+        LoadContext::with_world_and_mod_id(registry, is_active, &mut world as *mut World, None);
 
     let desc = ComponentDesc::new(
         c"drop_test::PanickingNonPod".as_ptr(),
@@ -601,7 +593,7 @@ fn test_non_pod_slot_reuse_on_mod_reload() {
         let world_reg = world.resource::<ModRegistry>().clone();
         let mut load_ctx_2 = LoadContext::with_world_and_mod_id(
             world_reg,
-            Arc::clone(&is_active_2),
+            is_active_2,
             &mut world as *mut World,
             None,
         );

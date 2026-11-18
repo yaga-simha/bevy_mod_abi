@@ -1074,7 +1074,7 @@ pub(crate) fn prune_drop_trampolines_for_guard(is_active: &Arc<AtomicBool>) {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let allocated_slots = ctrl.entries.len();
 
-        for slot in 0..allocated_slots {
+        for (slot, entries) in ctrl.entries.iter_mut().enumerate().take(allocated_slots) {
             let Some((page, in_page)) = get_drop_page(slot) else {
                 continue;
             };
@@ -1082,7 +1082,6 @@ pub(crate) fn prune_drop_trampolines_for_guard(is_active: &Arc<AtomicBool>) {
             if state != SLOT_IN_USE {
                 continue;
             }
-            let entries = &mut ctrl.entries[slot];
             let before = entries.len();
             entries.retain(|(_, g)| !Arc::ptr_eq(g, is_active) && g.load(Ordering::Acquire));
             if entries.len() != before {
@@ -1102,8 +1101,12 @@ pub(crate) fn prune_drop_trampolines_for_guard(is_active: &Arc<AtomicBool>) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let allocated_hook_slots = hctrl.entries.len();
-    for slot in 0..allocated_hook_slots {
-        let entries = &mut hctrl.entries[slot];
+    for (slot, entries) in hctrl
+        .entries
+        .iter_mut()
+        .enumerate()
+        .take(allocated_hook_slots)
+    {
         if entries.is_empty() {
             continue;
         }

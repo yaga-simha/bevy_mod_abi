@@ -454,7 +454,7 @@ mod tests {
         let leaf_check = {
             let mut ctx = LoadContext::with_world_and_mod_id(
                 world.resource::<ModRegistry>().clone(),
-                Arc::clone(&active),
+                active,
                 &mut world as *mut World,
                 Some(ModId(2)),
             );
@@ -548,7 +548,7 @@ mod tests {
         let (sys_cmds, sys_probe, children_handle) = {
             let mut ctx = LoadContext::with_world_and_mod_id(
                 reg,
-                Arc::clone(&active),
+                active,
                 &mut world as *mut World,
                 Some(ModId(3)),
             );
@@ -746,7 +746,7 @@ mod tests {
         let systems = {
             let mut ctx = LoadContext::with_world_and_mod_id(
                 reg_after,
-                Arc::clone(&active),
+                active,
                 &mut world as *mut World,
                 Some(ModId(5)),
             );
@@ -926,7 +926,7 @@ mod tests {
         let sys = {
             let mut ctx = LoadContext::with_world_and_mod_id(
                 reg.clone(),
-                Arc::clone(&active),
+                active,
                 &mut world as *mut World,
                 Some(ModId(6)),
             );

@@ -60,18 +60,22 @@ fn validate_mod_name(raw: &str) -> Result<String, CliError> {
     Ok(raw.replace('-', "_"))
 }
 
+fn format_guest_sdk_dep(path: &Path) -> String {
+    let forward = path.to_string_lossy().replace('\\', "/");
+    let clean = forward.strip_prefix("//?/").unwrap_or(&forward);
+    format!("bevy_abi_mod_guest = {{ path = \"{clean}\", features = [\"derive\"] }}")
+}
+
 fn default_guest_sdk_dep(guest_sdk_path: Option<&Path>) -> String {
     if let Some(p) = guest_sdk_path {
-        let escaped = p.to_string_lossy().replace('\\', "/");
-        return format!("bevy_abi_mod_guest = {{ path = \"{escaped}\", features = [\"derive\"] }}");
+        return format_guest_sdk_dep(p);
     }
     let workspace_guest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("bevy_abi_mod_guest");
     if workspace_guest.is_dir() {
         let canonical = fs::canonicalize(&workspace_guest).unwrap_or(workspace_guest);
-        let escaped = canonical.to_string_lossy().replace('\\', "/");
-        return format!("bevy_abi_mod_guest = {{ path = \"{escaped}\", features = [\"derive\"] }}");
+        return format_guest_sdk_dep(&canonical);
     }
     "bevy_abi_mod_guest = { version = \"0.2.0\", features = [\"derive\"] }".to_owned()
 }

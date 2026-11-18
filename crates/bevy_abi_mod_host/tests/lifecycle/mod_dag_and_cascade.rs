@@ -300,6 +300,9 @@ cyc_x = "^1.0"
 
 #[test]
 fn load_mods_dir_orders_topologically_quarantines_cycles_and_cascades_reload_and_unload() {
+    let _pool_guard = crate::DROP_SLOT_POOL_RWLOCK
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     let state_dylib = TempDylibCopy::new(
         &fixture_dylib("state_hooks_and_observers_mod"),
         "dag_state_mod",

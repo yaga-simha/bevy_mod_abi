@@ -244,7 +244,7 @@ fn ensure_bsn_world_setup(world: &mut World) {
     scene_reg.set_scene_type_handle(scene_type_handle);
 
     let backend: Arc<dyn HostSceneBackend> = Arc::new(BevyHostSceneBackend {
-        inner: Arc::clone(&scene_reg.inner),
+        inner: scene_reg.inner,
     });
     world
         .resource_mut::<ModRegistry>()

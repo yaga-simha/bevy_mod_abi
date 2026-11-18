@@ -131,16 +131,30 @@ fuzz_target!(|data: &[u8]| {
                 1
             };
             let mode_raw = if cursor < data.len() {
-                let m = (data[cursor] % 13) as u32;
+                let m = (data[cursor] % 16) as u32;
                 cursor += 1;
                 m
             } else {
                 0
             };
-            let t_flags = if cursor < data.len() && (data[cursor] & 0x80 != 0) {
-                let tf = data[cursor] as u32;
+            let t_flags: u16 = if cursor < data.len() && (data[cursor] & 0x80 != 0) {
+                let tf = data[cursor] as u16;
                 cursor += 1;
                 tf
+            } else {
+                0
+            };
+            let or_group: u8 = if cursor < data.len() && (data[cursor] & 0x20 != 0) {
+                let og = data[cursor] % 4;
+                cursor += 1;
+                og
+            } else {
+                0
+            };
+            let t_reserved0: u8 = if cursor < data.len() && (data[cursor] & 0x40 != 0) {
+                let r = data[cursor] % 2;
+                cursor += 1;
+                r
             } else {
                 0
             };
@@ -148,6 +162,8 @@ fuzz_target!(|data: &[u8]| {
                 component: BamComponent::from_raw(comp_raw),
                 mode: AccessMode(mode_raw),
                 flags: t_flags,
+                or_group,
+                reserved0: t_reserved0,
             });
         }
         term_storage.push(terms);
@@ -186,6 +202,12 @@ fuzz_target!(|data: &[u8]| {
         run_if_user_data: core::ptr::null_mut(),
         in_sets: core::ptr::null(),
         in_set_count: 0,
+        after_weak: core::ptr::null(),
+        after_weak_count: 0,
+        before_weak: core::ptr::null(),
+        before_weak_count: 0,
+        ambiguous_with: core::ptr::null(),
+        ambiguous_with_count: 0,
     };
 
     if poison_early {

@@ -1758,12 +1758,8 @@ fn two_worlds_same_uuid_keep_isolated_drop_callbacks_including_world_drop() {
     world_a.insert_resource(reg_a.clone());
     let active_a = Arc::new(AtomicBool::new(true));
     let handle_a = {
-        let mut ctx_a = LoadContext::with_world_and_mod_id(
-            reg_a,
-            Arc::clone(&active_a),
-            &mut world_a as *mut World,
-            None,
-        );
+        let mut ctx_a =
+            LoadContext::with_world_and_mod_id(reg_a, active_a, &mut world_a as *mut World, None);
         let desc_a = ComponentDesc::new(
             c"diff_parity::SharedCrossWorldComp".as_ptr(),
             shared_uuid,
@@ -1786,12 +1782,8 @@ fn two_worlds_same_uuid_keep_isolated_drop_callbacks_including_world_drop() {
     world_b.insert_resource(reg_b.clone());
     let active_b = Arc::new(AtomicBool::new(true));
     let handle_b = {
-        let mut ctx_b = LoadContext::with_world_and_mod_id(
-            reg_b,
-            Arc::clone(&active_b),
-            &mut world_b as *mut World,
-            None,
-        );
+        let mut ctx_b =
+            LoadContext::with_world_and_mod_id(reg_b, active_b, &mut world_b as *mut World, None);
         let desc_b = ComponentDesc::new(
             c"diff_parity::SharedCrossWorldComp".as_ptr(),
             shared_uuid,

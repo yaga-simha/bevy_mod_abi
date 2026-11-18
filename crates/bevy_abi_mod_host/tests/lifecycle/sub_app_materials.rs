@@ -98,6 +98,9 @@ impl Drop for TempAssetDir {
 
 #[test]
 fn multi_sub_app_extracts_host_and_guest_dynamic_components_resources_and_cleans_up_on_unload() {
+    let _pool_guard = crate::DROP_SLOT_POOL_RWLOCK
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     let ordered_dylib = TempDylibCopy::new(&fixture_dylib("ordered_sets_mod"), "sub_app_extract");
 
     let mut app = App::new();
@@ -192,7 +195,7 @@ fn multi_sub_app_extracts_host_and_guest_dynamic_components_resources_and_cleans
     let mut ffi_persistent = FfiEntity::NULL;
     {
         let mut cmds = HostCommands::new(&mut storage, app.world().entity_allocator(), &snap)
-            .with_mod_context(Some(mod_id), Some(Arc::clone(&mod_active)));
+            .with_mod_context(Some(mod_id), Some(mod_active));
         let raw_cmds = cmds.as_ffi_ptr();
 
         let pos1 = Position {
@@ -506,6 +509,9 @@ fn multi_sub_app_extracts_host_and_guest_dynamic_components_resources_and_cleans
 
 #[test]
 fn wesl_shaders_aligned_shader_buffers_and_materials_cleanup_on_mod_unload() {
+    let _pool_guard = crate::DROP_SLOT_POOL_RWLOCK
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     let dylib = TempDylibCopy::new(&fixture_dylib("ordered_sets_mod"), "wesl_materials");
     let temp_dir = TempAssetDir::new("wesl_files");
     let wesl_disk_path = temp_dir.path.join("from_disk.wesl");
@@ -783,6 +789,9 @@ fn wesl_shaders_aligned_shader_buffers_and_materials_cleanup_on_mod_unload() {
 
 #[test]
 fn mod_asset_plugin_mod_protocol_wesl_shader_loading_and_unload_cleanup() {
+    let _pool_guard = crate::DROP_SLOT_POOL_RWLOCK
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     let dylib = TempDylibCopy::new(&fixture_dylib("ordered_sets_mod"), "mod_proto_wesl");
     let asset_dir = TempAssetDir::new("mod_proto_wesl");
     let shaders_dir = asset_dir.path.join("shaders");

@@ -2475,7 +2475,7 @@ mod tests {
         let reg_after = {
             let mut ctx = LoadContext::with_world_and_mod_id(
                 reg,
-                Arc::clone(&active),
+                active,
                 &mut world as *mut World,
                 Some(ModId(13)),
             );
@@ -2724,7 +2724,7 @@ mod tests {
         let reg_after = {
             let mut ctx = LoadContext::with_world_and_mod_id(
                 reg,
-                Arc::clone(&active),
+                active,
                 &mut world as *mut World,
                 Some(ModId(400)),
             );
@@ -2824,7 +2824,7 @@ mod tests {
         let reg_after_b = {
             let mut ctx = LoadContext::with_world_and_mod_id(
                 reg_after_a1,
-                Arc::clone(&active_b),
+                active_b,
                 &mut world as *mut World,
                 Some(ModId(502)),
             );
@@ -2855,7 +2855,7 @@ mod tests {
         let reg_after_a2 = {
             let mut ctx = LoadContext::with_world_and_mod_id(
                 reg_after_b,
-                Arc::clone(&active_a2),
+                active_a2,
                 &mut world as *mut World,
                 Some(ModId(503)),
             );

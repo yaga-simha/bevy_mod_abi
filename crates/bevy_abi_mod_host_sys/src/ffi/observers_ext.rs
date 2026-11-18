@@ -1213,7 +1213,7 @@ mod tests {
         let mut storage = HostCommandsStorage::new();
         {
             let mut cmds = HostCommands::new(&mut storage, world.entity_allocator(), &snap)
-                .with_mod_context(Some(ModId(1)), Some(Arc::clone(&active)))
+                .with_mod_context(Some(ModId(1)), Some(active))
                 .with_registry(&reg);
             let trig = BamTriggerDesc::new(BamComponent::INVALID, core::ptr::null_mut(), 0)
                 .with_event_kind(BamEventKind::READY)
@@ -1378,7 +1378,7 @@ mod tests {
         let mut storage2 = HostCommandsStorage::new();
         {
             let mut cmds = HostCommands::new(&mut storage2, world.entity_allocator(), &snap)
-                .with_mod_context(Some(ModId(2)), Some(Arc::clone(&active)))
+                .with_mod_context(Some(ModId(2)), Some(active))
                 .with_registry(&reg);
             let obs = BamObserverDesc::new_mut(
                 evt_handle,
@@ -1555,7 +1555,7 @@ mod tests {
         let mut storage3 = HostCommandsStorage::new();
         {
             let mut cmds = HostCommands::new(&mut storage3, world.entity_allocator(), &snap)
-                .with_mod_context(Some(ModId(3)), Some(Arc::clone(&active)))
+                .with_mod_context(Some(ModId(3)), Some(active))
                 .with_registry(&reg);
             let mut payload = DamagePayload { amount: 5 };
             let trig = BamTriggerDesc::new(
@@ -1677,7 +1677,7 @@ mod tests {
         let mut storage2 = HostCommandsStorage::new();
         {
             let mut cmds = HostCommands::new(&mut storage2, world.entity_allocator(), &snap)
-                .with_mod_context(Some(ModId(7)), Some(Arc::clone(&active)))
+                .with_mod_context(Some(ModId(7)), Some(active))
                 .with_registry(&reg);
             let trig = BamTriggerDesc::new(BamComponent::INVALID, core::ptr::null_mut(), 0)
                 .with_event_kind(BamEventKind::READY)

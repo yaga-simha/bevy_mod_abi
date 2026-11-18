@@ -603,7 +603,7 @@ mod imp {
 
             match world.load_mod_with(&lib_path, opts.clone()) {
                 Ok(id) => {
-                    loaded_names.insert(manifest.name.clone());
+                    loaded_names.insert(manifest.name);
                     outcomes.push(ModHotReloadOutcome {
                         path: lib_path,
                         mod_id: Some(id),
