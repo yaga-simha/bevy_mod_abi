@@ -2,10 +2,14 @@
 //! End-to-end integration tests for Example 07 (`cpp_mod/mod.cpp`, ISO C++17).
 
 use bevy_abi_mod::prelude::*;
-use bevy_abi_mod_sys::{FfiBool, FfiResult};
+use bevy_abi_mod_sys::{FfiBool, FfiOption, FfiResult};
 use bevy_app::App;
 use bevy_ecs::message::Messages;
-use example_07_cpp17_guest::{Position, SimConfig, Velocity, resolve_or_build_cpp17_mod};
+use example_07_cpp17_guest::{
+    ActorStats, BehaviorMode, Position, SimConfig, Velocity, render_example_components_header,
+    resolve_or_build_cpp17_mod,
+};
+use std::path::PathBuf;
 
 fn build_configured_app() -> App {
     let mut app = App::new();
@@ -101,4 +105,80 @@ fn cpp17_guest_chunk_iteration_multi_world_raii_and_exception_containment() {
 
     app_b.unload_mod(mod_b).expect("unload World B mod");
     assert_eq!(app_b.world().resource::<Messages<ModUnloaded>>().len(), 1);
+}
+
+#[test]
+fn example_components_header_matches_mod_component_c_decl() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let header_path = manifest_dir.join("cpp_mod/example_components.h");
+    let expected = render_example_components_header();
+    if std::env::var_os("BAM_REGEN_EXAMPLE_HEADERS").is_some() {
+        std::fs::write(&header_path, &expected).expect("write example_components.h");
+    }
+    let actual = std::fs::read_to_string(&header_path)
+        .expect("read example_components.h")
+        .replace("\r\n", "\n");
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn cpp17_guest_typed_views_host_vec_ffi_option_and_enum_roundtrip() {
+    let dylib_path = resolve_or_build_cpp17_mod();
+    let mut app = build_configured_app();
+    app.register_mod_component::<ActorStats>(ComponentOptions::new().with_default())
+        .expect("register ActorStats");
+    app.register_mod_component::<BehaviorMode>(ComponentOptions::new().with_default())
+        .expect("register BehaviorMode");
+
+    let entity = app
+        .world_mut()
+        .spawn((
+            Position::new(0.0, 0.0, 0.0),
+            Velocity::new(2.0, 0.0, 0.0),
+            ActorStats {
+                active: false,
+                tag: String::from("initial"),
+                scores: vec![10, 20],
+                bonus: FfiOption::none(),
+            },
+            BehaviorMode::Idle,
+        ))
+        .id();
+
+    let mod_id = app
+        .load_mod_with(
+            &dylib_path,
+            LoadOptions {
+                shadow_copy: true,
+                strict: true,
+                ..Default::default()
+            },
+        )
+        .expect("load C++17 mod");
+
+    // Tick 1: Idle -> Patrol { speed: 14.5, aggressive: true }, scores [10, 20] -> push(50), push(60), pop(60), +5 -> [15, 25, 55]
+    app.update();
+    let stats = app.world().get::<ActorStats>(entity).unwrap();
+    assert!(stats.active);
+    assert_eq!(stats.tag, "cpp17_view_updated");
+    assert_eq!(stats.scores, vec![15, 25, 55]);
+    assert_eq!(stats.bonus, FfiOption::some(777));
+    assert_eq!(
+        *app.world().get::<BehaviorMode>(entity).unwrap(),
+        BehaviorMode::Patrol {
+            speed: 14.5,
+            aggressive: true
+        }
+    );
+
+    // Tick 2: Patrol -> Attack(99), scores [15, 25, 55] -> [20, 30, 60, 55]
+    app.update();
+    let stats = app.world().get::<ActorStats>(entity).unwrap();
+    assert_eq!(stats.scores, vec![20, 30, 60, 55]);
+    assert_eq!(
+        *app.world().get::<BehaviorMode>(entity).unwrap(),
+        BehaviorMode::Attack(99)
+    );
+
+    app.unload_mod(mod_id).expect("unload C++17 mod");
 }

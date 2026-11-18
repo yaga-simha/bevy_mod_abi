@@ -1,0 +1,5 @@
+error: `#[derive(AbiPod)]` can only be applied to structs
+ --> tests/ui/abi_pod_tagged_enum.rs:5:10
+  |
+5 | pub enum TaggedPodRejected {
+  |          ^^^^^^^^^^^^^^^^^

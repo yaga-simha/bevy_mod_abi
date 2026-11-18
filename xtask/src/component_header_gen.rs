@@ -159,18 +159,13 @@ pub struct CInteropComponent {
     pub label: String,
 }
 
-fn push_component_section<T: ModComponentTrait>(out: &mut String) {
-    out.push_str(&format!(
-        "/* Component: `{}` (IS_ABI_POD = {}) */\n",
-        T::CANONICAL_NAME,
-        T::IS_ABI_POD
-    ));
-    out.push_str(T::C_DECL);
-    out.push('\n');
-}
-
-/// Renders the deterministic C99 header `include/generated/testbed_components.h`.
-pub fn generate_testbed_components_header() -> String {
+/// Renders a standalone C99 + C++17 (`#ifdef __cplusplus` RAII / typed views) component header
+/// from a slice of `(canonical_name, is_abi_pod, c_decl)` sections.
+pub fn render_component_header(
+    guard_macro: &str,
+    abi_header_include: &str,
+    sections: &[(&str, bool, &str)],
+) -> String {
     let mut out = String::with_capacity(12 * 1024);
     out.push_str("/*\n");
     out.push_str(
@@ -188,34 +183,55 @@ pub fn generate_testbed_components_header() -> String {
         " * ============================================================================\n",
     );
     out.push_str(" */\n\n");
-    out.push_str("#ifndef BEVY_ABI_MOD_GENERATED_TESTBED_COMPONENTS_H\n");
-    out.push_str("#define BEVY_ABI_MOD_GENERATED_TESTBED_COMPONENTS_H\n\n");
-    out.push_str("#include \"../bevy_abi_mod.h\"\n\n");
+    out.push_str(&format!("#ifndef {guard_macro}\n"));
+    out.push_str(&format!("#define {guard_macro}\n\n"));
+    out.push_str(&format!("#include \"{abi_header_include}\"\n\n"));
     out.push_str("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n");
 
-    push_component_section::<Position>(&mut out);
-    push_component_section::<Velocity>(&mut out);
-    push_component_section::<CombatHealth>(&mut out);
-    push_component_section::<NameTag>(&mut out);
-    push_component_section::<MetadataTag>(&mut out);
-    push_component_section::<Mass>(&mut out);
-    push_component_section::<Armor>(&mut out);
-    push_component_section::<FilteredTransform>(&mut out);
-    push_component_section::<CFilteredTransform>(&mut out);
-    push_component_section::<ChangeSensor>(&mut out);
-    push_component_section::<CChangeSensor>(&mut out);
-    push_component_section::<FreshSpawnTag>(&mut out);
-    push_component_section::<CFreshSpawnTag>(&mut out);
-    push_component_section::<TransientMarker>(&mut out);
-    push_component_section::<CTransientMarker>(&mut out);
-    push_component_section::<RustFilterTelemetry>(&mut out);
-    push_component_section::<CFilterTelemetry>(&mut out);
-    push_component_section::<Vec3>(&mut out);
-    push_component_section::<CInteropComponent>(&mut out);
+    for &(canonical_name, is_abi_pod, c_decl) in sections {
+        out.push_str(&format!(
+            "/* Component: `{canonical_name}` (IS_ABI_POD = {is_abi_pod}) */\n"
+        ));
+        out.push_str(c_decl);
+        out.push('\n');
+    }
 
     out.push_str("#ifdef __cplusplus\n}\n#endif\n\n");
-    out.push_str("#endif /* BEVY_ABI_MOD_GENERATED_TESTBED_COMPONENTS_H */\n");
+    out.push_str(&format!("#endif /* {guard_macro} */\n"));
     out
+}
+
+fn section_for<T: ModComponentTrait>() -> (&'static str, bool, &'static str) {
+    (T::CANONICAL_NAME, T::IS_ABI_POD, T::C_DECL)
+}
+
+/// Renders the deterministic C99/C++17 header `include/generated/testbed_components.h`.
+pub fn generate_testbed_components_header() -> String {
+    render_component_header(
+        "BEVY_ABI_MOD_GENERATED_TESTBED_COMPONENTS_H",
+        "../bevy_abi_mod.h",
+        &[
+            section_for::<Position>(),
+            section_for::<Velocity>(),
+            section_for::<CombatHealth>(),
+            section_for::<NameTag>(),
+            section_for::<MetadataTag>(),
+            section_for::<Mass>(),
+            section_for::<Armor>(),
+            section_for::<FilteredTransform>(),
+            section_for::<CFilteredTransform>(),
+            section_for::<ChangeSensor>(),
+            section_for::<CChangeSensor>(),
+            section_for::<FreshSpawnTag>(),
+            section_for::<CFreshSpawnTag>(),
+            section_for::<TransientMarker>(),
+            section_for::<CTransientMarker>(),
+            section_for::<RustFilterTelemetry>(),
+            section_for::<CFilterTelemetry>(),
+            section_for::<Vec3>(),
+            section_for::<CInteropComponent>(),
+        ],
+    )
 }
 
 /// Writes `include/generated/testbed_components.h` or checks that it matches byte-for-byte.
@@ -254,4 +270,136 @@ pub fn write_or_check_component_headers(root: &Path, check_only: bool) -> Result
         header_path.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_abi_mod_sys::FfiOption;
+    use std::process::Command;
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, Default, PartialEq, ModComponent)]
+    #[mod_component(name = "header_test::OptPod", summary_tick, require(Position))]
+    struct OptPod {
+        pub pos: Position,
+        pub target_id: FfiOption<u32>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, ModComponent)]
+    #[mod_component(name = "header_test::HostBag")]
+    struct HostBag {
+        pub active: bool,
+        pub label: String,
+        pub scores: Vec<u32>,
+        pub bonus: FfiOption<i32>,
+    }
+
+    #[repr(u8)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, ModComponent)]
+    #[mod_component(name = "header_test::Mode")]
+    enum Mode {
+        Idle = 0,
+        Active = 1,
+    }
+
+    #[repr(C, u8)]
+    #[derive(Debug, Clone, PartialEq, ModComponent)]
+    #[mod_component(name = "header_test::StateMachine")]
+    enum StateMachine {
+        Off = 0,
+        Running { speed: f32, tag: String } = 1,
+        Paused(Vec<u16>, FfiOption<u8>) = 2,
+    }
+
+    struct TempTestDir(std::path::PathBuf);
+    impl Drop for TempTestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn generated_headers_compile_under_strict_c99_and_cpp17() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest_dir.parent().expect("workspace root");
+        let include_dir = root.join("include");
+
+        let tmp_dir =
+            std::env::temp_dir().join(format!("bam_comp_hdr_test_{}", std::process::id()));
+        let gen_subdir = tmp_dir.join("generated");
+        fs::create_dir_all(&gen_subdir).expect("create temp test dir");
+        let _guard = TempTestDir(tmp_dir.clone());
+        fs::copy(
+            include_dir.join("bevy_abi_mod.h"),
+            tmp_dir.join("bevy_abi_mod.h"),
+        )
+        .expect("copy bevy_abi_mod.h");
+        let testbed_hdr = gen_subdir.join("testbed.h");
+        fs::write(&testbed_hdr, generate_testbed_components_header()).expect("write testbed.h");
+
+        let full_hdr_path = tmp_dir.join("all_features.h");
+        let full_hdr = render_component_header(
+            "ALL_FEATURES_H",
+            "bevy_abi_mod.h",
+            &[
+                section_for::<Position>(),
+                section_for::<OptPod>(),
+                section_for::<HostBag>(),
+                section_for::<Mode>(),
+                section_for::<StateMachine>(),
+            ],
+        );
+        fs::write(&full_hdr_path, full_hdr).expect("write all_features.h");
+
+        // 1. Strict ISO C99 compilation check
+        let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_owned());
+        for hdr in [&testbed_hdr, &full_hdr_path] {
+            let status = Command::new(&cc)
+                .args([
+                    "-std=c99",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-pedantic",
+                    "-fsyntax-only",
+                    "-x",
+                    "c",
+                ])
+                .arg(format!("-I{}", include_dir.display()))
+                .arg(hdr)
+                .status()
+                .expect("spawn C99 compiler");
+            assert!(
+                status.success(),
+                "C99 syntax check failed for {}",
+                hdr.display()
+            );
+        }
+
+        // 2. Strict ISO C++17 compilation check (including template views & HostVecView)
+        let cxx = std::env::var("CXX").unwrap_or_else(|_| "c++".to_owned());
+        for hdr in [&testbed_hdr, &full_hdr_path] {
+            let status = Command::new(&cxx)
+                .args([
+                    "-std=c++17",
+                    "-Wall",
+                    "-Wextra",
+                    "-Wpedantic",
+                    "-Werror",
+                    "-fsyntax-only",
+                    "-x",
+                    "c++-header",
+                ])
+                .arg(format!("-I{}", include_dir.display()))
+                .arg(hdr)
+                .status()
+                .expect("spawn C++17 compiler");
+            assert!(
+                status.success(),
+                "C++17 syntax check failed for {}",
+                hdr.display()
+            );
+        }
+    }
 }

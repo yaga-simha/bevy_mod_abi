@@ -2,7 +2,7 @@
 //! Shared `#[repr(C)]` `ModComponent` types for Example 07 (C++17 Guest Mod).
 
 use bevy_abi_mod::prelude::*;
-use bevy_abi_mod_sys::FfiBool;
+use bevy_abi_mod_sys::{FfiBool, FfiOption, ModComponent as ModComponentTrait};
 use bevy_ecs::component::Component;
 use bevy_ecs::resource::Resource;
 use std::fs;
@@ -77,23 +77,88 @@ impl Default for SimConfig {
     }
 }
 
+/// Non-POD actor stats component demonstrating `Vec<u32>`, `String`, `FfiOption<u32>`, and `bool`
+/// accessed through C++17 `ActorStatsView` and `HostVecView` (`"example::ActorStats"`).
+#[derive(Component, Debug, Clone, Default, PartialEq, ModComponent)]
+#[mod_component(name = "example::ActorStats")]
+pub struct ActorStats {
+    /// Whether the actor is active.
+    pub active: bool,
+    /// Host-owned actor label.
+    pub tag: String,
+    /// Host-owned score history vector.
+    pub scores: Vec<u32>,
+    /// Optional bonus points.
+    pub bonus: FfiOption<u32>,
+}
+
+/// Tagged `#[repr(C, u8)]` enum component accessed through C++17 `BehaviorModeView` (`"example::BehaviorMode"`).
+#[repr(C, u8)]
+#[derive(Component, Debug, Clone, Default, PartialEq, ModComponent)]
+#[mod_component(name = "example::BehaviorMode")]
+pub enum BehaviorMode {
+    /// Idle state.
+    #[default]
+    Idle = 0,
+    /// Patrolling with speed and aggression flag.
+    Patrol {
+        /// Patrol speed.
+        speed: f32,
+        /// Aggression flag.
+        aggressive: bool,
+    } = 1,
+    /// Attacking target ID.
+    Attack(u32) = 2,
+}
+
+/// Renders `examples/07_cpp17_guest/cpp_mod/example_components.h` from `ModComponent::C_DECL`.
+pub fn render_example_components_header() -> String {
+    let mut out = String::with_capacity(16 * 1024);
+    out.push_str("/* AUTO-GENERATED FROM `ModComponent::C_DECL` — DO NOT EDIT BY HAND. */\n");
+    out.push_str("#ifndef EXAMPLE_07_COMPONENTS_H\n");
+    out.push_str("#define EXAMPLE_07_COMPONENTS_H\n\n");
+    out.push_str("#include \"../../../include/bevy_abi_mod.h\"\n\n");
+    out.push_str("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n");
+    for decl in [
+        <Position as ModComponentTrait>::C_DECL,
+        <Velocity as ModComponentTrait>::C_DECL,
+        <SimConfig as ModComponentTrait>::C_DECL,
+        <ActorStats as ModComponentTrait>::C_DECL,
+        <BehaviorMode as ModComponentTrait>::C_DECL,
+    ] {
+        out.push_str(decl);
+        out.push('\n');
+    }
+    out.push_str("#ifdef __cplusplus\n}\n#endif\n\n");
+    out.push_str("#endif /* EXAMPLE_07_COMPONENTS_H */\n");
+    out
+}
+
 static BUILT_CPP17_MOD: OnceLock<PathBuf> = OnceLock::new();
 
 fn file_mtime(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).ok()?.modified().ok()
 }
 
-fn is_dylib_up_to_date(dylib_path: &Path, src_path: &Path, header_path: &Path) -> bool {
+fn is_dylib_up_to_date(
+    dylib_path: &Path,
+    src_path: &Path,
+    gen_header_path: &Path,
+    abi_header_path: &Path,
+) -> bool {
     let Some(dylib_mtime) = file_mtime(dylib_path) else {
         return false;
     };
     let Some(src_mtime) = file_mtime(src_path) else {
         return false;
     };
-    let Some(hdr_mtime) = file_mtime(header_path) else {
+    let Some(gen_mtime) = file_mtime(gen_header_path) else {
         return false;
     };
-    dylib_mtime >= src_mtime && dylib_mtime >= hdr_mtime
+    let Some(abi_mtime) = file_mtime(abi_header_path) else {
+        return false;
+    };
+    dylib_mtime >= src_mtime && dylib_mtime >= gen_mtime && dylib_mtime >= abi_mtime
 }
 
 /// Resolves or builds the C++17 guest shared library (`libcpp17_mod.{dylib,so}` / `cpp17_mod.dll`).
@@ -120,9 +185,10 @@ pub fn resolve_or_build_cpp17_mod() -> PathBuf {
             let cpp_dir = manifest_dir.join("cpp_mod");
             let dylib_path = cpp_dir.join(&filename);
             let src_path = cpp_dir.join("mod.cpp");
-            let header_path = cpp_dir.join("../../../include/bevy_abi_mod.h");
+            let gen_header_path = cpp_dir.join("example_components.h");
+            let abi_header_path = cpp_dir.join("../../../include/bevy_abi_mod.h");
 
-            if !is_dylib_up_to_date(&dylib_path, &src_path, &header_path) {
+            if !is_dylib_up_to_date(&dylib_path, &src_path, &gen_header_path, &abi_header_path) {
                 build_cpp17_mod(&cpp_dir, &dylib_path, ext);
             }
             dylib_path

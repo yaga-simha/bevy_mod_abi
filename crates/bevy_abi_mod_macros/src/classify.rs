@@ -32,6 +32,11 @@ pub(crate) enum FieldKind {
         field_ty: Box<Type>,
         elem_ty: Box<Type>,
     },
+    /// Cross-language `#[repr(C)]` `FfiOption<T>` (`T: AbiPod`).
+    FfiOption {
+        field_ty: Box<Type>,
+        inner_ty: Box<Type>,
+    },
     /// Nested compound struct or fixed array exposed via `*const c_void` / `*mut c_void` pointers.
     Nested {
         ty: Box<Type>,
@@ -77,14 +82,21 @@ pub(crate) fn is_128bit_int(ty: &Type) -> bool {
 }
 
 /// Extracts a deterministic, whitespace-normalized field type tag for
-/// `ComponentUuid::hash_field_schema` on `#[repr(C)]` `AbiPod` structs.
+/// `ComponentUuid::hash_field_schema` on `#[repr(C)]` `AbiPod` structs and enums.
 pub(crate) fn canonical_field_type_tag(ty: &Type) -> String {
     match ty {
         Type::Path(tp) if tp.qself.is_none() => {
-            if let Some(last) = tp.path.segments.last()
-                && last.arguments.is_empty()
-            {
-                return last.ident.to_string();
+            if let Some(last) = tp.path.segments.last() {
+                if last.arguments.is_empty() {
+                    return last.ident.to_string();
+                }
+                if (last.ident == "FfiOption" || last.ident == "Vec")
+                    && let PathArguments::AngleBracketed(args) = &last.arguments
+                    && args.args.len() == 1
+                    && let Some(GenericArgument::Type(inner)) = args.args.first()
+                {
+                    return format!("{}<{}>", last.ident, canonical_field_type_tag(inner));
+                }
             }
             quote!(#ty).to_string().replace(' ', "")
         }
@@ -144,6 +156,28 @@ pub(crate) fn classify_type(ty: &Type, attr_override: FieldAttrOverride) -> syn:
                 "`#[mod_field(vec)]` requires a `Vec<T>` generic field type, or `#[mod_field(vec(ElemTy))]` for concrete type aliases",
             ));
         }
+        FieldAttrOverride::FfiOption(explicit_inner) => {
+            if let Some(inner_ty) = explicit_inner {
+                return Ok(FieldKind::FfiOption {
+                    field_ty: boxed_ty(),
+                    inner_ty,
+                });
+            }
+            if let Type::Path(type_path) = ty
+                && let Some(last_seg) = type_path.path.segments.last()
+                && let PathArguments::AngleBracketed(args) = &last_seg.arguments
+                && let Some(GenericArgument::Type(inner_ty)) = args.args.first()
+            {
+                return Ok(FieldKind::FfiOption {
+                    field_ty: boxed_ty(),
+                    inner_ty: Box::new(inner_ty.clone()),
+                });
+            }
+            return Err(syn::Error::new_spanned(
+                ty,
+                "`#[mod_field(option)]` requires an `FfiOption<T>` generic field type, or `#[mod_field(option(InnerTy))]` for concrete type aliases",
+            ));
+        }
         FieldAttrOverride::None => {}
     }
 
@@ -200,6 +234,20 @@ pub(crate) fn classify_type(ty: &Type, attr_override: FieldAttrOverride) -> syn:
                         return Err(syn::Error::new_spanned(
                             ty,
                             "unsupported `Vec` type arguments for `ModComponent` (custom allocators are not supported across the C-ABI)",
+                        ));
+                    }
+                    (PathArguments::AngleBracketed(args), "FfiOption") => {
+                        if args.args.len() == 1
+                            && let Some(GenericArgument::Type(inner_ty)) = args.args.first()
+                        {
+                            return Ok(FieldKind::FfiOption {
+                                field_ty: boxed_ty(),
+                                inner_ty: Box::new(inner_ty.clone()),
+                            });
+                        }
+                        return Err(syn::Error::new_spanned(
+                            ty,
+                            "unsupported `FfiOption` type arguments for `ModComponent`; expected `FfiOption<T>`",
                         ));
                     }
                     (

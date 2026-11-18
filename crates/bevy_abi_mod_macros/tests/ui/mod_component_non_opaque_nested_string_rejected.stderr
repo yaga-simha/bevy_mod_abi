@@ -35,12 +35,12 @@ help: the trait `RawInsertable` is not implemented for `InnerLabel`
    = help: the following other types implement trait `RawInsertable`:
              BamChangeTicks
              BamComponent
+             BamEventKind
              ComponentUuid
+             FfiAssetHandle
+             FfiAssetLoadState
              FfiBool
              FfiChildOf
-             FfiEntity
-             NonOpaqueOuter
-             [T; N]
            and $N others
 note: required by a bound in `assert_raw_insertable`
   --> $WORKSPACE/crates/bevy_abi_mod_sys/src/traits.rs
@@ -80,12 +80,12 @@ help: the trait `AbiPod` is not implemented for `InnerLabel`
    = help: the following other types implement trait `AbiPod`:
              BamChangeTicks
              BamComponent
+             BamEventKind
              ComponentUuid
+             FfiAssetHandle
+             FfiAssetLoadState
              FfiBool
              FfiChildOf
-             FfiEntity
-             NonOpaqueOuter
-             [T; N]
            and $N others
 note: required by a bound in `assert_abi_pod`
   --> $WORKSPACE/crates/bevy_abi_mod_sys/src/traits.rs
