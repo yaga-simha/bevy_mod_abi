@@ -66,3 +66,21 @@ note: required by a bound in `__bam_write_string`
 7 | #[derive(ModComponent)]
   |          ^^^^^^^^^^^^ required by this bound in `__bam_write_string`
   = note: this error originates in the derive macro `ModComponent` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: field type `String` is not `std::string::String` (syntactic `String` classification requires `std::string::String`; use `#[mod_field(nested)]`, `#[mod_field(primitive)]`, or `#[mod_field(skip)]` if intentional)
+ --> tests/ui/mod_component_spoofed_string_rejected.rs:9:16
+  |
+9 |     pub label: String,
+  |                ^^^^^^ unsatisfied trait bound
+  |
+help: the trait `__BamStdString` is not implemented for `String`
+ --> tests/ui/mod_component_spoofed_string_rejected.rs:3:1
+  |
+3 | pub struct String {
+  | ^^^^^^^^^^^^^^^^^
+help: the trait `__BamStdString` is implemented for `std::string::String`
+ --> tests/ui/mod_component_spoofed_string_rejected.rs:7:10
+  |
+7 | #[derive(ModComponent)]
+  |          ^^^^^^^^^^^^
+  = note: this error originates in the derive macro `ModComponent` (in Nightly builds, run with -Z macro-backtrace for more info)

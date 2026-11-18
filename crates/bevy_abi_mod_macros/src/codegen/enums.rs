@@ -1,6 +1,11 @@
 use crate::attrs::{IntRepr, ReprFlags, parse_field_attr, to_snake_case};
-use crate::classify::{FieldKind, canonical_field_type_tag, classify_type};
+use crate::classify::{
+    FieldKind, canonical_field_type_tag, canonical_kind_type_tag, classify_type,
+};
 use crate::codegen::c_decl::{DeclEnumInfo, DeclEnumVariant, DeclEnumVariantField, DeclFieldKind};
+use crate::codegen::witness::{
+    WitnessEnumVariant, WitnessEnumVariantField, WitnessFieldKind, emit_enum_witnesses,
+};
 use crate::codegen::{CodegenState, vtable};
 use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote, quote_spanned};
@@ -276,6 +281,7 @@ pub(crate) fn expand_enum_mod_component(
     });
 
     let mut decl_variants = Vec::with_capacity(variant_count);
+    let mut witness_variants = Vec::with_capacity(variant_count);
 
     // Emit `set_<variant>` and `try_get_<variant>_<field>` slots + schema/decl metadata.
     for (variant, disc_val, is_unit, is_named, has_skipped, fields_info) in &parsed_variants {
@@ -285,6 +291,7 @@ pub(crate) fn expand_enum_mod_component(
 
         let mut decl_fields = Vec::new();
         let mut schema_variant_fields = Vec::new();
+        let mut witness_fields = Vec::new();
 
         for info in fields_info {
             let f_span = info.span;
@@ -392,6 +399,27 @@ pub(crate) fn expand_enum_mod_component(
                     info.field_name.clone()
                 },
                 kind: decl_kind,
+                raw_ty: info.raw_ty.clone(),
+            });
+
+            let witness_kind = match &info.kind {
+                FieldKind::Skip => unreachable!(),
+                FieldKind::Bool(_) => WitnessFieldKind::Bool,
+                FieldKind::Primitive { .. } => WitnessFieldKind::Primitive,
+                FieldKind::HostString(_) => WitnessFieldKind::HostString,
+                FieldKind::HostVec { elem_ty, .. } => WitnessFieldKind::HostVec {
+                    elem_ty: elem_ty.clone(),
+                },
+                FieldKind::FfiOption { inner_ty, .. } => WitnessFieldKind::FfiOption {
+                    inner_ty: inner_ty.clone(),
+                },
+                FieldKind::Nested { .. } => WitnessFieldKind::Nested,
+            };
+            witness_fields.push(WitnessEnumVariantField {
+                field_name: info.field_name.clone(),
+                type_tag: canonical_kind_type_tag(&info.raw_ty, &info.kind),
+                rust_ident: info.rust_ident.clone(),
+                kind: witness_kind,
                 raw_ty: info.raw_ty.clone(),
             });
         }
@@ -736,12 +764,19 @@ pub(crate) fn expand_enum_mod_component(
         }
 
         decl_variants.push(DeclEnumVariant {
-            name: v_name,
+            name: v_name.clone(),
             snake_name: v_snake,
             discriminant: *disc_val,
             has_skipped: *has_skipped,
             fields: decl_fields,
             schema_fields: schema_variant_fields,
+        });
+        witness_variants.push(WitnessEnumVariant {
+            name: v_name,
+            is_unit: *is_unit,
+            is_named: *is_named,
+            has_skipped: *has_skipped,
+            fields: witness_fields,
         });
     }
 
@@ -751,5 +786,6 @@ pub(crate) fn expand_enum_mod_component(
         variants: decl_variants,
     });
 
+    emit_enum_witnesses(&mut state, &witness_variants);
     Ok(vtable::emit_vtable_and_impls(&state, vtable_ident))
 }

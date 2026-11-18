@@ -396,6 +396,31 @@ mod tests {
     }
 
     #[test]
+    fn emits_witness_symbols_for_non_opaque_and_omits_for_opaque() {
+        let non_opaque: DeriveInput = parse_quote! {
+            #[mod_component(name = "schema::Item")]
+            pub struct Item {
+                pub hp: i32,
+            }
+        };
+        let ts_non_opaque = expand_mod_component(&non_opaque).unwrap().to_string();
+        assert!(ts_non_opaque.contains("bam.v0.schema::Item.field_info"));
+        assert!(ts_non_opaque.contains("bam.v0.schema::Item.export_fields"));
+        assert!(ts_non_opaque.contains("bam.v0.schema::Item.import_field"));
+
+        let opaque: DeriveInput = parse_quote! {
+            #[mod_component(name = "schema::OpaqueItem", opaque)]
+            pub struct OpaqueItem {
+                pub hp: i32,
+            }
+        };
+        let ts_opaque = expand_mod_component(&opaque).unwrap().to_string();
+        assert!(!ts_opaque.contains("bam.v0.schema::OpaqueItem.field_info"));
+        assert!(!ts_opaque.contains("bam.v0.schema::OpaqueItem.export_fields"));
+        assert!(!ts_opaque.contains("bam.v0.schema::OpaqueItem.import_field"));
+    }
+
+    #[test]
     fn repr_c_pod_emits_raw_insertable_abi_pod_and_schema_uuid() {
         let input: DeriveInput = parse_quote! {
             #[repr(C)]
