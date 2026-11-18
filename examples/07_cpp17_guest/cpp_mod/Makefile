@@ -3,13 +3,13 @@ CXX ?= c++
 
 ifeq ($(UNAME_S),Darwin)
     TARGET = libcpp17_mod.dylib
-    LDFLAGS = -shared -fPIC
+    LDFLAGS = -shared -fPIC -fvisibility=hidden -fvisibility-inlines-hidden
 else ifeq ($(OS),Windows_NT)
     TARGET = cpp17_mod.dll
     LDFLAGS = -shared
 else
     TARGET = libcpp17_mod.so
-    LDFLAGS = -shared -fPIC
+    LDFLAGS = -shared -fPIC -fvisibility=hidden -fvisibility-inlines-hidden
 endif
 
 # Strict ISO C++17 compile flags (override prevents environment CXXFLAGS clobbering)

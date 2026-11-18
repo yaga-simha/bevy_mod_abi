@@ -63,6 +63,19 @@ fn c_compiler() -> String {
         })
 }
 
+fn cxx_compiler() -> String {
+    env::var("CXX")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            if cfg!(target_os = "windows") {
+                "g++".to_owned()
+            } else {
+                "c++".to_owned()
+            }
+        })
+}
+
 fn cargo_bin() -> String {
     env::var("CARGO")
         .ok()
@@ -215,6 +228,48 @@ fn build_c99_mod(
     if !out_path.is_file() {
         return Err(format!(
             "expected C99 shared library was not produced at {}",
+            out_path.display()
+        ));
+    }
+    Ok(out_path)
+}
+
+fn build_cpp17_mod(
+    root: &Path,
+    dir_rel: &str,
+    src_file: &str,
+    artifact_stem: &str,
+    opt_flag: &str,
+) -> Result<PathBuf, String> {
+    let mod_dir = root.join(dir_rel);
+    let (prefix, ext) = dylib_naming();
+    let out_name = format!("{prefix}{artifact_stem}.{ext}");
+    let out_path = mod_dir.join(&out_name);
+
+    let cxx = cxx_compiler();
+    let include_dir = root.join("include");
+    let mut cmd = Command::new(&cxx);
+    cmd.current_dir(&mod_dir)
+        .args(["-std=c++17", "-Wall", "-Wextra", "-Wpedantic", "-Werror"])
+        .arg(format!("-I{}", include_dir.display()))
+        .arg(opt_flag)
+        .arg("-shared");
+    if !cfg!(target_os = "windows") {
+        cmd.args([
+            "-fPIC",
+            "-fvisibility=hidden",
+            "-fvisibility-inlines-hidden",
+        ]);
+    }
+    cmd.arg(src_file).arg("-o").arg(&out_path);
+    run_cmd(
+        &mut cmd,
+        &format!("{cxx} {dir_rel}/{src_file} -> {out_name}"),
+    )?;
+
+    if !out_path.is_file() {
+        return Err(format!(
+            "expected C++17 shared library was not produced at {}",
             out_path.display()
         ));
     }
@@ -532,6 +587,23 @@ fn build_fixtures_internal(
         "release",
         &ex3_c,
         "example_03_c_mod",
+    )?);
+
+    let ex7_cpp = build_cpp17_mod(
+        root,
+        "examples/07_cpp17_guest/cpp_mod",
+        "mod.cpp",
+        "cpp17_mod",
+        "-O3",
+    )?;
+    built.push(stage_fixture(
+        root,
+        &fixtures_dir,
+        "cpp17_mod",
+        "cpp17",
+        "release",
+        &ex7_cpp,
+        "cpp17_mod",
     )?);
 
     // 4. Additional optional GUI/3D example guest mods (Example 05)

@@ -5,8 +5,11 @@ use bevy_abi_mod::prelude::*;
 use bevy_abi_mod_sys::FfiBool;
 use bevy_ecs::component::Component;
 use bevy_ecs::resource::Resource;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
+use std::time::SystemTime;
 
 /// 3D world-space position component exposed to the C++17 guest (`"example::Position"`).
 #[repr(C)]
@@ -74,9 +77,27 @@ impl Default for SimConfig {
     }
 }
 
+static BUILT_CPP17_MOD: OnceLock<PathBuf> = OnceLock::new();
+
+fn file_mtime(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).ok()?.modified().ok()
+}
+
+fn is_dylib_up_to_date(dylib_path: &Path, src_path: &Path, header_path: &Path) -> bool {
+    let Some(dylib_mtime) = file_mtime(dylib_path) else {
+        return false;
+    };
+    let Some(src_mtime) = file_mtime(src_path) else {
+        return false;
+    };
+    let Some(hdr_mtime) = file_mtime(header_path) else {
+        return false;
+    };
+    dylib_mtime >= src_mtime && dylib_mtime >= hdr_mtime
+}
+
 /// Resolves or builds the C++17 guest shared library (`libcpp17_mod.{dylib,so}` / `cpp17_mod.dll`).
 pub fn resolve_or_build_cpp17_mod() -> PathBuf {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let (prefix, ext) = if cfg!(target_os = "windows") {
         ("", "dll")
     } else if cfg!(target_os = "macos") {
@@ -93,57 +114,77 @@ pub fn resolve_or_build_cpp17_mod() -> PathBuf {
         }
     }
 
-    let cpp_dir = manifest_dir.join("cpp_mod");
-    let dylib_path = cpp_dir.join(&filename);
-    if dylib_path.is_file() {
-        return dylib_path;
-    }
+    BUILT_CPP17_MOD
+        .get_or_init(|| {
+            let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let cpp_dir = manifest_dir.join("cpp_mod");
+            let dylib_path = cpp_dir.join(&filename);
+            let src_path = cpp_dir.join("mod.cpp");
+            let header_path = cpp_dir.join("../../../include/bevy_abi_mod.h");
 
-    build_cpp17_mod(&cpp_dir, &dylib_path);
-    dylib_path
+            if !is_dylib_up_to_date(&dylib_path, &src_path, &header_path) {
+                build_cpp17_mod(&cpp_dir, &dylib_path, ext);
+            }
+            dylib_path
+        })
+        .clone()
 }
 
-fn build_cpp17_mod(cpp_dir: &Path, dylib_path: &Path) {
-    if !cfg!(target_os = "windows") && cpp_dir.join("Makefile").is_file() {
-        let status = Command::new("make")
-            .arg("-C")
-            .arg(cpp_dir)
-            .status()
-            .expect("Failed to invoke `make` for C++17 guest mod");
-        assert!(status.success(), "C++17 guest `make` build failed");
-    } else {
-        let cxx = std::env::var("CXX")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| {
-                if cfg!(target_os = "windows") {
-                    "g++".to_owned()
-                } else {
-                    "c++".to_owned()
-                }
-            });
-        let include_dir = cpp_dir.join("../../../include");
-        let mut cmd = Command::new(&cxx);
-        cmd.current_dir(cpp_dir)
-            .args([
-                "-std=c++17",
-                "-Wall",
-                "-Wextra",
-                "-Wpedantic",
-                "-Werror",
-                "-O3",
-                "-shared",
-            ])
-            .arg(format!("-I{}", include_dir.display()));
-        if !cfg!(target_os = "windows") {
-            cmd.arg("-fPIC");
-        }
-        cmd.arg("mod.cpp").arg("-o").arg(dylib_path);
-        let status = cmd
-            .status()
-            .unwrap_or_else(|e| panic!("Failed to invoke `{cxx}` for C++17 guest mod: {e}"));
-        assert!(status.success(), "C++17 guest `{cxx}` compilation failed");
+fn build_cpp17_mod(cpp_dir: &Path, dylib_path: &Path, ext: &str) {
+    let cxx = std::env::var("CXX")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            if cfg!(target_os = "windows") {
+                "g++".to_owned()
+            } else {
+                "c++".to_owned()
+            }
+        });
+    let include_dir = cpp_dir.join("../../../include");
+    let pid = std::process::id();
+    let tmp_path = cpp_dir.join(format!("cpp17_mod.tmp.{pid}.{ext}"));
+
+    let mut cmd = Command::new(&cxx);
+    cmd.current_dir(cpp_dir)
+        .args([
+            "-std=c++17",
+            "-Wall",
+            "-Wextra",
+            "-Wpedantic",
+            "-Werror",
+            "-O3",
+            "-shared",
+        ])
+        .arg(format!("-I{}", include_dir.display()));
+    if !cfg!(target_os = "windows") {
+        cmd.args([
+            "-fPIC",
+            "-fvisibility=hidden",
+            "-fvisibility-inlines-hidden",
+        ]);
     }
+    cmd.arg("mod.cpp").arg("-o").arg(&tmp_path);
+    let status = cmd
+        .status()
+        .unwrap_or_else(|e| panic!("Failed to invoke `{cxx}` for C++17 guest mod: {e}"));
+    if !status.success() {
+        let _ = fs::remove_file(&tmp_path);
+        panic!("C++17 guest `{cxx}` compilation failed with status {status}");
+    }
+
+    if let Err(rename_err) = fs::rename(&tmp_path, dylib_path) {
+        fs::copy(&tmp_path, dylib_path).unwrap_or_else(|copy_err| {
+            let _ = fs::remove_file(&tmp_path);
+            panic!(
+                "Failed to move compiled C++17 mod {} -> {} (rename: {rename_err}, copy: {copy_err})",
+                tmp_path.display(),
+                dylib_path.display()
+            );
+        });
+        let _ = fs::remove_file(&tmp_path);
+    }
+
     assert!(
         dylib_path.is_file(),
         "Expected compiled C++17 mod at {}",
