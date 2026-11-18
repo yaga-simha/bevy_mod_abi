@@ -16,6 +16,7 @@
 #[path = "../support/helpers.rs"]
 mod support;
 
+mod batch_cmds_and_messages;
 mod boundary_validation;
 mod c_vtable_interop;
 mod chunk_and_commands;

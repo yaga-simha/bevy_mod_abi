@@ -2,12 +2,13 @@
 //! sparse-set row views, untracked mutation + `mark_changed_range`, and singleton resource access.
 
 use core::{ffi::c_void, marker::PhantomData, mem::MaybeUninit, ops::Index};
+use std::ffi::CString;
 
 use bevy_abi_mod_sys::{
     AbiPod, AccessMode, BamChangeTicks, BamColumnInfo, BamComponent, BamHostApi, BamIter,
     BamIterReadRemovedFn, BamMsgReadBatchFn, BamMsgSendFn, BamMsgWriteBatchFn,
-    BamParForEachChunkFn, BamResTicksFn, ComponentUuid, FfiBool, FfiEntity, FfiResult,
-    MAX_TERMS_PER_QUERY, StrView,
+    BamParForEachChunkFn, BamResTicksFn, ComponentUuid, FfiBool, FfiEntity, FfiResult, FfiSlice,
+    MAX_TERMS_PER_QUERY, ModComponent, StrView,
 };
 
 use crate::{
@@ -1941,6 +1942,313 @@ impl<'a> ValidatedIter<'a> {
         unsafe { write_fn(self.raw, term_index, data_ptr, messages.len()) }
     }
 
+    /// Reads up to `out_ptrs.len()` unread non-POD message pointers (`*const c_void` referencing
+    /// host `M` items inside `Messages<M>`) from `term_index`, advancing this system's cursor.
+    ///
+    /// Returned pointers remain valid only for the synchronous duration of the active system tick.
+    pub fn read_non_pod_message_ptrs_checked(
+        &mut self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+        out_ptrs: &mut [*const c_void],
+    ) -> Result<usize, FfiResult> {
+        const _: () = assert!(
+            core::mem::size_of::<*const c_void>() == core::mem::size_of::<usize>()
+                && core::mem::align_of::<*const c_void>() == core::mem::align_of::<usize>()
+        );
+        if self.raw.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        if !self.host.api().covers_slot(
+            core::mem::offset_of!(BamHostApi, msg_read_batch),
+            core::mem::size_of::<Option<BamMsgReadBatchFn>>(),
+        ) {
+            return Err(FfiResult::UNSUPPORTED);
+        }
+        let Some(read_fn) = self.host.api().msg_read_batch else {
+            return Err(FfiResult::UNSUPPORTED);
+        };
+        let info = self.column_info(term_index)?;
+        if !validate_non_pod_message_info(&info, expected_uuid, false) {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        if out_ptrs.is_empty() {
+            return Ok(0);
+        }
+        let mut read_count = 0usize;
+        // SAFETY: `self.raw` is active, `out_ptrs` provides `out_ptrs.len()` writable
+        // `usize`/`*const c_void` slots, and `validate_non_pod_message_info` verified `term_index`.
+        let status = unsafe {
+            read_fn(
+                self.raw,
+                term_index,
+                out_ptrs.as_mut_ptr().cast::<u8>(),
+                out_ptrs.len(),
+                &mut read_count,
+            )
+        };
+        if !status.is_ok() {
+            return Err(status);
+        }
+        Ok(read_count.min(out_ptrs.len()))
+    }
+
+    /// Reads up to `max_count` unread VTable-backed non-POD messages (`M: ModComponent + Default`)
+    /// from `term_index`, reconstructing each host `M` into guest memory via the host's
+    /// `"bam.v0.<M>.export_fields"` witness symbol and guest's `"bam.v0.<M>.import_field"`.
+    pub fn read_non_pod_messages_checked<M: ModComponent + Default>(
+        &mut self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+        max_count: usize,
+    ) -> Result<Vec<M>, FfiResult> {
+        if max_count == 0 {
+            let info = self.column_info(term_index)?;
+            if !validate_non_pod_message_info(&info, expected_uuid, false) {
+                return Err(FfiResult::TYPE_MISMATCH);
+            }
+            return Ok(Vec::new());
+        }
+
+        let mut ptrs = vec![core::ptr::null::<c_void>(); max_count];
+        let actual =
+            self.read_non_pod_message_ptrs_checked(term_index, expected_uuid, &mut ptrs)?;
+        if actual == 0 {
+            return Ok(Vec::new());
+        }
+
+        type ExportFieldsFn = unsafe extern "C" fn(
+            src_ptr: *const c_void,
+            sink: Option<
+                unsafe extern "C" fn(
+                    sink_ctx: *mut c_void,
+                    field_name: StrView,
+                    type_tag: StrView,
+                    payload: FfiSlice<u8>,
+                ) -> FfiResult,
+            >,
+            sink_ctx: *mut c_void,
+        ) -> FfiResult;
+        type ImportFieldFn = unsafe extern "C" fn(
+            dst_ptr: *mut c_void,
+            field_name: StrView,
+            type_tag: StrView,
+            payload: FfiSlice<u8>,
+        ) -> FfiResult;
+
+        let export_sym_name = CString::new(format!("bam.v0.{}.export_fields", M::CANONICAL_NAME))
+            .map_err(|_| FfiResult::INVALID_ARGUMENT)?;
+        let host_export_ptr = self.host.resolve_custom_symbol(&export_sym_name)?;
+        if host_export_ptr.is_null() {
+            return Err(FfiResult::UNSUPPORTED);
+        }
+        // SAFETY: Host registered `"bam.v0.<M>.export_fields"` with the exact witness `ExportFieldsFn` ABI.
+        let host_export_fn: ExportFieldsFn = unsafe { core::mem::transmute(host_export_ptr) };
+
+        let guest_import_sym = format!("bam.v0.{}.import_field", M::CANONICAL_NAME);
+        let Some(guest_import_ptr) = M::resolve_symbol(&guest_import_sym) else {
+            return Err(FfiResult::UNSUPPORTED);
+        };
+        if guest_import_ptr.is_null() {
+            return Err(FfiResult::UNSUPPORTED);
+        }
+        // SAFETY: `M::symbols()` exports `"bam.v0.<M>.import_field"` with `ImportFieldFn` ABI.
+        let guest_import_fn: ImportFieldFn = unsafe { core::mem::transmute(guest_import_ptr) };
+
+        struct ImportSinkCtx {
+            dst_ptr: *mut c_void,
+            import_fn: ImportFieldFn,
+        }
+
+        unsafe extern "C" fn forward_field(
+            ctx: *mut c_void,
+            field_name: StrView,
+            type_tag: StrView,
+            payload: FfiSlice<u8>,
+        ) -> FfiResult {
+            // SAFETY: `ctx` points to a stack-pinned `ImportSinkCtx` for the duration of `host_export_fn`.
+            let sink_ctx = unsafe { &*ctx.cast::<ImportSinkCtx>() };
+            // SAFETY: `sink_ctx.dst_ptr` points to a valid initialized `M`, and `field_name`,
+            // `type_tag`, `payload` are valid slices for this synchronous callback.
+            unsafe { (sink_ctx.import_fn)(sink_ctx.dst_ptr, field_name, type_tag, payload) }
+        }
+
+        let mut out = Vec::with_capacity(actual);
+        for &host_msg_ptr in &ptrs[..actual] {
+            if host_msg_ptr.is_null() {
+                return Err(FfiResult::NULL_POINTER);
+            }
+            let mut guest_msg = M::default();
+            let mut sink_ctx = ImportSinkCtx {
+                dst_ptr: (&raw mut guest_msg).cast::<c_void>(),
+                import_fn: guest_import_fn,
+            };
+            // SAFETY: `host_msg_ptr` points to a live host `&M` inside `Messages<M>` for this tick;
+            // `sink_ctx` lives on the stack across `host_export_fn`.
+            let status = unsafe {
+                host_export_fn(
+                    host_msg_ptr,
+                    Some(forward_field),
+                    (&raw mut sink_ctx).cast::<c_void>(),
+                )
+            };
+            if !status.is_ok() {
+                return Err(status);
+            }
+            out.push(guest_msg);
+        }
+        Ok(out)
+    }
+
+    /// Drains all currently unread VTable-backed non-POD messages (`M: ModComponent + Default`)
+    /// from `term_index`.
+    pub fn drain_non_pod_messages_checked<M: ModComponent + Default>(
+        &mut self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<Vec<M>, FfiResult> {
+        const BATCH_SIZE: usize = 64;
+        let mut all = Vec::new();
+        loop {
+            let batch =
+                self.read_non_pod_messages_checked::<M>(term_index, expected_uuid, BATCH_SIZE)?;
+            let count = batch.len();
+            all.extend(batch);
+            if count < BATCH_SIZE {
+                break;
+            }
+        }
+        Ok(all)
+    }
+
+    /// Encodes a non-POD message `msg` (`M: ModComponent`) via `"bam.v0.<M>.export_fields"` into
+    /// a witness field packet `[field_count: u32; (name, tag, payload)*]` and sends it through
+    /// `BamHostApi::msg_send` on `term_index`.
+    pub fn send_non_pod_message_checked<M: ModComponent>(
+        &mut self,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+        msg: &M,
+    ) -> FfiResult {
+        if self.raw.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if !self.host.api().covers_slot(
+            core::mem::offset_of!(BamHostApi, msg_send),
+            core::mem::size_of::<Option<BamMsgSendFn>>(),
+        ) {
+            return FfiResult::UNSUPPORTED;
+        }
+        let Some(send_fn) = self.host.api().msg_send else {
+            return FfiResult::UNSUPPORTED;
+        };
+        let info = match self.column_info(term_index) {
+            Ok(i) => i,
+            Err(err) => return err,
+        };
+        if !validate_non_pod_message_info(&info, expected_uuid, true) {
+            return FfiResult::TYPE_MISMATCH;
+        }
+
+        type ExportFieldsFn = unsafe extern "C" fn(
+            src_ptr: *const c_void,
+            sink: Option<
+                unsafe extern "C" fn(
+                    sink_ctx: *mut c_void,
+                    field_name: StrView,
+                    type_tag: StrView,
+                    payload: FfiSlice<u8>,
+                ) -> FfiResult,
+            >,
+            sink_ctx: *mut c_void,
+        ) -> FfiResult;
+
+        let export_sym = format!("bam.v0.{}.export_fields", M::CANONICAL_NAME);
+        let Some(export_ptr) = M::resolve_symbol(&export_sym) else {
+            return FfiResult::UNSUPPORTED;
+        };
+        if export_ptr.is_null() {
+            return FfiResult::UNSUPPORTED;
+        }
+        // SAFETY: `M::symbols()` exports `"bam.v0.<M>.export_fields"` with `ExportFieldsFn` ABI.
+        let export_fn: ExportFieldsFn = unsafe { core::mem::transmute(export_ptr) };
+
+        struct PacketBuilder {
+            buf: Vec<u8>,
+            field_count: u32,
+        }
+
+        unsafe extern "C" fn append_field(
+            ctx: *mut c_void,
+            field_name: StrView,
+            type_tag: StrView,
+            payload: FfiSlice<u8>,
+        ) -> FfiResult {
+            // SAFETY: `ctx` points to an active `PacketBuilder` on the stack for this call.
+            let builder = unsafe { &mut *ctx.cast::<PacketBuilder>() };
+            // SAFETY: `field_name`, `type_tag`, and `payload` come directly from `export_fields`
+            // and borrow live slices for this synchronous callback.
+            let Ok(name_bytes) = (unsafe { field_name.try_as_slice() }) else {
+                return FfiResult::NULL_POINTER;
+            };
+            // SAFETY: Same as above for `type_tag`.
+            let Ok(tag_bytes) = (unsafe { type_tag.try_as_slice() }) else {
+                return FfiResult::NULL_POINTER;
+            };
+            // SAFETY: Same as above for `payload`.
+            let Ok(val_bytes) = (unsafe { payload.try_as_slice() }) else {
+                return FfiResult::NULL_POINTER;
+            };
+            let Ok(name_len) = u32::try_from(name_bytes.len()) else {
+                return FfiResult::CAPACITY_EXCEEDED;
+            };
+            let Ok(tag_len) = u32::try_from(tag_bytes.len()) else {
+                return FfiResult::CAPACITY_EXCEEDED;
+            };
+            let Ok(val_len) = u32::try_from(val_bytes.len()) else {
+                return FfiResult::CAPACITY_EXCEEDED;
+            };
+            let Some(next_count) = builder.field_count.checked_add(1) else {
+                return FfiResult::CAPACITY_EXCEEDED;
+            };
+            builder.field_count = next_count;
+            builder.buf.extend_from_slice(&name_len.to_le_bytes());
+            builder.buf.extend_from_slice(name_bytes);
+            builder.buf.extend_from_slice(&tag_len.to_le_bytes());
+            builder.buf.extend_from_slice(tag_bytes);
+            builder.buf.extend_from_slice(&val_len.to_le_bytes());
+            builder.buf.extend_from_slice(val_bytes);
+            FfiResult::OK
+        }
+
+        let mut builder = PacketBuilder {
+            buf: vec![0u8; 4],
+            field_count: 0,
+        };
+        // SAFETY: `msg` is a valid `&M` and `builder` stays pinned on the stack across `export_fn`.
+        let status = unsafe {
+            export_fn(
+                core::ptr::from_ref(msg).cast::<c_void>(),
+                Some(append_field),
+                (&raw mut builder).cast::<c_void>(),
+            )
+        };
+        if !status.is_ok() {
+            return status;
+        }
+        builder.buf[0..4].copy_from_slice(&builder.field_count.to_le_bytes());
+        // SAFETY: `self.raw` is active, `validate_non_pod_message_info` verified `MESSAGE_WRITE`,
+        // and `builder.buf` holds the serialized witness packet of `builder.buf.len()` bytes.
+        unsafe {
+            send_fn(
+                self.raw,
+                term_index,
+                builder.buf.as_ptr(),
+                builder.buf.len(),
+            )
+        }
+    }
+
     /// Reads the synthesized per-chunk [`AccessMode::HAS`] boolean presence indicator for
     /// `term_index` (`Some(true)` if present in the active chunk's archetype, `Some(false)` if
     /// absent, or `None` if `term_index` was not declared with `AccessMode::HAS` or no chunk is active).
@@ -2427,6 +2735,33 @@ fn validate_message_write_info<M: AbiPod>(
     true
 }
 
+#[inline]
+fn validate_non_pod_message_info(
+    info: &BamColumnInfo,
+    expected_uuid: Option<UuidFilter>,
+    writable: bool,
+) -> bool {
+    if writable {
+        if info.mode != AccessMode::MESSAGE_WRITE || info.is_immutable() {
+            return false;
+        }
+    } else if !matches!(
+        info.mode,
+        AccessMode::MESSAGE_READ | AccessMode::MESSAGE_WRITE
+    ) {
+        return false;
+    }
+    if !info.is_message() || info.is_resource() {
+        return false;
+    }
+    if let Some(filter) = expected_uuid
+        && !filter.matches(info.uuid)
+    {
+        return false;
+    }
+    true
+}
+
 #[derive(Clone, Copy)]
 struct DispensedBorrow {
     component: BamComponent,
@@ -2821,5 +3156,423 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
         self.iter
             .has_column(term_index)
             .ok_or(FfiResult::NULL_POINTER)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_abi_mod_sys::{ABI_VERSION, BAM_STORAGE_FLAG_MESSAGE, BamHostCtx, SymbolEntry};
+    use core::ffi::CStr;
+
+    #[derive(Default, Debug, Clone, PartialEq, Eq)]
+    struct MockNonPodMsg {
+        label: String,
+        nums: Vec<u32>,
+    }
+
+    unsafe extern "C" fn mock_export_fields(
+        src_ptr: *const c_void,
+        sink: Option<
+            unsafe extern "C" fn(
+                sink_ctx: *mut c_void,
+                field_name: StrView,
+                type_tag: StrView,
+                payload: FfiSlice<u8>,
+            ) -> FfiResult,
+        >,
+        sink_ctx: *mut c_void,
+    ) -> FfiResult {
+        // SAFETY: `src_ptr` points to a live `MockNonPodMsg`.
+        let msg = unsafe { &*src_ptr.cast::<MockNonPodMsg>() };
+        let Some(sink_fn) = sink else {
+            return FfiResult::NULL_POINTER;
+        };
+        // SAFETY: Forwarding live UTF-8 field slice into `sink_fn`.
+        let rc = unsafe {
+            sink_fn(
+                sink_ctx,
+                StrView::from_str("label"),
+                StrView::from_str("String"),
+                FfiSlice::from_slice(msg.label.as_bytes()),
+            )
+        };
+        if !rc.is_ok() {
+            return rc;
+        }
+        let mut raw_nums = Vec::with_capacity(4 + msg.nums.len() * 4);
+        raw_nums.extend_from_slice(&(msg.nums.len() as u32).to_le_bytes());
+        for &n in &msg.nums {
+            raw_nums.extend_from_slice(&n.to_le_bytes());
+        }
+        // SAFETY: Forwarding encoded `Vec<u32>` slice into `sink_fn`.
+        unsafe {
+            sink_fn(
+                sink_ctx,
+                StrView::from_str("nums"),
+                StrView::from_str("Vec<u32>"),
+                FfiSlice::from_slice(&raw_nums),
+            )
+        }
+    }
+
+    unsafe extern "C" fn mock_import_field(
+        dst_ptr: *mut c_void,
+        field_name: StrView,
+        _type_tag: StrView,
+        payload: FfiSlice<u8>,
+    ) -> FfiResult {
+        // SAFETY: `dst_ptr` points to a valid `MockNonPodMsg`.
+        let dst = unsafe { &mut *dst_ptr.cast::<MockNonPodMsg>() };
+        // SAFETY: `field_name` and `payload` borrow live slices for this synchronous callback.
+        let Ok(name) = (unsafe { field_name.try_as_str() }) else {
+            return FfiResult::INVALID_UTF8;
+        };
+        // SAFETY: Same as above for `payload`.
+        let Ok(bytes) = (unsafe { payload.try_as_slice() }) else {
+            return FfiResult::NULL_POINTER;
+        };
+        match name {
+            "label" => {
+                let Ok(s) = core::str::from_utf8(bytes) else {
+                    return FfiResult::INVALID_UTF8;
+                };
+                dst.label = s.to_owned();
+            }
+            "nums" => {
+                if bytes.len() < 4 {
+                    return FfiResult::INVALID_ARGUMENT;
+                }
+                let cnt = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+                if bytes.len() != 4 + cnt * 4 {
+                    return FfiResult::INVALID_ARGUMENT;
+                }
+                dst.nums.clear();
+                for i in 0..cnt {
+                    let off = 4 + i * 4;
+                    dst.nums.push(u32::from_le_bytes([
+                        bytes[off],
+                        bytes[off + 1],
+                        bytes[off + 2],
+                        bytes[off + 3],
+                    ]));
+                }
+            }
+            _ => return FfiResult::INVALID_ARGUMENT,
+        }
+        FfiResult::OK
+    }
+
+    static MOCK_SYMS: [SymbolEntry; 2] = [
+        SymbolEntry {
+            name: "bam.v0.mock::NonPodChat.export_fields",
+            ptr: mock_export_fields as *const c_void,
+        },
+        SymbolEntry {
+            name: "bam.v0.mock::NonPodChat.import_field",
+            ptr: mock_import_field as *const c_void,
+        },
+    ];
+
+    impl ModComponent for MockNonPodMsg {
+        const CANONICAL_NAME: &'static str = "mock::NonPodChat";
+        const COMPONENT_CSTR: &'static CStr = c"mock::NonPodChat";
+        const UUID: ComponentUuid = ComponentUuid::from_parts("mock::NonPodChat", 48, 8, 1);
+        type VTable = ();
+
+        fn vtable() -> &'static Self::VTable {
+            &()
+        }
+
+        fn symbols() -> &'static [SymbolEntry] {
+            &MOCK_SYMS
+        }
+    }
+
+    struct MockMsgWorld {
+        stored: Vec<MockNonPodMsg>,
+        sent_packets: Vec<Vec<u8>>,
+    }
+
+    unsafe extern "C" fn mock_get_proc(
+        _ctx: *const BamHostCtx,
+        sym: *const core::ffi::c_char,
+    ) -> *const c_void {
+        // SAFETY: Caller passes valid NUL-terminated CStr.
+        let name = unsafe { CStr::from_ptr(sym) };
+        if name.to_bytes() == b"bam.v0.mock::NonPodChat.export_fields" {
+            return mock_export_fields as *const c_void;
+        }
+        core::ptr::null()
+    }
+
+    unsafe extern "C" fn mock_col_info(
+        _iter: *const BamIter,
+        term_index: usize,
+        out_info: *mut BamColumnInfo,
+    ) -> FfiResult {
+        if term_index != 0 {
+            return FfiResult::OUT_OF_RANGE;
+        }
+        // SAFETY: `out_info` is writable.
+        unsafe {
+            *out_info = BamColumnInfo {
+                component: BamComponent::from_raw(1),
+                uuid: MockNonPodMsg::UUID,
+                size: 0,
+                align: 1,
+                mode: AccessMode::MESSAGE_WRITE,
+                storage_flags: BAM_STORAGE_FLAG_MESSAGE,
+                reserved0: 0,
+            };
+        }
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn mock_msg_read_batch(
+        iter: *mut BamIter,
+        _term_index: usize,
+        out_buf: *mut u8,
+        max_count: usize,
+        out_count: *mut usize,
+    ) -> FfiResult {
+        // SAFETY: `iter` points to `MockMsgWorld`.
+        let world = unsafe { &*iter.cast::<MockMsgWorld>() };
+        let take = world.stored.len().min(max_count);
+        for i in 0..take {
+            let ptr_bytes =
+                (core::ptr::from_ref(&world.stored[i]).cast::<c_void>() as usize).to_ne_bytes();
+            // SAFETY: `out_buf` is writable for `take` `usize` entries.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    ptr_bytes.as_ptr(),
+                    out_buf.add(i * ptr_bytes.len()),
+                    ptr_bytes.len(),
+                );
+            }
+        }
+        // SAFETY: `out_count` is writable.
+        unsafe {
+            *out_count = take;
+        }
+        FfiResult::OK
+    }
+
+    unsafe extern "C" fn mock_msg_send(
+        iter: *mut BamIter,
+        _term_index: usize,
+        data_ptr: *const u8,
+        data_len: usize,
+    ) -> FfiResult {
+        // SAFETY: `iter` points to `MockMsgWorld`, `data_ptr` is readable for `data_len`.
+        let world = unsafe { &mut *iter.cast::<MockMsgWorld>() };
+        // SAFETY: `data_ptr` covers `data_len` bytes.
+        let pkt = unsafe { core::slice::from_raw_parts(data_ptr, data_len) }.to_vec();
+        world.sent_packets.push(pkt);
+        FfiResult::OK
+    }
+
+    #[test]
+    fn validated_iter_non_pod_message_read_and_send_encode_witness_packets() {
+        use bevy_abi_mod_sys::{
+            BamCommands, BamLoadCtx, BamQueryDesc, BamSystemCtx, BamSystemDesc, ComponentDesc,
+            FfiBool, FfiEntity,
+        };
+        unsafe extern "C" fn stub_last_error(
+            _: *const BamHostCtx,
+            _: *mut core::ffi::c_char,
+            _: usize,
+        ) -> usize {
+            0
+        }
+        unsafe extern "C" fn stub_load_host_ctx(_: *const BamLoadCtx) -> *const BamHostCtx {
+            core::ptr::null()
+        }
+        unsafe extern "C" fn stub_reg_comp(
+            _: *mut BamLoadCtx,
+            _: *const ComponentDesc,
+            _: *mut BamComponent,
+        ) -> FfiResult {
+            FfiResult::OK
+        }
+        unsafe extern "C" fn stub_resolve_comp(
+            _: *const BamHostCtx,
+            _: *const core::ffi::c_char,
+            _: *const ComponentUuid,
+            _: *mut BamComponent,
+        ) -> FfiResult {
+            FfiResult::OK
+        }
+        unsafe extern "C" fn stub_reg_sys(
+            _: *mut BamLoadCtx,
+            _: *const BamSystemDesc,
+        ) -> FfiResult {
+            FfiResult::OK
+        }
+        unsafe extern "C" fn stub_sys_host_ctx(_: *const BamSystemCtx) -> *const BamHostCtx {
+            core::ptr::null()
+        }
+        unsafe extern "C" fn stub_sys_query(
+            _: *mut BamSystemCtx,
+            _: usize,
+            _: *mut *mut BamIter,
+        ) -> FfiResult {
+            FfiResult::OK
+        }
+        unsafe extern "C" fn stub_sys_cmds(
+            _: *mut BamSystemCtx,
+            _: *mut *mut BamCommands,
+        ) -> FfiResult {
+            FfiResult::OK
+        }
+        unsafe extern "C" fn stub_iter_next(_: *mut BamIter, _: *mut usize) -> FfiBool {
+            FfiBool::FALSE
+        }
+        unsafe extern "C" fn stub_iter_reset(_: *mut BamIter) -> FfiResult {
+            FfiResult::OK
+        }
+        unsafe extern "C" fn stub_iter_ents(_: *const BamIter) -> *const FfiEntity {
+            core::ptr::null()
+        }
+        unsafe extern "C" fn stub_col_ro(_: *const BamIter, _: usize) -> *const u8 {
+            core::ptr::null()
+        }
+        unsafe extern "C" fn stub_col_mut(_: *mut BamIter, _: usize) -> *mut u8 {
+            core::ptr::null_mut()
+        }
+        unsafe extern "C" fn stub_mark_changed(
+            _: *mut BamIter,
+            _: usize,
+            _: usize,
+            _: usize,
+        ) -> FfiResult {
+            FfiResult::OK
+        }
+        unsafe extern "C" fn stub_rows_ro(_: *mut BamIter, _: usize) -> *const *const u8 {
+            core::ptr::null()
+        }
+        unsafe extern "C" fn stub_rows_mut(_: *mut BamIter, _: usize) -> *const *mut u8 {
+            core::ptr::null()
+        }
+        unsafe extern "C" fn stub_res_ptr(_: *const BamIter, _: usize) -> *const u8 {
+            core::ptr::null()
+        }
+        unsafe extern "C" fn stub_res_mut(_: *mut BamIter, _: usize) -> *mut u8 {
+            core::ptr::null_mut()
+        }
+        unsafe extern "C" fn stub_spawn_empty(_: *mut BamCommands, _: *mut FfiEntity) -> FfiResult {
+            FfiResult::OK
+        }
+        unsafe extern "C" fn stub_spawn(
+            _: *mut BamCommands,
+            _: *const BamComponent,
+            _: *const *const u8,
+            _: usize,
+            _: *mut FfiEntity,
+        ) -> FfiResult {
+            FfiResult::OK
+        }
+        unsafe extern "C" fn stub_despawn(_: *mut BamCommands, _: FfiEntity) -> FfiResult {
+            FfiResult::OK
+        }
+        unsafe extern "C" fn stub_insert(
+            _: *mut BamCommands,
+            _: FfiEntity,
+            _: BamComponent,
+            _: *const u8,
+            _: usize,
+        ) -> FfiResult {
+            FfiResult::OK
+        }
+        unsafe extern "C" fn stub_insert_def(
+            _: *mut BamCommands,
+            _: FfiEntity,
+            _: BamComponent,
+        ) -> FfiResult {
+            FfiResult::OK
+        }
+        unsafe extern "C" fn stub_remove(
+            _: *mut BamCommands,
+            _: FfiEntity,
+            _: BamComponent,
+        ) -> FfiResult {
+            FfiResult::OK
+        }
+        let _ = core::mem::size_of::<BamQueryDesc>();
+
+        // SAFETY: Zeroed `BamHostApi` initialized with required baseline ABI callbacks + msg slots.
+        let mut api: BamHostApi = unsafe { MaybeUninit::zeroed().assume_init() };
+        api.struct_size = core::mem::size_of::<BamHostApi>() as u32;
+        api.abi_version = ABI_VERSION;
+        api.get_proc_address = Some(mock_get_proc);
+        api.last_error = Some(stub_last_error);
+        api.load_host_ctx = Some(stub_load_host_ctx);
+        api.register_component = Some(stub_reg_comp);
+        api.resolve_component = Some(stub_resolve_comp);
+        api.register_system = Some(stub_reg_sys);
+        api.sys_host_ctx = Some(stub_sys_host_ctx);
+        api.sys_query = Some(stub_sys_query);
+        api.sys_commands = Some(stub_sys_cmds);
+        api.iter_next_chunk = Some(stub_iter_next);
+        api.iter_reset = Some(stub_iter_reset);
+        api.iter_entities = Some(stub_iter_ents);
+        api.iter_column_readonly = Some(stub_col_ro);
+        api.iter_column_mutable = Some(stub_col_mut);
+        api.iter_column_mutable_untracked = Some(stub_col_mut);
+        api.iter_mark_changed_range = Some(stub_mark_changed);
+        api.iter_column_rows_readonly = Some(stub_rows_ro);
+        api.iter_column_rows_mutable = Some(stub_rows_mut);
+        api.iter_column_info = Some(mock_col_info);
+        api.res_ptr = Some(stub_res_ptr);
+        api.res_mut_ptr = Some(stub_res_mut);
+        api.cmd_spawn_empty = Some(stub_spawn_empty);
+        api.cmd_spawn = Some(stub_spawn);
+        api.cmd_despawn = Some(stub_despawn);
+        api.cmd_insert = Some(stub_insert);
+        api.cmd_insert_default = Some(stub_insert_def);
+        api.cmd_remove = Some(stub_remove);
+        api.msg_read_batch = Some(mock_msg_read_batch);
+        api.msg_send = Some(mock_msg_send);
+
+        let mut world = MockMsgWorld {
+            stored: vec![MockNonPodMsg {
+                label: "hello".to_owned(),
+                nums: vec![10, 20, 30],
+            }],
+            sent_packets: Vec::new(),
+        };
+        let host_ctx = (&raw mut world).cast::<BamHostCtx>();
+        // SAFETY: `api` and `host_ctx` live for the test duration.
+        let host = unsafe { Host::from_raw(&api, host_ctx) }.unwrap();
+        // SAFETY: `raw_iter` points to `MockMsgWorld` used by mock callbacks.
+        let mut iter =
+            unsafe { ValidatedIter::from_raw((&raw mut world).cast::<BamIter>(), &host) };
+
+        let got = iter
+            .read_non_pod_messages_checked::<MockNonPodMsg>(
+                0,
+                Some(UuidFilter::exact(MockNonPodMsg::UUID)),
+                8,
+            )
+            .unwrap();
+        assert_eq!(got, world.stored);
+
+        let outgoing = MockNonPodMsg {
+            label: "reply".to_owned(),
+            nums: vec![7, 8],
+        };
+        assert_eq!(
+            iter.send_non_pod_message_checked::<MockNonPodMsg>(
+                0,
+                Some(UuidFilter::exact(MockNonPodMsg::UUID)),
+                &outgoing,
+            ),
+            FfiResult::OK
+        );
+        assert_eq!(world.sent_packets.len(), 1);
+        assert_eq!(
+            u32::from_le_bytes(world.sent_packets[0][0..4].try_into().unwrap()),
+            2
+        );
     }
 }
