@@ -3,6 +3,7 @@
 
 pub mod builder;
 pub mod context;
+pub mod observers;
 
-pub use builder::{GuestApp, IntoSystemResult, QueryBuilder, SystemBuilder};
+pub use builder::{GuestApp, GuestComponentOptions, IntoSystemResult, QueryBuilder, SystemBuilder};
 pub use context::{GuestRes, GuestResMut, MultiQueryContext, RunConditionContext, SystemContext};

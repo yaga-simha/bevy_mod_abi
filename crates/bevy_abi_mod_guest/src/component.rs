@@ -6,7 +6,8 @@ use std::ffi::CString;
 use bevy_abi_mod_guest_sys::{Host, PodComponentHooks, UuidFilter, resolve_component};
 use bevy_abi_mod_sys::{AbiPod, BamComponent, ComponentUuid, FfiEntity, FfiResult};
 
-/// Safe builder for optional `on_add` and `on_remove` dynamic component hooks.
+/// Safe builder for optional dynamic component lifecycle hooks (`on_add`, `on_insert`,
+/// `on_discard`, `on_remove`, `on_despawn`), `EntityCloner` support, and required components.
 pub struct GuestComponentHooks<T: AbiPod> {
     pub(crate) inner: PodComponentHooks<T>,
 }
@@ -18,7 +19,7 @@ impl<T: AbiPod> Default for GuestComponentHooks<T> {
 }
 
 impl<T: AbiPod> GuestComponentHooks<T> {
-    /// Creates an empty hook configuration with neither `on_add` nor `on_remove` set.
+    /// Creates an empty hook configuration with no lifecycle hooks, clone, or requirements set.
     #[inline]
     pub fn new() -> Self {
         Self {
@@ -26,13 +27,33 @@ impl<T: AbiPod> GuestComponentHooks<T> {
         }
     }
 
-    /// Attaches an `on_add` hook invoked whenever `T` is inserted onto an entity.
+    /// Attaches an `on_add` hook invoked whenever `T` is newly added to an entity.
     #[inline]
     pub fn on_add<F>(mut self, callback: F) -> Self
     where
         F: FnMut(FfiEntity, &T) + Send + 'static,
     {
         self.inner.on_add = Some(Box::new(callback));
+        self
+    }
+
+    /// Attaches an `on_insert` hook invoked whenever `T` is inserted onto an entity (add or overwrite).
+    #[inline]
+    pub fn on_insert<F>(mut self, callback: F) -> Self
+    where
+        F: FnMut(FfiEntity, &T) + Send + 'static,
+    {
+        self.inner.on_insert = Some(Box::new(callback));
+        self
+    }
+
+    /// Attaches an `on_discard` hook invoked immediately before `T` is overwritten or removed.
+    #[inline]
+    pub fn on_discard<F>(mut self, callback: F) -> Self
+    where
+        F: FnMut(FfiEntity, &T) + Send + 'static,
+    {
+        self.inner.on_discard = Some(Box::new(callback));
         self
     }
 
@@ -43,6 +64,30 @@ impl<T: AbiPod> GuestComponentHooks<T> {
         F: FnMut(FfiEntity, &T) + Send + 'static,
     {
         self.inner.on_remove = Some(Box::new(callback));
+        self
+    }
+
+    /// Attaches an `on_despawn` hook invoked when an entity carrying `T` is despawned.
+    #[inline]
+    pub fn on_despawn<F>(mut self, callback: F) -> Self
+    where
+        F: FnMut(FfiEntity, &T) + Send + 'static,
+    {
+        self.inner.on_despawn = Some(Box::new(callback));
+        self
+    }
+
+    /// Enables or disables bitwise `ComponentCloneFn` registration for Bevy's `EntityCloner`.
+    #[inline]
+    pub fn with_clone(mut self, enabled: bool) -> Self {
+        self.inner.enable_clone = enabled;
+        self
+    }
+
+    /// Appends a pre-resolved required [`BamComponent`] handle (`#[require(...)]`).
+    #[inline]
+    pub fn with_required_handle(mut self, component: BamComponent) -> Self {
+        self.inner.required_components.push(component);
         self
     }
 }
