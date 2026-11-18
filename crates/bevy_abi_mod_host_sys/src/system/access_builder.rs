@@ -25,6 +25,8 @@ use bevy_abi_mod_sys::{
     MAX_TERMS_PER_QUERY,
 };
 use bevy_ecs::component::{ComponentId, StorageType};
+use bevy_ecs::lifecycle::RemovedComponentEntity;
+use bevy_ecs::message::MessageCursor;
 use bevy_ecs::query::{FilteredAccess, FilteredAccessSet, QueryBuilder};
 use bevy_ecs::world::World;
 use bevy_platform::collections::{HashMap, HashSet};
@@ -74,7 +76,9 @@ pub(crate) fn validate_system_queries_against_snapshot(
         let mut read_components: HashSet<ComponentId> = HashSet::new();
         let mut write_components: HashSet<ComponentId> = HashSet::new();
         let mut has_entity_terms = false;
-        let mut resolved: Vec<(ComponentId, AccessMode)> = Vec::with_capacity(group.terms.len());
+        let mut resolved: Vec<(ComponentId, AccessMode, u8)> =
+            Vec::with_capacity(group.terms.len());
+        let mut or_group_order: Vec<u8> = Vec::new();
 
         for (t_idx, term) in group.terms.iter().enumerate() {
             let v = term.validate();
@@ -114,6 +118,27 @@ pub(crate) fn validate_system_queries_against_snapshot(
                 ));
             }
 
+            if term.or_group != 0 {
+                if !matches!(
+                    term.mode,
+                    AccessMode::FILTER_ONLY
+                        | AccessMode::WITHOUT
+                        | AccessMode::CHANGED
+                        | AccessMode::ADDED
+                ) {
+                    return Err((
+                        FfiResult::INVALID_ARGUMENT,
+                        format!(
+                            "query {q_idx} term {t_idx} uses invalid mode {:?} inside or_group={}",
+                            term.mode, term.or_group
+                        ),
+                    ));
+                }
+                if !or_group_order.contains(&term.or_group) {
+                    or_group_order.push(term.or_group);
+                }
+            }
+
             let comp_id = reg.component_id;
             id_to_name
                 .entry(comp_id)
@@ -146,9 +171,12 @@ pub(crate) fn validate_system_queries_against_snapshot(
                 AccessMode::FILTER_ONLY
                 | AccessMode::WITHOUT
                 | AccessMode::CHANGED
-                | AccessMode::ADDED => {
+                | AccessMode::ADDED
+                | AccessMode::ALLOW
+                | AccessMode::HAS => {
                     has_entity_terms = true;
                 }
+                AccessMode::REMOVED_READ => {}
                 AccessMode::RESOURCE_READ | AccessMode::MESSAGE_READ => {
                     if system_res_writes.contains(&comp_id) {
                         return Err((
@@ -170,15 +198,6 @@ pub(crate) fn validate_system_queries_against_snapshot(
                     system_res_writes.insert(comp_id);
                     system_res_order.push((comp_id, Arc::clone(&reg.name)));
                 }
-                AccessMode::ALLOW | AccessMode::HAS | AccessMode::REMOVED_READ => {
-                    return Err((
-                        FfiResult::UNSUPPORTED,
-                        format!(
-                            "AccessMode({}) is not yet active in this build",
-                            term.mode.0
-                        ),
-                    ));
-                }
                 _ => {
                     return Err((
                         FfiResult::INVALID_ARGUMENT,
@@ -186,22 +205,16 @@ pub(crate) fn validate_system_queries_against_snapshot(
                     ));
                 }
             }
-            if term.or_group != 0 {
-                return Err((
-                    FfiResult::UNSUPPORTED,
-                    format!(
-                        "query {q_idx} term {t_idx} uses or_group={} (not yet active in this build)",
-                        term.or_group
-                    ),
-                ));
-            }
 
-            resolved.push((comp_id, term.mode));
+            resolved.push((comp_id, term.mode, term.or_group));
         }
 
         if group.terms.is_empty() || has_entity_terms {
             let mut fa = FilteredAccess::matches_everything();
-            for &(comp_id, mode) in &resolved {
+            for &(comp_id, mode, or_group) in &resolved {
+                if or_group != 0 {
+                    continue;
+                }
                 match mode {
                     AccessMode::READ => {
                         fa.add_read(comp_id);
@@ -228,8 +241,39 @@ pub(crate) fn validate_system_queries_against_snapshot(
                             fa.add_read(comp_id);
                         }
                     }
+                    AccessMode::ALLOW | AccessMode::HAS => {
+                        fa.access_mut().add_archetypal(comp_id);
+                    }
                     _ => {}
                 }
+            }
+            for &group_id in &or_group_order {
+                let mut or_access = FilteredAccess::matches_nothing();
+                for &(comp_id, mode, og) in &resolved {
+                    if og != group_id {
+                        continue;
+                    }
+                    let mut branch = FilteredAccess::default();
+                    match mode {
+                        AccessMode::FILTER_ONLY => {
+                            branch.and_with(comp_id);
+                        }
+                        AccessMode::WITHOUT => {
+                            branch.and_without(comp_id);
+                        }
+                        AccessMode::CHANGED | AccessMode::ADDED => {
+                            if write_components.contains(&comp_id) {
+                                branch.and_with(comp_id);
+                            } else {
+                                branch.add_read(comp_id);
+                            }
+                        }
+                        _ => {}
+                    }
+                    or_access.append_or(&branch);
+                    or_access.extend_access(&branch);
+                }
+                fa.extend(&or_access);
             }
 
             let mut candidate_set = FilteredAccessSet::new();
@@ -294,9 +338,21 @@ pub(crate) fn initialize_query_groups_in_world(
         let mut write_components: HashSet<ComponentId> = HashSet::new();
         let mut has_entity_terms = false;
         let mut term_metas: Vec<QueryTermMeta> = Vec::with_capacity(group.spec.terms.len());
+        let mut term_or_groups: Vec<u8> = Vec::with_capacity(group.spec.terms.len());
 
         for (col_idx, term) in group.spec.terms.iter().enumerate() {
             if !term.mode.is_valid() {
+                return Err(SystemInitError::InvalidMode { index: col_idx });
+            }
+            if term.or_group != 0
+                && !matches!(
+                    term.mode,
+                    AccessMode::FILTER_ONLY
+                        | AccessMode::WITHOUT
+                        | AccessMode::CHANGED
+                        | AccessMode::ADDED
+                )
+            {
                 return Err(SystemInitError::InvalidMode { index: col_idx });
             }
             let Some(reg) = snapshot.get_by_handle(term.component) else {
@@ -356,9 +412,12 @@ pub(crate) fn initialize_query_groups_in_world(
                 AccessMode::FILTER_ONLY
                 | AccessMode::WITHOUT
                 | AccessMode::CHANGED
-                | AccessMode::ADDED => {
+                | AccessMode::ADDED
+                | AccessMode::ALLOW
+                | AccessMode::HAS => {
                     has_entity_terms = true;
                 }
+                AccessMode::REMOVED_READ => {}
                 AccessMode::RESOURCE_READ | AccessMode::MESSAGE_READ => {
                     if system_res_writes.contains(&comp_id) {
                         return Err(SystemInitError::SelfConflict {
@@ -394,10 +453,16 @@ pub(crate) fn initialize_query_groups_in_world(
                 {
                     group.msg_cursors[col_idx] = Some(create_fn());
                 }
+            } else if term.mode == AccessMode::REMOVED_READ {
+                if group.msg_cursors[col_idx].is_none() {
+                    group.msg_cursors[col_idx] =
+                        Some(Box::new(MessageCursor::<RemovedComponentEntity>::default()));
+                }
             } else {
                 group.msg_cursors[col_idx] = None;
             }
 
+            term_or_groups.push(term.or_group);
             term_metas.push(QueryTermMeta {
                 component: reg.handle,
                 component_id: comp_id,
@@ -412,12 +477,15 @@ pub(crate) fn initialize_query_groups_in_world(
             });
         }
 
-        let plan = QueryPlan::from_terms(term_metas);
+        let plan = QueryPlan::from_terms_with_or_groups(term_metas, &term_or_groups);
         group.sparse_scratch.ensure_terms(plan.terms.len());
 
         if group.spec.terms.is_empty() || has_entity_terms {
             let mut builder = QueryBuilder::<()>::new(world);
-            for t in &plan.terms {
+            for (idx, t) in plan.terms.iter().enumerate() {
+                if (plan.or_term_mask & (1u32 << idx)) != 0 {
+                    continue;
+                }
                 match t.mode {
                     AccessMode::READ => {
                         builder.ref_id(t.component_id);
@@ -448,8 +516,38 @@ pub(crate) fn initialize_query_groups_in_world(
                             builder.ref_id(t.component_id);
                         }
                     }
+                    AccessMode::ALLOW | AccessMode::HAS => {
+                        let mut access = FilteredAccess::default();
+                        access.access_mut().add_archetypal(t.component_id);
+                        builder.extend_access(access);
+                    }
                     _ => {}
                 }
+            }
+            for or_group in &plan.or_groups {
+                let mut or_access = FilteredAccess::matches_nothing();
+                for clause in &or_group.terms {
+                    let mut branch = FilteredAccess::default();
+                    match clause.mode {
+                        AccessMode::FILTER_ONLY => {
+                            branch.and_with(clause.component_id);
+                        }
+                        AccessMode::WITHOUT => {
+                            branch.and_without(clause.component_id);
+                        }
+                        AccessMode::CHANGED | AccessMode::ADDED => {
+                            if write_components.contains(&clause.component_id) {
+                                branch.and_with(clause.component_id);
+                            } else {
+                                branch.add_read(clause.component_id);
+                            }
+                        }
+                        _ => {}
+                    }
+                    or_access.append_or(&branch);
+                    or_access.extend_access(&branch);
+                }
+                builder.extend_access(or_access);
             }
 
             let state = builder.build();
@@ -460,6 +558,7 @@ pub(crate) fn initialize_query_groups_in_world(
                     .is_some_and(|info| info.storage_type() == StorageType::Table)
             };
             group.is_dense = plan.sparse_data_mask == 0
+                && !plan.has_sparse_term
                 && state.component_access().with_filters().all(is_comp_dense)
                 && state
                     .component_access()

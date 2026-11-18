@@ -18,6 +18,7 @@ use crate::{
 mod private {
     pub trait TermSealed {}
     pub trait TupleSealed {}
+    pub trait OrFilterSealed {}
 }
 
 /// Archetype inclusion filter marker (`AccessMode::FILTER_ONLY`) for [`QueryTuple`].
@@ -31,6 +32,73 @@ pub struct Changed<T>(PhantomData<fn() -> T>);
 
 /// Row-level added-tick filter with read-only slice access (`AccessMode::ADDED`) for [`QueryTuple`].
 pub struct Added<T>(PhantomData<fn() -> T>);
+
+/// Archetype filter bypass marker (`AccessMode::ALLOW`) suppressing [`DefaultQueryFilters`]
+/// (such as `Disabled`) for `T` without requiring `T` to be present on matched entities.
+pub struct Allow<T>(PhantomData<fn() -> T>);
+
+/// Archetypal presence indicator (`AccessMode::HAS`) yielding `bool` for each matched chunk
+/// without borrowing `T`'s component storage (zero scheduler conflict with `&mut T`).
+pub struct Has<T>(PhantomData<fn() -> T>);
+
+/// Disjunctive 2-branch `Or<(A, B)>` query filter (`or_group != 0`) for [`QueryTuple`].
+///
+/// Non-filter data terms (such as `&T` or `&mut T`) are rejected at compile time:
+///
+/// ```compile_fail
+/// use bevy_abi_mod_guest::iter::{Or2, QueryTuple};
+/// use bevy_abi_mod_guest::FfiChildOf;
+///
+/// fn assert_tuple<Q: QueryTuple>() {}
+/// assert_tuple::<Or2<&FfiChildOf, &FfiChildOf>>();
+/// ```
+pub struct Or2<A, B>(PhantomData<fn() -> (A, B)>);
+
+/// Disjunctive 3-branch `Or<(A, B, C)>` query filter (`or_group != 0`) for [`QueryTuple`].
+pub struct Or3<A, B, C>(PhantomData<fn() -> (A, B, C)>);
+
+/// Sealed trait implemented by filter terms permitted inside [`Or2`] / [`Or3`]
+/// ([`With<T>`], [`Without<T>`], [`Changed<T>`], [`Added<T>`]).
+pub trait OrFilterTerm: private::OrFilterSealed {
+    /// Resolves and appends the filter term with `or_group` assigned.
+    fn push_filter_desc(
+        host: &Host,
+        manifest_name: &str,
+        or_group: u8,
+        out: &mut Vec<BamTermDesc>,
+    ) -> Result<(), FfiResult>;
+
+    /// Validates this filter term's descriptor in the active chunk without borrowing data slices.
+    fn fetch_filter<'chunk>(
+        dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
+    ) -> Result<(), FfiResult>;
+}
+
+#[inline]
+fn push_resolved_filter_term<T: GuestComponent>(
+    host: &Host,
+    manifest_name: &str,
+    mode: AccessMode,
+    or_group: u8,
+    out: &mut Vec<BamTermDesc>,
+) -> Result<(), FfiResult> {
+    if out.len() >= MAX_TERMS_PER_QUERY {
+        return Err(FfiResult::CAPACITY_EXCEEDED);
+    }
+    let comp = resolve_guest_component::<T>(host, manifest_name)?;
+    out.push(BamTermDesc::new(comp, mode).with_or_group(or_group));
+    Ok(())
+}
+
+#[inline]
+fn next_or_group_id(out: &[BamTermDesc]) -> Result<u8, FfiResult> {
+    out.iter()
+        .map(|t| t.or_group)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or(FfiResult::CAPACITY_EXCEEDED)
+}
 
 #[inline]
 fn push_resolved_term<T: GuestComponent>(
@@ -263,6 +331,134 @@ impl<T: GuestComponent> QueryTerm for Added<T> {
     }
 }
 
+impl<T: GuestComponent> private::TermSealed for Allow<T> {}
+impl<T: GuestComponent> QueryTerm for Allow<T> {
+    type Slice<'chunk> = ();
+
+    #[inline]
+    fn push_desc(
+        host: &Host,
+        manifest_name: &str,
+        out: &mut Vec<BamTermDesc>,
+    ) -> Result<(), FfiResult> {
+        push_resolved_term::<T>(host, manifest_name, AccessMode::ALLOW, out)
+    }
+
+    #[inline]
+    fn fetch_slice<'chunk>(
+        dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
+    ) -> Result<Self::Slice<'chunk>, FfiResult> {
+        let filter = guest_uuid_filter::<T>(dispenser.host().manifest_name());
+        dispenser.next_filter::<T>(AccessMode::ALLOW, Some(filter))
+    }
+}
+
+impl<T: GuestComponent> private::TermSealed for Has<T> {}
+impl<T: GuestComponent> QueryTerm for Has<T> {
+    type Slice<'chunk> = bool;
+
+    #[inline]
+    fn push_desc(
+        host: &Host,
+        manifest_name: &str,
+        out: &mut Vec<BamTermDesc>,
+    ) -> Result<(), FfiResult> {
+        push_resolved_term::<T>(host, manifest_name, AccessMode::HAS, out)
+    }
+
+    #[inline]
+    fn fetch_slice<'chunk>(
+        dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
+    ) -> Result<Self::Slice<'chunk>, FfiResult> {
+        let filter = guest_uuid_filter::<T>(dispenser.host().manifest_name());
+        dispenser.next_has::<T>(Some(filter))
+    }
+}
+
+macro_rules! impl_or_filter_term {
+    ($target:ty, $mode:expr) => {
+        impl<T: GuestComponent> private::OrFilterSealed for $target {}
+        impl<T: GuestComponent> OrFilterTerm for $target {
+            #[inline]
+            fn push_filter_desc(
+                host: &Host,
+                manifest_name: &str,
+                or_group: u8,
+                out: &mut Vec<BamTermDesc>,
+            ) -> Result<(), FfiResult> {
+                push_resolved_filter_term::<T>(host, manifest_name, $mode, or_group, out)
+            }
+
+            #[inline]
+            fn fetch_filter<'chunk>(
+                dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
+            ) -> Result<(), FfiResult> {
+                let filter = guest_uuid_filter::<T>(dispenser.host().manifest_name());
+                dispenser.next_filter::<T>($mode, Some(filter))
+            }
+        }
+    };
+}
+
+impl_or_filter_term!(With<T>, AccessMode::FILTER_ONLY);
+impl_or_filter_term!(Without<T>, AccessMode::WITHOUT);
+impl_or_filter_term!(Changed<T>, AccessMode::CHANGED);
+impl_or_filter_term!(Added<T>, AccessMode::ADDED);
+
+impl<A: OrFilterTerm, B: OrFilterTerm> private::TermSealed for Or2<A, B> {}
+impl<A: OrFilterTerm, B: OrFilterTerm> QueryTerm for Or2<A, B> {
+    type Slice<'chunk> = ();
+
+    #[inline]
+    fn push_desc(
+        host: &Host,
+        manifest_name: &str,
+        out: &mut Vec<BamTermDesc>,
+    ) -> Result<(), FfiResult> {
+        let group_id = next_or_group_id(out)?;
+        A::push_filter_desc(host, manifest_name, group_id, out)?;
+        B::push_filter_desc(host, manifest_name, group_id, out)?;
+        Ok(())
+    }
+
+    #[inline]
+    fn fetch_slice<'chunk>(
+        dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
+    ) -> Result<Self::Slice<'chunk>, FfiResult> {
+        A::fetch_filter(dispenser)?;
+        B::fetch_filter(dispenser)?;
+        Ok(())
+    }
+}
+
+impl<A: OrFilterTerm, B: OrFilterTerm, C: OrFilterTerm> private::TermSealed for Or3<A, B, C> {}
+impl<A: OrFilterTerm, B: OrFilterTerm, C: OrFilterTerm> QueryTerm for Or3<A, B, C> {
+    type Slice<'chunk> = ();
+
+    #[inline]
+    fn push_desc(
+        host: &Host,
+        manifest_name: &str,
+        out: &mut Vec<BamTermDesc>,
+    ) -> Result<(), FfiResult> {
+        let group_id = next_or_group_id(out)?;
+        A::push_filter_desc(host, manifest_name, group_id, out)?;
+        B::push_filter_desc(host, manifest_name, group_id, out)?;
+        C::push_filter_desc(host, manifest_name, group_id, out)?;
+        Ok(())
+    }
+
+    #[inline]
+    fn fetch_slice<'chunk>(
+        dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
+    ) -> Result<Self::Slice<'chunk>, FfiResult> {
+        A::fetch_filter(dispenser)?;
+        B::fetch_filter(dispenser)?;
+        C::fetch_filter(dispenser)?;
+        Ok(())
+    }
+}
+
 /// Sealed tuple trait over 1..=8 [`QueryTerm`] items (plus single-item shorthand).
 pub trait QueryTuple: private::TupleSealed {
     /// Tuple (or single item) of chunk slices yielded per chunk.
@@ -328,6 +524,46 @@ impl_single_query_tuple!(T: GuestComponent => With<T>);
 impl_single_query_tuple!(T: GuestComponent => Without<T>);
 impl_single_query_tuple!(T: GuestComponent => Changed<T>);
 impl_single_query_tuple!(T: GuestComponent => Added<T>);
+impl_single_query_tuple!(T: GuestComponent => Allow<T>);
+impl_single_query_tuple!(T: GuestComponent => Has<T>);
+
+impl<A: OrFilterTerm, B: OrFilterTerm> private::TupleSealed for Or2<A, B> {}
+impl<A: OrFilterTerm, B: OrFilterTerm> QueryTuple for Or2<A, B> {
+    type Slices<'chunk> = ();
+
+    #[inline]
+    fn collect_descs(host: &Host, manifest_name: &str) -> Result<Vec<BamTermDesc>, FfiResult> {
+        let mut out = Vec::with_capacity(2);
+        <Self as QueryTerm>::push_desc(host, manifest_name, &mut out)?;
+        Ok(out)
+    }
+
+    #[inline]
+    fn fetch_slices<'chunk>(
+        dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
+    ) -> Result<Self::Slices<'chunk>, FfiResult> {
+        <Self as QueryTerm>::fetch_slice(dispenser)
+    }
+}
+
+impl<A: OrFilterTerm, B: OrFilterTerm, C: OrFilterTerm> private::TupleSealed for Or3<A, B, C> {}
+impl<A: OrFilterTerm, B: OrFilterTerm, C: OrFilterTerm> QueryTuple for Or3<A, B, C> {
+    type Slices<'chunk> = ();
+
+    #[inline]
+    fn collect_descs(host: &Host, manifest_name: &str) -> Result<Vec<BamTermDesc>, FfiResult> {
+        let mut out = Vec::with_capacity(3);
+        <Self as QueryTerm>::push_desc(host, manifest_name, &mut out)?;
+        Ok(out)
+    }
+
+    #[inline]
+    fn fetch_slices<'chunk>(
+        dispenser: &mut ChunkColumnDispenser<'chunk, '_>,
+    ) -> Result<Self::Slices<'chunk>, FfiResult> {
+        <Self as QueryTerm>::fetch_slice(dispenser)
+    }
+}
 
 macro_rules! impl_query_tuple {
     ($cap:expr => $($term:ident),+ $(,)?) => {

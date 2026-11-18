@@ -2,6 +2,7 @@
 
 pub mod chunk;
 pub mod chunk_iter;
+pub mod filters;
 pub mod slice;
 pub mod typed_query;
 
@@ -9,4 +10,7 @@ pub use bevy_abi_mod_guest_sys::{SparseRows, SparseRowsIter, SparseRowsMut};
 pub use chunk::Chunk;
 pub use chunk_iter::ChunkIter;
 pub use slice::{ChunkSlice, ChunkSliceMut};
-pub use typed_query::{Added, Changed, QueryTerm, QueryTuple, TypedChunkIter, With, Without};
+pub use typed_query::{
+    Added, Allow, Changed, Has, Or2, Or3, OrFilterTerm, QueryTerm, QueryTuple, TypedChunkIter,
+    With, Without,
+};
