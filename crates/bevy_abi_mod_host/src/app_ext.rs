@@ -1,5 +1,6 @@
 //! [`ModAppExt`] extension methods on Bevy [`App`], delegating to [`ModWorldExt`].
 
+use crate::mod_dag::{DirectoryLoadReport, ModDagError};
 use crate::plugin::ensure_startup_tracker;
 use crate::world_ext::ModWorldExt;
 #[cfg(feature = "signature-verification")]
@@ -125,6 +126,21 @@ pub trait ModAppExt {
         path: P,
         options: LoadOptions,
     ) -> Result<ModId, ModLoadError>;
+
+    /// Discovers `mod.toml` manifests inside `dir`, validates SemVer constraints, quarantines
+    /// cyclic dependency subgraphs, and loads all valid acyclic mods in Kahn topological order
+    /// using [`LoadOptions::default()`].
+    fn load_mods_dir<P: AsRef<Path>>(&mut self, dir: P)
+    -> Result<DirectoryLoadReport, ModDagError>;
+
+    /// Discovers `mod.toml` manifests inside `dir`, validates SemVer constraints, quarantines
+    /// cyclic dependency subgraphs, and loads all valid acyclic mods in Kahn topological order
+    /// using `options`.
+    fn load_mods_dir_with<P: AsRef<Path>>(
+        &mut self,
+        dir: P,
+        options: LoadOptions,
+    ) -> Result<DirectoryLoadReport, ModDagError>;
 }
 
 impl ModAppExt for App {
@@ -257,5 +273,24 @@ impl ModAppExt for App {
     ) -> Result<ModId, ModLoadError> {
         ensure_startup_tracker(self);
         self.world_mut().reload_mod_from(id, path, options)
+    }
+
+    #[inline]
+    fn load_mods_dir<P: AsRef<Path>>(
+        &mut self,
+        dir: P,
+    ) -> Result<DirectoryLoadReport, ModDagError> {
+        ensure_startup_tracker(self);
+        self.world_mut().load_mods_dir(dir)
+    }
+
+    #[inline]
+    fn load_mods_dir_with<P: AsRef<Path>>(
+        &mut self,
+        dir: P,
+        options: LoadOptions,
+    ) -> Result<DirectoryLoadReport, ModDagError> {
+        ensure_startup_tracker(self);
+        self.world_mut().load_mods_dir_with(dir, options)
     }
 }

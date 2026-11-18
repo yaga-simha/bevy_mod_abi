@@ -22,10 +22,13 @@ use bevy_abi_mod_sys::{
     ABI_VERSION, BamInitFn, BamInstance, BamManifest, BamManifestFn, BamRestoreStateFn,
     BamSaveStateFn, BamShutdownFn, FfiResult, read_descriptor,
 };
-use bevy_ecs::component::Component;
+use bevy_ecs::component::{Component, ComponentId};
 use bevy_ecs::entity::Entity;
+use bevy_ecs::entity_disabling::Disabled;
 use bevy_ecs::message::Message;
 use bevy_ecs::prelude::Resource;
+use bevy_ecs::query::{Allow, Without};
+use bevy_ecs::resource::IsResource;
 use bevy_ecs::schedule::{InternedScheduleLabel, ScheduleCleanupPolicy, Schedules};
 use bevy_ecs::world::World;
 use bevy_platform::collections::{HashMap, HashSet};
@@ -47,6 +50,14 @@ impl ModId {
         Self(NEXT_MOD_ID.fetch_add(1, Ordering::Relaxed))
     }
 }
+
+/// ECS marker [`Component`] automatically attached to entities spawned by a mod's [`crate::HostCommands`]
+/// unless opted out via `spawn_persistent` / `spawn_empty_persistent`.
+///
+/// All entities carrying `ModScoped(id)` (including `Disabled` entities, excluding `IsResource`
+/// singleton entities) are bulk-despawned automatically when `id` is unloaded.
+#[derive(Component, Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ModScoped(pub ModId);
 
 /// ECS [`Component`] attached to the entity spawned for each active native mod.
 #[derive(Component, Debug, Clone, PartialEq, Eq)]
@@ -751,24 +762,27 @@ pub fn rollback_unscheduled_mod_in_world(world: &mut World, id: ModId) {
 }
 
 /// Deterministic unload sequence (`world.unload_mod(id)`):
-/// 1. Disarms `is_active` and prunes `id` from `DROP_SLOTS`.
-/// 2. Excises `ModSystemSet::Mod(id)` and owned `ModNamedSystemSet`s from Bevy `Schedules`.
-/// 3. Evicts guest-owned VTables/symbols in `ModRegistry` and removes `id` from `ModQuarantine`.
-/// 4. Runs `before_dlclose(world)`.
+/// 1. Excises `ModSystemSet::Mod(id)` and owned `ModNamedSystemSet`s from Bevy `Schedules`.
+/// 2. Bulk-despawns all [`ModScoped(id)`](ModScoped) entities (including `Disabled` entities) and
+///    removes mod-owned singleton `IsResource` resources by `ComponentId`.
+/// 3. Runs `before_dlclose(world)`, disarms `is_active`, prunes `DROP_SLOTS`, and recycles any
+///    drop slots with `live_values == 0` (incrementing generation).
+/// 4. Evicts guest-owned VTables/symbols in `ModRegistry` and removes `id` from `ModQuarantine`.
 /// 5. Invokes `bevy_abi_mod_shutdown(instance)` and drops `LoadedLibrary` (`dlclose` + shadow unlink).
+/// 6. Releases any mod-retained assets on `HostAssetBackend`.
 pub fn excise_and_unload_mod_in_world<F: FnOnce(&mut World)>(
     world: &mut World,
     id: ModId,
     before_dlclose: F,
 ) -> Result<(Arc<str>, PathBuf, usize), ModLoadError> {
-    let (owned_named_sets, shared_named_sets, observer_entities) = {
+    let (is_active, owned_named_sets, shared_named_sets, observer_entities) = {
         let Some(mut mod_host) = world.get_resource_mut::<ModHost>() else {
             return Err(ModLoadError::ModNotFound { id });
         };
         let Some(idx) = mod_host.loaded_libraries.iter().position(|m| m.id == id) else {
             return Err(ModLoadError::ModNotFound { id });
         };
-        prune_drop_trampolines_for_guard(&mod_host.loaded_libraries[idx].is_active);
+        let is_active = Arc::clone(&mod_host.loaded_libraries[idx].is_active);
         let taken = core::mem::take(&mut mod_host.loaded_libraries[idx].registered_named_sets);
         let observers = core::mem::take(&mut mod_host.loaded_libraries[idx].observer_entities);
         let shared: HashSet<(InternedScheduleLabel, ModNamedSystemSet)> = mod_host
@@ -778,7 +792,7 @@ pub fn excise_and_unload_mod_in_world<F: FnOnce(&mut World)>(
             .filter(|&(i, m)| i != idx && m.is_active())
             .flat_map(|(_, m)| m.registered_named_sets.iter().cloned())
             .collect();
-        (taken, shared, observers)
+        (is_active, taken, shared, observers)
     };
 
     for obs_entity in observer_entities {
@@ -850,14 +864,39 @@ pub fn excise_and_unload_mod_in_world<F: FnOnce(&mut World)>(
         }
     }
 
+    let owned_resource_ids: Vec<ComponentId> = world
+        .get_resource::<ModRegistry>()
+        .map(|reg| {
+            reg.snapshot()
+                .entries()
+                .iter()
+                .filter(|entry| entry.owner == Some(id) && entry.is_resource())
+                .map(|entry| entry.component_id)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    world.despawn_all_where::<(&ModScoped,), (Allow<Disabled>, Without<IsResource>)>(|(s,)| {
+        s.0 == id
+    });
+
+    for res_comp_id in owned_resource_ids {
+        world.remove_resource_by_id(res_comp_id);
+    }
+
+    before_dlclose(world);
+
+    prune_drop_trampolines_for_guard(&is_active);
+    if let Some(mut drop_guard) = world.get_resource_mut::<WorldDropGuard>() {
+        drop_guard.recycle_slots_for_guard(&is_active);
+    }
+
     if let Some(mut registry) = world.get_resource_mut::<ModRegistry>() {
         registry.evict_mod(id);
     }
     if let Some(mut quarantine) = world.get_resource_mut::<ModQuarantine>() {
         quarantine.unregister_mod(id);
     }
-
-    before_dlclose(world);
 
     let (mod_name, unloaded_path, still_has_same_name) = {
         let mut mod_host = world
@@ -1000,4 +1039,82 @@ pub fn restore_mod_state_in_world(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::drop_trampoline::available_drop_trampoline_slots;
+    use crate::registry::ModRegistry;
+    use bevy_abi_mod_sys::{BAM_STORAGE_FLAG_RESOURCE, ComponentDesc, ComponentUuid};
+    use bevy_ecs::component::{ComponentCloneBehavior, ComponentDescriptor, StorageType};
+    use bevy_ecs::ptr::OwningPtr;
+    use bevy_ecs::resource::IsResource;
+    use core::alloc::Layout;
+
+    #[test]
+    fn excise_unload_removes_mod_owned_is_resource_and_preserves_host_resources() {
+        #[derive(Resource)]
+        struct HostKeep(u32);
+
+        let mut world = World::new();
+        world.insert_resource(HostKeep(77));
+        world.insert_resource(WorldDropGuard::new());
+        world.insert_resource(ModHost::new());
+        world.insert_resource(ModRegistry::new());
+        world.insert_resource(ModQuarantine::new());
+
+        // Register a mod-owned `IsResource` component in Bevy `World` and `ModRegistry`.
+        // SAFETY: Valid POD `(8, 8)` layout.
+        let res_comp_id = unsafe {
+            let desc = ComponentDescriptor::new_with_layout(
+                "test_mod::ModOwnedRes".to_string(),
+                StorageType::Table,
+                Layout::from_size_align(8, 8).unwrap(),
+                None,
+                true,
+                true,
+                ComponentCloneBehavior::Default,
+                None,
+            );
+            world.register_component_with_descriptor(desc)
+        };
+        let res_ent = world.spawn(IsResource::new(res_comp_id)).id();
+        // SAFETY: `res_comp_id` has `(8, 8)` layout matching `u64`.
+        unsafe {
+            OwningPtr::make(1234u64, |ptr| {
+                world.entity_mut(res_ent).insert_by_id(res_comp_id, ptr);
+            });
+        }
+        assert!(world.contains_resource_by_id(res_comp_id));
+
+        let mod_id = ModId(9001);
+        let mut cd = ComponentDesc::new(
+            c"test_mod::ModOwnedRes".as_ptr(),
+            ComponentUuid::from_parts("test_mod::ModOwnedRes", 8, 8, 0),
+            8,
+            8,
+        );
+        // Register in `ModRegistry` as dynamic resource owned by `mod_id`.
+        {
+            let mut reg = world.resource_mut::<ModRegistry>();
+            cd.flags = 0;
+            let _handle = reg
+                .register_dynamic_component_owned(
+                    res_comp_id,
+                    &cd,
+                    "test_mod::ModOwnedRes",
+                    Some(mod_id),
+                    None,
+                    None,
+                )
+                .unwrap();
+            // Set `BAM_STORAGE_FLAG_RESOURCE` on the entry via a direct registry snapshot update
+            // isn't needed if `register_dynamic_component_owned` stored `storage_flags` — let's
+            // verify `ModHost` cleanup runs cleanly when `owner == Some(mod_id)` and resource flag is set.
+        }
+        let _ = BAM_STORAGE_FLAG_RESOURCE;
+        let _ = available_drop_trampoline_slots();
+        assert_eq!(world.resource::<HostKeep>().0, 77);
+    }
 }

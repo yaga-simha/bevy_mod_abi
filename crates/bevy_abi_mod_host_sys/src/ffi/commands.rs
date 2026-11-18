@@ -19,7 +19,7 @@
 
 use crate::drop_trampoline::run_uncommitted_slot_drop;
 use crate::handle_header::{COMMANDS_MAGIC, HandleHeader, validate_handle_mut};
-use crate::loader::ModId;
+use crate::loader::{ModId, ModScoped};
 use crate::registry::{InsertDefaultFn, ModRegistry, RegistrySnapshot};
 use bevy_abi_mod_sys::{BamCommands, BamComponent, FfiAssetHandle, FfiEntity, FfiResult};
 use bevy_ecs::component::ComponentId;
@@ -218,11 +218,13 @@ impl CommandArena {
 enum RecordedCommand {
     SpawnEmpty {
         entity: Entity,
+        owner_mod_id: Option<ModId>,
     },
     SpawnBatch {
         entity: Entity,
         batch_start: usize,
         batch_len: usize,
+        owner_mod_id: Option<ModId>,
     },
     Despawn {
         entity: Entity,
@@ -382,13 +384,21 @@ impl HostCommandsStorage {
 
         for i in 0..self.commands.len() {
             match self.commands[i] {
-                RecordedCommand::SpawnEmpty { entity } => {
-                    let _ = world.spawn_empty_at(entity);
+                RecordedCommand::SpawnEmpty {
+                    entity,
+                    owner_mod_id,
+                } => {
+                    if let Ok(mut entity_mut) = world.spawn_empty_at(entity)
+                        && let Some(mod_id) = owner_mod_id
+                    {
+                        entity_mut.insert(ModScoped(mod_id));
+                    }
                 }
                 RecordedCommand::SpawnBatch {
                     entity,
                     batch_start,
                     batch_len,
+                    owner_mod_id,
                 } => {
                     let mut include = [true; MAX_SPAWN_BATCH_COMPONENTS];
                     for (idx, item) in self.batch_items[batch_start..(batch_start + batch_len)]
@@ -413,6 +423,9 @@ impl HostCommandsStorage {
                         }
                     }
                     if let Ok(mut entity_mut) = world.spawn_empty_at(entity) {
+                        if let Some(mod_id) = owner_mod_id {
+                            entity_mut.insert(ModScoped(mod_id));
+                        }
                         self.scratch_ids.clear();
                         let batch_slice =
                             &mut self.batch_items[batch_start..(batch_start + batch_len)];
@@ -796,9 +809,10 @@ pub unsafe extern "C" fn host_cmd_spawn_empty(
     };
 
     let entity = cmds.allocator.alloc();
-    cmds.storage
-        .commands
-        .push(RecordedCommand::SpawnEmpty { entity });
+    cmds.storage.commands.push(RecordedCommand::SpawnEmpty {
+        entity,
+        owner_mod_id: cmds.mod_id,
+    });
     // SAFETY: `out_entity` was checked non-null above and caller guarantees writable `FfiEntity`.
     unsafe {
         *out_entity = FfiEntity::from_bits(entity.to_bits());
@@ -806,39 +820,32 @@ pub unsafe extern "C" fn host_cmd_spawn_empty(
     FfiResult::OK
 }
 
-/// Reserves a fresh entity and queues a batched `count`-component spawn.
+/// Shared batched spawn helper supporting both mod-scoped (`persistent == false`) and
+/// persistent (`persistent == true`, skipping `ModScoped`) entity creation.
 ///
 /// # Safety
-/// - `commands` must point to an active [`HostCommands`] cast to [`BamCommands`], or null.
-/// - `out_entity` must point to writable [`FfiEntity`] storage, or null.
+/// - `out_entity` must point to writable [`FfiEntity`] storage (non-null).
 /// - If `count > 0`, `components` must point to `count` readable [`BamComponent`] handles and
 ///   `data_ptrs` must point to `count` pointers readable for each component's byte size.
-pub unsafe extern "C" fn host_cmd_spawn(
-    commands: *mut BamCommands,
+pub(crate) unsafe fn spawn_batch_with_scope(
+    cmds: &mut HostCommands<'_>,
     components: *const BamComponent,
     data_ptrs: *const *const u8,
     count: usize,
     out_entity: *mut FfiEntity,
+    persistent: bool,
 ) -> FfiResult {
-    if out_entity.is_null() {
-        return FfiResult::NULL_POINTER;
-    }
-    // SAFETY: Validating `commands` against `COMMANDS_MAGIC` under `STRICT_FFI_CHECKS`.
-    let cmds = match unsafe {
-        validate_handle_mut::<HostCommands<'_>>(commands.cast::<c_void>(), COMMANDS_MAGIC, false)
-    } {
-        Ok(c) => c,
-        Err(err) => return err,
-    };
+    let owner_mod_id = if persistent { None } else { cmds.mod_id };
 
     if count > MAX_SPAWN_BATCH_COMPONENTS {
         return FfiResult::CAPACITY_EXCEEDED;
     }
     if count == 0 {
         let entity = cmds.allocator.alloc();
-        cmds.storage
-            .commands
-            .push(RecordedCommand::SpawnEmpty { entity });
+        cmds.storage.commands.push(RecordedCommand::SpawnEmpty {
+            entity,
+            owner_mod_id,
+        });
         // SAFETY: `out_entity` is non-null and writable.
         unsafe {
             *out_entity = FfiEntity::from_bits(entity.to_bits());
@@ -939,12 +946,41 @@ pub unsafe extern "C" fn host_cmd_spawn(
         entity,
         batch_start,
         batch_len: count,
+        owner_mod_id,
     });
     // SAFETY: `out_entity` is non-null and writable.
     unsafe {
         *out_entity = FfiEntity::from_bits(entity.to_bits());
     }
     FfiResult::OK
+}
+
+/// Reserves a fresh entity and queues a batched `count`-component spawn.
+///
+/// # Safety
+/// - `commands` must point to an active [`HostCommands`] cast to [`BamCommands`], or null.
+/// - `out_entity` must point to writable [`FfiEntity`] storage, or null.
+/// - If `count > 0`, `components` must point to `count` readable [`BamComponent`] handles and
+///   `data_ptrs` must point to `count` pointers readable for each component's byte size.
+pub unsafe extern "C" fn host_cmd_spawn(
+    commands: *mut BamCommands,
+    components: *const BamComponent,
+    data_ptrs: *const *const u8,
+    count: usize,
+    out_entity: *mut FfiEntity,
+) -> FfiResult {
+    if out_entity.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: Validating `commands` against `COMMANDS_MAGIC` under `STRICT_FFI_CHECKS`.
+    let cmds = match unsafe {
+        validate_handle_mut::<HostCommands<'_>>(commands.cast::<c_void>(), COMMANDS_MAGIC, false)
+    } {
+        Ok(c) => c,
+        Err(err) => return err,
+    };
+    // SAFETY: `cmds` is validated, `out_entity` is non-null and writable, and caller guarantees `components`/`data_ptrs`.
+    unsafe { spawn_batch_with_scope(cmds, components, data_ptrs, count, out_entity, false) }
 }
 
 /// Queues deferred despawning of `entity`.
