@@ -4,6 +4,7 @@
 //! Library implementation for the `cargo-bam` modding CLI toolchain (`ABI 0.2.0`).
 
 pub mod builder;
+pub mod dag;
 pub mod scaffold;
 pub mod sdk;
 pub mod signing;
@@ -72,7 +73,7 @@ enum Commands {
         #[arg(long)]
         out: PathBuf,
     },
-    /// Build a guest mod shared library and optionally stage it alongside `mod.toml`.
+    /// Build a guest mod shared library and optionally stage it alongside `mod.toml` (and `.sig`).
     Build {
         /// Explicit path to `mod.toml` or `Cargo.toml`.
         #[arg(long)]
@@ -83,9 +84,20 @@ enum Commands {
         /// Build with release optimizations.
         #[arg(long)]
         release: bool,
-        /// Optional staging directory for built shared library + `mod.toml`.
+        /// Optional staging root directory (`<out-dir>/<mod_id>/` with library, `mod.toml`, and optional `.sig`).
         #[arg(long)]
         out_dir: Option<PathBuf>,
+        /// Optional OpenSSH Ed25519 private key to detach-sign the built shared library.
+        #[arg(long)]
+        sign_key: Option<PathBuf>,
+        /// `SSHSIG` namespace used when `--sign-key` is passed.
+        #[arg(long, default_value = signing::DEFAULT_NAMESPACE)]
+        sign_namespace: String,
+    },
+    /// Validate `mod.toml` manifests, SemVer dependencies, and topological load order in `<dir>`.
+    CheckMods {
+        /// Mods directory containing `mod.toml` or `<mod>/mod.toml` subdirectories.
+        dir: PathBuf,
     },
     /// Generate an OpenSSH Ed25519 keypair (`<out>` + `<out>.pub`).
     Keygen {
@@ -181,18 +193,36 @@ where
             dir,
             release,
             out_dir,
+            sign_key,
+            sign_namespace,
         } => {
-            let out = builder::build_mod(
+            let out = builder::build_mod_with_signing(
                 manifest_path.as_deref(),
                 dir.as_deref(),
                 release,
                 out_dir.as_deref(),
+                sign_key.as_deref(),
+                &sign_namespace,
             )?;
             println!(
                 "Built {} mod library at {}",
                 out.language,
                 out.library_path.display()
             );
+            if let Some(sig) = out.signature_path {
+                println!("  signature: {}", sig.display());
+            }
+            Ok(())
+        }
+        Commands::CheckMods { dir } => {
+            let order = dag::check_mods_dir(&dir)?;
+            println!(
+                "Validated {} mod manifest(s) in topological load order:",
+                order.len()
+            );
+            for (idx, m) in order.iter().enumerate() {
+                println!("  {}. {} {}", idx + 1, m.id, m.version);
+            }
             Ok(())
         }
         Commands::Keygen { out, comment } => {
@@ -288,7 +318,7 @@ mod tests {
         assert!(c_proj.join("mod.toml").is_file());
         assert!(c_proj.join("src/mod.c").is_file());
 
-        // 2. Build C99 mod & stage into `dist/`
+        // 2. Build C99 mod & stage into `dist/sample_c_mod/`
         let dist_dir = tmp.path().join("dist_c");
         run_cli([
             "cargo-bam",
@@ -300,8 +330,9 @@ mod tests {
             dist_dir.to_str().unwrap(),
         ])
         .unwrap();
-        assert!(dist_dir.join("mod.toml").is_file());
-        let staged_c_lib = fs::read_dir(&dist_dir)
+        let staged_c_dir = dist_dir.join("sample_c_mod");
+        assert!(staged_c_dir.join("mod.toml").is_file());
+        let staged_c_lib = fs::read_dir(&staged_c_dir)
             .unwrap()
             .flatten()
             .map(|e| e.path())
@@ -362,7 +393,7 @@ mod tests {
             .is_err()
         );
 
-        // 4. Scaffold & build C++17 mod
+        // 4. Scaffold & build C++17 mod with `--sign-key` staged into `dist_cpp/sample_cpp_mod/`
         run_cli([
             "cargo-bam",
             "new",
@@ -382,9 +413,31 @@ mod tests {
             cpp_proj.to_str().unwrap(),
             "--out-dir",
             dist_cpp.to_str().unwrap(),
+            "--sign-key",
+            key_prefix.to_str().unwrap(),
         ])
         .unwrap();
-        assert!(dist_cpp.join("mod.toml").is_file());
+        let staged_cpp_dir = dist_cpp.join("sample_cpp_mod");
+        assert!(staged_cpp_dir.join("mod.toml").is_file());
+        let staged_cpp_lib = fs::read_dir(&staged_cpp_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| matches!(e, "so" | "dylib" | "dll"))
+            })
+            .expect("staged C++17 shared library must exist");
+        assert!(signing::default_sig_path(&staged_cpp_lib).is_file());
+        run_cli([
+            "cargo-bam",
+            "verify",
+            "--pubkey",
+            pub_path.to_str().unwrap(),
+            staged_cpp_lib.to_str().unwrap(),
+        ])
+        .unwrap();
     }
 
     #[test]
@@ -416,14 +469,73 @@ mod tests {
             dist_rust.to_str().unwrap(),
         ])
         .unwrap();
-        assert!(dist_rust.join("mod.toml").is_file());
-        let has_lib = fs::read_dir(&dist_rust).unwrap().flatten().any(|e| {
+        let staged_rust_dir = dist_rust.join("sample_rust_mod");
+        assert!(staged_rust_dir.join("mod.toml").is_file());
+        let has_lib = fs::read_dir(&staged_rust_dir).unwrap().flatten().any(|e| {
             e.path()
                 .extension()
                 .and_then(|ext| ext.to_str())
                 .is_some_and(|ext| matches!(ext, "so" | "dylib" | "dll"))
         });
-        assert!(has_lib, "built Rust cdylib must be staged into dist_rust");
+        assert!(
+            has_lib,
+            "built Rust cdylib must be staged into dist_rust/<mod_id>/"
+        );
+    }
+
+    #[test]
+    fn cli_check_mods_validates_dag_semver_mismatch_and_cycles() {
+        let tmp = TempDir::new().unwrap();
+        let mods_dir = tmp.path().join("mods");
+        fs::create_dir_all(mods_dir.join("base")).unwrap();
+        fs::create_dir_all(mods_dir.join("addon")).unwrap();
+        fs::create_dir_all(mods_dir.join("ui")).unwrap();
+
+        fs::write(
+            mods_dir.join("base/mod.toml"),
+            "[mod]\nid = \"base\"\nversion = \"1.2.0\"\nabi_version = \"^0.2.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            mods_dir.join("addon/mod.toml"),
+            "[mod]\nid = \"addon\"\nversion = \"1.0.0\"\nabi_version = \"^0.2.0\"\n\n[dependencies]\nbase = \"^1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            mods_dir.join("ui/mod.toml"),
+            "[mod]\nid = \"ui\"\nversion = \"0.5.0\"\n\n[dependencies]\naddon = \"^1.0\"\n",
+        )
+        .unwrap();
+
+        // Valid DAG returns topological order: base -> addon -> ui
+        let order = dag::check_mods_dir(&mods_dir).unwrap();
+        let ids: Vec<&str> = order.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["base", "addon", "ui"]);
+        run_cli(["cargo-bam", "check-mods", mods_dir.to_str().unwrap()]).unwrap();
+
+        // SemVer mismatch must fail!
+        fs::write(
+            mods_dir.join("addon/mod.toml"),
+            "[mod]\nid = \"addon\"\nversion = \"1.0.0\"\n\n[dependencies]\nbase = \"^2.0\"\n",
+        )
+        .unwrap();
+        let err = run_cli(["cargo-bam", "check-mods", mods_dir.to_str().unwrap()]).unwrap_err();
+        assert!(
+            err.to_string().contains("requires 'base' ^2.0"),
+            "unexpected error: {err}"
+        );
+
+        // Cycle must fail!
+        fs::write(
+            mods_dir.join("addon/mod.toml"),
+            "[mod]\nid = \"addon\"\nversion = \"1.0.0\"\n\n[dependencies]\nbase = \"^1.0\"\nui = \"^0.5\"\n",
+        )
+        .unwrap();
+        let cyc_err = run_cli(["cargo-bam", "check-mods", mods_dir.to_str().unwrap()]).unwrap_err();
+        assert!(
+            cyc_err.to_string().contains("dependency cycle"),
+            "unexpected error: {cyc_err}"
+        );
     }
 
     #[test]

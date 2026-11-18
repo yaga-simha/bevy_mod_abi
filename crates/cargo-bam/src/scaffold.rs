@@ -92,7 +92,7 @@ pub fn scaffold_new_mod(
     fs::create_dir_all(project_dir.join("src"))?;
 
     let mod_toml = format!(
-        "[mod]\nid = \"{stem}\"\nname = \"{name}\"\nversion = \"0.2.0\"\nabi_version = \"0.2.0\"\nlanguage = \"{}\"\nentry = \"{stem}\"\n\n[dependencies]\n",
+        "[mod]\nid = \"{stem}\"\nname = \"{name}\"\nversion = \"0.2.0\"\nabi_version = \"0.2.0\"\nlanguage = \"{}\"\n\n[dependencies]\n",
         lang.as_str()
     );
     fs::write(project_dir.join("mod.toml"), mod_toml)?;

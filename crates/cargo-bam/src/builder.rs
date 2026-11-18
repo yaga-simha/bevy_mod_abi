@@ -1,33 +1,14 @@
 //! Mod build and staging (`cargo bam build`) for Rust, C99, C++17, and Zig guest mods.
 
 use crate::CliError;
+use crate::dag::ValidatedModManifest;
 use crate::scaffold::ModLanguage;
+use crate::signing::{self, DEFAULT_NAMESPACE};
 use serde::Deserialize;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-/// Parsed `mod.toml` metadata used by `cargo bam build`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ModTomlManifest {
-    /// `[mod]` table.
-    #[serde(rename = "mod")]
-    pub mod_section: ModTomlSection,
-}
-
-/// `[mod]` section of `mod.toml`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ModTomlSection {
-    /// Logical module identifier / artifact stem.
-    pub id: Option<String>,
-    /// Human-readable module name.
-    pub name: Option<String>,
-    /// Guest language (`rust`, `c99`, `cpp17`, `zig`).
-    pub language: Option<String>,
-    /// Optional explicit entry stem or source filename.
-    pub entry: Option<String>,
-}
 
 /// Result returned by [`build_mod`].
 #[derive(Debug, Clone)]
@@ -38,6 +19,8 @@ pub struct BuildOutput {
     pub library_path: PathBuf,
     /// Staged `mod.toml` path if `mod.toml` existed and `--out-dir` was provided.
     pub staged_manifest_path: Option<PathBuf>,
+    /// Detached `.sig` sidecar path if `--sign-key` was provided.
+    pub signature_path: Option<PathBuf>,
 }
 
 fn dylib_naming() -> (&'static str, &'static str) {
@@ -144,7 +127,7 @@ fn parse_language_str(raw: &str) -> Option<ModLanguage> {
 fn resolve_project(
     manifest_path: Option<&Path>,
     dir: Option<&Path>,
-) -> Result<(PathBuf, Option<PathBuf>, Option<ModTomlManifest>), CliError> {
+) -> Result<(PathBuf, Option<PathBuf>, Option<ValidatedModManifest>), CliError> {
     let (project_dir, mod_toml_path) = if let Some(mp) = manifest_path {
         let file_name = mp.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if file_name == "mod.toml" {
@@ -175,10 +158,7 @@ fn resolve_project(
     };
 
     let parsed_mod_toml = if let Some(ref mp) = mod_toml_path {
-        let text = fs::read_to_string(mp)?;
-        let parsed: ModTomlManifest = toml::from_str(&text)
-            .map_err(|e| CliError::InvalidManifest(format!("{}: {e}", mp.display())))?;
-        Some(parsed)
+        Some(ValidatedModManifest::from_file(mp)?)
     } else {
         None
     };
@@ -193,20 +173,40 @@ fn find_first_existing(project_dir: &Path, candidates: &[&str]) -> Option<PathBu
         .find(|p| p.is_file())
 }
 
-/// Builds a guest mod project (Rust, C99, C++17, or Zig) and optionally stages the resulting
-/// shared library + `mod.toml` into `out_dir`.
+/// Builds a guest mod project (Rust, C99, C++17, or Zig), validates `mod.toml` metadata if
+/// present, optionally stages into `out_dir/<mod_id>/` ready for `load_mods_dir`, and optionally
+/// signs the artifact with `sign_key`.
 pub fn build_mod(
     manifest_path: Option<&Path>,
     dir: Option<&Path>,
     release: bool,
     out_dir: Option<&Path>,
 ) -> Result<BuildOutput, CliError> {
+    build_mod_with_signing(
+        manifest_path,
+        dir,
+        release,
+        out_dir,
+        None,
+        DEFAULT_NAMESPACE,
+    )
+}
+
+/// Builds, stages into `out_dir/<mod_id>/`, and optionally signs a guest mod artifact.
+pub fn build_mod_with_signing(
+    manifest_path: Option<&Path>,
+    dir: Option<&Path>,
+    release: bool,
+    out_dir: Option<&Path>,
+    sign_key: Option<&Path>,
+    sign_namespace: &str,
+) -> Result<BuildOutput, CliError> {
     let (project_dir, mod_toml_path, parsed_mod) = resolve_project(manifest_path, dir)?;
     let cargo_toml = project_dir.join("Cargo.toml");
 
     let explicit_lang = parsed_mod
         .as_ref()
-        .and_then(|m| m.mod_section.language.as_deref())
+        .and_then(|m| m.language.as_deref())
         .and_then(parse_language_str);
 
     let language = if let Some(lang) = explicit_lang {
@@ -226,22 +226,28 @@ pub fn build_mod(
         )));
     };
 
-    let stem_from_mod = parsed_mod
+    let mod_id = parsed_mod
         .as_ref()
-        .and_then(|m| {
-            m.mod_section
-                .entry
-                .clone()
-                .or_else(|| m.mod_section.id.clone())
-                .or_else(|| m.mod_section.name.clone())
-        })
+        .map(|m| m.id.clone())
         .unwrap_or_else(|| {
             project_dir
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("bam_mod")
                 .to_owned()
+        });
+    let stem_from_mod = parsed_mod
+        .as_ref()
+        .and_then(|m| m.entry.clone())
+        .map(|e| {
+            Path::new(&e)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&mod_id)
+                .trim_start_matches("lib")
+                .to_owned()
         })
+        .unwrap_or_else(|| mod_id.clone())
         .replace('-', "_");
 
     let (prefix, ext) = dylib_naming();
@@ -370,8 +376,9 @@ pub fn build_mod(
         }
     };
 
-    if let Some(stage_dir) = out_dir {
-        fs::create_dir_all(stage_dir)?;
+    if let Some(stage_root) = out_dir {
+        let stage_dir = stage_root.join(&mod_id);
+        fs::create_dir_all(&stage_dir)?;
         let file_name = built_artifact
             .file_name()
             .ok_or_else(|| CliError::Command("built artifact has no filename".to_owned()))?;
@@ -384,16 +391,31 @@ pub fn build_mod(
         } else {
             None
         };
+        let signature_path = if let Some(key_path) = sign_key {
+            let signed = signing::sign_mod_file(key_path, &staged_lib, None, sign_namespace)?;
+            Some(signed.signature_path)
+        } else {
+            None
+        };
         return Ok(BuildOutput {
             language,
             library_path: staged_lib,
             staged_manifest_path: staged_manifest,
+            signature_path,
         });
     }
+
+    let signature_path = if let Some(key_path) = sign_key {
+        let signed = signing::sign_mod_file(key_path, &built_artifact, None, sign_namespace)?;
+        Some(signed.signature_path)
+    } else {
+        None
+    };
 
     Ok(BuildOutput {
         language,
         library_path: built_artifact,
         staged_manifest_path: None,
+        signature_path,
     })
 }
