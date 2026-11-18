@@ -4,6 +4,11 @@ pub use crate::app_ext::ModAppExt;
 pub use crate::commands_ext::ModCommandsExt;
 pub use crate::events::{LoadedModInfo, ModLoaded, ModUnloaded};
 pub use crate::schedule_sets::{ModNamedSystemSet, ModScheduleMap, ModVisibleSets};
+#[cfg(feature = "hot-reload-watcher")]
+pub use crate::watcher::{
+    ModHotReloadAction, ModHotReloadHistory, ModHotReloadOutcome, ModHotReloadPlugin,
+    ModHotReloadWatcher,
+};
 pub use crate::world_ext::ModWorldExt;
 
 use crate::commands_ext::{PendingModLifecycleOps, flush_pending_mod_lifecycle_ops};

@@ -22,6 +22,7 @@ use bevy_abi_mod_sys::{
 use bevy_ecs::archetype::ArchetypeId;
 use bevy_ecs::change_detection::{CheckChangeTicks, Tick};
 use bevy_ecs::entity::Entity;
+use bevy_ecs::error::{BevyError, ContextExt};
 use bevy_ecs::message::Messages;
 #[cfg(feature = "diagnostics")]
 use bevy_ecs::prelude::Resource;
@@ -587,7 +588,11 @@ pub struct GuestSystem {
     is_main_thread: bool,
     after_systems: Vec<String>,
     before_systems: Vec<String>,
+    after_weak_systems: Vec<String>,
+    before_weak_systems: Vec<String>,
     in_sets: Vec<String>,
+    ambiguous_with_systems: Vec<String>,
+    ambiguous_with_all: bool,
     error_policy: ModErrorPolicy,
     error_policy_explicit: bool,
 
@@ -637,7 +642,11 @@ impl GuestSystem {
             is_main_thread: false,
             after_systems: Vec::new(),
             before_systems: Vec::new(),
+            after_weak_systems: Vec::new(),
+            before_weak_systems: Vec::new(),
             in_sets: Vec::new(),
+            ambiguous_with_systems: Vec::new(),
+            ambiguous_with_all: false,
             error_policy: ModErrorPolicy::Quarantine,
             error_policy_explicit: false,
             enabled_flag: Arc::new(AtomicBool::new(true)),
@@ -812,6 +821,25 @@ impl GuestSystem {
         &self.before_systems
     }
 
+    /// Builder helper to configure weak `after_weak` and `before_weak` ordering target names.
+    pub fn with_weak_ordering(mut self, after_weak: Vec<String>, before_weak: Vec<String>) -> Self {
+        self.after_weak_systems = after_weak;
+        self.before_weak_systems = before_weak;
+        self
+    }
+
+    /// System-set target names declared in `BamSystemDesc::after_weak`.
+    #[inline]
+    pub fn after_weak_systems(&self) -> &[String] {
+        &self.after_weak_systems
+    }
+
+    /// System-set target names declared in `BamSystemDesc::before_weak`.
+    #[inline]
+    pub fn before_weak_systems(&self) -> &[String] {
+        &self.before_weak_systems
+    }
+
     /// Configures explicit `in_sets` membership target names (`"host::<set>"` or named sets).
     pub fn with_in_sets(mut self, in_sets: Vec<String>) -> Self {
         self.in_sets = in_sets;
@@ -822,6 +850,31 @@ impl GuestSystem {
     #[inline]
     pub fn in_sets(&self) -> &[String] {
         &self.in_sets
+    }
+
+    /// Configures explicit `ambiguous_with` target names (`BamSystemDesc::ambiguous_with`).
+    pub fn with_ambiguous_with(mut self, ambiguous_with: Vec<String>) -> Self {
+        self.ambiguous_with_systems = ambiguous_with;
+        self
+    }
+
+    /// System-set target names declared in `BamSystemDesc::ambiguous_with`.
+    #[inline]
+    pub fn ambiguous_with_systems(&self) -> &[String] {
+        &self.ambiguous_with_systems
+    }
+
+    /// Configures `BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL` (`.ambiguous_with_all()`).
+    #[inline]
+    pub const fn with_ambiguous_with_all(mut self, ambiguous_with_all: bool) -> Self {
+        self.ambiguous_with_all = ambiguous_with_all;
+        self
+    }
+
+    /// Returns `true` if `BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL` was set on this system.
+    #[inline]
+    pub const fn is_ambiguous_with_all(&self) -> bool {
+        self.ambiguous_with_all
     }
 
     /// Returns the [`ModErrorPolicy`] governing faults in this system.
@@ -888,7 +941,9 @@ impl GuestSystem {
         status: FfiResult,
         panicked: bool,
     ) -> Result<(), RunSystemError> {
-        self.enabled_flag.store(false, Ordering::Release);
+        if self.error_policy != ModErrorPolicy::DelegateToBevyFallback {
+            self.enabled_flag.store(false, Ordering::Release);
+        }
         // Discard any partial deferred commands recorded by the faulting callback invocation.
         self.commands_storage.clear();
 
@@ -912,6 +967,15 @@ impl GuestSystem {
                     %status,
                     panicked,
                     "guest mod system faulted"
+                );
+            }
+            ModErrorPolicy::DelegateToBevyFallback => {
+                tracing::debug!(
+                    system = %sys_name,
+                    mod_id = ?mod_id,
+                    %status,
+                    panicked,
+                    "delegating guest mod system fault to Bevy FallbackErrorHandler"
                 );
             }
         }
@@ -940,6 +1004,23 @@ impl GuestSystem {
                 status,
                 panicked,
             })),
+            ModErrorPolicy::DelegateToBevyFallback => {
+                let err_res: Result<(), ModSystemError> = Err(ModSystemError {
+                    mod_id,
+                    system_name: sys_name.clone(),
+                    status,
+                    panicked,
+                });
+                let bevy_err: BevyError = err_res
+                    .with_context(|| {
+                        format!(
+                            "guest mod {:?} system {:?} faulted with {}",
+                            mod_id, sys_name, status
+                        )
+                    })
+                    .unwrap_err();
+                Err(RunSystemError::Failed(bevy_err))
+            }
         }
     }
 }

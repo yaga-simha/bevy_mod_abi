@@ -24,3 +24,4 @@ mod differential_parity;
 mod multi_query_and_conditions;
 mod ordering_and_validation;
 mod sets_and_diagnostics;
+mod weak_ordering_and_fallback;

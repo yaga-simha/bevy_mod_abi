@@ -23,6 +23,11 @@ pub enum ModErrorPolicy {
     /// Quarantines the faulting guest system, logs via `tracing::error!`, and propagates
     /// [`ModSystemError`] via `Err(RunSystemError::from(...))` to Bevy's error handler.
     ReportToBevy,
+    /// Discards uncommitted commands, emits [`ModSystemFaulted`], and delegates fault handling
+    /// directly to Bevy's world [`FallbackErrorHandler`](bevy_ecs::error::FallbackErrorHandler)
+    /// with a contextualized [`BevyError`](bevy_ecs::error::BevyError) (`.with_context(...)`)
+    /// without auto-quarantining the system.
+    DelegateToBevyFallback,
 }
 
 /// World resource configuring the default [`ModErrorPolicy`] for dynamic guest systems.
