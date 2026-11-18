@@ -132,26 +132,28 @@
 //!
 //! # Architecture & Contributor Guide (Crate Developers)
 //!
-//! ## Seven-Crate `-sys` vs. Safe Rust Split
+//! ## Eight-Crate `-sys` vs. Safe Rust Split
 //!
 //! The workspace strictly isolates `unsafe` FFI machinery inside `*-sys` crates while keeping
-//! high-level host and guest crates under `#![forbid(unsafe_code)]`, and keeping `bevy*` out of
-//! all wire, macro, and guest crates:
+//! high-level host, guest, macro, and CLI crates under `#![forbid(unsafe_code)]`, and keeping
+//! `bevy*` out of all wire, macro, guest, and CLI crates:
 //!
 //! - `bevy_abi_mod_sys`: `#![no_std]`, zero external dependencies. Defines the `#[repr(C)]`
 //!   `ABI 0.2.0` wire contract (`BamHostApi`, `BamManifest`, `BamSystemDesc`, `ComponentDesc`,
 //!   `FfiResult`, `StrView`, `ModComponent`, `AbiPod`).
-//! - `bevy_abi_mod_macros`: Proc-macro crate (`#[derive(ModComponent, AbiPod)]`). No `bevy`
+//! - `bevy_abi_mod_macros`: `#![forbid(unsafe_code)]` proc-macro crate (`#[derive(ModComponent, AbiPod)]`). No `bevy`
 //!   dependency.
 //! - `bevy_abi_mod_host_sys`: Isolates all host `unsafe` (`HOST_API`, `HostIter`, `HostCommands`,
 //!   `GuestSystem`, `ModRegistry`, `libloading` loader).
-//! - `bevy_abi_mod_host`: `#![forbid(unsafe_code)]` safe Bevy plugin, extension traits, and
-//!   lifecycle messages.
+//! - `bevy_abi_mod_host`: `#![forbid(unsafe_code)]` safe Bevy plugin, optional Bevy `0.20` bridges,
+//!   `SubApp` extraction, extension traits, and lifecycle messages.
 //! - `bevy_abi_mod`: `#![forbid(unsafe_code)]` top-level host facade (this crate).
 //! - `bevy_abi_mod_guest_sys`: Isolates all guest `unsafe` (`extern "C"` trampolines, panic
 //!   guards, host API cache). No `bevy` dependency.
 //! - `bevy_abi_mod_guest`: `#![forbid(unsafe_code)]` ergonomic Rust guest SDK. No `bevy`
 //!   dependency.
+//! - `cargo-bam`: `#![forbid(unsafe_code)]` standalone modder CLI (`new`, `build`, `header`,
+//!   `check-mods`, `doctor`, `sign`). No `bevy` dependency.
 //!
 //! ## Core Invariants
 //!

@@ -14,7 +14,7 @@ Dynamically loading native shared libraries (`.so`, `.dylib`, `.dll`) into a Bev
 ### 1.2 Architectural Approach
 `bevy_abi_mod` defines an **asymmetric, zero-serialization `extern "C"` wire contract (`ABI 0.2.0`, `0x0002_0000`)** between a Bevy host and native guest mods written in Rust, ISO C99, C++17/20, or Zig:
 1. **Zero Shared Rust ABI Assumptions:** Every wire structure is `#[repr(C)]` or `#[repr(transparent)]` with zero implicit padding, verified at compile time on 64-bit and 32-bit targets in both Rust (`offset_of!`) and ISO C99 (`BAM_STATIC_ASSERT` in `include/bevy_abi_mod.h`).
-2. **Versioned Table Handshake & Pre-Resolved Handles:** On load, the host validates the guest's `BamManifest` and passes a self-describing 38-slot `BamHostApi` table (`MIN_V0_2_SIZE = 224` B / `size_of = 312` B on 64-bit) alongside a transactional `BamLoadCtx`. Components, resources, messages, and events resolve once at initialization into 1-based `BamComponent(u32)` handles so per-frame iteration, resource/tick/message operations, random entity lookups, observers, and deferred commands perform zero string parsing or hashing.
+2. **Versioned Table Handshake & Pre-Resolved Handles:** On load, the host validates the guest's `BamManifest` and passes a self-describing 50-slot `BamHostApi` table (`MIN_V0_2_SIZE = 224` B / `size_of = 408` B on 64-bit; `116` B / `208` B on 32-bit) alongside a transactional `BamLoadCtx`. Components, resources, messages, events, assets, and scenes resolve once into 1-based `BamComponent(u32)` handles so per-frame iteration, resource/tick/message operations, random entity/hierarchy lookups, observers, and deferred commands perform zero string parsing or hashing.
 3. **Direct Archetype & Sparse-Set Iteration:** Host `Table` columns are exposed directly as contiguous SoA byte slices (and `SparseSet` columns as batched per-row pointer arrays) without copying component payloads.
 4. **First-Class Bevy Scheduler Concurrency:** Each registered mod system runs inside a native Bevy `System` (`GuestSystem`) that populates `FilteredAccessSet` read/write locks from pre-resolved `ComponentId`s, allowing Bevy's multi-threaded executor to schedule non-conflicting mod and host systems in parallel.
 5. **Per-World Instance Isolation & Deterministic Unloading:** Mods export `bevy_abi_mod_manifest`, `bevy_abi_mod_init(..., &mut instance_out)`, and `bevy_abi_mod_shutdown(instance)`. Each Bevy `World` owns an isolated `BamInstance*`, copy-on-write `ModRegistry` snapshot, transactional `LoadTransaction` rollback, shadow-copy loader support, and lock-free `ArcSwapOption` drop trampolines.
@@ -28,9 +28,9 @@ Native dynamic libraries loaded via `dlopen` / `LoadLibraryW` execute **in-proce
 
 ---
 
-## 2. Seven-Crate Workspace Architecture (`-sys` vs. `#![forbid(unsafe_code)]`)
+## 2. Eight-Crate Workspace Architecture (`-sys` vs. `#![forbid(unsafe_code)]`)
 
-The workspace separates low-level `unsafe` FFI machinery (`*-sys`) from high-level idiomatic Rust crates enforcing `#![forbid(unsafe_code)]`, while strictly keeping `bevy*` out of all wire, macro, and guest crates.
+The workspace separates low-level `unsafe` FFI machinery (`*-sys`) from high-level idiomatic Rust and CLI crates enforcing `#![forbid(unsafe_code)]`, while strictly keeping `bevy*` out of all wire, macro, guest, and CLI crates.
 
 ### 2.1 Dependency & Safety Graph
 
@@ -38,8 +38,9 @@ The workspace separates low-level `unsafe` FFI machinery (`*-sys`) from high-lev
 flowchart TD
     subgraph SafeLayer["Idiomatic Safe Rust Layer (#![forbid(unsafe_code)])"]
         BAM["bevy_abi_mod<br/>(Host Facade Crate)<br/>#![forbid(unsafe_code)]"]
-        HOST["bevy_abi_mod_host<br/>(Bevy Plugin, ModWorldExt, Sets, Messages)<br/>#![forbid(unsafe_code)]"]
+        HOST["bevy_abi_mod_host<br/>(Bevy Plugin, Bridges, SubApp, Sets, Messages)<br/>#![forbid(unsafe_code)]"]
         GUEST["bevy_abi_mod_guest<br/>(Safe Guest SDK: GuestApp, Chunk, GuestCommands)<br/>#![forbid(unsafe_code)] · NO bevy"]
+        CLI["cargo-bam<br/>(Developer CLI: new, build, doctor, sign)<br/>#![forbid(unsafe_code)] · NO bevy"]
     end
 
     subgraph MacroLayer["Compile-Time Codegen (NO bevy)"]
@@ -47,7 +48,7 @@ flowchart TD
     end
 
     subgraph SysLayer["Encapsulated Unsafe FFI Layer (*-sys)"]
-        HOST_SYS["bevy_abi_mod_host_sys<br/>(HOST_API, HostIter, HostCommands,<br/>GuestSystem, ModRegistry, ModHost, DROP_SLOTS)"]
+        HOST_SYS["bevy_abi_mod_host_sys<br/>(HOST_API, HostIter, HostCommands,<br/>GuestSystem, ModRegistry, ModHost, DROP_SLAB)"]
         GUEST_SYS["bevy_abi_mod_guest_sys<br/>(GuestInstance, Trampolines, Host Cache,<br/>Validated Column & Borrow Guards)<br/>NO bevy"]
         SYS["bevy_abi_mod_sys<br/>(#[repr(C)] ABI 0.2.0 Wire Contract)<br/>#![no_std] · ZERO external deps · NO bevy"]
     end
@@ -63,6 +64,7 @@ flowchart TD
     GUEST --> GUEST_SYS
     GUEST -. "optional feature: derive" .-> MACROS
     GUEST --> SYS
+    CLI --> SYS
 
     HOST_SYS --> SYS
     GUEST_SYS --> SYS
@@ -72,13 +74,14 @@ flowchart TD
 
 | Crate | `#![no_std]` | `#![forbid(unsafe_code)]` | `bevy*` Allowed | Responsibility & Allowed Dependencies |
 |---|---|---|---|---|
-| `crates/bevy_abi_mod_sys` | Yes | No (`unsafe trait`, `FfiSlice`, `ExtensibleStruct`) | **Never** | **Zero external dependencies.** Defines `ABI_VERSION` (`0.2.0`), `BamManifest`, `BamHostApi`, `BamSystemDesc`, `BamQueryDesc`, `BamTermDesc`, `ComponentDesc`, `BamColumnInfo`, `VTableHeader`, `BamComponent`, `ComponentUuid`, `FfiResult`, `FfiBool`, `FfiEntity`, `ModComponent`, `AbiPod`, and `RawInsertable`. |
-| `crates/bevy_abi_mod_macros` | N/A (`proc-macro`) | Yes (host macro logic) | **Never** | `syn`, `quote`, `proc-macro2`, `proc-macro-crate`. Implements `#[derive(ModComponent)]` (hygienic VTable + accessor codegen) and `#[derive(AbiPod)]`. |
-| `crates/bevy_abi_mod_host_sys` | No (`std`) | No (isolates all host `unsafe`) | Yes | `bevy_ecs`, `bevy_app`, `bevy_platform`, `libloading`, `arc-swap`, `thiserror`, `tracing`, `bevy_abi_mod_sys`, and optional pure-Rust `ssh-key` / `ssh-encoding` / `signature` (`signature-verification`). Implements `HOST_API`, `HostIter`, `HostCommands` (`CommandArena`), `GuestSystem`, `ModRegistry` (`RegistrySnapshot`), `ModHost`, `LoadContext`, `DROP_SLOTS`, `WorldDropGuard`, and `ModTrustPolicy`. |
-| `crates/bevy_abi_mod_host` | No (`std`) | **Yes** | Yes | `bevy_app`, `bevy_ecs`, `bevy_abi_mod_host_sys`, `bevy_abi_mod_sys`, `bevy_abi_mod_macros`. Safe Bevy plugin (`AbiModPlugin`), `ModWorldExt`, `ModAppExt`, `ModCommandsExt`, `LoadOptions`, `ComponentOptions`, `ModErrorPolicy`, `ModQuarantine`, `ModScheduleMap`, lifecycle `Message`s, `ModSystemSet`, `ModNamedSystemSet`, and `prelude`. |
+| `crates/bevy_abi_mod_sys` | Yes | No (`unsafe trait`, `FfiSlice`, `ExtensibleStruct`) | **Never** | **Zero external dependencies.** Defines `ABI_VERSION` (`0.2.0`), `BamManifest`, `BamHostApi`, `BamSystemDesc`, `BamObserverDesc`, `BamTriggerDesc`, `BamQueryDesc`, `BamTermDesc`, `ComponentDesc`, `BamColumnInfo`, `VTableHeader`, `BamComponent`, `ComponentUuid`, `FfiResult`, `FfiBool`, `FfiOption<T>`, `FfiEntity`, `FfiAssetHandle`, `ModComponent`, `AbiPod`, and `RawInsertable`. |
+| `crates/bevy_abi_mod_macros` | N/A (`proc-macro`) | Yes | **Never** | `syn`, `quote`, `proc-macro2`, `proc-macro-crate`. Implements `#[derive(ModComponent)]` (hygienic VTable + witness schema + C/Zig codegen across structs, tuple structs, and `#[repr(i8..u64)]` enums) and `#[derive(AbiPod)]`. |
+| `crates/bevy_abi_mod_host_sys` | No (`std`) | No (isolates all host `unsafe`) | Yes | `bevy_ecs`, `bevy_app`, `bevy_platform`, `libloading`, `arc-swap`, `thiserror`, `tracing`, `bevy_abi_mod_sys`, and optional pure-Rust `ssh-key` / `ssh-encoding` / `signature` (`signature-verification`). Implements `HOST_API`, `HostIter`, `HostCommands` (`CommandArena`), `GuestSystem`, `ModRegistry` (`RegistrySnapshot`), `ModHost`, `LoadContext`, paged `DROP_SLAB`, `WorldDropGuard`, witness schema helpers, and `ModTrustPolicy`. |
+| `crates/bevy_abi_mod_host` | No (`std`) | **Yes** | Yes | `bevy_app`, `bevy_ecs`, `bevy_abi_mod_host_sys`, `bevy_abi_mod_sys`, `bevy_abi_mod_macros`, plus optional Bevy bridge/watcher crates. Safe Bevy plugin (`AbiModPlugin`), `ModWorldExt`, `ModAppExt`, `ModCommandsExt`, `ModDependencyGraph` (`mod.toml` SemVer DAG), `ModHotReloadPlugin`, optional Bevy `0.20` bridges (`StdTypesBridgePlugin`, `ModAssetPlugin`, `ModStateExt`, `ModReflectPlugin`, `ModBsnPlugin`, `ModSubAppPlugin<L>`, `ModWeslMaterialPlugin`), and `prelude`. |
 | `crates/bevy_abi_mod` | No (`std`) | **Yes** | Yes | Top-level host facade re-exporting `bevy_abi_mod_host`, `ModComponent`, `AbiPod`, `bevy_abi_mod_sys`, and `prelude`. |
-| `crates/bevy_abi_mod_guest_sys` | No (`std`) | No (isolates all guest `unsafe`) | **Never** | Depends **only** on `bevy_abi_mod_sys`. Implements `GuestInstance`, `catch_guest_*` panic guards, `extern "C"` init/shutdown/system/`run_if`/drop trampolines, `Host` API table cache, lock-free closure re-entrancy guards, and validated column/row slice constructors. |
-| `crates/bevy_abi_mod_guest` | No (`std`) | **Yes** | **Never** | `bevy_abi_mod_guest_sys`, `bevy_abi_mod_sys`, optional `bevy_abi_mod_macros` (`derive` feature). Safe ergonomic Rust guest SDK: `GuestPlugin`, `GuestApp`, `SystemBuilder` (`app.system(...)`), `SystemContext`, `ChunkIter`, `Chunk`, `ChunkSlice`, `ChunkSliceMut`, `GuestCommands`, `GuestComponent`, `export_mod!`, `raw`, and `prelude`. |
+| `crates/bevy_abi_mod_guest_sys` | No (`std`) | No (isolates all guest `unsafe`) | **Never** | Depends **only** on `bevy_abi_mod_sys`. Implements `GuestInstance`, `catch_guest_*` panic guards, `extern "C"` init/shutdown/system/`run_if`/observer/hook/drop trampolines, `Host` API table cache, lock-free closure re-entrancy guards, and validated column/row slice constructors. |
+| `crates/bevy_abi_mod_guest` | No (`std`) | **Yes** | **Never** | `bevy_abi_mod_guest_sys`, `bevy_abi_mod_sys`, optional `bevy_abi_mod_macros` (`derive` feature). Safe ergonomic Rust guest SDK: `GuestPlugin`, `GuestApp`, `SystemBuilder`, `ObserverBuilder`, `SystemContext`, `ChunkIter`, `Chunk`, `GuestCommands`, `GuestComponent`, `GuestAssetServer`, `GuestStateBridge`, `GuestScene`, `export_mod!`, `raw`, and `prelude`. |
+| `crates/cargo-bam` | No (`std`) | **Yes** | **Never** | Standalone developer CLI (`cargo bam new`, `build --sign-key`, `export-sdk`/`header`, `check-mods`, `doctor`, `keygen`, `sign`, `verify`). |
 
 ### 2.3 Repository Layout
 
@@ -100,12 +103,13 @@ bevy_abi_mod/
 │   ├── bevy_abi_mod_sys/
 │   ├── bevy_abi_mod_macros/
 │   ├── bevy_abi_mod_host_sys/
-│   ├── bevy_abi_mod_host/      # Contains consolidated `tests/{ffi,scheduling,lifecycle,e2e}` & `benches/`
+│   ├── bevy_abi_mod_host/      # Consolidated `tests/{ffi,scheduling,lifecycle,e2e}` & `benches/`
 │   ├── bevy_abi_mod/
 │   ├── bevy_abi_mod_guest_sys/
-│   └── bevy_abi_mod_guest/
+│   ├── bevy_abi_mod_guest/
+│   └── cargo-bam/              # Standalone modder CLI (`new`, `build`, `header`, `check-mods`, `doctor`, `sign`)
 ├── tests/                      # Standalone C99 ABI harness (`standalone_c_test.c`) & `.cdylib` fixtures
-└── examples/                   # Progressive host + guest examples (01..06)
+└── examples/                   # Progressive Rust, C99, C++17, & Zig examples (01..08)
 ```
 
 ---
@@ -321,8 +325,9 @@ All core engine operations reside directly in `BamHostApi` (`408` B on 64-bit / 
 - Resolves crate paths hygienically via `proc-macro-crate` (`#[mod_component(crate = ...)]` override supported) and wraps generated `extern "C"` functions inside `const _: () = { ... };`.
 - Prepends `pub header: VTableHeader` at offset `0` of `<Struct>VTable` and registers `"bam.v0.<canonical_name>.vtable"` in `ModComponent::symbols()`. When `export_symbols` is enabled, exports C symbols named `bam_<sanitized_ns>_<Struct>_<op>_<field>`.
 - **Uniform `FfiResult` Setters:** Every generated setter takes `*mut c_void` and returns `FfiResult` (`NULL_POINTER` on null pointers, `INVALID_ARGUMENT` on misaligned pointers or slice overflow, `INVALID_UTF8` without mutating existing state on invalid UTF-8 in `String` setters, and `OK` on success).
-- **Syntactic Type Classification Guards:** Explicit `#[mod_field(primitive | string | vec | nested | skip)]` overrides syntactic matching, and classified `String` / `Vec<T>` fields emit compile-time type identity assertions against `::std::string::String` / `::std::vec::Vec<T>` so shadowed user types fail compilation cleanly.
-- **Generated C99 & Zig Component Declarations:** Emits `ModComponent::C_DECL` and `ModComponent::ZIG_DECL` covering POD struct layouts (when `#[repr(C)]`), `<Struct>VTable` function-pointer tables, and `BAM_STATIC_ASSERT` offset/size checks; `cargo xtask gen-component-headers` writes `include/generated/*.h` (`--check` fails on diff).
+- **Syntactic Type Classification & Expanded Item Support:** Supports named structs, tuple structs, and C-ABI enums (`#[repr(i8..u64)]`), `Option<T>` (`FfiOption<T>`), and `FfiAssetHandle` fields. Explicit `#[mod_field(primitive | string | vec | option | nested | skip)]` overrides syntactic matching, and classified `String` / `Vec<T>` fields emit compile-time type identity assertions against `::std::string::String` / `::std::vec::Vec<T>` so shadowed user types fail compilation cleanly.
+- **Schema-Evolution Witness Slots:** Emits witness field descriptors (`field_count`, `field_info`, `export_fields`, `import_field`) on `<Struct>VTable`, enabling field-by-field hot-reload schema migration (`reload_mod`) and dynamic `bevy_reflect` (`DynamicStruct`) synthesis without shared Rust layouts.
+- **Generated C99 & Zig Component Declarations:** Emits `ModComponent::C_DECL` and `ModComponent::ZIG_DECL` covering POD struct/enum layouts, `<Struct>VTable` function-pointer tables, and `BAM_STATIC_ASSERT` offset/size checks; `cargo xtask gen-component-headers` writes `include/generated/*.h` (`--check` fails on diff).
 
 ---
 
@@ -356,38 +361,47 @@ All core engine operations reside directly in `BamHostApi` (`408` B on 64-bit / 
 4. **Fault Quarantine, Tracing Spans & Optional Diagnostics:**
    - Lifecycle and fault notifications emit once through Bevy `Messages<ModLoaded>`, `Messages<ModUnloaded>`, and `Messages<ModSystemFaulted>` (with `tracing::warn!` / `tracing::error!` diagnostics). `ModQuarantine::reenable(mod_id, system_name)` allows hosts to re-enable quarantined systems, and `LoadedModInfo` tracks per-mod fault counters.
    - Every `GuestSystem` execution opens `tracing::debug_span!("bam_guest_system", mod_name, system, chunks, entities, commands)` recording exact chunk, entity, and command counts. Enabling Cargo feature `diagnostics` on `bevy_abi_mod_host` / `bevy_abi_mod` publishes aggregate and per-mod `bevy_diagnostic` metrics (`cpu_time_us`, `fault_count`, `commands_queued`).
-5. **Lock-Free `ArcSwapOption` Drop Trampolines & Two-Condition Reclamation:**
-   - Dynamic components carrying a foreign `ComponentDropFn` bind to a 1,024-slot monomorphized trampoline table (`DROP_SLOTS: [ArcSwapOption<DropSlotSnapshot>; 1024]`, returning `FfiResult::CAPACITY_EXCEEDED` on exhaustion).
+5. **Dynamically Paged `DROP_SLAB`, Generation-Tracked Recycling & Two-Condition Reclamation:**
+   - Dynamic components carrying a foreign `ComponentDropFn` bind to a dynamically paged, unbounded trampoline slab (`DROP_SLAB`, initialized with 1,024 pre-monomorphized trampolines and expanding on demand) with generation-tracked slot recycling and `DynamicComponentHookMap` dispatch for all five Bevy `0.20` lifecycle hooks (`on_add`, `on_insert`, `on_discard`, `on_remove`, `on_despawn`), custom `clone_fn` (`EntityCloner`), transitive `required_components`, and dynamic relationships (`__bam_rel_bind::`).
    - Failed `bevy_abi_mod_init` executions roll back atomically via `LoadTransaction::drop` before `Library` unmaps.
-   - Dropping a `World` disarms its slots (`WorldDropGuard::drop`), transitions each slot to `SLOT_CLOSING`, and returns the slot to the global free list **only** once both `state == SLOT_CLOSING` and `live_values == 0` (`SeqCst`-fenced), safely handling Bevy `Storages` drop ordering without cross-`World` slot-reuse races or retired-snapshot memory leaks.
-6. **Deterministic Unload Sequence (`world.unload_mod(id)`):**
+   - Dropping a `World` disarms its slots (`WorldDropGuard::drop`), transitions each slot to `SLOT_CLOSING`, and returns the slot to the free list **only** once both `state == SLOT_CLOSING` and `live_values == 0` (`SeqCst`-fenced), safely handling Bevy `Storages` drop ordering without cross-`World` slot-reuse races or retired-snapshot memory leaks.
+6. **Deterministic Unload, `ModScoped` Cleanup, `mod.toml` DAG, & Witness Hot-Reload (`world.unload_mod(id)` / `world.reload_mod(id)`):**
    1. Excises `ModSystemSet(id)` and all owned `ModNamedSystemSet`s from Bevy `Schedules` (`ScheduleCleanupPolicy::RemoveSetAndSystems`).
-   2. Disarms `is_active` (`Ordering::Release`) and prunes `id` from `DROP_SLOTS` while keeping `ComponentId` column storage intact for hot-reload rebinding.
+   2. Despawns `ModScoped(id)` entities (spawned via `cmd_spawn` / `cmd_spawn_empty` / `cmd_spawn_batch` / `cmd_spawn_scene`, preserving `cmd_spawn_persistent` entities), removes mod-owned dynamic resources, releases mod-pinned asset/scene/shader/material handles, and disarms `is_active` (`Ordering::Release`) on `DROP_SLAB`, `DynamicComponentHookMap`, and runtime/static observers.
    3. Updates `ModRegistry` CoW snapshot to null `vtable_ptr` on dynamic components owned by `id` and purge `"bam.v0.*"` symbols owned by `id`.
    4. Invokes `bevy_abi_mod_shutdown(instance)` while `.text`/`.rodata` remain mapped.
-   5. Drops `LoadedLibrary` (`dlclose` / `FreeLibrary` under per-image mutex, followed by shadow-file unlink) and emits `ModUnloaded`.
+   5. Drops `LoadedLibrary` (`dlclose` / `FreeLibrary` under per-image mutex, after ELF/Mach-O TLS/`DF_1_NODELETE` residency preflight and Windows `.pdb` RSDS sidecar cleanup) and emits `ModUnloaded`.
+   6. On `world.reload_mod(id)` (or debounced `ModHotReloadPlugin` under `hot-reload-watcher`), witness-exported component/resource fields and `PersistentMessageCursors` / `RemovedComponents` cursors migrate across compatible schema revisions; `world.load_mod_dir(...)` resolves `mod.toml` SemVer dependency DAGs in topological order and blocks unloading mods depended upon by active dependents.
+
+### 6.5 Optional Bevy `0.20` Subsystem Bridges & Multi-World Extraction (`bevy_abi_mod_host`)
+- **`bridge-std-types` (`StdTypesBridgePlugin`):** Zero-copy / VTable host bridges for `Transform`, `GlobalTransform`, `Visibility`, `Name`, `Time<Real|Virtual|Fixed>`, `ButtonInput<KeyCode>`, and `ButtonInput<MouseButton>`.
+- **`bridge-asset` (`ModAssetPlugin`):** Sandboxed `mod://<namespace>/...` Bevy `AssetSource` rejecting path traversal and symlink escapes, paired with refcounted `FfiAssetHandle` (`Option<AssetId>`) load/state/release FFI and automatic owner release on unload.
+- **`bridge-state` (`ModStateExt`):** Exposes Bevy `States` enums (`ComputedStates` / `SubStates`-compatible) with `OnEnter`/`OnExit`/`OnTransition` schedules, `in_state` run conditions, and `NextState::Pending` mutation.
+- **`bridge-reflect` (`ModReflectPlugin`):** Synthesizes `bevy_reflect::DynamicStruct` representations from `ModComponent` witness schemas, handles fallible `PartialReflect::to_dynamic`, registers 6 `bevy_abi_mod/*` Bevy Remote Protocol (`bevy_remote` BRP) JSON-RPC methods, and synchronizes `bevy_settings` TOML files.
+- **`bridge-bsn` (`ModBsnPlugin`):** Exposes Bevy `0.20` `bsn!` scenes and `ScenePatch` assets via `cmd_spawn_scene` (`ModScoped` cleanup + `ChildOf` hierarchy attachment) and bridges `bevy_scene::Ready` (`BamEventKind::READY`) observers and propagating triggers.
+- **`sub-app-extract` (`ModSubAppPlugin<L>`, `ModWeslMaterialPlugin`):** Extracts host and dynamic guest `BamComponent` components and singleton resources into arbitrary Bevy `SubApp` worlds (`RenderApp`, custom `AppLabel`s) via `bevy_extract`, and provides data-driven `.wesl` (`Source::Wesl` / `ValidateShader::Enabled`), 4-byte-padded `AlignedVec` `ShaderBuffer`, `SpriteMeshMaterial`, `ExtendedMaterial2d`, and `StandardMaterial` registration with automatic unload cleanup.
 
 ---
 
 ## 7. Safe Rust Guest SDK (`bevy_abi_mod_guest` & `bevy_abi_mod_guest_sys`)
 
-- **Zero `unsafe` in Public Guest Crate:** `bevy_abi_mod_guest` enforces `#![forbid(unsafe_code)]`. Raw pointer constructors live strictly as `unsafe fn`s inside `bevy_abi_mod_guest_sys`; `ChunkIter` tracks `current_len` internally (never accepting caller-supplied slice counts); and all typed slices, sparse row iterators, resource getters, and raw insertions require `T: AbiPod`.
-- **Single `Host` Table & `BamInstance` State:** `bevy_abi_mod_guest_sys` copies and validates `BamHostApi` once per `GuestInstance` (`bevy_abi_mod_guest::raw` re-exports `bevy_abi_mod_sys`) with zero process-global `GUEST_ALLOCATIONS` state. `GuestPlugin` and `export_mod!` emit `bevy_abi_mod_manifest`, `bevy_abi_mod_init`, and `bevy_abi_mod_shutdown`.
-- **Unified `SystemBuilder` & Typed Tuple Queries:** `app.system(c"name")` configures `.query(|q| ...)`, `.query_typed::<Q>()` (sealed over tuples up to arity 8 of `&T`, `&mut T`, `Option<&T>`, `Option<&mut T>`, `With<T>`, `Without<T>`, `Changed<T>`, `Added<T>`, and `FfiEntity` without magic column indices), `.resource_read::<R>()` / `.resource_write::<R>()`, `.message_read::<M>()` / `.message_write::<M>()`, `.schedule(...)`, `.after(...)` / `.before(...)`, `.main_thread()`, and `.run_if(...)`. `SystemContext` provides `single_query::<Q>()`, `query_typed::<Q>(idx)`, `par_chunks(|chunk| ...)`, `get::<T>` / `get_mut::<T>`, and `read_messages::<M>` / `send_message::<M>`, while `GuestPlugin::save_state` / `restore_state` and `GuestApp::register_component_with_hooks` expose state persistence and hooks safely under `#![forbid(unsafe_code)]`.
-- **Runtime UUID Introspection & Sparse/Untracked Views:** `Chunk` validates `BamColumnInfo` (`uuid`, `size`, `align`, `mode`) before materializing typed slices (returning `None` on component type confusion), exposes `Chunk::rows::<T>` / `rows_mut::<T>` for sparse-set columns, exposes untracked mutable slices + `mark_changed_range`, and restricts `GuestApp::register_component::<T: GuestComponent>()` to `AbiPod` types (with raw `register_dynamic_component_with_drop` available in `bevy_abi_mod_guest_sys` for custom destructors).
+- **Zero `unsafe` in Public Guest Crate:** `bevy_abi_mod_guest` enforces `#![forbid(unsafe_code)]` with zero `bevy*` dependencies. Raw pointer constructors live strictly as `unsafe fn`s inside `bevy_abi_mod_guest_sys`; `ChunkIter` tracks `current_len` internally; and all typed slices, sparse row iterators, resource getters, and raw insertions require `T: AbiPod`.
+- **Single `Host` Table & `BamInstance` State:** `bevy_abi_mod_guest_sys` copies and validates `BamHostApi` once per `GuestInstance` (`bevy_abi_mod_guest::raw` re-exports `bevy_abi_mod_sys`) with zero process-global mutable state. `GuestPlugin` and `export_mod!` emit `bevy_abi_mod_manifest`, `bevy_abi_mod_init`, and `bevy_abi_mod_shutdown`.
+- **Unified `SystemBuilder`, `ObserverBuilder`, & Subsystem Bridges:** `app.system(c"name")` configures `.query(|q| ...)`, `.query_typed::<Q>()` (including `Allow<T>`, `Has<T>`, and `Or2`/`Or3` disjunctive filters), `.removed::<T>()`, `.resource_read::<R>()` / `.resource_write::<R>()`, `.message_read::<M>()` / `.message_write::<M>()` (POD and VTable non-POD messages), `.schedule(...)`, `.after(...)` / `.before(...)`, `.after_weak(...)` / `.before_weak(...)`, `.ambiguous_with(...)` / `.ambiguous_with_all()`, `.main_thread()`, and `.run_if(...)`. `GuestApp` and `GuestCommands` expose `ObserverBuilder` (`ADD`/`INSERT`/`DISCARD`/`REMOVE`/`DESPAWN`/`READY`, mutable/stoppable propagation), SoA `spawn_batch`, `spawn_persistent`, `despawn_all`, `insert_if_new`, zero-copy `entity_children`, `GuestAssetServer`, `GuestStateBridge`, and `GuestScene` (`spawn_scene`).
+- **Runtime UUID Introspection & Sparse/Untracked Views:** `Chunk` validates `BamColumnInfo` (`uuid`, `size`, `align`, `mode`) before materializing typed slices (returning `None` on component type confusion), exposes `Chunk::rows::<T>` / `rows_mut::<T>` for sparse-set columns, exposes untracked mutable slices + `mark_changed_range`, and supports full 5-hook + `clone_fn` + `required_components` registration via `GuestComponentOptions`.
 
 ---
 
 ## 8. Verification & Quality Gates
 
 1. **Dependency & Safety Gates:**
-   - `cargo tree -p bevy_abi_mod_sys -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest -p bevy_abi_mod_macros | grep -v bevy_abi_mod | grep -i bevy` prints nothing.
+   - `cargo tree -p bevy_abi_mod_sys -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest -p bevy_abi_mod_macros -p cargo-bam | grep -v bevy_abi_mod | grep -i bevy` prints nothing.
    - `cargo check -p bevy_abi_mod_sys --target thumbv7em-none-eabihf` and 32-bit target checks verify `#![no_std]` purity and 32-bit layout assertions.
-   - `#![forbid(unsafe_code)]` enforced at line 1 of `bevy_abi_mod`, `bevy_abi_mod_host`, `bevy_abi_mod_guest`, and `xtask`.
-2. **Single-Source C99 Header Parity:**
-   - `cargo xtask header --test-c99 && git diff --exit-code include/bevy_abi_mod.h` compiles `tests/standalone_c_test.c` under `-std=c99 -Wall -Wextra -Wpedantic -Werror`.
-3. **Miri, `loom`, `trybuild` & Hermetic Integration Suites:**
-   - `MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test -p bevy_abi_mod_sys -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest` validates pointer provenance, padding-byte safety, and slice aliasing rules.
-   - `loom` concurrency model checks verify `DROP_SLOTS` `ArcSwapOption` publication and `WorldDropGuard` two-condition reclamation.
+   - `#![forbid(unsafe_code)]` enforced at line 1 of `bevy_abi_mod`, `bevy_abi_mod_host`, `bevy_abi_mod_guest`, `bevy_abi_mod_macros`, `cargo-bam`, and `xtask`.
+2. **Single-Source C99, C++17, & Zig SDK Parity:**
+   - `cargo xtask header --check --test-c99` and `cargo xtask gen-component-headers --check` compile `tests/standalone_c_test.c` under `-std=c99 -Wall -Wextra -Wpedantic -Werror`, alongside `examples/07_cpp17_guest` (`-std=c++17 -Wall -Wextra -Wpedantic -Werror`) and `examples/08_zig_guest`.
+3. **Miri, `loom`, `trybuild`, `cargo-bam`, & Hermetic Integration Suites:**
+   - `MIRIFLAGS="-Zmiri-tree-borrows" cargo xtask miri --all` validates pointer provenance, padding-byte safety, witness field migration, and slice aliasing across `bevy_abi_mod_sys`, `bevy_abi_mod_guest_sys`, `bevy_abi_mod_guest`, and `bevy_abi_mod_host_sys`.
+   - `cargo test -p bevy_abi_mod_host_sys --test loom_drop_trampoline --release` verifies `DROP_SLAB` `ArcSwapOption` publication and `WorldDropGuard` two-condition reclamation.
    - `trybuild` UI snapshots and `compile_fail` doctests verify rejection of non-`AbiPod` types (`bool`, `u128`, `usize`, enums) and spoofed field types.
-   - `fuzz_sshsig_and_krl`, property tests (`proptest`), OS/shadow-staging tests (`signature_loader_security_tests`), bidirectional OpenSSH `ssh-keygen -Y`/`-k`/`-Q` interoperability tests, and hermetic host integration suites (`ffi`, `scheduling`, `lifecycle`, `e2e`) staged via `cargo xtask fixtures` verify multi-World isolation, `panic = "unwind"` quarantine vs `panic = "abort"` subprocess termination, zero steady-state command arena allocations, and native-vs-guest differential Bevy ECS parity.
+   - `cargo test -p cargo-bam`, `fuzz_sshsig_and_krl`, property tests (`proptest`), OS/shadow-staging tests (`signature_loader_security_tests`), and hermetic host integration suites (`ffi`, `scheduling`, `lifecycle`, `e2e`) staged via `cargo xtask fixtures --all` verify multi-World isolation, `panic = "unwind"` quarantine vs `panic = "abort"` subprocess termination, zero steady-state command arena allocations, all Bevy `0.20` bridges, and native-vs-guest differential Bevy ECS parity.

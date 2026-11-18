@@ -722,11 +722,15 @@ impl HostAssetBackend for BevyHostAssetBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "bridge-reflect")]
     use crate::AbiModPlugin;
+    #[cfg(feature = "bridge-reflect")]
     use bevy_app::TaskPoolPlugin;
+    #[cfg(feature = "bridge-reflect")]
     use bevy_asset::AssetPlugin;
     use core::sync::atomic::{AtomicUsize, Ordering};
     use std::fs;
+    #[cfg(feature = "bridge-reflect")]
     use std::time::Duration;
 
     static TEMP_DIR_SEQ: AtomicUsize = AtomicUsize::new(0);

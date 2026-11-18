@@ -109,6 +109,19 @@ pub use bevy_abi_mod_host_sys::{
     feature = "bridge-state"
 ))]
 pub use bridges::ModBridgesPlugin;
+#[cfg(feature = "bridge-reflect")]
+pub use bridges::{
+    BRP_METHOD_GET_COMPONENTS, BRP_METHOD_GET_RESOURCES, BRP_METHOD_INSERT_COMPONENTS,
+    BRP_METHOD_LIST_COMPONENTS, BRP_METHOD_MUTATE_COMPONENTS, BRP_METHOD_MUTATE_RESOURCES,
+    ModReflectAppExt, ModReflectError, ModReflectPlugin, ModReflectRegistry, ModReflectRemoteExt,
+    ModReflectWorldExt, ModSettingsError, ModSettingsRegistry, TypedReflectBridgeEntry,
+    WitnessReflectSchema, handle_mod_brp_request, install_mod_brp_methods,
+};
+#[cfg(feature = "bridge-bsn")]
+pub use bridges::{
+    CANONICAL_READY_NAME, HostSceneRegistry, ModBsnAppExt, ModBsnPlugin, ModBsnWorldExt,
+    SCENE_PATCH_ALIAS,
+};
 #[cfg(feature = "bridge-std-types")]
 pub use bridges::{
     FfiGlobalTransform, FfiKeyCode, FfiKeyboardInput, FfiMouseButton, FfiMouseInput, FfiTimeFixed,
@@ -132,6 +145,21 @@ pub use schedule_sets::{
     ModNamedSystemSet, ModScheduleMap, ModSystemSet, ModVisibleSets, StartupCompleted,
     configure_guest_system_in_world, configure_weak_set_chain,
 };
+#[cfg(feature = "sub-app-extract")]
+pub use sub_app_materials::{
+    ModMaterialError, ModShaderBufferInit, ModShaderBufferSpec, ModSpriteMaterialEntry,
+    ModSpriteMaterialSpec, ModStandardMaterialEntry, ModStandardMaterialSpec, ModSubAppConfig,
+    ModSubAppExt, ModSubAppPlugin, ModSubAppSchedule, ModSubAppSystems, ModSubWorldExt,
+    ModWeslMaterialPlugin, ModWeslMaterialRegistry, WeslShaderAssetSpec, WeslShaderSource,
+    cleanup_mod_wesl_materials_in_world, register_mod_custom_asset_in_world,
+    register_mod_shader_buffer_in_world, register_mod_sprite_material_in_world,
+    register_mod_standard_material_in_world, register_mod_wesl_shader_in_world,
+    update_mod_shader_buffer_in_world,
+};
+#[cfg(all(feature = "sub-app-extract", feature = "bridge-reflect"))]
+pub use sub_app_materials::{
+    ModMaterialParams, ModSpriteExtension2d, register_mod_extended_sprite_material_in_world,
+};
 #[cfg(feature = "hot-reload-watcher")]
 pub use watcher::{
     ModHotReloadAction, ModHotReloadHistory, ModHotReloadOutcome, ModHotReloadPlugin,
@@ -154,10 +182,17 @@ pub mod prelude {
         FfiTimeFixed, FfiTimeReal, FfiTimeVirtual, FfiTransform, FfiVisibility,
         StdTypesBridgePlugin,
     };
+    #[cfg(feature = "bridge-bsn")]
+    pub use crate::bridges::{HostSceneRegistry, ModBsnAppExt, ModBsnPlugin, ModBsnWorldExt};
     #[cfg(feature = "bridge-asset")]
     pub use crate::bridges::{ModAssetAppExt, ModAssetPlugin, ModAssetRegistry, ModAssetWorldExt};
     #[cfg(feature = "bridge-state")]
     pub use crate::bridges::{ModNextState, ModStateError, ModStateExt, ModStateSpec};
+    #[cfg(feature = "bridge-reflect")]
+    pub use crate::bridges::{
+        ModReflectAppExt, ModReflectError, ModReflectPlugin, ModReflectRegistry,
+        ModReflectRemoteExt, ModReflectWorldExt, ModSettingsError, ModSettingsRegistry,
+    };
     pub use crate::commands_ext::ModCommandsExt;
     #[cfg(feature = "signature-verification")]
     pub use crate::events::VerifiedModSignature;
@@ -172,6 +207,15 @@ pub mod prelude {
         ModNamedSystemSet, ModScheduleMap, ModSystemSet, ModVisibleSets, StartupCompleted,
         configure_guest_system_in_world, configure_weak_set_chain,
     };
+    #[cfg(feature = "sub-app-extract")]
+    pub use crate::sub_app_materials::{
+        ModMaterialError, ModShaderBufferInit, ModShaderBufferSpec, ModSpriteMaterialSpec,
+        ModStandardMaterialSpec, ModSubAppConfig, ModSubAppExt, ModSubAppPlugin, ModSubAppSchedule,
+        ModSubAppSystems, ModSubWorldExt, ModWeslMaterialPlugin, ModWeslMaterialRegistry,
+        WeslShaderAssetSpec, WeslShaderSource,
+    };
+    #[cfg(all(feature = "sub-app-extract", feature = "bridge-reflect"))]
+    pub use crate::sub_app_materials::{ModMaterialParams, ModSpriteExtension2d};
     #[cfg(feature = "hot-reload-watcher")]
     pub use crate::watcher::{
         ModHotReloadAction, ModHotReloadHistory, ModHotReloadOutcome, ModHotReloadPlugin,

@@ -23,16 +23,20 @@ pub use crate::bridges::{
 };
 pub use crate::{
     app::{
-        GuestApp, GuestComponentOptions, GuestRes, GuestResMut, MultiQueryContext, QueryBuilder,
-        RunConditionContext, SystemBuilder, SystemContext,
+        GuestApp, GuestComponentOptions, GuestRes, GuestResMut, MultiQueryContext, ObserverBuilder,
+        QueryBuilder, RunConditionContext, SystemBuilder, SystemContext,
     },
     bridges::{
+        BRP_METHOD_GET_COMPONENTS, BRP_METHOD_GET_RESOURCES, BRP_METHOD_INSERT_COMPONENTS,
+        BRP_METHOD_LIST_COMPONENTS, BRP_METHOD_MUTATE_COMPONENTS, BRP_METHOD_MUTATE_RESOURCES,
         FfiGlobalTransform, FfiKeyCode, FfiKeyboardInput, FfiMouseButton, FfiMouseInput,
         FfiTimeFixed, FfiTimeReal, FfiTimeVirtual, FfiTransform, FfiVisibility, GuestAssetHandle,
-        GuestAssetHostExt, GuestAssetServer, GuestBridgesHostExt, GuestCommandsStateExt,
-        GuestNameBridge, GuestStateBridge, GuestStateHandles, GuestStateQueryBuilderExt,
-        GuestStateSystemBuilderExt, GuestStdCommandsExt, GuestStdHandles, GuestStdQueryBuilderExt,
-        TypedAssetHandle, on_enter_schedule, on_exit_schedule, on_transition_schedule,
+        GuestAssetHostExt, GuestAssetServer, GuestBridgesHostExt, GuestCommandsBsnExt,
+        GuestCommandsStateExt, GuestNameBridge, GuestScene, GuestStateBridge, GuestStateHandles,
+        GuestStateQueryBuilderExt, GuestStateSystemBuilderExt, GuestStdCommandsExt,
+        GuestStdHandles, GuestStdQueryBuilderExt, TypedAssetHandle, on_enter_schedule,
+        on_exit_schedule, on_transition_schedule, resolve_reflected_handle,
+        resolve_scene_patch_type, resolve_settings_handle,
     },
     commands::GuestCommands,
     component::{GuestComponent, GuestComponentHooks, guest_component_uuid},
