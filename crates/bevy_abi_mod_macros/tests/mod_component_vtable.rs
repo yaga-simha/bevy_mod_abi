@@ -1239,3 +1239,438 @@ fn repr_c_fieldless_and_tagged_enums_vtable_and_schema_uuid() {
     assert!(ActionPayload::ZIG_DECL.contains("pub const ActionPayloadTag = enum(u8)"));
     assert!(ActionPayload::ZIG_DECL.contains("pub const ActionPayloadView = struct"));
 }
+
+type FieldInfoFn = unsafe extern "C" fn(usize, *mut StrView, *mut StrView, *mut usize) -> FfiBool;
+type ExportSinkFn = unsafe extern "C" fn(*mut c_void, StrView, StrView, FfiSlice<u8>) -> FfiResult;
+type ExportFieldsFn =
+    unsafe extern "C" fn(*const c_void, Option<ExportSinkFn>, *mut c_void) -> FfiResult;
+type ImportFieldFn = unsafe extern "C" fn(*mut c_void, StrView, StrView, FfiSlice<u8>) -> FfiResult;
+
+#[derive(Debug, Clone, Default, PartialEq, ModComponent)]
+#[mod_component(name = "mig::RecordV1")]
+pub struct RecordV1 {
+    pub hp: i32,
+    pub name: String,
+    pub items: Vec<u32>,
+    pub flag: bool,
+    pub opt: FfiOption<u32>,
+    pub removed: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, ModComponent)]
+#[mod_component(name = "mig::RecordV2")]
+pub struct RecordV2 {
+    pub added: f32,
+    pub opt: FfiOption<u32>,
+    pub items: Vec<u32>,
+    pub name: String,
+    pub hp: i64,
+    pub flag: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, ModComponent)]
+#[mod_component(name = "mig::WidenSrc")]
+pub struct WidenSrc {
+    pub s8: i8,
+    pub u16v: u16,
+    pub f32v: f32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, ModComponent)]
+#[mod_component(name = "mig::WidenDst")]
+pub struct WidenDst {
+    pub s8: i32,
+    pub u16v: u64,
+    pub f32v: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, ModComponent)]
+#[mod_component(name = "mig::NestedHolder")]
+pub struct NestedHolder {
+    pub origin: PodPosition,
+    pub label: String,
+}
+
+#[test]
+fn witness_field_info_export_and_import_migration_is_miri_clean() {
+    // 1. Opaque components omit witness symbols
+    assert!(
+        OpaqueNamedHolder::resolve_symbol(
+            "bam.v0.mod_component_vtable::OpaqueNamedHolder.field_info"
+        )
+        .is_none()
+    );
+
+    // 2. Verify `field_info` for RecordV1 and RecordV2
+    let info_v1: FieldInfoFn = unsafe {
+        core::mem::transmute(
+            RecordV1::resolve_symbol("bam.v0.mig::RecordV1.field_info").expect("v1 field_info"),
+        )
+    };
+    let mut name_sv = StrView::empty();
+    let mut tag_sv = StrView::empty();
+    let mut off = 0usize;
+    let mut v1_fields = Vec::new();
+    let mut idx = 0usize;
+    while unsafe { info_v1(idx, &raw mut name_sv, &raw mut tag_sv, &raw mut off) }.get() {
+        v1_fields.push((
+            unsafe { name_sv.try_as_str() }.unwrap().to_owned(),
+            unsafe { tag_sv.try_as_str() }.unwrap().to_owned(),
+            off,
+        ));
+        idx += 1;
+    }
+    assert_eq!(
+        v1_fields,
+        vec![
+            (
+                "hp".to_owned(),
+                "i32".to_owned(),
+                core::mem::offset_of!(RecordV1, hp)
+            ),
+            (
+                "name".to_owned(),
+                "String".to_owned(),
+                core::mem::offset_of!(RecordV1, name)
+            ),
+            (
+                "items".to_owned(),
+                "Vec<u32>".to_owned(),
+                core::mem::offset_of!(RecordV1, items)
+            ),
+            (
+                "flag".to_owned(),
+                "bool".to_owned(),
+                core::mem::offset_of!(RecordV1, flag)
+            ),
+            (
+                "opt".to_owned(),
+                "FfiOption<u32>".to_owned(),
+                core::mem::offset_of!(RecordV1, opt)
+            ),
+            (
+                "removed".to_owned(),
+                "u64".to_owned(),
+                core::mem::offset_of!(RecordV1, removed)
+            ),
+        ]
+    );
+    assert_eq!(
+        unsafe { info_v1(0, core::ptr::null_mut(), &raw mut tag_sv, &raw mut off) },
+        FfiBool::FALSE
+    );
+
+    // 3. Export from RecordV1 -> Import into RecordV2 (reordered + added + removed + widened i32->i64 + heap fields + FfiOption)
+    let export_v1: ExportFieldsFn = unsafe {
+        core::mem::transmute(
+            RecordV1::resolve_symbol("bam.v0.mig::RecordV1.export_fields")
+                .expect("v1 export_fields"),
+        )
+    };
+    let import_v2: ImportFieldFn = unsafe {
+        core::mem::transmute(
+            RecordV2::resolve_symbol("bam.v0.mig::RecordV2.import_field").expect("v2 import_field"),
+        )
+    };
+
+    unsafe extern "C" fn collect_sink(
+        ctx: *mut c_void,
+        field_name: StrView,
+        type_tag: StrView,
+        payload: FfiSlice<u8>,
+    ) -> FfiResult {
+        let out = unsafe { &mut *ctx.cast::<Vec<(String, String, Vec<u8>)>>() };
+        let bytes = if payload.len == 0 {
+            Vec::new()
+        } else {
+            unsafe { payload.as_slice() }.to_vec()
+        };
+        out.push((
+            unsafe { field_name.try_as_str() }.unwrap().to_owned(),
+            unsafe { type_tag.try_as_str() }.unwrap().to_owned(),
+            bytes,
+        ));
+        FfiResult::OK
+    }
+
+    let src_some = RecordV1 {
+        hp: -42,
+        name: String::from("hero_unit"),
+        items: vec![10, 20, 30, 40],
+        flag: true,
+        opt: FfiOption::some(777),
+        removed: 0xDEAD_BEEF,
+    };
+    let mut captured: Vec<(String, String, Vec<u8>)> = Vec::new();
+    assert_eq!(
+        unsafe {
+            export_v1(
+                (&raw const src_some).cast::<c_void>(),
+                Some(collect_sink),
+                (&raw mut captured).cast::<c_void>(),
+            )
+        },
+        FfiResult::OK
+    );
+
+    let mut dst = RecordV2 {
+        added: 9.5,
+        ..Default::default()
+    };
+    for (f_name, t_tag, bytes) in &captured {
+        let rc = unsafe {
+            import_v2(
+                (&raw mut dst).cast::<c_void>(),
+                StrView::from_str(f_name),
+                StrView::from_str(t_tag),
+                FfiSlice::from_slice(bytes),
+            )
+        };
+        if f_name == "removed" {
+            assert_eq!(rc, FfiResult::NOT_FOUND);
+        } else {
+            assert_eq!(rc, FfiResult::OK, "import failed for {f_name} ({t_tag})");
+        }
+    }
+    assert_eq!(
+        dst,
+        RecordV2 {
+            added: 9.5,
+            opt: FfiOption::some(777),
+            items: vec![10, 20, 30, 40],
+            name: String::from("hero_unit"),
+            hp: -42i64,
+            flag: true,
+        }
+    );
+
+    // Verify FfiOption::none() roundtrips cleanly without reading uninit padding
+    let src_none = RecordV1 {
+        hp: 7,
+        name: String::from("none_opt"),
+        items: Vec::new(),
+        flag: false,
+        opt: FfiOption::none(),
+        removed: 1,
+    };
+    captured.clear();
+    assert_eq!(
+        unsafe {
+            export_v1(
+                (&raw const src_none).cast::<c_void>(),
+                Some(collect_sink),
+                (&raw mut captured).cast::<c_void>(),
+            )
+        },
+        FfiResult::OK
+    );
+    let mut dst_none = RecordV2 {
+        opt: FfiOption::some(123),
+        ..Default::default()
+    };
+    for (f_name, t_tag, bytes) in &captured {
+        let _ = unsafe {
+            import_v2(
+                (&raw mut dst_none).cast::<c_void>(),
+                StrView::from_str(f_name),
+                StrView::from_str(t_tag),
+                FfiSlice::from_slice(bytes),
+            )
+        };
+    }
+    assert!(dst_none.opt.is_none());
+    assert!(dst_none.items.is_empty());
+    assert_eq!(dst_none.hp, 7i64);
+
+    // Incompatible type_tag leaves destination field untouched and returns NOT_FOUND
+    assert_eq!(
+        unsafe {
+            import_v2(
+                (&raw mut dst_none).cast::<c_void>(),
+                StrView::from_str("hp"),
+                StrView::from_str("String"),
+                FfiSlice::from_slice(b"not_an_int"),
+            )
+        },
+        FfiResult::NOT_FOUND
+    );
+    assert_eq!(dst_none.hp, 7i64);
+    assert_eq!(
+        unsafe {
+            import_v2(
+                (&raw mut dst_none).cast::<c_void>(),
+                StrView::from_str("name"),
+                StrView::from_str("String"),
+                FfiSlice::from_slice(&[0xFF, 0xFE]),
+            )
+        },
+        FfiResult::INVALID_UTF8
+    );
+    assert_eq!(dst_none.name, "none_opt");
+
+    // 4. Additional widening checks: i8->i32, u16->u64, f32->f64
+    let export_widen: ExportFieldsFn = unsafe {
+        core::mem::transmute(
+            WidenSrc::resolve_symbol("bam.v0.mig::WidenSrc.export_fields").unwrap(),
+        )
+    };
+    let import_widen: ImportFieldFn = unsafe {
+        core::mem::transmute(WidenDst::resolve_symbol("bam.v0.mig::WidenDst.import_field").unwrap())
+    };
+    let widen_src = WidenSrc {
+        s8: -19,
+        u16v: 60_000,
+        f32v: 3.25,
+    };
+    captured.clear();
+    assert_eq!(
+        unsafe {
+            export_widen(
+                (&raw const widen_src).cast::<c_void>(),
+                Some(collect_sink),
+                (&raw mut captured).cast::<c_void>(),
+            )
+        },
+        FfiResult::OK
+    );
+    let mut widen_dst = WidenDst::default();
+    for (f_name, t_tag, bytes) in &captured {
+        assert_eq!(
+            unsafe {
+                import_widen(
+                    (&raw mut widen_dst).cast::<c_void>(),
+                    StrView::from_str(f_name),
+                    StrView::from_str(t_tag),
+                    FfiSlice::from_slice(bytes),
+                )
+            },
+            FfiResult::OK
+        );
+    }
+    assert_eq!(
+        widen_dst,
+        WidenDst {
+            s8: -19i32,
+            u16v: 60_000u64,
+            f32v: 3.25f64,
+        }
+    );
+
+    // 5. Nested ModComponent struct recursive export ("origin.x") & import
+    let export_nested: ExportFieldsFn = unsafe {
+        core::mem::transmute(
+            NestedHolder::resolve_symbol("bam.v0.mig::NestedHolder.export_fields").unwrap(),
+        )
+    };
+    let import_nested: ImportFieldFn = unsafe {
+        core::mem::transmute(
+            NestedHolder::resolve_symbol("bam.v0.mig::NestedHolder.import_field").unwrap(),
+        )
+    };
+    let nh_src = NestedHolder {
+        origin: PodPosition {
+            x: 1.5,
+            y: -2.5,
+            z: 8.0,
+        },
+        label: String::from("nested"),
+    };
+    captured.clear();
+    assert_eq!(
+        unsafe {
+            export_nested(
+                (&raw const nh_src).cast::<c_void>(),
+                Some(collect_sink),
+                (&raw mut captured).cast::<c_void>(),
+            )
+        },
+        FfiResult::OK
+    );
+    assert!(captured.iter().any(|(n, _, _)| n == "origin.x"));
+    let mut nh_dst = NestedHolder {
+        origin: PodPosition {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        },
+        label: String::new(),
+    };
+    for (f_name, t_tag, bytes) in &captured {
+        assert_eq!(
+            unsafe {
+                import_nested(
+                    (&raw mut nh_dst).cast::<c_void>(),
+                    StrView::from_str(f_name),
+                    StrView::from_str(t_tag),
+                    FfiSlice::from_slice(bytes),
+                )
+            },
+            FfiResult::OK
+        );
+    }
+    assert_eq!(nh_dst, nh_src);
+
+    // 6. Tagged enum export ("__variant", "Move::speed", "Cast::0") & import
+    let export_enum: ExportFieldsFn = unsafe {
+        core::mem::transmute(
+            ActionPayload::resolve_symbol("bam.v0.combat::ActionPayload.export_fields").unwrap(),
+        )
+    };
+    let import_enum: ImportFieldFn = unsafe {
+        core::mem::transmute(
+            ActionPayload::resolve_symbol("bam.v0.combat::ActionPayload.import_field").unwrap(),
+        )
+    };
+    let enum_src = ActionPayload::Cast(
+        String::from("ice"),
+        vec![5, 6, 7],
+        FfiOption::some(12),
+        PodPosition {
+            x: 3.0,
+            y: 4.0,
+            z: 5.0,
+        },
+    );
+    captured.clear();
+    assert_eq!(
+        unsafe {
+            export_enum(
+                (&raw const enum_src).cast::<c_void>(),
+                Some(collect_sink),
+                (&raw mut captured).cast::<c_void>(),
+            )
+        },
+        FfiResult::OK
+    );
+    assert_eq!(captured[0].0, "__variant");
+    assert_eq!(captured[0].1, "enum_variant");
+    assert_eq!(captured[0].2, b"Cast");
+
+    let mut enum_dst = ActionPayload::Idle;
+    for (f_name, t_tag, bytes) in &captured {
+        assert_eq!(
+            unsafe {
+                import_enum(
+                    (&raw mut enum_dst).cast::<c_void>(),
+                    StrView::from_str(f_name),
+                    StrView::from_str(t_tag),
+                    FfiSlice::from_slice(bytes),
+                )
+            },
+            FfiResult::OK,
+            "enum import failed for {f_name}"
+        );
+    }
+    assert_eq!(enum_dst, enum_src);
+    assert_eq!(
+        unsafe {
+            import_enum(
+                (&raw mut enum_dst).cast::<c_void>(),
+                StrView::from_str("Move::speed"),
+                StrView::from_str("f32"),
+                FfiSlice::from_slice(&1.0f32.to_ne_bytes()),
+            )
+        },
+        FfiResult::INVALID_STATE
+    );
+}

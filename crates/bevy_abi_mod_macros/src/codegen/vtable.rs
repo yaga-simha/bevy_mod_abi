@@ -38,6 +38,12 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
         })
         .collect();
 
+    let witness_helpers = if state.opaque {
+        quote! {}
+    } else {
+        crate::codegen::witness::emit_witness_helpers(sys_crate)
+    };
+
     let is_raw_insertable = state.can_impl_raw_insertable;
     let is_abi_pod = state.can_impl_raw_insertable && state.can_impl_abi_pod;
     let (c_decl_str, zig_decl_str) =
@@ -549,6 +555,7 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
                 #sys_crate::FfiResult::OK
             }
 
+            #witness_helpers
             #(#layout_assertions)*
             #(#req_assertions)*
             #(#extern_fns)*

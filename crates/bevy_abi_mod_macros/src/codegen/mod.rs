@@ -7,12 +7,15 @@ mod primitive;
 mod string;
 mod vec;
 mod vtable;
+pub(crate) mod witness;
 
 use crate::attrs::{
     parse_component_attrs, parse_field_attr, parse_repr_flags, resolve_sys_crate_path,
     sanitize_symbol_segment,
 };
-use crate::classify::{FieldKind, canonical_field_type_tag, classify_type};
+use crate::classify::{
+    FieldKind, canonical_field_type_tag, canonical_kind_type_tag, classify_type,
+};
 use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote};
 use std::collections::HashSet;
@@ -133,6 +136,7 @@ pub(crate) struct CodegenState {
     pub(crate) schema_fields: Vec<(String, String, TokenStream)>,
     pub(crate) decl_fields: Vec<c_decl::DeclFieldInfo>,
     pub(crate) decl_enum: Option<c_decl::DeclEnumInfo>,
+    pub(crate) witness_fields: Vec<witness::WitnessFieldInfo>,
     pub(crate) extern_fns: Vec<TokenStream>,
     pub(crate) vtable_fields: Vec<TokenStream>,
     pub(crate) vtable_inits: Vec<TokenStream>,
@@ -400,6 +404,7 @@ pub(crate) fn expand_mod_component_with_crate(
         schema_fields: Vec::new(),
         decl_fields: Vec::new(),
         decl_enum: None,
+        witness_fields: Vec::new(),
         extern_fns: Vec::new(),
         vtable_fields: Vec::new(),
         vtable_inits: Vec::new(),
@@ -478,6 +483,26 @@ pub(crate) fn expand_mod_component_with_crate(
             {
                 state.decl_fields.push(decl_info);
             }
+            let witness_kind = match &kind {
+                FieldKind::Skip => unreachable!(),
+                FieldKind::Bool(_) => witness::WitnessFieldKind::Bool,
+                FieldKind::Primitive { .. } => witness::WitnessFieldKind::Primitive,
+                FieldKind::HostString(_) => witness::WitnessFieldKind::HostString,
+                FieldKind::HostVec { elem_ty, .. } => witness::WitnessFieldKind::HostVec {
+                    elem_ty: elem_ty.clone(),
+                },
+                FieldKind::FfiOption { inner_ty, .. } => witness::WitnessFieldKind::FfiOption {
+                    inner_ty: inner_ty.clone(),
+                },
+                FieldKind::Nested { .. } => witness::WitnessFieldKind::Nested,
+            };
+            state.witness_fields.push(witness::WitnessFieldInfo {
+                field_name: field_name.clone(),
+                type_tag: canonical_kind_type_tag(&field.ty, &kind),
+                member_tokens: member_tokens.clone(),
+                kind: witness_kind,
+                raw_ty: field.ty.clone(),
+            });
         }
 
         let spec = match kind {
@@ -517,5 +542,6 @@ pub(crate) fn expand_mod_component_with_crate(
         state.emit_accessor(field, &field_name, spec)?;
     }
 
+    witness::emit_struct_witnesses(&mut state);
     Ok(vtable::emit_vtable_and_impls(&state, &vtable_ident))
 }

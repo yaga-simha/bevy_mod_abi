@@ -110,6 +110,23 @@ pub(crate) fn canonical_field_type_tag(ty: &Type) -> String {
     }
 }
 
+/// Returns the canonical type tag taking explicit `#[mod_field(...)]` overrides into account.
+pub(crate) fn canonical_kind_type_tag(ty: &Type, kind: &FieldKind) -> String {
+    match kind {
+        FieldKind::Bool(_) => "bool".to_owned(),
+        FieldKind::HostString(_) => "String".to_owned(),
+        FieldKind::HostVec { elem_ty, .. } => {
+            format!("Vec<{}>", canonical_field_type_tag(elem_ty))
+        }
+        FieldKind::FfiOption { inner_ty, .. } => {
+            format!("FfiOption<{}>", canonical_field_type_tag(inner_ty))
+        }
+        FieldKind::Primitive { ty: prim_ty, .. } => canonical_field_type_tag(prim_ty),
+        FieldKind::Nested { ty: nested_ty, .. } => canonical_field_type_tag(nested_ty),
+        FieldKind::Skip => canonical_field_type_tag(ty),
+    }
+}
+
 /// Classifies a struct field into bool, primitive, string, vector, nested, or skipped representation.
 ///
 /// Explicit `#[mod_field(...)]` overrides always take precedence over syntactic path inspection.
