@@ -511,14 +511,14 @@ pub struct QueryBuilder<'b> {
 
 impl<'b> QueryBuilder<'b> {
     #[inline]
-    fn record_error(&mut self, err: FfiResult) {
+    pub(crate) fn record_error(&mut self, err: FfiResult) {
         if self.first_error.is_none() {
             self.first_error = Some(err);
         }
     }
 
     #[inline]
-    fn push_term(&mut self, component: BamComponent, mode: AccessMode) {
+    pub(crate) fn push_term(&mut self, component: BamComponent, mode: AccessMode) {
         if !component.is_valid() {
             self.record_error(FfiResult::INVALID_COMPONENT);
             return;
