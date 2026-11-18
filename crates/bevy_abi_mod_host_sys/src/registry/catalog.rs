@@ -300,14 +300,16 @@ unsafe fn msg_read_batch_non_pod_impl<M: Message>(
     let messages: &Messages<M> = unsafe { res_ptr.deref::<Messages<M>>() };
     let mut written = 0usize;
     for msg in typed_cursor.read(messages).take(max_count) {
-        let ptr_bytes = (core::ptr::from_ref(msg).cast::<c_void>() as usize).to_ne_bytes();
-        // SAFETY: `out_buf` is writable for `max_count * size_of::<usize>()` bytes; bytewise
-        // `copy_nonoverlapping` avoids alignment assumptions on the guest scratch buffer.
+        let msg_ptr = core::ptr::from_ref(msg).cast::<c_void>();
+        // SAFETY: `out_buf` is writable for `max_count * size_of::<*const c_void>()` bytes;
+        // `write_unaligned` preserves full pointer provenance regardless of `out_buf` alignment.
+        #[allow(clippy::cast_ptr_alignment)]
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                ptr_bytes.as_ptr(),
-                out_buf.add(written * ptr_bytes.len()),
-                ptr_bytes.len(),
+            core::ptr::write_unaligned(
+                out_buf
+                    .add(written * core::mem::size_of::<*const c_void>())
+                    .cast::<*const c_void>(),
+                msg_ptr,
             );
         }
         written += 1;
@@ -1298,11 +1300,19 @@ impl ModRegistry {
             component_flags_to_storage_flags(M::COMPONENT_FLAGS) | BAM_STORAGE_FLAG_MESSAGE;
         let name_str = M::CANONICAL_NAME;
         let uuid = M::UUID;
+        let (wire_size, wire_align) = if is_abi_pod {
+            (M::size(), M::align())
+        } else {
+            (
+                core::mem::size_of::<*const c_void>(),
+                core::mem::align_of::<*const c_void>(),
+            )
+        };
         self.check_registration_collision(
             name_str,
             uuid,
-            M::size(),
-            M::align(),
+            wire_size,
+            wire_align,
             storage_flags,
             Some(messages_res_id),
         )?;
@@ -1313,6 +1323,8 @@ impl ModRegistry {
             let handle = if let Some(&existing_handle) = snap.by_name.get(name_str) {
                 let idx = (existing_handle.0 - 1) as usize;
                 snap.entries[idx].vtable_ptr = sym_addr;
+                snap.entries[idx].size = wire_size;
+                snap.entries[idx].align = wire_align;
                 snap.entries[idx].is_abi_pod = is_abi_pod;
                 snap.entries[idx].create_msg_cursor_fn = Some(create_msg_cursor_impl::<M>);
                 snap.entries[idx].msg_read_batch_fn = msg_read_batch_fn;
@@ -1329,8 +1341,8 @@ impl ModRegistry {
                     name: Arc::clone(&arc_name),
                     uuid,
                     component_id: messages_res_id,
-                    size: M::size(),
-                    align: M::align(),
+                    size: wire_size,
+                    align: wire_align,
                     storage_flags,
                     is_abi_pod,
                     is_dynamic: false,
@@ -1361,6 +1373,16 @@ impl ModRegistry {
                 handle
             };
             Self::insert_mod_component_symbols::<M>(snap);
+            if !is_abi_pod {
+                let marker_sym = format!("bam.v0.{}.non_pod_message", M::CANONICAL_NAME);
+                snap.symbols.insert(
+                    Arc::from(marker_sym.as_str()),
+                    SymbolRecord {
+                        addr: SymbolAddress::new(msg_read_batch_non_pod_impl::<M> as *const c_void),
+                        owner: None,
+                    },
+                );
+            }
             handle
         };
         self.publish_after_mutation();

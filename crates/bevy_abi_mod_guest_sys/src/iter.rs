@@ -1993,6 +1993,18 @@ impl<'a> ValidatedIter<'a> {
         Ok(read_count.min(out_ptrs.len()))
     }
 
+    fn verify_non_pod_message_marker<M: ModComponent>(&self) -> Result<(), FfiResult> {
+        let marker_sym = CString::new(format!("bam.v0.{}.non_pod_message", M::CANONICAL_NAME))
+            .map_err(|_| FfiResult::TYPE_MISMATCH)?;
+        let Ok(ptr) = self.host.resolve_custom_symbol(&marker_sym) else {
+            return Err(FfiResult::TYPE_MISMATCH);
+        };
+        if ptr.is_null() {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        Ok(())
+    }
+
     /// Reads up to `max_count` unread VTable-backed non-POD messages (`M: ModComponent + Default`)
     /// from `term_index`, reconstructing each host `M` into guest memory via the host's
     /// `"bam.v0.<M>.export_fields"` witness symbol and guest's `"bam.v0.<M>.import_field"`.
@@ -2002,11 +2014,12 @@ impl<'a> ValidatedIter<'a> {
         expected_uuid: Option<UuidFilter>,
         max_count: usize,
     ) -> Result<Vec<M>, FfiResult> {
+        let info = self.column_info(term_index)?;
+        if !validate_non_pod_message_info(&info, expected_uuid, false) {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        self.verify_non_pod_message_marker::<M>()?;
         if max_count == 0 {
-            let info = self.column_info(term_index)?;
-            if !validate_non_pod_message_info(&info, expected_uuid, false) {
-                return Err(FfiResult::TYPE_MISMATCH);
-            }
             return Ok(Vec::new());
         }
 
@@ -2148,6 +2161,9 @@ impl<'a> ValidatedIter<'a> {
         };
         if !validate_non_pod_message_info(&info, expected_uuid, true) {
             return FfiResult::TYPE_MISMATCH;
+        }
+        if let Err(err) = self.verify_non_pod_message_marker::<M>() {
+            return err;
         }
 
         type ExportFieldsFn = unsafe extern "C" fn(
@@ -2754,6 +2770,11 @@ fn validate_non_pod_message_info(
     if !info.is_message() || info.is_resource() {
         return false;
     }
+    if info.size != core::mem::size_of::<*const c_void>()
+        || info.align != core::mem::align_of::<*const c_void>()
+    {
+        return false;
+    }
     if let Some(filter) = expected_uuid
         && !filter.matches(info.uuid)
     {
@@ -3300,10 +3321,11 @@ mod tests {
     ) -> *const c_void {
         // SAFETY: Caller passes valid NUL-terminated CStr.
         let name = unsafe { CStr::from_ptr(sym) };
-        if name.to_bytes() == b"bam.v0.mock::NonPodChat.export_fields" {
-            return mock_export_fields as *const c_void;
+        match name.to_bytes() {
+            b"bam.v0.mock::NonPodChat.export_fields" => mock_export_fields as *const c_void,
+            b"bam.v0.mock::NonPodChat.non_pod_message" => mock_msg_read_batch as *const c_void,
+            _ => core::ptr::null(),
         }
-        core::ptr::null()
     }
 
     unsafe extern "C" fn mock_col_info(
@@ -3311,22 +3333,45 @@ mod tests {
         term_index: usize,
         out_info: *mut BamColumnInfo,
     ) -> FfiResult {
-        if term_index != 0 {
+        if term_index > 1 {
             return FfiResult::OUT_OF_RANGE;
         }
+        let uuid = if term_index == 0 {
+            MockNonPodMsg::UUID
+        } else {
+            MockPodWithoutMarker::UUID
+        };
         // SAFETY: `out_info` is writable.
         unsafe {
             *out_info = BamColumnInfo {
-                component: BamComponent::from_raw(1),
-                uuid: MockNonPodMsg::UUID,
-                size: 0,
-                align: 1,
+                component: BamComponent::from_raw((term_index + 1) as u32),
+                uuid,
+                size: core::mem::size_of::<*const c_void>(),
+                align: core::mem::align_of::<*const c_void>(),
                 mode: AccessMode::MESSAGE_WRITE,
                 storage_flags: BAM_STORAGE_FLAG_MESSAGE,
                 reserved0: 0,
             };
         }
         FfiResult::OK
+    }
+
+    #[derive(Default, Debug, PartialEq, Eq)]
+    struct MockPodWithoutMarker;
+
+    impl ModComponent for MockPodWithoutMarker {
+        const CANONICAL_NAME: &'static str = "mock::PodWithoutMarker";
+        const COMPONENT_CSTR: &'static CStr = c"mock::PodWithoutMarker";
+        const UUID: ComponentUuid = ComponentUuid::from_parts("mock::PodWithoutMarker", 8, 8, 2);
+        type VTable = ();
+
+        fn vtable() -> &'static Self::VTable {
+            &()
+        }
+
+        fn symbols() -> &'static [SymbolEntry] {
+            &[]
+        }
     }
 
     unsafe extern "C" fn mock_msg_read_batch(
@@ -3340,14 +3385,16 @@ mod tests {
         let world = unsafe { &*iter.cast::<MockMsgWorld>() };
         let take = world.stored.len().min(max_count);
         for i in 0..take {
-            let ptr_bytes =
-                (core::ptr::from_ref(&world.stored[i]).cast::<c_void>() as usize).to_ne_bytes();
-            // SAFETY: `out_buf` is writable for `take` `usize` entries.
+            let msg_ptr = core::ptr::from_ref(&world.stored[i]).cast::<c_void>();
+            // SAFETY: `out_buf` is writable for `take * size_of::<*const c_void>()` bytes;
+            // `write_unaligned` preserves full pointer provenance.
+            #[allow(clippy::cast_ptr_alignment)]
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    ptr_bytes.as_ptr(),
-                    out_buf.add(i * ptr_bytes.len()),
-                    ptr_bytes.len(),
+                core::ptr::write_unaligned(
+                    out_buf
+                        .add(i * core::mem::size_of::<*const c_void>())
+                        .cast::<*const c_void>(),
+                    msg_ptr,
                 );
             }
         }
@@ -3573,6 +3620,24 @@ mod tests {
         assert_eq!(
             u32::from_le_bytes(world.sent_packets[0][0..4].try_into().unwrap()),
             2
+        );
+
+        // 8-byte POD message without `non_pod_message` marker must be rejected with TYPE_MISMATCH.
+        assert_eq!(
+            iter.read_non_pod_messages_checked::<MockPodWithoutMarker>(
+                1,
+                Some(UuidFilter::exact(MockPodWithoutMarker::UUID)),
+                4,
+            ),
+            Err(FfiResult::TYPE_MISMATCH)
+        );
+        assert_eq!(
+            iter.send_non_pod_message_checked::<MockPodWithoutMarker>(
+                1,
+                Some(UuidFilter::exact(MockPodWithoutMarker::UUID)),
+                &MockPodWithoutMarker,
+            ),
+            FfiResult::TYPE_MISMATCH
         );
     }
 }

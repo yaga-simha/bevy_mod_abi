@@ -892,7 +892,7 @@ fn non_pod_messages_round_trip_and_batch_cursors_work_across_ffi() {
         .register_non_pod_message::<ChatMsg>(msg_res_id)
         .expect("register non-POD ChatMsg");
 
-    // Verify `ModRegistry::insert_mod_component_symbols` published witness symbols.
+    // Verify `ModRegistry::insert_mod_component_symbols` published witness & marker symbols.
     let snap = app.world().resource::<ModRegistry>().snapshot();
     assert!(
         snap.resolve_symbol("bam.v0.wave2_test::ChatMsg.export_fields")
@@ -902,7 +902,14 @@ fn non_pod_messages_round_trip_and_batch_cursors_work_across_ffi() {
         snap.resolve_symbol("bam.v0.wave2_test::ChatMsg.import_field")
             .is_some()
     );
-    assert!(!snap.get_by_handle(msg_h).unwrap().is_abi_pod);
+    assert!(
+        snap.resolve_symbol("bam.v0.wave2_test::ChatMsg.non_pod_message")
+            .is_some()
+    );
+    let entry = snap.get_by_handle(msg_h).unwrap();
+    assert!(!entry.is_abi_pod);
+    assert_eq!(entry.size, core::mem::size_of::<*const c_void>());
+    assert_eq!(entry.align, core::mem::align_of::<*const c_void>());
 
     // Host writes 3 non-POD ChatMsgs.
     {
@@ -943,8 +950,8 @@ fn non_pod_messages_round_trip_and_batch_cursors_work_across_ffi() {
             return rc;
         }
 
-        // Batch 1: read at most 2 pointers.
-        let mut ptrs = [0usize; 2];
+        // Batch 1: read at most 2 pointers (preserving strict provenance).
+        let mut ptrs: [*const c_void; 2] = [core::ptr::null(); 2];
         let mut count = 0usize;
         let rc =
             unsafe { host_msg_read_batch(iter, 0, ptrs.as_mut_ptr().cast::<u8>(), 2, &mut count) };
@@ -954,7 +961,7 @@ fn non_pod_messages_round_trip_and_batch_cursors_work_across_ffi() {
         assert_eq!(count, 2);
         let mut out = st.read_msgs.lock().unwrap();
         for &p in &ptrs[..count] {
-            out.push(decode_host_chat_msg(p as *const c_void));
+            out.push(decode_host_chat_msg(p));
         }
 
         // Batch 2: read remaining 1 pointer without skipping any!
@@ -964,7 +971,7 @@ fn non_pod_messages_round_trip_and_batch_cursors_work_across_ffi() {
             return rc;
         }
         assert_eq!(count, 1);
-        out.push(decode_host_chat_msg(ptrs[0] as *const c_void));
+        out.push(decode_host_chat_msg(ptrs[0]));
         FfiResult::OK
     }
 
