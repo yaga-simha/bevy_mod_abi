@@ -83,7 +83,9 @@
 pub use bevy_abi_mod_sys;
 
 pub mod app;
+pub mod bridges;
 pub mod commands;
+pub mod commands_lifecycle;
 pub mod component;
 pub mod iter;
 pub mod lifecycle;

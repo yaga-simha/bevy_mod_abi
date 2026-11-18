@@ -8,6 +8,7 @@ members = [
     "crates/bevy_abi_mod_guest_sys",
     "crates/bevy_abi_mod_guest",
     "crates/bevy_abi_mod",
+    "crates/cargo-bam",
     "xtask",
     "benches/coupled_rust_mod",
     "benches/permutation_bench",
@@ -28,6 +29,7 @@ default-members = [
     "crates/bevy_abi_mod_guest_sys",
     "crates/bevy_abi_mod_guest",
     "crates/bevy_abi_mod",
+    "crates/cargo-bam",
     "xtask",
     "examples/01_minimal_handshake",
     "examples/02_multi_system_pipeline",
@@ -96,6 +98,27 @@ bevy_app = { version = "0.20.1", default-features = false, features = ["std"] }
 bevy_platform = { version = "0.20.1", default-features = false, features = ["std"] }
 bevy_tasks = { version = "0.20.1", default-features = false, features = ["multi_threaded"] }
 bevy_diagnostic = { version = "0.20.1", default-features = false, features = ["std"] }
+bevy_math = { version = "0.20.1", default-features = false, features = ["std"] }
+bevy_transform = { version = "0.20.1", default-features = false, features = ["std", "bevy-support"] }
+bevy_camera = { version = "0.20.1", default-features = false }
+bevy_color = { version = "0.20.1", default-features = false, features = ["std"] }
+bevy_window = { version = "0.20.1", default-features = false, features = ["std"] }
+bevy_time = { version = "0.20.1", default-features = false, features = ["std"] }
+bevy_input = { version = "0.20.1", default-features = false, features = ["std", "keyboard", "mouse"] }
+bevy_asset = { version = "0.20.1", default-features = false, features = ["multi_threaded"] }
+bevy_state = { version = "0.20.1", default-features = false, features = ["std", "bevy_app"] }
+bevy_reflect = { version = "0.20.1", default-features = false, features = ["std"] }
+bevy_scene = { version = "0.20.1", default-features = false }
+bevy_extract = { version = "0.20.1", default-features = false }
+toml = "0.8"
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+notify-debouncer-full = "0.7"
+sha2 = "0.10"
+walkdir = "2"
+tempfile = "3"
 libloading = "0.8"
 nonmax = "0.5"
 arc-swap = "1.7"

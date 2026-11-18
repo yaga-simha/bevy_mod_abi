@@ -18,6 +18,13 @@ workspace = true
 strict-ffi-checks = ["bevy_abi_mod_host/strict-ffi-checks"]
 diagnostics = ["bevy_abi_mod_host/diagnostics"]
 signature-verification = ["bevy_abi_mod_host/signature-verification"]
+bridge-std-types = ["bevy_abi_mod_host/bridge-std-types"]
+bridge-asset = ["bevy_abi_mod_host/bridge-asset"]
+bridge-state = ["bevy_abi_mod_host/bridge-state"]
+bridge-reflect = ["bevy_abi_mod_host/bridge-reflect"]
+bridge-bsn = ["bevy_abi_mod_host/bridge-bsn"]
+sub-app-extract = ["bevy_abi_mod_host/sub-app-extract"]
+hot-reload-watcher = ["bevy_abi_mod_host/hot-reload-watcher"]
 
 [dependencies]
 bevy_abi_mod_sys = { workspace = true }

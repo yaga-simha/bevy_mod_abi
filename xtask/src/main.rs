@@ -769,7 +769,7 @@ fn cmd_fixtures(args: &[String]) -> Result<(), String> {
 }
 
 fn verify_zero_bevy_deps(root: &Path) -> Result<(), String> {
-    println!("==> Checking zero Bevy dependencies in ABI, guest, and macro crates");
+    println!("==> Checking zero Bevy dependencies in ABI, guest, macro, and CLI crates");
     let output = Command::new(cargo_bin())
         .current_dir(root)
         .args([
@@ -782,6 +782,8 @@ fn verify_zero_bevy_deps(root: &Path) -> Result<(), String> {
             "bevy_abi_mod_guest",
             "-p",
             "bevy_abi_mod_macros",
+            "-p",
+            "cargo-bam",
         ])
         .output()
         .map_err(|e| format!("failed to run `cargo tree`: {e}"))?;
@@ -1213,11 +1215,16 @@ fn cmd_miri(args: &[String]) -> Result<(), String> {
 }
 
 fn verify_forbid_unsafe(root: &Path) -> Result<(), String> {
-    println!("==> Verifying #![forbid(unsafe_code)] in safe host, guest, and xtask crates");
+    println!(
+        "==> Verifying #![forbid(unsafe_code)] in safe host, guest, macro, CLI, and xtask crates"
+    );
     let safe_crates = [
         "crates/bevy_abi_mod/src/lib.rs",
         "crates/bevy_abi_mod_host/src/lib.rs",
         "crates/bevy_abi_mod_guest/src/lib.rs",
+        "crates/bevy_abi_mod_macros/src/lib.rs",
+        "crates/cargo-bam/src/lib.rs",
+        "crates/cargo-bam/src/main.rs",
         "xtask/src/main.rs",
     ];
 

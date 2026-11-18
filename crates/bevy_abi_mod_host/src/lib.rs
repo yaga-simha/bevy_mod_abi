@@ -45,12 +45,15 @@
 //! ```
 
 pub mod app_ext;
+pub mod bridges;
 pub mod commands_ext;
 #[cfg(feature = "diagnostics")]
 pub mod diagnostics;
 pub mod events;
+pub mod mod_dag;
 pub mod plugin;
 pub mod schedule_sets;
+pub mod watcher;
 pub mod world_ext;
 
 pub use bevy_abi_mod_macros::{AbiPod, ModComponent};

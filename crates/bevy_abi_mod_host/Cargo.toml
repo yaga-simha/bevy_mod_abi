@@ -20,6 +20,21 @@ strict-ffi-checks = ["bevy_abi_mod_host_sys/strict-ffi-checks"]
 test-utils = ["bevy_abi_mod_host_sys/test-utils"]
 diagnostics = ["bevy_abi_mod_host_sys/diagnostics", "dep:bevy_diagnostic"]
 signature-verification = ["bevy_abi_mod_host_sys/signature-verification"]
+bridge-std-types = [
+    "dep:bevy_math",
+    "dep:bevy_transform",
+    "dep:bevy_camera",
+    "dep:bevy_color",
+    "dep:bevy_window",
+    "dep:bevy_time",
+    "dep:bevy_input",
+]
+bridge-asset = ["dep:bevy_asset"]
+bridge-state = ["dep:bevy_state"]
+bridge-reflect = ["dep:bevy_reflect"]
+bridge-bsn = ["dep:bevy_scene", "bridge-asset"]
+sub-app-extract = ["dep:bevy_extract"]
+hot-reload-watcher = ["dep:notify-debouncer-full"]
 
 [dependencies]
 bevy_abi_mod_sys = { workspace = true }
@@ -29,10 +44,27 @@ bevy_ecs = { workspace = true }
 bevy_app = { workspace = true }
 bevy_platform = { workspace = true }
 bevy_diagnostic = { workspace = true, optional = true }
+bevy_math = { workspace = true, optional = true }
+bevy_transform = { workspace = true, optional = true }
+bevy_camera = { workspace = true, optional = true }
+bevy_color = { workspace = true, optional = true }
+bevy_window = { workspace = true, optional = true }
+bevy_time = { workspace = true, optional = true }
+bevy_input = { workspace = true, optional = true }
+bevy_asset = { workspace = true, optional = true }
+bevy_state = { workspace = true, optional = true }
+bevy_reflect = { workspace = true, optional = true }
+bevy_scene = { workspace = true, optional = true }
+bevy_extract = { workspace = true, optional = true }
+notify-debouncer-full = { workspace = true, optional = true }
+toml = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 bevy_abi_mod_host_sys = { workspace = true, features = ["test-utils"] }
+bevy_ecs = { workspace = true, features = ["debug"] }
 libloading = { workspace = true }
 proptest = { workspace = true }
 rusty-fork = "0.3"
