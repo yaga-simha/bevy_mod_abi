@@ -38,11 +38,18 @@ jobs:
         with:
           command: check advisories licenses bans sources
 
-      - name: Formatting, workspace clippy & single-source C99 header verification
+      - name: Formatting, workspace lint/clippy (`--all-features`), zero-Bevy isolation & header checks
         run: |
           cargo fmt --all -- --check
+          cargo xtask lint
           cargo xtask header --check --test-c99
+          cargo xtask gen-component-headers --check
+          if cargo tree -p bevy_abi_mod_sys -p bevy_abi_mod_macros -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest -p cargo-bam | grep -v bevy_abi_mod | grep -i bevy; then
+            echo "ERROR: Unexpected Bevy dependency found in isolated ABI/macro/guest/CLI crates!"
+            exit 1
+          fi
           cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
           cargo clippy --manifest-path fuzz/Cargo.toml --bins -- -D warnings
 
       - name: Strict rustdoc warnings check
@@ -92,12 +99,20 @@ jobs:
       - name: Cache Cargo registry & build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Build hermetic fixtures & run parallel default tests (no `--test-threads=1`)
+      - name: Cross-OS clippy (`--all-features`), hermetic fixtures, workspace & `cargo-bam` suites
+        shell: bash
         run: |
+          cargo xtask lint
+          cargo xtask header --check --test-c99
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
           cargo xtask ci
-          cargo test --doc
+          cargo test --doc --all-features
           cargo test -p cargo-bam
-          cargo test -p bevy_abi_mod_host_sys -p bevy_abi_mod_host --all-features --lib
+          cargo test -p bevy_abi_mod_sys -p bevy_abi_mod_macros -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest --all-features
+          BAM_FIXTURE_DIR="${{ github.workspace }}/target/fixtures" \
+            cargo test -p bevy_abi_mod_host_sys -p bevy_abi_mod_host --all-features
+          cargo run -p cargo-bam -- doctor
+          cargo run -p cargo-bam -- header --out target/ci_sdk_check
 
   # ============================================================================
   # 3. Heavy GUI / 3D Examples (`04_visual_game`, `05_cute_3d_winit`)
@@ -252,8 +267,10 @@ jobs:
           CXX: ${{ matrix.cxx }}
         run: |
           cargo xtask lint
-          cargo xtask header --test-c99
+          cargo xtask header --check --test-c99
           cargo xtask fixtures
+          cargo test -p cargo-bam
+          cargo run -p cargo-bam -- doctor --require-c
           if [ "${{ runner.os }}" = "Windows" ]; then
             "$CXX" -std=c++17 -Wall -Wextra -Wpedantic -Werror -Iinclude -O3 -shared examples/07_cpp17_guest/cpp_mod/mod.cpp -o examples/07_cpp17_guest/cpp_mod/cpp17_mod.dll
           elif [ "${{ runner.os }}" = "macOS" ]; then
@@ -361,6 +378,24 @@ jobs:
 
       - name: Run Miri via `cargo xtask miri --all`
         run: cargo xtask miri --all
+
+  loom:
+    name: Loom Atomic Concurrency Verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: loom-concurrency
+
+      - name: Verify `DROP_SLOTS` generation/epoch atomics under Loom
+        run: cargo test -p bevy_abi_mod_host_sys --test loom_drop_trampoline --release
 
   sanitizers:
     name: ASan / UBSan C99 Verification
