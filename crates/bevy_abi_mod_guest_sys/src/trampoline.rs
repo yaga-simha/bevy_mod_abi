@@ -4,6 +4,7 @@
 use core::{
     cell::UnsafeCell,
     ffi::{CStr, c_char, c_void},
+    mem::ManuallyDrop,
     sync::atomic::{AtomicBool, Ordering},
 };
 use std::ffi::CString;
@@ -12,15 +13,15 @@ use bevy_abi_mod_sys::{
     AbiPod, BAM_SYSTEM_KNOWN_FLAGS, BamChangeTicks, BamCommands, BamComponent, BamEventKind,
     BamHostApi, BamIter, BamLoadCtx, BamObserverDesc, BamObserverFn, BamObserverMutFn,
     BamQueryDesc, BamRegisterObserverFn, BamRunIfFn, BamSysEntityChildrenFn, BamSysEntityGetFn,
-    BamSysEntityGetMutFn, BamSysResMutPtrFn, BamSysResPtrFn, BamSystemCtx, BamSystemDesc,
-    BamSystemFn, BamTermDesc, FfiBool, FfiEntity, FfiResult, MAX_QUERIES_PER_SYSTEM,
-    MAX_TERMS_PER_QUERY, ScheduleId,
+    BamSysEntityGetMutFn, BamSysHostCtxFn, BamSysResMutPtrFn, BamSysResPtrFn, BamSystemCtx,
+    BamSystemDesc, BamSystemFn, BamTermDesc, ComponentUuid, FfiBool, FfiEntity, FfiResult,
+    MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent, ScheduleId,
 };
 
 use crate::{
-    commands::ValidatedCommands,
+    commands::{SpawnEntry, ValidatedCommands},
     host::{Host, ValidatedWireVTable},
-    instance::GuestInstance,
+    instance::{GuestInstance, qualify_mod_component_identity},
     iter::{UuidFilter, ValidatedIter},
     panic::{catch_guest_bool, catch_guest_result},
 };
@@ -731,12 +732,29 @@ where
         // SAFETY: `user_data` was allocated via `GuestInstance::track_allocation` for
         // `SystemClosureState<F>` and remains valid until `bevy_abi_mod_shutdown`.
         let state = unsafe { &*user_data.cast::<SystemClosureState<F>>() };
+        let inv_host = if state.host.api().covers_slot(
+            core::mem::offset_of!(BamHostApi, sys_host_ctx),
+            core::mem::size_of::<Option<BamSysHostCtxFn>>(),
+        ) && let Some(sys_host_ctx_fn) = state.host.api().sys_host_ctx
+        {
+            // SAFETY: `sys_ctx` is non-null and active for the duration of this `BamSystemFn` call.
+            let raw_ctx = unsafe { sys_host_ctx_fn(sys_ctx.cast_const()) };
+            if raw_ctx.is_null() {
+                state.host
+            } else {
+                // SAFETY: `raw_ctx` was returned by `BamHostApi::sys_host_ctx(sys_ctx)` and
+                // remains valid for the duration of this system invocation.
+                unsafe { state.host.with_host_ctx_ptr(raw_ctx) }
+            }
+        } else {
+            state.host
+        };
         let Some(result) = state.closure.try_with_mut(|func| {
             // SAFETY: `sys_ctx` is non-null and active for the duration of this `BamSystemFn` call.
             let mut invocation = unsafe {
                 ValidatedSystemInvocation::from_raw(
                     sys_ctx,
-                    &state.host,
+                    &inv_host,
                     state.total_query_count,
                     state.user_query_count,
                     state.resource_query_index,
@@ -1701,4 +1719,394 @@ macro_rules! wrap_run_condition {
             })
         }
     };
+}
+
+// ============================================================================
+// Same-Mod Dynamic `ModComponent` Verification, Borrowing & Move Commands
+// ============================================================================
+
+#[inline]
+fn resolve_vtable_symbol_for_name(
+    host: &Host,
+    comp_name: &str,
+) -> Result<*const c_void, FfiResult> {
+    const PREFIX: &[u8] = b"bam.v0.";
+    const SUFFIX: &[u8] = b".vtable\0";
+    let total_len = PREFIX.len() + comp_name.len() + SUFFIX.len();
+    if total_len <= 256 {
+        let mut buf = [0u8; 256];
+        buf[..PREFIX.len()].copy_from_slice(PREFIX);
+        buf[PREFIX.len()..PREFIX.len() + comp_name.len()].copy_from_slice(comp_name.as_bytes());
+        buf[PREFIX.len() + comp_name.len()..total_len].copy_from_slice(SUFFIX);
+        let Ok(cstr) = CStr::from_bytes_with_nul(&buf[..total_len]) else {
+            return Err(FfiResult::INVALID_ARGUMENT);
+        };
+        return host.resolve_custom_symbol(cstr);
+    }
+    let sym = format!("bam.v0.{comp_name}.vtable");
+    let Ok(cstr) = CString::new(sym.as_bytes()) else {
+        return Err(FfiResult::INVALID_ARGUMENT);
+    };
+    host.resolve_custom_symbol(cstr.as_c_str())
+}
+
+/// Verifies that a host column/component with `(actual_uuid, actual_size, actual_align)` matches
+/// `T: ModComponent` registered by this same active mod instance (`vtable_ptr` address equality
+/// proves identical Rust ABI + active `ModRegistry` ownership).
+pub fn verify_same_mod_dynamic_component<T: ModComponent>(
+    host: &Host,
+    actual_uuid: ComponentUuid,
+    actual_size: usize,
+    actual_align: usize,
+) -> bool {
+    if actual_size != core::mem::size_of::<T>() || actual_align != core::mem::align_of::<T>() {
+        return false;
+    }
+    let Ok((qualified_name, qualified_uuid)) =
+        qualify_mod_component_identity::<T>(host.manifest_name())
+    else {
+        return false;
+    };
+    let matches_qualified = actual_uuid == qualified_uuid;
+    let matches_canonical = actual_uuid == T::UUID;
+    if !matches_qualified && !matches_canonical {
+        return false;
+    }
+    let expected_vtable = T::erased_vtable_ptr();
+    if matches_qualified
+        && let Ok(ptr) = resolve_vtable_symbol_for_name(host, &qualified_name)
+        && core::ptr::eq(ptr, expected_vtable)
+    {
+        return true;
+    }
+    if matches_canonical
+        && qualified_name != T::CANONICAL_NAME
+        && let Ok(ptr) = resolve_vtable_symbol_for_name(host, T::CANONICAL_NAME)
+        && core::ptr::eq(ptr, expected_vtable)
+    {
+        return true;
+    }
+    false
+}
+
+/// Borrows dense column `col` as `&[T]` for a same-mod dynamic [`ModComponent`] (`T`), verifying
+/// layout, [`ComponentUuid`], and active same-binary VTable provenance.
+pub fn iter_dynamic_slice<'b, 'a, T: ModComponent>(
+    iter: &'b ValidatedIter<'a>,
+    col: usize,
+) -> Option<&'b [T]> {
+    let info = iter.column_info(col).ok()?;
+    if !info.mode.has_entity_column_data() || info.is_resource() || info.is_sparse_set() {
+        return None;
+    }
+    if !verify_same_mod_dynamic_component::<T>(iter.host(), info.uuid, info.size, info.align) {
+        return None;
+    }
+    let len = iter.entities().len();
+    if len == 0 {
+        if info.mode.is_optional() {
+            return None;
+        }
+        return Some(&[]);
+    }
+    let elem_size = core::mem::size_of::<T>();
+    let ptr = iter.column_readonly_ptr(col);
+    if elem_size == 0 {
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: `T` is zero-sized, `ptr` is non-null (present), and `NonNull::dangling()` is
+        // aligned for `T`.
+        return Some(unsafe {
+            core::slice::from_raw_parts(core::ptr::NonNull::<T>::dangling().as_ptr(), len)
+        });
+    }
+    if ptr.is_null() || !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+        return None;
+    }
+    let byte_len = len.checked_mul(elem_size)?;
+    if byte_len > isize::MAX as usize {
+        return None;
+    }
+    // SAFETY: Verified same-mod `T` UUID + active VTable + layout, `ptr` non-null/aligned, and
+    // host guarantees `ptr` points to `len` initialized `T` elements for `'b`.
+    Some(unsafe { core::slice::from_raw_parts(ptr.cast::<T>(), len) })
+}
+
+/// Mutably borrows dense column `col` as `&mut [T]` for a same-mod dynamic [`ModComponent`] (`T`).
+pub fn iter_dynamic_slice_mut<'b, 'a, T: ModComponent>(
+    iter: &'b mut ValidatedIter<'a>,
+    col: usize,
+    mark_changed: bool,
+) -> Option<&'b mut [T]> {
+    let info = iter.column_info(col).ok()?;
+    if !info.mode.is_mutable()
+        || !info.mode.has_entity_column_data()
+        || info.is_immutable()
+        || info.is_resource()
+        || info.is_sparse_set()
+    {
+        return None;
+    }
+    if !verify_same_mod_dynamic_component::<T>(iter.host(), info.uuid, info.size, info.align) {
+        return None;
+    }
+    let len = iter.entities().len();
+    if len == 0 {
+        if info.mode.is_optional() {
+            return None;
+        }
+        return Some(&mut []);
+    }
+    let elem_size = core::mem::size_of::<T>();
+    let ptr = if mark_changed {
+        iter.column_mutable_ptr(col)
+    } else {
+        iter.column_mutable_untracked_ptr(col)
+    };
+    if elem_size == 0 {
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: `T` is zero-sized and `NonNull::dangling()` forms a sound mutable ZST slice.
+        return Some(unsafe {
+            core::slice::from_raw_parts_mut(core::ptr::NonNull::<T>::dangling().as_ptr(), len)
+        });
+    }
+    if ptr.is_null() || !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+        return None;
+    }
+    let byte_len = len.checked_mul(elem_size)?;
+    if byte_len > isize::MAX as usize {
+        return None;
+    }
+    // SAFETY: Verified writable dense column, same-mod `T` UUID + VTable + layout, and `&mut iter`
+    // enforces exclusive mutable access for `'b`.
+    Some(unsafe { core::slice::from_raw_parts_mut(ptr.cast::<T>(), len) })
+}
+
+/// Simultaneously borrows `[FfiEntity; len]` and writable dense dynamic component slice `&mut [T]`
+/// (`T: ModComponent`) for the current chunk.
+pub fn iter_entities_and_dynamic_slice_mut<'b, 'a, T: ModComponent>(
+    iter: &'b mut ValidatedIter<'a>,
+    write_col: usize,
+) -> Option<(&'b [FfiEntity], &'b mut [T])> {
+    let info = iter.column_info(write_col).ok()?;
+    if !info.mode.is_mutable()
+        || !info.mode.has_entity_column_data()
+        || info.is_immutable()
+        || info.is_resource()
+        || info.is_sparse_set()
+    {
+        return None;
+    }
+    if !verify_same_mod_dynamic_component::<T>(iter.host(), info.uuid, info.size, info.align) {
+        return None;
+    }
+    let len = iter.entities().len();
+    if len == 0 {
+        if info.mode.is_optional() {
+            return None;
+        }
+        return Some((&[], &mut []));
+    }
+    let elem_size = core::mem::size_of::<T>();
+    let ptr = iter.column_mutable_ptr(write_col);
+    let entities = iter.entities();
+    if elem_size == 0 {
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: `T` is zero-sized and disjoint from `entities`.
+        let slice_mut = unsafe {
+            core::slice::from_raw_parts_mut(core::ptr::NonNull::<T>::dangling().as_ptr(), len)
+        };
+        return Some((entities, slice_mut));
+    }
+    if ptr.is_null() || !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+        return None;
+    }
+    let byte_len = len.checked_mul(elem_size)?;
+    if byte_len > isize::MAX as usize {
+        return None;
+    }
+    // SAFETY: `entities` and component column `ptr` occupy disjoint Bevy archetype storage and
+    // `&mut iter` prevents aliasing borrows for `'b`.
+    let slice_mut = unsafe { core::slice::from_raw_parts_mut(ptr.cast::<T>(), len) };
+    Some((entities, slice_mut))
+}
+
+impl<'a> ValidatedSystemRef<'a> {
+    /// Looks up a shared `&'b T` reference for a same-mod dynamic [`ModComponent`] on `entity`
+    /// using declared access on `(query_index, term_index)`.
+    pub fn entity_get_dynamic_checked<'b, T: ModComponent>(
+        &'b self,
+        iter: &'b ValidatedIter<'a>,
+        query_index: usize,
+        term_index: usize,
+        entity: FfiEntity,
+    ) -> Option<&'b T> {
+        if self.sys_ctx.is_null() {
+            return None;
+        }
+        if !self.host.api().covers_slot(
+            core::mem::offset_of!(BamHostApi, sys_entity_get),
+            core::mem::size_of::<Option<BamSysEntityGetFn>>(),
+        ) {
+            return None;
+        }
+        let get_fn = self.host.api().sys_entity_get?;
+        let info = iter.column_info(term_index).ok()?;
+        if !info.mode.has_entity_column_data() || info.is_resource() || info.is_message() {
+            return None;
+        }
+        if !verify_same_mod_dynamic_component::<T>(self.host, info.uuid, info.size, info.align) {
+            return None;
+        }
+        // SAFETY: `self.sys_ctx` is active for `'a` and `&'b self` + `&'b iter` prevent mutable
+        // aliasing for `'b`.
+        let ptr = unsafe { get_fn(self.sys_ctx.cast_const(), query_index, entity, term_index) };
+        if ptr.is_null() {
+            return None;
+        }
+        if core::mem::size_of::<T>() == 0 {
+            // SAFETY: Zero-sized `T` may be referenced via `NonNull::dangling()`.
+            return Some(unsafe { core::ptr::NonNull::<T>::dangling().as_ref() });
+        }
+        if !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+            return None;
+        }
+        // SAFETY: Host verified query membership & declared access; `verify_same_mod_dynamic_component`
+        // confirmed `T`'s layout, UUID, and active same-binary VTable.
+        Some(unsafe { &*ptr.cast::<T>() })
+    }
+
+    /// Looks up an exclusive `&'b mut T` reference for a same-mod dynamic [`ModComponent`] on
+    /// `entity` using declared writable access on `(query_index, term_index)`.
+    pub fn entity_get_dynamic_mut_checked<'b, T: ModComponent>(
+        &'b mut self,
+        iter: &'b mut ValidatedIter<'a>,
+        query_index: usize,
+        term_index: usize,
+        entity: FfiEntity,
+    ) -> Option<&'b mut T> {
+        if self.sys_ctx.is_null() {
+            return None;
+        }
+        if !self.host.api().covers_slot(
+            core::mem::offset_of!(BamHostApi, sys_entity_get_mut),
+            core::mem::size_of::<Option<BamSysEntityGetMutFn>>(),
+        ) {
+            return None;
+        }
+        let get_mut_fn = self.host.api().sys_entity_get_mut?;
+        let info = iter.column_info(term_index).ok()?;
+        if !info.mode.is_mutable()
+            || !info.mode.has_entity_column_data()
+            || info.is_immutable()
+            || info.is_resource()
+            || info.is_message()
+        {
+            return None;
+        }
+        if !verify_same_mod_dynamic_component::<T>(self.host, info.uuid, info.size, info.align) {
+            return None;
+        }
+        // SAFETY: `self.sys_ctx` is active for `'a` and `&'b mut self` + `&'b mut iter` prevent
+        // aliasing borrows for `'b`.
+        let ptr = unsafe { get_mut_fn(self.sys_ctx, query_index, entity, term_index) };
+        if ptr.is_null() {
+            return None;
+        }
+        if core::mem::size_of::<T>() == 0 {
+            // SAFETY: Zero-sized `T` may be mutably referenced via `NonNull::dangling()`.
+            return Some(unsafe { core::ptr::NonNull::<T>::dangling().as_mut() });
+        }
+        if !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+            return None;
+        }
+        // SAFETY: Host verified writable access & stamped change ticks; `T`'s layout, UUID, and
+        // active same-binary VTable were verified.
+        Some(unsafe { &mut *ptr.cast::<T>() })
+    }
+}
+
+impl<'a> ValidatedCommands<'a> {
+    /// Moves an owned non-POD (or POD) [`ModComponent`] `value` into `BamHostApi::cmd_insert` via
+    /// [`ManuallyDrop`], dropping `value` on the guest heap if queueing fails before ownership
+    /// transfers to the host `CommandArena`.
+    pub fn insert_moved<T: ModComponent>(
+        &mut self,
+        entity: FfiEntity,
+        component: BamComponent,
+        value: T,
+    ) -> FfiResult {
+        let mut slot = ManuallyDrop::new(value);
+        let data_ptr = if core::mem::size_of::<T>() == 0 {
+            core::ptr::NonNull::<u8>::dangling().as_ptr().cast_const()
+        } else {
+            (&raw const *slot).cast::<u8>()
+        };
+        // SAFETY: `slot` remains alive on the stack during `insert_raw`. On `FfiResult::OK`, the
+        // host `CommandArena` copied `size_of::<T>()` bytes with ownership and `drop_fn`; on error,
+        // `slot` was not taken and is dropped cleanly below on the guest heap.
+        let status =
+            unsafe { self.insert_raw(entity, component, data_ptr, core::mem::size_of::<T>()) };
+        if !status.is_ok() {
+            // SAFETY: `insert_raw` failed before transferring ownership to the host.
+            unsafe {
+                ManuallyDrop::drop(&mut slot);
+            }
+        }
+        status
+    }
+
+    /// Spawns a fresh entity (mod-scoped or persistent) with an owned non-POD (or POD)
+    /// [`ModComponent`] `value` plus optional `extra` [`SpawnEntry`] items, dropping `value` on
+    /// the guest heap if spawning fails.
+    pub fn spawn_moved<T: ModComponent>(
+        &mut self,
+        component: BamComponent,
+        value: T,
+        extra: &[SpawnEntry<'_>],
+        persistent: bool,
+    ) -> Result<FfiEntity, FfiResult> {
+        let mut slot = ManuallyDrop::new(value);
+        if !component.is_valid() || extra.iter().any(|e| !e.component().is_valid()) {
+            // SAFETY: Ownership never transferred to the host.
+            unsafe {
+                ManuallyDrop::drop(&mut slot);
+            }
+            return Err(FfiResult::INVALID_COMPONENT);
+        }
+        let val_ptr = if core::mem::size_of::<T>() == 0 {
+            core::ptr::NonNull::<u8>::dangling().as_ptr().cast_const()
+        } else {
+            (&raw const *slot).cast::<u8>()
+        };
+        let mut comps = Vec::with_capacity(1 + extra.len());
+        let mut ptrs = Vec::with_capacity(1 + extra.len());
+        comps.push(component);
+        ptrs.push(val_ptr);
+        for entry in extra {
+            comps.push(entry.component());
+            ptrs.push(entry.data_ptr());
+        }
+        // SAFETY: `comps` and `ptrs` have matching length, `slot` remains live across the call,
+        // and each `extra` entry carries a valid `T: AbiPod` reference for `'a`.
+        let res = unsafe {
+            if persistent {
+                self.spawn_persistent_raw(&comps, &ptrs)
+            } else {
+                self.spawn_raw(&comps, &ptrs)
+            }
+        };
+        if res.is_err() {
+            // SAFETY: Spawn failed before transferring ownership into `CommandArena`.
+            unsafe {
+                ManuallyDrop::drop(&mut slot);
+            }
+        }
+        res
+    }
 }

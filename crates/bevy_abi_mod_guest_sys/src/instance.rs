@@ -1,13 +1,17 @@
 //! Per-World [`GuestInstance`] state container and `bevy_abi_mod_init` / `bevy_abi_mod_shutdown`
 //! lifecycle helpers with zero process-global mutable state.
 
-use core::ffi::{CStr, c_void};
+use core::ffi::{CStr, c_char, c_void};
+use std::collections::HashMap;
+use std::ffi::CString;
 
 use bevy_abi_mod_sys::{
-    BamHostApi, BamInstance, BamLoadCtx, BamManifest, BamStateWriterFn, FfiResult,
+    BamComponent, BamHostApi, BamInstance, BamLoadCtx, BamManifest, BamStateWriterFn,
+    ComponentDesc, ComponentUuid, FfiResult, ModComponent,
 };
 
 use crate::{
+    component::{generic_drop_trampoline, register_component_raw, resolve_component},
     host::{Host, ValidatedLoadCtx},
     panic::{catch_guest_result, catch_guest_unit},
     trampoline::ReentrantCell,
@@ -127,18 +131,29 @@ impl Drop for OwnedManifestBytes {
     }
 }
 
+#[derive(Clone, Copy)]
+struct GuestSymbolPtr(*const c_void);
+
+// SAFETY: `GuestSymbolPtr` stores `'static` function/VTable pointers owned by this guest binary
+// and valid for the lifetime of the loaded library.
+unsafe impl Send for GuestSymbolPtr {}
+// SAFETY: Shared read-only symbol pointers are immutable across threads.
+unsafe impl Sync for GuestSymbolPtr {}
+
 /// Heap-allocated per-World guest mod instance returned via `*instance_out` from
 /// `bevy_abi_mod_init` and reclaimed in `bevy_abi_mod_shutdown`.
 ///
 /// Owns the validated [`Host`] table, all registered system/`run_if` closure states, owned
-/// descriptor strings, hot-reload state hooks, and per-instance shutdown hooks so loading
-/// the same `.cdylib` into multiple Bevy `World`s simultaneously shares zero mutable global state.
+/// descriptor strings, per-instance `"bam.v0.*"` symbols, hot-reload state hooks, and per-instance
+/// shutdown hooks so loading the same `.cdylib` into multiple Bevy `World`s simultaneously shares
+/// zero mutable global state.
 pub struct GuestInstance {
     host: Host,
     allocations: Vec<ErasedAllocation>,
     shutdown_hooks: Vec<Box<dyn FnOnce() + Send + 'static>>,
     save_state_hook: Option<ReentrantCell<SaveStateHook>>,
     restore_state_hook: Option<ReentrantCell<RestoreStateHook>>,
+    symbols: HashMap<String, GuestSymbolPtr>,
     // Declared last so field drop runs strictly after `GuestInstance::drop` tears down every
     // closure/hook holding a copy of `host`.
     _runtime_allocs: Box<RuntimeAllocTracker>,
@@ -164,6 +179,7 @@ impl GuestInstance {
             shutdown_hooks: Vec::new(),
             save_state_hook: None,
             restore_state_hook: None,
+            symbols: HashMap::new(),
             _runtime_allocs: runtime_allocs,
             _manifest_bytes: manifest_bytes,
         }
@@ -232,6 +248,19 @@ impl GuestInstance {
             catch_guest_unit(hook);
         }
     }
+
+    /// Registers a `"bam.v0.*"` symbol address in this instance's symbol table.
+    pub fn register_symbol(&mut self, name: impl Into<String>, ptr: *const c_void) {
+        if !ptr.is_null() {
+            self.symbols.insert(name.into(), GuestSymbolPtr(ptr));
+        }
+    }
+
+    /// Resolves a `"bam.v0.*"` symbol previously registered on this instance.
+    #[inline]
+    pub fn resolve_symbol(&self, name: &str) -> Option<*const c_void> {
+        self.symbols.get(name).map(|entry| entry.0)
+    }
 }
 
 impl Drop for GuestInstance {
@@ -242,6 +271,7 @@ impl Drop for GuestInstance {
         self.shutdown_hooks.clear();
         self.save_state_hook = None;
         self.restore_state_hook = None;
+        self.symbols.clear();
         self._runtime_allocs.drain_lifo();
         while let Some(alloc) = self.allocations.pop() {
             drop(alloc);
@@ -419,4 +449,172 @@ pub unsafe extern "C" fn guest_restore_state_trampoline(
         };
         status
     })
+}
+
+/// Panic-safe `bevy_abi_mod_resolve_symbol` driver resolving a `"bam.v0.*"` symbol previously
+/// registered on `instance`.
+///
+/// Returns `null` if `instance` or `name` is null, `name` is not valid UTF-8, or no symbol matches.
+///
+/// # Safety
+/// - If `instance` is non-null, it must point to a live [`GuestInstance`] produced by
+///   [`init_guest_instance`] in this guest binary.
+/// - If `name` is non-null, it must point to a NUL-terminated C string.
+pub unsafe extern "C" fn resolve_guest_instance_symbol(
+    instance: *const BamInstance,
+    name: *const c_char,
+) -> *const c_void {
+    let mut out = core::ptr::null();
+    catch_guest_unit(|| {
+        if instance.is_null() || name.is_null() {
+            return;
+        }
+        // SAFETY: Caller guarantees `name` is a valid NUL-terminated C string for this call.
+        let Ok(name_str) = (unsafe { CStr::from_ptr(name) }).to_str() else {
+            return;
+        };
+        // SAFETY: Caller guarantees `instance` points to a live `GuestInstance` prior to shutdown.
+        let inst = unsafe { &*instance.cast::<GuestInstance>() };
+        if let Some(ptr) = inst.resolve_symbol(name_str) {
+            out = ptr;
+        }
+    });
+    out
+}
+
+/// Computes the manifest-qualified `(canonical_name, ComponentUuid)` pair for `T: ModComponent`.
+pub fn qualify_mod_component_identity<T: ModComponent>(
+    manifest_name: &str,
+) -> Result<(String, ComponentUuid), FfiResult> {
+    let raw_name = T::CANONICAL_NAME;
+    if raw_name.is_empty() {
+        return Err(FfiResult::INVALID_ARGUMENT);
+    }
+    if raw_name.contains("::") || manifest_name.is_empty() {
+        return Ok((raw_name.to_string(), T::UUID));
+    }
+    let qualified = format!("{manifest_name}::{raw_name}");
+    let default_canonical_uuid = ComponentUuid::from_canonical_name(raw_name);
+    let default_parts_uuid = ComponentUuid::from_parts(
+        raw_name,
+        core::mem::size_of::<T>(),
+        core::mem::align_of::<T>(),
+        0,
+    );
+    let uuid = if T::UUID == default_canonical_uuid {
+        ComponentUuid::from_canonical_name(&qualified)
+    } else if T::UUID == default_parts_uuid {
+        ComponentUuid::from_parts(
+            &qualified,
+            core::mem::size_of::<T>(),
+            core::mem::align_of::<T>(),
+            0,
+        )
+    } else {
+        T::UUID
+    };
+    Ok((qualified, uuid))
+}
+
+/// Resolves a dynamic [`ModComponent`] handle on `host`, trying the manifest-qualified name first
+/// when `T::CANONICAL_NAME` lacks `"::"` and falling back to `(T::COMPONENT_CSTR, T::UUID)`.
+pub fn resolve_mod_component<T: ModComponent>(host: &Host) -> Result<BamComponent, FfiResult> {
+    let (qualified, uuid) = qualify_mod_component_identity::<T>(host.manifest_name())?;
+    let Ok(qualified_cstr) = CString::new(qualified.as_bytes()) else {
+        return Err(FfiResult::INVALID_ARGUMENT);
+    };
+    match resolve_component(host, Some(qualified_cstr.as_c_str()), Some(uuid)) {
+        Ok(comp) => Ok(comp),
+        Err(FfiResult::NOT_FOUND) if qualified != T::CANONICAL_NAME => {
+            resolve_component(host, Some(T::COMPONENT_CSTR), Some(T::UUID))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Panic-safe `extern "C"` default-constructor trampoline writing `T::default()` into `dst`.
+///
+/// # Safety
+/// When `size_of::<T>() > 0`, `dst` must be non-null, aligned to `align_of::<T>()`, and point to
+/// `size_of::<T>()` writable bytes whose ownership transfers to the caller on [`FfiResult::OK`].
+unsafe extern "C" fn init_default_trampoline<T: Default>(dst: *mut c_void) -> FfiResult {
+    catch_guest_result(|| {
+        let size = core::mem::size_of::<T>();
+        if size == 0 {
+            let val = T::default();
+            core::mem::forget(val);
+            return FfiResult::OK;
+        }
+        if dst.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if !(dst as usize).is_multiple_of(core::mem::align_of::<T>()) {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        let val = T::default();
+        // SAFETY: Verified `dst` is non-null, aligned for `T`, and writable for `size_of::<T>()`
+        // bytes; ownership transfers to the host caller.
+        unsafe {
+            core::ptr::write(dst.cast::<T>(), val);
+        }
+        FfiResult::OK
+    })
+}
+
+impl<'a> ValidatedLoadCtx<'a> {
+    /// Registers a non-POD (or POD) [`ModComponent`] dynamic component `T` with automatic
+    /// manifest qualification, panic-guarded guest `ComponentDropFn`, `T::erased_vtable_ptr()`,
+    /// `"bam.v0.<name>.init_default"`, and all `T::symbols()` (`vtable`, `field_info`,
+    /// `export_fields`, `import_field`, getters/setters) stored in [`GuestInstance`].
+    pub fn register_dynamic_mod_component<T: ModComponent + Default + Send + Sync + 'static>(
+        &self,
+        instance: &mut GuestInstance,
+        flags: u32,
+    ) -> Result<BamComponent, FfiResult> {
+        let (qualified_name, uuid) = qualify_mod_component_identity::<T>(instance.manifest_name())?;
+        let Ok(owned_name) = CString::new(qualified_name.as_bytes()) else {
+            return Err(FfiResult::INVALID_ARGUMENT);
+        };
+        let raw_name = instance.track_allocation(Box::new(owned_name));
+        // SAFETY: `raw_name` was allocated via `instance.track_allocation` and remains pinned and
+        // valid until `bevy_abi_mod_shutdown` (or rollback).
+        let name_ptr = unsafe { (*raw_name).as_ptr() };
+
+        let mut desc = ComponentDesc::new(
+            name_ptr,
+            uuid,
+            core::mem::size_of::<T>(),
+            core::mem::align_of::<T>(),
+        )
+        .with_flags(flags | T::COMPONENT_FLAGS)
+        .with_vtable(T::erased_vtable_ptr());
+
+        if core::mem::needs_drop::<T>() {
+            desc = desc.with_drop(generic_drop_trampoline::<T>);
+        }
+
+        // SAFETY: `self.as_raw()` was validated in `ValidatedLoadCtx::from_raw`, `name_ptr` is
+        // owned by `instance`, `T::erased_vtable_ptr()` is `'static`, and `generic_drop_trampoline`
+        // catches panics and drops `T` in place on the guest heap.
+        let handle = unsafe { register_component_raw(self.as_raw(), self.host(), &desc) }?;
+
+        let canonical = T::CANONICAL_NAME;
+        let canonical_prefix = format!("bam.v0.{canonical}.");
+        for entry in T::symbols() {
+            instance.register_symbol(entry.name, entry.ptr);
+            if qualified_name != canonical
+                && let Some(suffix) = entry.name.strip_prefix(&canonical_prefix)
+            {
+                instance.register_symbol(format!("bam.v0.{qualified_name}.{suffix}"), entry.ptr);
+            }
+        }
+
+        let init_ptr = init_default_trampoline::<T> as *const c_void;
+        instance.register_symbol(format!("bam.v0.{canonical}.init_default"), init_ptr);
+        if qualified_name != canonical {
+            instance.register_symbol(format!("bam.v0.{qualified_name}.init_default"), init_ptr);
+        }
+
+        Ok(handle)
+    }
 }

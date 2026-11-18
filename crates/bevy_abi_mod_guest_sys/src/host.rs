@@ -233,6 +233,17 @@ impl Host {
         self
     }
 
+    /// Returns a copy of this [`Host`] updated to reference `host_ctx` for the active invocation.
+    ///
+    /// # Safety
+    /// If `host_ctx` is non-null, it must point to an active [`BamHostCtx`] valid for the
+    /// lifetime of every copy of the returned [`Host`].
+    #[inline]
+    pub const unsafe fn with_host_ctx_ptr(mut self, host_ctx: *const BamHostCtx) -> Self {
+        self.host_ctx = HostCtxPtr(host_ctx);
+        self
+    }
+
     /// Binds a heap-pinned [`RuntimeAllocTracker`] owned by [`GuestInstance`] so runtime
     /// `ValidatedCommands::observe*` closures are tracked and freed cleanly on shutdown.
     ///

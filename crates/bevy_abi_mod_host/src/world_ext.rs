@@ -11,6 +11,11 @@ use crate::schedule_sets::{
     run_late_startup_systems_in_world, schedule_mod_systems_in_world,
 };
 pub use bevy_abi_mod_host_sys::loader::ModScoped;
+use bevy_abi_mod_host_sys::loader::{
+    ReloadColumnSnapshot, cleanup_orphaned_mod_scoped_entities,
+    excise_and_unload_mod_for_reload_in_world, migrate_mod_scoped_entities,
+    restore_mod_dynamic_columns_after_reload, snapshot_mod_dynamic_columns_for_reload,
+};
 use bevy_abi_mod_host_sys::{
     ComponentCollisionError, ComponentOptions, LoadOptions, LoadedMod, ModErrorPolicy,
     ModErrorPolicyConfig, ModHost, ModId, ModLoadError, ModQuarantine, ModRegistry, WorldDropGuard,
@@ -192,10 +197,28 @@ fn load_mod_with_optional_state(
     options: LoadOptions,
     saved_state: Option<&[u8]>,
 ) -> Result<ModId, ModLoadError> {
+    load_mod_with_optional_state_and_migration(world, path, options, saved_state, None)
+}
+
+fn load_mod_with_optional_state_and_migration(
+    world: &mut World,
+    path: &Path,
+    options: LoadOptions,
+    saved_state: Option<&[u8]>,
+    reload_migration: Option<(ModId, ReloadColumnSnapshot)>,
+) -> Result<ModId, ModLoadError> {
     ensure_world_mod_resources(world);
     let path_buf = path.to_path_buf();
 
-    let (mod_id, systems) = load_mod_in_world(world, &path_buf, &options)?;
+    let (mod_id, systems) = match load_mod_in_world(world, &path_buf, &options) {
+        Ok(res) => res,
+        Err(err) => {
+            if let Some((old_id, _)) = reload_migration {
+                cleanup_orphaned_mod_scoped_entities(world, old_id);
+            }
+            return Err(err);
+        }
+    };
 
     let (mod_name, mod_version) = world
         .get_resource::<ModHost>()
@@ -211,6 +234,9 @@ fn load_mod_with_optional_state(
                 let sys_name = sys.system_name().to_string();
                 drop(systems);
                 rollback_unscheduled_mod_in_world(world, mod_id);
+                if let Some((old_id, _)) = reload_migration {
+                    cleanup_orphaned_mod_scoped_entities(world, old_id);
+                }
                 return Err(ModLoadError::MissingComponents {
                     path: path_buf,
                     system_name: sys_name,
@@ -229,6 +255,9 @@ fn load_mod_with_optional_state(
     ) {
         drop(systems);
         rollback_unscheduled_mod_in_world(world, mod_id);
+        if let Some((old_id, _)) = reload_migration {
+            cleanup_orphaned_mod_scoped_entities(world, old_id);
+        }
         return Err(err);
     }
 
@@ -237,7 +266,20 @@ fn load_mod_with_optional_state(
     {
         drop(systems);
         rollback_unscheduled_mod_in_world(world, mod_id);
+        if let Some((old_id, _)) = reload_migration {
+            cleanup_orphaned_mod_scoped_entities(world, old_id);
+        }
         return Err(err);
+    }
+
+    if let Some((old_id, col_snapshot)) = reload_migration {
+        if let Err(err) = restore_mod_dynamic_columns_after_reload(world, mod_id, col_snapshot) {
+            drop(systems);
+            rollback_unscheduled_mod_in_world(world, mod_id);
+            cleanup_orphaned_mod_scoped_entities(world, old_id);
+            return Err(err);
+        }
+        migrate_mod_scoped_entities(world, old_id, mod_id);
     }
 
     let system_count = systems.len();
@@ -277,6 +319,18 @@ fn load_mod_with_optional_state(
 fn unload_single_mod_in_world(world: &mut World, id: ModId) -> Result<(), ModLoadError> {
     let (mod_name, unloaded_path, removed_systems) =
         excise_and_unload_mod_in_world(world, id, |w| {
+            despawn_loaded_mod_entities(w, id);
+        })?;
+    if let Some(mut dag) = world.get_resource_mut::<ModDependencyGraph>() {
+        dag.unregister_mod(id);
+    }
+    emit_mod_unloaded_once(world, id, &mod_name, unloaded_path, removed_systems);
+    Ok(())
+}
+
+fn unload_single_mod_for_reload_in_world(world: &mut World, id: ModId) -> Result<(), ModLoadError> {
+    let (mod_name, unloaded_path, removed_systems) =
+        excise_and_unload_mod_for_reload_in_world(world, id, |w| {
             despawn_loaded_mod_entities(w, id);
         })?;
     if let Some(mut dag) = world.get_resource_mut::<ModDependencyGraph>() {
@@ -368,20 +422,36 @@ fn reload_mod_cascade(
         saved_states[idx] = blob;
     }
 
-    // Unload in reverse topological order (`C -> B -> A`).
+    // Snapshot live dynamic component columns & unload in reverse topological order (`C -> B -> A`),
+    // preserving `ModScoped(old_id)` entities across the reload.
+    let mut column_snapshots: Vec<Option<ReloadColumnSnapshot>> = vec![None; plan.len()];
     for idx in (0..plan.len()).rev() {
-        unload_single_mod_in_world(world, plan[idx].old_id)?;
+        let col_snap = snapshot_mod_dynamic_columns_for_reload(world, plan[idx].old_id)?;
+        column_snapshots[idx] = Some(col_snap);
+        unload_single_mod_for_reload_in_world(world, plan[idx].old_id)?;
     }
 
-    // Reload in forward topological order (`A -> B -> C`), restoring state on each mod.
+    // Reload in forward topological order (`A -> B -> C`), restoring state and migrating
+    // dynamic columns + `ModScoped` ownership onto each reloaded `ModId`.
     let mut new_root_id: Option<ModId> = None;
-    for (idx, item) in plan.into_iter().enumerate() {
-        let new_id = load_mod_with_optional_state(
+    let mut plan_iter = plan.into_iter().enumerate();
+    while let Some((idx, item)) = plan_iter.next() {
+        let col_snap = column_snapshots[idx].take().unwrap_or_default();
+        let new_id = match load_mod_with_optional_state_and_migration(
             world,
             &item.target_path,
             item.options.clone(),
             saved_states[idx].as_deref(),
-        )?;
+            Some((item.old_id, col_snap)),
+        ) {
+            Ok(id) => id,
+            Err(err) => {
+                for (_, remaining) in plan_iter {
+                    cleanup_orphaned_mod_scoped_entities(world, remaining.old_id);
+                }
+                return Err(err);
+            }
+        };
         if let Some(mut dag) = world.get_resource_mut::<ModDependencyGraph>() {
             dag.register_loaded_mod(
                 new_id,
