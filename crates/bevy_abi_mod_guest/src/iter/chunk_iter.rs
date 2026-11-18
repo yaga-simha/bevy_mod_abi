@@ -2,8 +2,10 @@
 
 use core::marker::PhantomData;
 
-use bevy_abi_mod_guest_sys::{Host, SparseRows, SparseRowsMut, ValidatedIter};
-use bevy_abi_mod_sys::{AbiPod, BamChangeTicks, BamColumnInfo, BamIter, FfiEntity, FfiResult};
+use bevy_abi_mod_guest_sys::{Host, SparseRows, SparseRowsMut, UuidFilter, ValidatedIter};
+use bevy_abi_mod_sys::{
+    AbiPod, BamChangeTicks, BamColumnInfo, BamIter, FfiEntity, FfiResult, ModComponent,
+};
 
 use crate::{
     app::{GuestRes, GuestResMut, IntoSystemResult},
@@ -341,6 +343,47 @@ impl<'a> ChunkIter<'a> {
             self.inner
                 .send_messages_batch_checked::<M>(term_index, Some(filter), messages);
         if status.is_ok() { Ok(()) } else { Err(status) }
+    }
+
+    /// Drains unread VTable-backed non-POD messages (`M: ModComponent + Default`) from
+    /// `term_index`, reconstructing each host message safely across the FFI boundary.
+    #[inline]
+    pub fn read_non_pod_messages<M: ModComponent + Default>(
+        &mut self,
+        term_index: usize,
+    ) -> Result<Vec<M>, FfiResult> {
+        self.inner
+            .drain_non_pod_messages_checked::<M>(term_index, Some(UuidFilter::exact(M::UUID)))
+    }
+
+    /// Reads up to `max_count` unread VTable-backed non-POD messages (`M: ModComponent + Default`)
+    /// from `term_index`.
+    #[inline]
+    pub fn read_non_pod_messages_batch<M: ModComponent + Default>(
+        &mut self,
+        term_index: usize,
+        max_count: usize,
+    ) -> Result<Vec<M>, FfiResult> {
+        self.inner.read_non_pod_messages_checked::<M>(
+            term_index,
+            Some(UuidFilter::exact(M::UUID)),
+            max_count,
+        )
+    }
+
+    /// Sends a VTable-backed non-POD message (`M: ModComponent`) on `term_index` declared with
+    /// `MESSAGE_WRITE`.
+    #[inline]
+    pub fn send_non_pod_message<M: ModComponent>(
+        &mut self,
+        term_index: usize,
+        msg: &M,
+    ) -> FfiResult {
+        self.inner.send_non_pod_message_checked::<M>(
+            term_index,
+            Some(UuidFilter::exact(M::UUID)),
+            msg,
+        )
     }
 }
 

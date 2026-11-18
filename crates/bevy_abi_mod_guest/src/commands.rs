@@ -2,8 +2,11 @@
 
 use core::ffi::CStr;
 
+pub use bevy_abi_mod_guest_sys::SpawnBatchColumn;
 use bevy_abi_mod_guest_sys::{Host, SpawnEntry, ValidatedCommands, resolve_component};
-use bevy_abi_mod_sys::{AbiPod, BamCommands, BamComponent, ComponentUuid, FfiEntity, FfiResult};
+use bevy_abi_mod_sys::{
+    AbiPod, BamCommands, BamComponent, BamTermDesc, ComponentUuid, FfiEntity, FfiResult,
+};
 
 use crate::component::{GuestComponent, resolve_guest_component};
 
@@ -182,6 +185,69 @@ impl<'a> GuestCommands<'a> {
     ) -> Result<(), FfiResult> {
         let status = self.inner.trigger(handle, target, event);
         if status.is_ok() { Ok(()) } else { Err(status) }
+    }
+
+    /// Spawns `entity_count` entities in one FFI call using Structure-of-Arrays component
+    /// columns, returning all reserved [`FfiEntity`] handles.
+    #[inline]
+    pub fn spawn_batch(
+        &mut self,
+        columns: &[SpawnBatchColumn<'_>],
+        entity_count: usize,
+    ) -> Result<Vec<FfiEntity>, FfiResult> {
+        let mut out = vec![FfiEntity::NULL; entity_count];
+        let status = self
+            .inner
+            .spawn_batch_columns(columns, entity_count, Some(&mut out));
+        if status.is_ok() { Ok(out) } else { Err(status) }
+    }
+
+    /// Spawns `entity_count` entities in one FFI call using Structure-of-Arrays component
+    /// columns, optionally writing reserved [`FfiEntity`] handles into `out_entities`.
+    #[inline]
+    pub fn spawn_batch_into(
+        &mut self,
+        columns: &[SpawnBatchColumn<'_>],
+        entity_count: usize,
+        out_entities: Option<&mut [FfiEntity]>,
+    ) -> Result<(), FfiResult> {
+        let status = self
+            .inner
+            .spawn_batch_columns(columns, entity_count, out_entities);
+        if status.is_ok() { Ok(()) } else { Err(status) }
+    }
+
+    /// Queues a deferred query-filtered bulk despawn of non-resource entities matching `terms`.
+    #[inline]
+    pub fn despawn_all(&mut self, terms: &[BamTermDesc]) -> Result<(), FfiResult> {
+        let status = self.inner.despawn_all(terms);
+        if status.is_ok() { Ok(()) } else { Err(status) }
+    }
+
+    /// Queues a deferred conditional insertion (`InsertMode::Keep`) of `value` (`T: AbiPod`) onto
+    /// `entity` only if `component` is not already present.
+    #[inline]
+    pub fn insert_if_new<T: AbiPod>(
+        &mut self,
+        entity: FfiEntity,
+        component: BamComponent,
+        value: &T,
+    ) -> Result<(), FfiResult> {
+        let status = self.inner.insert_if_new(entity, component, value);
+        if status.is_ok() { Ok(()) } else { Err(status) }
+    }
+
+    /// Resolves `T: GuestComponent` and queues a deferred conditional insertion (`InsertMode::Keep`)
+    /// onto `entity` only if absent.
+    #[inline]
+    pub fn insert_component_if_new<T: GuestComponent>(
+        &mut self,
+        entity: FfiEntity,
+        value: &T,
+    ) -> Result<(), FfiResult> {
+        let host = self.inner.host();
+        let comp = resolve_guest_component::<T>(host, host.manifest_name())?;
+        self.insert_if_new(entity, comp, value)
     }
 }
 

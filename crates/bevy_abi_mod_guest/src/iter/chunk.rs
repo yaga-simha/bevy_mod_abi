@@ -1,8 +1,10 @@
 //! Safe per-chunk view (`Chunk`) enforcing Rust borrow rules across dense columns, sparse rows,
 //! and fine-grained change-tick marking.
 
-use bevy_abi_mod_guest_sys::{ChunkColumnDispenser, SparseRows, SparseRowsMut, ValidatedIter};
-use bevy_abi_mod_sys::{AbiPod, BamColumnInfo, FfiEntity, FfiResult};
+use bevy_abi_mod_guest_sys::{
+    ChunkColumnDispenser, SparseRows, SparseRowsMut, UuidFilter, ValidatedIter,
+};
+use bevy_abi_mod_sys::{AbiPod, BamColumnInfo, FfiEntity, FfiResult, ModComponent};
 
 use crate::{
     component::{GuestComponent, guest_uuid_filter},
@@ -388,5 +390,46 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
         let filter = guest_uuid_filter::<M>(self.iter.host().manifest_name());
         self.iter
             .send_message_checked::<M>(term_index, Some(filter), msg)
+    }
+
+    /// Drains unread VTable-backed non-POD messages (`M: ModComponent + Default`) from
+    /// `term_index`.
+    #[inline]
+    pub fn read_non_pod_messages<M: ModComponent + Default>(
+        &mut self,
+        term_index: usize,
+    ) -> Result<Vec<M>, FfiResult> {
+        self.iter
+            .drain_non_pod_messages_checked::<M>(term_index, Some(UuidFilter::exact(M::UUID)))
+    }
+
+    /// Reads up to `max_count` unread VTable-backed non-POD messages (`M: ModComponent + Default`)
+    /// from `term_index`.
+    #[inline]
+    pub fn read_non_pod_messages_batch<M: ModComponent + Default>(
+        &mut self,
+        term_index: usize,
+        max_count: usize,
+    ) -> Result<Vec<M>, FfiResult> {
+        self.iter.read_non_pod_messages_checked::<M>(
+            term_index,
+            Some(UuidFilter::exact(M::UUID)),
+            max_count,
+        )
+    }
+
+    /// Sends a VTable-backed non-POD message (`M: ModComponent`) on `term_index` declared with
+    /// `MESSAGE_WRITE`.
+    #[inline]
+    pub fn send_non_pod_message<M: ModComponent>(
+        &mut self,
+        term_index: usize,
+        msg: &M,
+    ) -> FfiResult {
+        self.iter.send_non_pod_message_checked::<M>(
+            term_index,
+            Some(UuidFilter::exact(M::UUID)),
+            msg,
+        )
     }
 }

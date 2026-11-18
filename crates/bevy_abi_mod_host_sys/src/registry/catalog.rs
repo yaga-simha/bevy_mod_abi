@@ -12,7 +12,8 @@ use bevy_abi_mod_sys::{
     BAM_COMPONENT_FLAG_SUMMARY_TICK, BAM_STORAGE_FLAG_ENTITY_EVENT, BAM_STORAGE_FLAG_EVENT,
     BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE,
     BAM_STORAGE_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_SUMMARY_TICK, BamComponent, ComponentDesc,
-    ComponentDropFn, ComponentUuid, FfiChildOf, FfiEntity, FfiResult, ModComponent, RawInsertable,
+    ComponentDropFn, ComponentUuid, FfiChildOf, FfiEntity, FfiResult, FfiSlice, ModComponent,
+    RawInsertable, StrView,
 };
 use bevy_ecs::change_detection::Tick;
 use bevy_ecs::component::ComponentId;
@@ -216,20 +217,17 @@ unsafe fn msg_read_batch_impl<M: Message + AbiPod>(
     FfiResult::OK
 }
 
-unsafe fn msg_send_impl<M: Message + AbiPod>(
+/// Pushes a constructed `msg: M` into the World's `Messages<M>` resource, stamping `this_run`.
+///
+/// # Safety
+/// Caller must guarantee `MESSAGE_WRITE` on `msg_res_id` was declared in `FilteredAccessSet`.
+unsafe fn push_message_to_world<M: Message>(
     world: UnsafeWorldCell<'_>,
     last_run: Tick,
     this_run: Tick,
     msg_res_id: ComponentId,
-    data_ptr: *const u8,
-    data_len: usize,
+    msg: M,
 ) -> FfiResult {
-    if data_len != core::mem::size_of::<M>() {
-        return FfiResult::INVALID_ARGUMENT;
-    }
-    if data_len > 0 && data_ptr.is_null() {
-        return FfiResult::NULL_POINTER;
-    }
     // SAFETY: `MESSAGE_WRITE` on `msg_res_id` (`Messages<M>`) was declared in `FilteredAccessSet`,
     // granting exclusive mutable access to `Messages<M>` and its resource entity.
     let Some(entity) = (unsafe { world.resource_entities() }).get(msg_res_id) else {
@@ -244,6 +242,24 @@ unsafe fn msg_send_impl<M: Message + AbiPod>(
     };
     // SAFETY: `msg_res_id` was registered for `Messages<M>`.
     let mut messages = unsafe { mut_untyped.with_type::<Messages<M>>() };
+    messages.write(msg);
+    FfiResult::OK
+}
+
+unsafe fn msg_send_impl<M: Message + AbiPod>(
+    world: UnsafeWorldCell<'_>,
+    last_run: Tick,
+    this_run: Tick,
+    msg_res_id: ComponentId,
+    data_ptr: *const u8,
+    data_len: usize,
+) -> FfiResult {
+    if data_len != core::mem::size_of::<M>() {
+        return FfiResult::INVALID_ARGUMENT;
+    }
+    if data_len > 0 && data_ptr.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
     let msg: M = if data_len == 0 {
         // SAFETY: `M: AbiPod` is zero-sized, `Copy`, and valid when zeroed.
         unsafe { core::mem::MaybeUninit::<M>::zeroed().assume_init() }
@@ -251,8 +267,155 @@ unsafe fn msg_send_impl<M: Message + AbiPod>(
         // SAFETY: `data_ptr` is non-null and readable for `size_of::<M>()` bytes.
         unsafe { core::ptr::read_unaligned(data_ptr.cast::<M>()) }
     };
-    messages.write(msg);
+    // SAFETY: Caller declared `MESSAGE_WRITE` on `msg_res_id`.
+    unsafe { push_message_to_world(world, last_run, this_run, msg_res_id, msg) }
+}
+
+unsafe fn msg_read_batch_non_pod_impl<M: Message>(
+    world: UnsafeWorldCell<'_>,
+    msg_res_id: ComponentId,
+    cursor: &mut dyn Any,
+    out_buf: *mut u8,
+    max_count: usize,
+    out_count: *mut usize,
+) -> FfiResult {
+    // SAFETY: Caller guarantees `out_count` is non-null and writable.
+    unsafe {
+        *out_count = 0;
+    }
+    let Some(typed_cursor) = cursor.downcast_mut::<MessageCursor<M>>() else {
+        return FfiResult::TYPE_MISMATCH;
+    };
+    if max_count == 0 {
+        return FfiResult::OK;
+    }
+    if out_buf.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    // SAFETY: `MESSAGE_READ` or `MESSAGE_WRITE` on `msg_res_id` (`Messages<M>`) was declared in `FilteredAccessSet`.
+    let Some(res_ptr) = (unsafe { world.get_resource_by_id(msg_res_id) }) else {
+        return FfiResult::OK;
+    };
+    // SAFETY: `msg_res_id` was registered from `world.register_component::<Messages<M>>()`.
+    let messages: &Messages<M> = unsafe { res_ptr.deref::<Messages<M>>() };
+    let mut written = 0usize;
+    for msg in typed_cursor.read(messages).take(max_count) {
+        let msg_ptr = core::ptr::from_ref(msg).cast::<c_void>();
+        // SAFETY: `out_buf` is writable for `max_count * size_of::<*const c_void>()` bytes;
+        // `write_unaligned` preserves full pointer provenance regardless of `out_buf` alignment.
+        #[allow(clippy::cast_ptr_alignment)]
+        unsafe {
+            core::ptr::write_unaligned(
+                out_buf
+                    .add(written * core::mem::size_of::<*const c_void>())
+                    .cast::<*const c_void>(),
+                msg_ptr,
+            );
+        }
+        written += 1;
+    }
+    // SAFETY: `out_count` is non-null and writable.
+    unsafe {
+        *out_count = written;
+    }
     FfiResult::OK
+}
+
+fn read_u32_framed_slice<'a>(bytes: &'a [u8], pos: &mut usize) -> Result<&'a [u8], FfiResult> {
+    let end_len = pos.checked_add(4).ok_or(FfiResult::INVALID_ARGUMENT)?;
+    let len_hdr = bytes
+        .get(*pos..end_len)
+        .ok_or(FfiResult::INVALID_ARGUMENT)?;
+    let len = u32::from_le_bytes([len_hdr[0], len_hdr[1], len_hdr[2], len_hdr[3]]) as usize;
+    *pos = end_len;
+    let end_payload = pos.checked_add(len).ok_or(FfiResult::INVALID_ARGUMENT)?;
+    let payload = bytes
+        .get(*pos..end_payload)
+        .ok_or(FfiResult::INVALID_ARGUMENT)?;
+    *pos = end_payload;
+    Ok(payload)
+}
+
+unsafe fn msg_send_non_pod_impl<M: Message + ModComponent + Default>(
+    world: UnsafeWorldCell<'_>,
+    last_run: Tick,
+    this_run: Tick,
+    msg_res_id: ComponentId,
+    data_ptr: *const u8,
+    data_len: usize,
+) -> FfiResult {
+    if data_len < 4 {
+        return FfiResult::INVALID_ARGUMENT;
+    }
+    if data_ptr.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    let Some(sym) = M::symbols().iter().find(|s| {
+        s.name
+            .strip_prefix("bam.v0.")
+            .and_then(|rest| rest.strip_suffix(".import_field"))
+            == Some(M::CANONICAL_NAME)
+    }) else {
+        return FfiResult::UNSUPPORTED;
+    };
+    if sym.ptr.is_null() {
+        return FfiResult::UNSUPPORTED;
+    }
+    type ImportFieldFn = unsafe extern "C" fn(
+        dst_ptr: *mut c_void,
+        field_name: StrView,
+        type_tag: StrView,
+        payload: FfiSlice<u8>,
+    ) -> FfiResult;
+    // SAFETY: Witness codegen exports `"bam.v0.<M>.import_field"` with `ImportFieldFn` signature.
+    let import_fn: ImportFieldFn = unsafe { core::mem::transmute(sym.ptr) };
+
+    // SAFETY: Caller guarantees `data_ptr` is readable for `data_len` bytes (`>= 4`).
+    let bytes = unsafe { core::slice::from_raw_parts(data_ptr, data_len) };
+    let field_count = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    let mut pos = 4usize;
+    let mut host_msg = M::default();
+
+    for _ in 0..field_count {
+        let name_bytes = match read_u32_framed_slice(bytes, &mut pos) {
+            Ok(s) => s,
+            Err(err) => return err,
+        };
+        let Ok(name_str) = core::str::from_utf8(name_bytes) else {
+            return FfiResult::INVALID_UTF8;
+        };
+        let tag_bytes = match read_u32_framed_slice(bytes, &mut pos) {
+            Ok(s) => s,
+            Err(err) => return err,
+        };
+        let Ok(tag_str) = core::str::from_utf8(tag_bytes) else {
+            return FfiResult::INVALID_UTF8;
+        };
+        let val_bytes = match read_u32_framed_slice(bytes, &mut pos) {
+            Ok(s) => s,
+            Err(err) => return err,
+        };
+
+        // SAFETY: `&raw mut host_msg` points to an initialized `M`, and `StrView` / `FfiSlice`
+        // borrow valid UTF-8 / byte slices for the synchronous duration of `import_fn`.
+        let status = unsafe {
+            import_fn(
+                (&raw mut host_msg).cast::<c_void>(),
+                StrView::from_str(name_str),
+                StrView::from_str(tag_str),
+                FfiSlice::from_slice(val_bytes),
+            )
+        };
+        if !status.is_ok() {
+            return status;
+        }
+    }
+
+    if pos != bytes.len() {
+        return FfiResult::INVALID_ARGUMENT;
+    }
+    // SAFETY: Caller declared `MESSAGE_WRITE` on `msg_res_id`.
+    unsafe { push_message_to_world(world, last_run, this_run, msg_res_id, host_msg) }
 }
 
 /// Monomorphized typed component insertion function using unaligned memory reading.
@@ -1094,15 +1257,62 @@ impl ModRegistry {
         &mut self,
         messages_res_id: ComponentId,
     ) -> Result<BamComponent, ComponentCollisionError> {
+        self.register_message_inner::<M>(
+            messages_res_id,
+            true,
+            Some(msg_read_batch_impl::<M>),
+            Some(msg_send_impl::<M>),
+            Some(msg_write_batch_impl::<M>),
+        )
+    }
+
+    /// Registers a VTable-backed non-POD Bevy [`Message`] type (`Messages<M>`) implementing
+    /// [`ModComponent`] + [`Default`] (e.g. containing `String` or `Vec<T>` fields), returning its
+    /// 1-based [`BamComponent`] handle.
+    ///
+    /// - `msg_read_batch` writes `*const c_void` (`usize`) pointers to host `&M` items inside
+    ///   `Messages<M>`, which guests inspect through the exported `"bam.v0.<M>.export_fields"`
+    ///   witness symbol.
+    /// - `msg_send` accepts field-witness packets `[u32 field_count; (name, tag, payload)*]` and
+    ///   reconstructs `M` on the host allocator via `"bam.v0.<M>.import_field"`.
+    pub fn register_non_pod_message<M: Message + ModComponent + Default>(
+        &mut self,
+        messages_res_id: ComponentId,
+    ) -> Result<BamComponent, ComponentCollisionError> {
+        self.register_message_inner::<M>(
+            messages_res_id,
+            false,
+            Some(msg_read_batch_non_pod_impl::<M>),
+            Some(msg_send_non_pod_impl::<M>),
+            None,
+        )
+    }
+
+    fn register_message_inner<M: Message + ModComponent>(
+        &mut self,
+        messages_res_id: ComponentId,
+        is_abi_pod: bool,
+        msg_read_batch_fn: Option<MsgReadBatchFn>,
+        msg_send_fn: Option<MsgSendFn>,
+        msg_write_batch_fn: Option<MsgWriteBatchFn>,
+    ) -> Result<BamComponent, ComponentCollisionError> {
         let storage_flags =
             component_flags_to_storage_flags(M::COMPONENT_FLAGS) | BAM_STORAGE_FLAG_MESSAGE;
         let name_str = M::CANONICAL_NAME;
         let uuid = M::UUID;
+        let (wire_size, wire_align) = if is_abi_pod {
+            (M::size(), M::align())
+        } else {
+            (
+                core::mem::size_of::<*const c_void>(),
+                core::mem::align_of::<*const c_void>(),
+            )
+        };
         self.check_registration_collision(
             name_str,
             uuid,
-            M::size(),
-            M::align(),
+            wire_size,
+            wire_align,
             storage_flags,
             Some(messages_res_id),
         )?;
@@ -1113,10 +1323,13 @@ impl ModRegistry {
             let handle = if let Some(&existing_handle) = snap.by_name.get(name_str) {
                 let idx = (existing_handle.0 - 1) as usize;
                 snap.entries[idx].vtable_ptr = sym_addr;
+                snap.entries[idx].size = wire_size;
+                snap.entries[idx].align = wire_align;
+                snap.entries[idx].is_abi_pod = is_abi_pod;
                 snap.entries[idx].create_msg_cursor_fn = Some(create_msg_cursor_impl::<M>);
-                snap.entries[idx].msg_read_batch_fn = Some(msg_read_batch_impl::<M>);
-                snap.entries[idx].msg_send_fn = Some(msg_send_impl::<M>);
-                snap.entries[idx].msg_write_batch_fn = Some(msg_write_batch_impl::<M>);
+                snap.entries[idx].msg_read_batch_fn = msg_read_batch_fn;
+                snap.entries[idx].msg_send_fn = msg_send_fn;
+                snap.entries[idx].msg_write_batch_fn = msg_write_batch_fn;
                 existing_handle
             } else {
                 let next_raw = u32::try_from(snap.entries.len() + 1)
@@ -1128,10 +1341,10 @@ impl ModRegistry {
                     name: Arc::clone(&arc_name),
                     uuid,
                     component_id: messages_res_id,
-                    size: M::size(),
-                    align: M::align(),
+                    size: wire_size,
+                    align: wire_align,
                     storage_flags,
-                    is_abi_pod: true,
+                    is_abi_pod,
                     is_dynamic: false,
                     vtable_ptr: sym_addr,
                     insert_raw_fn: None,
@@ -1142,9 +1355,9 @@ impl ModRegistry {
                     has_on_add_hook: false,
                     has_on_remove_hook: false,
                     create_msg_cursor_fn: Some(create_msg_cursor_impl::<M>),
-                    msg_read_batch_fn: Some(msg_read_batch_impl::<M>),
-                    msg_send_fn: Some(msg_send_impl::<M>),
-                    msg_write_batch_fn: Some(msg_write_batch_impl::<M>),
+                    msg_read_batch_fn,
+                    msg_send_fn,
+                    msg_write_batch_fn,
                     validates_entity_payload: false,
                     synthesizes_ffi_entity_payload: false,
                     event_key: None,
@@ -1160,6 +1373,16 @@ impl ModRegistry {
                 handle
             };
             Self::insert_mod_component_symbols::<M>(snap);
+            if !is_abi_pod {
+                let marker_sym = format!("bam.v0.{}.non_pod_message", M::CANONICAL_NAME);
+                snap.symbols.insert(
+                    Arc::from(marker_sym.as_str()),
+                    SymbolRecord {
+                        addr: SymbolAddress::new(msg_read_batch_non_pod_impl::<M> as *const c_void),
+                        owner: None,
+                    },
+                );
+            }
             handle
         };
         self.publish_after_mutation();

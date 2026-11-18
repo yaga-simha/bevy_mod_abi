@@ -48,23 +48,27 @@ pub unsafe extern "C" fn host_cmd_spawn_batch(
     components: *const BamComponent,
     column_ptrs: *const *const u8,
     component_count: usize,
-    _entity_count: usize,
-    _out_entities: *mut FfiEntity,
+    entity_count: usize,
+    out_entities: *mut FfiEntity,
 ) -> FfiResult {
-    if component_count > 0 && (components.is_null() || column_ptrs.is_null()) {
-        return FfiResult::NULL_POINTER;
-    }
     // SAFETY: Validates `commands` against `COMMANDS_MAGIC` under `STRICT_FFI_CHECKS`.
-    let Ok(_host_cmds) = (unsafe {
+    let host_cmds = match unsafe {
         validate_handle_mut::<HostCommands<'_>>(commands.cast::<c_void>(), COMMANDS_MAGIC, false)
-    }) else {
-        return if commands.is_null() {
-            FfiResult::NULL_POINTER
-        } else {
-            FfiResult::INVALID_STATE
-        };
+    } {
+        Ok(c) => c,
+        Err(err) => return err,
     };
-    FfiResult::UNSUPPORTED
+    // SAFETY: `host_cmds` is validated and caller guarantees `components`, `column_ptrs`, and
+    // optional `out_entities` invariants.
+    unsafe {
+        host_cmds.spawn_soa_batch_raw(
+            components,
+            column_ptrs,
+            component_count,
+            entity_count,
+            out_entities,
+        )
+    }
 }
 
 /// Queues deferred bulk despawning (`World::despawn_all`) of non-resource entities matching `terms[0..term_count]`.
@@ -77,20 +81,15 @@ pub unsafe extern "C" fn host_cmd_despawn_all(
     terms: *const BamTermDesc,
     term_count: usize,
 ) -> FfiResult {
-    if term_count > 0 && terms.is_null() {
-        return FfiResult::NULL_POINTER;
-    }
     // SAFETY: Validates `commands` against `COMMANDS_MAGIC` under `STRICT_FFI_CHECKS`.
-    let Ok(_host_cmds) = (unsafe {
+    let host_cmds = match unsafe {
         validate_handle_mut::<HostCommands<'_>>(commands.cast::<c_void>(), COMMANDS_MAGIC, false)
-    }) else {
-        return if commands.is_null() {
-            FfiResult::NULL_POINTER
-        } else {
-            FfiResult::INVALID_STATE
-        };
+    } {
+        Ok(c) => c,
+        Err(err) => return err,
     };
-    FfiResult::UNSUPPORTED
+    // SAFETY: `host_cmds` is validated and caller guarantees `terms` is readable for `term_count`.
+    unsafe { host_cmds.despawn_all_raw(terms, term_count) }
 }
 
 /// Queues deferred conditional insertion (`InsertMode::Keep`) of `component` onto `entity` iff absent.
@@ -105,24 +104,13 @@ pub unsafe extern "C" fn host_cmd_insert_if_new(
     data_ptr: *const u8,
     data_len: usize,
 ) -> FfiResult {
-    if data_len > 0 && data_ptr.is_null() {
-        return FfiResult::NULL_POINTER;
-    }
     // SAFETY: Validates `commands` against `COMMANDS_MAGIC` under `STRICT_FFI_CHECKS`.
-    let Ok(_host_cmds) = (unsafe {
+    let host_cmds = match unsafe {
         validate_handle_mut::<HostCommands<'_>>(commands.cast::<c_void>(), COMMANDS_MAGIC, false)
-    }) else {
-        return if commands.is_null() {
-            FfiResult::NULL_POINTER
-        } else {
-            FfiResult::INVALID_STATE
-        };
+    } {
+        Ok(c) => c,
+        Err(err) => return err,
     };
-    if entity.is_null() {
-        return FfiResult::INVALID_ENTITY;
-    }
-    if !component.is_valid() {
-        return FfiResult::INVALID_COMPONENT;
-    }
-    FfiResult::UNSUPPORTED
+    // SAFETY: `host_cmds` is validated and caller guarantees `data_ptr` is readable for `data_len`.
+    unsafe { host_cmds.insert_raw_inner(entity, component, data_ptr, data_len, true) }
 }

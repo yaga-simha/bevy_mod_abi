@@ -19,7 +19,9 @@
 use crate::ffi::iter::{QueryPlan, QueryTermMeta};
 use crate::registry::RegistrySnapshot;
 use crate::system::error_policy::SystemInitError;
-use crate::system::query_group::{BamQuerySpecOwned, CachedQueryGroup};
+use crate::system::query_group::{
+    BamQuerySpecOwned, CachedQueryGroup, PersistentCursorKey, PersistentMessageCursors,
+};
 use bevy_abi_mod_sys::{
     AccessMode, BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_SPARSE_SET, FfiResult,
     MAX_TERMS_PER_QUERY,
@@ -325,10 +327,25 @@ pub(crate) fn initialize_query_groups_in_world(
     let mut system_res_writes: HashSet<ComponentId> = HashSet::new();
     let mut system_res_order: Vec<(ComponentId, Arc<str>)> = Vec::new();
     let mut id_to_name: HashMap<ComponentId, Arc<str>> = HashMap::new();
+    let mut persistent_store = None;
 
-    for group in query_groups.iter_mut() {
+    for (query_idx, group) in query_groups.iter_mut().enumerate() {
         group.query_state = None;
         group.reset_cache();
+        group.cursor_uuids.resize(group.spec.terms.len(), None);
+        let group_store = if group.owner_system_key.is_some() {
+            let store = persistent_store.get_or_insert_with(|| {
+                world
+                    .get_resource_or_insert_with(PersistentMessageCursors::default)
+                    .shared_store()
+            });
+            let cloned = Arc::clone(store);
+            group.persistent_store = Some((Arc::clone(&cloned), query_idx));
+            Some(cloned)
+        } else {
+            group.persistent_store = None;
+            None
+        };
 
         if group.spec.terms.len() > MAX_TERMS_PER_QUERY {
             return Err(SystemInitError::TooManyTerms);
@@ -448,17 +465,48 @@ pub(crate) fn initialize_query_groups_in_world(
                 group.msg_cursors.resize_with(col_idx + 1, || None);
             }
             if term.mode.is_message() {
+                group.cursor_uuids[col_idx] = Some(reg.uuid);
+                if group.msg_cursors[col_idx].is_none()
+                    && let (Some((mod_ns, sys_name)), Some(store)) =
+                        (&group.owner_system_key, &group_store)
+                {
+                    let key = PersistentCursorKey {
+                        mod_namespace: mod_ns.clone(),
+                        system_name: Arc::clone(sys_name),
+                        query_idx,
+                        term_idx: col_idx,
+                        component_uuid: reg.uuid,
+                    };
+                    group.msg_cursors[col_idx] =
+                        PersistentMessageCursors::take_from_store(store, &key);
+                }
                 if group.msg_cursors[col_idx].is_none()
                     && let Some(create_fn) = reg.create_msg_cursor_fn
                 {
                     group.msg_cursors[col_idx] = Some(create_fn());
                 }
             } else if term.mode == AccessMode::REMOVED_READ {
+                group.cursor_uuids[col_idx] = Some(reg.uuid);
+                if group.msg_cursors[col_idx].is_none()
+                    && let (Some((mod_ns, sys_name)), Some(store)) =
+                        (&group.owner_system_key, &group_store)
+                {
+                    let key = PersistentCursorKey {
+                        mod_namespace: mod_ns.clone(),
+                        system_name: Arc::clone(sys_name),
+                        query_idx,
+                        term_idx: col_idx,
+                        component_uuid: reg.uuid,
+                    };
+                    group.msg_cursors[col_idx] =
+                        PersistentMessageCursors::take_from_store(store, &key);
+                }
                 if group.msg_cursors[col_idx].is_none() {
                     group.msg_cursors[col_idx] =
                         Some(Box::new(MessageCursor::<RemovedComponentEntity>::default()));
                 }
             } else {
+                group.cursor_uuids[col_idx] = None;
                 group.msg_cursors[col_idx] = None;
             }
 
@@ -608,4 +656,173 @@ pub(crate) fn initialize_query_groups_in_world(
     }
 
     Ok(access_set)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::ModRegistry;
+    use bevy_abi_mod_macros::ModComponent;
+    use bevy_abi_mod_sys::BamTermDesc;
+    use bevy_ecs::message::{Message, Messages};
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, ModComponent)]
+    struct ReloadPing {
+        seq: u32,
+    }
+
+    impl Message for ReloadPing {}
+
+    #[test]
+    fn persistent_message_cursor_survives_query_group_reload() {
+        let mut world = World::new();
+        world.init_resource::<Messages<ReloadPing>>();
+        let res_id = world
+            .components()
+            .component_id::<Messages<ReloadPing>>()
+            .expect("Messages<ReloadPing> resource id");
+
+        let mut registry = ModRegistry::new();
+        let handle = registry
+            .register_message::<ReloadPing>(res_id)
+            .expect("register ReloadPing message");
+        let snapshot = registry.snapshot();
+
+        let term = BamTermDesc::new(handle, AccessMode::MESSAGE_READ);
+        let spec = BamQuerySpecOwned::new(vec![term]);
+
+        // Write 3 messages before initial load.
+        {
+            let mut msgs = world.resource_mut::<Messages<ReloadPing>>();
+            msgs.write(ReloadPing { seq: 1 });
+            msgs.write(ReloadPing { seq: 2 });
+            msgs.write(ReloadPing { seq: 3 });
+        }
+
+        // First mod generation reads 2 of 3 messages (or all 3) and drops on unload.
+        {
+            let mut group = CachedQueryGroup::new(spec.clone());
+            group.set_system_identity(Some(Arc::from("mod_a")), "tick_pings");
+            let mut groups = [group];
+            initialize_query_groups_in_world(&mut world, snapshot, &mut groups)
+                .expect("init gen 1");
+
+            let cursor = groups[0].msg_cursors[0]
+                .as_mut()
+                .expect("cursor initialized")
+                .downcast_mut::<MessageCursor<ReloadPing>>()
+                .expect("MessageCursor<ReloadPing>");
+            let messages = world.resource::<Messages<ReloadPing>>();
+            let batch: Vec<u32> = cursor.read(messages).take(2).map(|m| m.seq).collect();
+            assert_eq!(batch, vec![1, 2]);
+        }
+
+        // Write one more message while unloaded.
+        world
+            .resource_mut::<Messages<ReloadPing>>()
+            .write(ReloadPing { seq: 4 });
+
+        // Second mod generation with identical (mod_namespace, system_name, query_idx, term_idx, uuid)
+        // resumes cleanly at seq=3 without re-reading seq=1,2!
+        {
+            let mut group = CachedQueryGroup::new(spec.clone());
+            group.set_system_identity(Some(Arc::from("mod_a")), "tick_pings");
+            let mut groups = [group];
+            initialize_query_groups_in_world(&mut world, snapshot, &mut groups)
+                .expect("init gen 2");
+
+            let cursor = groups[0].msg_cursors[0]
+                .as_mut()
+                .expect("cursor restored")
+                .downcast_mut::<MessageCursor<ReloadPing>>()
+                .expect("MessageCursor<ReloadPing>");
+            let messages = world.resource::<Messages<ReloadPing>>();
+            let batch: Vec<u32> = cursor.read(messages).map(|m| m.seq).collect();
+            assert_eq!(batch, vec![3, 4]);
+        }
+
+        // Different system_name gets an independent fresh cursor starting from seq=1.
+        {
+            let mut other = CachedQueryGroup::new(spec);
+            other.set_system_identity(Some(Arc::from("mod_a")), "other_system");
+            let mut groups = [other];
+            initialize_query_groups_in_world(&mut world, snapshot, &mut groups)
+                .expect("init other");
+
+            let cursor = groups[0].msg_cursors[0]
+                .as_mut()
+                .expect("fresh cursor")
+                .downcast_mut::<MessageCursor<ReloadPing>>()
+                .expect("MessageCursor<ReloadPing>");
+            let messages = world.resource::<Messages<ReloadPing>>();
+            let batch: Vec<u32> = cursor.read(messages).map(|m| m.seq).collect();
+            assert_eq!(batch, vec![1, 2, 3, 4]);
+        }
+    }
+
+    #[test]
+    fn persistent_removed_cursor_survives_query_group_reload() {
+        #[repr(C)]
+        #[derive(bevy_ecs::component::Component, Clone, Copy, ModComponent)]
+        struct EphemeralTag;
+
+        let mut world = World::new();
+        let cid = world.register_component::<EphemeralTag>();
+        let mut registry = ModRegistry::new();
+        let handle = registry
+            .register_component::<EphemeralTag>(cid, Default::default())
+            .expect("register EphemeralTag");
+        let snapshot = registry.snapshot();
+
+        let e1 = world.spawn(EphemeralTag).id();
+        let e2 = world.spawn(EphemeralTag).id();
+        let e3 = world.spawn(EphemeralTag).id();
+        world.despawn(e1);
+        world.despawn(e2);
+
+        let term = BamTermDesc::new(handle, AccessMode::REMOVED_READ);
+        let spec = BamQuerySpecOwned::new(vec![term]);
+
+        {
+            let mut group = CachedQueryGroup::new(spec.clone());
+            group.set_system_identity(Some(Arc::from("mod_b")), "watch_removals");
+            let mut groups = [group];
+            initialize_query_groups_in_world(&mut world, snapshot, &mut groups)
+                .expect("init removed gen 1");
+
+            let cursor = groups[0].msg_cursors[0]
+                .as_mut()
+                .expect("removed cursor initialized")
+                .downcast_mut::<MessageCursor<RemovedComponentEntity>>()
+                .expect("MessageCursor<RemovedComponentEntity>");
+            let removed = world.removed_components().get(cid).expect("removed stream");
+            let first: Vec<bevy_ecs::entity::Entity> = cursor
+                .read(removed)
+                .take(1)
+                .map(|ev| ev.clone().into())
+                .collect();
+            assert_eq!(first, vec![e1]);
+        }
+
+        world.despawn(e3);
+
+        {
+            let mut group = CachedQueryGroup::new(spec);
+            group.set_system_identity(Some(Arc::from("mod_b")), "watch_removals");
+            let mut groups = [group];
+            initialize_query_groups_in_world(&mut world, snapshot, &mut groups)
+                .expect("init removed gen 2");
+
+            let cursor = groups[0].msg_cursors[0]
+                .as_mut()
+                .expect("removed cursor restored")
+                .downcast_mut::<MessageCursor<RemovedComponentEntity>>()
+                .expect("MessageCursor<RemovedComponentEntity>");
+            let removed = world.removed_components().get(cid).expect("removed stream");
+            let rest: Vec<bevy_ecs::entity::Entity> =
+                cursor.read(removed).map(|ev| ev.clone().into()).collect();
+            assert_eq!(rest, vec![e2, e3]);
+        }
+    }
 }
