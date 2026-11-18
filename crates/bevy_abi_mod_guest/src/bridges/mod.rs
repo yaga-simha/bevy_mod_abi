@@ -13,6 +13,12 @@ use bevy_abi_mod_sys::FfiResult;
 use crate::app::{GuestApp, SystemContext};
 
 pub use asset::{GuestAssetHandle, GuestAssetHostExt, GuestAssetServer, TypedAssetHandle};
+pub use bsn::{GuestCommandsBsnExt, GuestScene, resolve_scene_patch_type};
+pub use reflect::{
+    BRP_METHOD_GET_COMPONENTS, BRP_METHOD_GET_RESOURCES, BRP_METHOD_INSERT_COMPONENTS,
+    BRP_METHOD_LIST_COMPONENTS, BRP_METHOD_MUTATE_COMPONENTS, BRP_METHOD_MUTATE_RESOURCES,
+    resolve_reflected_handle, resolve_settings_handle,
+};
 pub use state::{
     GuestCommandsStateExt, GuestStateBridge, GuestStateHandles, GuestStateQueryBuilderExt,
     GuestStateSystemBuilderExt, on_enter_schedule, on_exit_schedule, on_transition_schedule,
