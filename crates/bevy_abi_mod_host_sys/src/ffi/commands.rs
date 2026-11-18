@@ -19,7 +19,8 @@
 
 use crate::drop_trampoline::run_uncommitted_slot_drop;
 use crate::handle_header::{COMMANDS_MAGIC, HandleHeader, validate_handle_mut};
-use crate::registry::{InsertDefaultFn, RegistrySnapshot};
+use crate::loader::ModId;
+use crate::registry::{InsertDefaultFn, ModRegistry, RegistrySnapshot};
 use bevy_abi_mod_sys::{BamCommands, BamComponent, FfiAssetHandle, FfiEntity, FfiResult};
 use bevy_ecs::component::ComponentId;
 use bevy_ecs::entity::{Entity, EntityAllocator};
@@ -30,7 +31,9 @@ use bevy_ecs::world::World;
 use core::ffi::c_void;
 use core::mem::MaybeUninit;
 use core::num::NonZeroUsize;
+use core::sync::atomic::AtomicBool;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
+use std::sync::Arc;
 
 /// Maximum number of components accepted in a single [`host_cmd_spawn`] batch (`FfiResult::CAPACITY_EXCEEDED`).
 pub const MAX_SPAWN_BATCH_COMPONENTS: usize = 64;
@@ -248,7 +251,12 @@ enum RecordedCommand {
         parent: Option<Entity>,
         handle: FfiAssetHandle,
     },
+    Custom {
+        idx: usize,
+    },
 }
+
+type CustomCommandFn = Box<dyn FnOnce(&mut World, &RegistrySnapshot) + Send + Sync>;
 
 #[derive(Clone, Copy)]
 struct BatchItem {
@@ -266,6 +274,7 @@ pub struct HostCommandsStorage {
     commands: Vec<RecordedCommand>,
     batch_items: Vec<BatchItem>,
     scratch_ids: Vec<ComponentId>,
+    custom_fns: Vec<Option<CustomCommandFn>>,
 }
 
 impl HostCommandsStorage {
@@ -277,6 +286,7 @@ impl HostCommandsStorage {
             commands: Vec::new(),
             batch_items: Vec::new(),
             scratch_ids: Vec::new(),
+            custom_fns: Vec::new(),
         }
     }
 
@@ -354,6 +364,7 @@ impl HostCommandsStorage {
         self.commands.clear();
         self.batch_items.clear();
         self.scratch_ids.clear();
+        self.custom_fns.clear();
         self.arena.reset();
     }
 
@@ -582,6 +593,11 @@ impl HostCommandsStorage {
                         }
                     }
                 }
+                RecordedCommand::Custom { idx } => {
+                    if let Some(custom_fn) = self.custom_fns.get_mut(idx).and_then(Option::take) {
+                        custom_fn(world, snapshot);
+                    }
+                }
             }
         }
 
@@ -603,6 +619,9 @@ pub struct HostCommands<'a> {
     storage: &'a mut HostCommandsStorage,
     allocator: &'a EntityAllocator,
     snapshot: &'a RegistrySnapshot,
+    mod_id: Option<ModId>,
+    is_active: Option<Arc<AtomicBool>>,
+    registry: Option<&'a ModRegistry>,
 }
 
 const _: () = assert!(core::mem::offset_of!(HostCommands<'_>, header) == 0);
@@ -620,6 +639,9 @@ impl<'a> HostCommands<'a> {
             storage,
             allocator,
             snapshot,
+            mod_id: None,
+            is_active: None,
+            registry: None,
         }
     }
 
@@ -636,7 +658,73 @@ impl<'a> HostCommands<'a> {
             storage,
             allocator,
             snapshot,
+            mod_id: None,
+            is_active: None,
+            registry: None,
         }
+    }
+
+    /// Attaches the owning [`ModId`] and shared module liveness flag (`is_active`) to this
+    /// command context.
+    #[inline]
+    pub fn with_mod_context(
+        mut self,
+        mod_id: Option<ModId>,
+        is_active: Option<Arc<AtomicBool>>,
+    ) -> Self {
+        self.mod_id = mod_id;
+        self.is_active = is_active;
+        self
+    }
+
+    /// Attaches the live [`ModRegistry`] handle to this command context (used by runtime observer
+    /// spawning).
+    #[inline]
+    pub const fn with_registry(mut self, registry: &'a ModRegistry) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+
+    /// Returns the owning [`ModId`] associated with this command buffer, if scoped to a loaded mod.
+    #[inline]
+    pub const fn owner_mod_id(&self) -> Option<ModId> {
+        self.mod_id
+    }
+
+    /// Returns the shared module liveness flag (`is_active`) associated with this command buffer, if any.
+    #[inline]
+    pub const fn is_active(&self) -> Option<&Arc<AtomicBool>> {
+        self.is_active.as_ref()
+    }
+
+    /// Returns the attached [`ModRegistry`] handle, if any.
+    #[inline]
+    pub const fn registry(&self) -> Option<&'a ModRegistry> {
+        self.registry
+    }
+
+    /// Returns the active [`RegistrySnapshot`] bound to this command buffer.
+    #[inline]
+    pub const fn snapshot(&self) -> &'a RegistrySnapshot {
+        self.snapshot
+    }
+
+    /// Reserves a fresh unique [`Entity`] via Bevy's lock-free [`EntityAllocator`].
+    #[inline]
+    pub fn reserve_entity(&self) -> Entity {
+        self.allocator.alloc()
+    }
+
+    /// Enqueues a custom deferred closure executed in FIFO order alongside standard commands during
+    /// [`HostCommandsStorage::apply_to_world`] (and dropped without running on [`HostCommandsStorage::clear`]).
+    #[inline]
+    pub fn queue_custom(
+        &mut self,
+        f: impl FnOnce(&mut World, &RegistrySnapshot) + Send + Sync + 'static,
+    ) {
+        let idx = self.storage.custom_fns.len();
+        self.storage.custom_fns.push(Some(Box::new(f)));
+        self.storage.commands.push(RecordedCommand::Custom { idx });
     }
 
     /// Casts `&mut self` to an opaque `*mut BamCommands` FFI pointer.
@@ -1116,4 +1204,60 @@ pub unsafe extern "C" fn host_cmd_trigger(
         slice,
     });
     FfiResult::OK
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::sync::atomic::Ordering;
+    use std::sync::Mutex;
+
+    #[test]
+    fn queue_custom_runs_in_fifo_order_and_clear_skips_execution() {
+        let mut world = World::new();
+        let registry = ModRegistry::new();
+        let snap = registry.snapshot_arc();
+        let mut storage = HostCommandsStorage::new();
+        let log = Arc::new(Mutex::new(Vec::<u32>::new()));
+        let active = Arc::new(AtomicBool::new(true));
+        let mid = ModId(7);
+
+        let reserved = {
+            let mut cmds = HostCommands::new(&mut storage, world.entity_allocator(), &snap)
+                .with_mod_context(Some(mid), Some(Arc::clone(&active)))
+                .with_registry(&registry);
+            assert_eq!(cmds.owner_mod_id(), Some(mid));
+            assert!(cmds.is_active().unwrap().load(Ordering::Relaxed));
+            assert!(cmds.registry().is_some());
+            let _ = cmds.snapshot();
+
+            let e = cmds.reserve_entity();
+            let log1 = Arc::clone(&log);
+            cmds.queue_custom(move |w, _| {
+                let _ = w.spawn_empty_at(e);
+                log1.lock().unwrap().push(1);
+            });
+            let log2 = Arc::clone(&log);
+            cmds.queue_custom(move |w, _| {
+                assert!(w.entities().contains(e));
+                log2.lock().unwrap().push(2);
+            });
+            e
+        };
+
+        storage.apply_to_world(&mut world, &snap);
+        assert!(world.entities().contains(reserved));
+        assert_eq!(*log.lock().unwrap(), vec![1, 2]);
+
+        {
+            let mut cmds = HostCommands::new(&mut storage, world.entity_allocator(), &snap);
+            let log3 = Arc::clone(&log);
+            cmds.queue_custom(move |_, _| {
+                log3.lock().unwrap().push(99);
+            });
+        }
+        storage.clear();
+        storage.apply_to_world(&mut world, &snap);
+        assert_eq!(*log.lock().unwrap(), vec![1, 2]);
+    }
 }

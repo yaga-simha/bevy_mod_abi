@@ -71,7 +71,9 @@ pub(crate) unsafe fn guest_observer_runner(
     let status = {
         let cell = world.as_unsafe_world_cell();
         let allocator = cell.entity_allocator();
-        let mut host_cmds = HostCommands::new(&mut storage, allocator, &snap);
+        let mut host_cmds = HostCommands::new(&mut storage, allocator, &snap)
+            .with_mod_context(binding.mod_id, Some(Arc::clone(&binding.is_active)))
+            .with_registry(&binding.registry);
         let GuestFnPtr(callback) = binding.callback;
         let wire_entity = target_ffi;
         let data_ptr = if binding.synthesizes_ffi_entity_payload {

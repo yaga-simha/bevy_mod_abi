@@ -1153,7 +1153,9 @@ impl System for GuestSystem {
                 &mut self.commands_storage,
                 world.entity_allocator(),
                 &self.snapshot,
-            );
+            )
+            .with_mod_context(self.mod_id, Some(Arc::clone(&self.is_active)))
+            .with_registry(&self.registry);
             let commands_ptr = host_commands.as_ffi_ptr();
             let err_buf = core::mem::take(&mut self.last_error_buf);
             let mut sys_ctx = HostSystemCtx::new(
