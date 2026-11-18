@@ -17,9 +17,9 @@
 //! - `cmd_spawn` applies all `K` components in a single archetype transition via
 //!   [`bevy_ecs::world::EntityWorldMut::insert_by_ids`].
 
-use crate::drop_trampoline::run_uncommitted_slot_drop;
+use crate::drop_trampoline::{drop_slot_generation, run_uncommitted_slot_drop};
 use crate::handle_header::{COMMANDS_MAGIC, HandleHeader, validate_handle_mut};
-use crate::loader::ModId;
+use crate::loader::{ModId, ModScoped};
 use crate::registry::{InsertDefaultFn, ModRegistry, RegistrySnapshot};
 use bevy_abi_mod_sys::{BamCommands, BamComponent, FfiAssetHandle, FfiEntity, FfiResult};
 use bevy_ecs::component::ComponentId;
@@ -218,11 +218,13 @@ impl CommandArena {
 enum RecordedCommand {
     SpawnEmpty {
         entity: Entity,
+        owner_mod_id: Option<ModId>,
     },
     SpawnBatch {
         entity: Entity,
         batch_start: usize,
         batch_len: usize,
+        owner_mod_id: Option<ModId>,
     },
     Despawn {
         entity: Entity,
@@ -231,7 +233,7 @@ enum RecordedCommand {
         entity: Entity,
         component: BamComponent,
         slice: ArenaSlice,
-        drop_slot: Option<usize>,
+        drop_slot: Option<(usize, u64)>,
     },
     InsertDefault {
         entity: Entity,
@@ -260,9 +262,10 @@ type CustomCommandFn = Box<dyn FnOnce(&mut World, &RegistrySnapshot) + Send + Sy
 
 #[derive(Clone, Copy)]
 struct BatchItem {
+    component: BamComponent,
     component_id: ComponentId,
     slice: ArenaSlice,
-    drop_slot: Option<usize>,
+    drop_slot: Option<(usize, u64)>,
     validates_entity_payload: bool,
 }
 
@@ -316,12 +319,12 @@ impl HostCommandsStorage {
                     ..
                 } => {
                     for item in &mut self.batch_items[batch_start..(batch_start + batch_len)] {
-                        if let Some(slot) = item.drop_slot.take() {
+                        if let Some((slot, expected_gen)) = item.drop_slot.take() {
                             let nn = self.arena.ptr_mut(item.slice);
                             // SAFETY: `nn` holds an uncommitted guest payload in `self.arena` whose
                             // ownership never transferred into Bevy ECS.
                             unsafe {
-                                run_uncommitted_slot_drop(slot, nn.as_ptr());
+                                run_uncommitted_slot_drop(slot, expected_gen, nn.as_ptr());
                             }
                         }
                     }
@@ -331,12 +334,12 @@ impl HostCommandsStorage {
                     ref mut drop_slot,
                     ..
                 } => {
-                    if let Some(slot) = drop_slot.take() {
+                    if let Some((slot, expected_gen)) = drop_slot.take() {
                         let nn = self.arena.ptr_mut(slice);
                         // SAFETY: `nn` holds an uncommitted guest payload in `self.arena` whose
                         // ownership never transferred into Bevy ECS.
                         unsafe {
-                            run_uncommitted_slot_drop(slot, nn.as_ptr());
+                            run_uncommitted_slot_drop(slot, expected_gen, nn.as_ptr());
                         }
                     }
                 }
@@ -345,11 +348,11 @@ impl HostCommandsStorage {
         }
         // Catch any orphaned `batch_items` not yet linked to a `SpawnBatch` command.
         for item in &mut self.batch_items {
-            if let Some(slot) = item.drop_slot.take() {
+            if let Some((slot, expected_gen)) = item.drop_slot.take() {
                 let nn = self.arena.ptr_mut(item.slice);
                 // SAFETY: Same as above.
                 unsafe {
-                    run_uncommitted_slot_drop(slot, nn.as_ptr());
+                    run_uncommitted_slot_drop(slot, expected_gen, nn.as_ptr());
                 }
             }
         }
@@ -379,22 +382,57 @@ impl HostCommandsStorage {
         if self.commands.is_empty() {
             return;
         }
+        // Prefer the latest `ModRegistry` snapshot in `world` when available so commands queued
+        // before an intermediate `unload_mod` observe evicted `drop_fn == None` state.
+        let live_registry = world.get_resource::<ModRegistry>().cloned();
+        let active_snapshot = live_registry
+            .as_ref()
+            .map(ModRegistry::snapshot)
+            .unwrap_or(snapshot);
 
         for i in 0..self.commands.len() {
             match self.commands[i] {
-                RecordedCommand::SpawnEmpty { entity } => {
-                    let _ = world.spawn_empty_at(entity);
+                RecordedCommand::SpawnEmpty {
+                    entity,
+                    owner_mod_id,
+                } => {
+                    if let Ok(mut entity_mut) = world.spawn_empty_at(entity)
+                        && let Some(mod_id) = owner_mod_id
+                    {
+                        entity_mut.insert(ModScoped(mod_id));
+                    }
                 }
                 RecordedCommand::SpawnBatch {
                     entity,
                     batch_start,
                     batch_len,
+                    owner_mod_id,
                 } => {
                     let mut include = [true; MAX_SPAWN_BATCH_COMPONENTS];
                     for (idx, item) in self.batch_items[batch_start..(batch_start + batch_len)]
-                        .iter()
+                        .iter_mut()
                         .enumerate()
                     {
+                        let stale_unloaded = match active_snapshot.get_by_handle(item.component) {
+                            None => true,
+                            Some(meta) => {
+                                meta.is_dynamic
+                                    && meta.drop_slot.is_some()
+                                    && meta.drop_fn.is_none()
+                            }
+                        };
+                        if stale_unloaded {
+                            include[idx] = false;
+                            if let Some((slot, expected_gen)) = item.drop_slot.take() {
+                                let nn = self.arena.ptr_mut(item.slice);
+                                // SAFETY: Component was unloaded before apply; `expected_gen` prevents
+                                // invoking a recycled slot's new destructor.
+                                unsafe {
+                                    run_uncommitted_slot_drop(slot, expected_gen, nn.as_ptr());
+                                }
+                            }
+                            continue;
+                        }
                         if item.validates_entity_payload {
                             let nn = self.arena.ptr_mut(item.slice);
                             // SAFETY: `validates_entity_payload` entries hold an 8-byte `FfiEntity`.
@@ -413,6 +451,9 @@ impl HostCommandsStorage {
                         }
                     }
                     if let Ok(mut entity_mut) = world.spawn_empty_at(entity) {
+                        if let Some(mod_id) = owner_mod_id {
+                            entity_mut.insert(ModScoped(mod_id));
+                        }
                         self.scratch_ids.clear();
                         let batch_slice =
                             &mut self.batch_items[batch_start..(batch_start + batch_len)];
@@ -444,11 +485,11 @@ impl HostCommandsStorage {
                         }
                     } else {
                         for item in &mut self.batch_items[batch_start..(batch_start + batch_len)] {
-                            if let Some(slot) = item.drop_slot.take() {
+                            if let Some((slot, expected_gen)) = item.drop_slot.take() {
                                 let nn = self.arena.ptr_mut(item.slice);
                                 // SAFETY: `spawn_empty_at` failed, so ownership remained in `self.arena`.
                                 unsafe {
-                                    run_uncommitted_slot_drop(slot, nn.as_ptr());
+                                    run_uncommitted_slot_drop(slot, expected_gen, nn.as_ptr());
                                 }
                             }
                         }
@@ -472,16 +513,27 @@ impl HostCommandsStorage {
                     {
                         *stored_slot = None;
                     }
-                    let Some(meta) = snapshot.get_by_handle(component) else {
-                        if let Some(slot) = drop_slot {
+                    let Some(meta) = active_snapshot.get_by_handle(component) else {
+                        if let Some((slot, expected_gen)) = drop_slot {
                             let nn = self.arena.ptr_mut(slice);
                             // SAFETY: Component handle vanished before apply; drop uncommitted payload.
                             unsafe {
-                                run_uncommitted_slot_drop(slot, nn.as_ptr());
+                                run_uncommitted_slot_drop(slot, expected_gen, nn.as_ptr());
                             }
                         }
                         continue;
                     };
+                    if meta.is_dynamic && meta.drop_slot.is_some() && meta.drop_fn.is_none() {
+                        if let Some((slot, expected_gen)) = drop_slot {
+                            let nn = self.arena.ptr_mut(slice);
+                            // SAFETY: Owning mod unloaded before apply; `expected_gen` guards against
+                            // invoking a recycled slot's new destructor.
+                            unsafe {
+                                run_uncommitted_slot_drop(slot, expected_gen, nn.as_ptr());
+                            }
+                        }
+                        continue;
+                    }
                     let nn = self.arena.ptr_mut(slice);
                     if meta.validates_entity_payload {
                         // SAFETY: `validates_entity_payload` components hold an 8-byte `FfiEntity`.
@@ -514,12 +566,12 @@ impl HostCommandsStorage {
                         unsafe {
                             entity_mut.insert_by_id(meta.component_id, owning);
                         }
-                    } else if let Some(slot) = drop_slot {
+                    } else if let Some((slot, expected_gen)) = drop_slot {
                         // SAFETY: Target `entity` did not exist (`get_entity_mut` failed), so
                         // ownership remained in `self.arena`; run foreign destructor without
                         // decrementing `SLOT_LIFECYCLE`.
                         unsafe {
-                            run_uncommitted_slot_drop(slot, nn.as_ptr());
+                            run_uncommitted_slot_drop(slot, expected_gen, nn.as_ptr());
                         }
                     }
                 }
@@ -796,10 +848,174 @@ pub unsafe extern "C" fn host_cmd_spawn_empty(
     };
 
     let entity = cmds.allocator.alloc();
-    cmds.storage
-        .commands
-        .push(RecordedCommand::SpawnEmpty { entity });
+    cmds.storage.commands.push(RecordedCommand::SpawnEmpty {
+        entity,
+        owner_mod_id: cmds.mod_id,
+    });
     // SAFETY: `out_entity` was checked non-null above and caller guarantees writable `FfiEntity`.
+    unsafe {
+        *out_entity = FfiEntity::from_bits(entity.to_bits());
+    }
+    FfiResult::OK
+}
+
+/// Shared batched spawn helper supporting both mod-scoped (`persistent == false`) and
+/// persistent (`persistent == true`, skipping `ModScoped`) entity creation.
+///
+/// # Safety
+/// - `out_entity` must point to writable [`FfiEntity`] storage (non-null).
+/// - If `count > 0`, `components` must point to `count` readable [`BamComponent`] handles and
+///   `data_ptrs` must point to `count` pointers readable for each component's byte size.
+pub(crate) unsafe fn spawn_batch_with_scope(
+    cmds: &mut HostCommands<'_>,
+    components: *const BamComponent,
+    data_ptrs: *const *const u8,
+    count: usize,
+    out_entity: *mut FfiEntity,
+    persistent: bool,
+) -> FfiResult {
+    let owner_mod_id = if persistent { None } else { cmds.mod_id };
+
+    if count > MAX_SPAWN_BATCH_COMPONENTS {
+        return FfiResult::CAPACITY_EXCEEDED;
+    }
+    if count == 0 {
+        let entity = cmds.allocator.alloc();
+        cmds.storage.commands.push(RecordedCommand::SpawnEmpty {
+            entity,
+            owner_mod_id,
+        });
+        // SAFETY: `out_entity` is non-null and writable.
+        unsafe {
+            *out_entity = FfiEntity::from_bits(entity.to_bits());
+        }
+        return FfiResult::OK;
+    }
+    if components.is_null() || data_ptrs.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+
+    // Pass 1: Validate every component handle, raw-insert permission, non-null payload, and
+    // absence of duplicate `ComponentId`s BEFORE allocating an entity or mutating batch buffers.
+    #[derive(Clone, Copy)]
+    struct ValidatedBatchEntry {
+        handle: BamComponent,
+        component_id: ComponentId,
+        size: usize,
+        align: usize,
+        ptr: *const u8,
+        drop_slot: Option<(usize, u64)>,
+        validates_entity_payload: bool,
+    }
+
+    let mut validated: [ValidatedBatchEntry; MAX_SPAWN_BATCH_COMPONENTS] = [ValidatedBatchEntry {
+        handle: BamComponent::INVALID,
+        component_id: ComponentId::new(0),
+        size: 0,
+        align: 1,
+        ptr: core::ptr::null(),
+        drop_slot: None,
+        validates_entity_payload: false,
+    };
+        MAX_SPAWN_BATCH_COMPONENTS];
+
+    for (i, slot) in validated.iter_mut().take(count).enumerate() {
+        // SAFETY: `components` and `data_ptrs` are non-null and caller guarantees `count` elements.
+        let handle = unsafe { *components.add(i) };
+        // SAFETY: Same bounds guarantee for `data_ptrs[0..count]`.
+        let ptr = unsafe { *data_ptrs.add(i) };
+
+        let Some(meta) = cmds.snapshot.get_by_handle(handle) else {
+            return FfiResult::INVALID_COMPONENT;
+        };
+        if meta.is_resource() {
+            return FfiResult::INVALID_COMPONENT;
+        };
+        if meta.is_dynamic && meta.drop_slot.is_some() && meta.drop_fn.is_none() {
+            return FfiResult::INVALID_STATE;
+        }
+        if !meta.is_dynamic && meta.insert_raw_fn.is_none() {
+            return FfiResult::PERMISSION_DENIED;
+        }
+        if meta.size > 0 && ptr.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if meta.validates_entity_payload {
+            if meta.size != core::mem::size_of::<FfiEntity>() {
+                return FfiResult::INVALID_ARGUMENT;
+            }
+            // SAFETY: `ptr` is non-null and points to 8 bytes (`FfiEntity`) above.
+            let raw_bits = unsafe { core::ptr::read_unaligned(ptr.cast::<u64>()) };
+            let target = FfiEntity::from_bits(raw_bits);
+            if validate_command_entity(target).is_err() {
+                return FfiResult::INVALID_ENTITY;
+            }
+        }
+        let drop_slot = if meta.is_dynamic {
+            meta.drop_slot
+                .and_then(|s| drop_slot_generation(s).map(|slot_gen| (s, slot_gen)))
+        } else {
+            None
+        };
+        *slot = ValidatedBatchEntry {
+            handle,
+            component_id: meta.component_id,
+            size: meta.size,
+            align: meta.align,
+            ptr,
+            drop_slot,
+            validates_entity_payload: meta.validates_entity_payload,
+        };
+    }
+    for i in 0..count {
+        for prev in &validated[..i] {
+            if prev.component_id == validated[i].component_id {
+                return FfiResult::INVALID_ARGUMENT;
+            }
+        }
+    }
+
+    // Pass 2: Copy payloads into `CommandArena` and record single `SpawnBatch`.
+    let batch_start = cmds.storage.batch_items.len();
+    for entry in &validated[..count] {
+        // SAFETY: `entry.ptr` was verified non-null when `entry.size > 0`, and caller guarantees `entry.size` readable bytes.
+        let slice = match unsafe {
+            cmds.storage
+                .arena
+                .alloc_copy_raw(entry.ptr, entry.size, entry.align)
+        } {
+            Ok(s) => s,
+            Err(err) => {
+                for item in &mut cmds.storage.batch_items[batch_start..] {
+                    if let Some((slot, expected_gen)) = item.drop_slot.take() {
+                        let nn = cmds.storage.arena.ptr_mut(item.slice);
+                        // SAFETY: Partial batch failed before commit; drop already-copied payloads.
+                        unsafe {
+                            run_uncommitted_slot_drop(slot, expected_gen, nn.as_ptr());
+                        }
+                    }
+                }
+                cmds.storage.batch_items.truncate(batch_start);
+                return err;
+            }
+        };
+        cmds.storage.batch_items.push(BatchItem {
+            component: entry.handle,
+            component_id: entry.component_id,
+            slice,
+            drop_slot: entry.drop_slot,
+            validates_entity_payload: entry.validates_entity_payload,
+        });
+    }
+
+    let entity = cmds.allocator.alloc();
+    cmds.storage.commands.push(RecordedCommand::SpawnBatch {
+        entity,
+        batch_start,
+        batch_len: count,
+        owner_mod_id,
+    });
+    // SAFETY: `out_entity` is non-null and writable.
     unsafe {
         *out_entity = FfiEntity::from_bits(entity.to_bits());
     }
@@ -830,121 +1046,8 @@ pub unsafe extern "C" fn host_cmd_spawn(
         Ok(c) => c,
         Err(err) => return err,
     };
-
-    if count > MAX_SPAWN_BATCH_COMPONENTS {
-        return FfiResult::CAPACITY_EXCEEDED;
-    }
-    if count == 0 {
-        let entity = cmds.allocator.alloc();
-        cmds.storage
-            .commands
-            .push(RecordedCommand::SpawnEmpty { entity });
-        // SAFETY: `out_entity` is non-null and writable.
-        unsafe {
-            *out_entity = FfiEntity::from_bits(entity.to_bits());
-        }
-        return FfiResult::OK;
-    }
-    if components.is_null() || data_ptrs.is_null() {
-        return FfiResult::NULL_POINTER;
-    }
-
-    // Pass 1: Validate every component handle, raw-insert permission, non-null payload, and
-    // absence of duplicate `ComponentId`s BEFORE allocating an entity or mutating batch buffers.
-    let mut validated: [(ComponentId, usize, usize, *const u8, Option<usize>, bool);
-        MAX_SPAWN_BATCH_COMPONENTS] =
-        [(ComponentId::new(0), 0, 1, core::ptr::null(), None, false); MAX_SPAWN_BATCH_COMPONENTS];
-
-    for i in 0..count {
-        // SAFETY: `components` and `data_ptrs` are non-null and caller guarantees `count` elements.
-        let handle = unsafe { *components.add(i) };
-        // SAFETY: Same bounds guarantee for `data_ptrs[0..count]`.
-        let ptr = unsafe { *data_ptrs.add(i) };
-
-        let Some(meta) = cmds.snapshot.get_by_handle(handle) else {
-            return FfiResult::INVALID_COMPONENT;
-        };
-        if meta.is_resource() {
-            return FfiResult::INVALID_COMPONENT;
-        };
-        if !meta.is_dynamic && meta.insert_raw_fn.is_none() {
-            return FfiResult::PERMISSION_DENIED;
-        }
-        if meta.size > 0 && ptr.is_null() {
-            return FfiResult::NULL_POINTER;
-        }
-        if meta.validates_entity_payload {
-            if meta.size != core::mem::size_of::<FfiEntity>() {
-                return FfiResult::INVALID_ARGUMENT;
-            }
-            // SAFETY: `ptr` is non-null and points to 8 bytes (`FfiEntity`) above.
-            let raw_bits = unsafe { core::ptr::read_unaligned(ptr.cast::<u64>()) };
-            let target = FfiEntity::from_bits(raw_bits);
-            if validate_command_entity(target).is_err() {
-                return FfiResult::INVALID_ENTITY;
-            }
-        }
-        for prev in &validated[..i] {
-            if prev.0 == meta.component_id {
-                return FfiResult::INVALID_ARGUMENT;
-            }
-        }
-        let drop_slot = if meta.is_dynamic {
-            meta.drop_slot
-        } else {
-            None
-        };
-        validated[i] = (
-            meta.component_id,
-            meta.size,
-            meta.align,
-            ptr,
-            drop_slot,
-            meta.validates_entity_payload,
-        );
-    }
-
-    // Pass 2: Copy payloads into `CommandArena` and record single `SpawnBatch`.
-    let batch_start = cmds.storage.batch_items.len();
-    for &(component_id, size, align, ptr, drop_slot, validates_entity_payload) in
-        &validated[..count]
-    {
-        // SAFETY: `ptr` was verified non-null when `size > 0`, and caller guarantees `size` readable bytes.
-        let slice = match unsafe { cmds.storage.arena.alloc_copy_raw(ptr, size, align) } {
-            Ok(s) => s,
-            Err(err) => {
-                for item in &mut cmds.storage.batch_items[batch_start..] {
-                    if let Some(slot) = item.drop_slot.take() {
-                        let nn = cmds.storage.arena.ptr_mut(item.slice);
-                        // SAFETY: Partial batch failed before commit; drop already-copied payloads.
-                        unsafe {
-                            run_uncommitted_slot_drop(slot, nn.as_ptr());
-                        }
-                    }
-                }
-                cmds.storage.batch_items.truncate(batch_start);
-                return err;
-            }
-        };
-        cmds.storage.batch_items.push(BatchItem {
-            component_id,
-            slice,
-            drop_slot,
-            validates_entity_payload,
-        });
-    }
-
-    let entity = cmds.allocator.alloc();
-    cmds.storage.commands.push(RecordedCommand::SpawnBatch {
-        entity,
-        batch_start,
-        batch_len: count,
-    });
-    // SAFETY: `out_entity` is non-null and writable.
-    unsafe {
-        *out_entity = FfiEntity::from_bits(entity.to_bits());
-    }
-    FfiResult::OK
+    // SAFETY: `cmds` is validated, `out_entity` is non-null and writable, and caller guarantees `components`/`data_ptrs`.
+    unsafe { spawn_batch_with_scope(cmds, components, data_ptrs, count, out_entity, false) }
 }
 
 /// Queues deferred despawning of `entity`.
@@ -1001,6 +1104,9 @@ pub unsafe extern "C" fn host_cmd_insert(
     if meta.is_resource() {
         return FfiResult::INVALID_COMPONENT;
     }
+    if meta.is_dynamic && meta.drop_slot.is_some() && meta.drop_fn.is_none() {
+        return FfiResult::INVALID_STATE;
+    }
     if !meta.is_dynamic && meta.insert_raw_fn.is_none() {
         return FfiResult::PERMISSION_DENIED;
     }
@@ -1038,6 +1144,7 @@ pub unsafe extern "C" fn host_cmd_insert(
 
     let drop_slot = if meta.is_dynamic {
         meta.drop_slot
+            .and_then(|slot| drop_slot_generation(slot).map(|slot_gen| (slot, slot_gen)))
     } else {
         None
     };
@@ -1259,5 +1366,239 @@ mod tests {
         storage.clear();
         storage.apply_to_world(&mut world, &snap);
         assert_eq!(*log.lock().unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    fn stale_unloaded_drop_handle_rejected_and_queued_commands_skip_recycled_drop_slot() {
+        use crate::drop_trampoline::{
+            WorldDropGuard, available_drop_trampoline_slots, prune_drop_trampolines_for_guard,
+        };
+        use crate::ffi::commands_ext::host_cmd_spawn_persistent;
+        use crate::ffi::register::{LoadContext, host_register_component};
+        use bevy_abi_mod_sys::{ComponentDesc, ComponentUuid};
+        use core::sync::atomic::AtomicUsize;
+
+        static DROP_A_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static DROP_B_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn drop_a(_ptr: *mut c_void) {
+            DROP_A_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe extern "C" fn drop_b(ptr: *mut c_void) {
+            // SAFETY: Validating Mod B's 24-byte magic sentinel to catch any cross-mod type confusion.
+            let sentinel = unsafe { core::ptr::read_unaligned(ptr.cast::<u64>()) };
+            assert_eq!(sentinel, 0xBBBB_BBBB_BBBB_BBBB);
+            DROP_B_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+
+        DROP_A_COUNT.store(0, Ordering::SeqCst);
+        DROP_B_COUNT.store(0, Ordering::SeqCst);
+
+        let mut world = World::new();
+        world.insert_resource(WorldDropGuard::new());
+        world.insert_resource(ModRegistry::new());
+        let mod_a = ModId(101);
+        let mod_b = ModId(102);
+
+        // 1. Mod A registers `CompA` (`size = 8`, `drop_a`).
+        let active_a = Arc::new(AtomicBool::new(true));
+        let mut comp_a_h = BamComponent::INVALID;
+        {
+            let reg = world.resource::<ModRegistry>().clone();
+            let mut ctx = LoadContext::with_world_and_mod_id(
+                reg,
+                Arc::clone(&active_a),
+                &mut world as *mut World,
+                Some(mod_a),
+            );
+            let desc_a = ComponentDesc::new(
+                c"stale_drop::CompA".as_ptr(),
+                ComponentUuid::from_parts("stale_drop::CompA", 8, 8, 1),
+                8,
+                8,
+            )
+            .with_drop(drop_a);
+            // SAFETY: Valid active `ctx`, `desc_a`, and writable `comp_a_h`.
+            let st = unsafe { host_register_component(ctx.as_ffi_ptr(), &desc_a, &mut comp_a_h) };
+            assert_eq!(st, FfiResult::OK);
+            let updated = ctx.registry.clone();
+            ctx.finish_init();
+            world.insert_resource(updated);
+        }
+        let comp_a_id = world
+            .resource::<ModRegistry>()
+            .get_by_handle(comp_a_h)
+            .unwrap()
+            .component_id;
+        let slot_a = world
+            .resource::<ModRegistry>()
+            .get_by_handle(comp_a_h)
+            .unwrap()
+            .drop_slot
+            .unwrap();
+
+        // 2. Queue `cmd_spawn` and `cmd_insert` of `CompA` BEFORE Mod A unloads.
+        let target_ent = world.spawn_empty().id();
+        let target_ffi = FfiEntity::from_bits(target_ent.to_bits());
+        let pre_unload_snap = world.resource::<ModRegistry>().snapshot_arc();
+        let mut pre_unload_storage = HostCommandsStorage::new();
+        let mut pre_unload_clear_storage = HostCommandsStorage::new();
+        let payload_a: u64 = 0xAAAA_AAAA_AAAA_AAAA;
+        let mut queued_spawn_ent = FfiEntity::NULL;
+        {
+            let mut cmds = HostCommands::new(
+                &mut pre_unload_storage,
+                world.entity_allocator(),
+                &pre_unload_snap,
+            )
+            .with_mod_context(Some(mod_a), Some(Arc::clone(&active_a)));
+            let comps = [comp_a_h];
+            let ptrs = [(&raw const payload_a).cast::<u8>()];
+            // SAFETY: Valid `cmds`, `comps`, `ptrs`, and `payload_a`.
+            unsafe {
+                assert_eq!(
+                    host_cmd_spawn(
+                        cmds.as_ffi_ptr(),
+                        comps.as_ptr(),
+                        ptrs.as_ptr(),
+                        1,
+                        &mut queued_spawn_ent,
+                    ),
+                    FfiResult::OK
+                );
+                assert_eq!(
+                    host_cmd_insert(
+                        cmds.as_ffi_ptr(),
+                        target_ffi,
+                        comp_a_h,
+                        (&raw const payload_a).cast::<u8>(),
+                        8,
+                    ),
+                    FfiResult::OK
+                );
+            }
+        }
+        {
+            let mut cmds = HostCommands::new(
+                &mut pre_unload_clear_storage,
+                world.entity_allocator(),
+                &pre_unload_snap,
+            )
+            .with_mod_context(Some(mod_a), Some(Arc::clone(&active_a)));
+            // SAFETY: Valid `cmds` and `payload_a`.
+            unsafe {
+                assert_eq!(
+                    host_cmd_insert(
+                        cmds.as_ffi_ptr(),
+                        target_ffi,
+                        comp_a_h,
+                        (&raw const payload_a).cast::<u8>(),
+                        8,
+                    ),
+                    FfiResult::OK
+                );
+            }
+        }
+
+        // 3. Unload Mod A (`live_values == 0`): disarms `active_a`, recycles `slot_a` (`gen + 1`),
+        //    and evicts Mod A from `ModRegistry` (`drop_fn = None`, `owner = None`).
+        prune_drop_trampolines_for_guard(&active_a);
+        let recycled = world
+            .resource_mut::<WorldDropGuard>()
+            .recycle_slots_for_guard(&active_a);
+        assert_eq!(recycled, 1);
+        world.resource_mut::<ModRegistry>().evict_mod(mod_a);
+
+        // 4. Mod B loads and registers `CompB` (`size = 24`, `drop_b`) — reuses `slot_a`!
+        let active_b = Arc::new(AtomicBool::new(true));
+        let mut comp_b_h = BamComponent::INVALID;
+        {
+            let reg = world.resource::<ModRegistry>().clone();
+            let mut ctx = LoadContext::with_world_and_mod_id(
+                reg,
+                Arc::clone(&active_b),
+                &mut world as *mut World,
+                Some(mod_b),
+            );
+            let desc_b = ComponentDesc::new(
+                c"stale_drop::CompB".as_ptr(),
+                ComponentUuid::from_parts("stale_drop::CompB", 24, 8, 2),
+                24,
+                8,
+            )
+            .with_drop(drop_b);
+            // SAFETY: Valid active `ctx`, `desc_b`, and writable `comp_b_h`.
+            let st = unsafe { host_register_component(ctx.as_ffi_ptr(), &desc_b, &mut comp_b_h) };
+            assert_eq!(st, FfiResult::OK);
+            let updated = ctx.registry.clone();
+            ctx.finish_init();
+            world.insert_resource(updated);
+        }
+        let slot_b = world
+            .resource::<ModRegistry>()
+            .get_by_handle(comp_b_h)
+            .unwrap()
+            .drop_slot
+            .unwrap();
+        assert_eq!(slot_b, slot_a);
+
+        // 5. Post-unload calls with stale `comp_a_h` MUST fail with `INVALID_STATE`.
+        let post_unload_snap = world.resource::<ModRegistry>().snapshot_arc();
+        let mut post_storage = HostCommandsStorage::new();
+        let mut ignored_ent = FfiEntity::NULL;
+        {
+            let mut cmds = HostCommands::new(
+                &mut post_storage,
+                world.entity_allocator(),
+                &post_unload_snap,
+            );
+            let comps = [comp_a_h];
+            let ptrs = [(&raw const payload_a).cast::<u8>()];
+            // SAFETY: Valid `cmds` and `payload_a`; verifying stale handle rejection.
+            unsafe {
+                assert_eq!(
+                    host_cmd_spawn(
+                        cmds.as_ffi_ptr(),
+                        comps.as_ptr(),
+                        ptrs.as_ptr(),
+                        1,
+                        &mut ignored_ent,
+                    ),
+                    FfiResult::INVALID_STATE
+                );
+                assert_eq!(
+                    host_cmd_spawn_persistent(
+                        cmds.as_ffi_ptr(),
+                        comps.as_ptr(),
+                        ptrs.as_ptr(),
+                        1,
+                        &mut ignored_ent,
+                    ),
+                    FfiResult::INVALID_STATE
+                );
+                assert_eq!(
+                    host_cmd_insert(
+                        cmds.as_ffi_ptr(),
+                        target_ffi,
+                        comp_a_h,
+                        (&raw const payload_a).cast::<u8>(),
+                        8,
+                    ),
+                    FfiResult::INVALID_STATE
+                );
+            }
+        }
+        assert!(post_storage.is_empty());
+
+        // 6. Applying & clearing commands queued BEFORE unload MUST NOT insert `comp_a_id` or invoke `drop_b`!
+        pre_unload_storage.apply_to_world(&mut world, &pre_unload_snap);
+        pre_unload_clear_storage.clear();
+        assert!(!world.entity(target_ent).contains_id(comp_a_id));
+        let spawned_bevy = Entity::from_bits(queued_spawn_ent.to_bits());
+        assert!(!world.entity(spawned_bevy).contains_id(comp_a_id));
+        assert_eq!(DROP_A_COUNT.load(Ordering::SeqCst), 0);
+        assert_eq!(DROP_B_COUNT.load(Ordering::SeqCst), 0);
+
+        let _ = available_drop_trampoline_slots();
     }
 }

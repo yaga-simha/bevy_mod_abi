@@ -4,13 +4,16 @@
 #[cfg(feature = "diagnostics")]
 use crate::diagnostics::{ensure_diagnostics_resources, register_mod_diagnostics_in_world};
 use crate::events::{LoadedModInfo, ModLoaded, ModSystemFaulted, ModUnloaded};
+pub use crate::mod_dag::{DirectoryLoadReport, ModDagError, ModDependencyGraph, ModTomlManifest};
+use crate::mod_dag::{discover_mod_manifests, resolve_dependency_dag};
 use crate::schedule_sets::{
     ModScheduleMap, ModVisibleSets, StartupCompleted, prevalidate_mod_schedules_and_ordering,
     run_late_startup_systems_in_world, schedule_mod_systems_in_world,
 };
+pub use bevy_abi_mod_host_sys::loader::ModScoped;
 use bevy_abi_mod_host_sys::{
-    ComponentCollisionError, ComponentOptions, LoadOptions, ModErrorPolicy, ModErrorPolicyConfig,
-    ModHost, ModId, ModLoadError, ModQuarantine, ModRegistry, WorldDropGuard,
+    ComponentCollisionError, ComponentOptions, LoadOptions, LoadedMod, ModErrorPolicy,
+    ModErrorPolicyConfig, ModHost, ModId, ModLoadError, ModQuarantine, ModRegistry, WorldDropGuard,
     excise_and_unload_mod_in_world, load_mod_in_world, restore_mod_state_in_world,
     rollback_unscheduled_mod_in_world, save_mod_state_in_world, unload_all_mods_in_world,
 };
@@ -29,6 +32,7 @@ use bevy_ecs::name::Name;
 use bevy_ecs::prelude::Resource;
 use bevy_ecs::schedule::{ScheduleLabel, Schedules, SystemSet};
 use bevy_ecs::world::World;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 pub(crate) fn ensure_hierarchy_registered(world: &mut World) {
@@ -60,6 +64,9 @@ pub(crate) fn ensure_world_mod_resources(world: &mut World) {
     }
     if !world.contains_resource::<ModVisibleSets>() {
         world.insert_resource(ModVisibleSets::new());
+    }
+    if !world.contains_resource::<ModDependencyGraph>() {
+        world.insert_resource(ModDependencyGraph::new());
     }
     #[cfg(feature = "signature-verification")]
     if !world.contains_resource::<ModTrustPolicy>() {
@@ -239,12 +246,155 @@ fn load_mod_with_optional_state(
         mod_id,
         mod_name.clone(),
         mod_version,
-        path_buf,
+        path_buf.clone(),
         system_count,
     );
+    let (dag_name, sidecar_deps) = path_buf
+        .parent()
+        .map(|dir| dir.join("mod.toml"))
+        .filter(|p| p.is_file())
+        .and_then(|toml_path| ModTomlManifest::from_file(&toml_path).ok())
+        .map(|manifest| {
+            let deps = manifest
+                .dependencies
+                .keys()
+                .chain(manifest.optional_dependencies.keys())
+                .cloned()
+                .collect::<Vec<String>>();
+            (manifest.name, deps)
+        })
+        .unwrap_or_else(|| (mod_name.clone(), Vec::new()));
+    if let Some(mut dag) = world.get_resource_mut::<ModDependencyGraph>() {
+        dag.register_loaded_mod(mod_id, dag_name, path_buf, options, sidecar_deps);
+    }
     run_late_startup_systems_in_world(world, &mod_name, late_startup);
 
     Ok(mod_id)
+}
+
+fn unload_single_mod_in_world(world: &mut World, id: ModId) -> Result<(), ModLoadError> {
+    let (mod_name, unloaded_path, removed_systems) =
+        excise_and_unload_mod_in_world(world, id, |w| {
+            despawn_loaded_mod_entities(w, id);
+        })?;
+    if let Some(mut dag) = world.get_resource_mut::<ModDependencyGraph>() {
+        dag.unregister_mod(id);
+    }
+    emit_mod_unloaded_once(world, id, &mod_name, unloaded_path, removed_systems);
+    Ok(())
+}
+
+struct CascadeReloadEntry {
+    old_id: ModId,
+    name: String,
+    target_path: PathBuf,
+    options: LoadOptions,
+    dependencies: Vec<String>,
+}
+
+fn reload_mod_cascade(
+    world: &mut World,
+    id: ModId,
+    override_path: Option<&Path>,
+    options: LoadOptions,
+) -> Result<ModId, ModLoadError> {
+    ensure_world_mod_resources(world);
+    let active_ids: BTreeSet<ModId> = {
+        let Some(host) = world.get_resource::<ModHost>() else {
+            return Err(ModLoadError::ModNotFound { id });
+        };
+        if !host.contains_mod(id) {
+            return Err(ModLoadError::ModNotFound { id });
+        }
+        host.loaded_mods().iter().map(LoadedMod::id).collect()
+    };
+
+    let forward_ids = world
+        .get_resource::<ModDependencyGraph>()
+        .map(|dag| dag.cascading_order(id, &active_ids))
+        .unwrap_or_else(|| vec![id]);
+
+    let mut plan = Vec::with_capacity(forward_ids.len());
+    for tid in forward_ids {
+        let (loaded_name, current_path) = {
+            let host = world.resource::<ModHost>();
+            let Some(loaded) = host.get_mod(tid) else {
+                return Err(ModLoadError::ModNotFound { id: tid });
+            };
+            (
+                loaded.name().to_string(),
+                loaded.source_path().to_path_buf(),
+            )
+        };
+        let (dag_name, recorded_opts, dependencies) = world
+            .get_resource::<ModDependencyGraph>()
+            .and_then(|dag| dag.get_node(tid))
+            .map(|n| (n.name.clone(), n.options.clone(), n.dependencies.clone()))
+            .unwrap_or_else(|| (loaded_name, LoadOptions::default(), Vec::new()));
+
+        let target_path = if tid == id {
+            override_path.map(Path::to_path_buf).unwrap_or(current_path)
+        } else {
+            current_path
+        };
+        let target_opts = if tid == id {
+            options.clone()
+        } else {
+            recorded_opts.with_shadow_copy(true)
+        };
+
+        #[cfg(feature = "signature-verification")]
+        {
+            let override_arg = (tid == id).then_some(target_path.as_path());
+            preverify_reload_target(world, tid, override_arg, &target_opts)?;
+        }
+
+        plan.push(CascadeReloadEntry {
+            old_id: tid,
+            name: dag_name,
+            target_path,
+            options: target_opts,
+            dependencies,
+        });
+    }
+
+    // Save state in reverse topological order (`C -> B -> A`) BEFORE unloading any mod so a
+    // `save_state` failure leaves the running dependency subgraph untouched.
+    let mut saved_states: Vec<Option<Vec<u8>>> = vec![None; plan.len()];
+    for idx in (0..plan.len()).rev() {
+        let (_path, blob) = save_mod_state_in_world(world, plan[idx].old_id)?;
+        saved_states[idx] = blob;
+    }
+
+    // Unload in reverse topological order (`C -> B -> A`).
+    for idx in (0..plan.len()).rev() {
+        unload_single_mod_in_world(world, plan[idx].old_id)?;
+    }
+
+    // Reload in forward topological order (`A -> B -> C`), restoring state on each mod.
+    let mut new_root_id: Option<ModId> = None;
+    for (idx, item) in plan.into_iter().enumerate() {
+        let new_id = load_mod_with_optional_state(
+            world,
+            &item.target_path,
+            item.options.clone(),
+            saved_states[idx].as_deref(),
+        )?;
+        if let Some(mut dag) = world.get_resource_mut::<ModDependencyGraph>() {
+            dag.register_loaded_mod(
+                new_id,
+                item.name,
+                item.target_path,
+                item.options,
+                item.dependencies,
+            );
+        }
+        if item.old_id == id {
+            new_root_id = Some(new_id);
+        }
+    }
+
+    Ok(new_root_id.expect("target ModId must be present in cascade reload plan"))
 }
 
 /// Exclusive `&mut World` extension trait for exposing Bevy ECS types and managing native C-ABI
@@ -349,6 +499,21 @@ pub trait ModWorldExt {
         path: P,
         options: LoadOptions,
     ) -> Result<ModId, ModLoadError>;
+
+    /// Discovers `mod.toml` manifests inside `dir`, validates SemVer constraints, quarantines
+    /// cyclic dependency subgraphs, and loads all valid acyclic mods in Kahn topological order
+    /// using [`LoadOptions::default()`].
+    fn load_mods_dir<P: AsRef<Path>>(&mut self, dir: P)
+    -> Result<DirectoryLoadReport, ModDagError>;
+
+    /// Discovers `mod.toml` manifests inside `dir`, validates SemVer constraints, quarantines
+    /// cyclic dependency subgraphs, and loads all valid acyclic mods in Kahn topological order
+    /// using `options`.
+    fn load_mods_dir_with<P: AsRef<Path>>(
+        &mut self,
+        dir: P,
+        options: LoadOptions,
+    ) -> Result<DirectoryLoadReport, ModDagError>;
 }
 
 impl ModWorldExt for World {
@@ -509,12 +674,24 @@ impl ModWorldExt for World {
 
     fn unload_mod(&mut self, id: ModId) -> Result<(), ModLoadError> {
         ensure_world_mod_resources(self);
-        let (mod_name, unloaded_path, removed_systems) =
-            excise_and_unload_mod_in_world(self, id, |world| {
-                despawn_loaded_mod_entities(world, id);
-            })?;
+        let active_ids: BTreeSet<ModId> = {
+            let Some(host) = self.get_resource::<ModHost>() else {
+                return Err(ModLoadError::ModNotFound { id });
+            };
+            if !host.contains_mod(id) {
+                return Err(ModLoadError::ModNotFound { id });
+            }
+            host.loaded_mods().iter().map(LoadedMod::id).collect()
+        };
 
-        emit_mod_unloaded_once(self, id, &mod_name, unloaded_path, removed_systems);
+        let forward_ids = self
+            .get_resource::<ModDependencyGraph>()
+            .map(|dag| dag.cascading_order(id, &active_ids))
+            .unwrap_or_else(|| vec![id]);
+
+        for target_id in forward_ids.into_iter().rev() {
+            unload_single_mod_in_world(self, target_id)?;
+        }
         Ok(())
     }
 
@@ -524,6 +701,9 @@ impl ModWorldExt for World {
             despawn_loaded_mod_entities(world, id);
             emit_mod_unloaded_once(world, id, &name, path, removed_systems);
         });
+        if let Some(mut dag) = self.get_resource_mut::<ModDependencyGraph>() {
+            dag.clear();
+        }
         self
     }
 
@@ -532,12 +712,7 @@ impl ModWorldExt for World {
     }
 
     fn reload_mod_with(&mut self, id: ModId, options: LoadOptions) -> Result<ModId, ModLoadError> {
-        ensure_world_mod_resources(self);
-        #[cfg(feature = "signature-verification")]
-        preverify_reload_target(self, id, None, &options)?;
-        let (source_path, saved_blob) = save_mod_state_in_world(self, id)?;
-        self.unload_mod(id)?;
-        load_mod_with_optional_state(self, &source_path, options, saved_blob.as_deref())
+        reload_mod_cascade(self, id, None, options)
     }
 
     fn reload_mod_from<P: AsRef<Path>>(
@@ -546,13 +721,105 @@ impl ModWorldExt for World {
         path: P,
         options: LoadOptions,
     ) -> Result<ModId, ModLoadError> {
+        reload_mod_cascade(self, id, Some(path.as_ref()), options)
+    }
+
+    fn load_mods_dir<P: AsRef<Path>>(
+        &mut self,
+        dir: P,
+    ) -> Result<DirectoryLoadReport, ModDagError> {
+        self.load_mods_dir_with(dir, LoadOptions::default())
+    }
+
+    fn load_mods_dir_with<P: AsRef<Path>>(
+        &mut self,
+        dir: P,
+        options: LoadOptions,
+    ) -> Result<DirectoryLoadReport, ModDagError> {
         ensure_world_mod_resources(self);
-        let replacement_path = path.as_ref();
-        #[cfg(feature = "signature-verification")]
-        preverify_reload_target(self, id, Some(replacement_path), &options)?;
-        let (_old_path, saved_blob) = save_mod_state_in_world(self, id)?;
-        self.unload_mod(id)?;
-        load_mod_with_optional_state(self, replacement_path, options, saved_blob.as_deref())
+        let (manifests, mut errors) = discover_mod_manifests(dir.as_ref())?;
+
+        let mut already_loaded: BTreeMap<String, semver::Version> = BTreeMap::new();
+        let mut loaded_names: BTreeSet<String> = BTreeSet::new();
+        if let Some(host) = self.get_resource::<ModHost>() {
+            for loaded in host.loaded_mods() {
+                loaded_names.insert(loaded.name().to_string());
+                if let Ok(ver) = semver::Version::parse(loaded.version()) {
+                    already_loaded.insert(loaded.name().to_string(), ver);
+                }
+            }
+        }
+
+        let resolution = resolve_dependency_dag(manifests, &already_loaded);
+        errors.extend(resolution.diagnostics);
+
+        let mut loaded = Vec::new();
+        let mut failed_mods: BTreeSet<String> = BTreeSet::new();
+
+        for manifest in resolution.load_order {
+            let mut missing_dep: Option<(String, semver::VersionReq)> = None;
+            for (dep, req) in &manifest.dependencies {
+                if failed_mods.contains(dep) || !loaded_names.contains(dep) {
+                    missing_dep = Some((dep.clone(), req.clone()));
+                    break;
+                }
+            }
+            if let Some((dep, req)) = missing_dep {
+                errors.push(ModDagError::MissingDependency {
+                    mod_name: manifest.name.clone(),
+                    dependency: dep,
+                    required: req,
+                });
+                failed_mods.insert(manifest.name);
+                continue;
+            }
+
+            let lib_path = match manifest.resolve_library_path() {
+                Ok(p) => p,
+                Err(err) => {
+                    errors.push(err);
+                    failed_mods.insert(manifest.name);
+                    continue;
+                }
+            };
+
+            let mut active_deps: Vec<String> = manifest.dependencies.keys().cloned().collect();
+            for opt_dep in manifest.optional_dependencies.keys() {
+                if loaded_names.contains(opt_dep) && !active_deps.contains(opt_dep) {
+                    active_deps.push(opt_dep.clone());
+                }
+            }
+
+            match load_mod_with_optional_state(self, &lib_path, options.clone(), None) {
+                Ok(mod_id) => {
+                    if let Some(mut dag) = self.get_resource_mut::<ModDependencyGraph>() {
+                        dag.register_loaded_mod(
+                            mod_id,
+                            manifest.name.clone(),
+                            lib_path,
+                            options.clone(),
+                            active_deps,
+                        );
+                    }
+                    loaded_names.insert(manifest.name.clone());
+                    loaded.push((manifest.name, mod_id));
+                }
+                Err(source) => {
+                    errors.push(ModDagError::LoadFailed {
+                        mod_name: manifest.name.clone(),
+                        path: lib_path,
+                        source: Box::new(source),
+                    });
+                    failed_mods.insert(manifest.name);
+                }
+            }
+        }
+
+        Ok(DirectoryLoadReport {
+            loaded,
+            quarantined_cycles: resolution.quarantined_cycles,
+            errors,
+        })
     }
 }
 

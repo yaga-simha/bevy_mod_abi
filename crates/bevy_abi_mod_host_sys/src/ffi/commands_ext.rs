@@ -6,7 +6,7 @@ use core::ffi::c_void;
 use bevy_abi_mod_sys::{BamCommands, BamComponent, BamTermDesc, FfiEntity, FfiResult};
 
 use crate::{
-    ffi::commands::HostCommands,
+    ffi::commands::{HostCommands, spawn_batch_with_scope},
     handle_header::{COMMANDS_MAGIC, validate_handle_mut},
 };
 
@@ -23,20 +23,18 @@ pub unsafe extern "C" fn host_cmd_spawn_persistent(
     count: usize,
     out_entity: *mut FfiEntity,
 ) -> FfiResult {
-    if out_entity.is_null() || (count > 0 && (components.is_null() || data_ptrs.is_null())) {
+    if out_entity.is_null() {
         return FfiResult::NULL_POINTER;
     }
     // SAFETY: Validates `commands` against `COMMANDS_MAGIC` under `STRICT_FFI_CHECKS`.
-    let Ok(_host_cmds) = (unsafe {
+    let cmds = match unsafe {
         validate_handle_mut::<HostCommands<'_>>(commands.cast::<c_void>(), COMMANDS_MAGIC, false)
-    }) else {
-        return if commands.is_null() {
-            FfiResult::NULL_POINTER
-        } else {
-            FfiResult::INVALID_STATE
-        };
+    } {
+        Ok(c) => c,
+        Err(err) => return err,
     };
-    FfiResult::UNSUPPORTED
+    // SAFETY: `cmds` is validated, `out_entity` is non-null and writable, and caller guarantees `components`/`data_ptrs`.
+    unsafe { spawn_batch_with_scope(cmds, components, data_ptrs, count, out_entity, true) }
 }
 
 /// Reserves `entity_count` fresh entities and queues a bulk SoA spawn across `components[0..component_count]`.
