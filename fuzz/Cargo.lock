@@ -98,7 +98,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bevy_abi_mod_fuzz"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bevy_abi_mod_host",
  "bevy_abi_mod_host_sys",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_abi_mod_host"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bevy_abi_mod_host_sys",
  "bevy_abi_mod_macros",
@@ -128,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_abi_mod_host_sys"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arc-swap",
  "bevy_abi_mod_sys",
@@ -145,7 +145,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_abi_mod_macros"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -155,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_abi_mod_manifest"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bevy_abi_mod_sys",
  "semver",
@@ -165,11 +165,11 @@ dependencies = [
 
 [[package]]
 name = "bevy_abi_mod_sys"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "bevy_abi_mod_trust"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ed25519-dalek",
  "sha2",
