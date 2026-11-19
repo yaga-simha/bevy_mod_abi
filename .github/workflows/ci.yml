@@ -132,7 +132,7 @@ jobs:
           cargo test -p cargo-bam
           cargo test -p bevy_abi_mod_sys -p bevy_abi_mod_macros -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest --all-features
           BAM_FIXTURE_DIR="${{ github.workspace }}/target/fixtures" \
-            cargo test -p bevy_abi_mod_host_sys -p bevy_abi_mod_host --all-features
+            cargo test -p bevy_abi_mod_host_sys -p bevy_abi_mod_host -p bevy_abi_mod_bridges -p bevy_abi_mod_render -p bevy_abi_mod_reflect -p bevy_abi_mod_watcher -p bevy_abi_mod --all-features
           cargo run -p cargo-bam -- doctor
           cargo run -p cargo-bam -- header --out target/ci_sdk_check
 
@@ -355,6 +355,8 @@ jobs:
             cargo test -p example_07_cpp17_guest -p example_08_zig_guest
           BAM_FIXTURE_DIR="${{ github.workspace }}/target/fixtures" \
             cargo test -p bevy_abi_mod_host --test e2e --all-features
+          BAM_FIXTURE_DIR="${{ github.workspace }}/target/fixtures" \
+            cargo test -p bevy_abi_mod --test bridges_integration --all-features
           cargo run -p example_07_cpp17_guest
           cargo run -p example_08_zig_guest
 
@@ -427,9 +429,13 @@ jobs:
             cargo llvm-cov --no-report \
               --all-features \
               -p bevy_abi_mod_host_sys \
-              -p bevy_abi_mod_host
+              -p bevy_abi_mod_host \
+              -p bevy_abi_mod_bridges \
+              -p bevy_abi_mod_render \
+              -p bevy_abi_mod_reflect \
+              -p bevy_abi_mod_watcher
           cargo llvm-cov report \
-            --ignore-filename-regex '(crates/bevy_abi_mod_host_sys/src/(drop_trampoline|handle_header|lib|loader|registry|schedule|sync_ptr|ffi/validation)|crates/bevy_abi_mod_(host|macros|sys|guest|guest_sys|trust|manifest|sdk_gen)/|tests/)' \
+            --ignore-filename-regex '(crates/bevy_abi_mod_host_sys/src/(drop_trampoline|handle_header|lib|loader|registry|schedule|sync_ptr|ffi/validation)|crates/bevy_abi_mod_(host|bridges|render|reflect|watcher|macros|sys|guest|guest_sys|trust|manifest|sdk_gen)/|tests/)' \
             --fail-under-lines 85
 
   # ============================================================================

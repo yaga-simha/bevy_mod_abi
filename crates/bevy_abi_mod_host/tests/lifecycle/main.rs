@@ -33,5 +33,3 @@ mod scoped_cleanup_and_slab;
 #[cfg(feature = "signature-verification")]
 mod signature_verification;
 mod state_hooks_and_observers;
-#[cfg(feature = "sub-app-extract")]
-mod sub_app_materials;

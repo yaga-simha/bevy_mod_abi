@@ -1,14 +1,18 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-//! Safe idiomatic Bevy host crate for `bevy_abi_mod` (`ABI 0.3.0`).
+//! Safe headless Bevy host crate for `bevy_abi_mod` (`ABI 0.3.0`).
 //!
-//! `bevy_abi_mod_host` provides Bevy ECS (`v0.20+`) integration (`ModWorldExt`, `ModAppExt`,
+//! `bevy_abi_mod_host` provides core Bevy ECS (`v0.20+`) integration (`ModWorldExt`, `ModAppExt`,
 //! `ModCommandsExt`, `AbiModPlugin`) for loading, executing, quarantining, and hot-unloading
-//! native C-ABI mods compiled in Rust, C99, C++, or Zig.
+//! native C-ABI mods compiled in Rust, C99, C++, or Zig — with zero rendering, reflection, scene,
+//! asset, or filesystem-watcher dependencies.
 //!
 //! All `unsafe` FFI internals are isolated inside `bevy_abi_mod_host_sys`; this crate enforces
-//! `#![forbid(unsafe_code)]`.
+//! `#![forbid(unsafe_code)]`. Optional Bevy subsystem bridges live in companion
+//! `#![forbid(unsafe_code)]` crates (`bevy_abi_mod_bridges`, `bevy_abi_mod_render`,
+//! `bevy_abi_mod_reflect`, and `bevy_abi_mod_watcher`), re-exported together by the top-level
+//! `bevy_abi_mod` facade crate.
 //!
 //! # Optional Features
 //!
@@ -16,18 +20,6 @@
 //! - `diagnostics`: Publishes per-mod and aggregate `bevy_diagnostic` counters.
 //! - `signature-verification`: Pure-Rust OpenSSH `SSHSIG` + Ed25519 CA certificate verification
 //!   of shared libraries prior to `dlopen` / `LoadLibraryW` (`ModTrustPolicy`, `VerifiedModSignature`).
-//! - `bridge-std-types`: Zero-copy / VTable host bridges for Bevy `Transform`, `GlobalTransform`,
-//!   `Visibility`, `Name`, `Time`, `ButtonInput<KeyCode>`, and `ButtonInput<MouseButton>`.
-//! - `bridge-asset`: Isolated `mod://<namespace>/...` Bevy `AssetSource` + refcounted `FfiAssetHandle`
-//!   host backend (`ModAssetPlugin`).
-//! - `bridge-state`: Bevy `States` exposure (`ModStateExt::expose_mod_state`), transition schedules,
-//!   and `in_state` run conditions.
-//! - `bridge-reflect`: Dynamic `bevy_reflect` registration, Bevy Remote Protocol (`bevy_remote`)
-//!   methods, and `bevy_settings` exposure for C-ABI components/resources.
-//! - `bridge-bsn`: Bevy Scene Notation (`bevy_scene`) spawning and `Ready` observer integration.
-//! - `sub-app-extract`: Safe `SubApp` (`RenderApp`) extraction, custom `Shader`, and custom
-//!   `Material` / `Material2d` modding support.
-//! - `hot-reload-watcher`: Debounced filesystem hot-reload watcher (`ModHotReloadPlugin`).
 //!
 //! # Quickstart
 //!
@@ -57,7 +49,6 @@
 //! ```
 
 pub mod app_ext;
-pub mod bridges;
 pub mod commands_ext;
 #[cfg(feature = "diagnostics")]
 pub mod diagnostics;
@@ -65,9 +56,6 @@ pub mod events;
 pub mod mod_dag;
 pub mod plugin;
 pub mod schedule_sets;
-#[cfg(feature = "sub-app-extract")]
-pub mod sub_app_materials;
-pub mod watcher;
 pub mod world_ext;
 
 pub use bevy_abi_mod_macros::{AbiPod, ModComponent};
@@ -102,37 +90,6 @@ pub use bevy_abi_mod_host_sys::{
     inspect_library_residency, inspect_library_residency_file, is_abi_version_compatible,
     read_entity_pod_bytes, write_entity_pod_bytes,
 };
-#[cfg(feature = "bridge-reflect")]
-pub use bevy_abi_mod_host_sys::{reflect_entity_component, reflect_entity_component_mut};
-#[cfg(all(
-    feature = "bridge-std-types",
-    feature = "bridge-asset",
-    feature = "bridge-state"
-))]
-pub use bridges::ModBridgesPlugin;
-#[cfg(feature = "bridge-reflect")]
-pub use bridges::{
-    BRP_METHOD_GET_COMPONENTS, BRP_METHOD_GET_RESOURCES, BRP_METHOD_INSERT_COMPONENTS,
-    BRP_METHOD_LIST_COMPONENTS, BRP_METHOD_MUTATE_COMPONENTS, BRP_METHOD_MUTATE_RESOURCES,
-    ModReflectAppExt, ModReflectError, ModReflectPlugin, ModReflectRegistry, ModReflectRemoteExt,
-    ModReflectWorldExt, ModSettingsError, ModSettingsRegistry, TypedReflectBridgeEntry,
-    WitnessReflectSchema, handle_mod_brp_request, install_mod_brp_methods,
-};
-#[cfg(feature = "bridge-bsn")]
-pub use bridges::{
-    CANONICAL_READY_NAME, HostSceneRegistry, ModBsnAppExt, ModBsnPlugin, ModBsnWorldExt,
-    SCENE_PATCH_ALIAS,
-};
-#[cfg(feature = "bridge-std-types")]
-pub use bridges::{
-    FfiGlobalTransform, FfiKeyCode, FfiKeyboardInput, FfiMouseButton, FfiMouseInput, FfiTimeFixed,
-    FfiTimeReal, FfiTimeVirtual, FfiTransform, FfiVisibility, StdTypesBridgePlugin,
-    register_std_types_bridges,
-};
-#[cfg(feature = "bridge-asset")]
-pub use bridges::{ModAssetAppExt, ModAssetPlugin, ModAssetRegistry, ModAssetWorldExt};
-#[cfg(feature = "bridge-state")]
-pub use bridges::{ModNextState, ModStateError, ModStateExt, ModStateSpec};
 pub use commands_ext::ModCommandsExt;
 pub use events::{
     LoadedModInfo, ModLoaded, ModSystemError, ModSystemFaulted, ModUnloaded, SystemInitError,
@@ -146,54 +103,13 @@ pub use schedule_sets::{
     ModNamedSystemSet, ModScheduleMap, ModSystemSet, ModVisibleSets, StartupCompleted,
     configure_guest_system_in_world, configure_weak_set_chain,
 };
-#[cfg(feature = "sub-app-extract")]
-pub use sub_app_materials::{
-    ModMaterialError, ModShaderBufferInit, ModShaderBufferSpec, ModSpriteMaterialEntry,
-    ModSpriteMaterialSpec, ModStandardMaterialEntry, ModStandardMaterialSpec, ModSubAppConfig,
-    ModSubAppExt, ModSubAppPlugin, ModSubAppSchedule, ModSubAppSystems, ModSubWorldExt,
-    ModWeslMaterialPlugin, ModWeslMaterialRegistry, WeslShaderAssetSpec, WeslShaderSource,
-    cleanup_mod_wesl_materials_in_world, register_mod_custom_asset_in_world,
-    register_mod_shader_buffer_in_world, register_mod_sprite_material_in_world,
-    register_mod_standard_material_in_world, register_mod_wesl_shader_in_world,
-    update_mod_shader_buffer_in_world,
+pub use world_ext::{
+    ModUnloadHookFn, ModUnloadHooks, ModWorldExt, register_mod_unload_hook_in_world,
 };
-#[cfg(all(feature = "sub-app-extract", feature = "bridge-reflect"))]
-pub use sub_app_materials::{
-    ModMaterialParams, ModSpriteExtension2d, register_mod_extended_sprite_material_in_world,
-};
-#[cfg(feature = "hot-reload-watcher")]
-pub use watcher::{
-    ModHotReloadAction, ModHotReloadHistory, ModHotReloadOutcome, ModHotReloadPlugin,
-    ModHotReloadWatcher,
-};
-pub use world_ext::ModWorldExt;
 
 /// Convenient prelude module for Bevy games hosting native C-ABI mods (`ABI 0.3.0`).
 pub mod prelude {
     pub use crate::app_ext::ModAppExt;
-    #[cfg(all(
-        feature = "bridge-std-types",
-        feature = "bridge-asset",
-        feature = "bridge-state"
-    ))]
-    pub use crate::bridges::ModBridgesPlugin;
-    #[cfg(feature = "bridge-std-types")]
-    pub use crate::bridges::{
-        FfiGlobalTransform, FfiKeyCode, FfiKeyboardInput, FfiMouseButton, FfiMouseInput,
-        FfiTimeFixed, FfiTimeReal, FfiTimeVirtual, FfiTransform, FfiVisibility,
-        StdTypesBridgePlugin,
-    };
-    #[cfg(feature = "bridge-bsn")]
-    pub use crate::bridges::{HostSceneRegistry, ModBsnAppExt, ModBsnPlugin, ModBsnWorldExt};
-    #[cfg(feature = "bridge-asset")]
-    pub use crate::bridges::{ModAssetAppExt, ModAssetPlugin, ModAssetRegistry, ModAssetWorldExt};
-    #[cfg(feature = "bridge-state")]
-    pub use crate::bridges::{ModNextState, ModStateError, ModStateExt, ModStateSpec};
-    #[cfg(feature = "bridge-reflect")]
-    pub use crate::bridges::{
-        ModReflectAppExt, ModReflectError, ModReflectPlugin, ModReflectRegistry,
-        ModReflectRemoteExt, ModReflectWorldExt, ModSettingsError, ModSettingsRegistry,
-    };
     pub use crate::commands_ext::ModCommandsExt;
     #[cfg(feature = "signature-verification")]
     pub use crate::events::VerifiedModSignature;
@@ -208,21 +124,7 @@ pub mod prelude {
         ModNamedSystemSet, ModScheduleMap, ModSystemSet, ModVisibleSets, StartupCompleted,
         configure_guest_system_in_world, configure_weak_set_chain,
     };
-    #[cfg(feature = "sub-app-extract")]
-    pub use crate::sub_app_materials::{
-        ModMaterialError, ModShaderBufferInit, ModShaderBufferSpec, ModSpriteMaterialSpec,
-        ModStandardMaterialSpec, ModSubAppConfig, ModSubAppExt, ModSubAppPlugin, ModSubAppSchedule,
-        ModSubAppSystems, ModSubWorldExt, ModWeslMaterialPlugin, ModWeslMaterialRegistry,
-        WeslShaderAssetSpec, WeslShaderSource,
-    };
-    #[cfg(all(feature = "sub-app-extract", feature = "bridge-reflect"))]
-    pub use crate::sub_app_materials::{ModMaterialParams, ModSpriteExtension2d};
-    #[cfg(feature = "hot-reload-watcher")]
-    pub use crate::watcher::{
-        ModHotReloadAction, ModHotReloadHistory, ModHotReloadOutcome, ModHotReloadPlugin,
-        ModHotReloadWatcher,
-    };
-    pub use crate::world_ext::ModWorldExt;
+    pub use crate::world_ext::{ModUnloadHooks, ModWorldExt};
     pub use crate::{
         AbiPod, ComponentCollisionError, ComponentOptions, LoadOptions, LoadedMod, ModComponent,
         ModErrorPolicy, ModHost, ModId, ModLoadError, ModQuarantine, ModRegistry, ModScoped,

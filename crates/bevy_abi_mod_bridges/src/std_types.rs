@@ -834,7 +834,7 @@ impl Plugin for StdTypesBridgePlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::AbiModPlugin;
+    use bevy_abi_mod_host::AbiModPlugin;
     use bevy_abi_mod_sys::{ComponentUuid, MappedStringVTable, MappedWireVTable};
     use bevy_app::App;
     use core::time::Duration;

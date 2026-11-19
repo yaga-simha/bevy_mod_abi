@@ -1,4 +1,11 @@
-//! Integration tests for `sub-app-extract`:
+#![allow(
+    clippy::undocumented_unsafe_blocks,
+    clippy::ptr_as_ptr,
+    clippy::cast_ptr_alignment,
+    clippy::transmute_ptr_to_ptr
+)]
+
+//! Integration tests for `bevy_abi_mod_render`:
 //! 1. Multi-world `SubApp` extraction (`RenderTestApp`, `AudioTestApp`) of host-registered and
 //!    guest-dynamic components plus singleton resources via `bevy_extract`, including cleanup on
 //!    `unload_mod`.
@@ -7,26 +14,19 @@
 //!    `StandardMaterial` assets, `mod://` asset protocol loading, and deterministic cleanup on
 //!    `unload_mod`.
 
-use crate::support::{Position, TempDylibCopy, fixture_dylib};
-use bevy_abi_mod_host::bridges::asset::{ModAssetAppExt, ModAssetPlugin};
+use bevy_abi_mod_bridges::asset::{ModAssetAppExt, ModAssetPlugin};
 use bevy_abi_mod_host::prelude::*;
-use bevy_abi_mod_host::sub_app_materials::{
-    ModMaterialError, ModShaderBufferSpec, ModSpriteMaterialSpec, ModStandardMaterialSpec,
-    ModSubAppConfig, ModSubAppExt, ModSubAppPlugin, ModWeslMaterialPlugin, ModWeslMaterialRegistry,
-    WeslShaderAssetSpec,
-};
-#[cfg(feature = "bridge-reflect")]
-use bevy_abi_mod_host::sub_app_materials::{
-    ModMaterialParams, ModSpriteExtension2d, register_mod_extended_sprite_material_in_world,
-};
 use bevy_abi_mod_host::world_ext::ModScoped;
 use bevy_abi_mod_host_sys::{
     HostCommands, HostCommandsStorage, LoadContext, LoadOptions, ModHost, host_cmd_spawn,
     host_cmd_spawn_persistent, host_register_component,
 };
+use bevy_abi_mod_render::prelude::*;
+use bevy_abi_mod_render::register_mod_extended_sprite_material_in_world;
 use bevy_abi_mod_sys::{ComponentDesc, FfiResult};
 use bevy_app::{App, AppLabel, TaskPoolPlugin};
 use bevy_asset::{AssetPlugin, Assets};
+use bevy_ecs::component::Component;
 use bevy_ecs::entity::Entity;
 use bevy_ecs::prelude::Resource;
 use bevy_extract::sync_world::{MainEntity, SubEntity};
@@ -34,14 +34,88 @@ use bevy_material::AlphaMode;
 use bevy_pbr::StandardMaterial;
 use bevy_render::storage::{ShaderBuffer, ShaderBufferData};
 use bevy_shader::{Shader, ShaderImport, Source, ValidateShader};
-#[cfg(feature = "bridge-reflect")]
-use bevy_sprite_render::ExtendedMaterial2d;
-use bevy_sprite_render::{AlphaMode2d, SpriteMeshMaterial};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use bevy_sprite_render::{AlphaMode2d, ExtendedMaterial2d, SpriteMeshMaterial};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::ffi::CString;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+#[repr(C)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, Default, ModComponent)]
+#[mod_component(name = "testbed::Position")]
+struct Position {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/ directory")
+        .parent()
+        .expect("workspace root directory")
+        .to_path_buf()
+}
+
+fn fixture_dylib(stem: &str) -> PathBuf {
+    let dir = std::env::var_os("BAM_FIXTURE_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root().join("target").join("fixtures"));
+    let (prefix, ext) = if cfg!(target_os = "windows") {
+        ("", "dll")
+    } else if cfg!(target_os = "macos") {
+        ("lib", "dylib")
+    } else {
+        ("lib", "so")
+    };
+    let path = dir.join(format!("{prefix}{stem}.{ext}"));
+    if !path.is_file() {
+        panic!(
+            "Fixture missing at {} — run 'cargo xtask fixtures' before 'cargo test'",
+            path.display()
+        );
+    }
+    path
+}
+
+struct TempDylibCopy {
+    path: PathBuf,
+    dir: PathBuf,
+}
+
+impl TempDylibCopy {
+    fn new(original: &Path, tag: &str) -> Self {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let ext = original
+            .extension()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "dylib".to_owned());
+        let dir = std::env::temp_dir().join(format!(
+            "bevy_abi_mod_render_shadow_{}_{}",
+            std::process::id(),
+            id
+        ));
+        fs::create_dir_all(&dir).expect("create shadow dir");
+        let path = dir.join(format!("{tag}_{id}.{ext}"));
+        fs::copy(original, &path).expect("copy shadow dylib");
+        Self { path, dir }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDylibCopy {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
 
 #[derive(AppLabel, Debug, Hash, PartialEq, Eq, Clone, Default, Copy)]
 struct RenderTestApp;
@@ -98,9 +172,6 @@ impl Drop for TempAssetDir {
 
 #[test]
 fn multi_sub_app_extracts_host_and_guest_dynamic_components_resources_and_cleans_up_on_unload() {
-    let _pool_guard = crate::DROP_SLOT_POOL_RWLOCK
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
     let ordered_dylib = TempDylibCopy::new(&fixture_dylib("ordered_sets_mod"), "sub_app_extract");
 
     let mut app = App::new();
@@ -509,9 +580,6 @@ fn multi_sub_app_extracts_host_and_guest_dynamic_components_resources_and_cleans
 
 #[test]
 fn wesl_shaders_aligned_shader_buffers_and_materials_cleanup_on_mod_unload() {
-    let _pool_guard = crate::DROP_SLOT_POOL_RWLOCK
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
     let dylib = TempDylibCopy::new(&fixture_dylib("ordered_sets_mod"), "wesl_materials");
     let temp_dir = TempAssetDir::new("wesl_files");
     let wesl_disk_path = temp_dir.path.join("from_disk.wesl");
@@ -637,7 +705,6 @@ fn wesl_shaders_aligned_shader_buffers_and_materials_cleanup_on_mod_unload() {
         )
         .expect("register SpriteMeshMaterial");
 
-    #[cfg(feature = "bridge-reflect")]
     let (ext_a, extended_2d_a) = register_mod_extended_sprite_material_in_world(
         app.world_mut(),
         mod_a,
@@ -742,21 +809,18 @@ fn wesl_shaders_aligned_shader_buffers_and_materials_cleanup_on_mod_unload() {
             .get(&sprite_mat_a)
             .is_none()
     );
-    #[cfg(feature = "bridge-reflect")]
-    {
-        assert!(
-            app.world()
-                .resource::<Assets<ModSpriteExtension2d>>()
-                .get(&ext_a)
-                .is_none()
-        );
-        assert!(
-            app.world()
-                .resource::<Assets<ExtendedMaterial2d<SpriteMeshMaterial, ModSpriteExtension2d>>>()
-                .get(&extended_2d_a)
-                .is_none()
-        );
-    }
+    assert!(
+        app.world()
+            .resource::<Assets<ModSpriteExtension2d>>()
+            .get(&ext_a)
+            .is_none()
+    );
+    assert!(
+        app.world()
+            .resource::<Assets<ExtendedMaterial2d<SpriteMeshMaterial, ModSpriteExtension2d>>>()
+            .get(&extended_2d_a)
+            .is_none()
+    );
     assert!(
         app.world()
             .resource::<Assets<StandardMaterial>>()
@@ -789,9 +853,6 @@ fn wesl_shaders_aligned_shader_buffers_and_materials_cleanup_on_mod_unload() {
 
 #[test]
 fn mod_asset_plugin_mod_protocol_wesl_shader_loading_and_unload_cleanup() {
-    let _pool_guard = crate::DROP_SLOT_POOL_RWLOCK
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
     let dylib = TempDylibCopy::new(&fixture_dylib("ordered_sets_mod"), "mod_proto_wesl");
     let asset_dir = TempAssetDir::new("mod_proto_wesl");
     let shaders_dir = asset_dir.path.join("shaders");

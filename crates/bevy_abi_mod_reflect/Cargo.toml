@@ -1,0 +1,36 @@
+[package]
+name = "bevy_abi_mod_reflect"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Safe (`#![forbid(unsafe_code)]`) dynamic `bevy_reflect`, Bevy Remote Protocol (`bevy_remote` BRP), and `bevy_settings` TOML bridges for `bevy_abi_mod`"
+readme = "README.md"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+
+[dependencies]
+bevy_abi_mod_sys = { workspace = true }
+bevy_abi_mod_host_sys = { workspace = true, features = ["bridge-reflect"] }
+bevy_abi_mod_host = { workspace = true }
+bevy_app = { workspace = true, features = ["bevy_reflect"] }
+bevy_ecs = { workspace = true, features = ["bevy_reflect"] }
+bevy_platform = { workspace = true }
+bevy_reflect = { workspace = true }
+bevy_remote = { workspace = true }
+bevy-settings = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+bevy_abi_mod_host_sys = { workspace = true, features = ["bridge-reflect", "test-utils"] }
+bevy_abi_mod_macros = { workspace = true }

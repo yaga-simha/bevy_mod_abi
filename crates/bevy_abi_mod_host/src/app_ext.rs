@@ -2,11 +2,6 @@
 
 use crate::mod_dag::{DirectoryLoadReport, ModDagError};
 use crate::plugin::ensure_startup_tracker;
-#[cfg(feature = "sub-app-extract")]
-use crate::sub_app_materials::{
-    ModMaterialError, ModShaderBufferSpec, ModSpriteMaterialSpec, ModStandardMaterialSpec,
-    WeslShaderAssetSpec,
-};
 use crate::world_ext::ModWorldExt;
 #[cfg(feature = "signature-verification")]
 use bevy_abi_mod_host_sys::ModTrustPolicy;
@@ -15,21 +10,11 @@ use bevy_abi_mod_host_sys::{
 };
 use bevy_abi_mod_sys::{AbiPod, BamComponent, ModComponent, ScheduleId};
 use bevy_app::App;
-#[cfg(feature = "sub-app-extract")]
-use bevy_asset::Handle;
 use bevy_ecs::component::Component;
 use bevy_ecs::event::{EntityEvent, Event};
 use bevy_ecs::message::{Message, Messages};
 use bevy_ecs::prelude::Resource;
 use bevy_ecs::schedule::{ScheduleLabel, SystemSet};
-#[cfg(feature = "sub-app-extract")]
-use bevy_pbr::StandardMaterial;
-#[cfg(feature = "sub-app-extract")]
-use bevy_render::storage::ShaderBuffer;
-#[cfg(feature = "sub-app-extract")]
-use bevy_shader::Shader;
-#[cfg(feature = "sub-app-extract")]
-use bevy_sprite_render::SpriteMeshMaterial;
 use std::path::Path;
 
 /// Extension methods on Bevy [`App`] for exposing components/resources/messages/schedules/sets and
@@ -163,51 +148,6 @@ pub trait ModAppExt {
         dir: P,
         options: LoadOptions,
     ) -> Result<DirectoryLoadReport, ModDagError>;
-
-    /// Registers a `ModId`-owned `.wesl` (or `.wgsl`) [`Shader`] asset in this [`App`].
-    #[cfg(feature = "sub-app-extract")]
-    fn register_mod_wesl_shader(
-        &mut self,
-        mod_id: ModId,
-        spec: WeslShaderAssetSpec,
-    ) -> Result<Handle<Shader>, ModMaterialError>;
-
-    /// Registers a `ModId`-owned [`ShaderBuffer`] backed by [`AlignedVec`](bevy_platform::collections::AlignedVec).
-    #[cfg(feature = "sub-app-extract")]
-    fn register_mod_shader_buffer(
-        &mut self,
-        mod_id: ModId,
-        spec: ModShaderBufferSpec,
-    ) -> Result<Handle<ShaderBuffer>, ModMaterialError>;
-
-    /// Updates a `ModId`-owned [`ShaderBuffer`]'s CPU byte payload while preserving alignment.
-    #[cfg(feature = "sub-app-extract")]
-    fn update_mod_shader_buffer(
-        &mut self,
-        mod_id: ModId,
-        handle: &Handle<ShaderBuffer>,
-        bytes: &[u8],
-    ) -> Result<(), ModMaterialError>;
-
-    /// Registers a `ModId`-owned [`SpriteMeshMaterial`] from a [`ModSpriteMaterialSpec`].
-    #[cfg(feature = "sub-app-extract")]
-    fn register_mod_sprite_material(
-        &mut self,
-        mod_id: ModId,
-        spec: ModSpriteMaterialSpec,
-    ) -> Result<Handle<SpriteMeshMaterial>, ModMaterialError>;
-
-    /// Registers a `ModId`-owned [`StandardMaterial`] from a [`ModStandardMaterialSpec`].
-    #[cfg(feature = "sub-app-extract")]
-    fn register_mod_standard_material(
-        &mut self,
-        mod_id: ModId,
-        spec: ModStandardMaterialSpec,
-    ) -> Result<Handle<StandardMaterial>, ModMaterialError>;
-
-    /// Removes all `.wesl` shaders, [`ShaderBuffer`]s, and material assets owned by `mod_id`.
-    #[cfg(feature = "sub-app-extract")]
-    fn cleanup_mod_materials(&mut self, mod_id: ModId) -> usize;
 }
 
 impl ModAppExt for App {
@@ -368,64 +308,5 @@ impl ModAppExt for App {
     ) -> Result<DirectoryLoadReport, ModDagError> {
         ensure_startup_tracker(self);
         self.world_mut().load_mods_dir_with(dir, options)
-    }
-
-    #[cfg(feature = "sub-app-extract")]
-    #[inline]
-    fn register_mod_wesl_shader(
-        &mut self,
-        mod_id: ModId,
-        spec: WeslShaderAssetSpec,
-    ) -> Result<Handle<Shader>, ModMaterialError> {
-        self.world_mut().register_mod_wesl_shader(mod_id, spec)
-    }
-
-    #[cfg(feature = "sub-app-extract")]
-    #[inline]
-    fn register_mod_shader_buffer(
-        &mut self,
-        mod_id: ModId,
-        spec: ModShaderBufferSpec,
-    ) -> Result<Handle<ShaderBuffer>, ModMaterialError> {
-        self.world_mut().register_mod_shader_buffer(mod_id, spec)
-    }
-
-    #[cfg(feature = "sub-app-extract")]
-    #[inline]
-    fn update_mod_shader_buffer(
-        &mut self,
-        mod_id: ModId,
-        handle: &Handle<ShaderBuffer>,
-        bytes: &[u8],
-    ) -> Result<(), ModMaterialError> {
-        self.world_mut()
-            .update_mod_shader_buffer(mod_id, handle, bytes)
-    }
-
-    #[cfg(feature = "sub-app-extract")]
-    #[inline]
-    fn register_mod_sprite_material(
-        &mut self,
-        mod_id: ModId,
-        spec: ModSpriteMaterialSpec,
-    ) -> Result<Handle<SpriteMeshMaterial>, ModMaterialError> {
-        self.world_mut().register_mod_sprite_material(mod_id, spec)
-    }
-
-    #[cfg(feature = "sub-app-extract")]
-    #[inline]
-    fn register_mod_standard_material(
-        &mut self,
-        mod_id: ModId,
-        spec: ModStandardMaterialSpec,
-    ) -> Result<Handle<StandardMaterial>, ModMaterialError> {
-        self.world_mut()
-            .register_mod_standard_material(mod_id, spec)
-    }
-
-    #[cfg(feature = "sub-app-extract")]
-    #[inline]
-    fn cleanup_mod_materials(&mut self, mod_id: ModId) -> usize {
-        self.world_mut().cleanup_mod_materials(mod_id)
     }
 }

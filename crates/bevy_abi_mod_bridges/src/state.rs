@@ -1361,7 +1361,7 @@ impl ModStateExt for App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AbiModPlugin, ModVisibleSets};
+    use bevy_abi_mod_host::{AbiModPlugin, ModVisibleSets};
     use bevy_abi_mod_host_sys::GuestSystem;
     use bevy_abi_mod_sys::{BamSystemCtx, ComponentUuid};
     use bevy_state::state::States;

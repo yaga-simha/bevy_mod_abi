@@ -1,7 +1,8 @@
 //! Safe (`#![forbid(unsafe_code)]`) multi-world `SubApp` (`RenderApp`, `AudioApp`, custom sub-apps)
 //! extraction via `bevy_extract`, data-driven `.wesl` [`Shader`] assets, [`AlignedVec`]-backed
-//! [`ShaderBuffer`] storage assets, and Bevy `0.20` 2D/3D material management (`feature = "sub-app-extract"`).
+//! [`ShaderBuffer`] storage assets, and Bevy `0.20` 2D/3D material management.
 
+use bevy_abi_mod_host::register_mod_unload_hook_in_world;
 use bevy_abi_mod_host_sys::{
     ModHost, ModId, ModRegistry, ensure_component_in_target_world,
     extract_component_between_worlds, extract_resource_between_worlds,
@@ -20,17 +21,14 @@ use bevy_image::Image;
 use bevy_material::AlphaMode;
 use bevy_pbr::StandardMaterial;
 use bevy_platform::collections::{AlignedVec, HashMap, HashSet};
-#[cfg(feature = "bridge-reflect")]
 use bevy_reflect::Reflect;
-use bevy_render::render_resource::BufferUsages;
-#[cfg(feature = "bridge-reflect")]
-use bevy_render::render_resource::{AsBindGroup, ShaderType};
+use bevy_render::render_resource::{AsBindGroup, BufferUsages, ShaderType};
 use bevy_render::storage::{ShaderBuffer, ShaderBufferData};
 use bevy_shader::{Shader, ShaderDefVal, ValidateShader};
 use bevy_sprite::SpriteImageMode;
-use bevy_sprite_render::{AlphaMode2d, SpriteMeshMaterial};
-#[cfg(feature = "bridge-reflect")]
-use bevy_sprite_render::{ExtendedMaterial2d, MaterialExtension2d};
+use bevy_sprite_render::{
+    AlphaMode2d, ExtendedMaterial2d, MaterialExtension2d, SpriteMeshMaterial,
+};
 use core::fmt;
 use core::marker::PhantomData;
 use std::borrow::Cow;
@@ -993,7 +991,6 @@ fn build_aligned_vec(align: usize, bytes: &[u8]) -> Result<AlignedVec, ModMateri
 }
 
 /// Uniform parameters attached to [`ModSpriteExtension2d`].
-#[cfg(feature = "bridge-reflect")]
 #[derive(ShaderType, Reflect, Debug, Clone, Copy, PartialEq)]
 pub struct ModMaterialParams {
     /// RGBA tint multiplier (`[r, g, b, a]`).
@@ -1008,7 +1005,6 @@ pub struct ModMaterialParams {
     pub _pad1: f32,
 }
 
-#[cfg(feature = "bridge-reflect")]
 impl Default for ModMaterialParams {
     fn default() -> Self {
         Self {
@@ -1024,7 +1020,6 @@ impl Default for ModMaterialParams {
 /// Concrete `2D` [`MaterialExtension2d`] combining uniform [`ModMaterialParams`] with an
 /// [`AlignedVec`]-backed storage [`Handle<ShaderBuffer>`] for [`SpriteMaterial`](bevy_sprite_render::SpriteMaterial) /
 /// [`ExtendedMaterial2d`].
-#[cfg(feature = "bridge-reflect")]
 #[derive(Asset, AsBindGroup, Reflect, Debug, Clone, Default)]
 #[reflect(Debug, Clone)]
 pub struct ModSpriteExtension2d {
@@ -1036,7 +1031,6 @@ pub struct ModSpriteExtension2d {
     pub params: ModMaterialParams,
 }
 
-#[cfg(feature = "bridge-reflect")]
 impl MaterialExtension2d for ModSpriteExtension2d {}
 
 /// Data-driven descriptor for instantiating a Bevy `0.20` 2D [`SpriteMeshMaterial`] (and optional
@@ -1055,7 +1049,7 @@ pub struct ModSpriteMaterialSpec {
     pub flip_y: bool,
     /// Sprite tiling / slicing mode.
     pub image_mode: SpriteImageMode,
-    /// Linear/sRGBA tint channels (`[r, g, b, a]`, applied when `bridge-std-types` is active).
+    /// Linear/sRGBA tint channels (`[r, g, b, a]`).
     pub color_rgba: [f32; 4],
     /// Optional custom `.wesl` shader associated with this material.
     pub shader: Option<Handle<Shader>>,
@@ -1127,7 +1121,6 @@ impl ModSpriteMaterialSpec {
         if let Some(mat) = &self.override_material {
             return mat.clone();
         }
-        #[allow(unused_mut)]
         let mut mat = SpriteMeshMaterial {
             image: self.image.clone().unwrap_or_default(),
             alpha_mode: self.alpha_mode,
@@ -1136,15 +1129,12 @@ impl ModSpriteMaterialSpec {
             image_mode: self.image_mode.clone(),
             ..Default::default()
         };
-        #[cfg(feature = "bridge-std-types")]
-        {
-            mat.color = bevy_color::Color::srgba(
-                self.color_rgba[0],
-                self.color_rgba[1],
-                self.color_rgba[2],
-                self.color_rgba[3],
-            );
-        }
+        mat.color = bevy_color::Color::srgba(
+            self.color_rgba[0],
+            self.color_rgba[1],
+            self.color_rgba[2],
+            self.color_rgba[3],
+        );
         mat
     }
 }
@@ -1171,9 +1161,9 @@ pub struct ModStandardMaterialSpec {
     pub base_color_texture: Option<Handle<Image>>,
     /// Optional emissive texture handle.
     pub emissive_texture: Option<Handle<Image>>,
-    /// Base color sRGBA channels (applied when `bridge-std-types` is active).
+    /// Base color sRGBA channels.
     pub base_color_rgba: [f32; 4],
-    /// Linear emissive RGBA channels (applied when `bridge-std-types` is active).
+    /// Linear emissive RGBA channels.
     pub emissive_rgba: [f32; 4],
     /// Optional custom `.wesl` shader associated with this material.
     pub shader: Option<Handle<Shader>>,
@@ -1262,7 +1252,6 @@ impl ModStandardMaterialSpec {
         if let Some(mat) = &self.override_material {
             return mat.clone();
         }
-        #[allow(unused_mut)]
         let mut mat = StandardMaterial {
             perceptual_roughness: self.perceptual_roughness,
             metallic: self.metallic,
@@ -1274,21 +1263,18 @@ impl ModStandardMaterialSpec {
             emissive_texture: self.emissive_texture.clone(),
             ..Default::default()
         };
-        #[cfg(feature = "bridge-std-types")]
-        {
-            mat.base_color = bevy_color::Color::srgba(
-                self.base_color_rgba[0],
-                self.base_color_rgba[1],
-                self.base_color_rgba[2],
-                self.base_color_rgba[3],
-            );
-            mat.emissive = bevy_color::LinearRgba::new(
-                self.emissive_rgba[0],
-                self.emissive_rgba[1],
-                self.emissive_rgba[2],
-                self.emissive_rgba[3],
-            );
-        }
+        mat.base_color = bevy_color::Color::srgba(
+            self.base_color_rgba[0],
+            self.base_color_rgba[1],
+            self.base_color_rgba[2],
+            self.base_color_rgba[3],
+        );
+        mat.emissive = bevy_color::LinearRgba::new(
+            self.emissive_rgba[0],
+            self.emissive_rgba[1],
+            self.emissive_rgba[2],
+            self.emissive_rgba[3],
+        );
         mat
     }
 }
@@ -1321,25 +1307,22 @@ pub struct ModStandardMaterialEntry {
 
 type CustomAssetCleanupFn = Box<dyn FnOnce(&mut World) + Send + Sync>;
 
-#[cfg(feature = "bridge-reflect")]
 type Extended2dMaterialHandle =
     Handle<ExtendedMaterial2d<SpriteMeshMaterial, ModSpriteExtension2d>>;
 
 /// Host [`Resource`] tracking all [`ModId`]-scoped `.wesl` [`Shader`]s, [`ShaderBuffer`]s,
 /// [`SpriteMeshMaterial`]s, [`StandardMaterial`]s, and custom asset handles.
 ///
-/// Automatically purged during [`ModWorldExt::unload_mod`](crate::ModWorldExt::unload_mod),
-/// [`ModWorldExt::unload_all_mods`](crate::ModWorldExt::unload_all_mods), and cascading
-/// [`ModWorldExt::reload_mod`](crate::ModWorldExt::reload_mod).
+/// Automatically purged during [`ModWorldExt::unload_mod`](bevy_abi_mod_host::ModWorldExt::unload_mod),
+/// [`ModWorldExt::unload_all_mods`](bevy_abi_mod_host::ModWorldExt::unload_all_mods), and cascading
+/// [`ModWorldExt::reload_mod`](bevy_abi_mod_host::ModWorldExt::reload_mod).
 #[derive(Resource, Default)]
 pub struct ModWeslMaterialRegistry {
     shaders: HashMap<ModId, Vec<(String, Handle<Shader>)>>,
     buffers: HashMap<ModId, Vec<(String, Handle<ShaderBuffer>)>>,
     sprite_materials: HashMap<ModId, Vec<ModSpriteMaterialEntry>>,
     standard_materials: HashMap<ModId, Vec<ModStandardMaterialEntry>>,
-    #[cfg(feature = "bridge-reflect")]
     sprite_extensions: HashMap<ModId, Vec<(String, Handle<ModSpriteExtension2d>)>>,
-    #[cfg(feature = "bridge-reflect")]
     extended_2d_materials: HashMap<ModId, Vec<(String, Extended2dMaterialHandle)>>,
     custom_cleanups: HashMap<ModId, Vec<CustomAssetCleanupFn>>,
 }
@@ -1372,18 +1355,13 @@ impl ModWeslMaterialRegistry {
 
     /// Returns the total number of tracked shader, buffer, and material assets for `mod_id`.
     pub fn total_assets_for_mod(&self, mod_id: ModId) -> usize {
-        #[allow(unused_mut)]
-        let mut total = self.shader_count_for_mod(mod_id)
+        self.shader_count_for_mod(mod_id)
             + self.buffer_count_for_mod(mod_id)
             + self.sprite_material_count_for_mod(mod_id)
             + self.standard_material_count_for_mod(mod_id)
-            + self.custom_cleanups.get(&mod_id).map_or(0, Vec::len);
-        #[cfg(feature = "bridge-reflect")]
-        {
-            total += self.sprite_extensions.get(&mod_id).map_or(0, Vec::len)
-                + self.extended_2d_materials.get(&mod_id).map_or(0, Vec::len);
-        }
-        total
+            + self.custom_cleanups.get(&mod_id).map_or(0, Vec::len)
+            + self.sprite_extensions.get(&mod_id).map_or(0, Vec::len)
+            + self.extended_2d_materials.get(&mod_id).map_or(0, Vec::len)
     }
 
     /// Looks up a mod-owned [`Handle<Shader>`] by `mod_id` and `label`.
@@ -1439,22 +1417,30 @@ impl ModWeslMaterialRegistry {
 #[derive(Default, Debug, Clone, Copy)]
 pub struct ModWeslMaterialPlugin;
 
+const WESL_MATERIAL_UNLOAD_HOOK_KEY: &str = "bevy_abi_mod_render::wesl_materials";
+
+fn cleanup_mod_wesl_materials_hook(world: &mut World, mod_id: ModId) {
+    let _ = cleanup_mod_wesl_materials_in_world(world, mod_id);
+}
+
 impl Plugin for ModWeslMaterialPlugin {
     fn build(&self, app: &mut App) {
         if !app.world().contains_resource::<ModWeslMaterialRegistry>() {
             app.insert_resource(ModWeslMaterialRegistry::new());
         }
+        register_mod_unload_hook_in_world(
+            app.world_mut(),
+            WESL_MATERIAL_UNLOAD_HOOK_KEY,
+            cleanup_mod_wesl_materials_hook,
+        );
         ensure_asset_store_in_app::<Shader>(app);
         ensure_asset_store_in_app::<ShaderBuffer>(app);
         ensure_asset_store_in_app::<SpriteMeshMaterial>(app);
         ensure_asset_store_in_app::<StandardMaterial>(app);
-        #[cfg(feature = "bridge-reflect")]
-        {
-            ensure_asset_store_in_app::<ModSpriteExtension2d>(app);
-            ensure_asset_store_in_app::<ExtendedMaterial2d<SpriteMeshMaterial, ModSpriteExtension2d>>(
-                app,
-            );
-        }
+        ensure_asset_store_in_app::<ModSpriteExtension2d>(app);
+        ensure_asset_store_in_app::<ExtendedMaterial2d<SpriteMeshMaterial, ModSpriteExtension2d>>(
+            app,
+        );
     }
 }
 
@@ -1482,6 +1468,11 @@ fn ensure_material_registry(world: &mut World) {
     if !world.contains_resource::<ModWeslMaterialRegistry>() {
         world.insert_resource(ModWeslMaterialRegistry::new());
     }
+    register_mod_unload_hook_in_world(
+        world,
+        WESL_MATERIAL_UNLOAD_HOOK_KEY,
+        cleanup_mod_wesl_materials_hook,
+    );
 }
 
 /// Registers a [`ModId`]-owned `.wesl` (or `.wgsl`) [`Shader`] in `world` and returns its
@@ -1612,7 +1603,6 @@ pub fn register_mod_sprite_material_in_world(
 
 /// Registers a [`ModId`]-owned [`ModSpriteExtension2d`] and paired
 /// [`ExtendedMaterial2d<SpriteMeshMaterial, ModSpriteExtension2d>`], returning both handles.
-#[cfg(feature = "bridge-reflect")]
 pub fn register_mod_extended_sprite_material_in_world(
     world: &mut World,
     mod_id: ModId,
@@ -1715,9 +1705,7 @@ pub fn cleanup_mod_wesl_materials_in_world(world: &mut World, mod_id: ModId) -> 
     let buffers;
     let sprite_mats;
     let standard_mats;
-    #[cfg(feature = "bridge-reflect")]
     let sprite_exts;
-    #[cfg(feature = "bridge-reflect")]
     let ext_2d_mats;
     let custom;
     {
@@ -1728,14 +1716,11 @@ pub fn cleanup_mod_wesl_materials_in_world(world: &mut World, mod_id: ModId) -> 
         buffers = reg.buffers.remove(&mod_id).unwrap_or_default();
         sprite_mats = reg.sprite_materials.remove(&mod_id).unwrap_or_default();
         standard_mats = reg.standard_materials.remove(&mod_id).unwrap_or_default();
-        #[cfg(feature = "bridge-reflect")]
-        {
-            sprite_exts = reg.sprite_extensions.remove(&mod_id).unwrap_or_default();
-            ext_2d_mats = reg
-                .extended_2d_materials
-                .remove(&mod_id)
-                .unwrap_or_default();
-        }
+        sprite_exts = reg.sprite_extensions.remove(&mod_id).unwrap_or_default();
+        ext_2d_mats = reg
+            .extended_2d_materials
+            .remove(&mod_id)
+            .unwrap_or_default();
         custom = reg.custom_cleanups.remove(&mod_id).unwrap_or_default();
     }
 
@@ -1769,7 +1754,6 @@ pub fn cleanup_mod_wesl_materials_in_world(world: &mut World, mod_id: ModId) -> 
             }
         }
     }
-    #[cfg(feature = "bridge-reflect")]
     if let Some(mut assets) = world.get_resource_mut::<Assets<ModSpriteExtension2d>>() {
         for (_, handle) in sprite_exts {
             if assets.remove(handle.id()).is_some() {
@@ -1777,7 +1761,6 @@ pub fn cleanup_mod_wesl_materials_in_world(world: &mut World, mod_id: ModId) -> 
             }
         }
     }
-    #[cfg(feature = "bridge-reflect")]
     if let Some(mut assets) = world
         .get_resource_mut::<Assets<ExtendedMaterial2d<SpriteMeshMaterial, ModSpriteExtension2d>>>()
     {

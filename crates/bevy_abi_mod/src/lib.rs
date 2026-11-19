@@ -4,8 +4,10 @@
 //! Zero-serialization, asymmetric C-ABI (`ABI 0.3.0`) native modding framework for Bevy ECS (`v0.20+`).
 //!
 //! `bevy_abi_mod` is the top-level host facade crate. It re-exports [`bevy_abi_mod_host`],
-//! [`ModComponent`], [`AbiPod`], [`bevy_abi_mod_sys`], and [`prelude`], while enforcing
-//! `#![forbid(unsafe_code)]` across all public host APIs.
+//! [`ModComponent`], [`AbiPod`], [`bevy_abi_mod_sys`], optional companion crates
+//! (`bevy_abi_mod_bridges`, `bevy_abi_mod_render`, `bevy_abi_mod_reflect`,
+//! `bevy_abi_mod_watcher`), and [`prelude`], while enforcing `#![forbid(unsafe_code)]` across all
+//! public host APIs.
 //!
 //! # Purpose & Design Philosophy
 //!
@@ -133,10 +135,8 @@
 //! # Workspace Architecture & Feature Flags
 //!
 //! The workspace separates `unsafe` FFI machinery inside `*-sys` crates while keeping all public
-//! host, guest, macro, trust, manifest, SDK-generator, and CLI crates `#![forbid(unsafe_code)]`
-//! (and keeping `bevy*` out of all non-host crates). See [`spec.md`](../../spec.md) and
-//! [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md) for the complete 11-crate boundary map,
-//! ABI `0.3.0` wire specification, and safety proofs.
+//! host, bridge, render, reflection, watcher, guest, macro, trust, manifest, SDK-generator, and
+//! CLI crates `#![forbid(unsafe_code)]` (and keeping `bevy*` out of all non-host crates).
 //!
 //! # Feature Flags
 //!
@@ -153,6 +153,134 @@
 //! - `sub-app-extract`: Enables `SubApp` (`RenderApp`) extraction and custom shader/material support.
 //! - `hot-reload-watcher`: Enables debounced filesystem hot-reload watching (`ModHotReloadPlugin`).
 
+#[cfg(any(
+    feature = "bridge-std-types",
+    feature = "bridge-asset",
+    feature = "bridge-state",
+    feature = "bridge-bsn"
+))]
+pub use bevy_abi_mod_bridges;
 pub use bevy_abi_mod_host;
 pub use bevy_abi_mod_host::*;
 pub use bevy_abi_mod_macros;
+#[cfg(feature = "bridge-reflect")]
+pub use bevy_abi_mod_reflect;
+#[cfg(feature = "sub-app-extract")]
+pub use bevy_abi_mod_render;
+#[cfg(feature = "hot-reload-watcher")]
+pub use bevy_abi_mod_watcher;
+
+/// Re-exported optional Bevy subsystem bridges (`std_types`, `asset`, `state`, `bsn`, and `reflect`).
+pub mod bridges {
+    #[cfg(all(
+        feature = "bridge-std-types",
+        feature = "bridge-asset",
+        feature = "bridge-state"
+    ))]
+    pub use bevy_abi_mod_bridges::ModBridgesPlugin;
+    #[cfg(feature = "bridge-bsn")]
+    pub use bevy_abi_mod_bridges::{
+        CANONICAL_READY_NAME, HostSceneRegistry, ModBsnAppExt, ModBsnPlugin, ModBsnWorldExt,
+        SCENE_PATCH_ALIAS, bsn,
+    };
+    #[cfg(feature = "bridge-std-types")]
+    pub use bevy_abi_mod_bridges::{
+        FfiGlobalTransform, FfiKeyCode, FfiKeyboardInput, FfiMouseButton, FfiMouseInput,
+        FfiTimeFixed, FfiTimeReal, FfiTimeVirtual, FfiTransform, FfiVisibility,
+        StdTypesBridgePlugin, register_std_types_bridges, std_types,
+    };
+    #[cfg(feature = "bridge-asset")]
+    pub use bevy_abi_mod_bridges::{
+        ModAssetAppExt, ModAssetPlugin, ModAssetRegistry, ModAssetWorldExt, asset,
+    };
+    #[cfg(feature = "bridge-state")]
+    pub use bevy_abi_mod_bridges::{ModNextState, ModStateError, ModStateExt, ModStateSpec, state};
+    #[cfg(feature = "bridge-reflect")]
+    pub use bevy_abi_mod_reflect::{
+        BRP_METHOD_GET_COMPONENTS, BRP_METHOD_GET_RESOURCES, BRP_METHOD_INSERT_COMPONENTS,
+        BRP_METHOD_LIST_COMPONENTS, BRP_METHOD_MUTATE_COMPONENTS, BRP_METHOD_MUTATE_RESOURCES,
+        ModReflectAppExt, ModReflectError, ModReflectPlugin, ModReflectRegistry,
+        ModReflectRemoteExt, ModReflectWorldExt, ModSettingsError, ModSettingsRegistry,
+        TypedReflectBridgeEntry, WitnessReflectSchema, handle_mod_brp_request,
+        install_mod_brp_methods, reflect,
+    };
+}
+
+#[cfg(feature = "sub-app-extract")]
+pub use bevy_abi_mod_render::sub_app_materials;
+
+#[cfg(feature = "hot-reload-watcher")]
+pub use bevy_abi_mod_watcher::watcher;
+
+#[cfg(all(
+    feature = "bridge-std-types",
+    feature = "bridge-asset",
+    feature = "bridge-state"
+))]
+pub use bevy_abi_mod_bridges::ModBridgesPlugin;
+#[cfg(feature = "bridge-bsn")]
+pub use bevy_abi_mod_bridges::{
+    CANONICAL_READY_NAME, HostSceneRegistry, ModBsnAppExt, ModBsnPlugin, ModBsnWorldExt,
+    SCENE_PATCH_ALIAS,
+};
+#[cfg(feature = "bridge-std-types")]
+pub use bevy_abi_mod_bridges::{
+    FfiGlobalTransform, FfiKeyCode, FfiKeyboardInput, FfiMouseButton, FfiMouseInput, FfiTimeFixed,
+    FfiTimeReal, FfiTimeVirtual, FfiTransform, FfiVisibility, StdTypesBridgePlugin,
+    register_std_types_bridges,
+};
+#[cfg(feature = "bridge-asset")]
+pub use bevy_abi_mod_bridges::{
+    ModAssetAppExt, ModAssetPlugin, ModAssetRegistry, ModAssetWorldExt,
+};
+#[cfg(feature = "bridge-state")]
+pub use bevy_abi_mod_bridges::{ModNextState, ModStateError, ModStateExt, ModStateSpec};
+
+#[cfg(feature = "bridge-reflect")]
+pub use bevy_abi_mod_reflect::{
+    BRP_METHOD_GET_COMPONENTS, BRP_METHOD_GET_RESOURCES, BRP_METHOD_INSERT_COMPONENTS,
+    BRP_METHOD_LIST_COMPONENTS, BRP_METHOD_MUTATE_COMPONENTS, BRP_METHOD_MUTATE_RESOURCES,
+    ModReflectAppExt, ModReflectError, ModReflectPlugin, ModReflectRegistry, ModReflectRemoteExt,
+    ModReflectWorldExt, ModSettingsError, ModSettingsRegistry, TypedReflectBridgeEntry,
+    WitnessReflectSchema, handle_mod_brp_request, install_mod_brp_methods,
+    reflect_entity_component, reflect_entity_component_mut, reflect_resource_component,
+    reflect_resource_component_mut,
+};
+
+#[cfg(feature = "sub-app-extract")]
+pub use bevy_abi_mod_render::{
+    ModMaterialAppExt, ModMaterialError, ModMaterialParams, ModMaterialWorldExt,
+    ModShaderBufferInit, ModShaderBufferSpec, ModSpriteExtension2d, ModSpriteMaterialEntry,
+    ModSpriteMaterialSpec, ModStandardMaterialEntry, ModStandardMaterialSpec, ModSubAppConfig,
+    ModSubAppExt, ModSubAppPlugin, ModSubAppSchedule, ModSubAppSystems, ModSubWorldExt,
+    ModWeslMaterialPlugin, ModWeslMaterialRegistry, WeslShaderAssetSpec, WeslShaderSource,
+    cleanup_mod_wesl_materials_in_world, register_mod_custom_asset_in_world,
+    register_mod_extended_sprite_material_in_world, register_mod_shader_buffer_in_world,
+    register_mod_sprite_material_in_world, register_mod_standard_material_in_world,
+    register_mod_wesl_shader_in_world, update_mod_shader_buffer_in_world,
+};
+
+#[cfg(feature = "hot-reload-watcher")]
+pub use bevy_abi_mod_watcher::{
+    ModHotReloadAction, ModHotReloadHistory, ModHotReloadOutcome, ModHotReloadPlugin,
+    ModHotReloadWatcher,
+};
+
+/// Convenient unified prelude re-exporting core host APIs plus all enabled bridge, render,
+/// reflection, and hot-reload watcher extensions.
+pub mod prelude {
+    #[cfg(any(
+        feature = "bridge-std-types",
+        feature = "bridge-asset",
+        feature = "bridge-state",
+        feature = "bridge-bsn"
+    ))]
+    pub use bevy_abi_mod_bridges::prelude::*;
+    pub use bevy_abi_mod_host::prelude::*;
+    #[cfg(feature = "bridge-reflect")]
+    pub use bevy_abi_mod_reflect::prelude::*;
+    #[cfg(feature = "sub-app-extract")]
+    pub use bevy_abi_mod_render::prelude::*;
+    #[cfg(feature = "hot-reload-watcher")]
+    pub use bevy_abi_mod_watcher::prelude::*;
+}

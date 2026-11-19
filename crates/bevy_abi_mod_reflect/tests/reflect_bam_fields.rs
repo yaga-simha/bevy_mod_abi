@@ -3,16 +3,16 @@
 //! BRP JSON-RPC, standard Bevy `0.20` `bevy_remote` BRP JSON-RPC, and `bevy_settings` TOML sync)
 //! on foreign/C99-style dynamic components and resources without Rust proc-macro witness VTables.
 
-use bevy_abi_mod_host::bridges::reflect::{
-    BRP_METHOD_GET_COMPONENTS, BRP_METHOD_GET_RESOURCES, BRP_METHOD_INSERT_COMPONENTS,
-    BRP_METHOD_LIST_COMPONENTS, BRP_METHOD_MUTATE_COMPONENTS, BRP_METHOD_MUTATE_RESOURCES,
-    ModReflectAppExt, ModReflectPlugin, ModReflectRegistry, ModReflectWorldExt,
-};
 use bevy_abi_mod_host::prelude::*;
 use bevy_abi_mod_host_sys::{
     HostCommands, HostCommandsStorage, LoadContext, host_cmd_insert, host_cmd_spawn_empty,
     host_register_component, read_entity_pod_bytes, read_resource_bam_field_bytes,
     write_entity_pod_bytes,
+};
+use bevy_abi_mod_reflect::reflect::{
+    BRP_METHOD_GET_COMPONENTS, BRP_METHOD_GET_RESOURCES, BRP_METHOD_INSERT_COMPONENTS,
+    BRP_METHOD_LIST_COMPONENTS, BRP_METHOD_MUTATE_COMPONENTS, BRP_METHOD_MUTATE_RESOURCES,
+    ModReflectAppExt, ModReflectPlugin, ModReflectRegistry, ModReflectWorldExt,
 };
 use bevy_abi_mod_sys::{
     BAM_COMPONENT_FLAG_IMMUTABLE, BamComponent, BamFieldDesc, BamFieldKind, ComponentDesc,

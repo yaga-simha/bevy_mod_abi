@@ -1,0 +1,115 @@
+[package]
+name = "bevy_abi_mod_bridges"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Safe (`#![forbid(unsafe_code)]`) optional Bevy subsystem bridges (std types, isolated mod:// assets, States, BSN scenes, picking, audio, lighting, and UI) for `bevy_abi_mod`"
+readme = "README.md"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+bridge-std-types = [
+    "dep:bevy_math",
+    "dep:bevy_transform",
+    "dep:bevy_camera",
+    "dep:bevy_color",
+    "dep:bevy_window",
+    "dep:bevy_time",
+    "dep:bevy_input",
+]
+bridge-asset = ["dep:bevy_asset"]
+bridge-state = ["dep:bevy_state"]
+bridge-bsn = [
+    "dep:bevy_scene",
+    "dep:bevy_reflect",
+    "bevy_ecs/bevy_reflect",
+    "bridge-asset",
+]
+bridge-picking = [
+    "dep:bevy_picking",
+    "dep:bevy_input",
+    "bevy_input/gamepad",
+    "dep:bevy_window",
+    "dep:bevy_camera",
+    "dep:bevy_math",
+]
+bridge-audio = [
+    "dep:bevy_audio",
+    "bridge-asset",
+]
+bridge-light = [
+    "dep:bevy_light",
+    "dep:bevy_camera",
+    "dep:bevy_color",
+]
+bridge-ui = [
+    "dep:bevy_ui",
+    "dep:bevy_text",
+    "dep:bevy_ui_widgets",
+    "dep:bevy_input_focus",
+    "dep:bevy_color",
+]
+bridge-feathers = [
+    "bridge-ui",
+    "dep:bevy_feathers",
+]
+bridge-camera-controller = [
+    "dep:bevy_camera_controller",
+    "bevy_camera_controller/free_camera",
+    "bevy_camera_controller/pan_camera",
+    "bevy_camera_controller/pan_orbit_camera",
+    "dep:bevy_camera",
+]
+bridge-solari = [
+    "dep:bevy_solari",
+    "dep:bevy_image",
+    "bevy_image/zstd_rust",
+]
+
+[dependencies]
+bevy_abi_mod_sys = { workspace = true }
+bevy_abi_mod_host_sys = { workspace = true }
+bevy_abi_mod_host = { workspace = true }
+bevy_abi_mod_macros = { workspace = true }
+bevy_ecs = { workspace = true }
+bevy_app = { workspace = true }
+bevy_platform = { workspace = true }
+bevy_math = { workspace = true, optional = true }
+bevy_transform = { workspace = true, optional = true }
+bevy_camera = { workspace = true, optional = true }
+bevy_color = { workspace = true, optional = true }
+bevy_window = { workspace = true, optional = true }
+bevy_time = { workspace = true, optional = true }
+bevy_input = { workspace = true, optional = true }
+bevy_asset = { workspace = true, optional = true }
+bevy_image = { workspace = true, optional = true }
+bevy_state = { workspace = true, optional = true }
+bevy_scene = { workspace = true, optional = true }
+bevy_reflect = { workspace = true, optional = true }
+bevy_picking = { workspace = true, optional = true }
+bevy_audio = { workspace = true, optional = true }
+bevy_light = { workspace = true, optional = true }
+bevy_ui = { workspace = true, optional = true }
+bevy_text = { workspace = true, optional = true }
+bevy_ui_widgets = { workspace = true, optional = true }
+bevy_input_focus = { workspace = true, optional = true }
+bevy_feathers = { workspace = true, optional = true }
+bevy_camera_controller = { workspace = true, optional = true }
+bevy_solari = { workspace = true, optional = true }
+
+[dev-dependencies]
+bevy_abi_mod_host_sys = { workspace = true, features = ["test-utils"] }
+bevy_reflect = { workspace = true }
+
+[[test]]
+name = "bridge_bsn"
+path = "tests/bridge_bsn.rs"
+required-features = ["bridge-bsn"]

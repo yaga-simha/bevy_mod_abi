@@ -722,15 +722,11 @@ impl HostAssetBackend for BevyHostAssetBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "bridge-reflect")]
-    use crate::AbiModPlugin;
-    #[cfg(feature = "bridge-reflect")]
+    use bevy_abi_mod_host::AbiModPlugin;
     use bevy_app::TaskPoolPlugin;
-    #[cfg(feature = "bridge-reflect")]
     use bevy_asset::AssetPlugin;
     use core::sync::atomic::{AtomicUsize, Ordering};
     use std::fs;
-    #[cfg(feature = "bridge-reflect")]
     use std::time::Duration;
 
     static TEMP_DIR_SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -836,7 +832,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "bridge-reflect")]
     #[test]
     fn real_async_mod_asset_load_isolation_traversal_and_unload_release() {
         use bevy_asset::io::Reader;

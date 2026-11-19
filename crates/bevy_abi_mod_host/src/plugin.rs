@@ -4,15 +4,11 @@ pub use crate::app_ext::ModAppExt;
 pub use crate::commands_ext::ModCommandsExt;
 pub use crate::events::{LoadedModInfo, ModLoaded, ModUnloaded};
 pub use crate::schedule_sets::{ModNamedSystemSet, ModScheduleMap, ModVisibleSets};
-#[cfg(feature = "hot-reload-watcher")]
-pub use crate::watcher::{
-    ModHotReloadAction, ModHotReloadHistory, ModHotReloadOutcome, ModHotReloadPlugin,
-    ModHotReloadWatcher,
-};
 pub use crate::world_ext::ModWorldExt;
 
 use crate::commands_ext::{PendingModLifecycleOps, flush_pending_mod_lifecycle_ops};
 use crate::mod_dag::ModDependencyGraph;
+use crate::world_ext::ModUnloadHooks;
 #[cfg(feature = "signature-verification")]
 use bevy_abi_mod_host_sys::ModTrustPolicy;
 use bevy_abi_mod_host_sys::loader::ensure_symbol_tables_in_world;
@@ -126,6 +122,9 @@ impl Plugin for ConfiguredAbiModPlugin {
         }
         if !app.world().contains_resource::<ModScheduleSetRegistry>() {
             app.insert_resource(ModScheduleSetRegistry::new());
+        }
+        if !app.world().contains_resource::<ModUnloadHooks>() {
+            app.insert_resource(ModUnloadHooks::new());
         }
         ensure_symbol_tables_in_world(app.world_mut());
         ensure_relation_graph_in_world(app.world_mut());

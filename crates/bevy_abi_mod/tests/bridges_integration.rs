@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Safe (`#![forbid(unsafe_code)]`) Cross-Bridge End-to-End Integration Suite (`e2e`).
 //!
 //! Compiles real temporary `.cdylib` guest crates using `bevy_abi_mod_guest` (`derive` +
@@ -19,12 +21,12 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use bevy_abi_mod_host::bridges::ModBridgesPlugin;
-use bevy_abi_mod_host::bridges::asset::ModAssetAppExt;
+use bevy_abi_mod::bridges::ModBridgesPlugin;
+use bevy_abi_mod::bridges::asset::ModAssetAppExt;
 #[cfg(feature = "bridge-reflect")]
-use bevy_abi_mod_host::bridges::asset::ModAssetRegistry;
-use bevy_abi_mod_host::bridges::state::ModStateExt;
-use bevy_abi_mod_host::prelude::*;
+use bevy_abi_mod::bridges::asset::ModAssetRegistry;
+use bevy_abi_mod::bridges::state::ModStateExt;
+use bevy_abi_mod::prelude::*;
 use bevy_app::{App, TaskPoolPlugin};
 #[cfg(feature = "bridge-reflect")]
 use bevy_asset::AssetApp;
@@ -43,7 +45,25 @@ use bevy_time::{Fixed, Real, Time, Virtual};
 use bevy_transform::TransformPlugin;
 use bevy_transform::components::{GlobalTransform, Transform};
 
-use crate::support::{dylib_filename, workspace_root};
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/ directory")
+        .parent()
+        .expect("workspace root directory")
+        .to_path_buf()
+}
+
+fn dylib_filename(stem: &str) -> String {
+    let (prefix, ext) = if cfg!(target_os = "windows") {
+        ("", "dll")
+    } else if cfg!(target_os = "macos") {
+        ("lib", "dylib")
+    } else {
+        ("lib", "so")
+    };
+    format!("{prefix}{stem}.{ext}")
+}
 
 // ============================================================================
 // Shared Host <-> Guest POD Wire Types & State Enum
@@ -126,10 +146,10 @@ mod reflect_assets {
     use bevy_reflect::TypePath;
 
     #[derive(Asset, TypePath, Debug, Clone)]
-    pub struct TextAsset(pub String);
+    pub(crate) struct TextAsset(pub(crate) String);
 
     #[derive(Default, TypePath)]
-    pub struct TextAssetLoader;
+    pub(crate) struct TextAssetLoader;
 
     impl AssetLoader for TextAssetLoader {
         type Asset = TextAsset;
@@ -1216,8 +1236,8 @@ fn cross_bridge_cdylib_mods_drive_std_types_isolated_assets_and_state_machine() 
 #[cfg(all(feature = "bridge-bsn", feature = "bridge-reflect"))]
 #[test]
 fn bridge_cdylib_bsn_scene_ready_observer_unload_cleanup_and_reflect_brp() {
-    use bevy_abi_mod_host::bridges::bsn::{ModBsnAppExt, ModBsnPlugin};
-    use bevy_abi_mod_host::bridges::reflect::{
+    use bevy_abi_mod::bridges::bsn::{ModBsnAppExt, ModBsnPlugin};
+    use bevy_abi_mod::bridges::reflect::{
         BRP_METHOD_GET_COMPONENTS, BRP_METHOD_MUTATE_COMPONENTS, ModReflectPlugin,
         ModReflectWorldExt, handle_mod_brp_request,
     };

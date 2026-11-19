@@ -1,16 +1,15 @@
-//! Debounced filesystem hot-reload watcher integration (`feature = "hot-reload-watcher"`).
+//! Debounced filesystem hot-reload watcher integration (`bevy_abi_mod_watcher`).
 //!
 //! Monitors a mods directory recursively for native shared libraries (`.so`, `.dylib`, `.dll`)
 //! and declarative `mod.toml` manifests, validates SemVer DAG constraints, performs incremental
 //! topological directory loading, and triggers cascading reverse-topological `reload_mod` /
 //! `unload_mod` operations.
 
-#[cfg(feature = "hot-reload-watcher")]
 mod imp {
-    use crate::mod_dag::{
+    use bevy_abi_mod_host::mod_dag::{
         ModDependencyGraph, ModTomlManifest, discover_mod_manifests, resolve_dependency_dag,
     };
-    use crate::world_ext::ModWorldExt;
+    use bevy_abi_mod_host::world_ext::ModWorldExt;
     use bevy_abi_mod_host_sys::{LoadOptions, ModHost, ModId, canonical_mod_name_from_path};
     use bevy_app::{App, Plugin, PreUpdate};
     use bevy_ecs::prelude::Resource;
@@ -834,9 +833,9 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::app_ext::ModAppExt;
-        use crate::events::{ModLoaded, ModUnloaded};
-        use crate::plugin::AbiModPlugin;
+        use bevy_abi_mod_host::app_ext::ModAppExt;
+        use bevy_abi_mod_host::events::{ModLoaded, ModUnloaded};
+        use bevy_abi_mod_host::plugin::AbiModPlugin;
         use bevy_abi_mod_macros::ModComponent;
         use bevy_ecs::message::{MessageCursor, Messages};
         use bevy_ecs::prelude::Resource;
@@ -1236,7 +1235,6 @@ BAM_EXPORT void bevy_abi_mod_shutdown(BamInstance* instance) {{
     }
 }
 
-#[cfg(feature = "hot-reload-watcher")]
 pub use imp::{
     ModHotReloadAction, ModHotReloadHistory, ModHotReloadOutcome, ModHotReloadPlugin,
     ModHotReloadWatcher,

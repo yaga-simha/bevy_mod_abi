@@ -18,10 +18,6 @@ mod support;
 
 mod batch_cmds_and_messages;
 mod boundary_validation;
-#[cfg(feature = "bridge-bsn")]
-mod bridge_bsn;
-#[cfg(feature = "bridge-reflect")]
-mod bridge_reflect;
 mod c_vtable_interop;
 mod chunk_and_commands;
 mod engine_bridge;

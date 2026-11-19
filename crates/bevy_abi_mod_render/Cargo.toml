@@ -1,0 +1,43 @@
+[package]
+name = "bevy_abi_mod_render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Safe (`#![forbid(unsafe_code)]`) multi-world SubApp extraction, WESL shaders, AlignedVec ShaderBuffers, and 2D/3D material modding for `bevy_abi_mod`"
+readme = "README.md"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+
+[dependencies]
+bevy_abi_mod_sys = { workspace = true }
+bevy_abi_mod_host_sys = { workspace = true }
+bevy_abi_mod_host = { workspace = true }
+bevy_app = { workspace = true }
+bevy_asset = { workspace = true }
+bevy_color = { workspace = true }
+bevy_ecs = { workspace = true }
+bevy_extract = { workspace = true }
+bevy_image = { workspace = true }
+bevy_material = { workspace = true }
+bevy_pbr = { workspace = true }
+bevy_platform = { workspace = true }
+bevy_reflect = { workspace = true }
+bevy_render = { workspace = true }
+bevy_shader = { workspace = true }
+bevy_sprite = { workspace = true }
+bevy_sprite_render = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+bevy_abi_mod_bridges = { workspace = true, features = ["bridge-asset"] }
+bevy_abi_mod_host_sys = { workspace = true, features = ["test-utils"] }
+bevy_abi_mod_macros = { workspace = true }

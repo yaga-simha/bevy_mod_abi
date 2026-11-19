@@ -1,0 +1,31 @@
+[package]
+name = "bevy_abi_mod_watcher"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Safe (`#![forbid(unsafe_code)]`) debounced filesystem hot-reload watcher (`ModHotReloadPlugin`) for `bevy_abi_mod`"
+readme = "README.md"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+
+[dependencies]
+bevy_abi_mod_host_sys = { workspace = true }
+bevy_abi_mod_host = { workspace = true }
+bevy_app = { workspace = true }
+bevy_ecs = { workspace = true }
+notify-debouncer-full = { workspace = true }
+semver = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+bevy_abi_mod_macros = { workspace = true }
+bevy_abi_mod_sys = { workspace = true }

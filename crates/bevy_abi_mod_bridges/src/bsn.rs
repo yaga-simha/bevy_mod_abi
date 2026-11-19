@@ -15,7 +15,7 @@ use bevy_platform::collections::HashMap;
 use bevy_scene::{Ready, ResolvedSceneRoot, Scene, ScenePatch, ScenePlugin};
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::bridges::asset::ModAssetWorldExt;
+use crate::asset::ModAssetWorldExt;
 
 /// Canonical registry name for Bevy's [`Ready`] entity event.
 pub const CANONICAL_READY_NAME: &str = "bevy_scene::Ready";

@@ -5,6 +5,10 @@ members = [
     "crates/bevy_abi_mod_macros",
     "crates/bevy_abi_mod_host_sys",
     "crates/bevy_abi_mod_host",
+    "crates/bevy_abi_mod_bridges",
+    "crates/bevy_abi_mod_render",
+    "crates/bevy_abi_mod_reflect",
+    "crates/bevy_abi_mod_watcher",
     "crates/bevy_abi_mod_guest_sys",
     "crates/bevy_abi_mod_guest",
     "crates/bevy_abi_mod",
@@ -29,6 +33,10 @@ default-members = [
     "crates/bevy_abi_mod_macros",
     "crates/bevy_abi_mod_host_sys",
     "crates/bevy_abi_mod_host",
+    "crates/bevy_abi_mod_bridges",
+    "crates/bevy_abi_mod_render",
+    "crates/bevy_abi_mod_reflect",
+    "crates/bevy_abi_mod_watcher",
     "crates/bevy_abi_mod_guest_sys",
     "crates/bevy_abi_mod_guest",
     "crates/bevy_abi_mod",
@@ -95,6 +103,10 @@ bevy_abi_mod_sys = { version = "0.2.0", path = "crates/bevy_abi_mod_sys" }
 bevy_abi_mod_macros = { version = "0.2.0", path = "crates/bevy_abi_mod_macros" }
 bevy_abi_mod_host_sys = { version = "0.2.0", path = "crates/bevy_abi_mod_host_sys" }
 bevy_abi_mod_host = { version = "0.2.0", path = "crates/bevy_abi_mod_host" }
+bevy_abi_mod_bridges = { version = "0.2.0", path = "crates/bevy_abi_mod_bridges" }
+bevy_abi_mod_render = { version = "0.2.0", path = "crates/bevy_abi_mod_render" }
+bevy_abi_mod_reflect = { version = "0.2.0", path = "crates/bevy_abi_mod_reflect" }
+bevy_abi_mod_watcher = { version = "0.2.0", path = "crates/bevy_abi_mod_watcher" }
 bevy_abi_mod_guest_sys = { version = "0.2.0", path = "crates/bevy_abi_mod_guest_sys" }
 bevy_abi_mod = { version = "0.2.0", path = "crates/bevy_abi_mod" }
 bevy_abi_mod_trust = { version = "0.2.0", path = "crates/bevy_abi_mod_trust" }
@@ -127,6 +139,16 @@ bevy_sprite_render = { version = "0.20.1", default-features = false }
 bevy_pbr = { version = "0.20.1", default-features = false }
 bevy_mesh = { version = "0.20.1", default-features = false }
 bevy_image = { version = "0.20.1", default-features = false }
+bevy_picking = { version = "0.20.1", default-features = false }
+bevy_audio = { version = "0.20.1", default-features = false }
+bevy_light = { version = "0.20.1", default-features = false }
+bevy_ui = { version = "0.20.1", default-features = false }
+bevy_text = { version = "0.20.1", default-features = false }
+bevy_ui_widgets = { version = "0.20.1", default-features = false }
+bevy_input_focus = { version = "0.20.1", default-features = false, features = ["std"] }
+bevy_feathers = { version = "0.20.1", default-features = false }
+bevy_camera_controller = { version = "0.20.1", default-features = false }
+bevy_solari = { version = "0.20.1", default-features = false }
 toml = "0.8"
 semver = "1"
 serde = { version = "1", features = ["derive"] }

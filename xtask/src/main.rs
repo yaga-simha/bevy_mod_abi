@@ -1548,6 +1548,7 @@ fn cmd_lint(args: &[String]) -> Result<(), String> {
     run_sig_verification_clippy(&root)?;
 
     verify_zero_bevy_deps(&root)?;
+    verify_headless_host_isolation(&root)?;
     verify_forbid_unsafe(&root)?;
     bevy_abi_mod_sdk_gen::write_or_check_header(&root, true)?;
     component_header_gen::write_or_check_component_headers(&root, true)?;
@@ -1763,13 +1764,68 @@ fn cmd_miri(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn verify_headless_host_isolation(root: &Path) -> Result<(), String> {
+    println!(
+        "==> Checking headless `bevy_abi_mod_host` has zero render/reflect/scene/asset/notify dependencies"
+    );
+    let output = Command::new(cargo_bin())
+        .current_dir(root)
+        .args([
+            "tree",
+            "-p",
+            "bevy_abi_mod_host",
+            "--edges",
+            "normal",
+            "--all-features",
+        ])
+        .output()
+        .map_err(|e| format!("failed to run `cargo tree` on bevy_abi_mod_host: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "`cargo tree -p bevy_abi_mod_host` failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let forbidden = [
+        "bevy_render",
+        "bevy_reflect",
+        "bevy_scene",
+        "bevy_asset",
+        "notify",
+    ];
+    let leaked: Vec<&str> = stdout
+        .lines()
+        .filter(|line| {
+            let crate_part = line.split(" (").next().unwrap_or(line);
+            forbidden.iter().any(|bad| {
+                crate_part.contains(&format!(" {bad} ")) || crate_part.contains(&format!(" {bad}-"))
+            })
+        })
+        .collect();
+
+    if !leaked.is_empty() {
+        return Err(format!(
+            "Forbidden heavy dependency leaked into headless `bevy_abi_mod_host`:\n{}",
+            leaked.join("\n")
+        ));
+    }
+    Ok(())
+}
+
 fn verify_forbid_unsafe(root: &Path) -> Result<(), String> {
     println!(
-        "==> Verifying #![forbid(unsafe_code)] in safe host, guest, macro, CLI, and xtask crates"
+        "==> Verifying #![forbid(unsafe_code)] in safe host, bridge, render, reflect, watcher, guest, macro, CLI, and xtask crates"
     );
     let safe_crates = [
         "crates/bevy_abi_mod/src/lib.rs",
         "crates/bevy_abi_mod_host/src/lib.rs",
+        "crates/bevy_abi_mod_bridges/src/lib.rs",
+        "crates/bevy_abi_mod_render/src/lib.rs",
+        "crates/bevy_abi_mod_reflect/src/lib.rs",
+        "crates/bevy_abi_mod_watcher/src/lib.rs",
         "crates/bevy_abi_mod_guest/src/lib.rs",
         "crates/bevy_abi_mod_macros/src/lib.rs",
         "crates/bevy_abi_mod_trust/src/lib.rs",
@@ -1834,9 +1890,17 @@ fn check_or_run_bevy_lint(root: &Path) -> Result<(), String> {
 
 fn audit_bevy_idioms(root: &Path) -> Result<(), String> {
     println!("==> Performing static idiomatic Bevy & Rust audit...");
-    let host_src = root.join("crates").join("bevy_abi_mod_host").join("src");
-    if host_src.is_dir() {
-        audit_dir_bevy_idioms(&host_src)?;
+    for crate_name in [
+        "bevy_abi_mod_host",
+        "bevy_abi_mod_bridges",
+        "bevy_abi_mod_render",
+        "bevy_abi_mod_reflect",
+        "bevy_abi_mod_watcher",
+    ] {
+        let src_dir = root.join("crates").join(crate_name).join("src");
+        if src_dir.is_dir() {
+            audit_dir_bevy_idioms(&src_dir)?;
+        }
     }
     Ok(())
 }

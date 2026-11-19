@@ -2,12 +2,12 @@
 
 #![forbid(unsafe_code)]
 
-use bevy_abi_mod_host::bridges::reflect::{
+use bevy_abi_mod_host::prelude::*;
+use bevy_abi_mod_reflect::reflect::{
     BRP_METHOD_GET_COMPONENTS, BRP_METHOD_GET_RESOURCES, BRP_METHOD_INSERT_COMPONENTS,
     BRP_METHOD_LIST_COMPONENTS, BRP_METHOD_MUTATE_COMPONENTS, BRP_METHOD_MUTATE_RESOURCES,
     ModReflectAppExt, ModReflectError, ModReflectPlugin, ModReflectWorldExt,
 };
-use bevy_abi_mod_host::prelude::*;
 use bevy_app::App;
 use bevy_ecs::prelude::{Component, Resource};
 use bevy_ecs::reflect::{ReflectComponent, ReflectResource};

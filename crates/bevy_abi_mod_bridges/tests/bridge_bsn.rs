@@ -1,10 +1,12 @@
+#![allow(clippy::undocumented_unsafe_blocks, clippy::ptr_as_ptr)]
+
 //! Integration tests for `bridge-bsn` (`ModBsnPlugin`, `HostSceneRegistry`,
 //! `expose_mod_scene`, `expose_mod_scene_bsn`, `expose_mod_scene_patch`, `cmd_spawn_scene`,
 //! `ChildOf` attachment, `ModScoped` cleanup, and `bevy_scene::Ready` guest observers).
 
 use std::sync::{Arc, Mutex};
 
-use bevy_abi_mod_host::bridges::bsn::{
+use bevy_abi_mod_bridges::bsn::{
     CANONICAL_READY_NAME, HostSceneRegistry, ModBsnAppExt, ModBsnPlugin, SCENE_PATCH_ALIAS,
 };
 use bevy_abi_mod_host::prelude::*;
@@ -378,4 +380,8 @@ fn expose_mod_scene_bsn_and_patch_spawn_and_notify_guest_ready_observers() {
 #[test]
 fn bsn_ready_name_constant_matches_type_name() {
     assert_eq!(CANONICAL_READY_NAME, core::any::type_name::<Ready>());
+    assert_eq!(
+        core::mem::size_of::<Ready>(),
+        core::mem::size_of::<FfiEntity>()
+    );
 }
