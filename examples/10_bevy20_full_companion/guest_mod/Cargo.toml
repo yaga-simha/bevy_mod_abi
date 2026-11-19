@@ -1,0 +1,32 @@
+[package]
+name = "companion_guest_mod"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = []
+# Builds the secondary companion mod (`companion_fx_mod`) used to demonstrate
+# multi-mod live telemetry and Quick-Save / Mod-Disable / Quick-Load recovery.
+mod-b = []
+
+[dependencies]
+bevy_abi_mod_guest = { path = "../../../crates/bevy_abi_mod_guest", features = ["derive"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+improper_ctypes_definitions = "deny"
+unreachable_pub = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+needless_pass_by_ref_mut = "warn"
+redundant_clone = "warn"
+match_same_arms = "warn"
