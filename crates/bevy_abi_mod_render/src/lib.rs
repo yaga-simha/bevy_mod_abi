@@ -10,8 +10,32 @@
 //! `bevy_abi_mod_host` so shaders, storage buffers, and material assets owned by an unloaded or
 //! hot-reloaded mod are purged deterministically from `Assets<T>`.
 
+pub mod sprite_mesh_shaders;
 pub mod sub_app_materials;
 
+pub use sprite_mesh_shaders::{
+    ExtractedModMeshPipeline, ExtractedModMeshPipelines, ModExtendedSpriteMaterial2d,
+    ModExtendedSpriteMaterialSpec, ModMeshPipelineEntry, ModMeshPipelineId, ModMeshPipelineSpec,
+    ModMeshShaderAppExt, ModMeshShaderConfig, ModMeshShaderPlugin, ModMeshShaderRegistry,
+    ModMeshShaderSubAppPlugin, ModMeshShaderWorldExt, ModMeshStageSpec, ModShaderDef,
+    ModSpriteBindingKind, ModSpriteMaterial, ModSpriteMaterialPlugin, ModSpriteMeshAppExt,
+    ModSpriteMeshBridgeRegistry, ModSpriteMeshWorldExt, ModUnifiedSpriteSpec,
+    ModWeslExtendedMaterialEntry, ModWeslSpriteExtension2d, ModWeslSpriteExtension2dKey,
+    ModWeslSpriteExtensionEntry, ModWeslSpriteExtensionSpec, ModWeslSpriteSpecialization,
+    apply_wesl_sprite_specialization, attach_mod_extended_material_2d_in_world,
+    attach_mod_sprite_material_in_world, build_quad_mesh_2d, cleanup_mod_mesh_pipelines_in_world,
+    cleanup_mod_sprite_mesh_bindings_in_world, detach_mod_extended_material_2d_in_world,
+    detach_mod_sprite_material_in_world, register_mod_mesh_pipeline_in_world,
+    register_mod_quad_mesh_in_world, register_mod_wesl_extended_sprite_material_in_world,
+    register_mod_wesl_sprite_extension_in_world, resolve_wesl_sprite_specialization,
+    spawn_mod_extended_mesh_sprite_in_world, spawn_mod_sprite_with_material_in_world,
+    unregister_mod_mesh_pipeline_in_world, update_mod_extended_sprite_material_buffer_in_world,
+    update_mod_extended_sprite_material_params_in_world,
+    update_mod_extended_sprite_material_shaders_in_world,
+    update_mod_sprite_extension_params_in_world, update_mod_wesl_sprite_extension_buffer_in_world,
+    update_mod_wesl_sprite_extension_params_in_world,
+    update_mod_wesl_sprite_extension_shaders_in_world,
+};
 pub use sub_app_materials::{
     ModMaterialError, ModMaterialParams, ModShaderBufferInit, ModShaderBufferSpec,
     ModSpriteExtension2d, ModSpriteMaterialEntry, ModSpriteMaterialSpec, ModStandardMaterialEntry,
@@ -229,8 +253,20 @@ impl ModMaterialAppExt for App {
     }
 }
 
-/// Convenient prelude re-exporting `SubApp` extraction and WESL/material plugins, traits, and specs.
+/// Convenient prelude re-exporting `SubApp` extraction, WESL/material, 2D sprite shader, and
+/// opt-in mesh-shader plugins, traits, and specs.
 pub mod prelude {
+    pub use crate::sprite_mesh_shaders::{
+        ExtractedModMeshPipeline, ExtractedModMeshPipelines, ModExtendedSpriteMaterial2d,
+        ModExtendedSpriteMaterialSpec, ModMeshPipelineEntry, ModMeshPipelineId,
+        ModMeshPipelineSpec, ModMeshShaderAppExt, ModMeshShaderConfig, ModMeshShaderPlugin,
+        ModMeshShaderRegistry, ModMeshShaderSubAppPlugin, ModMeshShaderWorldExt, ModMeshStageSpec,
+        ModShaderDef, ModSpriteBindingKind, ModSpriteMaterial, ModSpriteMaterialPlugin,
+        ModSpriteMeshAppExt, ModSpriteMeshBridgeRegistry, ModSpriteMeshWorldExt,
+        ModUnifiedSpriteSpec, ModWeslExtendedMaterialEntry, ModWeslSpriteExtension2d,
+        ModWeslSpriteExtension2dKey, ModWeslSpriteExtensionEntry, ModWeslSpriteExtensionSpec,
+        ModWeslSpriteSpecialization,
+    };
     pub use crate::sub_app_materials::{
         ModMaterialError, ModMaterialParams, ModShaderBufferInit, ModShaderBufferSpec,
         ModSpriteExtension2d, ModSpriteMaterialSpec, ModStandardMaterialSpec, ModSubAppConfig,

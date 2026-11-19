@@ -2,6 +2,11 @@
 //! extraction via `bevy_extract`, data-driven `.wesl` [`Shader`] assets, [`AlignedVec`]-backed
 //! [`ShaderBuffer`] storage assets, and Bevy `0.20` 2D/3D material management.
 
+use crate::sprite_mesh_shaders::{
+    ModExtendedSpriteMaterial2d, ModWeslExtendedMaterialEntry, ModWeslSpriteExtension2d,
+    ModWeslSpriteExtensionEntry, evict_wesl_sprite_specializations_for_shaders,
+    lookup_wesl_specialization_slot,
+};
 use bevy_abi_mod_host::register_mod_unload_hook_in_world;
 use bevy_abi_mod_host_sys::{
     ModHost, ModId, ModRegistry, ensure_component_in_target_world,
@@ -698,7 +703,8 @@ impl ModSubWorldExt for SubApp {
     }
 }
 
-/// Errors returned by `.wesl` shader, [`ShaderBuffer`], and data-driven material registration APIs.
+/// Errors returned by `.wesl` shader, [`ShaderBuffer`], sprite material, and mesh-shader
+/// pipeline registration APIs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModMaterialError {
     /// Alignment was zero, not a power of two, or exceeded [`isize::MAX`].
@@ -716,11 +722,27 @@ pub enum ModMaterialError {
     },
     /// Required [`Assets<T>`] store could not be accessed.
     AssetStoreUnavailable(&'static str),
-    /// Referenced asset handle is not owned by the specified [`ModId`].
+    /// Referenced asset or pipeline handle is not owned by the specified [`ModId`].
     ModNotOwner {
         /// Mod attempting the mutation.
         mod_id: ModId,
     },
+    /// Opt-in mesh shader pipeline registration was not enabled by the host
+    /// (`ModMeshShaderPlugin` / `ModMeshShaderConfig`).
+    MeshShadersNotEnabled,
+    /// Mod exceeded its configured mesh-shader pipeline registration quota.
+    MeshPipelineQuotaExceeded {
+        /// Mod attempting to register another mesh-shader pipeline.
+        mod_id: ModId,
+        /// Configured maximum number of pipelines per mod.
+        limit: usize,
+    },
+    /// Provided mesh-shader or sprite descriptor failed validation.
+    InvalidPipelineDescriptor(String),
+    /// Referenced ECS [`Entity`] does not exist in the target [`World`].
+    EntityNotFound(Entity),
+    /// Referenced mod mesh-shader pipeline handle was not found.
+    PipelineNotFound(u64),
 }
 
 impl fmt::Display for ModMaterialError {
@@ -742,6 +764,28 @@ impl fmt::Display for ModMaterialError {
             }
             Self::ModNotOwner { mod_id } => {
                 write!(f, "asset handle is not owned by mod {:?}", mod_id)
+            }
+            Self::MeshShadersNotEnabled => {
+                write!(
+                    f,
+                    "mesh shader pipeline bridge is opt-in and not enabled in this World"
+                )
+            }
+            Self::MeshPipelineQuotaExceeded { mod_id, limit } => {
+                write!(
+                    f,
+                    "mod {:?} exceeded mesh shader pipeline quota of {limit}",
+                    mod_id
+                )
+            }
+            Self::InvalidPipelineDescriptor(reason) => {
+                write!(f, "invalid pipeline or sprite descriptor: {reason}")
+            }
+            Self::EntityNotFound(entity) => {
+                write!(f, "entity {entity:?} does not exist in World")
+            }
+            Self::PipelineNotFound(id) => {
+                write!(f, "mesh shader pipeline id {id} was not found")
             }
         }
     }
@@ -1324,6 +1368,8 @@ pub struct ModWeslMaterialRegistry {
     standard_materials: HashMap<ModId, Vec<ModStandardMaterialEntry>>,
     sprite_extensions: HashMap<ModId, Vec<(String, Handle<ModSpriteExtension2d>)>>,
     extended_2d_materials: HashMap<ModId, Vec<(String, Extended2dMaterialHandle)>>,
+    pub(crate) wesl_sprite_extensions: HashMap<ModId, Vec<ModWeslSpriteExtensionEntry>>,
+    pub(crate) wesl_extended_2d_materials: HashMap<ModId, Vec<ModWeslExtendedMaterialEntry>>,
     custom_cleanups: HashMap<ModId, Vec<CustomAssetCleanupFn>>,
 }
 
@@ -1353,6 +1399,18 @@ impl ModWeslMaterialRegistry {
         self.standard_materials.get(&mod_id).map_or(0, Vec::len)
     }
 
+    /// Returns the number of [`ModWeslSpriteExtension2d`] assets currently tracked for `mod_id`.
+    pub fn wesl_sprite_extension_count_for_mod(&self, mod_id: ModId) -> usize {
+        self.wesl_sprite_extensions.get(&mod_id).map_or(0, Vec::len)
+    }
+
+    /// Returns the number of [`ModExtendedSpriteMaterial2d`] assets currently tracked for `mod_id`.
+    pub fn wesl_extended_2d_material_count_for_mod(&self, mod_id: ModId) -> usize {
+        self.wesl_extended_2d_materials
+            .get(&mod_id)
+            .map_or(0, Vec::len)
+    }
+
     /// Returns the total number of tracked shader, buffer, and material assets for `mod_id`.
     pub fn total_assets_for_mod(&self, mod_id: ModId) -> usize {
         self.shader_count_for_mod(mod_id)
@@ -1362,6 +1420,8 @@ impl ModWeslMaterialRegistry {
             + self.custom_cleanups.get(&mod_id).map_or(0, Vec::len)
             + self.sprite_extensions.get(&mod_id).map_or(0, Vec::len)
             + self.extended_2d_materials.get(&mod_id).map_or(0, Vec::len)
+            + self.wesl_sprite_extension_count_for_mod(mod_id)
+            + self.wesl_extended_2d_material_count_for_mod(mod_id)
     }
 
     /// Looks up a mod-owned [`Handle<Shader>`] by `mod_id` and `label`.
@@ -1404,16 +1464,81 @@ impl ModWeslMaterialRegistry {
             .find(|entry| entry.label == label)
     }
 
+    /// Looks up a mod-owned [`ModWeslSpriteExtensionEntry`] by `mod_id` and `label`.
+    pub fn get_wesl_sprite_extension(
+        &self,
+        mod_id: ModId,
+        label: &str,
+    ) -> Option<&ModWeslSpriteExtensionEntry> {
+        self.wesl_sprite_extensions
+            .get(&mod_id)?
+            .iter()
+            .find(|entry| entry.label == label)
+    }
+
+    /// Looks up a mod-owned [`ModWeslExtendedMaterialEntry`] by `mod_id` and `label`.
+    pub fn get_wesl_extended_2d_material(
+        &self,
+        mod_id: ModId,
+        label: &str,
+    ) -> Option<&ModWeslExtendedMaterialEntry> {
+        self.wesl_extended_2d_materials
+            .get(&mod_id)?
+            .iter()
+            .find(|entry| entry.label == label)
+    }
+
+    /// Returns `true` if `shader_id` is currently owned by `mod_id`.
+    pub fn is_shader_owned_by(&self, mod_id: ModId, shader_id: AssetId<Shader>) -> bool {
+        self.shaders
+            .get(&mod_id)
+            .is_some_and(|list| list.iter().any(|(_, h)| h.id() == shader_id))
+    }
+
     /// Returns `true` if `buffer_id` is currently owned by `mod_id`.
     pub fn is_buffer_owned_by(&self, mod_id: ModId, buffer_id: AssetId<ShaderBuffer>) -> bool {
         self.buffers
             .get(&mod_id)
             .is_some_and(|list| list.iter().any(|(_, h)| h.id() == buffer_id))
     }
+
+    /// Returns `true` if `ext_id` is a [`ModSpriteExtension2d`] owned by `mod_id`.
+    pub fn is_sprite_extension_owned_by(
+        &self,
+        mod_id: ModId,
+        ext_id: AssetId<ModSpriteExtension2d>,
+    ) -> bool {
+        self.sprite_extensions
+            .get(&mod_id)
+            .is_some_and(|list| list.iter().any(|(_, h)| h.id() == ext_id))
+    }
+
+    /// Returns `true` if `ext_id` is a [`ModWeslSpriteExtension2d`] owned by `mod_id`.
+    pub fn is_wesl_sprite_extension_owned_by(
+        &self,
+        mod_id: ModId,
+        ext_id: AssetId<ModWeslSpriteExtension2d>,
+    ) -> bool {
+        self.wesl_sprite_extensions
+            .get(&mod_id)
+            .is_some_and(|list| list.iter().any(|entry| entry.handle.id() == ext_id))
+    }
+
+    /// Returns `true` if `mat_id` is a [`ModExtendedSpriteMaterial2d`] owned by `mod_id`.
+    pub fn is_wesl_extended_2d_material_owned_by(
+        &self,
+        mod_id: ModId,
+        mat_id: AssetId<ModExtendedSpriteMaterial2d>,
+    ) -> bool {
+        self.wesl_extended_2d_materials
+            .get(&mod_id)
+            .is_some_and(|list| list.iter().any(|entry| entry.handle.id() == mat_id))
+    }
 }
 
 /// Initializes [`ModWeslMaterialRegistry`] and headless-safe [`Assets`] stores for `.wesl`
-/// [`Shader`], [`ShaderBuffer`], [`SpriteMeshMaterial`], and [`StandardMaterial`] assets.
+/// [`Shader`], [`ShaderBuffer`], [`SpriteMeshMaterial`], [`ModWeslSpriteExtension2d`],
+/// [`ModExtendedSpriteMaterial2d`], and [`StandardMaterial`] assets.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct ModWeslMaterialPlugin;
 
@@ -1441,10 +1566,12 @@ impl Plugin for ModWeslMaterialPlugin {
         ensure_asset_store_in_app::<ExtendedMaterial2d<SpriteMeshMaterial, ModSpriteExtension2d>>(
             app,
         );
+        ensure_asset_store_in_app::<ModWeslSpriteExtension2d>(app);
+        ensure_asset_store_in_app::<ModExtendedSpriteMaterial2d>(app);
     }
 }
 
-fn ensure_asset_store_in_app<A: Asset>(app: &mut App) {
+pub(crate) fn ensure_asset_store_in_app<A: Asset>(app: &mut App) {
     if !app.world().contains_resource::<Assets<A>>() {
         if app.world().contains_resource::<AssetServer>() {
             app.init_asset::<A>();
@@ -1454,7 +1581,7 @@ fn ensure_asset_store_in_app<A: Asset>(app: &mut App) {
     }
 }
 
-fn ensure_asset_store_in_world<A: Asset>(world: &mut World) {
+pub(crate) fn ensure_asset_store_in_world<A: Asset>(world: &mut World) {
     if !world.contains_resource::<Assets<A>>() {
         let assets = Assets::<A>::default();
         if let Some(server) = world.get_resource::<AssetServer>().cloned() {
@@ -1464,7 +1591,7 @@ fn ensure_asset_store_in_world<A: Asset>(world: &mut World) {
     }
 }
 
-fn ensure_material_registry(world: &mut World) {
+pub(crate) fn ensure_material_registry(world: &mut World) {
     if !world.contains_resource::<ModWeslMaterialRegistry>() {
         world.insert_resource(ModWeslMaterialRegistry::new());
     }
@@ -1707,6 +1834,8 @@ pub fn cleanup_mod_wesl_materials_in_world(world: &mut World, mod_id: ModId) -> 
     let standard_mats;
     let sprite_exts;
     let ext_2d_mats;
+    let wesl_sprite_exts;
+    let wesl_ext_2d_mats;
     let custom;
     {
         let Some(mut reg) = world.get_resource_mut::<ModWeslMaterialRegistry>() else {
@@ -1721,16 +1850,32 @@ pub fn cleanup_mod_wesl_materials_in_world(world: &mut World, mod_id: ModId) -> 
             .extended_2d_materials
             .remove(&mod_id)
             .unwrap_or_default();
+        wesl_sprite_exts = reg
+            .wesl_sprite_extensions
+            .remove(&mod_id)
+            .unwrap_or_default();
+        wesl_ext_2d_mats = reg
+            .wesl_extended_2d_materials
+            .remove(&mod_id)
+            .unwrap_or_default();
         custom = reg.custom_cleanups.remove(&mod_id).unwrap_or_default();
     }
 
     let mut removed = 0usize;
+    let mut removed_shader_ids = Vec::with_capacity(shaders.len());
+    let mut removed_spec_slots = Vec::new();
 
     if let Some(mut assets) = world.get_resource_mut::<Assets<Shader>>() {
         for (_, handle) in shaders {
-            if assets.remove(handle.id()).is_some() {
+            let id = handle.id();
+            removed_shader_ids.push(id);
+            if assets.remove(id).is_some() {
                 removed += 1;
             }
+        }
+    } else {
+        for (_, handle) in shaders {
+            removed_shader_ids.push(handle.id());
         }
     }
     if let Some(mut assets) = world.get_resource_mut::<Assets<ShaderBuffer>>() {
@@ -1770,6 +1915,52 @@ pub fn cleanup_mod_wesl_materials_in_world(world: &mut World, mod_id: ModId) -> 
             }
         }
     }
+    if let Some(mut assets) = world.get_resource_mut::<Assets<ModWeslSpriteExtension2d>>() {
+        for entry in wesl_sprite_exts {
+            if let Some(ext) = assets.remove(entry.handle.id()) {
+                let slot = lookup_wesl_specialization_slot(&ext);
+                if slot != 0 {
+                    removed_spec_slots.push(slot);
+                }
+                removed += 1;
+            }
+        }
+    }
+    if let Some(mut assets) = world.get_resource_mut::<Assets<ModExtendedSpriteMaterial2d>>() {
+        for entry in wesl_ext_2d_mats {
+            if let Some(mat) = assets.remove(entry.handle.id()) {
+                let slot = lookup_wesl_specialization_slot(&mat.extension);
+                if slot != 0 {
+                    removed_spec_slots.push(slot);
+                }
+                removed += 1;
+            }
+        }
+    }
+    let mut live_slots = HashSet::default();
+    if !removed_spec_slots.is_empty() {
+        if let Some(assets) = world.get_resource::<Assets<ModWeslSpriteExtension2d>>() {
+            for (_, ext) in assets.iter() {
+                let slot = lookup_wesl_specialization_slot(ext);
+                if slot != 0 {
+                    live_slots.insert(slot);
+                }
+            }
+        }
+        if let Some(assets) = world.get_resource::<Assets<ModExtendedSpriteMaterial2d>>() {
+            for (_, mat) in assets.iter() {
+                let slot = lookup_wesl_specialization_slot(&mat.extension);
+                if slot != 0 {
+                    live_slots.insert(slot);
+                }
+            }
+        }
+    }
+    let _ = evict_wesl_sprite_specializations_for_shaders(
+        &removed_shader_ids,
+        &removed_spec_slots,
+        &live_slots,
+    );
     for cleanup in custom {
         cleanup(world);
         removed += 1;
