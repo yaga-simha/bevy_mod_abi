@@ -371,8 +371,8 @@ pub unsafe extern "C" fn host_register_relation(
     unsafe { crate::ffi::relations::register_relation_impl(load_ctx, desc_ptr, out_component) }
 }
 
-/// Reserved ABI `0.3.0` slot for symbol table string interning (`BamSymbol`)
-/// (validates inputs and currently returns [`FfiResult::UNSUPPORTED`]).
+/// Interns a non-empty UTF-8 symbol string into the world's monotonic [`crate::loader::BamSymbolTable`],
+/// writing its stable [`BamSymbol`] handle (`BamSymbol(0)`, `BamSymbol(1)`, ...) into `*out_symbol`.
 ///
 /// # Safety
 /// - `ctx` must point to an active [`HostContext`] cast to [`BamHostCtx`], or null.
@@ -394,16 +394,31 @@ pub unsafe extern "C" fn host_intern_symbol(
         Err(err) => return err,
     };
     // SAFETY: Caller guarantees `symbol.ptr` references `symbol.len` readable bytes when `len > 0`.
-    if let Err(err) = unsafe { validate_non_empty_str_view(symbol) } {
-        host_ctx.set_last_error(format!("intern_symbol `symbol` validation failed ({err})"));
-        return err;
+    let sym_str = match unsafe { validate_non_empty_str_view(symbol) } {
+        Ok(s) => s,
+        Err(err) => {
+            host_ctx.set_last_error(format!("intern_symbol `symbol` validation failed ({err})"));
+            return err;
+        }
+    };
+    match crate::loader::symbols::intern_symbol_for_host_ctx(host_ctx, sym_str) {
+        Ok(handle) => {
+            // SAFETY: `out_symbol` was checked non-null and caller guarantees writable `BamSymbol`.
+            unsafe {
+                *out_symbol = handle;
+            }
+            FfiResult::OK
+        }
+        Err(err) => err,
     }
-    host_ctx.set_last_error("intern_symbol is reserved in ABI 0.3.0 and not yet implemented");
-    FfiResult::UNSUPPORTED
 }
 
-/// Reserved ABI `0.3.0` slot for canonical entity name binding
-/// (validates inputs and currently returns [`FfiResult::UNSUPPORTED`]).
+/// Binds or rebinds a canonical UTF-8 object/prefab `name` (and its deterministic 128-bit UUID
+/// `ComponentUuid::from_parts(name, 0, 0, 0)`) to `entity` in the world's persistent
+/// [`crate::loader::ModNamedObjects`] registry.
+///
+/// Rejects [`FfiEntity::NULL`], `Entity::PLACEHOLDER`, or invalid entity bit patterns with
+/// [`FfiResult::INVALID_ENTITY`].
 ///
 /// # Safety
 /// - `ctx` must point to an active [`HostContext`] cast to [`BamHostCtx`], or null.
@@ -421,18 +436,26 @@ pub unsafe extern "C" fn host_bind_named_object(
         Err(err) => return err,
     };
     // SAFETY: Caller guarantees `name.ptr` references `name.len` readable bytes when `len > 0`.
-    if let Err(err) = unsafe { validate_non_empty_str_view(name) } {
-        host_ctx.set_last_error(format!(
-            "bind_named_object `name` validation failed ({err})"
-        ));
-        return err;
+    let name_str = match unsafe { validate_non_empty_str_view(name) } {
+        Ok(s) => s,
+        Err(err) => {
+            host_ctx.set_last_error(format!(
+                "bind_named_object `name` validation failed ({err})"
+            ));
+            return err;
+        }
+    };
+    let bevy_entity = match validate_non_null_entity(entity) {
+        Ok(e) => e,
+        Err(err) => {
+            host_ctx.set_last_error("bind_named_object requires a valid non-null entity");
+            return err;
+        }
+    };
+    match crate::loader::symbols::bind_named_object_for_host_ctx(host_ctx, name_str, bevy_entity) {
+        Ok(()) => FfiResult::OK,
+        Err(err) => err,
     }
-    if let Err(err) = validate_non_null_entity(entity) {
-        host_ctx.set_last_error("bind_named_object requires a valid non-null entity");
-        return err;
-    }
-    host_ctx.set_last_error("bind_named_object is reserved in ABI 0.3.0 and not yet implemented");
-    FfiResult::UNSUPPORTED
 }
 
 /// Walks upward from `entity`'s parent along `relation` (`BamComponent::INVALID` defaults to
@@ -805,19 +828,21 @@ pub unsafe extern "C" fn host_cmd_remove_relation(
     unsafe { crate::ffi::relations::cmd_remove_relation_impl(commands, entity, relation, target) }
 }
 
-/// Reserved ABI `0.3.0` slot for live schema-fingerprint component column migration
-/// (validates inputs and currently returns [`FfiResult::UNSUPPORTED`]).
+/// Migrates live ECS rows of dynamic `AbiPod` component `component` from `old_fingerprint` to
+/// `new_desc_ptr` using contiguous per-table scratch buffers and atomically remaps `component`
+/// in [`crate::ModRegistry`] (zero-copy fast path when `schema_fingerprint` and layout are unchanged).
 ///
 /// # Safety
 /// - `load_ctx` must point to an active `LoadContext` cast to [`BamLoadCtx`], or null.
 /// - `new_desc_ptr` must point to a readable [`ComponentDesc`], or null.
+/// - If `migrate_fn` is `Some`, it must uphold [`BamRowMigrateFn`]'s nounwind safety contract.
 pub unsafe extern "C" fn host_migrate_component_column(
     load_ctx: *mut BamLoadCtx,
     component: BamComponent,
-    _old_fingerprint: u64,
+    old_fingerprint: u64,
     new_desc_ptr: *const ComponentDesc,
     migrate_fn: Option<BamRowMigrateFn>,
-    _user_data: *mut c_void,
+    user_data: *mut c_void,
 ) -> FfiResult {
     // SAFETY: Validates active `LoadContext` header and `in_init` state.
     let ctx = match unsafe { validate_active_load_ctx(load_ctx) } {
@@ -847,15 +872,22 @@ pub unsafe extern "C" fn host_migrate_component_column(
             .set_last_error(format!("migration ComponentDesc invalid ({status})"));
         return status;
     }
-    if migrate_fn.is_none() {
+    let Some(migrate_cb) = migrate_fn else {
         ctx.host_ctx
             .set_last_error("migrate_component_column requires a non-null `migrate_fn`");
         return FfiResult::NULL_POINTER;
+    };
+    // SAFETY: `new_desc` passed `ComponentDesc::validate()` and `migrate_cb` satisfies caller contract.
+    unsafe {
+        crate::loader::schema_migration::migrate_component_column_ffi(
+            ctx,
+            component,
+            old_fingerprint,
+            &new_desc,
+            migrate_cb,
+            user_data,
+        )
     }
-    ctx.host_ctx.set_last_error(
-        "migrate_component_column is reserved in ABI 0.3.0 and not yet implemented",
-    );
-    FfiResult::UNSUPPORTED
 }
 
 /// Retains a single place checking the `host_cmd_*` imports used in unit tests cleanly while
@@ -1277,8 +1309,9 @@ mod tests {
             );
             assert_eq!(
                 host_intern_symbol(host_ptr, StrView::from_str("hp"), &raw mut sym),
-                FfiResult::UNSUPPORTED
+                FfiResult::OK
             );
+            assert_eq!(sym, BamSymbol::from_raw(0));
 
             assert_eq!(
                 host_bind_named_object(host_ptr, StrView::from_str("hero"), FfiEntity::NULL),
@@ -1286,7 +1319,7 @@ mod tests {
             );
             assert_eq!(
                 host_bind_named_object(host_ptr, StrView::from_str("hero"), live_ent),
-                FfiResult::UNSUPPORTED
+                FfiResult::OK
             );
 
             assert_eq!(
@@ -1324,7 +1357,7 @@ mod tests {
                     Some(stub_migrate),
                     core::ptr::null_mut(),
                 ),
-                FfiResult::UNSUPPORTED
+                FfiResult::PERMISSION_DENIED
             );
         }
 

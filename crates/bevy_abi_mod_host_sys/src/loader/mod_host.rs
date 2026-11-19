@@ -11,6 +11,7 @@ use crate::loader::shared_lib::{
 };
 #[cfg(feature = "signature-verification")]
 use crate::loader::signing::{ModTrustPolicy, VerifiedModSignature, default_signature_path_for};
+use crate::loader::symbols::{ModNamedObjects, ensure_symbol_tables_in_world};
 use crate::loader::transaction::LoadTransaction;
 use crate::registry::{ModRegistry, RegistrySnapshot};
 use crate::schedule::{ModNamedSystemSet, ModSystemSet};
@@ -621,6 +622,7 @@ impl ModHost {
             // SAFETY: `world_ptr` is exclusively borrowed and `load_ctx` holds no live `&mut World`.
             let world = unsafe { &mut *world_ptr };
             world.insert_resource(load_ctx.registry.clone());
+            ModNamedObjects::strip_mod_scoped_in_world(world);
             observer_entities = spawn_registered_observers_in_world(
                 world,
                 core::mem::take(&mut load_ctx.registered_observers),
@@ -756,6 +758,7 @@ pub fn load_mod_in_world(
     if !world.contains_resource::<ModQuarantine>() {
         world.insert_resource(ModQuarantine::new());
     }
+    ensure_symbol_tables_in_world(world);
     world.resource_scope::<ModHost, _>(|world, mut mod_host| {
         let registry = world
             .get_resource::<ModRegistry>()
@@ -969,6 +972,10 @@ fn excise_and_unload_mod_inner<F: FnOnce(&mut World)>(
                 .collect()
         })
         .unwrap_or_default();
+
+    // Promote any entities bound in `ModNamedObjects` to persistent (`!ModScoped`) before
+    // mod-scoped teardown so named objects/prefabs survive unload and hot-reload.
+    ModNamedObjects::strip_mod_scoped_in_world(world);
 
     if despawn_scoped {
         world.despawn_all_where::<(&ModScoped,), (Allow<Disabled>, Without<IsResource>)>(|(s,)| {

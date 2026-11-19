@@ -8,6 +8,7 @@ pub mod shared_lib;
 #[cfg(feature = "signature-verification")]
 #[forbid(unsafe_code)]
 pub mod signing;
+pub mod symbols;
 pub(crate) mod transaction;
 
 pub use error::{ModLoadError, is_abi_version_compatible};
@@ -18,8 +19,8 @@ pub use mod_host::{
     save_mod_state_in_world, unload_all_mods_in_world,
 };
 pub use schema_migration::{
-    ExportedFieldRecord, ReloadColumnSnapshot, SnapshotComponentColumn, SnapshotEntityFields,
-    cleanup_orphaned_mod_scoped_entities, migrate_mod_scoped_entities,
+    ExportedFieldRecord, ReloadColumnSnapshot, RetainedZeroCopyColumn, SnapshotComponentColumn,
+    SnapshotEntityFields, cleanup_orphaned_mod_scoped_entities, migrate_mod_scoped_entities,
     restore_mod_dynamic_columns_after_reload, snapshot_mod_dynamic_columns_for_reload,
 };
 #[cfg(feature = "signature-verification")]
@@ -39,3 +40,4 @@ pub use signing::{
     default_signature_path_for, extract_embedded_bam_sig, sign_mod_bytes_with_certificate,
     sign_mod_bytes_with_key, sign_mod_bytes_with_openssh_certificate, zeroed_binary_for_bam_sig,
 };
+pub use symbols::{BamSymbolTable, ModNamedObjects, ensure_symbol_tables_in_world};

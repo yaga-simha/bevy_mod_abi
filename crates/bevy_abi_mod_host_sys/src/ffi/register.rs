@@ -10,6 +10,7 @@ use crate::handle_header::{
     validate_handle_ref,
 };
 use crate::loader::ModId;
+use crate::loader::symbols::ensure_symbol_tables_in_world;
 use crate::registry::{
     ExtractEventTargetFn, ModRegistry, RegistrySnapshot, component_flags_to_storage_flags,
     extract_owned_dynamic_fields,
@@ -19,11 +20,11 @@ use crate::sync_ptr::{GuestFnPtr, GuestUserData};
 use crate::system::access_builder::validate_system_queries_against_snapshot;
 use crate::system::{BamQuerySpecOwned, GuestSystem};
 use bevy_abi_mod_sys::{
-    BAM_REQUIRED_FLAG_CUSTOM_BYTES, BAM_REQUIRED_FLAG_INIT_FN, BAM_REQUIRED_KNOWN_FLAGS,
-    BamComponent, BamEventKind, BamHostCtx, BamLoadCtx, BamObserverDesc, BamObserverFn,
-    BamObserverMutFn, BamQueryDesc, BamRequiredComponent, BamSystem, BamSystemDesc, BamTermDesc,
-    ComponentCloneFn, ComponentDesc, ComponentHookFn, ComponentUuid, FfiEntity, FfiResult,
-    read_descriptor,
+    BAM_REQUIRED_FLAG_CUSTOM_BYTES, BAM_REQUIRED_FLAG_INIT_FN, BAM_REQUIRED_FLAG_RESOLVE_BY_UUID,
+    BAM_REQUIRED_KNOWN_FLAGS, BamComponent, BamEventKind, BamHostCtx, BamLoadCtx, BamObserverDesc,
+    BamObserverFn, BamObserverMutFn, BamQueryDesc, BamRequiredComponent, BamRequiredInitFn,
+    BamSystem, BamSystemDesc, BamTermDesc, ComponentCloneFn, ComponentDesc, ComponentHookFn,
+    ComponentUuid, FfiEntity, FfiResult, read_descriptor,
 };
 use bevy_ecs::component::{ComponentCloneBehavior, ComponentDescriptor, ComponentId, StorageType};
 use bevy_ecs::entity::{ComponentCloneCtx, Entity, SourceComponent};
@@ -86,6 +87,23 @@ pub struct GuestObserverBinding {
 // ============================================================================
 
 #[derive(Clone)]
+enum RequiredInitStrategy {
+    Default,
+    CustomBytes(Arc<[u8]>),
+    InitFn {
+        init_fn: GuestFnPtr<BamRequiredInitFn>,
+        user_data: GuestUserData,
+        is_active: Arc<AtomicBool>,
+    },
+}
+
+#[derive(Clone)]
+struct ResolvedRequiredInit {
+    handle: BamComponent,
+    strategy: RequiredInitStrategy,
+}
+
+#[derive(Clone)]
 struct DynamicHookBinding {
     on_add: Option<GuestFnPtr<ComponentHookFn>>,
     on_insert: Option<GuestFnPtr<ComponentHookFn>>,
@@ -94,7 +112,7 @@ struct DynamicHookBinding {
     on_despawn: Option<GuestFnPtr<ComponentHookFn>>,
     user_data: GuestUserData,
     is_active: Arc<AtomicBool>,
-    required_components: Arc<[BamComponent]>,
+    required_inits: Arc<[ResolvedRequiredInit]>,
     registry: ModRegistry,
 }
 
@@ -255,10 +273,47 @@ impl Drop for OwnedZeroedBuffer {
     }
 }
 
+fn insert_required_raw_buffer(
+    world: &mut World,
+    entity: Entity,
+    req_meta: &crate::registry::RegisteredComponent,
+    buf: &OwnedZeroedBuffer,
+) -> bool {
+    if !req_meta.is_dynamic {
+        if let Some(insert_raw) = req_meta.insert_raw_fn {
+            // SAFETY: `buf.ptr` holds `req_meta.size` initialized bytes aligned to `req_meta.align`
+            // matching `req_meta`'s raw-insertable host layout.
+            unsafe {
+                insert_raw(world, entity, buf.ptr.cast_const());
+            }
+            return true;
+        }
+        return false;
+    }
+
+    if let Ok(mut e_mut) = world.get_entity_mut(entity) {
+        let nn = if buf.layout.size() == 0 {
+            core::ptr::NonNull::<u8>::dangling()
+        } else {
+            // SAFETY: `OwnedZeroedBuffer::new` aborts on null when `size > 0`.
+            unsafe { core::ptr::NonNull::new_unchecked(buf.ptr) }
+        };
+        // SAFETY: `nn` points to `req_meta.size` initialized bytes matching `req_meta.component_id`'s
+        // layout; `insert_by_id` copies out without freeing `buf`.
+        let owning = unsafe { OwningPtr::new(nn) };
+        // SAFETY: `req_meta.component_id` was registered in `world` with `(size, align)`.
+        unsafe {
+            e_mut.insert_by_id(req_meta.component_id, owning);
+        }
+        return true;
+    }
+    false
+}
+
 fn insert_required_components_recursive(
     world: &mut World,
     entity: Entity,
-    root_reqs: &[BamComponent],
+    root_reqs: &[ResolvedRequiredInit],
     registry: &ModRegistry,
 ) {
     if root_reqs.is_empty() || !world.entities().contains(entity) {
@@ -266,20 +321,42 @@ fn insert_required_components_recursive(
     }
     let snap = registry.latest_snapshot_arc();
     let mut visited = HashSet::<BamComponent>::new();
-    let mut queue = VecDeque::<BamComponent>::new();
-    for &req in root_reqs {
-        if visited.insert(req) {
-            queue.push_back(req);
+    let mut queue = VecDeque::<ResolvedRequiredInit>::new();
+    for req in root_reqs {
+        if visited.insert(req.handle) {
+            queue.push_back(req.clone());
         }
     }
 
-    while let Some(req_handle) = queue.pop_front() {
-        let Some(req_meta) = snap.get_by_handle(req_handle) else {
+    while let Some(req_item) = queue.pop_front() {
+        let Some(req_meta) = snap.get_by_handle(req_item.handle) else {
             continue;
         };
-        for &transitive in snap.required_components(req_handle) {
+
+        // Enqueue transitive custom required initializers first (preserving explicit strategies).
+        let transitive_custom: Option<Arc<[ResolvedRequiredInit]>> = world
+            .get_resource::<DynamicComponentHookMap>()
+            .and_then(|map| map.by_id.get(&req_meta.component_id))
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .rev()
+                    .find(|e| e.is_active.load(Ordering::Acquire))
+            })
+            .map(|binding| Arc::clone(&binding.required_inits));
+        if let Some(custom_reqs) = transitive_custom {
+            for transitive in custom_reqs.iter() {
+                if visited.insert(transitive.handle) {
+                    queue.push_back(transitive.clone());
+                }
+            }
+        }
+        for &transitive in snap.required_components(req_item.handle) {
             if visited.insert(transitive) {
-                queue.push_back(transitive);
+                queue.push_back(ResolvedRequiredInit {
+                    handle: transitive,
+                    strategy: RequiredInitStrategy::Default,
+                });
             }
         }
 
@@ -290,35 +367,81 @@ fn insert_required_components_recursive(
             continue;
         }
 
-        if let Some(insert_default) = req_meta.insert_default_fn {
-            insert_default(world, entity);
-        } else if req_meta.is_abi_pod && req_meta.drop_fn.is_none() && req_meta.drop_slot.is_none()
-        {
-            let Ok(layout) = Layout::from_size_align(req_meta.size, req_meta.align.max(1)) else {
-                continue;
-            };
-            let zeroed = OwnedZeroedBuffer::new(layout);
-            if !req_meta.is_dynamic {
-                if let Some(insert_raw) = req_meta.insert_raw_fn {
-                    // SAFETY: `zeroed.ptr` holds `req_meta.size` zeroed bytes aligned to
-                    // `req_meta.align`, and `req_meta.is_abi_pod` guarantees zero-init validity.
+        match req_item.strategy {
+            RequiredInitStrategy::Default => {
+                if let Some(insert_default) = req_meta.insert_default_fn {
+                    insert_default(world, entity);
+                } else if req_meta.is_abi_pod
+                    && req_meta.drop_fn.is_none()
+                    && req_meta.drop_slot.is_none()
+                {
+                    let Ok(layout) = Layout::from_size_align(req_meta.size, req_meta.align.max(1))
+                    else {
+                        continue;
+                    };
+                    let zeroed = OwnedZeroedBuffer::new(layout);
+                    let _ = insert_required_raw_buffer(world, entity, req_meta, &zeroed);
+                }
+            }
+            RequiredInitStrategy::CustomBytes(ref bytes) => {
+                if bytes.len() != req_meta.size
+                    || !req_meta.is_abi_pod
+                    || req_meta.drop_fn.is_some()
+                    || req_meta.drop_slot.is_some()
+                {
+                    continue;
+                }
+                let Ok(layout) = Layout::from_size_align(req_meta.size, req_meta.align.max(1))
+                else {
+                    continue;
+                };
+                let buf = OwnedZeroedBuffer::new(layout);
+                if !bytes.is_empty() {
+                    // SAFETY: `buf.ptr` is allocated for `req_meta.size == bytes.len()` writable
+                    // bytes and does not overlap `bytes`.
                     unsafe {
-                        insert_raw(world, entity, zeroed.ptr.cast_const());
+                        core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.ptr, bytes.len());
                     }
                 }
-            } else if let Ok(mut e_mut) = world.get_entity_mut(entity) {
-                let nn = if layout.size() == 0 {
-                    core::ptr::NonNull::<u8>::dangling()
-                } else {
-                    // SAFETY: `OwnedZeroedBuffer::new` aborts on null when `size > 0`.
-                    unsafe { core::ptr::NonNull::new_unchecked(zeroed.ptr) }
+                let _ = insert_required_raw_buffer(world, entity, req_meta, &buf);
+            }
+            RequiredInitStrategy::InitFn {
+                init_fn: GuestFnPtr(init_fn),
+                user_data,
+                ref is_active,
+            } => {
+                if !is_active.load(Ordering::Acquire) {
+                    continue;
+                }
+                let Ok(layout) = Layout::from_size_align(req_meta.size, req_meta.align.max(1))
+                else {
+                    continue;
                 };
-                // SAFETY: `nn` points to `req_meta.size` initialized zeroed bytes matching
-                // `req_meta.component_id`'s layout; `insert_by_id` copies out without freeing `nn`.
-                let owning = unsafe { OwningPtr::new(nn) };
-                // SAFETY: `req_meta.component_id` was registered in `world` with `(size, align)`.
-                unsafe {
-                    e_mut.insert_by_id(req_meta.component_id, owning);
+                let buf = OwnedZeroedBuffer::new(layout);
+                let dst_ptr = if layout.size() == 0 {
+                    core::ptr::NonNull::<u8>::dangling()
+                        .as_ptr()
+                        .cast::<c_void>()
+                } else {
+                    buf.ptr.cast::<c_void>()
+                };
+                // SAFETY: `is_active` was verified true (`Ordering::Acquire`), `dst_ptr` points to
+                // `req_meta.size` writable `req_meta.align`-aligned bytes, and `init_fn` upholds
+                // `BamRequiredInitFn`'s nounwind contract.
+                let rc = unsafe { init_fn(dst_ptr, user_data.as_ptr()) };
+                if !rc.is_ok() {
+                    continue;
+                }
+                let inserted = insert_required_raw_buffer(world, entity, req_meta, &buf);
+                if !inserted
+                    && let Some(drop_fn) = req_meta.drop_fn
+                    && is_active.load(Ordering::Acquire)
+                {
+                    // SAFETY: `init_fn` returned `OK` initializing `dst_ptr`, and ownership was not
+                    // transferred into ECS storage, so run `drop_fn` before `buf` deallocates.
+                    unsafe {
+                        drop_fn(dst_ptr);
+                    }
                 }
             }
         }
@@ -365,13 +488,10 @@ fn invoke_dynamic_hook(
 
 fn dynamic_on_add_hook(mut world: DeferredWorld<'_>, ctx: HookContext) {
     let req_info = active_hook_binding(&world, ctx.component_id).and_then(|entry| {
-        if entry.required_components.is_empty() {
+        if entry.required_inits.is_empty() {
             None
         } else {
-            Some((
-                Arc::clone(&entry.required_components),
-                entry.registry.clone(),
-            ))
+            Some((Arc::clone(&entry.required_inits), entry.registry.clone()))
         }
     });
     if let Some((reqs, registry)) = req_info {
@@ -751,30 +871,33 @@ impl LoadContext {
             fresh_rel_bindings: Vec::new(),
             in_init: true,
         };
-        if !ctx.world_ptr.is_null()
-            && (ctx.mod_id.is_some()
+        if !ctx.world_ptr.is_null() {
+            let world_tables_id = ensure_symbol_tables_in_world(ctx.world_mut());
+            ctx.registry.attach_world_tables_id(world_tables_id);
+            if ctx.mod_id.is_some()
                 || ctx
                     .registry
                     .get_by_name(bevy_abi_mod_sys::BAM_CHILD_OF_NAME)
-                    .is_some())
-        {
-            let children_id = ctx
-                .world_mut()
-                .register_component::<bevy_ecs::hierarchy::Children>();
-            if ctx
-                .registry
-                .get_by_name(bevy_abi_mod_sys::BAM_CHILDREN_NAME)
-                .is_none()
+                    .is_some()
             {
-                let _ = ctx.registry.register_children_hierarchy(children_id);
-                let updated_reg = ctx.registry.clone();
-                if let Some(mut world_reg) = ctx.world_mut().get_resource_mut::<ModRegistry>() {
-                    *world_reg = updated_reg;
+                let children_id = ctx
+                    .world_mut()
+                    .register_component::<bevy_ecs::hierarchy::Children>();
+                if ctx
+                    .registry
+                    .get_by_name(bevy_abi_mod_sys::BAM_CHILDREN_NAME)
+                    .is_none()
+                {
+                    let _ = ctx.registry.register_children_hierarchy(children_id);
                 }
-                let new_snap = ctx.registry.snapshot_arc();
-                ctx.pre_snapshot = Arc::clone(&new_snap);
-                ctx.host_ctx.set_snapshot(new_snap);
             }
+            let updated_reg = ctx.registry.clone();
+            if let Some(mut world_reg) = ctx.world_mut().get_resource_mut::<ModRegistry>() {
+                *world_reg = updated_reg;
+            }
+            let new_snap = ctx.registry.snapshot_arc();
+            ctx.pre_snapshot = Arc::clone(&new_snap);
+            ctx.host_ctx.set_snapshot(new_snap);
         }
         ctx
     }
@@ -851,7 +974,7 @@ impl LoadContext {
         (self as *mut Self).cast::<BamLoadCtx>()
     }
 
-    fn world_mut(&mut self) -> &mut World {
+    pub(crate) fn world_mut(&mut self) -> &mut World {
         if !self.world_ptr.is_null() {
             // SAFETY: `self.world_ptr` comes from an exclusively borrowed `&mut World` held for the
             // duration of `bevy_abi_mod_init` with no aliasing references.
@@ -860,6 +983,10 @@ impl LoadContext {
             self.standalone_world
                 .get_or_insert_with(|| Box::new(World::new()))
         }
+    }
+
+    pub(crate) fn record_fresh_dynamic_comp_id(&mut self, comp_id: ComponentId) {
+        self.fresh_dynamic_comp_ids.push(comp_id);
     }
 }
 
@@ -1249,6 +1376,8 @@ pub unsafe extern "C" fn host_register_component(
 
     // Validate `required_components[0..required_component_count]` handles and default constructors.
     let mut required_handles = Vec::with_capacity(desc.required_component_count);
+    let mut required_inits: Vec<ResolvedRequiredInit> =
+        Vec::with_capacity(desc.required_component_count);
     if desc.required_component_count > 0 {
         // SAFETY: `desc.validate()` verified `!desc.required_components.is_null()` when count > 0.
         let req_slice = unsafe {
@@ -1290,10 +1419,13 @@ pub unsafe extern "C" fn host_register_component(
             }
             if !required_handles.contains(&req_handle) {
                 required_handles.push(req_handle);
+                required_inits.push(ResolvedRequiredInit {
+                    handle: req_handle,
+                    strategy: RequiredInitStrategy::Default,
+                });
             }
         }
     }
-    let required_boxed: Box<[BamComponent]> = required_handles.into_boxed_slice();
 
     // Validate ABI `0.3` `schema_fingerprint` / `fields` and `required_init_descs` upfront before
     // allocating a Bevy `ComponentDescriptor` or trampoline slot.
@@ -1345,23 +1477,160 @@ pub unsafe extern "C" fn host_register_component(
                 ));
                 return FfiResult::INVALID_ARGUMENT;
             }
-            if (req_init.flags & BAM_REQUIRED_FLAG_CUSTOM_BYTES) != 0
-                && req_init.init_size > 0
-                && req_init.init_bytes.is_null()
-            {
+            let has_custom_bytes = (req_init.flags & BAM_REQUIRED_FLAG_CUSTOM_BYTES) != 0;
+            let has_init_fn = (req_init.flags & BAM_REQUIRED_FLAG_INIT_FN) != 0;
+            if has_custom_bytes && has_init_fn {
+                ctx.host_ctx.set_last_error(format!(
+                    "BamRequiredComponent[{idx}] cannot combine CUSTOM_BYTES and INIT_FN"
+                ));
+                return FfiResult::INVALID_ARGUMENT;
+            }
+            if has_custom_bytes && req_init.init_size > 0 && req_init.init_bytes.is_null() {
                 ctx.host_ctx.set_last_error(format!(
                     "BamRequiredComponent[{idx}] `init_bytes` is null with non-zero `init_size`"
                 ));
                 return FfiResult::NULL_POINTER;
             }
-            if (req_init.flags & BAM_REQUIRED_FLAG_INIT_FN) != 0 && req_init.init_fn.is_none() {
+            if has_init_fn && req_init.init_fn.is_none() {
                 ctx.host_ctx.set_last_error(format!(
                     "BamRequiredComponent[{idx}] `init_fn` is null with INIT_FN flag set"
                 ));
                 return FfiResult::NULL_POINTER;
             }
+
+            let resolve_by_uuid = (req_init.flags & BAM_REQUIRED_FLAG_RESOLVE_BY_UUID) != 0;
+            let req_meta = if resolve_by_uuid {
+                if req_init.uuid == ComponentUuid::ZERO {
+                    ctx.host_ctx.set_last_error(format!(
+                        "BamRequiredComponent[{idx}] RESOLVE_BY_UUID set with zero UUID"
+                    ));
+                    return FfiResult::INVALID_ARGUMENT;
+                }
+                let Some(meta) = ctx.registry.get_by_uuid(&req_init.uuid) else {
+                    ctx.host_ctx.set_last_error(format!(
+                        "BamRequiredComponent[{idx}] required UUID {:?} is not registered",
+                        req_init.uuid
+                    ));
+                    return FfiResult::NOT_FOUND;
+                };
+                meta
+            } else {
+                let Some(meta) = ctx.registry.get_by_handle(req_init.component) else {
+                    ctx.host_ctx.set_last_error(format!(
+                        "BamRequiredComponent[{idx}] required component handle {} is not registered",
+                        req_init.component.0
+                    ));
+                    return FfiResult::INVALID_COMPONENT;
+                };
+                meta
+            };
+
+            if req_meta.is_resource() || req_meta.is_message() || req_meta.is_event() {
+                ctx.host_ctx.set_last_error(format!(
+                    "BamRequiredComponent[{idx}] target '{}' must be a Component, not a Resource/Message/Event",
+                    req_meta.name
+                ));
+                return FfiResult::INVALID_COMPONENT;
+            }
+            if req_meta.uuid == desc.uuid || req_meta.name.as_ref() == name_ref {
+                ctx.host_ctx.set_last_error(format!(
+                    "ComponentDesc '{}' cannot require itself via required_init_descs[{idx}]",
+                    name_ref
+                ));
+                return FfiResult::INVALID_ARGUMENT;
+            }
+
+            let strategy = if has_custom_bytes {
+                if req_init.init_size != req_meta.size {
+                    ctx.host_ctx.set_last_error(format!(
+                        "BamRequiredComponent[{idx}] init_size ({}) != target '{}' size ({})",
+                        req_init.init_size, req_meta.name, req_meta.size
+                    ));
+                    return FfiResult::TYPE_MISMATCH;
+                }
+                let can_raw_pod = req_meta.is_abi_pod
+                    && req_meta.drop_fn.is_none()
+                    && req_meta.drop_slot.is_none()
+                    && (req_meta.is_dynamic || req_meta.insert_raw_fn.is_some());
+                if !can_raw_pod {
+                    ctx.host_ctx.set_last_error(format!(
+                        "BamRequiredComponent[{idx}] CUSTOM_BYTES requires POD raw-insertable target '{}'",
+                        req_meta.name
+                    ));
+                    return FfiResult::PERMISSION_DENIED;
+                }
+                let owned_bytes: Arc<[u8]> = if req_init.init_size == 0 {
+                    Arc::from([])
+                } else {
+                    // SAFETY: `init_bytes` was verified non-null above and caller guarantees
+                    // `init_size` readable initialized POD bytes for this registration call.
+                    let slice = unsafe {
+                        core::slice::from_raw_parts(req_init.init_bytes, req_init.init_size)
+                    };
+                    Arc::from(slice)
+                };
+                RequiredInitStrategy::CustomBytes(owned_bytes)
+            } else if has_init_fn {
+                if req_init.init_size != req_meta.size {
+                    ctx.host_ctx.set_last_error(format!(
+                        "BamRequiredComponent[{idx}] init_size ({}) != target '{}' size ({})",
+                        req_init.init_size, req_meta.name, req_meta.size
+                    ));
+                    return FfiResult::TYPE_MISMATCH;
+                }
+                if !req_meta.is_dynamic && req_meta.insert_raw_fn.is_none() {
+                    ctx.host_ctx.set_last_error(format!(
+                        "BamRequiredComponent[{idx}] INIT_FN cannot write raw bytes into opaque host component '{}'",
+                        req_meta.name
+                    ));
+                    return FfiResult::PERMISSION_DENIED;
+                }
+                let cb = req_init.init_fn.expect("checked Some above");
+                RequiredInitStrategy::InitFn {
+                    init_fn: GuestFnPtr(cb),
+                    user_data: GuestUserData::new(req_init.user_data),
+                    is_active: Arc::clone(&ctx.is_active),
+                }
+            } else {
+                if req_init.init_size != 0 && req_init.init_size != req_meta.size {
+                    ctx.host_ctx.set_last_error(format!(
+                        "BamRequiredComponent[{idx}] init_size ({}) != target '{}' size ({})",
+                        req_init.init_size, req_meta.name, req_meta.size
+                    ));
+                    return FfiResult::TYPE_MISMATCH;
+                }
+                let has_default_ctor = req_meta.insert_default_fn.is_some()
+                    || (req_meta.is_abi_pod
+                        && req_meta.drop_fn.is_none()
+                        && req_meta.drop_slot.is_none()
+                        && (req_meta.is_dynamic || req_meta.insert_raw_fn.is_some()));
+                if !has_default_ctor {
+                    ctx.host_ctx.set_last_error(format!(
+                        "BamRequiredComponent[{idx}] target '{}' lacks a default or POD zero-init constructor",
+                        req_meta.name
+                    ));
+                    return FfiResult::PERMISSION_DENIED;
+                }
+                RequiredInitStrategy::Default
+            };
+
+            let target_handle = req_meta.handle;
+            if let Some(existing_init) = required_inits
+                .iter_mut()
+                .find(|entry| entry.handle == target_handle)
+            {
+                existing_init.strategy = strategy;
+            } else {
+                required_handles.push(target_handle);
+                required_inits.push(ResolvedRequiredInit {
+                    handle: target_handle,
+                    strategy,
+                });
+            }
         }
     }
+    let required_boxed: Box<[BamComponent]> = required_handles.into_boxed_slice();
+    let required_inits_arc: Arc<[ResolvedRequiredInit]> = Arc::from(required_inits);
 
     let storage_flags = component_flags_to_storage_flags(desc.flags);
     let existing_entry = ctx.registry.get_by_name(name_ref).cloned();
@@ -1378,6 +1647,18 @@ pub unsafe extern "C" fn host_register_component(
         ctx.host_ctx.set_last_error(collision.to_string());
         return FfiResult::TYPE_MISMATCH;
     }
+    if let Some(ref existing) = existing_entry
+        && existing.is_dynamic
+        && existing.schema_fingerprint != 0
+        && schema_fingerprint != 0
+        && existing.schema_fingerprint != schema_fingerprint
+    {
+        ctx.host_ctx.set_last_error(format!(
+            "ComponentDesc '{name_ref}' schema_fingerprint mismatch (existing=0x{:016x}, new=0x{:016x}); call migrate_component_column to evolve layout",
+            existing.schema_fingerprint, schema_fingerprint
+        ));
+        return FfiResult::TYPE_MISMATCH;
+    }
     if let Err(drop_mismatch) = ctx
         .registry
         .check_dynamic_drop_compatibility(name_ref, desc.drop_fn.is_some())
@@ -1385,9 +1666,11 @@ pub unsafe extern "C" fn host_register_component(
         ctx.host_ctx.set_last_error(drop_mismatch.to_string());
         return FfiResult::TYPE_MISMATCH;
     }
+    let mut desc_for_registry = desc;
+    desc_for_registry.required_component_count = required_boxed.len();
     if let Err(hook_mismatch) = ctx
         .registry
-        .check_dynamic_extended_hook_compatibility(name_ref, &desc)
+        .check_dynamic_extended_hook_compatibility(name_ref, &desc_for_registry)
     {
         ctx.host_ctx.set_last_error(hook_mismatch.to_string());
         return FfiResult::TYPE_MISMATCH;
@@ -1396,7 +1679,7 @@ pub unsafe extern "C" fn host_register_component(
     let is_active = Arc::clone(&ctx.is_active);
     let owner = ctx.mod_id;
     let staged_log = Arc::clone(&ctx.staged_drop_bindings);
-    let has_any_dynamic_hook = desc.has_hooks() || !required_boxed.is_empty();
+    let has_any_dynamic_hook = desc.has_hooks() || !required_inits_arc.is_empty();
 
     let (comp_id, drop_slot, was_fresh_id): (ComponentId, Option<usize>, bool) = {
         let world = ctx.world_mut();
@@ -1467,7 +1750,7 @@ pub unsafe extern "C" fn host_register_component(
             if (slot_opt.is_some() || has_any_dynamic_hook)
                 && let Some(hooks) = world.register_component_hooks_by_id(new_id)
             {
-                if desc.on_add.is_some() || !required_boxed.is_empty() {
+                if desc.on_add.is_some() || !required_inits_arc.is_empty() {
                     hooks.on_add(dynamic_on_add_hook);
                 }
                 if desc.on_insert.is_some() {
@@ -1492,10 +1775,9 @@ pub unsafe extern "C" fn host_register_component(
         ctx.fresh_dynamic_comp_ids.push(comp_id);
     }
 
-    let reqs_arc: Arc<[BamComponent]> = Arc::from(required_boxed.as_ref());
     let handle = match ctx.registry.register_dynamic_component_owned_with_schema(
         comp_id,
-        &desc,
+        &desc_for_registry,
         name_ref,
         owner,
         drop_slot,
@@ -1520,7 +1802,7 @@ pub unsafe extern "C" fn host_register_component(
             on_despawn: desc.on_despawn.map(GuestFnPtr),
             user_data: GuestUserData::new(desc.hook_user_data),
             is_active: Arc::clone(&ctx.is_active),
-            required_components: reqs_arc,
+            required_inits: required_inits_arc,
             registry: ctx.registry.clone(),
         });
         let clone_entry = desc.clone_fn.map(|clone_fn| CloneBindingEntry {
@@ -2977,5 +3259,271 @@ mod tests {
         assert!(world.despawn(eb));
         assert_eq!(drop_a_count.load(Ordering::Relaxed), 1);
         assert_eq!(drop_b_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn required_init_descs_custom_bytes_init_fn_uuid_and_disarm_under_miri() {
+        use bevy_abi_mod_sys::{
+            BAM_REQUIRED_FLAG_CUSTOM_BYTES, BAM_REQUIRED_FLAG_INIT_FN,
+            BAM_REQUIRED_FLAG_RESOLVE_BY_UUID, BamRequiredComponent,
+        };
+
+        #[repr(C)]
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        struct Stats {
+            hp: i32,
+            armor: i32,
+        }
+
+        #[repr(C)]
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        struct Shield {
+            cap: u32,
+            regen: u32,
+        }
+
+        #[repr(C)]
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        struct BaseBadge {
+            rank: u64,
+        }
+
+        const STATS_UUID: ComponentUuid = ComponentUuid::from_parts("req::Stats", 8, 4, 0);
+        const SHIELD_UUID: ComponentUuid = ComponentUuid::from_parts("req::Shield", 8, 4, 0);
+        const BADGE_UUID: ComponentUuid = ComponentUuid::from_parts("req::BaseBadge", 8, 8, 0);
+        const UNIT_UUID: ComponentUuid = ComponentUuid::from_parts("req::Unit", 0, 1, 0);
+
+        struct InitCtx {
+            calls: AtomicUsize,
+            rank_value: u64,
+        }
+
+        unsafe extern "C" fn init_badge_fn(dst: *mut c_void, user_data: *mut c_void) -> FfiResult {
+            // SAFETY: `user_data` points to `InitCtx` pinned on the test stack while `active` is true.
+            let ctx = unsafe { &*user_data.cast::<InitCtx>() };
+            ctx.calls.fetch_add(1, Ordering::SeqCst);
+            // SAFETY: `dst` is valid 8-byte aligned storage for `BaseBadge`.
+            unsafe {
+                core::ptr::write(
+                    dst.cast::<BaseBadge>(),
+                    BaseBadge {
+                        rank: ctx.rank_value,
+                    },
+                );
+            }
+            FfiResult::OK
+        }
+
+        let mut world = World::new();
+        world.insert_resource(WorldDropGuard::new());
+        let reg = ModRegistry::new();
+        let active = Arc::new(AtomicBool::new(true));
+        let init_ctx = InitCtx {
+            calls: AtomicUsize::new(0),
+            rank_value: 0xABCD_1234_5678_90EF,
+        };
+
+        let mut h_stats = BamComponent::INVALID;
+        let mut h_shield = BamComponent::INVALID;
+        let mut h_badge = BamComponent::INVALID;
+        let mut h_unit = BamComponent::INVALID;
+
+        let stats_custom = Stats { hp: 250, armor: 42 };
+        let stats_bytes: [u8; 8] = {
+            let mut b = [0u8; 8];
+            b[0..4].copy_from_slice(&stats_custom.hp.to_ne_bytes());
+            b[4..8].copy_from_slice(&stats_custom.armor.to_ne_bytes());
+            b
+        };
+        let shield_custom = Shield {
+            cap: 120,
+            regen: 15,
+        };
+        let shield_bytes: [u8; 8] = {
+            let mut b = [0u8; 8];
+            b[0..4].copy_from_slice(&shield_custom.cap.to_ne_bytes());
+            b[4..8].copy_from_slice(&shield_custom.regen.to_ne_bytes());
+            b
+        };
+
+        let reg = {
+            let mut ctx = LoadContext::with_world_and_mod_id(
+                reg,
+                Arc::clone(&active),
+                &mut world as *mut World,
+                Some(ModId(601)),
+            );
+
+            let badge_desc = ComponentDesc::new(
+                c"req::BaseBadge".as_ptr(),
+                BADGE_UUID,
+                core::mem::size_of::<BaseBadge>(),
+                core::mem::align_of::<BaseBadge>(),
+            );
+            assert_eq!(
+                // SAFETY: Valid `LoadContext`, `ComponentDesc`, and output pointer.
+                unsafe { host_register_component(ctx.as_ffi_ptr(), &badge_desc, &mut h_badge) },
+                FfiResult::OK
+            );
+
+            // `Shield` transitively requires `BaseBadge` via `INIT_FN` + `RESOLVE_BY_UUID`.
+            let badge_req = BamRequiredComponent::by_uuid(BADGE_UUID).with_init_fn(
+                init_badge_fn,
+                core::mem::size_of::<BaseBadge>(),
+                (&raw const init_ctx).cast_mut().cast::<c_void>(),
+            );
+            assert_eq!(
+                badge_req.flags,
+                BAM_REQUIRED_FLAG_RESOLVE_BY_UUID | BAM_REQUIRED_FLAG_INIT_FN
+            );
+            let shield_desc = ComponentDesc::new(
+                c"req::Shield".as_ptr(),
+                SHIELD_UUID,
+                core::mem::size_of::<Shield>(),
+                core::mem::align_of::<Shield>(),
+            )
+            .with_required_init_descs(&badge_req, 1);
+            assert_eq!(
+                // SAFETY: Valid `LoadContext`, `ComponentDesc`, and output pointer.
+                unsafe { host_register_component(ctx.as_ffi_ptr(), &shield_desc, &mut h_shield) },
+                FfiResult::OK
+            );
+
+            let stats_desc = ComponentDesc::new(
+                c"req::Stats".as_ptr(),
+                STATS_UUID,
+                core::mem::size_of::<Stats>(),
+                core::mem::align_of::<Stats>(),
+            );
+            assert_eq!(
+                // SAFETY: Valid `LoadContext`, `ComponentDesc`, and output pointer.
+                unsafe { host_register_component(ctx.as_ffi_ptr(), &stats_desc, &mut h_stats) },
+                FfiResult::OK
+            );
+
+            // Mismatched `init_size` (4 != 8) must fail with `TYPE_MISMATCH`.
+            let bad_bytes = [0u8; 4];
+            let mut bad_req = BamRequiredComponent::by_handle(h_stats);
+            bad_req.flags = BAM_REQUIRED_FLAG_CUSTOM_BYTES;
+            bad_req.init_bytes = bad_bytes.as_ptr();
+            bad_req.init_size = bad_bytes.len();
+            let bad_unit_desc = ComponentDesc::new(c"req::BadUnit".as_ptr(), UNIT_UUID, 0, 1)
+                .with_required_init_descs(&bad_req, 1);
+            let mut h_bad = BamComponent::INVALID;
+            assert_eq!(
+                // SAFETY: Valid `LoadContext`, `ComponentDesc`, and output pointer.
+                unsafe { host_register_component(ctx.as_ffi_ptr(), &bad_unit_desc, &mut h_bad) },
+                FfiResult::TYPE_MISMATCH
+            );
+
+            // `Unit` requires `Stats` (by handle + CUSTOM_BYTES) and `Shield` (by UUID + CUSTOM_BYTES).
+            let mut req_stats = BamRequiredComponent::by_handle(h_stats);
+            req_stats.flags = BAM_REQUIRED_FLAG_CUSTOM_BYTES;
+            req_stats.init_bytes = stats_bytes.as_ptr();
+            req_stats.init_size = stats_bytes.len();
+
+            let mut req_shield = BamRequiredComponent::by_uuid(SHIELD_UUID);
+            req_shield.flags |= BAM_REQUIRED_FLAG_CUSTOM_BYTES;
+            req_shield.init_bytes = shield_bytes.as_ptr();
+            req_shield.init_size = shield_bytes.len();
+
+            let unit_reqs = [req_stats, req_shield];
+            let unit_desc = ComponentDesc::new(c"req::Unit".as_ptr(), UNIT_UUID, 0, 1)
+                .with_required_init_descs(unit_reqs.as_ptr(), unit_reqs.len());
+            assert_eq!(
+                // SAFETY: Valid `LoadContext`, `ComponentDesc`, and output pointer.
+                unsafe { host_register_component(ctx.as_ffi_ptr(), &unit_desc, &mut h_unit) },
+                FfiResult::OK
+            );
+
+            let r = ctx.registry.clone();
+            ctx.finish_init();
+            r
+        };
+
+        let cid_stats = reg.get_by_handle(h_stats).unwrap().component_id;
+        let cid_shield = reg.get_by_handle(h_shield).unwrap().component_id;
+        let cid_badge = reg.get_by_handle(h_badge).unwrap().component_id;
+        let cid_unit = reg.get_by_handle(h_unit).unwrap().component_id;
+
+        // Spawn entity and insert `Unit`: must materialize `Stats`, `Shield`, and transitively `BaseBadge`!
+        let e1 = world.spawn_empty().id();
+        // SAFETY: `cid_unit` is a ZST component registered in `world`.
+        unsafe {
+            world
+                .entity_mut(e1)
+                .insert_by_id(cid_unit, OwningPtr::new(core::ptr::NonNull::dangling()));
+        }
+        assert_eq!(init_ctx.calls.load(Ordering::SeqCst), 1);
+        // SAFETY: Components hold initialized POD values matching their registered layouts.
+        unsafe {
+            assert_eq!(
+                *world
+                    .entity(e1)
+                    .get_by_id(cid_stats)
+                    .unwrap()
+                    .deref::<Stats>(),
+                stats_custom
+            );
+            assert_eq!(
+                *world
+                    .entity(e1)
+                    .get_by_id(cid_shield)
+                    .unwrap()
+                    .deref::<Shield>(),
+                shield_custom
+            );
+            assert_eq!(
+                *world
+                    .entity(e1)
+                    .get_by_id(cid_badge)
+                    .unwrap()
+                    .deref::<BaseBadge>(),
+                BaseBadge {
+                    rank: 0xABCD_1234_5678_90EF
+                }
+            );
+        }
+
+        // Existing `Stats` must NOT be overwritten when `Unit` is added!
+        let e2 = world.spawn_empty().id();
+        let existing_stats = Stats { hp: 999, armor: 7 };
+        // SAFETY: `cid_stats` and `cid_unit` match registered layouts.
+        unsafe {
+            OwningPtr::make(existing_stats, |p| {
+                world.entity_mut(e2).insert_by_id(cid_stats, p);
+            });
+            world
+                .entity_mut(e2)
+                .insert_by_id(cid_unit, OwningPtr::new(core::ptr::NonNull::dangling()));
+        }
+        assert_eq!(init_ctx.calls.load(Ordering::SeqCst), 2);
+        // SAFETY: `cid_stats` holds `Stats`.
+        unsafe {
+            assert_eq!(
+                *world
+                    .entity(e2)
+                    .get_by_id(cid_stats)
+                    .unwrap()
+                    .deref::<Stats>(),
+                existing_stats
+            );
+        }
+
+        // Disarm the mod (`is_active = false`): inserting `Shield` must NOT call `init_badge_fn`!
+        active.store(false, Ordering::SeqCst);
+        let e3 = world.spawn_empty().id();
+        // SAFETY: `cid_shield` matches `Shield` layout.
+        unsafe {
+            OwningPtr::make(shield_custom, |p| {
+                world.entity_mut(e3).insert_by_id(cid_shield, p);
+            });
+        }
+        assert_eq!(
+            init_ctx.calls.load(Ordering::SeqCst),
+            2,
+            "disarmed mod tombstone must suppress `init_fn` after unload"
+        );
+        assert!(world.entity(e3).get_by_id(cid_badge).is_err());
     }
 }

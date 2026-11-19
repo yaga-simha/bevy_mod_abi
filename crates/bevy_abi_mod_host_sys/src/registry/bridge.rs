@@ -7,13 +7,14 @@ use std::sync::Arc;
 
 use bevy_abi_mod_sys::{
     AbiPod, BAM_CHILDREN_NAME, BAM_STORAGE_FLAG_ENTITY_EVENT, BAM_STORAGE_FLAG_EVENT,
-    BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_RESOURCE, BamComponent, ComponentUuid, FfiEntity,
-    FfiResult, MappedStringVTable, MappedWireVTable, StrView, VTableHeader,
+    BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_RESOURCE, BamComponent, BamFieldDesc,
+    ComponentUuid, FfiEntity, FfiResult, MappedStringVTable, MappedWireVTable, StrView,
+    VTableHeader,
 };
 use bevy_ecs::{
     component::ComponentId,
     entity::Entity,
-    event::{EntityEvent, Event},
+    event::{EntityEvent, Event, EventKey},
     hierarchy::Children,
     prelude::{Component, Resource},
     relationship::RelationshipTarget,
@@ -21,9 +22,10 @@ use bevy_ecs::{
 };
 
 use crate::{
+    loader::ModId,
     registry::{
         ComponentCollisionError, EntityEventTriggerFn, InsertDefaultFn, InsertRawFn, ModRegistry,
-        RegisteredComponent, SymbolRecord,
+        RegisteredComponent, RegistrySnapshot, SymbolRecord, catalog::OwnedFieldStrings,
     },
     sync_ptr::SymbolAddress,
 };
@@ -639,5 +641,139 @@ impl ModRegistry {
         };
         self.publish_after_mutation();
         handle
+    }
+
+    /// Attaches the internal world-table directory token (`world_id`) to this registry's snapshot
+    /// so `HostContext` FFI entrypoints (`host_intern_symbol`, `host_bind_named_object`) resolve
+    /// the world's `BamSymbolTable` and `ModNamedObjects` resources in `O(1)` without exposing
+    /// any `"bam.v0.*"` guest symbol.
+    pub(crate) fn attach_world_tables_id(&mut self, world_id: usize) {
+        if world_id == 0 || self.snapshot.world_tables_id() == Some(world_id) {
+            return;
+        }
+        let encoded = SymbolAddress::new(core::ptr::without_provenance::<c_void>(world_id));
+        {
+            let snap = Arc::make_mut(&mut self.snapshot);
+            snap.symbols.insert(
+                Arc::from(INTERNAL_WORLD_TABLES_KEY),
+                SymbolRecord {
+                    addr: encoded,
+                    owner: None,
+                },
+            );
+        }
+        self.publish_after_mutation();
+    }
+
+    /// Atomically remaps an existing dynamic [`BamComponent`] handle to a freshly migrated Bevy
+    /// [`ComponentId`], layout `(size, align, storage_flags)`, `schema_fingerprint`, and retained
+    /// `BamFieldDesc` reflection metadata, publishing a new CoW [`RegistrySnapshot`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn remap_migrated_component(
+        &mut self,
+        handle: BamComponent,
+        new_comp_id: ComponentId,
+        new_uuid: ComponentUuid,
+        new_size: usize,
+        new_align: usize,
+        new_storage_flags: u32,
+        new_schema_fingerprint: u64,
+        new_fields: Arc<[BamFieldDesc]>,
+        new_owned_field_strings: Option<OwnedFieldStrings>,
+        new_vtable_ptr: *const c_void,
+        owner: Option<ModId>,
+    ) -> Result<(), ComponentCollisionError> {
+        let Some(existing) = self.snapshot.get_by_handle(handle) else {
+            return Err(ComponentCollisionError::MetadataMismatch {
+                name: format!("BamComponent({})", handle.0),
+                reason: "cannot remap unregistered component handle".to_string(),
+            });
+        };
+        if !existing.is_dynamic {
+            return Err(ComponentCollisionError::MetadataMismatch {
+                name: existing.name.to_string(),
+                reason: "cannot remap host-owned static component".to_string(),
+            });
+        }
+        if let Some(other) = self.snapshot.get_by_uuid(&new_uuid)
+            && other.handle != handle
+        {
+            return Err(ComponentCollisionError::UuidCollision {
+                existing_name: other.name.to_string(),
+                new_name: existing.name.to_string(),
+                uuid: new_uuid,
+            });
+        }
+
+        let sym_addr = SymbolAddress::new(new_vtable_ptr);
+        {
+            let snap = Arc::make_mut(&mut self.snapshot);
+            let idx = (handle.0 - 1) as usize;
+            let (old_comp_id, old_uuid, comp_name) = {
+                let entry = &snap.entries[idx];
+                (entry.component_id, entry.uuid, Arc::clone(&entry.name))
+            };
+
+            if old_comp_id != new_comp_id {
+                if snap.by_component_id.get(&old_comp_id) == Some(&handle) {
+                    snap.by_component_id.remove(&old_comp_id);
+                }
+                snap.by_component_id.insert(new_comp_id, handle);
+            }
+            if old_uuid != new_uuid {
+                if snap.by_uuid.get(&old_uuid) == Some(&handle) {
+                    snap.by_uuid.remove(&old_uuid);
+                }
+                snap.by_uuid.insert(new_uuid, handle);
+            }
+
+            let entry = &mut snap.entries[idx];
+            entry.component_id = new_comp_id;
+            entry.uuid = new_uuid;
+            entry.size = new_size;
+            entry.align = new_align;
+            entry.storage_flags = new_storage_flags;
+            entry.schema_fingerprint = new_schema_fingerprint;
+            entry.fields = new_fields;
+            entry.owned_field_strings = new_owned_field_strings;
+            entry.vtable_ptr = sym_addr;
+            // SAFETY: `new_comp_id` was registered in `world` with `(new_size, new_align)`.
+            entry.event_key = Some(unsafe { EventKey::new(new_comp_id) });
+            if owner.is_some() {
+                entry.owner = owner;
+            }
+
+            let vtable_key: Arc<str> = Arc::from(format!("bam.v0.{comp_name}.vtable").as_str());
+            if !sym_addr.is_null() {
+                snap.symbols.insert(
+                    vtable_key,
+                    SymbolRecord {
+                        addr: sym_addr,
+                        owner: entry.owner,
+                    },
+                );
+            } else if snap
+                .symbols
+                .get(vtable_key.as_ref())
+                .is_some_and(|r| r.owner.is_some())
+            {
+                snap.symbols.remove(vtable_key.as_ref());
+            }
+        }
+        self.publish_after_mutation();
+        Ok(())
+    }
+}
+
+pub(crate) const INTERNAL_WORLD_TABLES_KEY: &str = "__bam_internal.world_tables_id";
+
+impl RegistrySnapshot {
+    /// Reads the internal world-table directory token (`world_id`) attached to this snapshot,
+    /// if any, using strict-provenance `.addr()`.
+    #[inline]
+    pub(crate) fn world_tables_id(&self) -> Option<usize> {
+        let rec = self.symbols.get(INTERNAL_WORLD_TABLES_KEY)?;
+        let id = rec.addr.as_ptr().addr();
+        (id != 0).then_some(id)
     }
 }

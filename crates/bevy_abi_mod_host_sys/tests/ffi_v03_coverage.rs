@@ -594,8 +594,9 @@ fn v03_reserved_slots_exhaustive_validation() {
         );
         assert_eq!(
             host_intern_symbol(host_ptr, StrView::from_str("sym"), &raw mut out_sym),
-            FfiResult::UNSUPPORTED
+            FfiResult::OK
         );
+        assert_eq!(out_sym, BamSymbol::from_raw(0));
 
         // 3. `host_bind_named_object`
         assert_eq!(
@@ -628,7 +629,7 @@ fn v03_reserved_slots_exhaustive_validation() {
         );
         assert_eq!(
             host_bind_named_object(host_ptr, StrView::from_str("hero"), live_ent),
-            FfiResult::UNSUPPORTED
+            FfiResult::OK
         );
 
         // 4. `host_configure_schedule_set`
@@ -837,7 +838,7 @@ fn v03_reserved_slots_exhaustive_validation() {
                 Some(noop_migrate),
                 null_mut()
             ),
-            FfiResult::UNSUPPORTED
+            FfiResult::PERMISSION_DENIED
         );
 
         load_ctx.finish_init();
