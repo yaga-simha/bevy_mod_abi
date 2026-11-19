@@ -107,6 +107,12 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libasound2-dev libudev-dev libx11-dev libxi-dev libxkbcommon-dev libwayland-dev pkg-config
 
+      - name: Initialize MSVC Developer Environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -267,6 +273,8 @@ jobs:
       - name: Initialize MSVC Developer Environment
         if: runner.os == 'Windows' && matrix.cc == 'cl.exe'
         uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
       - name: Install Linux X11 / Wayland / ALSA / udev system headers for Bevy
         if: runner.os == 'Linux'
@@ -421,7 +429,7 @@ jobs:
               -p bevy_abi_mod_host_sys \
               -p bevy_abi_mod_host
           cargo llvm-cov report \
-            --ignore-filename-regex '(crates/bevy_abi_mod_host_sys/src/(drop_trampoline|handle_header|lib|loader|registry|schedule|sync_ptr|ffi/wave3_helpers)|crates/bevy_abi_mod_(host|macros|sys|guest|guest_sys|trust|manifest|sdk_gen)/|tests/)' \
+            --ignore-filename-regex '(crates/bevy_abi_mod_host_sys/src/(drop_trampoline|handle_header|lib|loader|registry|schedule|sync_ptr|ffi/validation)|crates/bevy_abi_mod_(host|macros|sys|guest|guest_sys|trust|manifest|sdk_gen)/|tests/)' \
             --fail-under-lines 85
 
   # ============================================================================
@@ -467,7 +475,7 @@ jobs:
         with:
           key: loom-concurrency
 
-      - name: Verify `DROP_SLOTS` generation/epoch atomics under Loom
+      - name: Verify `DROP_PAGES` generation/epoch atomics under Loom
         run: cargo test -p bevy_abi_mod_host_sys --test loom_drop_trampoline --release
 
   sanitizers:

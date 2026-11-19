@@ -5,6 +5,8 @@ use bevy_abi_mod::prelude::*;
 use bevy_abi_mod_sys::{FfiBool, FfiOption, ModComponent as ModComponentTrait};
 use bevy_ecs::component::Component;
 use bevy_ecs::resource::Resource;
+use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -244,8 +246,334 @@ fn is_msvc_style_driver(tool: &str) -> bool {
     stem.eq_ignore_ascii_case("cl") || stem.eq_ignore_ascii_case("clang-cl")
 }
 
+fn is_plain_cl_driver(tool: &str) -> bool {
+    let file_name = Path::new(tool)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(tool);
+    let stem = file_name
+        .strip_suffix(".exe")
+        .or_else(|| file_name.strip_suffix(".EXE"))
+        .unwrap_or(file_name);
+    stem.eq_ignore_ascii_case("cl")
+}
+
+fn msvc_path_arg(prefix: &str, path: &Path) -> OsString {
+    let mut arg = OsString::from(prefix);
+    arg.push(path.as_os_str());
+    arg
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_msvc_env_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "PATH"
+            | "INCLUDE"
+            | "EXTERNAL_INCLUDE"
+            | "LIB"
+            | "LIBPATH"
+            | "PLATFORM"
+            | "DEVENVDIR"
+            | "VISUALSTUDIOVERSION"
+            | "PREFERREDTOOLARCHITECTURE"
+            | "UCRTVERSION"
+            | "UNIVERSALCRTSDKDIR"
+            | "VCINSTALLDIR"
+            | "VSINSTALLDIR"
+            | "NETFXSDKDIR"
+    ) || upper.starts_with("VSCMD_")
+        || upper.starts_with("VCTOOLS")
+        || upper.starts_with("WINDOWSSDK")
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_vcvars_env_output(stdout: &str) -> Vec<(String, String)> {
+    let mut vars: Vec<(String, String)> = Vec::new();
+    for raw_line in stdout.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.is_empty() || line.starts_with('=') {
+            continue;
+        }
+        let Some((raw_key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = raw_key.trim();
+        if key.is_empty() || !is_msvc_env_key(key) {
+            continue;
+        }
+        let normalized_key = if key.eq_ignore_ascii_case("PATH") {
+            "PATH".to_owned()
+        } else if key.eq_ignore_ascii_case("INCLUDE") {
+            "INCLUDE".to_owned()
+        } else if key.eq_ignore_ascii_case("LIB") {
+            "LIB".to_owned()
+        } else if key.eq_ignore_ascii_case("LIBPATH") {
+            "LIBPATH".to_owned()
+        } else {
+            key.to_owned()
+        };
+        if let Some(existing) = vars
+            .iter_mut()
+            .find(|(k, _)| k.eq_ignore_ascii_case(&normalized_key))
+        {
+            existing.1 = value.to_owned();
+        } else {
+            vars.push((normalized_key, value.to_owned()));
+        }
+    }
+    vars
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn msvc_vcvars_bat_candidates(
+    install_root: &Path,
+    arch: &str,
+) -> Vec<(PathBuf, Option<&'static str>)> {
+    let aux_build = install_root.join("VC").join("Auxiliary").join("Build");
+    match arch {
+        "x86" => vec![
+            (aux_build.join("vcvars32.bat"), None),
+            (aux_build.join("vcvarsall.bat"), Some("x86")),
+        ],
+        "aarch64" => vec![
+            (aux_build.join("vcvarsall.bat"), Some("arm64")),
+            (aux_build.join("vcvars64.bat"), None),
+        ],
+        _ => vec![
+            (aux_build.join("vcvars64.bat"), None),
+            (aux_build.join("vcvarsall.bat"), Some("x64")),
+        ],
+    }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn find_exe_in_path_list(exe_name: &str, path_value: &str) -> Option<PathBuf> {
+    let has_exe_ext = Path::new(exe_name)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("exe"));
+    for dir in env::split_paths(path_value) {
+        let direct = dir.join(exe_name);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        if !has_exe_ext {
+            let with_exe = dir.join(format!("{exe_name}.exe"));
+            if with_exe.is_file() {
+                return Some(with_exe);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct MsvcEnv {
+    vars: Vec<(String, String)>,
+    cl_exe: Option<PathBuf>,
+}
+
+#[cfg(windows)]
+fn find_vs_install_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut vswhere_bins = Vec::new();
+    for env_key in ["ProgramFiles(x86)", "ProgramFiles"] {
+        if let Some(base) = env::var_os(env_key) {
+            let candidate = PathBuf::from(base)
+                .join("Microsoft Visual Studio")
+                .join("Installer")
+                .join("vswhere.exe");
+            if candidate.is_file() && !vswhere_bins.contains(&candidate) {
+                vswhere_bins.push(candidate);
+            }
+        }
+    }
+    vswhere_bins.push(PathBuf::from("vswhere.exe"));
+
+    let required_component = if cfg!(target_arch = "aarch64") {
+        "Microsoft.VisualStudio.Component.VC.Tools.ARM64"
+    } else {
+        "Microsoft.VisualStudio.Component.VC.Tools.x86.x64"
+    };
+    let queries: [&[&str]; 2] = [
+        &[
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            required_component,
+            "-property",
+            "installationPath",
+        ],
+        &[
+            "-latest",
+            "-products",
+            "*",
+            "-prerelease",
+            "-requires",
+            required_component,
+            "-property",
+            "installationPath",
+        ],
+    ];
+
+    for vswhere in &vswhere_bins {
+        for query in &queries {
+            let Ok(out) = Command::new(vswhere).args(*query).output() else {
+                continue;
+            };
+            if !out.status.success() {
+                continue;
+            }
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for line in stdout.lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    let path = PathBuf::from(trimmed);
+                    if path.is_dir() && !roots.contains(&path) {
+                        roots.push(path);
+                    }
+                }
+            }
+            if !roots.is_empty() {
+                return roots;
+            }
+        }
+    }
+
+    if let Some(vs_dir) = env::var_os("VSINSTALLDIR") {
+        let path = PathBuf::from(vs_dir);
+        if path.is_dir() && !roots.contains(&path) {
+            roots.push(path);
+        }
+    }
+    for env_key in ["ProgramFiles", "ProgramFiles(x86)"] {
+        let Some(base) = env::var_os(env_key) else {
+            continue;
+        };
+        for year in ["2022", "2019"] {
+            for edition in ["Enterprise", "Professional", "Community", "BuildTools"] {
+                let cand = PathBuf::from(&base)
+                    .join("Microsoft Visual Studio")
+                    .join(year)
+                    .join(edition);
+                if cand.is_dir() && !roots.contains(&cand) {
+                    roots.push(cand);
+                }
+            }
+        }
+    }
+
+    roots
+}
+
+#[cfg(windows)]
+fn capture_vcvars_env(bat_path: &Path, bat_arg: Option<&str>) -> Option<MsvcEnv> {
+    use std::os::windows::process::CommandExt;
+
+    let comspec = env::var_os("COMSPEC").unwrap_or_else(|| OsString::from("cmd.exe"));
+    let mut cmd = Command::new(comspec);
+    cmd.env("VSCMD_SKIP_SENDTELEMETRY", "1")
+        .env("BAM_VCVARS_BAT", bat_path)
+        .args(["/D", "/S", "/C"]);
+    match bat_arg {
+        Some(arg) => {
+            cmd.raw_arg(format!(
+                "\"call \"%BAM_VCVARS_BAT%\" {arg} >NUL 2>&1 && set\""
+            ));
+        }
+        None => {
+            cmd.raw_arg("\"call \"%BAM_VCVARS_BAT%\" >NUL 2>&1 && set\"");
+        }
+    }
+
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let vars = parse_vcvars_env_output(&stdout);
+
+    let path_val = vars
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+        .map(|(_, v)| v.as_str())?;
+    let has_include = vars
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("INCLUDE") && !v.is_empty());
+    let has_lib = vars
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("LIB") && !v.is_empty());
+    if !has_include || !has_lib {
+        return None;
+    }
+
+    let cl_exe = find_exe_in_path_list("cl.exe", path_val);
+    Some(MsvcEnv { vars, cl_exe })
+}
+
+#[cfg(windows)]
+fn cached_msvc_env() -> Option<&'static MsvcEnv> {
+    static MSVC_ENV: OnceLock<Option<MsvcEnv>> = OnceLock::new();
+    MSVC_ENV
+        .get_or_init(|| {
+            for install_root in find_vs_install_roots() {
+                for (bat_path, bat_arg) in
+                    msvc_vcvars_bat_candidates(&install_root, env::consts::ARCH)
+                {
+                    if bat_path.is_file()
+                        && let Some(captured) = capture_vcvars_env(&bat_path, bat_arg)
+                    {
+                        return Some(captured);
+                    }
+                }
+            }
+            None
+        })
+        .as_ref()
+}
+
+fn msvc_command(program: &str) -> Command {
+    #[cfg(windows)]
+    if is_msvc_style_driver(program) {
+        let has_include = env::var_os("INCLUDE").is_some_and(|v| !v.is_empty());
+        let has_lib = env::var_os("LIB").is_some_and(|v| !v.is_empty());
+        let explicit_path = Path::new(program).components().count() > 1;
+        let direct_driver_ok = if !is_plain_cl_driver(program) {
+            true
+        } else if explicit_path {
+            Path::new(program).is_file()
+        } else {
+            env::var("PATH")
+                .ok()
+                .and_then(|path_val| find_exe_in_path_list(program, &path_val))
+                .is_some()
+        };
+
+        if !(has_include && has_lib && direct_driver_ok)
+            && let Some(msvc_env) = cached_msvc_env()
+        {
+            let mut cmd = if is_plain_cl_driver(program) && !explicit_path {
+                match &msvc_env.cl_exe {
+                    Some(cl_path) => Command::new(cl_path),
+                    None => Command::new(program),
+                }
+            } else {
+                Command::new(program)
+            };
+            for (k, v) in &msvc_env.vars {
+                cmd.env(k, v);
+            }
+            return cmd;
+        }
+    }
+    Command::new(program)
+}
+
 fn find_cxx_compiler() -> String {
-    if let Ok(cxx) = std::env::var("CXX")
+    if let Ok(cxx) = env::var("CXX")
         && !cxx.trim().is_empty()
     {
         return cxx.trim().to_owned();
@@ -255,14 +583,11 @@ fn find_cxx_compiler() -> String {
     #[cfg(not(target_os = "windows"))]
     let candidates = ["clang++", "g++", "c++"];
     for cand in candidates {
-        let is_plain_cl = Path::new(cand)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .is_some_and(|n| n.eq_ignore_ascii_case("cl") || n.eq_ignore_ascii_case("cl.exe"));
+        let is_plain_cl = is_plain_cl_driver(cand);
         let res = if is_plain_cl {
-            Command::new(cand).output()
+            msvc_command(cand).output()
         } else {
-            Command::new(cand).arg("--version").output()
+            msvc_command(cand).arg("--version").output()
         };
         if let Ok(out) = res
             && (out.status.success() || (is_plain_cl && !out.stderr.is_empty()))
@@ -282,16 +607,17 @@ fn build_cpp17_mod(cpp_dir: &Path, dylib_path: &Path, ext: &str) {
     let include_dir = cpp_dir.join("../../../include");
     let pid = std::process::id();
     let tmp_path = cpp_dir.join(format!("cpp17_mod.tmp.{pid}.{ext}"));
-    let obj_path = std::env::temp_dir().join(format!("cpp17_mod_{pid}.obj"));
-    let implib_path = std::env::temp_dir().join(format!("cpp17_mod_{pid}.lib"));
-    let exp_path = std::env::temp_dir().join(format!("cpp17_mod_{pid}.exp"));
+    let obj_path = env::temp_dir().join(format!("cpp17_mod_{pid}.obj"));
+    let implib_path = env::temp_dir().join(format!("cpp17_mod_{pid}.lib"));
+    let exp_path = env::temp_dir().join(format!("cpp17_mod_{pid}.exp"));
 
-    let mut cmd = Command::new(&cxx);
+    let mut cmd = msvc_command(&cxx);
     cmd.current_dir(cpp_dir);
     if is_msvc_style_driver(&cxx) {
         cmd.args([
             "/nologo",
             "/LD",
+            "/TP",
             "/std:c++17",
             "/Zc:__cplusplus",
             "/EHsc",
@@ -299,12 +625,13 @@ fn build_cpp17_mod(cpp_dir: &Path, dylib_path: &Path, ext: &str) {
             "/WX",
             "/O2",
         ])
-        .arg(format!("/I{}", include_dir.display()))
-        .arg(format!("/Fo{}", obj_path.display()))
+        .arg("/I")
+        .arg(&include_dir)
+        .arg(msvc_path_arg("/Fo:", &obj_path))
+        .arg(msvc_path_arg("/Fe:", &tmp_path))
         .arg("mod.cpp")
         .arg("/link")
-        .arg(format!("/IMPLIB:{}", implib_path.display()))
-        .arg(format!("/OUT:{}", tmp_path.display()));
+        .arg(msvc_path_arg("/IMPLIB:", &implib_path));
     } else {
         cmd.args([
             "-std=c++17",

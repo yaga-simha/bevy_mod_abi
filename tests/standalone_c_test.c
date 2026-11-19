@@ -494,14 +494,14 @@ static BamResult mock_guest_system(BamSystemCtx* sys_ctx, void* user_data) {
 
     while (g_guest_api.iter_next_chunk(iter, &chunk_len) != BAM_FALSE) {
         const BamEntity* entities = g_guest_api.iter_entities(iter);
-        float* health = (float*)g_guest_api.iter_column_mutable_untracked(iter, 0u);
+        float* health = (float*)(void*)g_guest_api.iter_column_mutable_untracked(iter, 0u);
         uint8_t* const* pos_rows = g_guest_api.iter_column_rows_mutable(iter, 1u);
-        const float* dt = (const float*)g_guest_api.res_ptr(iter, 2u);
+        const float* dt = (const float*)(const void*)g_guest_api.res_ptr(iter, 2u);
         size_t row;
 
         assert(entities != NULL && health != NULL && pos_rows != NULL && dt != NULL);
         for (row = 0u; row < chunk_len; ++row) {
-            MockPosition* pos = (MockPosition*)pos_rows[row];
+            MockPosition* pos = (MockPosition*)(void*)pos_rows[row];
             pos->x += *dt;
             if (row == 1u) {
                 health[row] += 5.0f;

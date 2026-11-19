@@ -45,7 +45,9 @@ constexpr BamManifest kManifest = {
     "example_07_cpp17_mod",
     "0.2.0",
     0u,
-    0u
+    0u,
+    nullptr,
+    nullptr
 };
 
 // Per-World RAII instance state owned exclusively by the C++ guest allocator (`new`/`delete`).

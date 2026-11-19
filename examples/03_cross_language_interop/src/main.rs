@@ -15,8 +15,13 @@ use bevy_ecs::message::Messages;
 use bevy_ecs::query::{Changed, Or};
 use bevy_ecs::system::Query;
 use components::{ColorRgba, Position, Velocity};
-use std::path::PathBuf;
+use std::env;
+use std::ffi::OsString;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(windows)]
+use std::sync::OnceLock;
 
 /// Host monitoring system observing mutations produced by both C99 and Rust mods.
 fn host_telemetry_monitor(
@@ -33,6 +38,264 @@ fn host_telemetry_monitor(
     }
 }
 
+fn is_msvc_style_driver(tool: &str) -> bool {
+    let file_name = Path::new(tool)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(tool);
+    let stem = file_name
+        .strip_suffix(".exe")
+        .or_else(|| file_name.strip_suffix(".EXE"))
+        .unwrap_or(file_name);
+    stem.eq_ignore_ascii_case("cl") || stem.eq_ignore_ascii_case("clang-cl")
+}
+
+fn is_plain_cl_driver(tool: &str) -> bool {
+    let file_name = Path::new(tool)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(tool);
+    let stem = file_name
+        .strip_suffix(".exe")
+        .or_else(|| file_name.strip_suffix(".EXE"))
+        .unwrap_or(file_name);
+    stem.eq_ignore_ascii_case("cl")
+}
+
+fn msvc_path_arg(prefix: &str, path: &Path) -> OsString {
+    let mut arg = OsString::from(prefix);
+    arg.push(path.as_os_str());
+    arg
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct MsvcEnv {
+    vars: Vec<(String, String)>,
+    cl_exe: Option<PathBuf>,
+}
+
+#[cfg(windows)]
+fn is_msvc_env_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "PATH"
+            | "INCLUDE"
+            | "EXTERNAL_INCLUDE"
+            | "LIB"
+            | "LIBPATH"
+            | "PLATFORM"
+            | "DEVENVDIR"
+            | "VISUALSTUDIOVERSION"
+            | "PREFERREDTOOLARCHITECTURE"
+            | "UCRTVERSION"
+            | "UNIVERSALCRTSDKDIR"
+            | "VCINSTALLDIR"
+            | "VSINSTALLDIR"
+            | "NETFXSDKDIR"
+    ) || upper.starts_with("VSCMD_")
+        || upper.starts_with("VCTOOLS")
+        || upper.starts_with("WINDOWSSDK")
+}
+
+#[cfg(windows)]
+fn find_exe_in_path_list(exe_name: &str, path_value: &str) -> Option<PathBuf> {
+    let has_exe_ext = Path::new(exe_name)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("exe"));
+    for dir in env::split_paths(path_value) {
+        let direct = dir.join(exe_name);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        if !has_exe_ext {
+            let with_exe = dir.join(format!("{exe_name}.exe"));
+            if with_exe.is_file() {
+                return Some(with_exe);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn cached_msvc_env() -> Option<&'static MsvcEnv> {
+    use std::os::windows::process::CommandExt;
+
+    static MSVC_ENV: OnceLock<Option<MsvcEnv>> = OnceLock::new();
+    MSVC_ENV
+        .get_or_init(|| {
+            let mut vswhere_bins = Vec::new();
+            for env_key in ["ProgramFiles(x86)", "ProgramFiles"] {
+                if let Some(base) = env::var_os(env_key) {
+                    let cand = PathBuf::from(base)
+                        .join("Microsoft Visual Studio")
+                        .join("Installer")
+                        .join("vswhere.exe");
+                    if cand.is_file() && !vswhere_bins.contains(&cand) {
+                        vswhere_bins.push(cand);
+                    }
+                }
+            }
+            vswhere_bins.push(PathBuf::from("vswhere.exe"));
+
+            let mut roots = Vec::new();
+            for vswhere in &vswhere_bins {
+                let Ok(out) = Command::new(vswhere)
+                    .args([
+                        "-latest",
+                        "-products",
+                        "*",
+                        "-requires",
+                        "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                        "-property",
+                        "installationPath",
+                    ])
+                    .output()
+                else {
+                    continue;
+                };
+                if out.status.success() {
+                    for line in String::from_utf8_lossy(&out.stdout).lines() {
+                        let p = PathBuf::from(line.trim());
+                        if p.is_dir() && !roots.contains(&p) {
+                            roots.push(p);
+                        }
+                    }
+                    if !roots.is_empty() {
+                        break;
+                    }
+                }
+            }
+
+            let comspec = env::var_os("COMSPEC").unwrap_or_else(|| OsString::from("cmd.exe"));
+            for root in roots {
+                let bat = root
+                    .join("VC")
+                    .join("Auxiliary")
+                    .join("Build")
+                    .join("vcvars64.bat");
+                if !bat.is_file() {
+                    continue;
+                }
+                let Ok(output) = Command::new(&comspec)
+                    .env("VSCMD_SKIP_SENDTELEMETRY", "1")
+                    .env("BAM_VCVARS_BAT", &bat)
+                    .args(["/D", "/S", "/C"])
+                    .raw_arg("\"call \"%BAM_VCVARS_BAT%\" >NUL 2>&1 && set\"")
+                    .output()
+                else {
+                    continue;
+                };
+                if !output.status.success() {
+                    continue;
+                }
+                let mut vars: Vec<(String, String)> = Vec::new();
+                for raw_line in String::from_utf8_lossy(&output.stdout).lines() {
+                    let line = raw_line.trim_end_matches('\r');
+                    if line.is_empty() || line.starts_with('=') {
+                        continue;
+                    }
+                    let Some((raw_key, value)) = line.split_once('=') else {
+                        continue;
+                    };
+                    let key = raw_key.trim();
+                    if key.is_empty() || !is_msvc_env_key(key) {
+                        continue;
+                    }
+                    vars.push((key.to_owned(), value.to_owned()));
+                }
+                let Some(path_val) = vars
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+                    .map(|(_, v)| v.as_str())
+                else {
+                    continue;
+                };
+                let has_inc = vars
+                    .iter()
+                    .any(|(k, v)| k.eq_ignore_ascii_case("INCLUDE") && !v.is_empty());
+                let has_lib = vars
+                    .iter()
+                    .any(|(k, v)| k.eq_ignore_ascii_case("LIB") && !v.is_empty());
+                if has_inc && has_lib {
+                    let cl_exe = find_exe_in_path_list("cl.exe", path_val);
+                    return Some(MsvcEnv { vars, cl_exe });
+                }
+            }
+            None
+        })
+        .as_ref()
+}
+
+fn msvc_command(program: &str) -> Command {
+    #[cfg(windows)]
+    if is_msvc_style_driver(program) {
+        let has_include = env::var_os("INCLUDE").is_some_and(|v| !v.is_empty());
+        let has_lib = env::var_os("LIB").is_some_and(|v| !v.is_empty());
+        let explicit_path = Path::new(program).components().count() > 1;
+        let direct_driver_ok = if !is_plain_cl_driver(program) {
+            true
+        } else if explicit_path {
+            Path::new(program).is_file()
+        } else {
+            env::var("PATH")
+                .ok()
+                .and_then(|path_val| find_exe_in_path_list(program, &path_val))
+                .is_some()
+        };
+
+        if !(has_include && has_lib && direct_driver_ok)
+            && let Some(msvc_env) = cached_msvc_env()
+        {
+            let mut cmd = if is_plain_cl_driver(program) && !explicit_path {
+                match &msvc_env.cl_exe {
+                    Some(cl_path) => Command::new(cl_path),
+                    None => Command::new(program),
+                }
+            } else {
+                Command::new(program)
+            };
+            for (k, v) in &msvc_env.vars {
+                cmd.env(k, v);
+            }
+            return cmd;
+        }
+    }
+    Command::new(program)
+}
+
+fn find_c_compiler() -> String {
+    if let Ok(cc) = env::var("CC")
+        && !cc.trim().is_empty()
+    {
+        return cc.trim().to_owned();
+    }
+    #[cfg(target_os = "windows")]
+    let candidates = ["clang", "clang-cl", "cl.exe", "cl", "gcc", "cc"];
+    #[cfg(not(target_os = "windows"))]
+    let candidates = ["clang", "gcc", "cc"];
+    for cand in candidates {
+        let is_plain_cl = is_plain_cl_driver(cand);
+        let res = if is_plain_cl {
+            msvc_command(cand).output()
+        } else {
+            msvc_command(cand).arg("--version").output()
+        };
+        if let Ok(out) = res
+            && (out.status.success() || (is_plain_cl && !out.stderr.is_empty()))
+        {
+            return cand.to_owned();
+        }
+    }
+    if cfg!(target_os = "windows") {
+        "gcc".to_owned()
+    } else {
+        "cc".to_owned()
+    }
+}
+
 fn get_guest_dylib_paths() -> (PathBuf, PathBuf) {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let (prefix, ext) = if cfg!(target_os = "windows") {
@@ -42,6 +305,15 @@ fn get_guest_dylib_paths() -> (PathBuf, PathBuf) {
     } else {
         ("lib", "so")
     };
+
+    if let Some(dir) = env::var_os("BAM_FIXTURE_DIR").filter(|v| !v.is_empty()) {
+        let dir = PathBuf::from(dir);
+        let staged_c = dir.join(format!("{prefix}example_03_c_mod.{ext}"));
+        let staged_rust = dir.join(format!("{prefix}example_03_rust_mod.{ext}"));
+        if staged_c.is_file() && staged_rust.is_file() {
+            return (staged_c, staged_rust);
+        }
+    }
 
     let c_dylib = manifest_dir
         .join("c_mod")
@@ -59,13 +331,49 @@ fn ensure_mods_built() -> (PathBuf, PathBuf) {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
     if !c_dylib.exists() {
-        println!("[HOST] Compiling C99 guest mod via make...");
-        let status = Command::new("make")
-            .arg("-C")
-            .arg(manifest_dir.join("c_mod"))
+        let cc = find_c_compiler();
+        let c_dir = manifest_dir.join("c_mod");
+        let include_dir = manifest_dir.join("../../include");
+        println!("[HOST] Compiling C99/C11 guest mod via `{cc}`...");
+        let pid = std::process::id();
+        let obj_path = env::temp_dir().join(format!("example_03_c_mod_{pid}.obj"));
+        let implib_path = env::temp_dir().join(format!("example_03_c_mod_{pid}.lib"));
+        let exp_path = env::temp_dir().join(format!("example_03_c_mod_{pid}.exp"));
+
+        let mut cmd = msvc_command(&cc);
+        cmd.current_dir(&c_dir);
+        if is_msvc_style_driver(&cc) {
+            cmd.args(["/nologo", "/LD", "/TC", "/std:c11", "/W4", "/WX", "/O2"])
+                .arg("/I")
+                .arg(&include_dir)
+                .arg(msvc_path_arg("/Fo:", &obj_path))
+                .arg(msvc_path_arg("/Fe:", &c_dylib))
+                .arg("mod.c")
+                .arg("/link")
+                .arg(msvc_path_arg("/IMPLIB:", &implib_path));
+        } else {
+            cmd.args([
+                "-std=c99",
+                "-Wall",
+                "-Wextra",
+                "-Wpedantic",
+                "-Werror",
+                "-O3",
+                "-shared",
+            ])
+            .arg(format!("-I{}", include_dir.display()));
+            if !cfg!(target_os = "windows") {
+                cmd.arg("-fPIC");
+            }
+            cmd.arg("mod.c").arg("-o").arg(&c_dylib);
+        }
+        let status = cmd
             .status()
-            .expect("Failed to execute make for c_mod");
-        assert!(status.success(), "Failed to build C99 guest mod");
+            .unwrap_or_else(|e| panic!("Failed to execute `{cc}` for c_mod: {e}"));
+        let _ = fs::remove_file(&obj_path);
+        let _ = fs::remove_file(&implib_path);
+        let _ = fs::remove_file(&exp_path);
+        assert!(status.success(), "Failed to build C99/C11 guest mod");
     }
 
     if !rust_dylib.exists() {
