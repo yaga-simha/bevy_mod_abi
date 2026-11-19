@@ -56,6 +56,9 @@ bridge-ui = [
     "dep:bevy_ui_widgets",
     "dep:bevy_input_focus",
     "dep:bevy_color",
+    "dep:bevy_asset",
+    "dep:bevy_image",
+    "dep:bevy_math",
 ]
 bridge-feathers = [
     "bridge-ui",

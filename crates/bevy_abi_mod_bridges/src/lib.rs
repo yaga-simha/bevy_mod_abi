@@ -31,6 +31,8 @@ pub mod picking;
 pub mod state;
 #[cfg(feature = "bridge-std-types")]
 pub mod std_types;
+#[cfg(feature = "bridge-ui")]
+pub mod ui;
 
 #[cfg(feature = "bridge-asset")]
 pub use asset::{ModAssetAppExt, ModAssetPlugin, ModAssetRegistry, ModAssetWorldExt};
@@ -59,6 +61,19 @@ pub use std_types::{
     FfiGlobalTransform, FfiKeyCode, FfiKeyboardInput, FfiMouseButton, FfiMouseInput, FfiTimeFixed,
     FfiTimeReal, FfiTimeVirtual, FfiTransform, FfiVisibility, StdTypesBridgePlugin,
     register_std_types_bridges,
+};
+#[cfg(feature = "bridge-ui")]
+pub use ui::{
+    FfiBorderColor, FfiBorderRadius, FfiCornerRadius, FfiEditableTextConfig, FfiEmSize,
+    FfiFontSize, FfiInlineBox, FfiInlineImage, FfiRemSize, FfiRgba, FfiSelectedTab, FfiTab,
+    FfiTabList, FfiUiNode, FfiUiRect, FfiUiTextStyle, FfiVal, FfiValueChange, ModUiAppExt,
+    ModUiBridgePlugin, ModUiBridgeSet, ModUiRegistry, ModUiWorldExt, cleanup_mod_ui_in_world,
+    register_ui_bridges,
+};
+#[cfg(feature = "bridge-feathers")]
+pub use ui::{
+    FfiFeathersColorInput, FfiFeathersDropdown, FfiFeathersListRow, FfiFeathersListView,
+    FfiFeathersNumberInput, FfiFeathersScrollableList, FfiFeathersSelect, FfiThemeContext,
 };
 
 /// Convenience umbrella plugin installing [`StdTypesBridgePlugin`], [`ModAssetPlugin`], and
@@ -124,5 +139,17 @@ pub mod prelude {
         FfiGlobalTransform, FfiKeyCode, FfiKeyboardInput, FfiMouseButton, FfiMouseInput,
         FfiTimeFixed, FfiTimeReal, FfiTimeVirtual, FfiTransform, FfiVisibility,
         StdTypesBridgePlugin,
+    };
+    #[cfg(feature = "bridge-ui")]
+    pub use crate::ui::{
+        FfiBorderColor, FfiBorderRadius, FfiCornerRadius, FfiEditableTextConfig, FfiEmSize,
+        FfiFontSize, FfiInlineBox, FfiInlineImage, FfiRemSize, FfiRgba, FfiSelectedTab, FfiTab,
+        FfiTabList, FfiUiNode, FfiUiRect, FfiUiTextStyle, FfiVal, FfiValueChange, ModUiAppExt,
+        ModUiBridgePlugin, ModUiBridgeSet, ModUiRegistry, ModUiWorldExt,
+    };
+    #[cfg(feature = "bridge-feathers")]
+    pub use crate::ui::{
+        FfiFeathersColorInput, FfiFeathersDropdown, FfiFeathersListRow, FfiFeathersListView,
+        FfiFeathersNumberInput, FfiFeathersScrollableList, FfiFeathersSelect, FfiThemeContext,
     };
 }
