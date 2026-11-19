@@ -25,7 +25,8 @@
 
 use crate::savegame::format_component_uuid;
 use bevy_abi_mod_host::{
-    LoadOptions, LoadedModInfo, ModHost, ModId, ModQuarantine, ModRegistry, ModWorldExt,
+    LoadOptions, LoadedModInfo, ModBudgetTelemetry, ModHost, ModId, ModQuarantine, ModRegistry,
+    ModWorldExt,
 };
 use bevy_abi_mod_host_sys::{
     inspect_component_bam_fields, inspect_component_witness_fields,
@@ -656,6 +657,53 @@ impl ModTelemetryRecorder {
         state.budget_breached = snapshot.budget_breached;
     }
 
+    /// Synchronizes live per-system execution metrics and watchdog states from
+    /// [`ModBudgetTelemetry`] into this recorder (idempotent across repeated pulls within the same
+    /// frame).
+    pub fn sync_budget_telemetry(&mut self, budgets: &ModBudgetTelemetry) {
+        for snap in budgets.system_budget_snapshots() {
+            let mod_id = snap.mod_id.map_or(0, |id| id.0);
+            let mod_name = if snap.mod_name.is_empty() {
+                "unscoped".to_owned()
+            } else {
+                snap.mod_name
+            };
+            let key = (mod_id, mod_name.clone(), snap.system_name.clone());
+            let window_size = self.window_size;
+            let state = self.systems.entry(key).or_insert_with(|| {
+                let system_hash = fnv1a_64_hash_system(&mod_name, &snap.system_name);
+                SystemMetricState {
+                    mod_id,
+                    mod_name,
+                    system_name: snap.system_name,
+                    system_hash,
+                    durations_us: VecDeque::with_capacity(window_size),
+                    override_percentiles: None,
+                    last_duration_us: 0,
+                    matched_entities: 0,
+                    matched_tables: 0,
+                    skipped_summary_tick_tables: 0,
+                    chunks: 0,
+                    commands_queued: 0,
+                    sample_count: 0,
+                    quarantined: false,
+                    faulted: false,
+                    budget_breached: false,
+                }
+            });
+            state.override_percentiles = Some((snap.p50_us, snap.p99_us));
+            state.last_duration_us = snap.last_duration_us;
+            state.matched_entities = snap.matched_entities;
+            state.matched_tables = snap.matched_tables;
+            state.skipped_summary_tick_tables = snap.skipped_summary_tick_tables;
+            state.chunks = snap.chunks_yielded as u64;
+            state.commands_queued = snap.commands_queued as u64;
+            state.sample_count = state.sample_count.max(1);
+            state.quarantined = snap.quarantined;
+            state.budget_breached = snap.breach_count > 0;
+        }
+    }
+
     /// Synchronizes quarantine status from [`ModQuarantine`] across all tracked systems.
     pub fn sync_quarantine(&mut self, quarantine: &ModQuarantine) {
         for state in self.systems.values_mut() {
@@ -1252,14 +1300,19 @@ impl ModTelemetryEndpoint {
 // `Last`-Schedule Telemetry Sync & Stream Flush System
 // ============================================================================
 
-/// `Last`-schedule Bevy system synchronizing quarantine state into [`ModTelemetryRecorder`] and
-/// streaming fixed 64-byte [`SystemTelemetryDigest64`] frames to any connected
-/// [`ModTelemetryEndpoint`] clients non-blockingly.
+/// `Last`-schedule Bevy system synchronizing live [`ModBudgetTelemetry`] snapshots and
+/// [`ModQuarantine`] state into [`ModTelemetryRecorder`], and streaming fixed 64-byte
+/// [`SystemTelemetryDigest64`] frames to any connected [`ModTelemetryEndpoint`] clients
+/// non-blockingly.
 pub fn flush_mod_telemetry_system(
     mut recorder: ResMut<ModTelemetryRecorder>,
+    budgets: Option<Res<ModBudgetTelemetry>>,
     quarantine: Option<Res<ModQuarantine>>,
     endpoint: Option<Res<ModTelemetryEndpoint>>,
 ) {
+    if let Some(ref b) = budgets {
+        recorder.sync_budget_telemetry(b);
+    }
     if let Some(ref q) = quarantine {
         recorder.sync_quarantine(q);
     }
@@ -1607,6 +1660,12 @@ fn brp_bam_system_metrics_impl(world: &mut World, params: Option<&Value>) -> Brp
         .and_then(|p| p.get("system_name"))
         .and_then(Value::as_str);
 
+    if let (Some(b), Some(mut rec)) = (
+        world.get_resource::<ModBudgetTelemetry>().cloned(),
+        world.get_resource_mut::<ModTelemetryRecorder>(),
+    ) {
+        rec.sync_budget_telemetry(&b);
+    }
     if let (Some(q), Some(mut rec)) = (
         world.get_resource::<ModQuarantine>().cloned(),
         world.get_resource_mut::<ModTelemetryRecorder>(),

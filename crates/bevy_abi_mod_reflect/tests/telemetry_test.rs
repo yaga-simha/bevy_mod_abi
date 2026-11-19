@@ -717,3 +717,71 @@ fn loopback_tcp_transport_streams_64b_digests_and_rejects_non_loopback() {
     assert_eq!(digest.p50_us, 333);
     assert_eq!(digest.p99_us, 333);
 }
+
+#[test]
+fn mod_budget_telemetry_syncs_automatically_into_telemetry_recorder_and_brp() {
+    use bevy_abi_mod_host_sys::GuestSystem;
+    use bevy_abi_mod_sys::BamSystemCtx;
+    use bevy_app::Update;
+    use core::ffi::c_void;
+
+    unsafe extern "C" fn live_budget_noop(
+        _ctx: *mut BamSystemCtx,
+        user_data: *mut c_void,
+    ) -> FfiResult {
+        if !user_data.is_null() {
+            // SAFETY: `user_data` points to `runs: AtomicUsize` valid for the duration of `app.update()`.
+            let counter = unsafe { &*user_data.cast::<AtomicUsize>() };
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+        FfiResult::OK
+    }
+
+    let mut app = App::new();
+    app.add_plugins((
+        AbiModPlugin,
+        RemotePlugin::default(),
+        ModTelemetryPlugin::new(),
+    ));
+
+    let runs = Box::new(AtomicUsize::new(0));
+    let reg = app.world().resource::<ModRegistry>().clone();
+    let mut sys = GuestSystem::new(
+        "live_budget_tick",
+        Vec::new(),
+        live_budget_noop,
+        (&raw const *runs).cast_mut().cast::<c_void>(),
+        reg,
+    );
+    sys.set_mod_id(ModId(77));
+    sys.set_mod_namespace(Some(Arc::from("budget_sync_mod")));
+    app.add_systems(Update, sys);
+
+    // Run one full frame so `Update` executes `GuestSystem` (recording into `ModBudgetTelemetry`)
+    // and `Last` flushes synchronized budget metrics into `ModTelemetryRecorder`.
+    app.finish();
+    app.cleanup();
+    app.update();
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+    let brp = call_remote_method(
+        app.world_mut(),
+        BRP_METHOD_BAM_SYSTEM_METRICS,
+        Some(serde_json::json!({ "mod_id": 77 })),
+    )
+    .expect("bam/system_metrics succeeds");
+    let systems = brp["systems"].as_array().unwrap();
+    assert_eq!(systems.len(), 1);
+    assert_eq!(systems[0]["mod_name"], "budget_sync_mod");
+    assert_eq!(systems[0]["system_name"], "live_budget_tick");
+    assert!(systems[0]["sample_count"].as_u64().unwrap() >= 1);
+    assert_eq!(systems[0]["quarantined"], false);
+
+    let rec = app.world().resource::<ModTelemetryRecorder>();
+    assert!(rec.system_metrics().iter().any(|m| {
+        m.mod_id == 77 && m.mod_name == "budget_sync_mod" && m.system_name == "live_budget_tick"
+    }));
+
+    drop(app);
+    drop(runs);
+}

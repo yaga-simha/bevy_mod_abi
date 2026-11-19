@@ -145,19 +145,33 @@
 //! - `diagnostics`: Enables optional diagnostic instrumentation in `bevy_abi_mod_host`.
 //! - `signature-verification`: Enables optional pure-Rust OpenSSH `SSHSIG` and Ed25519 CA
 //!   certificate verification (`ModTrustPolicy`) prior to mapping native shared libraries.
-//! - `bridge-std-types`: Enables Bevy standard component/resource/input bridges (`StdTypesBridgePlugin`).
-//! - `bridge-asset`: Enables isolated `mod://<namespace>/...` Bevy asset sourcing (`ModAssetPlugin`).
-//! - `bridge-state`: Enables Bevy `States` exposure (`ModStateExt`).
-//! - `bridge-reflect`: Enables dynamic `bevy_reflect`, `bevy_remote` BRP, and `bevy_settings` bridges.
+//! - `bridge-std-types`: Enables Bevy standard component/resource/input bridges (`StdTypesBridgePlugin`, `Disabled`, `ModInputExtBridgePlugin`).
+//! - `bridge-asset`: Enables isolated `mod://<namespace>/...` Bevy asset sourcing & `AssetOverlayPolicy` (`ModAssetPlugin`).
+//! - `bridge-state`: Enables Bevy `States`, `SubStates`, and `ComputedStates` dynamic slab exposure (`ModStateExt`).
+//! - `bridge-reflect`: Enables dynamic `bevy_reflect`, `bevy_remote` BRP, `bevy_settings` TOML, `ModSaveGamePlugin`, and `ModTelemetryPlugin`.
 //! - `bridge-bsn`: Enables Bevy Scene Notation (`bevy_scene`) scene spawning (`cmd_spawn_scene`).
-//! - `sub-app-extract`: Enables `SubApp` (`RenderApp`) extraction and custom shader/material support.
+//! - `bridge-picking`: Enables Bevy `0.20` flattened `Pointer*` observers, `EntityCursor`, and `Gamepad` + rumble bridges (`ModPickingBridgePlugin`, `ModInputExtBridgePlugin`).
+//! - `bridge-audio`: Enables `AudioPlayer<AudioSource>`, `PlaybackSettings`, and `SpatialAudioSink` bridges (`ModAudioBridgePlugin`).
+//! - `bridge-light`: Enables `Camera2d`, `Camera3d`, `Tonemapping`, `DebandDither`, `ScreenSpaceTransmission`, and `PointLight`/`SpotLight`/`DirectionalLight` bridges (`ModCameraLightBridgePlugin`).
+//! - `bridge-ui`: Enables retained Bevy `0.20` UI, `EditableText`/`TextInput`, `InlineBox`/`InlineImage`, and headless widgets (`ModUiBridgePlugin`).
+//! - `bridge-feathers`: Enables `bevy_feathers` control and `ThemeContext` bridges (implies `bridge-ui`).
+//! - `bridge-camera-controller`: Enables `PanOrbitCamera` controller bridge (`ModCameraLightBridgePlugin`).
+//! - `bridge-solari`: Enables `SolariLighting` realtime GI bridge (`ModCameraLightBridgePlugin`).
+//! - `sub-app-extract`: Enables `SubApp` (`RenderApp`) extraction, `.wesl` 2D/3D materials (`SpriteMaterial`, `ExtendedMaterial2d`), and opt-in mesh-shader pipelines.
 //! - `hot-reload-watcher`: Enables debounced filesystem hot-reload watching (`ModHotReloadPlugin`).
 
 #[cfg(any(
     feature = "bridge-std-types",
     feature = "bridge-asset",
     feature = "bridge-state",
-    feature = "bridge-bsn"
+    feature = "bridge-bsn",
+    feature = "bridge-picking",
+    feature = "bridge-audio",
+    feature = "bridge-light",
+    feature = "bridge-ui",
+    feature = "bridge-feathers",
+    feature = "bridge-camera-controller",
+    feature = "bridge-solari"
 ))]
 pub use bevy_abi_mod_bridges;
 pub use bevy_abi_mod_host;
@@ -170,94 +184,252 @@ pub use bevy_abi_mod_render;
 #[cfg(feature = "hot-reload-watcher")]
 pub use bevy_abi_mod_watcher;
 
-/// Re-exported optional Bevy subsystem bridges (`std_types`, `asset`, `state`, `bsn`, and `reflect`).
+/// Re-exported optional Bevy subsystem bridges (`std_types`, `asset`, `state`, `bsn`, `picking`,
+/// `input_ext`, `camera_light`, `audio`, `ui`, `reflect`, `savegame`, and `telemetry`).
 pub mod bridges {
+    #[cfg(feature = "bridge-camera-controller")]
+    pub use bevy_abi_mod_bridges::FfiPanOrbitCamera;
+    #[cfg(feature = "bridge-solari")]
+    pub use bevy_abi_mod_bridges::FfiSolariLighting;
     #[cfg(all(
         feature = "bridge-std-types",
         feature = "bridge-asset",
         feature = "bridge-state"
     ))]
     pub use bevy_abi_mod_bridges::ModBridgesPlugin;
+    #[cfg(feature = "bridge-asset")]
+    pub use bevy_abi_mod_bridges::{
+        AssetOverlayPolicy, ConfiguredModAssetPlugin, ModAssetAppExt, ModAssetPlugin,
+        ModAssetRegistry, ModAssetWorldExt, OVERLAY_NAMESPACE, asset,
+    };
+    #[cfg(feature = "bridge-audio")]
+    pub use bevy_abi_mod_bridges::{
+        AudioBridgeSystems, FfiAudioPlaybackSettings, FfiAudioPlayerSpec,
+        FfiSpatialAudioSinkControl, ModAudioBridgePlugin, audio, register_audio_bridges,
+    };
+    #[cfg(feature = "bridge-std-types")]
+    pub use bevy_abi_mod_bridges::{
+        CANONICAL_DISABLED_NAME, FfiGlobalTransform, FfiKeyCode, FfiKeyboardInput, FfiMouseButton,
+        FfiMouseInput, FfiTimeFixed, FfiTimeReal, FfiTimeVirtual, FfiTransform, FfiVisibility,
+        StdTypesBridgePlugin, register_std_types_bridges, std_types,
+    };
     #[cfg(feature = "bridge-bsn")]
     pub use bevy_abi_mod_bridges::{
         CANONICAL_READY_NAME, HostSceneRegistry, ModBsnAppExt, ModBsnPlugin, ModBsnWorldExt,
         SCENE_PATCH_ALIAS, bsn,
     };
-    #[cfg(feature = "bridge-std-types")]
+    #[cfg(any(
+        feature = "bridge-light",
+        feature = "bridge-camera-controller",
+        feature = "bridge-solari"
+    ))]
     pub use bevy_abi_mod_bridges::{
-        FfiGlobalTransform, FfiKeyCode, FfiKeyboardInput, FfiMouseButton, FfiMouseInput,
-        FfiTimeFixed, FfiTimeReal, FfiTimeVirtual, FfiTransform, FfiVisibility,
-        StdTypesBridgePlugin, register_std_types_bridges, std_types,
+        CameraLightBridgeSystems, ModCameraLightBridgePlugin, camera_light,
+        register_camera_light_bridges,
     };
-    #[cfg(feature = "bridge-asset")]
+    #[cfg(feature = "bridge-ui")]
     pub use bevy_abi_mod_bridges::{
-        ModAssetAppExt, ModAssetPlugin, ModAssetRegistry, ModAssetWorldExt, asset,
+        FfiBorderColor, FfiBorderRadius, FfiCornerRadius, FfiEditableTextConfig, FfiEmSize,
+        FfiFontSize, FfiInlineBox, FfiInlineImage, FfiRemSize, FfiRgba, FfiSelectedTab, FfiTab,
+        FfiTabList, FfiUiNode, FfiUiRect, FfiUiTextStyle, FfiVal, FfiValueChange, ModUiAppExt,
+        ModUiBridgePlugin, ModUiBridgeSet, ModUiRegistry, ModUiWorldExt, cleanup_mod_ui_in_world,
+        register_ui_bridges, ui,
+    };
+    #[cfg(feature = "bridge-light")]
+    pub use bevy_abi_mod_bridges::{
+        FfiCamera2d, FfiCamera3d, FfiDirectionalLight, FfiPointLight, FfiSpotLight,
+    };
+    #[cfg(feature = "bridge-picking")]
+    pub use bevy_abi_mod_bridges::{
+        FfiEntityCursor, FfiGamepadButton, FfiGamepadRumble, FfiGamepadState, FfiPointerButton,
+        FfiPointerClick, FfiPointerDrag, FfiPointerKind, FfiPointerMove, FfiPointerOut,
+        FfiPointerOver, FfiPointerPress, FfiPointerRelease, ModPickingBridgePlugin,
+        PickingBridgeSet, picking, register_picking_bridges,
+    };
+    #[cfg(feature = "bridge-feathers")]
+    pub use bevy_abi_mod_bridges::{
+        FfiFeathersColorInput, FfiFeathersDropdown, FfiFeathersListRow, FfiFeathersListView,
+        FfiFeathersNumberInput, FfiFeathersScrollableList, FfiFeathersSelect, FfiThemeContext,
+    };
+    #[cfg(any(feature = "bridge-picking", feature = "bridge-std-types"))]
+    pub use bevy_abi_mod_bridges::{
+        FfiMouseMotion, FfiMouseScroll, InputExtBridgeSet, ModInputExtBridgePlugin, input_ext,
+        register_input_ext_bridges,
     };
     #[cfg(feature = "bridge-state")]
-    pub use bevy_abi_mod_bridges::{ModNextState, ModStateError, ModStateExt, ModStateSpec, state};
+    pub use bevy_abi_mod_bridges::{
+        ModDespawnOnEnter, ModDespawnOnExit, ModNextState, ModStateEntry, ModStateError,
+        ModStateExt, ModStateHandle, ModStateKind, ModStateSlab, ModStateSpec,
+        ModStateTransitionRequest, STATE_ABSENT_DISCRIMINANT, state,
+    };
     #[cfg(feature = "bridge-reflect")]
     pub use bevy_abi_mod_reflect::{
-        BRP_METHOD_GET_COMPONENTS, BRP_METHOD_GET_RESOURCES, BRP_METHOD_INSERT_COMPONENTS,
-        BRP_METHOD_LIST_COMPONENTS, BRP_METHOD_MUTATE_COMPONENTS, BRP_METHOD_MUTATE_RESOURCES,
-        ModReflectAppExt, ModReflectError, ModReflectPlugin, ModReflectRegistry,
-        ModReflectRemoteExt, ModReflectWorldExt, ModSettingsError, ModSettingsRegistry,
-        TypedReflectBridgeEntry, WitnessReflectSchema, handle_mod_brp_request,
-        install_mod_brp_methods, reflect,
+        BRP_METHOD_BAM_COMPONENT_SCHEMAS, BRP_METHOD_BAM_HOT_RELOAD, BRP_METHOD_BAM_LIST_MODS,
+        BRP_METHOD_BAM_SYSTEM_METRICS, BRP_METHOD_GET_COMPONENTS, BRP_METHOD_GET_RESOURCES,
+        BRP_METHOD_INSERT_COMPONENTS, BRP_METHOD_LIST_COMPONENTS, BRP_METHOD_MUTATE_COMPONENTS,
+        BRP_METHOD_MUTATE_RESOURCES, ComponentMigrationContext, CustomHotReloadHandler,
+        HotReloadOutcome, HotReloadRequest, MOD_SAVE_ARCHIVE_VERSION, MOD_SAVE_BINARY_MAGIC,
+        MigratedComponentPayload, ModComponentMigrator, ModHotReloadQueue, ModReflectAppExt,
+        ModReflectError, ModReflectPlugin, ModReflectRegistry, ModReflectRemoteExt,
+        ModReflectWorldExt, ModSaveAppExt, ModSaveArchive, ModSaveFormatPreference,
+        ModSaveGamePlugin, ModSaveLoadError, ModSaveLoadPolicy, ModSaveLoadReport, ModSaveOptions,
+        ModSaveRegistry, ModSaveWorldExt, ModSettingsError, ModSettingsRegistry,
+        ModTelemetryEndpoint, ModTelemetryPlugin, ModTelemetryRecorder, ModTelemetryRemoteExt,
+        ModTelemetryTransport, ModTelemetryWorldExt, SYSTEM_TELEMETRY_DIGEST_SIZE,
+        SYSTEM_TELEMETRY_DIGEST_VERSION, SYSTEM_TELEMETRY_MAGIC, SavedComponentEntry,
+        SavedComponentFormat, SavedComponentHeader, SavedComponentPayload, SavedEntityRecord,
+        SavedFieldHeader, SavedModMetadata, SummaryTickTableStats, SystemExecutionSample,
+        SystemMetricSnapshot, SystemTelemetryDigest64, SystemTelemetryMetrics,
+        TELEMETRY_FLAG_BUDGET_BREACHED, TELEMETRY_FLAG_FAULTED, TELEMETRY_FLAG_QUARANTINED,
+        TELEMETRY_FLAG_SUMMARY_TICK_ACTIVE, TelemetryFrameError, TypedReflectBridgeEntry,
+        WitnessReflectSchema, flush_mod_telemetry_system, fnv1a_64_hash_system,
+        handle_mod_brp_request, handle_telemetry_brp_request, install_bam_telemetry_brp_methods,
+        install_mod_brp_methods, probe_summary_tick_tables, process_pending_hot_reloads, reflect,
+        savegame, telemetry,
     };
 }
 
 #[cfg(feature = "sub-app-extract")]
-pub use bevy_abi_mod_render::sub_app_materials;
+pub use bevy_abi_mod_render::{sprite_mesh_shaders, sub_app_materials};
+
+#[cfg(feature = "bridge-reflect")]
+pub use bevy_abi_mod_reflect::{savegame, telemetry};
 
 #[cfg(feature = "hot-reload-watcher")]
 pub use bevy_abi_mod_watcher::watcher;
 
+#[cfg(feature = "bridge-camera-controller")]
+pub use bevy_abi_mod_bridges::FfiPanOrbitCamera;
+#[cfg(feature = "bridge-solari")]
+pub use bevy_abi_mod_bridges::FfiSolariLighting;
 #[cfg(all(
     feature = "bridge-std-types",
     feature = "bridge-asset",
     feature = "bridge-state"
 ))]
 pub use bevy_abi_mod_bridges::ModBridgesPlugin;
+#[cfg(feature = "bridge-asset")]
+pub use bevy_abi_mod_bridges::{
+    AssetOverlayPolicy, ConfiguredModAssetPlugin, ModAssetAppExt, ModAssetPlugin, ModAssetRegistry,
+    ModAssetWorldExt, OVERLAY_NAMESPACE,
+};
+#[cfg(feature = "bridge-audio")]
+pub use bevy_abi_mod_bridges::{
+    AudioBridgeSystems, FfiAudioPlaybackSettings, FfiAudioPlayerSpec, FfiSpatialAudioSinkControl,
+    ModAudioBridgePlugin, register_audio_bridges,
+};
+#[cfg(feature = "bridge-std-types")]
+pub use bevy_abi_mod_bridges::{
+    CANONICAL_DISABLED_NAME, FfiGlobalTransform, FfiKeyCode, FfiKeyboardInput, FfiMouseButton,
+    FfiMouseInput, FfiTimeFixed, FfiTimeReal, FfiTimeVirtual, FfiTransform, FfiVisibility,
+    StdTypesBridgePlugin, register_std_types_bridges,
+};
 #[cfg(feature = "bridge-bsn")]
 pub use bevy_abi_mod_bridges::{
     CANONICAL_READY_NAME, HostSceneRegistry, ModBsnAppExt, ModBsnPlugin, ModBsnWorldExt,
     SCENE_PATCH_ALIAS,
 };
-#[cfg(feature = "bridge-std-types")]
+#[cfg(any(
+    feature = "bridge-light",
+    feature = "bridge-camera-controller",
+    feature = "bridge-solari"
+))]
 pub use bevy_abi_mod_bridges::{
-    FfiGlobalTransform, FfiKeyCode, FfiKeyboardInput, FfiMouseButton, FfiMouseInput, FfiTimeFixed,
-    FfiTimeReal, FfiTimeVirtual, FfiTransform, FfiVisibility, StdTypesBridgePlugin,
-    register_std_types_bridges,
+    CameraLightBridgeSystems, ModCameraLightBridgePlugin, register_camera_light_bridges,
 };
-#[cfg(feature = "bridge-asset")]
+#[cfg(feature = "bridge-ui")]
 pub use bevy_abi_mod_bridges::{
-    ModAssetAppExt, ModAssetPlugin, ModAssetRegistry, ModAssetWorldExt,
+    FfiBorderColor, FfiBorderRadius, FfiCornerRadius, FfiEditableTextConfig, FfiEmSize,
+    FfiFontSize, FfiInlineBox, FfiInlineImage, FfiRemSize, FfiRgba, FfiSelectedTab, FfiTab,
+    FfiTabList, FfiUiNode, FfiUiRect, FfiUiTextStyle, FfiVal, FfiValueChange, ModUiAppExt,
+    ModUiBridgePlugin, ModUiBridgeSet, ModUiRegistry, ModUiWorldExt, cleanup_mod_ui_in_world,
+    register_ui_bridges,
+};
+#[cfg(feature = "bridge-light")]
+pub use bevy_abi_mod_bridges::{
+    FfiCamera2d, FfiCamera3d, FfiDirectionalLight, FfiPointLight, FfiSpotLight,
+};
+#[cfg(feature = "bridge-picking")]
+pub use bevy_abi_mod_bridges::{
+    FfiEntityCursor, FfiGamepadButton, FfiGamepadRumble, FfiGamepadState, FfiPointerButton,
+    FfiPointerClick, FfiPointerDrag, FfiPointerKind, FfiPointerMove, FfiPointerOut, FfiPointerOver,
+    FfiPointerPress, FfiPointerRelease, ModPickingBridgePlugin, PickingBridgeSet,
+    register_picking_bridges,
+};
+#[cfg(feature = "bridge-feathers")]
+pub use bevy_abi_mod_bridges::{
+    FfiFeathersColorInput, FfiFeathersDropdown, FfiFeathersListRow, FfiFeathersListView,
+    FfiFeathersNumberInput, FfiFeathersScrollableList, FfiFeathersSelect, FfiThemeContext,
+};
+#[cfg(any(feature = "bridge-picking", feature = "bridge-std-types"))]
+pub use bevy_abi_mod_bridges::{
+    FfiMouseMotion, FfiMouseScroll, InputExtBridgeSet, ModInputExtBridgePlugin,
+    register_input_ext_bridges,
 };
 #[cfg(feature = "bridge-state")]
-pub use bevy_abi_mod_bridges::{ModNextState, ModStateError, ModStateExt, ModStateSpec};
+pub use bevy_abi_mod_bridges::{
+    ModDespawnOnEnter, ModDespawnOnExit, ModNextState, ModStateEntry, ModStateError, ModStateExt,
+    ModStateHandle, ModStateKind, ModStateSlab, ModStateSpec, ModStateTransitionRequest,
+    STATE_ABSENT_DISCRIMINANT,
+};
 
 #[cfg(feature = "bridge-reflect")]
 pub use bevy_abi_mod_reflect::{
-    BRP_METHOD_GET_COMPONENTS, BRP_METHOD_GET_RESOURCES, BRP_METHOD_INSERT_COMPONENTS,
-    BRP_METHOD_LIST_COMPONENTS, BRP_METHOD_MUTATE_COMPONENTS, BRP_METHOD_MUTATE_RESOURCES,
-    ModReflectAppExt, ModReflectError, ModReflectPlugin, ModReflectRegistry, ModReflectRemoteExt,
-    ModReflectWorldExt, ModSettingsError, ModSettingsRegistry, TypedReflectBridgeEntry,
-    WitnessReflectSchema, handle_mod_brp_request, install_mod_brp_methods,
-    reflect_entity_component, reflect_entity_component_mut, reflect_resource_component,
-    reflect_resource_component_mut,
+    BRP_METHOD_BAM_COMPONENT_SCHEMAS, BRP_METHOD_BAM_HOT_RELOAD, BRP_METHOD_BAM_LIST_MODS,
+    BRP_METHOD_BAM_SYSTEM_METRICS, BRP_METHOD_GET_COMPONENTS, BRP_METHOD_GET_RESOURCES,
+    BRP_METHOD_INSERT_COMPONENTS, BRP_METHOD_LIST_COMPONENTS, BRP_METHOD_MUTATE_COMPONENTS,
+    BRP_METHOD_MUTATE_RESOURCES, ComponentMigrationContext, CustomHotReloadHandler,
+    HotReloadOutcome, HotReloadRequest, MOD_SAVE_ARCHIVE_VERSION, MOD_SAVE_BINARY_MAGIC,
+    MigratedComponentPayload, ModComponentMigrator, ModHotReloadQueue, ModReflectAppExt,
+    ModReflectError, ModReflectPlugin, ModReflectRegistry, ModReflectRemoteExt, ModReflectWorldExt,
+    ModSaveAppExt, ModSaveArchive, ModSaveFormatPreference, ModSaveGamePlugin, ModSaveLoadError,
+    ModSaveLoadPolicy, ModSaveLoadReport, ModSaveOptions, ModSaveRegistry, ModSaveWorldExt,
+    ModSettingsError, ModSettingsRegistry, ModTelemetryEndpoint, ModTelemetryPlugin,
+    ModTelemetryRecorder, ModTelemetryRemoteExt, ModTelemetryTransport, ModTelemetryWorldExt,
+    SYSTEM_TELEMETRY_DIGEST_SIZE, SYSTEM_TELEMETRY_DIGEST_VERSION, SYSTEM_TELEMETRY_MAGIC,
+    SavedComponentEntry, SavedComponentFormat, SavedComponentHeader, SavedComponentPayload,
+    SavedEntityRecord, SavedFieldHeader, SavedModMetadata, SummaryTickTableStats,
+    SystemExecutionSample, SystemMetricSnapshot, SystemTelemetryDigest64, SystemTelemetryMetrics,
+    TELEMETRY_FLAG_BUDGET_BREACHED, TELEMETRY_FLAG_FAULTED, TELEMETRY_FLAG_QUARANTINED,
+    TELEMETRY_FLAG_SUMMARY_TICK_ACTIVE, TelemetryFrameError, TypedReflectBridgeEntry,
+    WitnessReflectSchema, flush_mod_telemetry_system, fnv1a_64_hash_system, handle_mod_brp_request,
+    handle_telemetry_brp_request, install_bam_telemetry_brp_methods, install_mod_brp_methods,
+    probe_summary_tick_tables, process_pending_hot_reloads, reflect_entity_component,
+    reflect_entity_component_mut, reflect_resource_component, reflect_resource_component_mut,
 };
 
 #[cfg(feature = "sub-app-extract")]
 pub use bevy_abi_mod_render::{
-    ModMaterialAppExt, ModMaterialError, ModMaterialParams, ModMaterialWorldExt,
-    ModShaderBufferInit, ModShaderBufferSpec, ModSpriteExtension2d, ModSpriteMaterialEntry,
-    ModSpriteMaterialSpec, ModStandardMaterialEntry, ModStandardMaterialSpec, ModSubAppConfig,
-    ModSubAppExt, ModSubAppPlugin, ModSubAppSchedule, ModSubAppSystems, ModSubWorldExt,
-    ModWeslMaterialPlugin, ModWeslMaterialRegistry, WeslShaderAssetSpec, WeslShaderSource,
-    cleanup_mod_wesl_materials_in_world, register_mod_custom_asset_in_world,
-    register_mod_extended_sprite_material_in_world, register_mod_shader_buffer_in_world,
-    register_mod_sprite_material_in_world, register_mod_standard_material_in_world,
-    register_mod_wesl_shader_in_world, update_mod_shader_buffer_in_world,
+    ExtractedModMeshPipeline, ExtractedModMeshPipelines, ModExtendedSpriteMaterial2d,
+    ModExtendedSpriteMaterialSpec, ModMaterialAppExt, ModMaterialError, ModMaterialParams,
+    ModMaterialWorldExt, ModMeshPipelineEntry, ModMeshPipelineId, ModMeshPipelineSpec,
+    ModMeshShaderAppExt, ModMeshShaderConfig, ModMeshShaderPlugin, ModMeshShaderRegistry,
+    ModMeshShaderSubAppPlugin, ModMeshShaderWorldExt, ModMeshStageSpec, ModShaderBufferInit,
+    ModShaderBufferSpec, ModShaderDef, ModSpriteBindingKind, ModSpriteExtension2d,
+    ModSpriteMaterial, ModSpriteMaterialEntry, ModSpriteMaterialPlugin, ModSpriteMaterialSpec,
+    ModSpriteMeshAppExt, ModSpriteMeshBridgeRegistry, ModSpriteMeshWorldExt,
+    ModStandardMaterialEntry, ModStandardMaterialSpec, ModSubAppConfig, ModSubAppExt,
+    ModSubAppPlugin, ModSubAppSchedule, ModSubAppSystems, ModSubWorldExt, ModUnifiedSpriteSpec,
+    ModWeslExtendedMaterialEntry, ModWeslMaterialPlugin, ModWeslMaterialRegistry,
+    ModWeslSpriteExtension2d, ModWeslSpriteExtension2dKey, ModWeslSpriteExtensionEntry,
+    ModWeslSpriteExtensionSpec, ModWeslSpriteSpecialization, WeslShaderAssetSpec, WeslShaderSource,
+    apply_wesl_sprite_specialization, attach_mod_extended_material_2d_in_world,
+    attach_mod_sprite_material_in_world, build_quad_mesh_2d, cleanup_mod_mesh_pipelines_in_world,
+    cleanup_mod_sprite_mesh_bindings_in_world, cleanup_mod_wesl_materials_in_world,
+    detach_mod_extended_material_2d_in_world, detach_mod_sprite_material_in_world,
+    register_mod_custom_asset_in_world, register_mod_extended_sprite_material_in_world,
+    register_mod_mesh_pipeline_in_world, register_mod_quad_mesh_in_world,
+    register_mod_shader_buffer_in_world, register_mod_sprite_material_in_world,
+    register_mod_standard_material_in_world, register_mod_wesl_extended_sprite_material_in_world,
+    register_mod_wesl_shader_in_world, register_mod_wesl_sprite_extension_in_world,
+    resolve_wesl_sprite_specialization, spawn_mod_extended_mesh_sprite_in_world,
+    spawn_mod_sprite_with_material_in_world, unregister_mod_mesh_pipeline_in_world,
+    update_mod_extended_sprite_material_buffer_in_world,
+    update_mod_extended_sprite_material_params_in_world,
+    update_mod_extended_sprite_material_shaders_in_world, update_mod_shader_buffer_in_world,
+    update_mod_sprite_extension_params_in_world, update_mod_wesl_sprite_extension_buffer_in_world,
+    update_mod_wesl_sprite_extension_params_in_world,
+    update_mod_wesl_sprite_extension_shaders_in_world,
 };
 
 #[cfg(feature = "hot-reload-watcher")]
@@ -273,7 +445,14 @@ pub mod prelude {
         feature = "bridge-std-types",
         feature = "bridge-asset",
         feature = "bridge-state",
-        feature = "bridge-bsn"
+        feature = "bridge-bsn",
+        feature = "bridge-picking",
+        feature = "bridge-audio",
+        feature = "bridge-light",
+        feature = "bridge-ui",
+        feature = "bridge-feathers",
+        feature = "bridge-camera-controller",
+        feature = "bridge-solari"
     ))]
     pub use bevy_abi_mod_bridges::prelude::*;
     pub use bevy_abi_mod_host::prelude::*;

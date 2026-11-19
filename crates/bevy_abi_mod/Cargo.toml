@@ -36,6 +36,36 @@ bridge-bsn = [
     "bevy_abi_mod_bridges/bridge-bsn",
     "bridge-asset",
 ]
+bridge-picking = [
+    "dep:bevy_abi_mod_bridges",
+    "bevy_abi_mod_bridges/bridge-picking",
+]
+bridge-audio = [
+    "dep:bevy_abi_mod_bridges",
+    "bevy_abi_mod_bridges/bridge-audio",
+    "bridge-asset",
+]
+bridge-light = [
+    "dep:bevy_abi_mod_bridges",
+    "bevy_abi_mod_bridges/bridge-light",
+]
+bridge-ui = [
+    "dep:bevy_abi_mod_bridges",
+    "bevy_abi_mod_bridges/bridge-ui",
+]
+bridge-feathers = [
+    "dep:bevy_abi_mod_bridges",
+    "bevy_abi_mod_bridges/bridge-feathers",
+    "bridge-ui",
+]
+bridge-camera-controller = [
+    "dep:bevy_abi_mod_bridges",
+    "bevy_abi_mod_bridges/bridge-camera-controller",
+]
+bridge-solari = [
+    "dep:bevy_abi_mod_bridges",
+    "bevy_abi_mod_bridges/bridge-solari",
+]
 sub-app-extract = [
     "dep:bevy_abi_mod_render",
     "bridge-asset",
