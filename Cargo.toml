@@ -28,6 +28,7 @@ members = [
     "examples/06_cross_mod_components",
     "examples/07_cpp17_guest",
     "examples/08_zig_guest",
+    "examples/09_bql_wire_parity",
     "examples/10_bevy20_full_companion",
 ]
 default-members = [
@@ -53,6 +54,7 @@ default-members = [
     "examples/03_cross_language_interop",
     "examples/06_cross_mod_components",
     "examples/07_cpp17_guest",
+    "examples/09_bql_wire_parity",
     "examples/10_bevy20_full_companion",
 ]
 exclude = [
@@ -76,6 +78,7 @@ exclude = [
     "examples/05_cute_3d_winit/mods/mod_carousel",
     "examples/06_cross_mod_components/mods/mod_shield_emitter",
     "examples/06_cross_mod_components/mods/mod_overcharge_siphon",
+    "examples/09_bql_wire_parity/rust_mod",
     "examples/10_bevy20_full_companion/guest_mod",
 ]
 

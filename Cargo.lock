@@ -3284,6 +3284,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "example_09_bql_wire_parity"
+version = "0.3.0"
+dependencies = [
+ "bevy_abi_mod",
+ "bevy_abi_mod_host_sys",
+ "bevy_abi_mod_sys",
+ "bevy_app",
+ "bevy_ecs",
+ "bevy_reflect",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "example_10_bevy20_full_companion"
 version = "0.3.0"
 dependencies = [
