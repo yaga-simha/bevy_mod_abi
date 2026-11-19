@@ -952,7 +952,7 @@ impl ModWorldExt for World {
             let lib_path = match manifest.resolve_library_path() {
                 Ok(p) => p,
                 Err(err) => {
-                    errors.push(err);
+                    errors.push(err.into());
                     failed_mods.insert(manifest.name);
                     continue;
                 }

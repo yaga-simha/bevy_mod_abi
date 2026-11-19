@@ -952,26 +952,74 @@ BAM_EXPORT void bevy_abi_mod_shutdown(BamInstance* instance) {{
             );
             std::fs::write(&c_src, code).unwrap();
 
-            let cc = std::env::var("CC")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| {
-                    if cfg!(target_os = "windows") {
-                        "gcc".to_owned()
+            let cc = if let Ok(cc) = std::env::var("CC")
+                && !cc.trim().is_empty()
+            {
+                cc.trim().to_owned()
+            } else {
+                #[cfg(target_os = "windows")]
+                let cands = ["clang", "clang-cl", "cl.exe", "cl", "gcc", "cc"];
+                #[cfg(not(target_os = "windows"))]
+                let cands = ["clang", "gcc", "cc"];
+                cands
+                    .iter()
+                    .copied()
+                    .find(|cand| {
+                        let is_cl = std::path::Path::new(cand)
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .is_some_and(|n| {
+                                n.eq_ignore_ascii_case("cl") || n.eq_ignore_ascii_case("cl.exe")
+                            });
+                        let res = if is_cl {
+                            Command::new(cand).output()
+                        } else {
+                            Command::new(cand).arg("--version").output()
+                        };
+                        matches!(res, Ok(out) if out.status.success() || (is_cl && !out.stderr.is_empty()))
+                    })
+                    .unwrap_or(if cfg!(target_os = "windows") {
+                        "gcc"
                     } else {
-                        "cc".to_owned()
-                    }
-                });
+                        "cc"
+                    })
+                    .to_owned()
+            };
 
-            let staging = src_dir.join(format!("{mod_name}_tmp_out"));
+            let staging = src_dir.join(format!(
+                "{mod_name}_tmp_out.{}",
+                std::env::consts::DLL_EXTENSION
+            ));
+            let is_msvc = std::path::Path::new(&cc)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|n| {
+                    let s = n
+                        .strip_suffix(".exe")
+                        .or_else(|| n.strip_suffix(".EXE"))
+                        .unwrap_or(n);
+                    s.eq_ignore_ascii_case("cl") || s.eq_ignore_ascii_case("clang-cl")
+                });
             let mut cmd = Command::new(&cc);
-            cmd.args(["-std=c99", "-Wall", "-Wextra", "-Werror"])
-                .arg(format!("-I{}", include_dir.display()))
-                .args(["-O2", "-shared"]);
-            if !cfg!(target_os = "windows") {
-                cmd.arg("-fPIC");
+            if is_msvc {
+                let obj_path = src_dir.join(format!("{mod_name}_tmp.obj"));
+                let implib_path = src_dir.join(format!("{mod_name}_tmp.lib"));
+                cmd.args(["/nologo", "/LD", "/std:c11", "/W4", "/WX", "/O2"])
+                    .arg(format!("/I{}", include_dir.display()))
+                    .arg(format!("/Fo{}", obj_path.display()))
+                    .arg(&c_src)
+                    .arg("/link")
+                    .arg(format!("/IMPLIB:{}", implib_path.display()))
+                    .arg(format!("/OUT:{}", staging.display()));
+            } else {
+                cmd.args(["-std=c99", "-Wall", "-Wextra", "-Werror"])
+                    .arg(format!("-I{}", include_dir.display()))
+                    .args(["-O2", "-shared"]);
+                if !cfg!(target_os = "windows") {
+                    cmd.arg("-fPIC");
+                }
+                cmd.arg(&c_src).arg("-o").arg(&staging);
             }
-            cmd.arg(&c_src).arg("-o").arg(&staging);
             let out = cmd
                 .output()
                 .expect("C compiler must be available for watcher test");
@@ -980,7 +1028,10 @@ BAM_EXPORT void bevy_abi_mod_shutdown(BamInstance* instance) {{
                 "C compiler failed: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
-            std::fs::rename(&staging, out_dylib).unwrap();
+            if std::fs::rename(&staging, out_dylib).is_err() {
+                std::fs::copy(&staging, out_dylib).unwrap();
+                let _ = std::fs::remove_file(&staging);
+            }
         }
 
         fn dylib_filename(stem: &str) -> String {
@@ -1062,12 +1113,12 @@ BAM_EXPORT void bevy_abi_mod_shutdown(BamInstance* instance) {{
 
             std::fs::write(
                 base_dir.join("mod.toml"),
-                "[mod]\nid = \"base_mod\"\nversion = \"1.0.0\"\nabi_version = \"^0.2.0\"\n",
+                "[mod]\nid = \"base_mod\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n",
             )
             .unwrap();
             std::fs::write(
                 addon_dir.join("mod.toml"),
-                "[mod]\nid = \"addon_mod\"\nversion = \"1.0.0\"\nabi_version = \"^0.2.0\"\n\n[dependencies]\nbase_mod = \"^1.0\"\n",
+                "[mod]\nid = \"addon_mod\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n\n[dependencies]\nbase_mod = \"^1.0\"\n",
             )
             .unwrap();
 

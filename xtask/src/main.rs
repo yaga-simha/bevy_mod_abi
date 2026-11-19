@@ -50,30 +50,158 @@ fn dylib_naming() -> (&'static str, &'static str) {
     }
 }
 
-fn c_compiler() -> String {
-    env::var("CC")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| {
-            if cfg!(target_os = "windows") {
-                "gcc".to_owned()
-            } else {
-                "cc".to_owned()
-            }
-        })
+pub(crate) fn is_msvc_style_driver(tool: &str) -> bool {
+    let file_name = Path::new(tool)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(tool);
+    let stem = file_name
+        .strip_suffix(".exe")
+        .or_else(|| file_name.strip_suffix(".EXE"))
+        .unwrap_or(file_name);
+    stem.eq_ignore_ascii_case("cl") || stem.eq_ignore_ascii_case("clang-cl")
 }
 
-fn cxx_compiler() -> String {
-    env::var("CXX")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| {
-            if cfg!(target_os = "windows") {
-                "g++".to_owned()
-            } else {
-                "c++".to_owned()
-            }
+fn is_plain_cl_driver(tool: &str) -> bool {
+    let file_name = Path::new(tool)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(tool);
+    let stem = file_name
+        .strip_suffix(".exe")
+        .or_else(|| file_name.strip_suffix(".EXE"))
+        .unwrap_or(file_name);
+    stem.eq_ignore_ascii_case("cl")
+}
+
+fn compiler_available(program: &str) -> bool {
+    let output = if is_plain_cl_driver(program) {
+        Command::new(program).output()
+    } else {
+        Command::new(program).arg("--version").output()
+    };
+    let Ok(out) = output else {
+        return false;
+    };
+    out.status.success() || (is_plain_cl_driver(program) && !out.stderr.is_empty())
+}
+
+pub(crate) fn c_compiler() -> String {
+    if let Ok(cc) = env::var("CC")
+        && !cc.trim().is_empty()
+    {
+        return cc.trim().to_owned();
+    }
+    #[cfg(target_os = "windows")]
+    let defaults = ["clang", "clang-cl", "cl.exe", "cl", "gcc", "cc"];
+    #[cfg(not(target_os = "windows"))]
+    let defaults = ["clang", "gcc", "cc"];
+    defaults
+        .iter()
+        .copied()
+        .find(|cand| compiler_available(cand))
+        .unwrap_or(if cfg!(target_os = "windows") {
+            "gcc"
+        } else {
+            "cc"
         })
+        .to_owned()
+}
+
+pub(crate) fn cxx_compiler() -> String {
+    if let Ok(cxx) = env::var("CXX")
+        && !cxx.trim().is_empty()
+    {
+        return cxx.trim().to_owned();
+    }
+    #[cfg(target_os = "windows")]
+    let defaults = ["clang++", "clang-cl", "cl.exe", "cl", "g++", "c++"];
+    #[cfg(not(target_os = "windows"))]
+    let defaults = ["clang++", "g++", "c++"];
+    defaults
+        .iter()
+        .copied()
+        .find(|cand| compiler_available(cand))
+        .unwrap_or(if cfg!(target_os = "windows") {
+            "g++"
+        } else {
+            "c++"
+        })
+        .to_owned()
+}
+
+pub(crate) fn c_syntax_only_cmd(
+    cc: &str,
+    include_dir: Option<&Path>,
+    header_or_c: &Path,
+) -> Command {
+    let mut cmd = Command::new(cc);
+    if is_msvc_style_driver(cc) {
+        cmd.args(["/nologo", "/Zs", "/TC", "/std:c11", "/W4", "/WX"]);
+        if let Some(inc) = include_dir {
+            cmd.arg(format!("/I{}", inc.display()));
+        }
+    } else {
+        cmd.args([
+            "-std=c99",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pedantic",
+            "-fsyntax-only",
+            "-x",
+            "c",
+        ]);
+        if let Some(inc) = include_dir {
+            cmd.arg(format!("-I{}", inc.display()));
+        }
+    }
+    cmd.arg(header_or_c);
+    cmd
+}
+
+#[cfg(test)]
+pub(crate) fn cxx17_syntax_only_cmd(
+    cxx: &str,
+    include_dir: Option<&Path>,
+    header_or_cpp: &Path,
+) -> Command {
+    let mut cmd = Command::new(cxx);
+    if is_msvc_style_driver(cxx) {
+        cmd.args([
+            "/nologo",
+            "/Zs",
+            "/TP",
+            "/std:c++17",
+            "/Zc:__cplusplus",
+            "/EHsc",
+            "/W4",
+            "/WX",
+        ]);
+        if let Some(inc) = include_dir {
+            cmd.arg(format!("/I{}", inc.display()));
+        }
+    } else {
+        cmd.args([
+            "-std=c++17",
+            "-Wall",
+            "-Wextra",
+            "-Wpedantic",
+            "-Werror",
+            "-fsyntax-only",
+            "-x",
+            "c++-header",
+        ]);
+        if let Some(inc) = include_dir {
+            cmd.arg(format!("-I{}", inc.display()));
+        }
+    }
+    cmd.arg(header_or_cpp);
+    cmd
+}
+
+fn msvc_opt_flag(opt_flag: &str) -> &'static str {
+    if opt_flag == "-O0" { "/Od" } else { "/O2" }
 }
 
 fn cargo_bin() -> String {
@@ -207,18 +335,34 @@ fn build_c99_mod(
 
     let cc = c_compiler();
     let include_dir = root.join("include");
+    let obj_dir = root.join("target").join("c_mods_obj");
+    fs::create_dir_all(&obj_dir)
+        .map_err(|e| format!("failed to create {}: {e}", obj_dir.display()))?;
     let mut cmd = Command::new(&cc);
-    cmd.current_dir(&mod_dir)
-        .args(["-std=c99", "-Wall", "-Wextra", "-Werror"])
-        .arg(format!("-I{}", include_dir.display()))
-        .arg(opt_flag)
-        .arg("-shared");
-    if !cfg!(target_os = "windows") {
-        cmd.arg("-fPIC");
-    }
-    cmd.arg(src_file).arg("-o").arg(&out_path);
-    if link_math && !cfg!(target_os = "windows") {
-        cmd.arg("-lm");
+    cmd.current_dir(&mod_dir);
+    if is_msvc_style_driver(&cc) {
+        let obj_path = obj_dir.join(format!("{artifact_stem}.c.obj"));
+        let implib_path = obj_dir.join(format!("{artifact_stem}.c.lib"));
+        cmd.args(["/nologo", "/LD", "/std:c11", "/W4", "/WX"])
+            .arg(msvc_opt_flag(opt_flag))
+            .arg(format!("/I{}", include_dir.display()))
+            .arg(format!("/Fo{}", obj_path.display()))
+            .arg(src_file)
+            .arg("/link")
+            .arg(format!("/IMPLIB:{}", implib_path.display()))
+            .arg(format!("/OUT:{}", out_path.display()));
+    } else {
+        cmd.args(["-std=c99", "-Wall", "-Wextra", "-Werror"])
+            .arg(format!("-I{}", include_dir.display()))
+            .arg(opt_flag)
+            .arg("-shared");
+        if !cfg!(target_os = "windows") {
+            cmd.arg("-fPIC");
+        }
+        cmd.arg(src_file).arg("-o").arg(&out_path);
+        if link_math && !cfg!(target_os = "windows") {
+            cmd.arg("-lm");
+        }
     }
     run_cmd(
         &mut cmd,
@@ -248,20 +392,44 @@ fn build_cpp17_mod(
 
     let cxx = cxx_compiler();
     let include_dir = root.join("include");
+    let obj_dir = root.join("target").join("c_mods_obj");
+    fs::create_dir_all(&obj_dir)
+        .map_err(|e| format!("failed to create {}: {e}", obj_dir.display()))?;
     let mut cmd = Command::new(&cxx);
-    cmd.current_dir(&mod_dir)
-        .args(["-std=c++17", "-Wall", "-Wextra", "-Wpedantic", "-Werror"])
-        .arg(format!("-I{}", include_dir.display()))
-        .arg(opt_flag)
-        .arg("-shared");
-    if !cfg!(target_os = "windows") {
+    cmd.current_dir(&mod_dir);
+    if is_msvc_style_driver(&cxx) {
+        let obj_path = obj_dir.join(format!("{artifact_stem}.cpp.obj"));
+        let implib_path = obj_dir.join(format!("{artifact_stem}.cpp.lib"));
         cmd.args([
-            "-fPIC",
-            "-fvisibility=hidden",
-            "-fvisibility-inlines-hidden",
-        ]);
+            "/nologo",
+            "/LD",
+            "/std:c++17",
+            "/Zc:__cplusplus",
+            "/EHsc",
+            "/W4",
+            "/WX",
+        ])
+        .arg(msvc_opt_flag(opt_flag))
+        .arg(format!("/I{}", include_dir.display()))
+        .arg(format!("/Fo{}", obj_path.display()))
+        .arg(src_file)
+        .arg("/link")
+        .arg(format!("/IMPLIB:{}", implib_path.display()))
+        .arg(format!("/OUT:{}", out_path.display()));
+    } else {
+        cmd.args(["-std=c++17", "-Wall", "-Wextra", "-Wpedantic", "-Werror"])
+            .arg(format!("-I{}", include_dir.display()))
+            .arg(opt_flag)
+            .arg("-shared");
+        if !cfg!(target_os = "windows") {
+            cmd.args([
+                "-fPIC",
+                "-fvisibility=hidden",
+                "-fvisibility-inlines-hidden",
+            ]);
+        }
+        cmd.arg(src_file).arg("-o").arg(&out_path);
     }
-    cmd.arg(src_file).arg("-o").arg(&out_path);
     run_cmd(
         &mut cmd,
         &format!("{cxx} {dir_rel}/{src_file} -> {out_name}"),
@@ -290,14 +458,26 @@ fn build_c99_test_fixture(root: &Path, stem: &str) -> Result<PathBuf, String> {
     let cc = c_compiler();
     let include_dir = root.join("include");
     let mut cmd = Command::new(&cc);
-    cmd.current_dir(root)
-        .args(["-std=c99", "-Wall", "-Wextra", "-Werror"])
-        .arg(format!("-I{}", include_dir.display()))
-        .args(["-O2", "-shared"]);
-    if !cfg!(target_os = "windows") {
-        cmd.arg("-fPIC");
+    cmd.current_dir(root);
+    if is_msvc_style_driver(&cc) {
+        let obj_path = build_dir.join(format!("{stem}.obj"));
+        let implib_path = build_dir.join(format!("{stem}.lib"));
+        cmd.args(["/nologo", "/LD", "/std:c11", "/W4", "/WX", "/O2"])
+            .arg(format!("/I{}", include_dir.display()))
+            .arg(format!("/Fo{}", obj_path.display()))
+            .arg(&src_path)
+            .arg("/link")
+            .arg(format!("/IMPLIB:{}", implib_path.display()))
+            .arg(format!("/OUT:{}", out_path.display()));
+    } else {
+        cmd.args(["-std=c99", "-Wall", "-Wextra", "-Werror"])
+            .arg(format!("-I{}", include_dir.display()))
+            .args(["-O2", "-shared"]);
+        if !cfg!(target_os = "windows") {
+            cmd.arg("-fPIC");
+        }
+        cmd.arg(&src_path).arg("-o").arg(&out_path);
     }
-    cmd.arg(&src_path).arg("-o").arg(&out_path);
     run_cmd(
         &mut cmd,
         &format!("{cc} tests/fixtures/c_mods/{stem}.c -> target/c_mods_build/{out_name}"),
@@ -783,6 +963,12 @@ fn verify_zero_bevy_deps(root: &Path) -> Result<(), String> {
             "-p",
             "bevy_abi_mod_macros",
             "-p",
+            "bevy_abi_mod_trust",
+            "-p",
+            "bevy_abi_mod_manifest",
+            "-p",
+            "bevy_abi_mod_sdk_gen",
+            "-p",
             "cargo-bam",
         ])
         .output()
@@ -828,23 +1014,11 @@ fn verify_c99_header_and_tests(root: &Path, run_standalone_test: bool) -> Result
     }
 
     let cc = c_compiler();
-    let mut syntax_cmd = Command::new(&cc);
-    syntax_cmd
-        .current_dir(root)
-        .args([
-            "-std=c99",
-            "-Wall",
-            "-Wextra",
-            "-Werror",
-            "-pedantic",
-            "-fsyntax-only",
-            "-x",
-            "c",
-        ])
-        .arg(&header_path);
+    let mut syntax_cmd = c_syntax_only_cmd(&cc, None, &header_path);
+    syntax_cmd.current_dir(root);
     run_cmd(
         &mut syntax_cmd,
-        &format!("{cc} -std=c99 -pedantic -fsyntax-only include/bevy_abi_mod.h"),
+        &format!("{cc} C99/C11 syntax check include/bevy_abi_mod.h"),
     )?;
 
     if run_standalone_test {
@@ -858,22 +1032,31 @@ fn verify_c99_header_and_tests(root: &Path, run_standalone_test: bool) -> Result
         };
         let exe_path = target_dir.join(exe_name);
         let mut build_test = Command::new(&cc);
-        build_test
-            .current_dir(root)
-            .args([
-                "-std=c99",
-                "-Wall",
-                "-Wextra",
-                "-Werror",
-                "-pedantic",
-                "-Iinclude",
-            ])
-            .arg(root.join("tests").join("standalone_c_test.c"))
-            .arg("-o")
-            .arg(&exe_path);
+        build_test.current_dir(root);
+        if is_msvc_style_driver(&cc) {
+            let obj_path = target_dir.join("standalone_c_test.obj");
+            build_test
+                .args(["/nologo", "/std:c11", "/W4", "/WX", "/Iinclude"])
+                .arg(format!("/Fo{}", obj_path.display()))
+                .arg(format!("/Fe{}", exe_path.display()))
+                .arg(root.join("tests").join("standalone_c_test.c"));
+        } else {
+            build_test
+                .args([
+                    "-std=c99",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-pedantic",
+                    "-Iinclude",
+                ])
+                .arg(root.join("tests").join("standalone_c_test.c"))
+                .arg("-o")
+                .arg(&exe_path);
+        }
         run_cmd(
             &mut build_test,
-            &format!("{cc} -std=c99 -pedantic tests/standalone_c_test.c -> target/{exe_name}"),
+            &format!("{cc} tests/standalone_c_test.c -> target/{exe_name}"),
         )?;
 
         let mut exec_test = Command::new(&exe_path);
@@ -925,23 +1108,11 @@ fn cmd_gen_component_headers(args: &[String]) -> Result<(), String> {
         .join("include")
         .join("generated")
         .join("testbed_components.h");
-    let mut syntax_cmd = Command::new(&cc);
-    syntax_cmd
-        .current_dir(&root)
-        .args([
-            "-std=c99",
-            "-Wall",
-            "-Wextra",
-            "-Werror",
-            "-pedantic",
-            "-fsyntax-only",
-            "-x",
-            "c",
-        ])
-        .arg(&gen_header);
+    let mut syntax_cmd = c_syntax_only_cmd(&cc, None, &gen_header);
+    syntax_cmd.current_dir(&root);
     run_cmd(
         &mut syntax_cmd,
-        &format!("{cc} -std=c99 -pedantic -fsyntax-only include/generated/testbed_components.h"),
+        &format!("{cc} C99/C11 syntax check include/generated/testbed_components.h"),
     )
 }
 
@@ -1230,6 +1401,9 @@ fn verify_forbid_unsafe(root: &Path) -> Result<(), String> {
         "crates/bevy_abi_mod_host/src/lib.rs",
         "crates/bevy_abi_mod_guest/src/lib.rs",
         "crates/bevy_abi_mod_macros/src/lib.rs",
+        "crates/bevy_abi_mod_trust/src/lib.rs",
+        "crates/bevy_abi_mod_manifest/src/lib.rs",
+        "crates/bevy_abi_mod_sdk_gen/src/lib.rs",
         "crates/cargo-bam/src/lib.rs",
         "crates/cargo-bam/src/main.rs",
         "xtask/src/main.rs",

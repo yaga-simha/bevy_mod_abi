@@ -57,6 +57,7 @@ hot-reload-watcher = ["dep:notify-debouncer-full"]
 
 [dependencies]
 bevy_abi_mod_sys = { workspace = true }
+bevy_abi_mod_manifest = { workspace = true }
 bevy_abi_mod_host_sys = { workspace = true }
 bevy_abi_mod_macros = { workspace = true }
 bevy_ecs = { workspace = true }

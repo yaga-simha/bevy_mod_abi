@@ -13,15 +13,18 @@ use crate::handle_header::{
 use crate::loader::ModId;
 use crate::registry::{
     ExtractEventTargetFn, ModRegistry, RegistrySnapshot, component_flags_to_storage_flags,
+    extract_owned_dynamic_fields,
 };
 use crate::schedule::ModNamedSystemSet;
 use crate::sync_ptr::{GuestFnPtr, GuestUserData};
 use crate::system::access_builder::validate_system_queries_against_snapshot;
 use crate::system::{BamQuerySpecOwned, GuestSystem};
 use bevy_abi_mod_sys::{
+    BAM_REQUIRED_FLAG_CUSTOM_BYTES, BAM_REQUIRED_FLAG_INIT_FN, BAM_REQUIRED_KNOWN_FLAGS,
     BamComponent, BamEventKind, BamHostCtx, BamLoadCtx, BamObserverDesc, BamObserverFn,
-    BamObserverMutFn, BamQueryDesc, BamSystemDesc, BamTermDesc, ComponentCloneFn, ComponentDesc,
-    ComponentHookFn, ComponentUuid, FfiEntity, FfiResult, read_descriptor,
+    BamObserverMutFn, BamQueryDesc, BamRequiredComponent, BamSystem, BamSystemDesc, BamTermDesc,
+    ComponentCloneFn, ComponentDesc, ComponentHookFn, ComponentUuid, FfiEntity, FfiResult,
+    read_descriptor,
 };
 use bevy_ecs::component::{ComponentCloneBehavior, ComponentDescriptor, ComponentId, StorageType};
 use bevy_ecs::entity::{ComponentCloneCtx, Entity, SourceComponent};
@@ -888,7 +891,7 @@ impl Drop for LoadContext {
 }
 
 #[inline]
-unsafe fn validate_active_load_ctx<'a>(
+pub(crate) unsafe fn validate_active_load_ctx<'a>(
     load_ctx: *mut BamLoadCtx,
 ) -> Result<&'a mut LoadContext, FfiResult> {
     // SAFETY: Unconditionally validates non-null, alignment, and `LOAD_CTX_MAGIC` + non-zero generation.
@@ -1311,6 +1314,74 @@ pub unsafe extern "C" fn host_register_component(
     }
     let required_boxed: Box<[BamComponent]> = required_handles.into_boxed_slice();
 
+    // Validate ABI `0.3` `schema_fingerprint` / `fields` and `required_init_descs` upfront before
+    // allocating a Bevy `ComponentDescriptor` or trampoline slot.
+    // SAFETY: `desc.validate()` verified `!desc.fields.is_null()` when `desc.field_count > 0`.
+    let (schema_fingerprint, extracted_fields, owned_field_strings) =
+        match unsafe { extract_owned_dynamic_fields(&desc) } {
+            Ok(v) => v,
+            Err((err, msg)) => {
+                ctx.host_ctx.set_last_error(msg);
+                return err;
+            }
+        };
+
+    if desc.covers_slot(
+        core::mem::offset_of!(ComponentDesc, required_init_desc_count),
+        core::mem::size_of::<usize>(),
+    ) && desc.required_init_desc_count > 0
+    {
+        if desc.required_init_descs.is_null() {
+            ctx.host_ctx
+                .set_last_error("ComponentDesc `required_init_descs` is null with non-zero count");
+            return FfiResult::NULL_POINTER;
+        }
+        // SAFETY: `desc.required_init_descs` is non-null and caller guarantees `desc.required_init_desc_count`
+        // readable `BamRequiredComponent` entries.
+        let req_init_slice = unsafe {
+            core::slice::from_raw_parts(desc.required_init_descs, desc.required_init_desc_count)
+        };
+        for (idx, req_init) in req_init_slice.iter().enumerate() {
+            if (req_init.struct_size as usize) < BamRequiredComponent::MIN_V0_3_SIZE {
+                ctx.host_ctx.set_last_error(format!(
+                    "BamRequiredComponent[{idx}] struct_size ({}) < MIN_V0_3_SIZE ({})",
+                    req_init.struct_size,
+                    BamRequiredComponent::MIN_V0_3_SIZE
+                ));
+                return FfiResult::INVALID_VERSION;
+            }
+            if (req_init.flags & !BAM_REQUIRED_KNOWN_FLAGS) != 0 {
+                ctx.host_ctx.set_last_error(format!(
+                    "BamRequiredComponent[{idx}] has unsupported flags 0x{:08X}",
+                    req_init.flags
+                ));
+                return FfiResult::UNSUPPORTED;
+            }
+            if req_init.reserved0 != 0 {
+                ctx.host_ctx.set_last_error(format!(
+                    "BamRequiredComponent[{idx}] non-zero `reserved0` ({})",
+                    req_init.reserved0
+                ));
+                return FfiResult::INVALID_ARGUMENT;
+            }
+            if (req_init.flags & BAM_REQUIRED_FLAG_CUSTOM_BYTES) != 0
+                && req_init.init_size > 0
+                && req_init.init_bytes.is_null()
+            {
+                ctx.host_ctx.set_last_error(format!(
+                    "BamRequiredComponent[{idx}] `init_bytes` is null with non-zero `init_size`"
+                ));
+                return FfiResult::NULL_POINTER;
+            }
+            if (req_init.flags & BAM_REQUIRED_FLAG_INIT_FN) != 0 && req_init.init_fn.is_none() {
+                ctx.host_ctx.set_last_error(format!(
+                    "BamRequiredComponent[{idx}] `init_fn` is null with INIT_FN flag set"
+                ));
+                return FfiResult::NULL_POINTER;
+            }
+        }
+    }
+
     let storage_flags = component_flags_to_storage_flags(desc.flags);
     let existing_entry = ctx.registry.get_by_name(name_ref).cloned();
     let existing_comp_id = existing_entry.as_ref().map(|e| e.component_id);
@@ -1446,7 +1517,7 @@ pub unsafe extern "C" fn host_register_component(
     }
 
     let reqs_arc: Arc<[BamComponent]> = Arc::from(required_boxed.as_ref());
-    let handle = match ctx.registry.register_dynamic_component_owned_with_required(
+    let handle = match ctx.registry.register_dynamic_component_owned_with_schema(
         comp_id,
         &desc,
         name_ref,
@@ -1454,6 +1525,9 @@ pub unsafe extern "C" fn host_register_component(
         drop_slot,
         None,
         required_boxed,
+        schema_fingerprint,
+        extracted_fields,
+        owned_field_strings,
     ) {
         Ok(h) => h,
         Err(err) => {
@@ -1556,20 +1630,17 @@ unsafe fn parse_ordering_targets(
     Ok(out)
 }
 
-/// Registers a unified [`BamSystemDesc`] inside `load_ctx`.
+/// Registers a unified [`BamSystemDesc`] inside `load_ctx`, returning its 1-based [`BamSystem`] handle.
 ///
 /// # Safety
 /// - `load_ctx` must point to the active [`LoadContext`] cast to [`BamLoadCtx`], or null.
 /// - `desc_ptr` must point to a readable [`BamSystemDesc`], or null.
-pub unsafe extern "C" fn host_register_system(
+pub(crate) unsafe fn register_system_inner(
     load_ctx: *mut BamLoadCtx,
     desc_ptr: *const BamSystemDesc,
-) -> FfiResult {
+) -> Result<BamSystem, FfiResult> {
     // SAFETY: Validates active `LoadContext` header and `in_init` state.
-    let ctx = match unsafe { validate_active_load_ctx(load_ctx) } {
-        Ok(c) => c,
-        Err(err) => return err,
-    };
+    let ctx = unsafe { validate_active_load_ctx(load_ctx) }?;
 
     // SAFETY: `read_descriptor` checks null and `struct_size >= BamSystemDesc::MIN_V0_2_SIZE`.
     let desc = match unsafe { read_descriptor::<BamSystemDesc>(desc_ptr.cast::<c_void>()) } {
@@ -1577,7 +1648,7 @@ pub unsafe extern "C" fn host_register_system(
         Err(err) => {
             ctx.host_ctx
                 .set_last_error(format!("invalid BamSystemDesc header ({err})"));
-            return err;
+            return Err(err);
         }
     };
 
@@ -1585,25 +1656,25 @@ pub unsafe extern "C" fn host_register_system(
     if val_status.is_err() {
         ctx.host_ctx
             .set_last_error(format!("BamSystemDesc validation failed ({val_status})"));
-        return val_status;
+        return Err(val_status);
     }
 
     let Some(callback) = desc.callback else {
         ctx.host_ctx
             .set_last_error("BamSystemDesc `callback` is null");
-        return FfiResult::NULL_POINTER;
+        return Err(FfiResult::NULL_POINTER);
     };
 
     // SAFETY: `desc.validate()` verified `!desc.name.is_null()`.
     let Ok(sys_name) = (unsafe { CStr::from_ptr(desc.name) }).to_str() else {
         ctx.host_ctx
             .set_last_error("BamSystemDesc `name` is not valid UTF-8");
-        return FfiResult::INVALID_UTF8;
+        return Err(FfiResult::INVALID_UTF8);
     };
     if sys_name.is_empty() {
         ctx.host_ctx
             .set_last_error("BamSystemDesc `name` must not be empty");
-        return FfiResult::INVALID_ARGUMENT;
+        return Err(FfiResult::INVALID_ARGUMENT);
     }
 
     // Parse `queries[0..desc.query_count]`.
@@ -1618,12 +1689,12 @@ pub unsafe extern "C" fn host_register_system(
             ctx.host_ctx.set_last_error(format!(
                 "BamQueryDesc[0] struct_size ({first_size}) < MIN_V0_2_SIZE"
             ));
-            return FfiResult::INVALID_VERSION;
+            return Err(FfiResult::INVALID_VERSION);
         }
 
         for q_idx in 0..desc.query_count {
             let Some(byte_offset) = q_idx.checked_mul(first_size) else {
-                return FfiResult::INVALID_ARGUMENT;
+                return Err(FfiResult::INVALID_ARGUMENT);
             };
             // SAFETY: Caller guarantees `desc.queries` holds `desc.query_count` contiguous elements.
             let q_ptr = unsafe { base_ptr.add(byte_offset).cast::<c_void>() };
@@ -1633,14 +1704,14 @@ pub unsafe extern "C" fn host_register_system(
                 Err(err) => {
                     ctx.host_ctx
                         .set_last_error(format!("invalid BamQueryDesc[{q_idx}] ({err})"));
-                    return err;
+                    return Err(err);
                 }
             };
             let q_val = q_desc.validate();
             if q_val.is_err() {
                 ctx.host_ctx
                     .set_last_error(format!("BamQueryDesc[{q_idx}] validation failed ({q_val})"));
-                return q_val;
+                return Err(q_val);
             }
 
             let mut terms = Vec::with_capacity(q_desc.term_count);
@@ -1661,7 +1732,7 @@ pub unsafe extern "C" fn host_register_system(
         validate_system_queries_against_snapshot(ctx.registry.snapshot(), &query_specs)
     {
         ctx.host_ctx.set_last_error(msg);
-        return status;
+        return Err(status);
     }
 
     // SAFETY: `desc.validate()` verified `after` and `before` non-null when their counts > 0.
@@ -1669,7 +1740,7 @@ pub unsafe extern "C" fn host_register_system(
         Ok(v) => v,
         Err((status, msg)) => {
             ctx.host_ctx.set_last_error(msg);
-            return status;
+            return Err(status);
         }
     };
     // SAFETY: Same guarantee for `desc.before[0..desc.before_count]`.
@@ -1677,7 +1748,7 @@ pub unsafe extern "C" fn host_register_system(
         Ok(v) => v,
         Err((status, msg)) => {
             ctx.host_ctx.set_last_error(msg);
-            return status;
+            return Err(status);
         }
     };
     // SAFETY: `desc.validate()` verified `in_sets` non-null when `in_set_count > 0`.
@@ -1685,7 +1756,7 @@ pub unsafe extern "C" fn host_register_system(
         Ok(v) => v,
         Err((status, msg)) => {
             ctx.host_ctx.set_last_error(msg);
-            return status;
+            return Err(status);
         }
     };
     // SAFETY: `desc.validate()` verified `after_weak` is non-null when `after_weak_count > 0`.
@@ -1694,7 +1765,7 @@ pub unsafe extern "C" fn host_register_system(
         Ok(v) => v,
         Err((status, msg)) => {
             ctx.host_ctx.set_last_error(msg);
-            return status;
+            return Err(status);
         }
     };
     // SAFETY: `desc.validate()` verified `before_weak` is non-null when `before_weak_count > 0`.
@@ -1703,7 +1774,7 @@ pub unsafe extern "C" fn host_register_system(
             Ok(v) => v,
             Err((status, msg)) => {
                 ctx.host_ctx.set_last_error(msg);
-                return status;
+                return Err(status);
             }
         };
     // SAFETY: `desc.validate()` verified `ambiguous_with` is non-null when `ambiguous_with_count > 0`.
@@ -1712,7 +1783,7 @@ pub unsafe extern "C" fn host_register_system(
             Ok(v) => v,
             Err((status, msg)) => {
                 ctx.host_ctx.set_last_error(msg);
-                return status;
+                return Err(status);
             }
         };
 
@@ -1739,8 +1810,26 @@ pub unsafe extern "C" fn host_register_system(
         sys.set_mod_id(id);
     }
 
+    let next_raw = u32::try_from(ctx.registered_systems.len() + 1)
+        .map_err(|_| FfiResult::CAPACITY_EXCEEDED)?;
     ctx.registered_systems.push(sys);
-    FfiResult::OK
+    Ok(BamSystem::from_raw(next_raw))
+}
+
+/// Registers a unified [`BamSystemDesc`] inside `load_ctx`.
+///
+/// # Safety
+/// - `load_ctx` must point to the active [`LoadContext`] cast to [`BamLoadCtx`], or null.
+/// - `desc_ptr` must point to a readable [`BamSystemDesc`], or null.
+pub unsafe extern "C" fn host_register_system(
+    load_ctx: *mut BamLoadCtx,
+    desc_ptr: *const BamSystemDesc,
+) -> FfiResult {
+    // SAFETY: Caller upholds `load_ctx` and `desc_ptr` FFI contract.
+    match unsafe { register_system_inner(load_ctx, desc_ptr) } {
+        Ok(_) => FfiResult::OK,
+        Err(err) => err,
+    }
 }
 
 /// Resolves a validated [`BamObserverDesc`] into a [`GuestObserverBinding`].

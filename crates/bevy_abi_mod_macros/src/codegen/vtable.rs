@@ -1,6 +1,6 @@
 use crate::codegen::CodegenState;
 use proc_macro2::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::Ident;
 
 pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) -> TokenStream {
@@ -18,17 +18,24 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
     let req_names: Vec<TokenStream> = state
         .required_components
         .iter()
-        .map(|path| quote! { <#path as #sys_crate::ModComponent>::CANONICAL_NAME })
+        .map(|req| {
+            let path = &req.path;
+            quote! { <#path as #sys_crate::ModComponent>::CANONICAL_NAME }
+        })
         .collect();
     let req_uuids: Vec<TokenStream> = state
         .required_components
         .iter()
-        .map(|path| quote! { <#path as #sys_crate::ModComponent>::UUID })
+        .map(|req| {
+            let path = &req.path;
+            quote! { <#path as #sys_crate::ModComponent>::UUID }
+        })
         .collect();
     let req_assertions: Vec<TokenStream> = state
         .required_components
         .iter()
-        .map(|path| {
+        .map(|req| {
+            let path = &req.path;
             quote::quote_spanned! { syn::spanned::Spanned::span(path) =>
                 const _: fn() = || {
                     fn assert_required_mod_component<T: #sys_crate::ModComponent>() {}
@@ -37,6 +44,101 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
             }
         })
         .collect();
+
+    let mut req_init_fns = Vec::new();
+    let mut req_desc_exprs = Vec::new();
+    for (idx, req) in state.required_components.iter().enumerate() {
+        let path = &req.path;
+        if let Some(ref init_expr) = req.init_expr {
+            let init_fn_ident = format_ident!("__bam_req_init_{}", idx);
+            let span = syn::spanned::Spanned::span(init_expr);
+            req_init_fns.push(quote::quote_spanned! { span =>
+                #[allow(non_snake_case, clippy::undocumented_unsafe_blocks)]
+                unsafe extern "C" fn #init_fn_ident(
+                    dst: *mut ::core::ffi::c_void,
+                    _user_data: *mut ::core::ffi::c_void,
+                ) -> #sys_crate::FfiResult {
+                    if dst.is_null() {
+                        return #sys_crate::FfiResult::NULL_POINTER;
+                    }
+                    let typed_dst = dst.cast::<#path>();
+                    if !typed_dst.is_aligned() {
+                        return #sys_crate::FfiResult::INVALID_ARGUMENT;
+                    }
+                    let val: #path = { #init_expr };
+                    unsafe { ::core::ptr::write(typed_dst, val) };
+                    #sys_crate::FfiResult::OK
+                }
+            });
+            req_desc_exprs.push(quote! {
+                #sys_crate::BamRequiredComponent::by_uuid(
+                    <#path as #sys_crate::ModComponent>::UUID,
+                )
+                .with_init_fn(
+                    #init_fn_ident,
+                    ::core::mem::size_of::<#path>(),
+                    ::core::ptr::null_mut(),
+                )
+            });
+        } else {
+            req_desc_exprs.push(quote! {
+                #sys_crate::BamRequiredComponent::by_uuid(
+                    <#path as #sys_crate::ModComponent>::UUID,
+                )
+            });
+        }
+    }
+
+    let mut bam_field_entries = Vec::new();
+    let mut schema_fp_updates = Vec::new();
+    for field in &state.bam_fields {
+        let f_name = &field.name;
+        let f_tag = &field.type_tag;
+        let kind_ident = format_ident!("{}", field.kind_ident);
+        let member_toks = &field.member_tokens;
+        let f_ty = &field.field_ty;
+        bam_field_entries.push(quote! {
+            #sys_crate::BamFieldDesc::new(
+                #sys_crate::BamFieldKind::#kind_ident,
+                #sys_crate::StrView::from_str(#f_name),
+                #sys_crate::StrView::from_str(#f_tag),
+                ::core::mem::offset_of!(#struct_ident, #member_toks),
+                ::core::mem::size_of::<#f_ty>(),
+                ::core::mem::align_of::<#f_ty>(),
+            )
+        });
+        schema_fp_updates.push(quote! {
+            h = #sys_crate::fnv1a_64_update_u64(h, (#sys_crate::BamFieldKind::#kind_ident).0 as u64);
+            h = #sys_crate::fnv1a_64_update_bytes(h, #f_name.as_bytes());
+            h = #sys_crate::fnv1a_64_update_bytes(h, #f_tag.as_bytes());
+            h = #sys_crate::fnv1a_64_update_u64(
+                h,
+                ::core::mem::offset_of!(#struct_ident, #member_toks) as u64,
+            );
+            h = #sys_crate::fnv1a_64_update_u64(h, ::core::mem::size_of::<#f_ty>() as u64);
+            h = #sys_crate::fnv1a_64_update_u64(h, ::core::mem::align_of::<#f_ty>() as u64);
+        });
+    }
+    if let Some(ref enum_info) = state.decl_enum {
+        let tag_str = enum_info.int_repr.rust_ty_str();
+        schema_fp_updates.push(quote! {
+            h = #sys_crate::fnv1a_64_update_bytes(h, #tag_str.as_bytes());
+        });
+        for var in &enum_info.variants {
+            let v_name = &var.name;
+            let disc_u64 = var.discriminant as u64;
+            schema_fp_updates.push(quote! {
+                h = #sys_crate::fnv1a_64_update_bytes(h, #v_name.as_bytes());
+                h = #sys_crate::fnv1a_64_update_u64(h, #disc_u64);
+            });
+            for (f_name, f_tag) in &var.schema_fields {
+                schema_fp_updates.push(quote! {
+                    h = #sys_crate::fnv1a_64_update_bytes(h, #f_name.as_bytes());
+                    h = #sys_crate::fnv1a_64_update_bytes(h, #f_tag.as_bytes());
+                });
+            }
+        }
+    }
 
     let witness_helpers = if state.opaque {
         quote! {}
@@ -126,15 +228,24 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
     };
 
     let conditional_abi_pod_impl = if is_abi_pod {
+        let mut pod_size_sum = quote! { 0usize };
+        for ty in &state.pod_field_types {
+            pod_size_sum = quote! { #pod_size_sum + ::core::mem::size_of::<#ty>() };
+        }
         quote! {
             fn assert_pod_self_copy<T: ::core::marker::Copy + 'static>() {}
             fn check_pod_invariants() {
                 assert_pod_self_copy::<#struct_ident>();
                 #(#nested_pod_assertions)*
             }
+            ::core::assert!(
+                ::core::mem::size_of::<#struct_ident>() == (#pod_size_sum),
+                "`#[repr(C)] #[derive(ModComponent)]` (`IS_ABI_POD = true`) requires zero implicit compiler padding; insert explicit `_pad` fields or annotate `#[mod_component(no_pod)]`"
+            );
 
             // SAFETY: `#struct_ident` is `#[repr(C)]` or `#[repr(transparent)]` (non-packed), `Copy + 'static`,
-            // has zero drop glue, no skipped fields, and every field is verified `AbiPod` above.
+            // has zero drop glue, zero implicit compiler padding, no skipped fields, and every field is
+            // verified `AbiPod` above.
             #[allow(clippy::undocumented_unsafe_blocks)]
             unsafe impl #sys_crate::AbiPod for #struct_ident {}
         }
@@ -570,7 +681,32 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
             #witness_helpers
             #(#layout_assertions)*
             #(#req_assertions)*
+            #(#req_init_fns)*
             #(#extern_fns)*
+
+            static BAM_FIELDS_DESC: &[#sys_crate::BamFieldDesc] = &[
+                #(#bam_field_entries),*
+            ];
+
+            static REQUIRED_COMPONENTS_DESC: &[#sys_crate::BamRequiredComponent] = &[
+                #(#req_desc_exprs),*
+            ];
+
+            const SCHEMA_FINGERPRINT_VAL: u64 = {
+                let mut h = #sys_crate::fnv1a_64_init();
+                h = #sys_crate::fnv1a_64_update_bytes(
+                    h,
+                    <#struct_ident as #sys_crate::ModComponent>::CANONICAL_NAME.as_bytes(),
+                );
+                h = #sys_crate::fnv1a_64_update_u64(h, ::core::mem::size_of::<#struct_ident>() as u64);
+                h = #sys_crate::fnv1a_64_update_u64(h, ::core::mem::align_of::<#struct_ident>() as u64);
+                h = #sys_crate::fnv1a_64_update_u64(
+                    h,
+                    <#struct_ident as #sys_crate::ModComponent>::COMPONENT_FLAGS as u64,
+                );
+                #(#schema_fp_updates)*
+                h
+            };
 
             #[allow(unreachable_pub)]
             impl #struct_ident {
@@ -586,6 +722,10 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
 
                 /// Deterministic UUIDs of components declared via `#[mod_component(require(...))]`.
                 pub const REQUIRED_COMPONENT_UUIDS: &'static [#sys_crate::ComponentUuid] = &[#(#req_uuids),*];
+
+                /// Required component initialization descriptors declared via `#[mod_component(require(...))]`.
+                pub const REQUIRED_COMPONENTS: &'static [#sys_crate::BamRequiredComponent] =
+                    REQUIRED_COMPONENTS_DESC;
 
                 /// Compile-time C-ABI VTable constant for `#struct_ident`.
                 pub const VTABLE: #vtable_ident = #vtable_ident {
@@ -624,6 +764,10 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
                 const IS_ABI_POD: bool = #is_abi_pod;
                 const IS_RAW_INSERTABLE: bool = #is_raw_insertable;
                 const COMPONENT_FLAGS: u32 = #component_flags_expr;
+                const SCHEMA_FINGERPRINT: u64 = SCHEMA_FINGERPRINT_VAL;
+                const BAM_FIELDS: &'static [#sys_crate::BamFieldDesc] = BAM_FIELDS_DESC;
+                const REQUIRED_COMPONENTS: &'static [#sys_crate::BamRequiredComponent] =
+                    REQUIRED_COMPONENTS_DESC;
                 const C_DECL: &'static str = #c_decl_str;
                 const ZIG_DECL: &'static str = #zig_decl_str;
 

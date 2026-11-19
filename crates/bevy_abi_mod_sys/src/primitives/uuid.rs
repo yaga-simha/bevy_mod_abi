@@ -342,3 +342,43 @@ const _: () = {
     assert!(core::mem::size_of::<ComponentUuid>() == 16);
     assert!(core::mem::align_of::<ComponentUuid>() == 1);
 };
+
+/// 64-bit FNV-1a offset basis (`0xcbf2_9ce4_8422_2325`).
+pub const FNV1A_64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// 64-bit FNV-1a prime multiplier (`0x0000_0100_0000_01b3`).
+pub const FNV1A_64_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// Returns the initial 64-bit FNV-1a accumulator (`FNV1A_64_OFFSET_BASIS`).
+#[inline]
+#[must_use]
+pub const fn fnv1a_64_init() -> u64 {
+    FNV1A_64_OFFSET_BASIS
+}
+
+/// Folds `bytes` into an ongoing 64-bit FNV-1a hash in `const` or runtime contexts.
+#[inline]
+#[must_use]
+pub const fn fnv1a_64_update_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u64;
+        hash = hash.wrapping_mul(FNV1A_64_PRIME);
+        i += 1;
+    }
+    hash
+}
+
+/// Folds little-endian `value` bytes into an ongoing 64-bit FNV-1a hash.
+#[inline]
+#[must_use]
+pub const fn fnv1a_64_update_u64(hash: u64, value: u64) -> u64 {
+    fnv1a_64_update_bytes(hash, &value.to_le_bytes())
+}
+
+/// Computes the 64-bit FNV-1a digest of a UTF-8 string slice.
+#[inline]
+#[must_use]
+pub const fn fnv1a_64_str(s: &str) -> u64 {
+    fnv1a_64_update_bytes(fnv1a_64_init(), s.as_bytes())
+}

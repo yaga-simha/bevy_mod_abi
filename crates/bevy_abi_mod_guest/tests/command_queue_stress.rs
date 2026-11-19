@@ -25,12 +25,19 @@ macro_rules! impl_pod_no_derive {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
-#[cfg_attr(feature = "derive", derive(AbiPod))]
 struct PaddedPayload {
     tag: u8,
     // 3 bytes of natural C padding (`MaybeUninit<u8>`) — must be sound under Miri!
     value: u32,
 }
+
+// SAFETY: `PaddedPayload` intentionally leaves 3 uninitialized C alignment padding bytes to test
+// Miri uninit-padding soundness across the command queue; every field is `AbiPod`.
+#[allow(unsafe_code)]
+unsafe impl RawInsertable for PaddedPayload {}
+// SAFETY: Deterministic `#[repr(C)]` layout over `u8` and `u32` primitives with no drop glue.
+#[allow(unsafe_code)]
+unsafe impl AbiPod for PaddedPayload {}
 
 impl GuestComponent for PaddedPayload {
     const NAME: &'static CStr = c"cmd::PaddedPayload";
@@ -57,7 +64,7 @@ impl GuestComponent for WithDefault {
 }
 
 #[cfg(not(feature = "derive"))]
-impl_pod_no_derive!(PaddedPayload, MarkerZst, WithDefault);
+impl_pod_no_derive!(MarkerZst, WithDefault);
 
 #[test]
 fn handle_commands_and_batched_spawn_fast_and_heap_paths() {

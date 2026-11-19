@@ -51,6 +51,14 @@ pub use ffi::register::{
     GuestObserverBinding, LoadContext, ensure_dynamic_hook_map_in_world, host_load_host_ctx,
     host_register_component, host_register_observer, host_register_system, host_resolve_component,
 };
+pub use ffi::v03_ext::{
+    host_bind_named_object, host_cmd_checkpoint, host_cmd_insert_relation,
+    host_cmd_remove_relation, host_cmd_rollback, host_component_layout_info,
+    host_configure_schedule_set, host_intern_symbol, host_iter_count, host_iter_up_cascade,
+    host_log_diagnostic, host_migrate_component_column, host_mount_system_in_schedule,
+    host_par_for_each_chunk_readonly, host_register_relation, host_register_system_handle,
+    host_report_guest_fault, host_resolve_component_by_uuid,
+};
 pub use ffi::wave3_helpers::{
     WitnessFieldDescriptor, apply_entity_component_fields, apply_resource_fields,
     ensure_component_in_target_world, export_entity_component_fields, export_resource_fields,
@@ -67,6 +75,18 @@ pub use handle_header::{
     COMMANDS_MAGIC, HOST_CTX_MAGIC, HandleHeader, HostContext, ITER_MAGIC, LOAD_CTX_MAGIC,
     POISONED_MAGIC, STRICT_FFI_CHECKS, SYS_CTX_MAGIC, host_last_error,
 };
+#[cfg(feature = "signature-verification")]
+pub use loader::{
+    BAM_SIG_MACHO_SECTION_NAME, BAM_SIG_SECTION_NAME, BAMPACK_MAGIC, BAMPACK_VERSION,
+    BamPackBuilder, BamPackEntry, CertificateValidityPolicy, DEFAULT_BAMPACK_NAMESPACE,
+    DEFAULT_KRL_SIGNATURE_NAMESPACE, DEFAULT_MAX_MOD_BINARY_BYTES, DEFAULT_SIGNATURE_NAMESPACE,
+    EmbeddedSignatureSection, KrlBuilder, MAX_BAMPACK_ENTRIES, MAX_KRL_BYTES,
+    MAX_SIGNATURE_SIDECAR_BYTES, ModSigningError, ModTrustConfigError, ModTrustPolicy,
+    SignatureEnforcement, SignatureVerificationError, VerifiedBamPack, VerifiedModSignature,
+    default_signature_path_for, extract_embedded_bam_sig, preverify_mod_on_disk,
+    sign_mod_bytes_with_certificate, sign_mod_bytes_with_key,
+    sign_mod_bytes_with_openssh_certificate, zeroed_binary_for_bam_sig,
+};
 pub use loader::{
     BinaryFormat, LibraryResidencyInfo, LoadOptions, LoadedMod, LoadedModInfo, ModHost, ModId,
     ModLoadError, ModLoaded, ModScoped, ModUnloaded, canonical_mod_name_from_path,
@@ -74,15 +94,6 @@ pub use loader::{
     is_abi_version_compatible, load_mod_in_world, record_mod_named_sets_in_world,
     restore_mod_state_in_world, rollback_unscheduled_mod_in_world, save_mod_state_in_world,
     unload_all_mods_in_world,
-};
-#[cfg(feature = "signature-verification")]
-pub use loader::{
-    CertificateValidityPolicy, DEFAULT_KRL_SIGNATURE_NAMESPACE, DEFAULT_MAX_MOD_BINARY_BYTES,
-    DEFAULT_SIGNATURE_NAMESPACE, KrlBuilder, MAX_KRL_BYTES, MAX_SIGNATURE_SIDECAR_BYTES,
-    ModSigningError, ModTrustConfigError, ModTrustPolicy, SignatureEnforcement,
-    SignatureVerificationError, VerifiedModSignature, default_signature_path_for,
-    preverify_mod_on_disk, sign_mod_bytes_with_certificate, sign_mod_bytes_with_key,
-    sign_mod_bytes_with_openssh_certificate,
 };
 pub use registry::{
     ComponentCollisionError, ComponentOptions, CreateMsgCursorFn, EntityEventTriggerFn,

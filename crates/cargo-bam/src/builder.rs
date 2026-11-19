@@ -33,30 +33,115 @@ fn dylib_naming() -> (&'static str, &'static str) {
     }
 }
 
+pub(crate) fn is_msvc_style_driver(tool: &str) -> bool {
+    let file_name = Path::new(tool)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(tool);
+    let stem = file_name
+        .strip_suffix(".exe")
+        .or_else(|| file_name.strip_suffix(".EXE"))
+        .unwrap_or(file_name);
+    stem.eq_ignore_ascii_case("cl") || stem.eq_ignore_ascii_case("clang-cl")
+}
+
+pub(crate) fn is_plain_cl_driver(tool: &str) -> bool {
+    let file_name = Path::new(tool)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(tool);
+    let stem = file_name
+        .strip_suffix(".exe")
+        .or_else(|| file_name.strip_suffix(".EXE"))
+        .unwrap_or(file_name);
+    stem.eq_ignore_ascii_case("cl")
+}
+
+pub(crate) fn probe_compiler_banner(program: &str) -> Option<String> {
+    let output = if is_plain_cl_driver(program) {
+        Command::new(program).output().ok()?
+    } else {
+        Command::new(program).arg("--version").output().ok()?
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if output.status.success() || (is_plain_cl_driver(program) && !stderr.is_empty()) {
+        let first_line = stdout
+            .lines()
+            .next()
+            .filter(|l| !l.trim().is_empty())
+            .or_else(|| stderr.lines().next().filter(|l| !l.trim().is_empty()))
+            .unwrap_or("ok");
+        Some(format!("{program}: {first_line}"))
+    } else {
+        None
+    }
+}
+
+pub(crate) fn c_candidates() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(cc) = env::var("CC") {
+        let trimmed = cc.trim();
+        if !trimmed.is_empty() {
+            out.push(trimmed.to_owned());
+        }
+    }
+    #[cfg(target_os = "windows")]
+    let defaults = ["clang", "clang-cl", "cl.exe", "cl", "gcc", "cc"];
+    #[cfg(not(target_os = "windows"))]
+    let defaults = ["clang", "gcc", "cc"];
+    for cand in defaults {
+        if !out.iter().any(|existing| existing == cand) {
+            out.push(cand.to_owned());
+        }
+    }
+    out
+}
+
+pub(crate) fn cxx_candidates() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(cxx) = env::var("CXX") {
+        let trimmed = cxx.trim();
+        if !trimmed.is_empty() {
+            out.push(trimmed.to_owned());
+        }
+    }
+    #[cfg(target_os = "windows")]
+    let defaults = ["clang++", "clang-cl", "cl.exe", "cl", "g++", "c++"];
+    #[cfg(not(target_os = "windows"))]
+    let defaults = ["clang++", "g++", "c++"];
+    for cand in defaults {
+        if !out.iter().any(|existing| existing == cand) {
+            out.push(cand.to_owned());
+        }
+    }
+    out
+}
+
 fn c_compiler() -> String {
-    env::var("CC")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| {
-            if cfg!(target_os = "windows") {
-                "gcc".to_owned()
-            } else {
-                "cc".to_owned()
-            }
-        })
+    let candidates = c_candidates();
+    for cand in &candidates {
+        if probe_compiler_banner(cand).is_some() {
+            return cand.clone();
+        }
+    }
+    candidates
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "cc".to_owned())
 }
 
 fn cxx_compiler() -> String {
-    env::var("CXX")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| {
-            if cfg!(target_os = "windows") {
-                "g++".to_owned()
-            } else {
-                "c++".to_owned()
-            }
-        })
+    let candidates = cxx_candidates();
+    for cand in &candidates {
+        if probe_compiler_banner(cand).is_some() {
+            return cand.clone();
+        }
+    }
+    candidates
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "c++".to_owned())
 }
 
 fn cargo_bin() -> String {
@@ -303,18 +388,33 @@ pub fn build_mod_with_signing(
             let include_dir = project_dir.join("include");
             let cc = c_compiler();
             let mut cmd = Command::new(&cc);
-            cmd.current_dir(&project_dir)
-                .args(["-std=c99", "-Wall", "-Wextra", "-Werror"])
-                .arg(if release { "-O2" } else { "-O0" })
-                .arg("-shared");
-            if include_dir.is_dir() {
-                cmd.arg(format!("-I{}", include_dir.display()));
+            cmd.current_dir(&project_dir);
+            if is_msvc_style_driver(&cc) {
+                let obj_path = build_dir.join(format!("{stem_from_mod}.c.obj"));
+                let implib_path = build_dir.join(format!("{stem_from_mod}.c.lib"));
+                cmd.args(["/nologo", "/LD", "/std:c11", "/W4", "/WX"])
+                    .arg(if release { "/O2" } else { "/Od" });
+                if include_dir.is_dir() {
+                    cmd.arg(format!("/I{}", include_dir.display()));
+                }
+                cmd.arg(format!("/Fo{}", obj_path.display()))
+                    .arg(&src)
+                    .arg("/link")
+                    .arg(format!("/IMPLIB:{}", implib_path.display()))
+                    .arg(format!("/OUT:{}", out_path.display()));
+            } else {
+                cmd.args(["-std=c99", "-Wall", "-Wextra", "-Werror"])
+                    .arg(if release { "-O2" } else { "-O0" })
+                    .arg("-shared");
+                if include_dir.is_dir() {
+                    cmd.arg(format!("-I{}", include_dir.display()));
+                }
+                if !cfg!(target_os = "windows") {
+                    cmd.arg("-fPIC");
+                }
+                cmd.arg(&src).arg("-o").arg(&out_path);
             }
-            if !cfg!(target_os = "windows") {
-                cmd.arg("-fPIC");
-            }
-            cmd.arg(&src).arg("-o").arg(&out_path);
-            run_command(&mut cmd, &format!("{cc} -std=c99"))?;
+            run_command(&mut cmd, &format!("{cc} C99/C11 build"))?;
             out_path
         }
         ModLanguage::Cpp17 => {
@@ -335,21 +435,44 @@ pub fn build_mod_with_signing(
             let include_dir = project_dir.join("include");
             let cxx = cxx_compiler();
             let mut cmd = Command::new(&cxx);
-            cmd.current_dir(&project_dir)
-                .args(["-std=c++17", "-Wall", "-Wextra", "-Wpedantic", "-Werror"])
-                .arg(if release { "-O2" } else { "-O0" })
-                .arg("-shared");
-            if include_dir.is_dir() {
-                cmd.arg(format!("-I{}", include_dir.display()));
-            }
-            if !cfg!(target_os = "windows") {
+            cmd.current_dir(&project_dir);
+            if is_msvc_style_driver(&cxx) {
+                let obj_path = build_dir.join(format!("{stem_from_mod}.cpp.obj"));
+                let implib_path = build_dir.join(format!("{stem_from_mod}.cpp.lib"));
                 cmd.args([
-                    "-fPIC",
-                    "-fvisibility=hidden",
-                    "-fvisibility-inlines-hidden",
-                ]);
+                    "/nologo",
+                    "/LD",
+                    "/std:c++17",
+                    "/Zc:__cplusplus",
+                    "/EHsc",
+                    "/W4",
+                    "/WX",
+                ])
+                .arg(if release { "/O2" } else { "/Od" });
+                if include_dir.is_dir() {
+                    cmd.arg(format!("/I{}", include_dir.display()));
+                }
+                cmd.arg(format!("/Fo{}", obj_path.display()))
+                    .arg(&src)
+                    .arg("/link")
+                    .arg(format!("/IMPLIB:{}", implib_path.display()))
+                    .arg(format!("/OUT:{}", out_path.display()));
+            } else {
+                cmd.args(["-std=c++17", "-Wall", "-Wextra", "-Wpedantic", "-Werror"])
+                    .arg(if release { "-O2" } else { "-O0" })
+                    .arg("-shared");
+                if include_dir.is_dir() {
+                    cmd.arg(format!("-I{}", include_dir.display()));
+                }
+                if !cfg!(target_os = "windows") {
+                    cmd.args([
+                        "-fPIC",
+                        "-fvisibility=hidden",
+                        "-fvisibility-inlines-hidden",
+                    ]);
+                }
+                cmd.arg(&src).arg("-o").arg(&out_path);
             }
-            cmd.arg(&src).arg("-o").arg(&out_path);
             run_command(&mut cmd, &format!("{cxx} -std=c++17"))?;
             out_path
         }
@@ -418,4 +541,34 @@ pub fn build_mod_with_signing(
         staged_manifest_path: None,
         signature_path,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn msvc_driver_classification_distinguishes_cl_clang_cl_and_gnu() {
+        assert!(is_msvc_style_driver("cl"));
+        assert!(is_msvc_style_driver("cl.exe"));
+        assert!(is_msvc_style_driver("C:/MSVC/bin/Hostx64/x64/CL.EXE"));
+        assert!(is_msvc_style_driver("clang-cl"));
+        assert!(is_msvc_style_driver("clang-cl.exe"));
+        assert!(!is_msvc_style_driver("clang"));
+        assert!(!is_msvc_style_driver("clang++"));
+        assert!(!is_msvc_style_driver("gcc"));
+        assert!(!is_msvc_style_driver("x86_64-w64-mingw32-gcc"));
+
+        assert!(is_plain_cl_driver("cl"));
+        assert!(is_plain_cl_driver("cl.exe"));
+        assert!(!is_plain_cl_driver("clang-cl"));
+        assert!(!is_plain_cl_driver("clang"));
+
+        let c_cands = c_candidates();
+        assert!(c_cands.iter().any(|c| c == "clang"));
+        assert!(c_cands.iter().any(|c| c == "gcc"));
+        let cxx_cands = cxx_candidates();
+        assert!(cxx_cands.iter().any(|c| c == "clang++"));
+        assert!(cxx_cands.iter().any(|c| c == "g++"));
+    }
 }

@@ -1,0 +1,31 @@
+[package]
+name = "bevy_abi_mod_trust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Pure-Rust, zero-Bevy (`#![forbid(unsafe_code)]`) OpenSSH SSHSIG, Ed25519 CA, SSHKRL, embedded `.bam_sig`, and `.bampack` cryptographic verification engine for `bevy_abi_mod`"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+keygen = ["ssh-key/getrandom"]
+
+[dependencies]
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
+signature = { workspace = true }
+ssh-encoding = { workspace = true }
+ssh-key = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+ssh-key = { workspace = true, features = ["getrandom"] }
+tempfile = { workspace = true }

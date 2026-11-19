@@ -1,9 +1,9 @@
 #![no_main]
 
-//! Fuzz Target: OpenSSH `SSHSIG`, certificate wire parsing, binary `SSHKRL`, signed KRL, and
-//! revocation spec parser inside `ModTrustPolicy`.
+//! Fuzz Target: OpenSSH `SSHSIG`, certificate wire parsing, binary `SSHKRL`, signed KRL,
+//! revocation spec parser, embedded `.bam_sig`, and `.bampack` inside `bevy_abi_mod_trust`.
 
-use bevy_abi_mod_host_sys::ModTrustPolicy;
+use bevy_abi_mod_trust::{ModTrustPolicy, extract_embedded_bam_sig};
 use libfuzzer_sys::fuzz_target;
 use std::hint::black_box;
 
@@ -12,6 +12,8 @@ const FUZZ_ED25519_PUB: &str =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFhmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZm fuzz@abi";
 
 fuzz_target!(|data: &[u8]| {
+    let _ = black_box(extract_embedded_bam_sig(data));
+
     let Ok(policy) = ModTrustPolicy::from_ca_openssh(FUZZ_ED25519_PUB) else {
         return;
     };
@@ -21,6 +23,8 @@ fuzz_target!(|data: &[u8]| {
     };
 
     let _ = black_box(policy.clone().add_krl_bytes(data));
+    let _ = black_box(policy.verify_embedded_bam_sig(data));
+    let _ = black_box(policy.verify_bampack_bytes(data));
 
     if let Some((&selector, rest)) = data.split_first() {
         let split_at = if rest.is_empty() {

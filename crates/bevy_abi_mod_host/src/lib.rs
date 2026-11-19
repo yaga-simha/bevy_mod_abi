@@ -78,6 +78,18 @@ pub use bevy_abi_mod_host_sys::PersistentMessageCursors;
 pub use bevy_abi_mod_host_sys::loader::{
     ExportedFieldRecord, ReloadColumnSnapshot, SnapshotComponentColumn, SnapshotEntityFields,
 };
+#[cfg(feature = "signature-verification")]
+pub use bevy_abi_mod_host_sys::{
+    BAM_SIG_MACHO_SECTION_NAME, BAM_SIG_SECTION_NAME, BAMPACK_MAGIC, BAMPACK_VERSION,
+    BamPackBuilder, BamPackEntry, CertificateValidityPolicy, DEFAULT_BAMPACK_NAMESPACE,
+    DEFAULT_KRL_SIGNATURE_NAMESPACE, DEFAULT_MAX_MOD_BINARY_BYTES, DEFAULT_SIGNATURE_NAMESPACE,
+    EmbeddedSignatureSection, KrlBuilder, MAX_BAMPACK_ENTRIES, MAX_KRL_BYTES,
+    MAX_SIGNATURE_SIDECAR_BYTES, ModSigningError, ModTrustConfigError, ModTrustPolicy,
+    SignatureEnforcement, SignatureVerificationError, VerifiedBamPack, VerifiedModSignature,
+    default_signature_path_for, extract_embedded_bam_sig, preverify_mod_on_disk,
+    sign_mod_bytes_with_certificate, sign_mod_bytes_with_key,
+    sign_mod_bytes_with_openssh_certificate, zeroed_binary_for_bam_sig,
+};
 pub use bevy_abi_mod_host_sys::{
     BinaryFormat, ComponentCollisionError, ComponentOptions, LibraryResidencyInfo, LoadOptions,
     LoadedMod, ModErrorPolicy, ModErrorPolicyConfig, ModHost, ModId, ModLoadError, ModQuarantine,
@@ -89,15 +101,6 @@ pub use bevy_abi_mod_host_sys::{
     inspect_component_witness_fields, inspect_component_witness_fields_in_registry,
     inspect_library_residency, inspect_library_residency_file, is_abi_version_compatible,
     read_entity_pod_bytes, write_entity_pod_bytes,
-};
-#[cfg(feature = "signature-verification")]
-pub use bevy_abi_mod_host_sys::{
-    CertificateValidityPolicy, DEFAULT_KRL_SIGNATURE_NAMESPACE, DEFAULT_MAX_MOD_BINARY_BYTES,
-    DEFAULT_SIGNATURE_NAMESPACE, KrlBuilder, MAX_KRL_BYTES, MAX_SIGNATURE_SIDECAR_BYTES,
-    ModSigningError, ModTrustConfigError, ModTrustPolicy, SignatureEnforcement,
-    SignatureVerificationError, VerifiedModSignature, default_signature_path_for,
-    preverify_mod_on_disk, sign_mod_bytes_with_certificate, sign_mod_bytes_with_key,
-    sign_mod_bytes_with_openssh_certificate,
 };
 #[cfg(feature = "bridge-reflect")]
 pub use bevy_abi_mod_host_sys::{
@@ -137,7 +140,7 @@ pub use events::{
     LoadedModInfo, ModLoaded, ModSystemError, ModSystemFaulted, ModUnloaded, SystemInitError,
 };
 pub use mod_dag::{
-    DagResolution, DirectoryLoadReport, ModDagError, ModDagNode, ModDependencyGraph,
+    DagResolution, DirectoryLoadReport, ManifestError, ModDagError, ModDagNode, ModDependencyGraph,
     ModTomlManifest, discover_mod_manifests, host_abi_semver, resolve_dependency_dag,
 };
 pub use plugin::{AbiModPlugin, ConfiguredAbiModPlugin};
@@ -237,13 +240,15 @@ pub mod prelude {
         sign_mod_bytes_with_openssh_certificate,
     };
     pub use bevy_abi_mod_sys::{
-        ABI_VERSION, AccessMode, BAM_COMPONENT_FLAG_SUMMARY_TICK, BAM_OBSERVER_FLAG_PROPAGATE,
+        ABI_VERSION, AccessMode, BAM_COMPONENT_FLAG_SUMMARY_TICK, BAM_LOG_DEBUG, BAM_LOG_ERROR,
+        BAM_LOG_INFO, BAM_LOG_TRACE, BAM_LOG_WARN, BAM_OBSERVER_FLAG_PROPAGATE,
         BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL, BAM_TRIGGER_FLAG_PROPAGATE, BamChangeTicks,
-        BamColumnInfo, BamComponent, BamEventKind, BamObserverDesc, BamObserverFn,
-        BamObserverMutFn, BamQueryDesc, BamRunIfFn, BamSystemDesc, BamTermDesc, BamTriggerDesc,
-        ComponentDesc, ComponentUuid, FfiAssetHandle, FfiAssetLoadState, FfiBool, FfiChildOf,
-        FfiEntity, FfiOption, FfiResult, FfiSlice, RawInsertable, ScheduleId, StrView,
-        VTableHeader,
+        BamColumnInfo, BamComponent, BamEventKind, BamFieldDesc, BamFieldKind, BamLayoutInfo,
+        BamObserverDesc, BamObserverFn, BamObserverMutFn, BamQueryDesc, BamRelationDesc,
+        BamRequiredComponent, BamRowMigrateFn, BamRunIfFn, BamScheduleSetDesc, BamSymbol,
+        BamSystem, BamSystemDesc, BamSystemSet, BamTermDesc, BamTriggerDesc, ComponentDesc,
+        ComponentUuid, FfiAssetHandle, FfiAssetLoadState, FfiBool, FfiChildOf, FfiEntity,
+        FfiOption, FfiResult, FfiSlice, RawInsertable, ScheduleId, StrView, VTableHeader,
     };
 }
 

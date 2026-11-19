@@ -1,4 +1,4 @@
-# Specification: `bevy_abi_mod` (`ABI 0.2.0`)
+# Specification: `bevy_abi_mod` (`ABI 0.3.0`)
 **Asymmetric, Zero-Serialization C-ABI Modding Framework for Bevy ECS (`v0.20+`)**
 
 ---
@@ -12,9 +12,9 @@ Dynamically loading native shared libraries (`.so`, `.dylib`, `.dll`) into a Bev
 3. **Frame-Budget Throughput:** Serializing ECS archetype tables to JSON, MessagePack, or Bincode on every frame destroys cache locality and 60/120 Hz frame budgets.
 
 ### 1.2 Architectural Approach
-`bevy_abi_mod` defines an **asymmetric, zero-serialization `extern "C"` wire contract (`ABI 0.2.0`, `0x0002_0000`)** between a Bevy host and native guest mods written in Rust, ISO C99, C++17/20, or Zig:
+`bevy_abi_mod` defines an **asymmetric, zero-serialization `extern "C"` wire contract (`ABI 0.3.0`, `0x0003_0000`)** between a Bevy host and native guest mods written in Rust, ISO C99, C++17/20, or Zig:
 1. **Zero Shared Rust ABI Assumptions:** Every wire structure is `#[repr(C)]` or `#[repr(transparent)]` with zero implicit padding, verified at compile time on 64-bit and 32-bit targets in both Rust (`offset_of!`) and ISO C99 (`BAM_STATIC_ASSERT` in `include/bevy_abi_mod.h`).
-2. **Versioned Table Handshake & Pre-Resolved Handles:** On load, the host validates the guest's `BamManifest` and passes a self-describing 50-slot `BamHostApi` table (`MIN_V0_2_SIZE = 224` B / `size_of = 408` B on 64-bit; `116` B / `208` B on 32-bit) alongside a transactional `BamLoadCtx`. Components, resources, messages, events, assets, and scenes resolve once into 1-based `BamComponent(u32)` handles so per-frame iteration, resource/tick/message operations, random entity/hierarchy lookups, observers, and deferred commands perform zero string parsing or hashing.
+2. **Versioned Table Handshake & Pre-Resolved Handles:** On load, the host validates the guest's `BamManifest` and passes a self-describing 68-slot `BamHostApi` table (`MIN_V0_2_SIZE = 224` B / `MIN_V0_3_SIZE = size_of = 552` B on 64-bit; `116` B / `280` B on 32-bit) alongside a transactional `BamLoadCtx`. Components, resources, messages, events, assets, and scenes resolve once into 1-based `BamComponent(u32)` handles so per-frame iteration, resource/tick/message operations, random entity/hierarchy lookups, observers, and deferred commands perform zero string parsing or hashing.
 3. **Direct Archetype & Sparse-Set Iteration:** Host `Table` columns are exposed directly as contiguous SoA byte slices (and `SparseSet` columns as batched per-row pointer arrays) without copying component payloads.
 4. **First-Class Bevy Scheduler Concurrency:** Each registered mod system runs inside a native Bevy `System` (`GuestSystem`) that populates `FilteredAccessSet` read/write locks from pre-resolved `ComponentId`s, allowing Bevy's multi-threaded executor to schedule non-conflicting mod and host systems in parallel.
 5. **Per-World Instance Isolation & Deterministic Unloading:** Mods export `bevy_abi_mod_manifest`, `bevy_abi_mod_init(..., &mut instance_out)`, and `bevy_abi_mod_shutdown(instance)`. Each Bevy `World` owns an isolated `BamInstance*`, copy-on-write `ModRegistry` snapshot, transactional `LoadTransaction` rollback, shadow-copy loader support, and lock-free `ArcSwapOption` drop trampolines.
@@ -28,9 +28,9 @@ Native dynamic libraries loaded via `dlopen` / `LoadLibraryW` execute **in-proce
 
 ---
 
-## 2. Eight-Crate Workspace Architecture (`-sys` vs. `#![forbid(unsafe_code)]`)
+## 2. Eleven-Crate Workspace Architecture (`-sys` vs. `#![forbid(unsafe_code)]`)
 
-The workspace separates low-level `unsafe` FFI machinery (`*-sys`) from high-level idiomatic Rust and CLI crates enforcing `#![forbid(unsafe_code)]`, while strictly keeping `bevy*` out of all wire, macro, guest, and CLI crates.
+The workspace separates low-level `unsafe` FFI machinery (`*-sys`) from high-level idiomatic Rust, trust, manifest, SDK-generator, and CLI crates enforcing `#![forbid(unsafe_code)]`, while strictly keeping `bevy*` out of all wire, macro, trust, manifest, SDK-generator, guest, and CLI crates.
 
 ### 2.1 Dependency & Safety Graph
 
@@ -40,6 +40,9 @@ flowchart TD
         BAM["bevy_abi_mod<br/>(Host Facade Crate)<br/>#![forbid(unsafe_code)]"]
         HOST["bevy_abi_mod_host<br/>(Bevy Plugin, Bridges, SubApp, Sets, Messages)<br/>#![forbid(unsafe_code)]"]
         GUEST["bevy_abi_mod_guest<br/>(Safe Guest SDK: GuestApp, Chunk, GuestCommands)<br/>#![forbid(unsafe_code)] · NO bevy"]
+        TRUST["bevy_abi_mod_trust<br/>(SSHSIG, CA, SSHKRL, .bam_sig, .bampack)<br/>#![forbid(unsafe_code)] · NO bevy"]
+        MANIFEST["bevy_abi_mod_manifest<br/>(mod.toml Parser & SemVer DAG)<br/>#![forbid(unsafe_code)] · NO bevy"]
+        SDKGEN["bevy_abi_mod_sdk_gen<br/>(C99/C++17/Zig & SDK Generator)<br/>#![forbid(unsafe_code)] · NO bevy"]
         CLI["cargo-bam<br/>(Developer CLI: new, build, doctor, sign)<br/>#![forbid(unsafe_code)] · NO bevy"]
     end
 
@@ -50,7 +53,7 @@ flowchart TD
     subgraph SysLayer["Encapsulated Unsafe FFI Layer (*-sys)"]
         HOST_SYS["bevy_abi_mod_host_sys<br/>(HOST_API, HostIter, HostCommands,<br/>GuestSystem, ModRegistry, ModHost, DROP_SLAB)"]
         GUEST_SYS["bevy_abi_mod_guest_sys<br/>(GuestInstance, Trampolines, Host Cache,<br/>Validated Column & Borrow Guards)<br/>NO bevy"]
-        SYS["bevy_abi_mod_sys<br/>(#[repr(C)] ABI 0.2.0 Wire Contract)<br/>#![no_std] · ZERO external deps · NO bevy"]
+        SYS["bevy_abi_mod_sys<br/>(#[repr(C)] ABI 0.3.0 Wire Contract)<br/>#![no_std] · ZERO external deps · NO bevy"]
     end
 
     BAM --> HOST
@@ -58,41 +61,51 @@ flowchart TD
     BAM --> SYS
 
     HOST --> HOST_SYS
+    HOST --> MANIFEST
     HOST --> MACROS
     HOST --> SYS
+
+    HOST_SYS -. "optional: signature-verification" .-> TRUST
+    HOST_SYS --> SYS
 
     GUEST --> GUEST_SYS
     GUEST -. "optional feature: derive" .-> MACROS
     GUEST --> SYS
-    CLI --> SYS
-
-    HOST_SYS --> SYS
     GUEST_SYS --> SYS
+
+    SDKGEN --> SYS
+    CLI --> SYS
+    CLI --> TRUST
+    CLI --> MANIFEST
+    CLI --> SDKGEN
 ```
 
 ### 2.2 Crate Boundaries & Invariants
 
 | Crate | `#![no_std]` | `#![forbid(unsafe_code)]` | `bevy*` Allowed | Responsibility & Allowed Dependencies |
 |---|---|---|---|---|
-| `crates/bevy_abi_mod_sys` | Yes | No (`unsafe trait`, `FfiSlice`, `ExtensibleStruct`) | **Never** | **Zero external dependencies.** Defines `ABI_VERSION` (`0.2.0`), `BamManifest`, `BamHostApi`, `BamSystemDesc`, `BamObserverDesc`, `BamTriggerDesc`, `BamQueryDesc`, `BamTermDesc`, `ComponentDesc`, `BamColumnInfo`, `VTableHeader`, `BamComponent`, `ComponentUuid`, `FfiResult`, `FfiBool`, `FfiOption<T>`, `FfiEntity`, `FfiAssetHandle`, `ModComponent`, `AbiPod`, and `RawInsertable`. |
-| `crates/bevy_abi_mod_macros` | N/A (`proc-macro`) | Yes | **Never** | `syn`, `quote`, `proc-macro2`, `proc-macro-crate`. Implements `#[derive(ModComponent)]` (hygienic VTable + witness schema + C/Zig codegen across structs, tuple structs, and `#[repr(i8..u64)]` enums) and `#[derive(AbiPod)]`. |
-| `crates/bevy_abi_mod_host_sys` | No (`std`) | No (isolates all host `unsafe`) | Yes | `bevy_ecs`, `bevy_app`, `bevy_platform`, `libloading`, `arc-swap`, `thiserror`, `tracing`, `bevy_abi_mod_sys`, and optional pure-Rust `ssh-key` / `ssh-encoding` / `signature` (`signature-verification`). Implements `HOST_API`, `HostIter`, `HostCommands` (`CommandArena`), `GuestSystem`, `ModRegistry` (`RegistrySnapshot`), `ModHost`, `LoadContext`, paged `DROP_SLAB`, `WorldDropGuard`, witness schema helpers, and `ModTrustPolicy`. |
-| `crates/bevy_abi_mod_host` | No (`std`) | **Yes** | Yes | `bevy_app`, `bevy_ecs`, `bevy_abi_mod_host_sys`, `bevy_abi_mod_sys`, `bevy_abi_mod_macros`, plus optional Bevy bridge/watcher crates. Safe Bevy plugin (`AbiModPlugin`), `ModWorldExt`, `ModAppExt`, `ModCommandsExt`, `ModDependencyGraph` (`mod.toml` SemVer DAG), `ModHotReloadPlugin`, optional Bevy `0.20` bridges (`StdTypesBridgePlugin`, `ModAssetPlugin`, `ModStateExt`, `ModReflectPlugin`, `ModBsnPlugin`, `ModSubAppPlugin<L>`, `ModWeslMaterialPlugin`), and `prelude`. |
+| `crates/bevy_abi_mod_sys` | Yes | No (`unsafe trait`, `FfiSlice`, `ExtensibleStruct`) | **Never** | **Zero external dependencies.** Defines `ABI_VERSION` (`0.3.0`), `BamManifest`, 68-slot `BamHostApi`, `BamSystemDesc`, `BamObserverDesc`, `BamTriggerDesc`, `BamQueryDesc`, `BamTermDesc`, `ComponentDesc`, `BamFieldDesc`, `BamFieldKind`, `BamRequiredComponent`, `BamRelationDesc`, `BamLayoutInfo`, `BamRowMigrateFn`, `BamScheduleSetDesc`, `BamColumnInfo`, `VTableHeader`, `BamComponent`, `BamSystem`, `BamSystemSet`, `BamSymbol`, `ComponentUuid`, `FfiResult`, `FfiBool`, `FfiOption<T>`, `FfiEntity`, `FfiAssetHandle`, `ModComponent`, `AbiPod`, and `RawInsertable`. |
+| `crates/bevy_abi_mod_macros` | N/A (`proc-macro`) | Yes | **Never** | `syn`, `quote`, `proc-macro2`, `proc-macro-crate`. Implements `#[derive(ModComponent)]` (hygienic VTable + `SCHEMA_FINGERPRINT` + `BAM_FIELDS` + `require(Comp = expr)` + witness schema + C/Zig codegen across structs, tuple structs, and `#[repr(i8..u64)]` enums) and `#[derive(AbiPod)]` (compile-time zero-padding verification). |
+| `crates/bevy_abi_mod_trust` | No (`std`) | **Yes** | **Never** | Pure-Rust Ed25519 OpenSSH `SSHSIG`, CA certificate, `PROTOCOL.krl` (`SSHKRL`), `.bam_sig`, and `.bampack` verification engine (`ssh-key`, `ed25519-dalek`, `sha2`, `tar`, `toml`). |
+| `crates/bevy_abi_mod_manifest` | No (`std`) | **Yes** | **Never** | `mod.toml` manifest parser, `ModDependencyGraph` SemVer DAG topological sorter, and mismatch/quarantine types (`semver`, `serde`, `toml`, `thiserror`). |
+| `crates/bevy_abi_mod_sdk_gen` | No (`std`) | **Yes** | **Never** | Single-source ISO C99 (`include/bevy_abi_mod.h`), C++17, Zig, and component header generator (`BAM_EXPORT`, `BAM_HOST_API_OFFSET_*`). Depends on `bevy_abi_mod_sys`. |
+| `crates/bevy_abi_mod_host_sys` | No (`std`) | No (isolates all host `unsafe`) | Yes | `bevy_ecs`, `bevy_app`, `bevy_platform`, `libloading`, `arc-swap`, `thiserror`, `tracing`, `bevy_abi_mod_sys`, and optional `bevy_abi_mod_trust` (`signature-verification`). Implements `HOST_API`, `HostIter`, `HostCommands` (`CommandArena` + checkpoints), `GuestSystem`, `ModRegistry` (`RegistrySnapshot`), `ModHost`, `LoadContext`, paged `DROP_SLAB`, `WorldDropGuard`, witness schema helpers, and `ModTrustPolicy`. |
+| `crates/bevy_abi_mod_host` | No (`std`) | **Yes** | Yes | `bevy_app`, `bevy_ecs`, `bevy_abi_mod_host_sys`, `bevy_abi_mod_manifest`, `bevy_abi_mod_sys`, `bevy_abi_mod_macros`, plus optional Bevy bridge/watcher crates. Safe Bevy plugin (`AbiModPlugin`), `ModWorldExt`, `ModAppExt`, `ModCommandsExt`, `ModDependencyGraph` (`mod.toml` SemVer DAG), `ModHotReloadPlugin`, optional Bevy `0.20` bridges (`StdTypesBridgePlugin`, `ModAssetPlugin`, `ModStateExt`, `ModReflectPlugin`, `ModBsnPlugin`, `ModSubAppPlugin<L>`, `ModWeslMaterialPlugin`), and `prelude`. |
 | `crates/bevy_abi_mod` | No (`std`) | **Yes** | Yes | Top-level host facade re-exporting `bevy_abi_mod_host`, `ModComponent`, `AbiPod`, `bevy_abi_mod_sys`, and `prelude`. |
 | `crates/bevy_abi_mod_guest_sys` | No (`std`) | No (isolates all guest `unsafe`) | **Never** | Depends **only** on `bevy_abi_mod_sys`. Implements `GuestInstance`, `catch_guest_*` panic guards, `extern "C"` init/shutdown/system/`run_if`/observer/hook/drop trampolines, `Host` API table cache, lock-free closure re-entrancy guards, and validated column/row slice constructors. |
 | `crates/bevy_abi_mod_guest` | No (`std`) | **Yes** | **Never** | `bevy_abi_mod_guest_sys`, `bevy_abi_mod_sys`, optional `bevy_abi_mod_macros` (`derive` feature). Safe ergonomic Rust guest SDK: `GuestPlugin`, `GuestApp`, `SystemBuilder`, `ObserverBuilder`, `SystemContext`, `ChunkIter`, `Chunk`, `GuestCommands`, `GuestComponent`, `GuestAssetServer`, `GuestStateBridge`, `GuestScene`, `export_mod!`, `raw`, and `prelude`. |
-| `crates/cargo-bam` | No (`std`) | **Yes** | **Never** | Standalone developer CLI (`cargo bam new`, `build --sign-key`, `export-sdk`/`header`, `check-mods`, `doctor`, `keygen`, `sign`, `verify`). |
+| `crates/cargo-bam` | No (`std`) | **Yes** | **Never** | `bevy_abi_mod_sys`, `bevy_abi_mod_trust`, `bevy_abi_mod_manifest`, `bevy_abi_mod_sdk_gen` plus pure-Rust CLI crates. Standalone developer CLI (`cargo bam new`, `build --sign-key`, `export-sdk`/`header`, `check-mods`, `doctor`, `keygen`, `sign`, `verify`). |
 
 ### 2.3 Repository Layout
 
 ```text
 bevy_abi_mod/
 ├── Cargo.toml                  # Workspace definition, shared lints, edition 2024
-├── spec.md                     # Authoritative ABI 0.2.0 & runtime specification
+├── spec.md                     # Authoritative ABI 0.3.0 & runtime specification
 ├── CHANGELOG.md                # Release history (Keep a Changelog)
 ├── GEMINI.md                   # Engineering rules & Bevy 0.20 coding standards
 ├── include/
-│   ├── bevy_abi_mod.h          # Single-source ISO C99 header generated by `cargo xtask header`
+│   ├── bevy_abi_mod.h          # Single-source ISO C99 header generated by `bevy_abi_mod_sdk_gen` / `cargo xtask header`
 │   └── generated/              # Component C headers generated by `cargo xtask gen-component-headers`
 ├── xtask/                      # Workspace automation (`header`, `gen-component-headers`, `fixtures`, `lint`, `ci`, `miri`)
 ├── docs/
@@ -102,12 +115,15 @@ bevy_abi_mod/
 ├── crates/
 │   ├── bevy_abi_mod_sys/
 │   ├── bevy_abi_mod_macros/
+│   ├── bevy_abi_mod_trust/     # Pure-Rust SSHSIG / CA / SSHKRL / .bam_sig / .bampack engine
+│   ├── bevy_abi_mod_manifest/  # Pure-Rust mod.toml parser & SemVer DAG resolver
+│   ├── bevy_abi_mod_sdk_gen/   # Single-source C99 / C++17 / Zig & SDK generator
 │   ├── bevy_abi_mod_host_sys/
 │   ├── bevy_abi_mod_host/      # Consolidated `tests/{ffi,scheduling,lifecycle,e2e}` & `benches/`
 │   ├── bevy_abi_mod/
 │   ├── bevy_abi_mod_guest_sys/
 │   ├── bevy_abi_mod_guest/
-│   └── cargo-bam/              # Standalone modder CLI (`new`, `build`, `header`, `check-mods`, `doctor`, `sign`)
+│   └── cargo-bam/              # Standalone modder CLI (`new`, `build`, `export-sdk`/`header`, `check-mods`, `doctor`, `keygen`, `sign`, `verify`)
 ├── tests/                      # Standalone C99 ABI harness (`standalone_c_test.c`) & `.cdylib` fixtures
 └── examples/                   # Progressive Rust, C99, C++17, & Zig examples (01..08)
 ```
@@ -118,14 +134,14 @@ bevy_abi_mod/
 
 ### 3.1 ABI SemVer Packing & Compatibility
 ABI versions are packed into a 32-bit unsigned integer (`u32` / `uint32_t`) via `(major << 24) | (minor << 16) | patch`, with `const` range assertions (`major <= 255`, `minor <= 255`, `patch <= 65535`):
-- Current contract version: `ABI_VERSION = 0x0002_0000` (`0.2.0`, C `BAM_ABI_VERSION`).
-- **Pre-1.0 (`major == 0`):** Minor version bumps are breaking under Cargo SemVer. `abi_version_is_compatible(host, guest)` (`bam_version_is_compatible` in C99) requires `host_major == 0 && guest_major == 0 && host_minor == guest_minor`. Patch differences (`0.2.0` vs `0.2.3`) are wire-compatible.
+- Current contract version: `ABI_VERSION = 0x0003_0000` (`0.3.0`, C `BAM_ABI_VERSION`).
+- **Pre-1.0 (`major == 0`):** Minor version bumps are breaking under Cargo SemVer. `abi_version_is_compatible(host, guest)` (`bam_version_is_compatible` in C99) requires `host_major == 0 && guest_major == 0 && host_minor == guest_minor`. Patch differences (`0.3.0` vs `0.3.3`) are wire-compatible.
 - **Post-1.0 (`major >= 1`):** Minor bumps are strictly additive (`struct_size` extension). Compatibility requires `host_major == guest_major && guest_minor <= host_minor` (patch ignored).
 
 ### 3.2 `ExtensibleStruct`, `Option<fn>`, and Flag Validation
-1. **Frozen `MIN_V0_2_SIZE`:** Every extensible `#[repr(C)]` struct (`BamManifest`, `BamHostApi`, `BamQueryDesc`, `BamSystemDesc`, `ComponentDesc`, `VTableHeader`) carries `pub struct_size: u32` at byte offset `0` and defines `MIN_V0_2_SIZE` via `core::mem::offset_of!(Self, <last_v0_2_field>) + core::mem::size_of::<LastFieldTy>()` (never `size_of::<Self>()`). Appending fields in future compatible minor versions preserves `MIN_V0_2_SIZE`; `read_extensible_struct::<T>` copies `min(struct_size, size_of::<T>())` bytes into a zero-initialized `MaybeUninit<T>`.
+1. **Frozen `MIN_V0_2_SIZE` & `MIN_V0_3_SIZE`:** Every extensible `#[repr(C)]` struct (`BamManifest`, `BamHostApi`, `BamQueryDesc`, `BamSystemDesc`, `ComponentDesc`, `BamFieldDesc`, `BamRequiredComponent`, `BamRelationDesc`, `BamLayoutInfo`, `BamScheduleSetDesc`, `VTableHeader`) carries `pub struct_size: u32` at byte offset `0` and defines frozen minimum size constants via `core::mem::offset_of!`. Appending fields in future compatible revisions preserves `MIN_V0_2_SIZE` / `MIN_V0_3_SIZE`; `read_extensible_struct::<T>` copies `min(struct_size, size_of::<T>())` bytes into a zero-initialized `MaybeUninit<T>`.
 2. **`Option<unsafe extern "C" fn(...)>` Callback Slots:** Every foreign function-pointer field across the ABI uses `Option<unsafe extern "C" fn(...)>`. Rust's guaranteed null-pointer niche optimization ensures all-bits-zero is a valid `None` on every architecture without `usize` byte-probing.
-3. **Forward-Compatible Guest Slot Negotiation:** Guests check `api.struct_size >= BamHostApi::MIN_V0_2_SIZE` (`bam_host_api_copy_bounded` in C99) for mandatory `0.2` slots and use `BamHostApi::covers_slot(offset, slot_size)` for any future appended optional slots rather than requiring `api.struct_size >= size_of::<BamHostApi>()`.
+3. **Forward-Compatible Guest Slot Negotiation:** Guests check `api.struct_size >= BamHostApi::MIN_V0_2_SIZE` (`bam_host_api_copy_bounded` in C99) for mandatory `0.2` slots and use `BamHostApi::covers_slot(offset, slot_size)` (or `bam_host_api_covers_slot(&api, BAM_HOST_API_OFFSET_*, sizeof(...))` in C99) for extended `0.2` / `0.3` slots rather than requiring `api.struct_size >= size_of::<BamHostApi>()`.
 4. **Strict Flag & Reserved Word Rejection:** Any unknown bit in a `flags` field (`flags & !KNOWN_FLAGS != 0`) is rejected synchronously with `FfiResult::UNSUPPORTED` (`14`). Any non-zero `reserved0` field is rejected with `FfiResult::INVALID_ARGUMENT` (`8`).
 
 ### 3.3 Memory & Allocator Isolation
@@ -172,9 +188,9 @@ Every opaque handle has a strict lexical or session scope and **must never be ca
 
 ---
 
-## 4. ABI `0.2.0` Wire Specification (`bevy_abi_mod_sys` & `include/bevy_abi_mod.h`)
+## 4. ABI `0.3.0` Wire Specification (`bevy_abi_mod_sys` & `include/bevy_abi_mod.h`)
 
-`crates/bevy_abi_mod_sys` is the sole source of truth for the wire contract. `cargo xtask header` generates `include/bevy_abi_mod.h` with `Bam*` type prefixes, `BAM_*` constant prefixes, `bam_*` inline helpers, and 64-bit/32-bit `BAM_STATIC_ASSERT` offset/size checks.
+`crates/bevy_abi_mod_sys` is the sole source of truth for the wire contract. `crates/bevy_abi_mod_sdk_gen` (invoked by `cargo xtask header` and `cargo bam export-sdk`) generates `include/bevy_abi_mod.h` with `BAM_EXPORT`, `Bam*` type prefixes, `BAM_*` constant prefixes, `BAM_HOST_API_OFFSET_*` slot offsets, `bam_*` inline helpers, and 64-bit/32-bit `BAM_STATIC_ASSERT` offset/size checks.
 
 ### 4.1 Wire Struct Sizes & Alignments (Zero Implicit Padding)
 
@@ -183,6 +199,10 @@ Every opaque handle has a strict lexical or session scope and **must never be ca
 | `FfiBool(pub u8)` | `BamBool` | 1 B / 1 B | 1 B / 1 B | 0 B |
 | `FfiOption<T>` | `BAM_OPTION_STRUCT(T, Name)` | `align_to(1 + sizeof(T), alignof(T))` / `alignof(T)` | same | explicit `is_some: FfiBool` + `T` |
 | `BamComponent(pub u32)` | `BamComponent` | 4 B / 4 B | 4 B / 4 B | 0 B |
+| `BamSystem(pub u32)` | `BamSystem` | 4 B / 4 B | 4 B / 4 B | 0 B |
+| `BamSystemSet(pub u32)` | `BamSystemSet` | 4 B / 4 B | 4 B / 4 B | 0 B |
+| `BamSymbol(pub u32)` | `BamSymbol` | 4 B / 4 B | 4 B / 4 B | 0 B |
+| `BamFieldKind(pub u32)` | `BamFieldKind` | 4 B / 4 B | 4 B / 4 B | 0 B |
 | `FfiEntity(pub u64)` | `BamEntity` | 8 B / 8 B | 8 B / 4–8 B | 0 B |
 | `FfiChildOf` | `BamChildOf` | 8 B / 8 B | 8 B / 4–8 B | 0 B |
 | `FfiAssetHandle` | `BamAssetHandle` | 32 B / 4 B | 32 B / 4 B | 0 B (`reserved0: [u8; 3]`) |
@@ -200,11 +220,16 @@ Every opaque handle has a strict lexical or session scope and **must never be ca
 | `BamSystemDesc` | `BamSystemDesc` | 168 B (`MIN_V0_2_SIZE = 104` B) / 8 B | 92 B (`MIN_V0_2_SIZE = 60` B) / 4 B | 0 B (`reserved0`) |
 | `BamObserverDesc` | `BamObserverDesc` | 88 B (`MIN_V0_2_SIZE = 48` B) / 8 B | 64 B (`MIN_V0_2_SIZE = 36` B) / 4 B | 0 B (`reserved0..2`) |
 | `BamTriggerDesc` | `BamTriggerDesc` | 64 B (`MIN_V0_2_SIZE = 64` B) / 8 B | 48 B (`MIN_V0_2_SIZE = 48` B) / 4 B | 0 B (`reserved0`) |
-| `ComponentDesc` | `BamComponentDesc` | 136 B (`MIN_V0_2_SIZE = 64` B) / 8 B | 80 B (`MIN_V0_2_SIZE = 44` B) / 4 B | 0 B |
+| `BamFieldDesc` | `BamFieldDesc` | 64 B (`MIN_V0_3_SIZE = 64` B) / 8 B | 36 B (`MIN_V0_3_SIZE = 36` B) / 4 B | 0 B |
+| `BamRequiredComponent` | `BamRequiredComponent` | 64 B (`MIN_V0_3_SIZE = 64` B) / 8 B | 48 B (`MIN_V0_3_SIZE = 48` B) / 4 B | 0 B |
+| `BamRelationDesc` | `BamRelationDesc` | 56 B (`MIN_V0_3_SIZE = 56` B) / 8 B | 44 B (`MIN_V0_3_SIZE = 44` B) / 4 B | 0 B |
+| `BamLayoutInfo` | `BamLayoutInfo` | 64 B (`MIN_V0_3_SIZE = 64` B) / 8 B | 48 B (`MIN_V0_3_SIZE = 48` B) / 4–8 B | 0 B |
+| `BamScheduleSetDesc` | `BamScheduleSetDesc` | 48 B (`MIN_V0_3_SIZE = 48` B) / 8 B | 36 B (`MIN_V0_3_SIZE = 36` B) / 4 B | 0 B |
+| `ComponentDesc` | `BamComponentDesc` | 176 B (`MIN_V0_2_SIZE = 64` B, `MIN_V0_3_SIZE = 176` B) / 8 B | 104 B (`MIN_V0_2_SIZE = 44` B, `MIN_V0_3_SIZE = 104` B) / 4–8 B | 0 B |
 | `BamColumnInfo` | `BamColumnInfo` | 48 B / 8 B | 40 B / 4 B | 0 B (`reserved0`) |
 | `VTableHeader` | `BamVTableHeader` | 40 B / 8 B | 32 B / 4 B | 0 B |
 | `MappedStringVTable` | `BamMappedStringVTable` | 56 B / 8 B | 40 B / 4 B | 0 B |
-| `BamHostApi` | `BamHostApi` | 408 B (`MIN_V0_2_SIZE = 224` B) / 8 B | 208 B (`MIN_V0_2_SIZE = 116` B) / 4 B | 0 B |
+| `BamHostApi` | `BamHostApi` | 552 B (`MIN_V0_2_SIZE = 224` B, `MIN_V0_3_SIZE = 552` B) / 8 B | 280 B (`MIN_V0_2_SIZE = 116` B, `MIN_V0_3_SIZE = 280` B) / 4 B | 0 B |
 
 ### 4.2 Primitives, Handles, Status Codes & Modes
 
@@ -240,8 +265,8 @@ Every guest shared library must export three `extern "C"` entry points:
 2. `bevy_abi_mod_init(api: *const BamHostApi, load_ctx: *mut BamLoadCtx, instance_out: *mut *mut BamInstance) -> FfiResult`: Initializes the mod for a single Bevy `World` and writes an optional guest-heap `*mut BamInstance` into `*instance_out`. On non-`OK` return, the guest frees partial guest allocations before returning and the host's `LoadTransaction` rolls back all staged registrations without calling `shutdown`.
 3. `bevy_abi_mod_shutdown(instance: *mut BamInstance)`: Invoked once per successful `bevy_abi_mod_init` when that load session unloads from its `World` (or when that `World` drops), strictly after systems, component hooks, and drop trampolines are disarmed and strictly before `dlclose`.
 
-### 4.5 Complete 50-Slot `BamHostApi`
-All core engine operations reside directly in `BamHostApi` (`408` B on 64-bit / `208` B on 32-bit, with `MIN_V0_2_SIZE = 224` B / `116` B covering the 27 core ABI `0.2` slots and 23 optional extended slots appended at offsets `224..408` on 64-bit / `116..208` on 32-bit):
+### 4.5 Complete 68-Slot `BamHostApi`
+All core engine operations reside directly in `BamHostApi` (`552` B on 64-bit / `280` B on 32-bit, with `MIN_V0_2_SIZE = 224` B / `116` B covering the 27 core ABI `0.2` slots, 23 extended `0.2.x` slots at offsets `224..408` / `116..208`, and 18 `ABI 0.3.0` slots at offsets `408..552` / `208..280`, `MIN_V0_3_SIZE = 552` B / `280` B):
 
 | Group | Slot (`BamHostApi`) | Signature Summary & Purpose |
 |---|---|---|
@@ -295,13 +320,31 @@ All core engine operations reside directly in `BamHostApi` (`408` B on 64-bit / 
 | | `asset_get_load_state` | `(ctx: *const BamHostCtx, handle: *const FfiAssetHandle, out_state: *mut FfiAssetLoadState) -> FfiResult` — queries `FfiAssetLoadState` for `handle`. |
 | | `asset_release` | `(ctx: *const BamHostCtx, handle: *const FfiAssetHandle) -> FfiResult` — releases a mod-pinned strong asset handle. |
 | | `cmd_spawn_scene` | `(cmds: *mut BamCommands, scene_handle: *const FfiAssetHandle, parent: FfiEntity, out_entity: *mut FfiEntity) -> FfiResult` — spawns a BSN / dynamic scene instance and returns its reserved root `FfiEntity`. |
+| **10. ABI `0.3.0` Diagnostics, Schema Reflection, Relations, Scheduling & Checkpoints (`covers_slot`)** | `log_diagnostic` | `(ctx: *const BamHostCtx, level: u32, message: StrView) -> FfiResult` — emits a structured host `tracing` diagnostic at `BAM_LOG_{TRACE,DEBUG,INFO,WARN,ERROR}`. |
+| | `report_guest_fault` | `(ctx: *const BamHostCtx, message: StrView) -> FfiResult` — records a structured guest fault message on `BamHostCtx` and logs at `warn`. |
+| | `resolve_component_by_uuid` | `(ctx: *const BamHostCtx, uuid: *const ComponentUuid, out_comp: *mut BamComponent) -> FfiResult` — resolves a registered component/resource by `ComponentUuid` into a 1-based `BamComponent` handle. |
+| | `component_layout_info` | `(ctx: *const BamHostCtx, comp: BamComponent, out_info: *mut BamLayoutInfo) -> FfiResult` — writes `size`, `align`, `schema_fingerprint`, `storage_flags`, and `field_count` for `comp`. |
+| | `register_relation` | `(load_ctx: *mut BamLoadCtx, desc: *const BamRelationDesc, out_comp: *mut BamComponent) -> FfiResult` — registers an entity relationship descriptor. |
+| | `intern_symbol` | `(ctx: *const BamHostCtx, symbol: StrView, out_symbol: *mut BamSymbol) -> FfiResult` — interns a symbol string into a compact `BamSymbol(u32)` handle. |
+| | `bind_named_object` | `(ctx: *const BamHostCtx, name: StrView, entity: FfiEntity) -> FfiResult` — associates a named object identifier with an entity. |
+| | `iter_count` | `(iter: *mut BamIter, out_count: *mut usize) -> FfiResult` — non-destructively counts matching entities without advancing `HostIter`. |
+| | `iter_up_cascade` | `(iter: *mut BamIter, relation: BamComponent, entity: FfiEntity, term_index: usize, out_ptr: *mut *const c_void, out_owner: *mut FfiEntity) -> FfiResult` — walks upward along a relationship edge to locate an ancestor component. |
+| | `par_for_each_chunk_readonly` | `(iter: *mut BamIter, chunk_fn: Option<BamChunkTaskFn>, user_data: *mut c_void) -> FfiResult` — read-only parallel chunk dispatch (rejects writable query terms with `PERMISSION_DENIED`). |
+| | `register_system_handle` | `(load_ctx: *mut BamLoadCtx, desc: *const BamSystemDesc, out_system: *mut BamSystem) -> FfiResult` — registers a system via `BamSystemDesc` and returns its `BamSystem(u32)` handle. |
+| | `configure_schedule_set` | `(load_ctx: *mut BamLoadCtx, desc: *const BamScheduleSetDesc, out_set: *mut BamSystemSet) -> FfiResult` — configures a schedule set descriptor returning a `BamSystemSet(u32)` handle. |
+| | `mount_system_in_schedule` | `(load_ctx: *mut BamLoadCtx, system: BamSystem, schedule: ScheduleId, set: BamSystemSet) -> FfiResult` — mounts a registered `BamSystem` into a schedule and set. |
+| | `cmd_checkpoint` | `(cmds: *mut BamCommands, out_checkpoint: *mut usize) -> FfiResult` — snapshots the current `HostCommands` tape length as a rollback checkpoint. |
+| | `cmd_rollback` | `(cmds: *mut BamCommands, checkpoint: usize) -> FfiResult` — truncates uncommitted commands back to `checkpoint` in LIFO order. |
+| | `cmd_insert_relation` | `(cmds: *mut BamCommands, entity: FfiEntity, relation: BamComponent, target: FfiEntity, data: *const c_void, data_size: usize) -> FfiResult` — queues deferred insertion of a relationship edge. |
+| | `cmd_remove_relation` | `(cmds: *mut BamCommands, entity: FfiEntity, relation: BamComponent, target: FfiEntity) -> FfiResult` — queues deferred removal of a relationship edge. |
+| | `migrate_component_column` | `(load_ctx: *mut BamLoadCtx, comp: BamComponent, old_fingerprint: u64, new_desc: *const ComponentDesc, migrate_fn: BamRowMigrateFn, user_data: *mut c_void) -> FfiResult` — migrates component storage columns across schema revisions. |
 
 ### 4.6 Unified Descriptors (`BamSystemDesc`, `BamObserverDesc`, `BamTriggerDesc`, `BamQueryDesc`, `BamTermDesc`, `ComponentDesc`, `BamColumnInfo`, `VTableHeader`)
 1. **`BamTermDesc` (`12` B):** `{ component: BamComponent, mode: AccessMode, flags: u16, or_group: u8, reserved0: u8 }` (`or_group == 0` = conjunctive `AND`; terms sharing `or_group >= 1` form a disjunctive `Or<(...)>` filter clause).
 2. **`BamQueryDesc` (`24` B / `16` B):** `{ struct_size: u32, flags: u32, terms: *const BamTermDesc, term_count: usize }` (`term_count <= 32`). Resource/message-only queries (all terms `RESOURCE_*` or `MESSAGE_*`) register `FilteredAccessSet` resource locks and immediately serve `res_ptr` / `res_mut_ptr` / `res_ticks` / `sys_res_ptr` / `sys_res_mut_ptr` / `msg_read_batch` / `msg_send` / `msg_write_batch` without chunk iteration (`iter_next_chunk` returns `FfiBool::FALSE`).
 3. **`BamSystemDesc` (`168` B / `92` B, `MIN_V0_2_SIZE = 104` B / `60` B):** Unifies single-query, multi-query (`0..=8` queries), scheduled (`schedule: ScheduleId`), ordered (`after`/`before`, `in_sets`, weak ordering `after_weak`/`before_weak`, and `ambiguous_with` C-string arrays + `BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL`), main-thread (`BAM_SYSTEM_FLAG_MAIN_THREAD`), and conditional (`run_if: Option<BamRunIfFn>`, `run_if_user_data`) systems into a single descriptor passed to `register_system`. `run_if` executes before advancing `last_run` so `Changed<T>` / `Added<T>` ticks accumulated across skipped frames are preserved.
 4. **`BamObserverDesc` (`88` B / `64` B, `MIN_V0_2_SIZE = 48` B / `36` B) & `BamTriggerDesc` (`64` B / `48` B):** `BamObserverDesc` supports custom events (`BamEventKind::CUSTOM`), component lifecycle observers (`ADD`, `INSERT`, `DISCARD`, `REMOVE`, `DESPAWN` with `watched_components`), scene `READY` observers, mutable payload/propagation callbacks (`mut_callback: Option<BamObserverMutFn>`), and relationship propagation (`BAM_OBSERVER_FLAG_PROPAGATE`, `propagate_relationship`). `BamTriggerDesc` provides matching extensible custom, lifecycle, and propagating trigger metadata for `cmd_trigger_ex`.
-5. **`ComponentDesc` (`136` B / `80` B, `MIN_V0_2_SIZE = 64` B / `44` B):** Extends the base descriptor (`struct_size, flags, name, uuid, size, align, drop_fn, vtable_ptr, on_add, on_remove, hook_user_data`) with `on_insert`, `on_discard`, `on_despawn`, `clone_fn: Option<ComponentCloneFn>`, and `required_components[0..required_component_count]`, plus `BAM_COMPONENT_FLAG_SUMMARY_TICK` (`1 << 2`, valid only for `Table` storage; `SPARSE_SET | SUMMARY_TICK` is rejected with `INVALID_ARGUMENT`).
+5. **`ComponentDesc` (`176` B / `104` B, `MIN_V0_2_SIZE = 64` B / `44` B, `MIN_V0_3_SIZE = 176` B / `104` B):** Extends the base descriptor (`struct_size, flags, name, uuid, size, align, drop_fn, vtable_ptr, on_add, on_remove, hook_user_data`) with `on_insert`, `on_discard`, `on_despawn`, `clone_fn: Option<ComponentCloneFn>`, `required_components[0..required_component_count]`, and `ABI 0.3.0` fields `schema_fingerprint: u64`, `fields[0..field_count]` (`*const BamFieldDesc`), and `required_init_descs[0..required_init_count]` (`*const BamRequiredComponent`), alongside `BamRowMigrateFn` for schema migration and `BAM_COMPONENT_FLAG_SUMMARY_TICK` (`1 << 2`, valid only for `Table` storage; `SPARSE_SET | SUMMARY_TICK` is rejected with `INVALID_ARGUMENT`).
 6. **`BamColumnInfo` (`48` B / `40` B):** `{ component, mode, uuid, size, align, storage_flags, reserved0 }` with `BAM_STORAGE_FLAG_SPARSE_SET (1 << 0)`, `BAM_STORAGE_FLAG_IMMUTABLE (1 << 1)`, `BAM_STORAGE_FLAG_RESOURCE (1 << 2)`, `BAM_STORAGE_FLAG_MESSAGE (1 << 3)`, `BAM_STORAGE_FLAG_EVENT (1 << 4)`, `BAM_STORAGE_FLAG_ENTITY_EVENT (1 << 5)`, and `BAM_STORAGE_FLAG_SUMMARY_TICK (1 << 6)`. Returned via out-pointer to avoid cross-platform 48-byte struct-return ABI subtle differences.
 7. **`VTableHeader` (`40` B / `32` B), `MappedWireVTable<W>`, & `MappedStringVTable` (`56` B / `40` B):** `VTableHeader { struct_size, abi_version, uuid, size, align }` sits at byte offset `0` of every `<Struct>VTable` emitted by `#[derive(ModComponent)]` as well as host-bridged `MappedWireVTable<W>` (`BAM_MAPPED_WIRE_VTABLE_STRUCT`) and `MappedStringVTable` (`BamMappedStringVTable`).
 8. **Built-in Hierarchy (`FfiChildOf` / `BamChildOf` & `BAM_CHILDREN_NAME`):** `bevy_ecs::hierarchy::ChildOf` (`BAM_CHILD_OF_NAME = "bevy_ecs::hierarchy::ChildOf"`, plus `"ChildOf"` alias) and `bevy_ecs::hierarchy::Children` (`BAM_CHILDREN_NAME = "bevy_ecs::hierarchy::Children"`, plus `"Children"` alias) support parent attachment and read-only child traversal (`sys_entity_children`) across FFI.
@@ -312,17 +355,18 @@ All core engine operations reside directly in `BamHostApi` (`408` B on 64-bit / 
 
 ### 5.1 `AbiPod` vs. `RawInsertable` vs. `ModComponent`
 1. **`unsafe trait AbiPod: RawInsertable + Copy + Send + Sync + 'static`:**
-   - Marks cross-language Plain Old Data types with deterministic `#[repr(C)]` or `#[repr(transparent)]` non-packed layout, no drop glue, and universal bit validity across every field. Natural C inter-field or trailing alignment padding is allowed.
+   - Marks cross-language Plain Old Data types with deterministic `#[repr(C)]` or `#[repr(transparent)]` non-packed layout, no drop glue, zero implicit compiler padding (`size_of::<Self>() == sum(size_of::<FieldTy>())`, enforced at compile time matching `bytemuck::NoUninit`), and universal bit validity across every field.
    - **Permitted primitives:** `u8`, `i8`, `u16`, `i16`, `u32`, `i32`, `u64`, `i64`, `f32`, `f64`, `FfiBool`, `BamComponent`, `FfiEntity`, `ComponentUuid`, and `[T; N] where T: AbiPod`.
-   - **Excluded primitives:** `u128` and `i128` (no ISO C99 equivalent; 8-byte vs 16-byte alignment divergence across compilers/ABIs), `usize` and `isize` (pointer-width dependent), and `bool`, `char`, `NonZero*`, references, and `enum`s (invalid bit patterns).
+   - **Excluded primitives:** `u128` and `i128` (no ISO C99 equivalent; 8-byte vs 16-byte alignment divergence across compilers/ABIs), `usize` and `isize` (pointer-width dependent), `bool`, `char`, `NonZero*`, references, `enum`s, and types with implicit compiler alignment padding (invalid bit patterns or uninitialized padding UB).
    - Required by **all** safe typed column slices, sparse row slices, resource borrows, and raw guest insertions in `bevy_abi_mod_guest`.
 2. **`unsafe trait RawInsertable: Sized + Send + Sync + 'static`:**
    - Marks types safe for same-process raw byte moves and unaligned reads (`!needs_drop`, no heap pointers or invalid bit patterns). Implemented for all `AbiPod` types plus `u128`, `i128`, `usize`, and `isize` (`IS_ABI_POD = false`, `IS_RAW_INSERTABLE = true`).
 3. **`pub trait ModComponent: Sized + 'static`:**
-   - Lives in `bevy_abi_mod_sys` with zero `bevy_ecs`, `RawInsertable`, or `Default` supertraits, exposing `CANONICAL_NAME`, `COMPONENT_CSTR`, `UUID`, `IS_ABI_POD`, `IS_RAW_INSERTABLE`, `COMPONENT_FLAGS`, `VTable`, `vtable()`, and `symbols()`.
+   - Lives in `bevy_abi_mod_sys` with zero `bevy_ecs`, `RawInsertable`, or `Default` supertraits, exposing `CANONICAL_NAME`, `COMPONENT_CSTR`, `UUID`, `SCHEMA_FINGERPRINT`, `BAM_FIELDS`, `REQUIRED_COMPONENTS`, `IS_ABI_POD`, `IS_RAW_INSERTABLE`, `COMPONENT_FLAGS`, `VTable`, `vtable()`, and `symbols()`.
 
 ### 5.2 `#[derive(ModComponent)]` & `#[derive(AbiPod)]`
 - Resolves crate paths hygienically via `proc-macro-crate` (`#[mod_component(crate = ...)]` override supported) and wraps generated `extern "C"` functions inside `const _: () = { ... };`.
+- Emits deterministic 64-bit FNV-1a `SCHEMA_FINGERPRINT: u64`, static `BAM_FIELDS: &[BamFieldDesc]`, and `#[mod_component(require(Comp = expr))]` custom-byte initialization descriptors (`REQUIRED_COMPONENTS: &[BamRequiredComponent]`) in addition to required-component name lists.
 - Prepends `pub header: VTableHeader` at offset `0` of `<Struct>VTable` and registers `"bam.v0.<canonical_name>.vtable"` in `ModComponent::symbols()`. When `export_symbols` is enabled, exports C symbols named `bam_<sanitized_ns>_<Struct>_<op>_<field>`.
 - **Uniform `FfiResult` Setters:** Every generated setter takes `*mut c_void` and returns `FfiResult` (`NULL_POINTER` on null pointers, `INVALID_ARGUMENT` on misaligned pointers or slice overflow, `INVALID_UTF8` without mutating existing state on invalid UTF-8 in `String` setters, and `OK` on success).
 - **Syntactic Type Classification & Expanded Item Support:** Supports named structs, tuple structs, and C-ABI enums (`#[repr(i8..u64)]`), `Option<T>` (`FfiOption<T>`), and `FfiAssetHandle` fields. Explicit `#[mod_field(primitive | string | vec | option | nested | skip)]` overrides syntactic matching, and classified `String` / `Vec<T>` fields emit compile-time type identity assertions against `::std::string::String` / `::std::vec::Vec<T>` so shadowed user types fail compilation cleanly.
@@ -354,7 +398,7 @@ All core engine operations reside directly in `BamHostApi` (`408` B on 64-bit / 
    - Public load/unload/reload operations require exclusive world access via `ModWorldExt` (`world.load_mod`, `world.load_mod_with`, `world.unload_mod`), `ModAppExt` (delegating to `app.world_mut()`), or deferred `ModCommandsExt` (`commands.load_mod`, `commands.load_mod_with`, `commands.unload_mod`). `ModHost` exposes read-only inspection only, preventing concurrent `dlclose` races during parallel schedule execution. Errors use `thiserror` with preserved `#[source]` chains.
 2. **Core Shadow-Copy Loader & Optional Signature Verification:**
    - `LoadOptions { shadow_copy, shadow_dir, schedule_override, strict, error_policy, signature_path }` copies shared libraries to `<shadow_dir>/<stem>.<pid>.<seq>.<ext>` prior to `dlopen` / `LoadLibraryW` (preventing Windows PDB/DLL file locks and macOS Apple Silicon Mach-O in-place overwrite `SIGKILL`s). `LoadedLibrary` drops `libloading::Library` strictly before `ShadowFileGuard` unlinks the temporary file.
-   - With `signature-verification` enabled and an enforcing `ModTrustPolicy` resource in `World`, `LoadedLibrary::open` reads non-empty bytes once (capped at `max_binary_bytes`), verifies the detached OpenSSH `SSHSIG` `.sig` sidecar (`<path>.sig` or `LoadOptions::signature_path`) against configured Ed25519 CA certificates / pinned keys and OpenSSH `PROTOCOL.krl` (`SSHKRL` / signed KRLs with monotonic `with_min_krl_version` anti-rollback) in pure-Rust `#![forbid(unsafe_code)]` code (`signing.rs` with strict Curve25519 subgroup, canonical $y < p$, and `ed25519_dalek::VerifyingKey::verify_strict` scalar validation), and stages verified bytes into an exclusively created (`create_new(true)`, `0o700`) file inside a non-symlink, non-world-writable shadow directory before calling `dlopen` / `LoadLibraryW` (`ABI 0.2.0` wire layouts are unchanged). Hot-reloads pre-verify replacements (including manifest principal binding) prior to unloading the active mod, successful loads attach `VerifiedModSignature` to `LoadedModInfo` entities, and `evict_revoked_mods()` surgically unloads live mods invalidated by policy/KRL updates.
+   - With `signature-verification` enabled and an enforcing `ModTrustPolicy` resource in `World`, `LoadedLibrary::open` reads non-empty bytes once (capped at `max_binary_bytes`), verifies the detached OpenSSH `SSHSIG` `.sig` sidecar (`<path>.sig` or `LoadOptions::signature_path`), embedded `.bam_sig` section, or `.bampack` archive against configured Ed25519 CA certificates / pinned keys and OpenSSH `PROTOCOL.krl` (`SSHKRL` / signed KRLs with monotonic `with_min_krl_version` anti-rollback) in pure-Rust `#![forbid(unsafe_code)]` code (`bevy_abi_mod_trust` with strict Curve25519 subgroup, canonical $y < p$, and `ed25519_dalek::VerifyingKey::verify_strict` scalar validation), and stages verified bytes into an exclusively created (`create_new(true)`, `0o700`) file inside a non-symlink, non-world-writable shadow directory before calling `dlopen` / `LoadLibraryW` (`ABI 0.3.0` wire layouts are unchanged). Hot-reloads pre-verify replacements (including manifest principal binding) prior to unloading the active mod, successful loads attach `VerifiedModSignature` to `LoadedModInfo` entities, and `evict_revoked_mods()` surgically unloads live mods invalidated by policy/KRL updates.
 3. **Post-Startup Execution, Scoped Ordering Sets, & Host Visible Sets:**
    - If `Startup` has already run (`StartupCompleted` resource), `ScheduleId::STARTUP` systems registered by runtime-loaded mods execute once immediately upon load commit.
    - Every registered system unconditionally joins `ModSystemSet(mod_id)` and `ModNamedSystemSet { mod_name, system_name }`. Unqualified `before`/`after` targets resolve within the same mod (`"integrate"`), `"other_mod::integrate"` orders across mods, and `"host::<name>"` orders against host `SystemSet`s registered in `ModVisibleSets` (`register_mod_visible_set`, never excised on mod unload). Unresolved targets emit a `tracing::warn!` (or fail load with `ModLoadError` when `LoadOptions::strict == true`).
@@ -395,13 +439,13 @@ All core engine operations reside directly in `BamHostApi` (`408` B on 64-bit / 
 ## 8. Verification & Quality Gates
 
 1. **Dependency & Safety Gates:**
-   - `cargo tree -p bevy_abi_mod_sys -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest -p bevy_abi_mod_macros -p cargo-bam | sed 's/ (.*//' | grep -v bevy_abi_mod | grep -i bevy` prints nothing.
-   - `cargo check -p bevy_abi_mod_sys --target thumbv7em-none-eabihf` and 32-bit target checks verify `#![no_std]` purity and 32-bit layout assertions.
-   - `#![forbid(unsafe_code)]` enforced at line 1 of `bevy_abi_mod`, `bevy_abi_mod_host`, `bevy_abi_mod_guest`, `bevy_abi_mod_macros`, `cargo-bam`, and `xtask`.
+   - `cargo tree -p bevy_abi_mod_sys -p bevy_abi_mod_macros -p bevy_abi_mod_trust -p bevy_abi_mod_manifest -p bevy_abi_mod_sdk_gen -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest -p cargo-bam | sed 's/ (.*//' | grep -v bevy_abi_mod | grep -i bevy` prints nothing.
+   - `cargo check -p bevy_abi_mod_sys --target thumbv7em-none-eabi` and 32-bit target checks (`wasm32-wasip1`) verify `#![no_std]` purity and 32-bit layout assertions.
+   - `#![forbid(unsafe_code)]` enforced at line 1 of `bevy_abi_mod`, `bevy_abi_mod_host`, `bevy_abi_mod_guest`, `bevy_abi_mod_macros`, `bevy_abi_mod_trust`, `bevy_abi_mod_manifest`, `bevy_abi_mod_sdk_gen`, `cargo-bam`, and `xtask`.
 2. **Single-Source C99, C++17, & Zig SDK Parity:**
    - `cargo xtask header --check --test-c99` and `cargo xtask gen-component-headers --check` compile `tests/standalone_c_test.c` under `-std=c99 -Wall -Wextra -Wpedantic -Werror`, alongside `examples/07_cpp17_guest` (`-std=c++17 -Wall -Wextra -Wpedantic -Werror`) and `examples/08_zig_guest`.
 3. **Miri, `loom`, `trybuild`, `cargo-bam`, & Hermetic Integration Suites:**
    - `MIRIFLAGS="-Zmiri-tree-borrows" cargo xtask miri --all` validates pointer provenance, padding-byte safety, witness field migration, and slice aliasing across `bevy_abi_mod_sys`, `bevy_abi_mod_guest_sys`, `bevy_abi_mod_guest`, and `bevy_abi_mod_host_sys`.
    - `cargo test -p bevy_abi_mod_host_sys --test loom_drop_trampoline --release` verifies `DROP_SLAB` `ArcSwapOption` publication and `WorldDropGuard` two-condition reclamation.
-   - `trybuild` UI snapshots and `compile_fail` doctests verify rejection of non-`AbiPod` types (`bool`, `u128`, `usize`, enums) and spoofed field types.
+   - `trybuild` UI snapshots and `compile_fail` doctests verify rejection of non-`AbiPod` types (`bool`, `u128`, `usize`, enums), implicitly padded structs, and spoofed field types.
    - `cargo test -p cargo-bam`, `fuzz_sshsig_and_krl`, property tests (`proptest`), OS/shadow-staging tests (`signature_loader_security_tests`), and hermetic host integration suites (`ffi`, `scheduling`, `lifecycle`, `e2e`) staged via `cargo xtask fixtures --all` verify multi-World isolation, `panic = "unwind"` quarantine vs `panic = "abort"` subprocess termination, zero steady-state command arena allocations, all Bevy `0.20` bridges, and native-vs-guest differential Bevy ECS parity.

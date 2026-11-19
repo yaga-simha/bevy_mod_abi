@@ -525,12 +525,12 @@ mod tests {
 
         fs::write(
             mods_dir.join("base/mod.toml"),
-            "[mod]\nid = \"base\"\nversion = \"1.2.0\"\nabi_version = \"^0.2.0\"\n",
+            "[mod]\nid = \"base\"\nversion = \"1.2.0\"\nabi_version = \"^0.3.0\"\n",
         )
         .unwrap();
         fs::write(
             mods_dir.join("addon/mod.toml"),
-            "[mod]\nid = \"addon\"\nversion = \"1.0.0\"\nabi_version = \"^0.2.0\"\n\n[dependencies]\nbase = \"^1.0\"\n",
+            "[mod]\nid = \"addon\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n\n[dependencies]\nbase = \"^1.0\"\n",
         )
         .unwrap();
         fs::write(
@@ -603,7 +603,7 @@ mod tests {
         fs::create_dir_all(mods_dir.join("core")).unwrap();
         fs::write(
             mods_dir.join("core/mod.toml"),
-            "[mod]\nid = \"core\"\nversion = \"0.2.0\"\nabi_version = \"^0.2.0\"\n",
+            "[mod]\nid = \"core\"\nversion = \"0.2.0\"\nabi_version = \"^0.3.0\"\n",
         )
         .unwrap();
 
@@ -611,7 +611,7 @@ mod tests {
 
         let report = doctor::run_doctor(Some(&mods_dir), false).unwrap();
         assert!(report.ok);
-        assert_eq!(report.host_abi_version, "0.2.0");
+        assert_eq!(report.host_abi_version, "0.3.0");
         assert!(
             report
                 .tools
@@ -641,8 +641,8 @@ mod tests {
         let err =
             run_cli(["cargo-bam", "doctor", "--dir", mods_dir.to_str().unwrap()]).unwrap_err();
         assert!(
-            err.to_string().contains("0.2.0"),
-            "expected ABI compatibility error mentioning 0.2.0, got: {err}"
+            err.to_string().contains("0.3.0"),
+            "expected ABI compatibility error mentioning 0.3.0, got: {err}"
         );
     }
 

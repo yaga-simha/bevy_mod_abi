@@ -1163,6 +1163,7 @@ struct DamageApplied {
     #[event_target]
     entity: TargetEntity,
     amount: f32,
+    _pad0: u32,
 }
 
 #[test]
@@ -1242,6 +1243,7 @@ fn messages_batch_write_and_cmd_trigger_entity_events() {
         let dmg_other = DamageApplied {
             entity: TargetEntity::from(state.target_other),
             amount: 12.0,
+            _pad0: 0,
         };
         assert_eq!(
             unsafe {
@@ -1258,6 +1260,7 @@ fn messages_batch_write_and_cmd_trigger_entity_events() {
         let dmg_watched = DamageApplied {
             entity: TargetEntity::from(state.target_watched),
             amount: 42.0,
+            _pad0: 0,
         };
         assert_eq!(
             unsafe {

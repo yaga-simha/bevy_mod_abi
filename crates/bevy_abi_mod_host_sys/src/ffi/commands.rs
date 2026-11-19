@@ -445,6 +445,120 @@ impl HostCommandsStorage {
         self.arena.reset();
     }
 
+    /// Captures an opaque checkpoint token representing the current command-buffer watermark.
+    #[inline]
+    pub fn checkpoint(&self) -> usize {
+        self.commands.len()
+    }
+
+    /// Rolls back all commands queued after `checkpoint`, invoking foreign destructors in reverse
+    /// order for uncommitted dynamic payloads and truncating auxiliary command storage.
+    pub fn rollback_to_checkpoint(&mut self, checkpoint: usize) -> FfiResult {
+        if checkpoint > self.commands.len() {
+            return FfiResult::OUT_OF_RANGE;
+        }
+        if checkpoint == self.commands.len() {
+            return FfiResult::OK;
+        }
+
+        let mut min_batch_len = self.batch_items.len();
+        let mut min_soa_ent_len = self.soa_entities.len();
+        let mut min_soa_col_len = self.soa_columns.len();
+        let mut min_custom_len = self.custom_fns.len();
+
+        for i in (checkpoint..self.commands.len()).rev() {
+            let cmd = &mut self.commands[i];
+            match cmd {
+                RecordedCommand::Insert {
+                    slice, drop_slot, ..
+                }
+                | RecordedCommand::InsertIfNew {
+                    slice, drop_slot, ..
+                } => {
+                    let slice = *slice;
+                    if let Some((slot, expected_gen)) = drop_slot.take() {
+                        let nn = self.arena.ptr_mut(slice);
+                        // SAFETY: `nn` holds an uncommitted guest payload in `self.arena` whose
+                        // ownership never transferred into Bevy ECS.
+                        unsafe {
+                            run_uncommitted_slot_drop(slot, expected_gen, nn.as_ptr());
+                        }
+                    }
+                }
+                RecordedCommand::SpawnBatch {
+                    batch_start,
+                    batch_len,
+                    ..
+                } => {
+                    let bs = *batch_start;
+                    let bl = *batch_len;
+                    min_batch_len = min_batch_len.min(bs);
+                    for j in (bs..bs + bl).rev() {
+                        let item = &mut self.batch_items[j];
+                        let slice = item.slice;
+                        if let Some((slot, expected_gen)) = item.drop_slot.take() {
+                            let nn = self.arena.ptr_mut(slice);
+                            // SAFETY: `nn` holds an uncommitted batch item payload in `self.arena`.
+                            unsafe {
+                                run_uncommitted_slot_drop(slot, expected_gen, nn.as_ptr());
+                            }
+                        }
+                    }
+                }
+                RecordedCommand::SpawnSoaBatch {
+                    entity_start,
+                    col_start,
+                    col_count,
+                    ..
+                } => {
+                    let es = *entity_start;
+                    let cs = *col_start;
+                    let cc = *col_count;
+                    min_soa_ent_len = min_soa_ent_len.min(es);
+                    min_soa_col_len = min_soa_col_len.min(cs);
+                    for c in (cs..cs + cc).rev() {
+                        let col = &mut self.soa_columns[c];
+                        let slice = col.slice;
+                        let elem_size = col.elem_size;
+                        let entity_count = col.entity_count;
+                        if let Some((slot, expected_gen)) = col.drop_slot.take() {
+                            let base = self.arena.ptr_mut(slice);
+                            for r in (0..entity_count).rev() {
+                                // SAFETY: `base` holds `entity_count` contiguous `elem_size`
+                                // uncommitted payloads inside `self.arena`.
+                                let elem_ptr = unsafe { base.as_ptr().add(r * elem_size) };
+                                // SAFETY: Ownership never transferred into Bevy ECS.
+                                unsafe {
+                                    run_uncommitted_slot_drop(slot, expected_gen, elem_ptr);
+                                }
+                            }
+                        }
+                    }
+                }
+                RecordedCommand::Custom { idx } => {
+                    let c_idx = *idx;
+                    min_custom_len = min_custom_len.min(c_idx);
+                    if let Some(slot) = self.custom_fns.get_mut(c_idx) {
+                        let _ = slot.take();
+                    }
+                }
+                RecordedCommand::SpawnEmpty { .. }
+                | RecordedCommand::Despawn { .. }
+                | RecordedCommand::InsertDefault { .. }
+                | RecordedCommand::Remove { .. }
+                | RecordedCommand::Trigger { .. }
+                | RecordedCommand::SpawnScene { .. } => {}
+            }
+        }
+
+        self.commands.truncate(checkpoint);
+        self.batch_items.truncate(min_batch_len);
+        self.soa_entities.truncate(min_soa_ent_len);
+        self.soa_columns.truncate(min_soa_col_len);
+        self.custom_fns.truncate(min_custom_len);
+        FfiResult::OK
+    }
+
     /// Takes ownership of all queued commands into a fresh `HostCommandsStorage` (used only by
     /// the cold `System::queue_deferred` combinator path).
     pub fn take_for_deferred_queue(&mut self) -> Self {
@@ -1027,6 +1141,18 @@ impl<'a> HostCommands<'a> {
     #[inline]
     pub fn as_ffi_ptr(&mut self) -> *mut BamCommands {
         (self as *mut Self).cast::<BamCommands>()
+    }
+
+    /// Captures a command-buffer checkpoint token from the backing [`HostCommandsStorage`].
+    #[inline]
+    pub fn checkpoint(&self) -> usize {
+        self.storage.checkpoint()
+    }
+
+    /// Rolls back commands queued after `checkpoint` in the backing [`HostCommandsStorage`].
+    #[inline]
+    pub fn rollback_to_checkpoint(&mut self, checkpoint: usize) -> FfiResult {
+        self.storage.rollback_to_checkpoint(checkpoint)
     }
 
     pub(crate) fn queue_spawn_scene(

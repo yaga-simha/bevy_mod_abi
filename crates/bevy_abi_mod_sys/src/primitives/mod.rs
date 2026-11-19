@@ -10,10 +10,16 @@ mod uuid;
 pub use self::{
     asset::{FfiAssetHandle, FfiAssetLoadState},
     bool::FfiBool,
-    entity::{BAM_CHILD_OF_NAME, BAM_CHILDREN_NAME, BamComponent, FfiChildOf, FfiEntity},
+    entity::{
+        BAM_CHILD_OF_NAME, BAM_CHILDREN_NAME, BamComponent, BamSymbol, BamSystem, BamSystemSet,
+        FfiChildOf, FfiEntity,
+    },
     option::FfiOption,
     slice::{FfiSlice, StrView},
-    uuid::{ComponentUuid, SIPHASH_KEY_0, SIPHASH_KEY_1, siphash24_128},
+    uuid::{
+        ComponentUuid, FNV1A_64_OFFSET_BASIS, FNV1A_64_PRIME, SIPHASH_KEY_0, SIPHASH_KEY_1,
+        fnv1a_64_init, fnv1a_64_str, fnv1a_64_update_bytes, fnv1a_64_update_u64, siphash24_128,
+    },
 };
 
 /// FFI-safe status code returned across the C-ABI boundary (`typedef uint32_t BamResult;`).

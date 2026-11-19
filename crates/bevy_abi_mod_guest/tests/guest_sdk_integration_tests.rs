@@ -881,6 +881,7 @@ fn state_messages_random_get_and_hooks() {
     struct DamageEvent {
         target_bits: u64,
         amount: u32,
+        _pad: u32,
     }
     #[cfg(not(feature = "derive"))]
     impl_pod_no_derive!(DamageEvent);
@@ -1028,6 +1029,7 @@ fn state_messages_random_get_and_hooks() {
                         &DamageEvent {
                             target_bits: 101,
                             amount: 15,
+                            _pad: 0,
                         },
                     )
                 });

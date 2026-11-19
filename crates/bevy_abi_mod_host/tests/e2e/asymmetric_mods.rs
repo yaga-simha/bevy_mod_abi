@@ -1909,6 +1909,7 @@ fn test_end_to_end_asymmetric_rust_and_c99_optional_changed_resources_and_comman
         scale: 2.0,
         matched_rows: 0,
         optional_vel_hits: 0,
+        _pad0: 0,
         spawned_default_entity: 0,
     });
 
@@ -1933,6 +1934,7 @@ fn test_end_to_end_asymmetric_rust_and_c99_optional_changed_resources_and_comman
         scale: 3.0,
         matched_rows: 0,
         optional_vel_hits: 0,
+        _pad0: 0,
         spawned_default_entity: 0,
     });
 

@@ -1,2 +1,7 @@
 * text=auto eol=lf
+*.rs text eol=lf
+*.stderr text eol=lf
+*.c text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
 fuzz/corpus/** binary

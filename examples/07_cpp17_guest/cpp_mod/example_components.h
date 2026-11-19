@@ -123,8 +123,10 @@ public:
     }
 
     void reset(InstanceT* next = nullptr) noexcept {
-        if (ptr_ != nullptr && DestroyFn != nullptr) {
-            DestroyFn(ptr_);
+        if constexpr (DestroyFn != nullptr) {
+            if (ptr_ != nullptr) {
+                DestroyFn(ptr_);
+            }
         }
         ptr_ = next;
     }
@@ -435,8 +437,10 @@ public:
     }
 
     void reset(InstanceT* next = nullptr) noexcept {
-        if (ptr_ != nullptr && DestroyFn != nullptr) {
-            DestroyFn(ptr_);
+        if constexpr (DestroyFn != nullptr) {
+            if (ptr_ != nullptr) {
+                DestroyFn(ptr_);
+            }
         }
         ptr_ = next;
     }
@@ -750,8 +754,10 @@ public:
     }
 
     void reset(InstanceT* next = nullptr) noexcept {
-        if (ptr_ != nullptr && DestroyFn != nullptr) {
-            DestroyFn(ptr_);
+        if constexpr (DestroyFn != nullptr) {
+            if (ptr_ != nullptr) {
+                DestroyFn(ptr_);
+            }
         }
         ptr_ = next;
     }
@@ -1089,8 +1095,10 @@ public:
     }
 
     void reset(InstanceT* next = nullptr) noexcept {
-        if (ptr_ != nullptr && DestroyFn != nullptr) {
-            DestroyFn(ptr_);
+        if constexpr (DestroyFn != nullptr) {
+            if (ptr_ != nullptr) {
+                DestroyFn(ptr_);
+            }
         }
         ptr_ = next;
     }
@@ -1458,8 +1466,10 @@ public:
     }
 
     void reset(InstanceT* next = nullptr) noexcept {
-        if (ptr_ != nullptr && DestroyFn != nullptr) {
-            DestroyFn(ptr_);
+        if constexpr (DestroyFn != nullptr) {
+            if (ptr_ != nullptr) {
+                DestroyFn(ptr_);
+            }
         }
         ptr_ = next;
     }
@@ -1788,8 +1798,10 @@ public:
     }
 
     void reset(InstanceT* next = nullptr) noexcept {
-        if (ptr_ != nullptr && DestroyFn != nullptr) {
-            DestroyFn(ptr_);
+        if constexpr (DestroyFn != nullptr) {
+            if (ptr_ != nullptr) {
+                DestroyFn(ptr_);
+            }
         }
         ptr_ = next;
     }

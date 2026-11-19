@@ -56,18 +56,28 @@ pub use commands::{
 };
 pub use component::{
     BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_COMPONENT_FLAG_SUMMARY_TICK,
-    BAM_COMPONENT_KNOWN_FLAGS, ComponentCloneFn, ComponentDesc, ComponentDropFn, ComponentHookFn,
-    MappedStringGetFn, MappedStringSetFn, MappedStringVTable, MappedWireGetFn, MappedWireSetFn,
-    MappedWireVTable, VTableHeader,
+    BAM_COMPONENT_KNOWN_FLAGS, BAM_RELATION_FLAG_CASCADE_DESPAWN, BAM_RELATION_FLAG_EXCLUSIVE,
+    BAM_RELATION_FLAG_SYMMETRIC, BAM_RELATION_KNOWN_FLAGS, BAM_REQUIRED_FLAG_CUSTOM_BYTES,
+    BAM_REQUIRED_FLAG_INIT_FN, BAM_REQUIRED_FLAG_RESOLVE_BY_UUID, BAM_REQUIRED_KNOWN_FLAGS,
+    BAM_SCHEDULE_SET_KNOWN_FLAGS, BamFieldDesc, BamFieldKind, BamLayoutInfo, BamRelationDesc,
+    BamRequiredComponent, BamRequiredInitFn, BamRowMigrateFn, BamScheduleSetDesc, ComponentCloneFn,
+    ComponentDesc, ComponentDropFn, ComponentHookFn, MappedStringGetFn, MappedStringSetFn,
+    MappedStringVTable, MappedWireGetFn, MappedWireSetFn, MappedWireVTable, VTableHeader,
 };
 pub use extensible::{ExtensibleStruct, read_descriptor, read_extensible_struct};
 pub use host_api::{
+    BAM_LOG_DEBUG, BAM_LOG_ERROR, BAM_LOG_INFO, BAM_LOG_TRACE, BAM_LOG_WARN,
     BAM_MANIFEST_KNOWN_FLAGS, BamAssetGetLoadStateFn, BamAssetLoadFn, BamAssetReleaseFn,
-    BamGetProcAddressFn, BamHostApi, BamInitFn, BamInstance, BamLastErrorFn, BamLoadHostCtxFn,
-    BamManifest, BamManifestFn, BamRegisterComponentFn, BamRegisterObserverFn, BamRegisterSystemFn,
-    BamResolveComponentFn, BamRestoreStateFn, BamSaveStateFn, BamShutdownFn, BamStateWriterFn,
-    BamSysCommandsFn, BamSysEntityChildrenFn, BamSysEntityGetFn, BamSysEntityGetMutFn,
-    BamSysHostCtxFn, BamSysQueryFn, BamSysResMutPtrFn, BamSysResPtrFn,
+    BamBindNamedObjectFn, BamCmdCheckpointFn, BamCmdInsertRelationFn, BamCmdRemoveRelationFn,
+    BamCmdRollbackFn, BamComponentLayoutInfoFn, BamConfigureScheduleSetFn, BamGetProcAddressFn,
+    BamHostApi, BamInitFn, BamInstance, BamInternSymbolFn, BamIterCountFn, BamIterUpCascadeFn,
+    BamLastErrorFn, BamLoadHostCtxFn, BamLogDiagnosticFn, BamManifest, BamManifestFn,
+    BamMigrateComponentColumnFn, BamMountSystemInScheduleFn, BamRegisterComponentFn,
+    BamRegisterObserverFn, BamRegisterRelationFn, BamRegisterSystemFn, BamRegisterSystemHandleFn,
+    BamReportGuestFaultFn, BamResolveComponentByUuidFn, BamResolveComponentFn, BamRestoreStateFn,
+    BamSaveStateFn, BamShutdownFn, BamStateWriterFn, BamSysCommandsFn, BamSysEntityChildrenFn,
+    BamSysEntityGetFn, BamSysEntityGetMutFn, BamSysHostCtxFn, BamSysQueryFn, BamSysResMutPtrFn,
+    BamSysResPtrFn,
 };
 pub use iter::{
     BAM_MAX_CHANGE_AGE, BAM_STORAGE_FLAG_ENTITY_EVENT, BAM_STORAGE_FLAG_EVENT,
@@ -80,9 +90,11 @@ pub use iter::{
     BamParForEachChunkFn, BamResMutPtrFn, BamResPtrFn, BamResTicksFn,
 };
 pub use primitives::{
-    BAM_CHILD_OF_NAME, BAM_CHILDREN_NAME, BamComponent, ComponentUuid, FfiAssetHandle,
-    FfiAssetLoadState, FfiBool, FfiChildOf, FfiEntity, FfiOption, FfiResult, FfiSlice,
-    SIPHASH_KEY_0, SIPHASH_KEY_1, StrView, siphash24_128,
+    BAM_CHILD_OF_NAME, BAM_CHILDREN_NAME, BamComponent, BamSymbol, BamSystem, BamSystemSet,
+    ComponentUuid, FNV1A_64_OFFSET_BASIS, FNV1A_64_PRIME, FfiAssetHandle, FfiAssetLoadState,
+    FfiBool, FfiChildOf, FfiEntity, FfiOption, FfiResult, FfiSlice, SIPHASH_KEY_0, SIPHASH_KEY_1,
+    StrView, fnv1a_64_init, fnv1a_64_str, fnv1a_64_update_bytes, fnv1a_64_update_u64,
+    siphash24_128,
 };
 pub use system::{
     BAM_OBSERVER_FLAG_PROPAGATE, BAM_OBSERVER_KNOWN_FLAGS, BAM_QUERY_KNOWN_FLAGS,

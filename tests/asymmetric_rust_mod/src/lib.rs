@@ -81,6 +81,7 @@ pub struct RustFilterTelemetry {
     pub scale: f32,
     pub matched_rows: u32,
     pub optional_vel_hits: u32,
+    pub _pad0: u32,
     pub spawned_default_entity: u64,
 }
 

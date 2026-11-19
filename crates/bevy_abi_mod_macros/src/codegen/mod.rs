@@ -120,6 +120,83 @@ pub(crate) struct AccessorSpec {
     pub(crate) slots: Vec<SlotSpec>,
 }
 
+pub(crate) struct BamFieldMeta {
+    pub(crate) name: String,
+    pub(crate) type_tag: String,
+    pub(crate) kind_ident: &'static str,
+    pub(crate) member_tokens: TokenStream,
+    pub(crate) field_ty: syn::Type,
+}
+
+fn match_prim_ident(ty: &syn::Type, target: &str) -> bool {
+    if let syn::Type::Path(tp) = ty
+        && tp.qself.is_none()
+    {
+        if tp.path.is_ident(target) {
+            return true;
+        }
+        let segs = &tp.path.segments;
+        if segs.len() == 3
+            && (segs[0].ident == "core" || segs[0].ident == "std")
+            && segs[1].ident == "primitive"
+            && segs[2].ident == target
+            && segs[2].arguments.is_empty()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn infer_bam_field_kind_ident(kind: &FieldKind, ty: &syn::Type) -> &'static str {
+    match kind {
+        FieldKind::Skip => "OPAQUE",
+        FieldKind::Bool(_) => "BOOL",
+        FieldKind::HostString(_) => "STRING",
+        FieldKind::HostVec { .. } => "VEC",
+        FieldKind::FfiOption { .. } => "FFI_OPTION",
+        FieldKind::Nested { .. } => "NESTED",
+        FieldKind::Primitive { ty: prim_ty, .. } => {
+            if match_prim_ident(prim_ty, "u8") {
+                "U8"
+            } else if match_prim_ident(prim_ty, "i8") {
+                "I8"
+            } else if match_prim_ident(prim_ty, "u16") {
+                "U16"
+            } else if match_prim_ident(prim_ty, "i16") {
+                "I16"
+            } else if match_prim_ident(prim_ty, "u32") {
+                "U32"
+            } else if match_prim_ident(prim_ty, "i32") {
+                "I32"
+            } else if match_prim_ident(prim_ty, "u64") {
+                "U64"
+            } else if match_prim_ident(prim_ty, "i64") {
+                "I64"
+            } else if match_prim_ident(prim_ty, "f32") {
+                "F32"
+            } else if match_prim_ident(prim_ty, "f64") {
+                "F64"
+            } else if match_prim_ident(prim_ty, "usize") {
+                "USIZE"
+            } else if match_prim_ident(prim_ty, "isize") {
+                "ISIZE"
+            } else if let syn::Type::Path(tp) = ty
+                && tp.qself.is_none()
+                && tp
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|s| s.ident == "FfiBool")
+            {
+                "BOOL"
+            } else {
+                "UNKNOWN"
+            }
+        }
+    }
+}
+
 pub(crate) struct CodegenState {
     pub(crate) sys_crate: TokenStream,
     pub(crate) struct_ident: Ident,
@@ -131,9 +208,11 @@ pub(crate) struct CodegenState {
     pub(crate) can_impl_abi_pod: bool,
     pub(crate) component_flags_expr: TokenStream,
     pub(crate) summary_tick: bool,
-    pub(crate) required_components: Vec<syn::Path>,
+    pub(crate) required_components: Vec<crate::attrs::RequiredComponentAttr>,
     pub(crate) custom_uuid: Option<String>,
     pub(crate) schema_fields: Vec<(String, String, TokenStream)>,
+    pub(crate) bam_fields: Vec<BamFieldMeta>,
+    pub(crate) pod_field_types: Vec<syn::Type>,
     pub(crate) decl_fields: Vec<c_decl::DeclFieldInfo>,
     pub(crate) decl_enum: Option<c_decl::DeclEnumInfo>,
     pub(crate) witness_fields: Vec<witness::WitnessFieldInfo>,
@@ -402,6 +481,8 @@ pub(crate) fn expand_mod_component_with_crate(
         required_components: comp_attrs.required_components,
         custom_uuid: comp_attrs.custom_uuid,
         schema_fields: Vec::new(),
+        bam_fields: Vec::new(),
+        pod_field_types: Vec::new(),
         decl_fields: Vec::new(),
         decl_enum: None,
         witness_fields: Vec::new(),
@@ -472,6 +553,21 @@ pub(crate) fn expand_mod_component_with_crate(
         let kind = classify_type(&field.ty, attr_override)?;
         let field_span = field.ty.span();
 
+        state.pod_field_types.push(field.ty.clone());
+        let field_kind_ident = if state.opaque {
+            "OPAQUE"
+        } else {
+            infer_bam_field_kind_ident(&kind, &field.ty)
+        };
+        let bam_type_tag = canonical_kind_type_tag(&field.ty, &kind);
+        state.bam_fields.push(BamFieldMeta {
+            name: field_name.clone(),
+            type_tag: bam_type_tag.clone(),
+            kind_ident: field_kind_ident,
+            member_tokens: member_tokens.clone(),
+            field_ty: field.ty.clone(),
+        });
+
         if !matches!(kind, FieldKind::Skip) {
             state.schema_fields.push((
                 field_name.clone(),
@@ -498,7 +594,7 @@ pub(crate) fn expand_mod_component_with_crate(
             };
             state.witness_fields.push(witness::WitnessFieldInfo {
                 field_name: field_name.clone(),
-                type_tag: canonical_kind_type_tag(&field.ty, &kind),
+                type_tag: bam_type_tag,
                 member_tokens: member_tokens.clone(),
                 kind: witness_kind,
                 raw_ty: field.ty.clone(),

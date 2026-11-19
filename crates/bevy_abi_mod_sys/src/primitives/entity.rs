@@ -43,6 +43,126 @@ impl BamComponent {
     }
 }
 
+/// 0-based world-scoped system registry handle (`typedef uint32_t BamSystem;`).
+///
+/// `u32::MAX` ([`BamSystem::INVALID`]) is reserved as the invalid/uninitialized sentinel.
+#[repr(transparent)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct BamSystem(pub u32);
+
+impl Default for BamSystem {
+    #[inline]
+    fn default() -> Self {
+        Self::INVALID
+    }
+}
+
+impl BamSystem {
+    /// Reserved invalid/uninitialized system handle sentinel (`0xFFFF_FFFF`).
+    pub const INVALID: Self = Self(u32::MAX);
+
+    /// Constructs a `BamSystem` handle from a raw `u32` value.
+    #[inline]
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    /// Extracts the underlying `u32` handle value.
+    #[inline]
+    pub const fn to_raw(self) -> u32 {
+        self.0
+    }
+
+    /// Returns `true` if this handle is not [`Self::INVALID`].
+    #[inline]
+    pub const fn is_valid(self) -> bool {
+        self.0 != u32::MAX
+    }
+}
+
+/// World-scoped schedule system-set handle (`typedef uint32_t BamSystemSet;`).
+///
+/// `u32::MAX` ([`BamSystemSet::INVALID`]) is reserved as the invalid/uninitialized sentinel.
+#[repr(transparent)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct BamSystemSet(pub u32);
+
+impl Default for BamSystemSet {
+    #[inline]
+    fn default() -> Self {
+        Self::INVALID
+    }
+}
+
+impl BamSystemSet {
+    /// Reserved invalid/uninitialized system-set handle sentinel (`0xFFFF_FFFF`).
+    pub const INVALID: Self = Self(u32::MAX);
+
+    /// Constructs a `BamSystemSet` handle from a raw `u32` value.
+    #[inline]
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    /// Extracts the underlying `u32` handle value.
+    #[inline]
+    pub const fn to_raw(self) -> u32 {
+        self.0
+    }
+
+    /// Returns `true` if this handle is not [`Self::INVALID`].
+    #[inline]
+    pub const fn is_valid(self) -> bool {
+        self.0 != u32::MAX
+    }
+}
+
+/// Interned symbolic identifier handle (`typedef uint32_t BamSymbol;`).
+///
+/// `u32::MAX` ([`BamSymbol::INVALID`]) is reserved as the invalid/uninitialized sentinel.
+#[repr(transparent)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct BamSymbol(pub u32);
+
+impl Default for BamSymbol {
+    #[inline]
+    fn default() -> Self {
+        Self::INVALID
+    }
+}
+
+impl BamSymbol {
+    /// Reserved invalid/uninitialized symbol handle sentinel (`0xFFFF_FFFF`).
+    pub const INVALID: Self = Self(u32::MAX);
+
+    /// Constructs a `BamSymbol` handle from a raw `u32` value.
+    #[inline]
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    /// Extracts the underlying `u32` handle value.
+    #[inline]
+    pub const fn to_raw(self) -> u32 {
+        self.0
+    }
+
+    /// Returns `true` if this handle is not [`Self::INVALID`].
+    #[inline]
+    pub const fn is_valid(self) -> bool {
+        self.0 != u32::MAX
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<BamSystem>() == 4);
+    assert!(core::mem::align_of::<BamSystem>() == 4);
+    assert!(core::mem::size_of::<BamSystemSet>() == 4);
+    assert!(core::mem::align_of::<BamSystemSet>() == 4);
+    assert!(core::mem::size_of::<BamSymbol>() == 4);
+    assert!(core::mem::align_of::<BamSymbol>() == 4);
+};
+
 /// Opaque 64-bit entity identifier matching `bevy_ecs::entity::Entity::to_bits()`
 /// (`typedef uint64_t BamEntity;`).
 ///

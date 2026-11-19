@@ -16,12 +16,12 @@ fn semver_abi_compatibility_and_typed_mod_load_error_work() {
         (maj << 24) | (min << 16) | patch
     }
 
-    // Host is `0.2.0` (`ABI_VERSION = 0x0002_0000`): pre-1.0 requires exact minor match.
+    // Host is `0.3.0` (`ABI_VERSION = 0x0003_0000`): pre-1.0 requires exact minor match.
     assert!(is_abi_version_compatible(ABI_VERSION, ABI_VERSION));
-    assert!(is_abi_version_compatible(ABI_VERSION, pack_ver(0, 2, 99)));
+    assert!(is_abi_version_compatible(ABI_VERSION, pack_ver(0, 3, 99)));
     assert!(!is_abi_version_compatible(ABI_VERSION, pack_ver(0, 0, 9)));
-    assert!(!is_abi_version_compatible(ABI_VERSION, pack_ver(0, 1, 99)));
-    assert!(!is_abi_version_compatible(ABI_VERSION, pack_ver(0, 3, 0)));
+    assert!(!is_abi_version_compatible(ABI_VERSION, pack_ver(0, 2, 99)));
+    assert!(!is_abi_version_compatible(ABI_VERSION, pack_ver(0, 4, 0)));
     assert!(!is_abi_version_compatible(ABI_VERSION, pack_ver(1, 0, 0)));
 
     // Post-1.0 (`major >= 1`) allows `guest_minor <= host_minor`.

@@ -1,8 +1,8 @@
 //! Toolchain, ABI, and mod-directory diagnostics (`cargo bam doctor`).
 
+use crate::builder::{c_candidates, cxx_candidates, probe_compiler_banner};
 use crate::dag::{self, ValidatedModManifest};
 use crate::{CliError, sdk};
-use std::env;
 use std::path::Path;
 use std::process::Command;
 
@@ -49,43 +49,10 @@ fn probe_command(program: &str, args: &[&str]) -> Option<String> {
     }
 }
 
-fn probe_candidates(candidates: &[String], args: &[&str]) -> Option<String> {
-    for candidate in candidates {
-        if let Some(found) = probe_command(candidate, args) {
-            return Some(found);
-        }
-    }
-    None
-}
-
-fn c_candidates() -> Vec<String> {
-    let mut out = Vec::new();
-    if let Ok(cc) = env::var("CC")
-        && !cc.trim().is_empty()
-    {
-        out.push(cc);
-    }
-    for default_cc in ["cc", "gcc", "clang"] {
-        if !out.iter().any(|c| c == default_cc) {
-            out.push(default_cc.to_string());
-        }
-    }
-    out
-}
-
-fn cxx_candidates() -> Vec<String> {
-    let mut out = Vec::new();
-    if let Ok(cxx) = env::var("CXX")
-        && !cxx.trim().is_empty()
-    {
-        out.push(cxx);
-    }
-    for default_cxx in ["c++", "g++", "clang++"] {
-        if !out.iter().any(|c| c == default_cxx) {
-            out.push(default_cxx.to_string());
-        }
-    }
-    out
+fn probe_candidates(candidates: &[String]) -> Option<String> {
+    candidates
+        .iter()
+        .find_map(|candidate| probe_compiler_banner(candidate))
 }
 
 /// Inspects Rust, C99/C++17/Zig toolchains and embedded SDK headers without failing on optional tools.
@@ -123,24 +90,22 @@ pub fn inspect_environment(require_c: bool) -> DoctorReport {
         }),
     }
 
-    let cc_found = probe_candidates(&c_candidates(), &["--version"])
-        .or_else(|| cfg!(windows).then(|| probe_command("cl", &[])).flatten());
+    let cc_found = probe_candidates(&c_candidates());
     tools.push(ToolCheck {
         name: "c99".to_string(),
         available: cc_found.is_some(),
         required: require_c,
         detail: cc_found
-            .unwrap_or_else(|| "not found (set CC or install cc/gcc/clang)".to_string()),
+            .unwrap_or_else(|| "not found (set CC or install clang/cl.exe/gcc/cc)".to_string()),
     });
 
-    let cxx_found = probe_candidates(&cxx_candidates(), &["--version"])
-        .or_else(|| cfg!(windows).then(|| probe_command("cl", &[])).flatten());
+    let cxx_found = probe_candidates(&cxx_candidates());
     tools.push(ToolCheck {
         name: "cpp17".to_string(),
         available: cxx_found.is_some(),
         required: require_c,
         detail: cxx_found
-            .unwrap_or_else(|| "not found (set CXX or install c++/g++/clang++)".to_string()),
+            .unwrap_or_else(|| "not found (set CXX or install clang++/cl.exe/g++/c++)".to_string()),
     });
 
     let zig_found = probe_command("zig", &["version"]);
@@ -151,7 +116,8 @@ pub fn inspect_environment(require_c: bool) -> DoctorReport {
         detail: zig_found.unwrap_or_else(|| "optional zig toolchain not installed".to_string()),
     });
 
-    let headers_ok = sdk::C99_HEADER.contains("BAM_ABI_VERSION")
+    let c99_header = sdk::c99_header();
+    let headers_ok = c99_header.contains("BAM_ABI_VERSION")
         && sdk::CPP17_HEADER.contains("BEVY_ABI_MOD_HPP")
         && !sdk::ZIG_SDK.trim().is_empty();
     tools.push(ToolCheck {
@@ -160,7 +126,7 @@ pub fn inspect_environment(require_c: bool) -> DoctorReport {
         required: true,
         detail: format!(
             "embedded C99 ({} B), C++17 ({} B), Zig ({} B)",
-            sdk::C99_HEADER.len(),
+            c99_header.len(),
             sdk::CPP17_HEADER.len(),
             sdk::ZIG_SDK.len()
         ),

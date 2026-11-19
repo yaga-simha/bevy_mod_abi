@@ -467,6 +467,7 @@ dependencies = [
  "bevy-settings",
  "bevy_abi_mod_host_sys",
  "bevy_abi_mod_macros",
+ "bevy_abi_mod_manifest",
  "bevy_abi_mod_sys",
  "bevy_app",
  "bevy_asset",
@@ -512,18 +513,16 @@ dependencies = [
  "arc-swap",
  "bevy_abi_mod_macros",
  "bevy_abi_mod_sys",
+ "bevy_abi_mod_trust",
  "bevy_app",
  "bevy_ecs",
  "bevy_platform",
  "bevy_reflect",
  "bevy_tasks",
- "ed25519-dalek",
  "libloading",
  "loom",
  "nonmax",
  "proptest",
- "signature",
- "ssh-encoding",
  "ssh-key",
  "thiserror 2.0.21",
  "tracing",
@@ -542,8 +541,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "bevy_abi_mod_manifest"
+version = "0.2.0"
+dependencies = [
+ "bevy_abi_mod_sys",
+ "semver",
+ "serde",
+ "tempfile",
+ "toml 0.8.23",
+]
+
+[[package]]
+name = "bevy_abi_mod_sdk_gen"
+version = "0.2.0"
+dependencies = [
+ "bevy_abi_mod_sys",
+]
+
+[[package]]
 name = "bevy_abi_mod_sys"
 version = "0.2.0"
+
+[[package]]
+name = "bevy_abi_mod_trust"
+version = "0.2.0"
+dependencies = [
+ "ed25519-dalek",
+ "proptest",
+ "sha2",
+ "signature",
+ "ssh-encoding",
+ "ssh-key",
+ "tempfile",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "bevy_android"
@@ -2030,15 +2061,14 @@ dependencies = [
 name = "cargo-bam"
 version = "0.2.0"
 dependencies = [
+ "bevy_abi_mod_manifest",
+ "bevy_abi_mod_sdk_gen",
  "bevy_abi_mod_sys",
+ "bevy_abi_mod_trust",
  "clap",
- "ed25519-dalek",
  "semver",
  "serde",
  "sha2",
- "signature",
- "ssh-encoding",
- "ssh-key",
  "tempfile",
  "thiserror 2.0.21",
  "toml 0.8.23",
@@ -7906,11 +7936,10 @@ name = "xtask"
 version = "0.2.0"
 dependencies = [
  "bevy_abi_mod_macros",
+ "bevy_abi_mod_manifest",
+ "bevy_abi_mod_sdk_gen",
  "bevy_abi_mod_sys",
- "ed25519-dalek",
- "signature",
- "ssh-encoding",
- "ssh-key",
+ "bevy_abi_mod_trust",
 ]
 
 [[package]]

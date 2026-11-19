@@ -6,7 +6,7 @@ pub const ABI_VERSION_MAJOR: u32 = 0;
 
 /// Minor version of the ABI contract. Breaking while `ABI_VERSION_MAJOR == 0`; backward-compatible
 /// additive capability bumps once `ABI_VERSION_MAJOR >= 1`.
-pub const ABI_VERSION_MINOR: u32 = 2;
+pub const ABI_VERSION_MINOR: u32 = 3;
 
 /// Patch version of the ABI contract. Incremented for wire-identical internal fixes.
 pub const ABI_VERSION_PATCH: u32 = 0;
@@ -61,7 +61,7 @@ pub const fn abi_version_patch(version: u32) -> u32 {
     version & 0xFFFF
 }
 
-/// Packed 32-bit ABI version word (`0x0002_0000` for `0.2.0`).
+/// Packed 32-bit ABI version word (`0x0003_0000` for `0.3.0`).
 ///
 /// # Example
 ///
@@ -75,8 +75,8 @@ pub const fn abi_version_patch(version: u32) -> u32 {
 ///     unpack_abi_version(ABI_VERSION),
 ///     (ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PATCH),
 /// );
-/// assert!(abi_version_is_compatible(pack_abi_version(0, 2, 5), ABI_VERSION));
-/// assert!(!abi_version_is_compatible(pack_abi_version(0, 1, 0), ABI_VERSION));
+/// assert!(abi_version_is_compatible(pack_abi_version(0, 3, 5), ABI_VERSION));
+/// assert!(!abi_version_is_compatible(pack_abi_version(0, 2, 0), ABI_VERSION));
 /// assert!(abi_version_is_compatible(pack_abi_version(1, 2, 0), pack_abi_version(1, 1, 0)));
 /// ```
 pub const ABI_VERSION: u32 =

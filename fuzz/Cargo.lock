@@ -102,7 +102,9 @@ version = "0.2.0"
 dependencies = [
  "bevy_abi_mod_host",
  "bevy_abi_mod_host_sys",
+ "bevy_abi_mod_manifest",
  "bevy_abi_mod_sys",
+ "bevy_abi_mod_trust",
  "bevy_ecs",
  "libfuzzer-sys",
 ]
@@ -113,6 +115,7 @@ version = "0.2.0"
 dependencies = [
  "bevy_abi_mod_host_sys",
  "bevy_abi_mod_macros",
+ "bevy_abi_mod_manifest",
  "bevy_abi_mod_sys",
  "bevy_app",
  "bevy_ecs",
@@ -129,16 +132,13 @@ version = "0.2.0"
 dependencies = [
  "arc-swap",
  "bevy_abi_mod_sys",
+ "bevy_abi_mod_trust",
  "bevy_app",
  "bevy_ecs",
  "bevy_platform",
  "bevy_tasks",
- "ed25519-dalek",
  "libloading",
  "nonmax",
- "signature",
- "ssh-encoding",
- "ssh-key",
  "thiserror",
  "tracing",
 ]
@@ -154,8 +154,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "bevy_abi_mod_manifest"
+version = "0.2.0"
+dependencies = [
+ "bevy_abi_mod_sys",
+ "semver",
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "bevy_abi_mod_sys"
 version = "0.2.0"
+
+[[package]]
+name = "bevy_abi_mod_trust"
+version = "0.2.0"
+dependencies = [
+ "ed25519-dalek",
+ "sha2",
+ "signature",
+ "ssh-encoding",
+ "ssh-key",
+ "thiserror",
+]
 
 [[package]]
 name = "bevy_app"

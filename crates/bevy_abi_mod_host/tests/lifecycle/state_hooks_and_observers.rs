@@ -297,6 +297,7 @@ struct CDamageApplied {
     #[event_target]
     entity: TargetEntity,
     amount: f32,
+    pad0: u32,
 }
 
 #[repr(C)]
@@ -453,6 +454,7 @@ fn c99_dynamic_layout_and_entity_event_observers_lifecycle() {
     app.world_mut().trigger(CDamageApplied {
         entity: TargetEntity::from(unwatched_entity),
         amount: 15.0,
+        pad0: 0,
     });
     assert!(app.world().get::<CDamagedMark>(unwatched_entity).is_none());
 
@@ -460,6 +462,7 @@ fn c99_dynamic_layout_and_entity_event_observers_lifecycle() {
     app.world_mut().trigger(CDamageApplied {
         entity: TargetEntity::from(watched_entity),
         amount: 33.0,
+        pad0: 0,
     });
     // Flush observer deferred commands and verify `.in_set("host::logic")` executes strictly
     // between host `BeforeLogic` (10) and `AfterLogic` (20).
@@ -494,6 +497,7 @@ fn c99_dynamic_layout_and_entity_event_observers_lifecycle() {
     app.world_mut().trigger(CDamageApplied {
         entity: TargetEntity::from(watched_entity),
         amount: 99.0,
+        pad0: 0,
     });
     assert!(app.world_mut().despawn(e_layout_post));
     // Trigger/despawn caused zero callbacks; host Update still runs BeforeLogic & AfterLogic only.

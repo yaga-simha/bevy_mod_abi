@@ -41,12 +41,14 @@ pub(crate) fn expand_abi_pod(input: &DeriveInput) -> syn::Result<TokenStream> {
 
     let struct_ident = &input.ident;
     let mut field_assertions = Vec::new();
+    let mut field_size_sum = quote! { 0usize };
     for field in fields.iter() {
         let field_ty = &field.ty;
         let span = field_ty.span();
         field_assertions.push(quote_spanned! { span =>
             #sys_crate::assert_abi_pod::<#field_ty>();
         });
+        field_size_sum = quote! { #field_size_sum + ::core::mem::size_of::<#field_ty>() };
     }
 
     Ok(quote! {
@@ -57,9 +59,13 @@ pub(crate) fn expand_abi_pod(input: &DeriveInput) -> syn::Result<TokenStream> {
                 #(#field_assertions)*
             }
             ::core::assert!(!::core::mem::needs_drop::<#struct_ident>());
+            ::core::assert!(
+                ::core::mem::size_of::<#struct_ident>() == (#field_size_sum),
+                "`#[derive(AbiPod)]` requires zero implicit compiler padding; insert explicit `_pad` fields"
+            );
 
             // SAFETY: Verified `#[repr(C)]` / `#[repr(transparent)]` non-packed struct, `Copy + 'static`,
-            // zero drop glue, and every field verified `AbiPod` via `assert_abi_pod` above.
+            // zero drop glue, zero implicit compiler padding, and every field verified `AbiPod` via `assert_abi_pod` above.
             #[allow(clippy::undocumented_unsafe_blocks)]
             unsafe impl #sys_crate::RawInsertable for #struct_ident {}
 

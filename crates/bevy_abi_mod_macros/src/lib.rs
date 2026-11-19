@@ -485,12 +485,14 @@ mod tests {
             #[repr(C)]
             pub struct ValidPod {
                 pub x: f32,
+                pub _pad: u32,
                 pub y: u64,
             }
         };
         let ts = expand_abi_pod(&valid_pod).unwrap().to_string();
         assert!(ts.contains("assert_abi_pod :: < f32 > ()"));
         assert!(ts.contains("assert_abi_pod :: < u64 > ()"));
+        assert!(ts.contains("size_of :: < ValidPod > () =="));
         assert!(ts.contains("unsafe impl :: bevy_abi_mod_sys :: RawInsertable for ValidPod"));
         assert!(ts.contains("unsafe impl :: bevy_abi_mod_sys :: AbiPod for ValidPod"));
     }

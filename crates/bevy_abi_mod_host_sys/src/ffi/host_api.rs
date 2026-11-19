@@ -1,4 +1,4 @@
-//! Static 50-slot `HOST_API: BamHostApi` function table passed to `bevy_abi_mod_init`.
+//! Static 68-slot `HOST_API: BamHostApi` function table passed to `bevy_abi_mod_init`.
 
 use crate::ffi::assets_scene::{
     host_asset_get_load_state, host_asset_load, host_asset_release, host_cmd_spawn_scene,
@@ -25,6 +25,14 @@ use crate::ffi::register::{
     host_load_host_ctx, host_register_component, host_register_observer, host_register_system,
     host_resolve_component,
 };
+use crate::ffi::v03_ext::{
+    host_bind_named_object, host_cmd_checkpoint, host_cmd_insert_relation,
+    host_cmd_remove_relation, host_cmd_rollback, host_component_layout_info,
+    host_configure_schedule_set, host_intern_symbol, host_iter_count, host_iter_up_cascade,
+    host_log_diagnostic, host_migrate_component_column, host_mount_system_in_schedule,
+    host_par_for_each_chunk_readonly, host_register_relation, host_register_system_handle,
+    host_report_guest_fault, host_resolve_component_by_uuid,
+};
 use crate::handle_header::host_last_error;
 use crate::system::{
     host_sys_commands, host_sys_entity_get, host_sys_entity_get_mut, host_sys_host_ctx,
@@ -32,7 +40,7 @@ use crate::system::{
 };
 use bevy_abi_mod_sys::{ABI_VERSION, BamHostApi};
 
-/// Global immutable 50-slot C-ABI v0.2 host function table.
+/// Global immutable 68-slot C-ABI v0.3 host function table.
 pub static HOST_API: BamHostApi = BamHostApi {
     struct_size: core::mem::size_of::<BamHostApi>() as u32,
     abi_version: ABI_VERSION,
@@ -104,7 +112,28 @@ pub static HOST_API: BamHostApi = BamHostApi {
     asset_get_load_state: Some(host_asset_get_load_state),
     asset_release: Some(host_asset_release),
     cmd_spawn_scene: Some(host_cmd_spawn_scene),
+
+    // ABI `0.3.0` extended diagnostics, schema/layout introspection, relations, scheduling & checkpoints
+    log_diagnostic: Some(host_log_diagnostic),
+    report_guest_fault: Some(host_report_guest_fault),
+    resolve_component_by_uuid: Some(host_resolve_component_by_uuid),
+    component_layout_info: Some(host_component_layout_info),
+    register_relation: Some(host_register_relation),
+    intern_symbol: Some(host_intern_symbol),
+    bind_named_object: Some(host_bind_named_object),
+    iter_count: Some(host_iter_count),
+    iter_up_cascade: Some(host_iter_up_cascade),
+    par_for_each_chunk_readonly: Some(host_par_for_each_chunk_readonly),
+    register_system_handle: Some(host_register_system_handle),
+    configure_schedule_set: Some(host_configure_schedule_set),
+    mount_system_in_schedule: Some(host_mount_system_in_schedule),
+    cmd_checkpoint: Some(host_cmd_checkpoint),
+    cmd_rollback: Some(host_cmd_rollback),
+    cmd_insert_relation: Some(host_cmd_insert_relation),
+    cmd_remove_relation: Some(host_cmd_remove_relation),
+    migrate_component_column: Some(host_migrate_component_column),
 };
 
 const _: () = assert!(HOST_API.has_all_v0_2_slots());
+const _: () = assert!(HOST_API.has_all_v0_3_slots());
 const _: () = assert!(HOST_API.has_all_slots());

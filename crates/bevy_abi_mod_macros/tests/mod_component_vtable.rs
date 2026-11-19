@@ -561,6 +561,7 @@ pub struct PodEntityTransform {
     pub target: FfiEntity,
     pub origin: PodPosition,
     pub weights: [f32; 4],
+    pub _pad: u32,
 }
 
 #[repr(C)]
@@ -589,6 +590,7 @@ pub struct OpaqueNamedHolder {
 pub struct StandalonePodPair {
     pub a: u64,
     pub b: f32,
+    pub _pad: u32,
 }
 
 #[repr(transparent)]
@@ -641,6 +643,7 @@ fn pod_vs_raw_insertable_vs_opaque_traits() {
             z: 3.0,
         },
         weights: [0.25, 0.25, 0.25, 0.25],
+        _pad: 0,
     };
     let xform_vt = PodEntityTransform::vtable();
     let xform_ptr = (&raw mut xform).cast::<c_void>();
@@ -2004,4 +2007,122 @@ fn wide_i64_and_u64_enums_discriminants_vtables_and_witness_roundtrip() {
         );
     }
     assert_eq!(u_dst, u_val);
+}
+
+#[test]
+fn schema_fingerprint_bam_fields_and_custom_require_init_work() {
+    use bevy_abi_mod_sys::{
+        BAM_REQUIRED_FLAG_INIT_FN, BAM_REQUIRED_FLAG_RESOLVE_BY_UUID, BamFieldKind, FfiOption,
+    };
+    use core::mem::MaybeUninit;
+
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone, PartialEq, ModComponent)]
+    #[mod_component(name = "meta::Health")]
+    struct MetaHealth {
+        hp: i32,
+        max_hp: i32,
+    }
+
+    impl MetaHealth {
+        fn make(hp: i32) -> Self {
+            Self { hp, max_hp: hp * 2 }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone, PartialEq, ModComponent)]
+    #[mod_component(name = "meta::Marker")]
+    struct MetaMarker {
+        tag: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone, PartialEq, ModComponent)]
+    #[mod_component(
+        name = "meta::Actor",
+        require(MetaHealth = MetaHealth::make(125), MetaMarker)
+    )]
+    struct MetaActor {
+        id: u64,
+        score: f32,
+        opt: FfiOption<u8>,
+        _pad: [u8; 2],
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone, PartialEq, ModComponent)]
+    #[mod_component(name = "meta::Actor")]
+    struct MetaActorReordered {
+        score: f32,
+        _pad0: u32,
+        id: u64,
+        opt: FfiOption<u8>,
+        _pad1: [u8; 6],
+    }
+
+    #[derive(ModComponent)]
+    #[mod_component(name = "meta::DynamicRich")]
+    struct DynamicRich {
+        name: String,
+        items: Vec<u32>,
+        active: bool,
+        #[mod_field(skip)]
+        _internal: u64,
+    }
+
+    // 1. Deterministic 64-bit FNV-1a schema fingerprints diverge on layout/order changes.
+    assert_ne!(MetaActor::SCHEMA_FINGERPRINT, 0);
+    assert_ne!(
+        MetaActor::SCHEMA_FINGERPRINT,
+        MetaActorReordered::SCHEMA_FINGERPRINT
+    );
+    assert_ne!(DynamicRich::SCHEMA_FINGERPRINT, 0);
+
+    // 2. BAM_FIELDS preserves exact names, kinds, offsets, sizes, and alignments.
+    assert_eq!(MetaActor::BAM_FIELDS.len(), 4);
+    assert_eq!(MetaActor::BAM_FIELDS[0].kind, BamFieldKind::U64);
+    assert_eq!(
+        unsafe { MetaActor::BAM_FIELDS[0].name.try_as_str().unwrap() },
+        "id"
+    );
+    assert_eq!(MetaActor::BAM_FIELDS[0].offset, 0);
+    assert_eq!(MetaActor::BAM_FIELDS[0].size, 8);
+    assert_eq!(MetaActor::BAM_FIELDS[1].kind, BamFieldKind::F32);
+    assert_eq!(MetaActor::BAM_FIELDS[1].offset, 8);
+    assert_eq!(MetaActor::BAM_FIELDS[2].kind, BamFieldKind::FFI_OPTION);
+    assert_eq!(MetaActor::BAM_FIELDS[2].offset, 12);
+    assert_eq!(MetaActor::BAM_FIELDS[2].size, 2);
+
+    assert_eq!(DynamicRich::BAM_FIELDS.len(), 4);
+    assert_eq!(DynamicRich::BAM_FIELDS[0].kind, BamFieldKind::STRING);
+    assert_eq!(DynamicRich::BAM_FIELDS[1].kind, BamFieldKind::VEC);
+    assert_eq!(DynamicRich::BAM_FIELDS[2].kind, BamFieldKind::BOOL);
+    assert_eq!(DynamicRich::BAM_FIELDS[3].kind, BamFieldKind::OPAQUE);
+
+    // 3. `require(Comp = expr)` emits init_fn initializing `MetaHealth::make(125)`.
+    let reqs = <MetaActor as ModComponent>::REQUIRED_COMPONENTS;
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs[0].uuid, MetaHealth::UUID);
+    assert_eq!(
+        reqs[0].flags,
+        BAM_REQUIRED_FLAG_INIT_FN | BAM_REQUIRED_FLAG_RESOLVE_BY_UUID
+    );
+    assert_eq!(reqs[0].init_size, core::mem::size_of::<MetaHealth>());
+    let init_fn = reqs[0].init_fn.expect("custom init_fn generated");
+    let mut slot = MaybeUninit::<MetaHealth>::uninit();
+    let res = unsafe { init_fn(slot.as_mut_ptr().cast::<c_void>(), core::ptr::null_mut()) };
+    assert_eq!(res, FfiResult::OK);
+    let initialized = unsafe { slot.assume_init() };
+    assert_eq!(
+        initialized,
+        MetaHealth {
+            hp: 125,
+            max_hp: 250
+        }
+    );
+
+    assert_eq!(reqs[1].uuid, MetaMarker::UUID);
+    assert_eq!(reqs[1].flags, BAM_REQUIRED_FLAG_RESOLVE_BY_UUID);
+    assert!(reqs[1].init_fn.is_none());
 }

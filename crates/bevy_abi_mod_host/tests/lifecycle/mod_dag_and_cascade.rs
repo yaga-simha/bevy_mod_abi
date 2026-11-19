@@ -3,7 +3,7 @@
 
 use crate::support::{TempDylibCopy, fixture_dylib};
 use bevy_abi_mod_host::mod_dag::{
-    ModDagError, ModDependencyGraph, ModTomlManifest, resolve_dependency_dag,
+    ManifestError, ModDagError, ModDependencyGraph, ModTomlManifest, resolve_dependency_dag,
 };
 use bevy_abi_mod_host::prelude::*;
 use bevy_abi_mod_sys::{ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PATCH};
@@ -110,7 +110,7 @@ version = "1.0.0"
 "#;
     assert!(matches!(
         ModTomlManifest::parse_str(missing_name, "bad/mod.toml"),
-        Err(ModDagError::MissingModName { .. })
+        Err(ManifestError::MissingModName { .. })
     ));
 
     // Invalid SemVer version
@@ -121,7 +121,7 @@ version = "not-a-semver"
 "#;
     assert!(matches!(
         ModTomlManifest::parse_str(bad_ver, "bad/mod.toml"),
-        Err(ModDagError::InvalidVersion { .. })
+        Err(ManifestError::InvalidVersion { .. })
     ));
 
     // Invalid dependency SemVer requirement
@@ -135,7 +135,7 @@ core = "===broken"
 "#;
     assert!(matches!(
         ModTomlManifest::parse_str(bad_dep_req, "bad/mod.toml"),
-        Err(ModDagError::InvalidDependencyReq { .. })
+        Err(ManifestError::InvalidDependencyReq { .. })
     ));
 }
 

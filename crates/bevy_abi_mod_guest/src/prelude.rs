@@ -3,13 +3,15 @@
 pub use bevy_abi_mod_guest_sys::SpawnEntry;
 pub use bevy_abi_mod_sys::{
     ABI_VERSION, AbiPod, AccessMode, BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET,
-    BAM_COMPONENT_FLAG_SUMMARY_TICK, BAM_OBSERVER_FLAG_PROPAGATE,
-    BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL, BAM_SYSTEM_FLAG_MAIN_THREAD, BAM_TRIGGER_FLAG_PROPAGATE,
-    BamChangeTicks, BamColumnInfo, BamComponent, BamEventKind, BamManifest, BamObserverDesc,
-    BamObserverFn, BamObserverMutFn, BamTriggerDesc, ComponentUuid, FfiAssetHandle,
-    FfiAssetLoadState, FfiBool, FfiChildOf, FfiEntity, FfiOption, FfiResult, FfiSlice,
-    MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent, RawInsertable, ScheduleId, StrView,
-    VTableHeader,
+    BAM_COMPONENT_FLAG_SUMMARY_TICK, BAM_LOG_DEBUG, BAM_LOG_ERROR, BAM_LOG_INFO, BAM_LOG_TRACE,
+    BAM_LOG_WARN, BAM_OBSERVER_FLAG_PROPAGATE, BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL,
+    BAM_SYSTEM_FLAG_MAIN_THREAD, BAM_TRIGGER_FLAG_PROPAGATE, BamChangeTicks, BamColumnInfo,
+    BamComponent, BamEventKind, BamFieldDesc, BamFieldKind, BamLayoutInfo, BamManifest,
+    BamObserverDesc, BamObserverFn, BamObserverMutFn, BamRelationDesc, BamRequiredComponent,
+    BamRowMigrateFn, BamScheduleSetDesc, BamSymbol, BamSystem, BamSystemSet, BamTriggerDesc,
+    ComponentUuid, FfiAssetHandle, FfiAssetLoadState, FfiBool, FfiChildOf, FfiEntity, FfiOption,
+    FfiResult, FfiSlice, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent, RawInsertable,
+    ScheduleId, StrView, VTableHeader,
 };
 
 #[cfg(feature = "derive")]

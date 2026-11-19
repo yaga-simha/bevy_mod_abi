@@ -891,9 +891,9 @@ mod registry_and_command_bridge {
         #[cfg(target_pointer_width = "64")]
         {
             assert_eq!(BamHostApi::MIN_V0_2_SIZE, 224);
-            assert_eq!(core::mem::size_of::<BamHostApi>(), 408);
+            assert_eq!(core::mem::size_of::<BamHostApi>(), 552);
             assert_eq!(core::mem::align_of::<BamHostApi>(), 8);
-            assert_eq!(HOST_API.struct_size, 408);
+            assert_eq!(HOST_API.struct_size, 552);
             assert_eq!(core::mem::offset_of!(BamHostApi, register_component), 32);
         }
         assert_eq!(HOST_API.abi_version, ABI_VERSION);

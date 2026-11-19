@@ -1992,7 +1992,7 @@ mod padded_and_entity_layout {
 
     #[repr(C)]
     #[derive(Component, ModComponent, Copy, Clone, Debug, PartialEq, Eq)]
-    #[mod_component(name = "ffi_layout::PaddedLayoutPair")]
+    #[mod_component(name = "ffi_layout::PaddedLayoutPair", no_pod)]
     struct PaddedLayoutPair {
         tag: u8,
         // 7 padding bytes at offsets 1..8

@@ -10,5 +10,7 @@ pub use catalog::{
     InsertDefaultFn, InsertRawFn, ModRegistry, MsgReadBatchFn, MsgSendFn, MsgWriteBatchFn,
     RegisteredComponent, RegistrySnapshot, TargetEntity, TriggerEventFn,
 };
-pub(crate) use catalog::{SymbolRecord, component_flags_to_storage_flags};
+pub(crate) use catalog::{
+    SymbolRecord, component_flags_to_storage_flags, extract_owned_dynamic_fields,
+};
 pub use collision::ComponentCollisionError;

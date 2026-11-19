@@ -6,12 +6,15 @@ use core::{
 };
 
 use crate::{
+    access::ScheduleId,
     commands::{
         BamCmdDespawnAllFn, BamCmdDespawnFn, BamCmdInsertDefaultFn, BamCmdInsertFn,
         BamCmdObserveFn, BamCmdRemoveFn, BamCmdSpawnBatchFn, BamCmdSpawnEmptyFn, BamCmdSpawnFn,
         BamCmdSpawnSceneFn, BamCmdTriggerExFn, BamCmdTriggerFn, BamCommands,
     },
-    component::ComponentDesc,
+    component::{
+        BamLayoutInfo, BamRelationDesc, BamRowMigrateFn, BamScheduleSetDesc, ComponentDesc,
+    },
     extensible::ExtensibleStruct,
     iter::{
         BamChangeTicks, BamIter, BamIterColumnInfoFn, BamIterColumnMutableFn,
@@ -21,8 +24,8 @@ use crate::{
         BamMsgWriteBatchFn, BamParForEachChunkFn, BamResMutPtrFn, BamResPtrFn, BamResTicksFn,
     },
     primitives::{
-        BamComponent, ComponentUuid, FfiAssetHandle, FfiAssetLoadState, FfiEntity, FfiResult,
-        StrView,
+        BamComponent, BamSymbol, BamSystem, BamSystemSet, ComponentUuid, FfiAssetHandle,
+        FfiAssetLoadState, FfiEntity, FfiResult, StrView,
     },
     system::{BamHostCtx, BamLoadCtx, BamObserverDesc, BamSystemCtx, BamSystemDesc},
     version::{ABI_VERSION, abi_version_is_compatible},
@@ -493,6 +496,146 @@ pub type BamAssetGetLoadStateFn = unsafe extern "C" fn(
 pub type BamAssetReleaseFn =
     unsafe extern "C" fn(ctx: *const BamHostCtx, handle: *const FfiAssetHandle) -> FfiResult;
 
+/// Trace severity passed to [`BamLogDiagnosticFn`] (`0`).
+pub const BAM_LOG_TRACE: u32 = 0;
+/// Debug severity passed to [`BamLogDiagnosticFn`] (`1`).
+pub const BAM_LOG_DEBUG: u32 = 1;
+/// Info severity passed to [`BamLogDiagnosticFn`] (`2`).
+pub const BAM_LOG_INFO: u32 = 2;
+/// Warning severity passed to [`BamLogDiagnosticFn`] (`3`).
+pub const BAM_LOG_WARN: u32 = 3;
+/// Error severity passed to [`BamLogDiagnosticFn`] (`4`).
+pub const BAM_LOG_ERROR: u32 = 4;
+
+/// Emits a structured guest diagnostic message via the host `tracing` subscriber
+/// (`typedef BamResult (*BamLogDiagnosticFn)(const BamHostCtx* ctx, uint32_t level, BamStrView message);`).
+pub type BamLogDiagnosticFn =
+    unsafe extern "C" fn(ctx: *const BamHostCtx, level: u32, message: StrView) -> FfiResult;
+
+/// Records a guest-side fatal or recoverable fault on `ctx` without unwinding across FFI
+/// (`typedef BamResult (*BamReportGuestFaultFn)(const BamHostCtx* ctx, BamStrView message);`).
+pub type BamReportGuestFaultFn =
+    unsafe extern "C" fn(ctx: *const BamHostCtx, message: StrView) -> FfiResult;
+
+/// Resolves a registered component or resource strictly by its 128-bit [`ComponentUuid`]
+/// (`typedef BamResult (*BamResolveComponentByUuidFn)(const BamHostCtx* ctx, const BamComponentUuid* uuid, BamComponent* out_component);`).
+pub type BamResolveComponentByUuidFn = unsafe extern "C" fn(
+    ctx: *const BamHostCtx,
+    uuid: *const ComponentUuid,
+    out_component: *mut BamComponent,
+) -> FfiResult;
+
+/// Queries registered layout, schema fingerprint, and [`crate::BamFieldDesc`] reflection metadata
+/// (`typedef BamResult (*BamComponentLayoutInfoFn)(const BamHostCtx* ctx, BamComponent component, BamLayoutInfo* out_info);`).
+pub type BamComponentLayoutInfoFn = unsafe extern "C" fn(
+    ctx: *const BamHostCtx,
+    component: BamComponent,
+    out_info: *mut BamLayoutInfo,
+) -> FfiResult;
+
+/// Registers a typed entity relationship edge descriptor during mod initialization
+/// (`typedef BamResult (*BamRegisterRelationFn)(BamLoadCtx* load_ctx, const BamRelationDesc* desc, BamComponent* out_component);`).
+pub type BamRegisterRelationFn = unsafe extern "C" fn(
+    load_ctx: *mut BamLoadCtx,
+    desc: *const BamRelationDesc,
+    out_component: *mut BamComponent,
+) -> FfiResult;
+
+/// Interns an arbitrary UTF-8 symbol string to an `O(1)` comparable [`BamSymbol`] handle
+/// (`typedef BamResult (*BamInternSymbolFn)(const BamHostCtx* ctx, BamStrView symbol, BamSymbol* out_symbol);`).
+pub type BamInternSymbolFn = unsafe extern "C" fn(
+    ctx: *const BamHostCtx,
+    symbol: StrView,
+    out_symbol: *mut BamSymbol,
+) -> FfiResult;
+
+/// Binds a canonical lookup name to an entity in the host symbol registry
+/// (`typedef BamResult (*BamBindNamedObjectFn)(const BamHostCtx* ctx, BamStrView name, BamEntity entity);`).
+pub type BamBindNamedObjectFn =
+    unsafe extern "C" fn(ctx: *const BamHostCtx, name: StrView, entity: FfiEntity) -> FfiResult;
+
+/// Counts matching entities in an active query iterator without destroying chunks
+/// (`typedef BamResult (*BamIterCountFn)(BamIter* iter, size_t* out_count);`).
+pub type BamIterCountFn =
+    unsafe extern "C" fn(iter: *mut BamIter, out_count: *mut usize) -> FfiResult;
+
+/// Walks an ancestor relationship chain upward until finding `term_index`
+/// (`typedef BamResult (*BamIterUpCascadeFn)(BamIter* iter, BamComponent relation, BamEntity entity, size_t term_index, const void** out_ptr, BamEntity* out_owner);`).
+pub type BamIterUpCascadeFn = unsafe extern "C" fn(
+    iter: *mut BamIter,
+    relation: BamComponent,
+    entity: FfiEntity,
+    term_index: usize,
+    out_ptr: *mut *const c_void,
+    out_owner: *mut FfiEntity,
+) -> FfiResult;
+
+/// Registers a unified [`BamSystemDesc`] and returns its assigned [`BamSystem`] handle
+/// (`typedef BamResult (*BamRegisterSystemHandleFn)(BamLoadCtx* load_ctx, const BamSystemDesc* desc, BamSystem* out_system);`).
+pub type BamRegisterSystemHandleFn = unsafe extern "C" fn(
+    load_ctx: *mut BamLoadCtx,
+    desc: *const BamSystemDesc,
+    out_system: *mut BamSystem,
+) -> FfiResult;
+
+/// Configures a named schedule system set and its `before`/`after` ordering edges
+/// (`typedef BamResult (*BamConfigureScheduleSetFn)(BamLoadCtx* load_ctx, const BamScheduleSetDesc* desc, BamSystemSet* out_set);`).
+pub type BamConfigureScheduleSetFn = unsafe extern "C" fn(
+    load_ctx: *mut BamLoadCtx,
+    desc: *const BamScheduleSetDesc,
+    out_set: *mut BamSystemSet,
+) -> FfiResult;
+
+/// Mounts a registered [`BamSystem`] into `schedule` under `set`
+/// (`typedef BamResult (*BamMountSystemInScheduleFn)(BamLoadCtx* load_ctx, BamSystem system, BamScheduleId schedule, BamSystemSet set);`).
+pub type BamMountSystemInScheduleFn = unsafe extern "C" fn(
+    load_ctx: *mut BamLoadCtx,
+    system: BamSystem,
+    schedule: ScheduleId,
+    set: BamSystemSet,
+) -> FfiResult;
+
+/// Captures a deferred command-buffer checkpoint token
+/// (`typedef BamResult (*BamCmdCheckpointFn)(BamCommands* commands, size_t* out_checkpoint);`).
+pub type BamCmdCheckpointFn =
+    unsafe extern "C" fn(commands: *mut BamCommands, out_checkpoint: *mut usize) -> FfiResult;
+
+/// Rolls back deferred commands queued after `checkpoint`, invoking uncommitted guest destructors
+/// (`typedef BamResult (*BamCmdRollbackFn)(BamCommands* commands, size_t checkpoint);`).
+pub type BamCmdRollbackFn =
+    unsafe extern "C" fn(commands: *mut BamCommands, checkpoint: usize) -> FfiResult;
+
+/// Queues insertion of a typed relationship edge `entity --[relation]--> target`
+/// (`typedef BamResult (*BamCmdInsertRelationFn)(BamCommands* commands, BamEntity entity, BamComponent relation, BamEntity target, const void* data, size_t data_size);`).
+pub type BamCmdInsertRelationFn = unsafe extern "C" fn(
+    commands: *mut BamCommands,
+    entity: FfiEntity,
+    relation: BamComponent,
+    target: FfiEntity,
+    data: *const c_void,
+    data_size: usize,
+) -> FfiResult;
+
+/// Queues removal of a typed relationship edge `entity --[relation]--> target`
+/// (`typedef BamResult (*BamCmdRemoveRelationFn)(BamCommands* commands, BamEntity entity, BamComponent relation, BamEntity target);`).
+pub type BamCmdRemoveRelationFn = unsafe extern "C" fn(
+    commands: *mut BamCommands,
+    entity: FfiEntity,
+    relation: BamComponent,
+    target: FfiEntity,
+) -> FfiResult;
+
+/// Migrates live ECS rows of `component` from `old_fingerprint` to `new_desc` using `migrate_fn`
+/// (`typedef BamResult (*BamMigrateComponentColumnFn)(BamLoadCtx* load_ctx, BamComponent component, uint64_t old_fingerprint, const BamComponentDesc* new_desc, BamRowMigrateFn migrate_fn, void* user_data);`).
+pub type BamMigrateComponentColumnFn = unsafe extern "C" fn(
+    load_ctx: *mut BamLoadCtx,
+    component: BamComponent,
+    old_fingerprint: u64,
+    new_desc: *const ComponentDesc,
+    migrate_fn: Option<BamRowMigrateFn>,
+    user_data: *mut c_void,
+) -> FfiResult;
+
 /// Complete versioned host function table passed to `bevy_abi_mod_init`
 /// (`typedef struct BamHostApi BamHostApi;`).
 ///
@@ -500,8 +643,8 @@ pub type BamAssetReleaseFn =
 /// null-pointer checks are sound without raw pointer byte-probing.
 ///
 /// Layout:
-/// - 64-bit: `MIN_V0_2_SIZE = 224` bytes (`8`B header + `27 * 8`B core slots; `size_of = 408` bytes with 23 optional extended slots), `8`-byte alignment.
-/// - 32-bit: `MIN_V0_2_SIZE = 116` bytes (`8`B header + `27 * 4`B core slots; `size_of = 208` bytes with 23 optional extended slots), `4`-byte alignment.
+/// - 64-bit: `MIN_V0_2_SIZE = 224` bytes (`8`B header + `27 * 8`B core slots; `size_of = 552` bytes with all 68 ABI `0.3` slots), `8`-byte alignment.
+/// - 32-bit: `MIN_V0_2_SIZE = 116` bytes (`8`B header + `27 * 4`B core slots; `size_of = 280` bytes with all 68 ABI `0.3` slots), `4`-byte alignment.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct BamHostApi {
@@ -625,12 +768,53 @@ pub struct BamHostApi {
     pub asset_release: Option<BamAssetReleaseFn>,
     /// Deferred scene asset spawning (`offset 400` / `204`).
     pub cmd_spawn_scene: Option<BamCmdSpawnSceneFn>,
+
+    // ABI `0.3.0` extended diagnostics, schema/layout introspection, relations, scheduling & checkpoints
+    /// Emit structured guest log via host `tracing` (`offset 408` / `208`).
+    pub log_diagnostic: Option<BamLogDiagnosticFn>,
+    /// Report a guest-side fault on `BamHostCtx` (`offset 416` / `212`).
+    pub report_guest_fault: Option<BamReportGuestFaultFn>,
+    /// Resolve a component/resource by 128-bit UUID (`offset 424` / `216`).
+    pub resolve_component_by_uuid: Option<BamResolveComponentByUuidFn>,
+    /// Query registered `BamLayoutInfo`, schema fingerprint & fields (`offset 432` / `220`).
+    pub component_layout_info: Option<BamComponentLayoutInfoFn>,
+    /// Register a typed entity relationship edge (`offset 440` / `224`).
+    pub register_relation: Option<BamRegisterRelationFn>,
+    /// Intern a UTF-8 symbol string to an `O(1)` `BamSymbol` (`offset 448` / `228`).
+    pub intern_symbol: Option<BamInternSymbolFn>,
+    /// Bind a canonical name to an entity (`offset 456` / `232`).
+    pub bind_named_object: Option<BamBindNamedObjectFn>,
+    /// Count matching entities in an active iterator (`offset 464` / `236`).
+    pub iter_count: Option<BamIterCountFn>,
+    /// Walk ancestor relationship chain upward (`offset 472` / `240`).
+    pub iter_up_cascade: Option<BamIterUpCascadeFn>,
+    /// Host-driven parallel read-only chunk iteration (`offset 480` / `244`).
+    pub par_for_each_chunk_readonly: Option<BamParForEachChunkFn>,
+    /// Register a system and receive its `BamSystem` handle (`offset 488` / `248`).
+    pub register_system_handle: Option<BamRegisterSystemHandleFn>,
+    /// Configure a schedule system set (`offset 496` / `252`).
+    pub configure_schedule_set: Option<BamConfigureScheduleSetFn>,
+    /// Mount a `BamSystem` into a schedule and set (`offset 504` / `256`).
+    pub mount_system_in_schedule: Option<BamMountSystemInScheduleFn>,
+    /// Capture a command-buffer checkpoint (`offset 512` / `260`).
+    pub cmd_checkpoint: Option<BamCmdCheckpointFn>,
+    /// Roll back queued commands to a checkpoint (`offset 520` / `264`).
+    pub cmd_rollback: Option<BamCmdRollbackFn>,
+    /// Queue typed relationship insertion (`offset 528` / `268`).
+    pub cmd_insert_relation: Option<BamCmdInsertRelationFn>,
+    /// Queue typed relationship removal (`offset 536` / `272`).
+    pub cmd_remove_relation: Option<BamCmdRemoveRelationFn>,
+    /// Migrate live component rows across schemas (`offset 544` / `276`).
+    pub migrate_component_column: Option<BamMigrateComponentColumnFn>,
 }
 
 impl BamHostApi {
     /// Frozen minimum valid `BamHostApi` size in ABI `0.2` (`224` on 64-bit, `116` on 32-bit).
     pub const MIN_V0_2_SIZE: usize =
         core::mem::offset_of!(Self, cmd_remove) + core::mem::size_of::<Option<BamCmdRemoveFn>>();
+
+    /// Full ABI `0.3` size of `BamHostApi` (`552` on 64-bit, `280` on 32-bit, all 68 slots).
+    pub const MIN_V0_3_SIZE: usize = core::mem::size_of::<Self>();
 
     /// Safely reads the `struct_size` header at offset `0` from a potentially smaller `BamHostApi`
     /// allocation without forming a full `&BamHostApi` reference.
@@ -706,7 +890,7 @@ impl BamHostApi {
 
     /// Returns `true` if all 50 ABI `0.2` core and extended function-pointer slots are `Some`.
     #[inline]
-    pub const fn has_all_slots(&self) -> bool {
+    pub const fn has_all_v0_2_extended_slots(&self) -> bool {
         self.has_all_v0_2_slots()
             && self.par_for_each_chunk.is_some()
             && self.sys_entity_get.is_some()
@@ -733,6 +917,35 @@ impl BamHostApi {
             && self.cmd_spawn_scene.is_some()
     }
 
+    /// Returns `true` if all 18 ABI `0.3` function-pointer slots are `Some`.
+    #[inline]
+    pub const fn has_all_v0_3_slots(&self) -> bool {
+        self.log_diagnostic.is_some()
+            && self.report_guest_fault.is_some()
+            && self.resolve_component_by_uuid.is_some()
+            && self.component_layout_info.is_some()
+            && self.register_relation.is_some()
+            && self.intern_symbol.is_some()
+            && self.bind_named_object.is_some()
+            && self.iter_count.is_some()
+            && self.iter_up_cascade.is_some()
+            && self.par_for_each_chunk_readonly.is_some()
+            && self.register_system_handle.is_some()
+            && self.configure_schedule_set.is_some()
+            && self.mount_system_in_schedule.is_some()
+            && self.cmd_checkpoint.is_some()
+            && self.cmd_rollback.is_some()
+            && self.cmd_insert_relation.is_some()
+            && self.cmd_remove_relation.is_some()
+            && self.migrate_component_column.is_some()
+    }
+
+    /// Returns `true` if all 68 ABI `0.3` function-pointer slots are `Some`.
+    #[inline]
+    pub const fn has_all_slots(&self) -> bool {
+        self.has_all_v0_2_extended_slots() && self.has_all_v0_3_slots()
+    }
+
     /// Validates `struct_size >= MIN_V0_2_SIZE`, SemVer compatibility against `guest_version`,
     /// and non-nullness of all 27 core `0.2` slots.
     #[inline]
@@ -752,10 +965,11 @@ impl BamHostApi {
 
 const _: () = {
     assert!(BamHostApi::MIN_V0_2_SIZE <= core::mem::size_of::<BamHostApi>());
+    assert!(BamHostApi::MIN_V0_3_SIZE == core::mem::size_of::<BamHostApi>());
     #[cfg(target_pointer_width = "64")]
     {
         assert!(BamHostApi::MIN_V0_2_SIZE == 224);
-        assert!(core::mem::size_of::<BamHostApi>() == 408);
+        assert!(core::mem::size_of::<BamHostApi>() == 552);
         assert!(core::mem::align_of::<BamHostApi>() == 8);
         assert!(core::mem::offset_of!(BamHostApi, struct_size) == 0);
         assert!(core::mem::offset_of!(BamHostApi, abi_version) == 4);
@@ -809,11 +1023,29 @@ const _: () = {
         assert!(core::mem::offset_of!(BamHostApi, asset_get_load_state) == 384);
         assert!(core::mem::offset_of!(BamHostApi, asset_release) == 392);
         assert!(core::mem::offset_of!(BamHostApi, cmd_spawn_scene) == 400);
+        assert!(core::mem::offset_of!(BamHostApi, log_diagnostic) == 408);
+        assert!(core::mem::offset_of!(BamHostApi, report_guest_fault) == 416);
+        assert!(core::mem::offset_of!(BamHostApi, resolve_component_by_uuid) == 424);
+        assert!(core::mem::offset_of!(BamHostApi, component_layout_info) == 432);
+        assert!(core::mem::offset_of!(BamHostApi, register_relation) == 440);
+        assert!(core::mem::offset_of!(BamHostApi, intern_symbol) == 448);
+        assert!(core::mem::offset_of!(BamHostApi, bind_named_object) == 456);
+        assert!(core::mem::offset_of!(BamHostApi, iter_count) == 464);
+        assert!(core::mem::offset_of!(BamHostApi, iter_up_cascade) == 472);
+        assert!(core::mem::offset_of!(BamHostApi, par_for_each_chunk_readonly) == 480);
+        assert!(core::mem::offset_of!(BamHostApi, register_system_handle) == 488);
+        assert!(core::mem::offset_of!(BamHostApi, configure_schedule_set) == 496);
+        assert!(core::mem::offset_of!(BamHostApi, mount_system_in_schedule) == 504);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_checkpoint) == 512);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_rollback) == 520);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_insert_relation) == 528);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_remove_relation) == 536);
+        assert!(core::mem::offset_of!(BamHostApi, migrate_component_column) == 544);
     }
     #[cfg(target_pointer_width = "32")]
     {
         assert!(BamHostApi::MIN_V0_2_SIZE == 116);
-        assert!(core::mem::size_of::<BamHostApi>() == 208);
+        assert!(core::mem::size_of::<BamHostApi>() == 280);
         assert!(core::mem::align_of::<BamHostApi>() == 4);
         assert!(core::mem::offset_of!(BamHostApi, struct_size) == 0);
         assert!(core::mem::offset_of!(BamHostApi, abi_version) == 4);
@@ -867,6 +1099,24 @@ const _: () = {
         assert!(core::mem::offset_of!(BamHostApi, asset_get_load_state) == 196);
         assert!(core::mem::offset_of!(BamHostApi, asset_release) == 200);
         assert!(core::mem::offset_of!(BamHostApi, cmd_spawn_scene) == 204);
+        assert!(core::mem::offset_of!(BamHostApi, log_diagnostic) == 208);
+        assert!(core::mem::offset_of!(BamHostApi, report_guest_fault) == 212);
+        assert!(core::mem::offset_of!(BamHostApi, resolve_component_by_uuid) == 216);
+        assert!(core::mem::offset_of!(BamHostApi, component_layout_info) == 220);
+        assert!(core::mem::offset_of!(BamHostApi, register_relation) == 224);
+        assert!(core::mem::offset_of!(BamHostApi, intern_symbol) == 228);
+        assert!(core::mem::offset_of!(BamHostApi, bind_named_object) == 232);
+        assert!(core::mem::offset_of!(BamHostApi, iter_count) == 236);
+        assert!(core::mem::offset_of!(BamHostApi, iter_up_cascade) == 240);
+        assert!(core::mem::offset_of!(BamHostApi, par_for_each_chunk_readonly) == 244);
+        assert!(core::mem::offset_of!(BamHostApi, register_system_handle) == 248);
+        assert!(core::mem::offset_of!(BamHostApi, configure_schedule_set) == 252);
+        assert!(core::mem::offset_of!(BamHostApi, mount_system_in_schedule) == 256);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_checkpoint) == 260);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_rollback) == 264);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_insert_relation) == 268);
+        assert!(core::mem::offset_of!(BamHostApi, cmd_remove_relation) == 272);
+        assert!(core::mem::offset_of!(BamHostApi, migrate_component_column) == 276);
     }
 };
 

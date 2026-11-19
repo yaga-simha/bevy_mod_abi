@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 
 #[repr(C)]
 #[derive(Component, ModComponent, Copy, Clone, Debug, PartialEq, Eq)]
-#[mod_component(name = "sched_reg::PaddedPair")]
+#[mod_component(name = "sched_reg::PaddedPair", no_pod)]
 struct PaddedPair {
     tag: u8,
     value: u64,

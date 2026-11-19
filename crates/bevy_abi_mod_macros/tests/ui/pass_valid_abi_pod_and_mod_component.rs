@@ -11,6 +11,7 @@ pub struct ValidC {
     pub uuid: ComponentUuid,
     pub coords: [f32; 3],
     pub flag: FfiBool,
+    pub _pad: [u8; 3],
     pub maybe_id: FfiOption<u32>,
 }
 

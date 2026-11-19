@@ -3,6 +3,7 @@
 use core::ffi::{c_char, c_void};
 
 use crate::{
+    access::ScheduleId,
     extensible::ExtensibleStruct,
     primitives::{BamComponent, ComponentUuid, FfiEntity, FfiResult, StrView},
     traits::AbiPod,
@@ -58,8 +59,10 @@ pub const BAM_COMPONENT_KNOWN_FLAGS: u32 =
 /// Runtime component registration descriptor (`typedef struct BamComponentDesc BamComponentDesc;`).
 ///
 /// Layout:
-/// - 64-bit: `MIN_V0_2_SIZE = 64` bytes (`size_of = 136` bytes with lifecycle hooks, clone, and required components), `8`-byte alignment, zero implicit padding.
-/// - 32-bit: `MIN_V0_2_SIZE = 44` bytes (`size_of = 80` bytes with lifecycle hooks, clone, and required components), `4`-byte alignment, zero implicit padding.
+/// - 64-bit: `MIN_V0_2_SIZE = 64` bytes (`size_of = 176` bytes with v0.3 schema fingerprint,
+///   fields, and required-component custom initializers), `8`-byte alignment, zero implicit padding.
+/// - 32-bit: `MIN_V0_2_SIZE = 44` bytes (`size_of = 104` bytes), `align = align_of::<u64>()` (`4` on
+///   `i686`, `8` on `wasm32`), zero implicit padding on every target.
 ///
 /// # Example
 ///
@@ -109,6 +112,16 @@ pub struct ComponentDesc {
     pub required_components: *const BamComponent,
     /// Number of entries in `required_components` (`offset 128` on 64-bit / `76` on 32-bit).
     pub required_component_count: usize,
+    /// Deterministic 64-bit FNV-1a schema fingerprint (`offset 136` on 64-bit / `80` on 32-bit).
+    pub schema_fingerprint: u64,
+    /// Optional array of static field descriptors (`fields[0..field_count]`, `offset 144` on 64-bit / `88` on 32-bit).
+    pub fields: *const BamFieldDesc,
+    /// Number of entries in `fields` (`offset 152` on 64-bit / `92` on 32-bit).
+    pub field_count: usize,
+    /// Optional array of required-component initialization descriptors (`offset 160` on 64-bit / `96` on 32-bit).
+    pub required_init_descs: *const BamRequiredComponent,
+    /// Number of entries in `required_init_descs` (`offset 168` on 64-bit / `100` on 32-bit).
+    pub required_init_desc_count: usize,
 }
 
 impl ComponentDesc {
@@ -116,8 +129,11 @@ impl ComponentDesc {
     pub const MIN_V0_2_SIZE: usize =
         core::mem::offset_of!(Self, vtable_ptr) + core::mem::size_of::<*const c_void>();
 
+    /// Full ABI `0.3` size of `ComponentDesc` (`176` on 64-bit, `104` on 32-bit).
+    pub const MIN_V0_3_SIZE: usize = core::mem::size_of::<Self>();
+
     /// Constructs a Plain Old Data component descriptor with `flags = 0`, `drop_fn = None`,
-    /// `vtable_ptr = null`, no lifecycle/clone hooks, and no required components.
+    /// `vtable_ptr = null`, no lifecycle/clone hooks, and no field/required metadata.
     #[inline]
     pub const fn new(name: *const c_char, uuid: ComponentUuid, size: usize, align: usize) -> Self {
         Self {
@@ -138,6 +154,11 @@ impl ComponentDesc {
             clone_fn: None,
             required_components: core::ptr::null(),
             required_component_count: 0,
+            schema_fingerprint: 0,
+            fields: core::ptr::null(),
+            field_count: 0,
+            required_init_descs: core::ptr::null(),
+            required_init_desc_count: 0,
         }
     }
 
@@ -253,6 +274,33 @@ impl ComponentDesc {
         self
     }
 
+    /// Attaches the compile-time 64-bit FNV-1a [`ModComponent::SCHEMA_FINGERPRINT`](crate::ModComponent::SCHEMA_FINGERPRINT).
+    #[inline]
+    pub const fn with_schema_fingerprint(mut self, schema_fingerprint: u64) -> Self {
+        self.schema_fingerprint = schema_fingerprint;
+        self
+    }
+
+    /// Attaches static field metadata (`fields[0..count]`).
+    #[inline]
+    pub const fn with_fields(mut self, fields: *const BamFieldDesc, field_count: usize) -> Self {
+        self.fields = fields;
+        self.field_count = field_count;
+        self
+    }
+
+    /// Attaches extended required-component initialization descriptors (`descs[0..count]`).
+    #[inline]
+    pub const fn with_required_init_descs(
+        mut self,
+        required_init_descs: *const BamRequiredComponent,
+        required_init_desc_count: usize,
+    ) -> Self {
+        self.required_init_descs = required_init_descs;
+        self.required_init_desc_count = required_init_desc_count;
+        self
+    }
+
     /// Returns `true` if any lifecycle hook (`on_add`, `on_insert`, `on_discard`, `on_remove`, or `on_despawn`) is set.
     #[inline]
     pub const fn has_hooks(&self) -> bool {
@@ -322,6 +370,12 @@ impl ComponentDesc {
         if self.required_component_count > 0 && self.required_components.is_null() {
             return FfiResult::NULL_POINTER;
         }
+        if self.field_count > 0 && self.fields.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if self.required_init_desc_count > 0 && self.required_init_descs.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
         if self.layout().is_none() {
             return FfiResult::INVALID_ARGUMENT;
         }
@@ -352,10 +406,11 @@ impl ComponentDesc {
 
 const _: () = {
     assert!(ComponentDesc::MIN_V0_2_SIZE <= core::mem::size_of::<ComponentDesc>());
+    assert!(ComponentDesc::MIN_V0_3_SIZE == core::mem::size_of::<ComponentDesc>());
     #[cfg(target_pointer_width = "64")]
     {
         assert!(ComponentDesc::MIN_V0_2_SIZE == 64);
-        assert!(core::mem::size_of::<ComponentDesc>() == 136);
+        assert!(core::mem::size_of::<ComponentDesc>() == 176);
         assert!(core::mem::align_of::<ComponentDesc>() == 8);
         assert!(core::mem::offset_of!(ComponentDesc, struct_size) == 0);
         assert!(core::mem::offset_of!(ComponentDesc, flags) == 4);
@@ -374,12 +429,17 @@ const _: () = {
         assert!(core::mem::offset_of!(ComponentDesc, clone_fn) == 112);
         assert!(core::mem::offset_of!(ComponentDesc, required_components) == 120);
         assert!(core::mem::offset_of!(ComponentDesc, required_component_count) == 128);
+        assert!(core::mem::offset_of!(ComponentDesc, schema_fingerprint) == 136);
+        assert!(core::mem::offset_of!(ComponentDesc, fields) == 144);
+        assert!(core::mem::offset_of!(ComponentDesc, field_count) == 152);
+        assert!(core::mem::offset_of!(ComponentDesc, required_init_descs) == 160);
+        assert!(core::mem::offset_of!(ComponentDesc, required_init_desc_count) == 168);
     }
     #[cfg(target_pointer_width = "32")]
     {
         assert!(ComponentDesc::MIN_V0_2_SIZE == 44);
-        assert!(core::mem::size_of::<ComponentDesc>() == 80);
-        assert!(core::mem::align_of::<ComponentDesc>() == 4);
+        assert!(core::mem::size_of::<ComponentDesc>() == 104);
+        assert!(core::mem::align_of::<ComponentDesc>() == core::mem::align_of::<u64>());
         assert!(core::mem::offset_of!(ComponentDesc, struct_size) == 0);
         assert!(core::mem::offset_of!(ComponentDesc, flags) == 4);
         assert!(core::mem::offset_of!(ComponentDesc, name) == 8);
@@ -397,6 +457,11 @@ const _: () = {
         assert!(core::mem::offset_of!(ComponentDesc, clone_fn) == 68);
         assert!(core::mem::offset_of!(ComponentDesc, required_components) == 72);
         assert!(core::mem::offset_of!(ComponentDesc, required_component_count) == 76);
+        assert!(core::mem::offset_of!(ComponentDesc, schema_fingerprint) == 80);
+        assert!(core::mem::offset_of!(ComponentDesc, fields) == 88);
+        assert!(core::mem::offset_of!(ComponentDesc, field_count) == 92);
+        assert!(core::mem::offset_of!(ComponentDesc, required_init_descs) == 96);
+        assert!(core::mem::offset_of!(ComponentDesc, required_init_desc_count) == 100);
     }
 };
 
@@ -581,4 +646,627 @@ pub struct MappedStringVTable {
     pub get: Option<MappedStringGetFn>,
     /// Replaces the UTF-8 string value in place (`None` when read-only).
     pub set: Option<MappedStringSetFn>,
+}
+
+/// Wire classification tag for a [`BamFieldDesc`] entry (`typedef uint32_t BamFieldKind;`).
+#[repr(transparent)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Default)]
+pub struct BamFieldKind(pub u32);
+
+impl BamFieldKind {
+    /// Unclassified or unknown field type (`0`).
+    pub const UNKNOWN: Self = Self(0);
+    /// `bool` / `FfiBool` (`1`).
+    pub const BOOL: Self = Self(1);
+    /// Unsigned 8-bit integer `u8` (`2`).
+    pub const U8: Self = Self(2);
+    /// Signed 8-bit integer `i8` (`3`).
+    pub const I8: Self = Self(3);
+    /// Unsigned 16-bit integer `u16` (`4`).
+    pub const U16: Self = Self(4);
+    /// Signed 16-bit integer `i16` (`5`).
+    pub const I16: Self = Self(5);
+    /// Unsigned 32-bit integer `u32` (`6`).
+    pub const U32: Self = Self(6);
+    /// Signed 32-bit integer `i32` (`7`).
+    pub const I32: Self = Self(7);
+    /// Unsigned 64-bit integer `u64` (`8`).
+    pub const U64: Self = Self(8);
+    /// Signed 64-bit integer `i64` (`9`).
+    pub const I64: Self = Self(9);
+    /// 32-bit IEEE 754 float `f32` (`10`).
+    pub const F32: Self = Self(10);
+    /// 64-bit IEEE 754 float `f64` (`11`).
+    pub const F64: Self = Self(11);
+    /// Platform pointer-sized unsigned integer `usize` (`12`).
+    pub const USIZE: Self = Self(12);
+    /// Platform pointer-sized signed integer `isize` (`13`).
+    pub const ISIZE: Self = Self(13);
+    /// Host-owned UTF-8 `String` exposed via `StrView` (`14`).
+    pub const STRING: Self = Self(14);
+    /// Host-owned typed `Vec<T>` exposed via `FfiSlice<T>` (`15`).
+    pub const VEC: Self = Self(15);
+    /// Cross-language `FfiOption<T>` (`16`).
+    pub const FFI_OPTION: Self = Self(16);
+    /// Nested `#[repr(C)]` struct or array (`17`).
+    pub const NESTED: Self = Self(17);
+    /// Opaque / skipped / non-inspectable field (`18`).
+    pub const OPAQUE: Self = Self(18);
+}
+
+/// Static compile-time field reflection metadata generated by `#[derive(ModComponent)]`
+/// (`typedef struct BamFieldDesc BamFieldDesc;`).
+///
+/// Layout:
+/// - 64-bit: `64` bytes, `8`-byte alignment, zero implicit padding.
+/// - 32-bit: `36` bytes, `4`-byte alignment, zero implicit padding.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct BamFieldDesc {
+    /// Size of this struct in bytes (`offset 0`).
+    pub struct_size: u32,
+    /// Wire classification tag [`BamFieldKind`] (`offset 4`).
+    pub kind: BamFieldKind,
+    /// UTF-8 field identifier (`offset 8`).
+    pub name: StrView,
+    /// Normalized Rust/ABI type tag (`offset 24` / `16`).
+    pub type_tag: StrView,
+    /// Byte offset inside the outer component (`offset 40` / `24`).
+    pub offset: usize,
+    /// Field byte size (`size_of::<Field>()`, `offset 48` / `28`).
+    pub size: usize,
+    /// Field byte alignment (`align_of::<Field>()`, `offset 56` / `32`).
+    pub align: usize,
+}
+
+impl BamFieldDesc {
+    /// Minimum size of `BamFieldDesc` in ABI `0.3` (`64` on 64-bit, `36` on 32-bit).
+    pub const MIN_V0_3_SIZE: usize = core::mem::size_of::<Self>();
+
+    /// Constructs a `BamFieldDesc` stamped with `struct_size = size_of::<Self>()`.
+    #[inline]
+    #[must_use]
+    pub const fn new(
+        kind: BamFieldKind,
+        name: StrView,
+        type_tag: StrView,
+        offset: usize,
+        size: usize,
+        align: usize,
+    ) -> Self {
+        Self {
+            struct_size: core::mem::size_of::<Self>() as u32,
+            kind,
+            name,
+            type_tag,
+            offset,
+            size,
+            align,
+        }
+    }
+}
+
+// SAFETY: `BamFieldDesc` stores `'static` field names/tags and constant layout integers.
+unsafe impl Send for BamFieldDesc {}
+// SAFETY: See `Send` implementation above; enables `static BAM_FIELDS: &[BamFieldDesc]`.
+unsafe impl Sync for BamFieldDesc {}
+
+const _: () = {
+    #[cfg(target_pointer_width = "64")]
+    {
+        assert!(core::mem::size_of::<BamFieldDesc>() == 64);
+        assert!(core::mem::align_of::<BamFieldDesc>() == 8);
+        assert!(core::mem::offset_of!(BamFieldDesc, struct_size) == 0);
+        assert!(core::mem::offset_of!(BamFieldDesc, kind) == 4);
+        assert!(core::mem::offset_of!(BamFieldDesc, name) == 8);
+        assert!(core::mem::offset_of!(BamFieldDesc, type_tag) == 24);
+        assert!(core::mem::offset_of!(BamFieldDesc, offset) == 40);
+        assert!(core::mem::offset_of!(BamFieldDesc, size) == 48);
+        assert!(core::mem::offset_of!(BamFieldDesc, align) == 56);
+    }
+    #[cfg(target_pointer_width = "32")]
+    {
+        assert!(core::mem::size_of::<BamFieldDesc>() == 36);
+        assert!(core::mem::align_of::<BamFieldDesc>() == 4);
+        assert!(core::mem::offset_of!(BamFieldDesc, struct_size) == 0);
+        assert!(core::mem::offset_of!(BamFieldDesc, kind) == 4);
+        assert!(core::mem::offset_of!(BamFieldDesc, name) == 8);
+        assert!(core::mem::offset_of!(BamFieldDesc, type_tag) == 16);
+        assert!(core::mem::offset_of!(BamFieldDesc, offset) == 24);
+        assert!(core::mem::offset_of!(BamFieldDesc, size) == 28);
+        assert!(core::mem::offset_of!(BamFieldDesc, align) == 32);
+    }
+};
+
+/// Custom initializer callback invoked by the host when materializing a required component
+/// (`typedef BamResult (*BamRequiredInitFn)(void* dst, void* user_data);`).
+///
+/// # Safety
+/// - `dst` must be non-null and aligned for the target component's `(size, align)`.
+/// - `user_data` is the opaque pointer recorded in [`BamRequiredComponent::user_data`].
+/// - The callback must initialize all `size` bytes of `dst` on `OK` and never unwind across FFI.
+pub type BamRequiredInitFn =
+    unsafe extern "C" fn(dst: *mut c_void, user_data: *mut c_void) -> FfiResult;
+
+/// Required component descriptor supplies static POD custom bytes via [`BamRequiredComponent::init_bytes`].
+pub const BAM_REQUIRED_FLAG_CUSTOM_BYTES: u32 = 1 << 0;
+
+/// Required component descriptor supplies custom initialization callback [`BamRequiredComponent::init_fn`].
+pub const BAM_REQUIRED_FLAG_INIT_FN: u32 = 1 << 1;
+
+/// Required component descriptor identifies its target by [`BamRequiredComponent::uuid`] instead
+/// of a pre-resolved [`BamRequiredComponent::component`] handle.
+pub const BAM_REQUIRED_FLAG_RESOLVE_BY_UUID: u32 = 1 << 2;
+
+/// Bitmask of all recognized [`BamRequiredComponent::flags`] bits in ABI `0.3`.
+pub const BAM_REQUIRED_KNOWN_FLAGS: u32 =
+    BAM_REQUIRED_FLAG_CUSTOM_BYTES | BAM_REQUIRED_FLAG_INIT_FN | BAM_REQUIRED_FLAG_RESOLVE_BY_UUID;
+
+/// Descriptor for a required component relationship (`#[mod_component(require(Comp = expr))]`)
+/// (`typedef struct BamRequiredComponent BamRequiredComponent;`).
+///
+/// Layout:
+/// - 64-bit: `64` bytes, `8`-byte alignment, zero implicit padding.
+/// - 32-bit: `48` bytes, `4`-byte alignment, zero implicit padding.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct BamRequiredComponent {
+    /// Size of this struct in bytes (`offset 0`).
+    pub struct_size: u32,
+    /// Bitmask of `BAM_REQUIRED_FLAG_*` (`offset 4`).
+    pub flags: u32,
+    /// Resolved target component handle (`BamComponent::INVALID` when `RESOLVE_BY_UUID` is set, `offset 8`).
+    pub component: BamComponent,
+    /// Explicit zero-reserved field (`must be 0`, `offset 12`).
+    pub reserved0: u32,
+    /// Deterministic 128-bit UUID of the required component (`offset 16`).
+    pub uuid: ComponentUuid,
+    /// Optional custom POD initialization byte slice pointer (`offset 32`).
+    pub init_bytes: *const u8,
+    /// Target byte length (`init_bytes` length or output size expected by `init_fn`, `offset 40` / `36`).
+    pub init_size: usize,
+    /// Optional custom initializer callback invoked when `BAM_REQUIRED_FLAG_INIT_FN` is set (`offset 48` / `40`).
+    pub init_fn: Option<BamRequiredInitFn>,
+    /// Opaque user context passed to `init_fn` (`offset 56` / `44`).
+    pub user_data: *mut c_void,
+}
+
+impl BamRequiredComponent {
+    /// Minimum size of `BamRequiredComponent` in ABI `0.3` (`64` on 64-bit, `48` on 32-bit).
+    pub const MIN_V0_3_SIZE: usize = core::mem::size_of::<Self>();
+
+    /// Constructs a required component entry resolving by pre-registered [`BamComponent`] handle
+    /// using the component's default constructor.
+    #[inline]
+    #[must_use]
+    pub const fn by_handle(component: BamComponent) -> Self {
+        Self {
+            struct_size: core::mem::size_of::<Self>() as u32,
+            flags: 0,
+            component,
+            reserved0: 0,
+            uuid: ComponentUuid::ZERO,
+            init_bytes: core::ptr::null(),
+            init_size: 0,
+            init_fn: None,
+            user_data: core::ptr::null_mut(),
+        }
+    }
+
+    /// Constructs a required component entry resolving by [`ComponentUuid`] (for static
+    /// [`ModComponent::REQUIRED_COMPONENTS`](crate::ModComponent::REQUIRED_COMPONENTS) tables).
+    #[inline]
+    #[must_use]
+    pub const fn by_uuid(uuid: ComponentUuid) -> Self {
+        Self {
+            struct_size: core::mem::size_of::<Self>() as u32,
+            flags: BAM_REQUIRED_FLAG_RESOLVE_BY_UUID,
+            component: BamComponent::INVALID,
+            reserved0: 0,
+            uuid,
+            init_bytes: core::ptr::null(),
+            init_size: 0,
+            init_fn: None,
+            user_data: core::ptr::null_mut(),
+        }
+    }
+
+    /// Attaches a custom initialization callback and expected target byte size.
+    #[inline]
+    #[must_use]
+    pub const fn with_init_fn(
+        mut self,
+        init_fn: BamRequiredInitFn,
+        init_size: usize,
+        user_data: *mut c_void,
+    ) -> Self {
+        self.flags |= BAM_REQUIRED_FLAG_INIT_FN;
+        self.init_fn = Some(init_fn);
+        self.init_size = init_size;
+        self.user_data = user_data;
+        self
+    }
+
+    /// Attaches static POD custom initialization bytes.
+    #[inline]
+    #[must_use]
+    pub const fn with_custom_bytes(mut self, bytes: &'static [u8]) -> Self {
+        self.flags |= BAM_REQUIRED_FLAG_CUSTOM_BYTES;
+        self.init_bytes = bytes.as_ptr();
+        self.init_size = bytes.len();
+        self
+    }
+}
+
+// SAFETY: `BamRequiredComponent` holds immutable `'static` metadata and optional `extern "C"` fn pointers.
+unsafe impl Send for BamRequiredComponent {}
+// SAFETY: See `Send` implementation above; enables `static REQUIRED_COMPONENTS: &[BamRequiredComponent]`.
+unsafe impl Sync for BamRequiredComponent {}
+
+const _: () = {
+    #[cfg(target_pointer_width = "64")]
+    {
+        assert!(core::mem::size_of::<BamRequiredComponent>() == 64);
+        assert!(core::mem::align_of::<BamRequiredComponent>() == 8);
+        assert!(core::mem::offset_of!(BamRequiredComponent, struct_size) == 0);
+        assert!(core::mem::offset_of!(BamRequiredComponent, flags) == 4);
+        assert!(core::mem::offset_of!(BamRequiredComponent, component) == 8);
+        assert!(core::mem::offset_of!(BamRequiredComponent, reserved0) == 12);
+        assert!(core::mem::offset_of!(BamRequiredComponent, uuid) == 16);
+        assert!(core::mem::offset_of!(BamRequiredComponent, init_bytes) == 32);
+        assert!(core::mem::offset_of!(BamRequiredComponent, init_size) == 40);
+        assert!(core::mem::offset_of!(BamRequiredComponent, init_fn) == 48);
+        assert!(core::mem::offset_of!(BamRequiredComponent, user_data) == 56);
+    }
+    #[cfg(target_pointer_width = "32")]
+    {
+        assert!(core::mem::size_of::<BamRequiredComponent>() == 48);
+        assert!(core::mem::align_of::<BamRequiredComponent>() == 4);
+        assert!(core::mem::offset_of!(BamRequiredComponent, struct_size) == 0);
+        assert!(core::mem::offset_of!(BamRequiredComponent, flags) == 4);
+        assert!(core::mem::offset_of!(BamRequiredComponent, component) == 8);
+        assert!(core::mem::offset_of!(BamRequiredComponent, reserved0) == 12);
+        assert!(core::mem::offset_of!(BamRequiredComponent, uuid) == 16);
+        assert!(core::mem::offset_of!(BamRequiredComponent, init_bytes) == 32);
+        assert!(core::mem::offset_of!(BamRequiredComponent, init_size) == 36);
+        assert!(core::mem::offset_of!(BamRequiredComponent, init_fn) == 40);
+        assert!(core::mem::offset_of!(BamRequiredComponent, user_data) == 44);
+    }
+};
+
+/// Exclusive relationship flag: attaching a new target replaces any prior edge of this relation.
+pub const BAM_RELATION_FLAG_EXCLUSIVE: u32 = 1 << 0;
+
+/// Cascade-despawn relationship flag: despawning the target also despawns dependent source entities.
+pub const BAM_RELATION_FLAG_CASCADE_DESPAWN: u32 = 1 << 1;
+
+/// Symmetric relationship flag: edge `(A -> B)` implies `(B -> A)`.
+pub const BAM_RELATION_FLAG_SYMMETRIC: u32 = 1 << 2;
+
+/// Bitmask of all recognized [`BamRelationDesc::flags`] bits in ABI `0.3`.
+pub const BAM_RELATION_KNOWN_FLAGS: u32 =
+    BAM_RELATION_FLAG_EXCLUSIVE | BAM_RELATION_FLAG_CASCADE_DESPAWN | BAM_RELATION_FLAG_SYMMETRIC;
+
+/// Descriptor registering a typed entity relationship edge (`typedef struct BamRelationDesc BamRelationDesc;`).
+///
+/// Layout:
+/// - 64-bit: `56` bytes, `8`-byte alignment, zero implicit padding.
+/// - 32-bit: `44` bytes, `4`-byte alignment, zero implicit padding.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct BamRelationDesc {
+    /// Size of this struct in bytes (`offset 0`).
+    pub struct_size: u32,
+    /// Bitmask of `BAM_RELATION_FLAG_*` (`offset 4`).
+    pub flags: u32,
+    /// Canonical NUL-terminated UTF-8 relation name (`offset 8`).
+    pub name: *const c_char,
+    /// Deterministic 128-bit UUID identifying the relation (`offset 16` / `12`).
+    pub uuid: ComponentUuid,
+    /// Edge payload byte size (`0` for tag/marker relations, `offset 32` / `28`).
+    pub data_size: usize,
+    /// Edge payload byte alignment (`1` when `data_size == 0`, `offset 40` / `32`).
+    pub data_align: usize,
+    /// Optional out-degree cap (`0` = unlimited, `1` for exclusive if flagged, `offset 48` / `36`).
+    pub max_degree: u32,
+    /// Explicit zero-reserved field (`must be 0`, `offset 52` / `40`).
+    pub reserved0: u32,
+}
+
+impl BamRelationDesc {
+    /// Minimum size of `BamRelationDesc` in ABI `0.3` (`56` on 64-bit, `44` on 32-bit).
+    pub const MIN_V0_3_SIZE: usize = core::mem::size_of::<Self>();
+
+    /// Constructs a marker (zero-sized payload) relationship descriptor.
+    #[inline]
+    pub const fn new(name: *const c_char, uuid: ComponentUuid) -> Self {
+        Self {
+            struct_size: core::mem::size_of::<Self>() as u32,
+            flags: 0,
+            name,
+            uuid,
+            data_size: 0,
+            data_align: 1,
+            max_degree: 0,
+            reserved0: 0,
+        }
+    }
+
+    /// Sets `BAM_RELATION_FLAG_*` bitflags on this descriptor.
+    #[inline]
+    pub const fn with_flags(mut self, flags: u32) -> Self {
+        self.flags = flags;
+        self
+    }
+
+    /// Attaches an edge payload `(data_size, data_align)`.
+    #[inline]
+    pub const fn with_payload_layout(mut self, data_size: usize, data_align: usize) -> Self {
+        self.data_size = data_size;
+        self.data_align = data_align;
+        self
+    }
+
+    /// Validates `struct_size`, known `flags`, zero `reserved0`, non-null `name`, and payload layout.
+    #[inline]
+    pub fn validate(&self) -> FfiResult {
+        if (self.struct_size as usize) < Self::MIN_V0_3_SIZE {
+            return FfiResult::INVALID_VERSION;
+        }
+        if (self.flags & !BAM_RELATION_KNOWN_FLAGS) != 0 {
+            return FfiResult::UNSUPPORTED;
+        }
+        if self.reserved0 != 0 {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        if self.name.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if !self.data_align.is_power_of_two() || !self.data_size.is_multiple_of(self.data_align) {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        FfiResult::OK
+    }
+}
+
+/// Output descriptor returned by `component_layout_info` (`typedef struct BamLayoutInfo BamLayoutInfo;`).
+///
+/// Layout:
+/// - 64-bit: `64` bytes, `8`-byte alignment (`schema_fingerprint` at offset `24`), zero padding.
+/// - 32-bit: `48` bytes, `align = align_of::<u64>()` (`schema_fingerprint` at offset `24`), zero padding.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct BamLayoutInfo {
+    /// Size of this struct in bytes (`offset 0`).
+    pub struct_size: u32,
+    /// Host storage/metadata flags (`BAM_STORAGE_FLAG_*`, `offset 4`).
+    pub flags: u32,
+    /// Deterministic 128-bit component UUID (`offset 8`).
+    pub uuid: ComponentUuid,
+    /// Deterministic 64-bit FNV-1a schema fingerprint (`offset 24`).
+    pub schema_fingerprint: u64,
+    /// Component byte size (`size_of::<T>()`, `offset 32`).
+    pub size: usize,
+    /// Component byte alignment (`align_of::<T>()`, `offset 40` / `36`).
+    pub align: usize,
+    /// Pointer to immutable host-retained [`BamFieldDesc`] slice (`offset 48` / `40`).
+    pub fields: *const BamFieldDesc,
+    /// Number of [`BamFieldDesc`] entries (`offset 56` / `44`).
+    pub field_count: usize,
+}
+
+impl BamLayoutInfo {
+    /// Minimum size of `BamLayoutInfo` in ABI `0.3` (`64` on 64-bit, `48` on 32-bit).
+    pub const MIN_V0_3_SIZE: usize = core::mem::size_of::<Self>();
+
+    /// Constructs a zeroed `BamLayoutInfo` buffer stamped with `struct_size`.
+    #[inline]
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            struct_size: core::mem::size_of::<Self>() as u32,
+            flags: 0,
+            uuid: ComponentUuid::ZERO,
+            schema_fingerprint: 0,
+            size: 0,
+            align: 1,
+            fields: core::ptr::null(),
+            field_count: 0,
+        }
+    }
+}
+
+/// Row migration callback invoked per live entity during `migrate_component_column`
+/// (`typedef BamResult (*BamRowMigrateFn)(const void* src_row, void* dst_row, void* user_data);`).
+///
+/// # Safety
+/// - `src_row` points to a readable, initialized component instance under the old layout.
+/// - `dst_row` points to uninitialized, properly aligned writable storage under `new_desc`.
+/// - The callback must never unwind across FFI.
+pub type BamRowMigrateFn = unsafe extern "C" fn(
+    src_row: *const c_void,
+    dst_row: *mut c_void,
+    user_data: *mut c_void,
+) -> FfiResult;
+
+/// Bitmask of recognized [`BamScheduleSetDesc::flags`] bits in ABI `0.3` (`0`).
+pub const BAM_SCHEDULE_SET_KNOWN_FLAGS: u32 = 0;
+
+/// Descriptor configuring a named schedule system set and ordering edges
+/// (`typedef struct BamScheduleSetDesc BamScheduleSetDesc;`).
+///
+/// Layout:
+/// - 64-bit: `48` bytes, `8`-byte alignment, zero implicit padding.
+/// - 32-bit: `36` bytes, `4`-byte alignment, zero implicit padding.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct BamScheduleSetDesc {
+    /// Size of this struct in bytes (`offset 0`).
+    pub struct_size: u32,
+    /// Reserved flags (`0` in ABI `0.3`, `offset 4`).
+    pub flags: u32,
+    /// Target schedule (`ScheduleId`, `offset 8`).
+    pub schedule: ScheduleId,
+    /// Number of handles in `before_sets` (`offset 12`).
+    pub before_count: u32,
+    /// Number of handles in `after_sets` (`offset 16`).
+    pub after_count: u32,
+    /// Explicit zero-reserved field (`must be 0`, `offset 20`).
+    pub reserved0: u32,
+    /// NUL-terminated UTF-8 set name (`offset 24`).
+    pub name: *const c_char,
+    /// Optional slice of sets ordered after this set (`offset 32` / `28`).
+    pub before_sets: *const crate::primitives::BamSystemSet,
+    /// Optional slice of sets ordered before this set (`offset 40` / `32`).
+    pub after_sets: *const crate::primitives::BamSystemSet,
+}
+
+impl BamScheduleSetDesc {
+    /// Minimum size of `BamScheduleSetDesc` in ABI `0.3` (`48` on 64-bit, `36` on 32-bit).
+    pub const MIN_V0_3_SIZE: usize = core::mem::size_of::<Self>();
+
+    /// Constructs a `BamScheduleSetDesc` with empty ordering edges in `ScheduleId::UPDATE`.
+    #[inline]
+    pub const fn new(name: *const c_char) -> Self {
+        Self {
+            struct_size: core::mem::size_of::<Self>() as u32,
+            flags: 0,
+            schedule: ScheduleId::UPDATE,
+            before_count: 0,
+            after_count: 0,
+            reserved0: 0,
+            name,
+            before_sets: core::ptr::null(),
+            after_sets: core::ptr::null(),
+        }
+    }
+
+    /// Validates `struct_size`, known flags, `reserved0 == 0`, `schedule`, non-null `name`,
+    /// and edge pointer non-nullness.
+    #[inline]
+    pub fn validate(&self) -> FfiResult {
+        if (self.struct_size as usize) < Self::MIN_V0_3_SIZE {
+            return FfiResult::INVALID_VERSION;
+        }
+        if (self.flags & !BAM_SCHEDULE_SET_KNOWN_FLAGS) != 0 {
+            return FfiResult::UNSUPPORTED;
+        }
+        if self.reserved0 != 0 || !self.schedule.is_valid() {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        if self.name.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if (self.before_count > 0 && self.before_sets.is_null())
+            || (self.after_count > 0 && self.after_sets.is_null())
+        {
+            return FfiResult::NULL_POINTER;
+        }
+        FfiResult::OK
+    }
+}
+
+const _: () = {
+    #[cfg(target_pointer_width = "64")]
+    {
+        assert!(core::mem::size_of::<BamRelationDesc>() == 56);
+        assert!(core::mem::align_of::<BamRelationDesc>() == 8);
+        assert!(core::mem::offset_of!(BamRelationDesc, struct_size) == 0);
+        assert!(core::mem::offset_of!(BamRelationDesc, flags) == 4);
+        assert!(core::mem::offset_of!(BamRelationDesc, name) == 8);
+        assert!(core::mem::offset_of!(BamRelationDesc, uuid) == 16);
+        assert!(core::mem::offset_of!(BamRelationDesc, data_size) == 32);
+        assert!(core::mem::offset_of!(BamRelationDesc, data_align) == 40);
+        assert!(core::mem::offset_of!(BamRelationDesc, max_degree) == 48);
+        assert!(core::mem::offset_of!(BamRelationDesc, reserved0) == 52);
+
+        assert!(core::mem::size_of::<BamLayoutInfo>() == 64);
+        assert!(core::mem::align_of::<BamLayoutInfo>() == 8);
+        assert!(core::mem::offset_of!(BamLayoutInfo, struct_size) == 0);
+        assert!(core::mem::offset_of!(BamLayoutInfo, flags) == 4);
+        assert!(core::mem::offset_of!(BamLayoutInfo, uuid) == 8);
+        assert!(core::mem::offset_of!(BamLayoutInfo, schema_fingerprint) == 24);
+        assert!(core::mem::offset_of!(BamLayoutInfo, size) == 32);
+        assert!(core::mem::offset_of!(BamLayoutInfo, align) == 40);
+        assert!(core::mem::offset_of!(BamLayoutInfo, fields) == 48);
+        assert!(core::mem::offset_of!(BamLayoutInfo, field_count) == 56);
+
+        assert!(core::mem::size_of::<BamScheduleSetDesc>() == 48);
+        assert!(core::mem::align_of::<BamScheduleSetDesc>() == 8);
+        assert!(core::mem::offset_of!(BamScheduleSetDesc, struct_size) == 0);
+        assert!(core::mem::offset_of!(BamScheduleSetDesc, flags) == 4);
+        assert!(core::mem::offset_of!(BamScheduleSetDesc, schedule) == 8);
+        assert!(core::mem::offset_of!(BamScheduleSetDesc, before_count) == 12);
+        assert!(core::mem::offset_of!(BamScheduleSetDesc, after_count) == 16);
+        assert!(core::mem::offset_of!(BamScheduleSetDesc, reserved0) == 20);
+        assert!(core::mem::offset_of!(BamScheduleSetDesc, name) == 24);
+        assert!(core::mem::offset_of!(BamScheduleSetDesc, before_sets) == 32);
+        assert!(core::mem::offset_of!(BamScheduleSetDesc, after_sets) == 40);
+    }
+    #[cfg(target_pointer_width = "32")]
+    {
+        assert!(core::mem::size_of::<BamRelationDesc>() == 44);
+        assert!(core::mem::align_of::<BamRelationDesc>() == 4);
+        assert!(core::mem::offset_of!(BamRelationDesc, struct_size) == 0);
+        assert!(core::mem::offset_of!(BamRelationDesc, flags) == 4);
+        assert!(core::mem::offset_of!(BamRelationDesc, name) == 8);
+        assert!(core::mem::offset_of!(BamRelationDesc, uuid) == 12);
+        assert!(core::mem::offset_of!(BamRelationDesc, data_size) == 28);
+        assert!(core::mem::offset_of!(BamRelationDesc, data_align) == 32);
+        assert!(core::mem::offset_of!(BamRelationDesc, max_degree) == 36);
+        assert!(core::mem::offset_of!(BamRelationDesc, reserved0) == 40);
+
+        assert!(core::mem::size_of::<BamLayoutInfo>() == 48);
+        assert!(core::mem::align_of::<BamLayoutInfo>() == core::mem::align_of::<u64>());
+        assert!(core::mem::offset_of!(BamLayoutInfo, struct_size) == 0);
+        assert!(core::mem::offset_of!(BamLayoutInfo, flags) == 4);
+        assert!(core::mem::offset_of!(BamLayoutInfo, uuid) == 8);
+        assert!(core::mem::offset_of!(BamLayoutInfo, schema_fingerprint) == 24);
+        assert!(core::mem::offset_of!(BamLayoutInfo, size) == 32);
+        assert!(core::mem::offset_of!(BamLayoutInfo, align) == 36);
+        assert!(core::mem::offset_of!(BamLayoutInfo, fields) == 40);
+        assert!(core::mem::offset_of!(BamLayoutInfo, field_count) == 44);
+
+        assert!(core::mem::size_of::<BamScheduleSetDesc>() == 36);
+        assert!(core::mem::align_of::<BamScheduleSetDesc>() == 4);
+        assert!(core::mem::offset_of!(BamScheduleSetDesc, struct_size) == 0);
+        assert!(core::mem::offset_of!(BamScheduleSetDesc, flags) == 4);
+        assert!(core::mem::offset_of!(BamScheduleSetDesc, schedule) == 8);
+        assert!(core::mem::offset_of!(BamScheduleSetDesc, before_count) == 12);
+        assert!(core::mem::offset_of!(BamScheduleSetDesc, after_count) == 16);
+        assert!(core::mem::offset_of!(BamScheduleSetDesc, reserved0) == 20);
+        assert!(core::mem::offset_of!(BamScheduleSetDesc, name) == 24);
+        assert!(core::mem::offset_of!(BamScheduleSetDesc, before_sets) == 28);
+        assert!(core::mem::offset_of!(BamScheduleSetDesc, after_sets) == 32);
+    }
+};
+
+// SAFETY: `BamFieldDesc` is `#[repr(C)]`, starts with `struct_size: u32` at offset 0, and all
+// fields are valid when zero-filled.
+unsafe impl ExtensibleStruct for BamFieldDesc {
+    const MIN_V0_2_SIZE: usize = Self::MIN_V0_3_SIZE;
+}
+
+// SAFETY: `BamRequiredComponent` is `#[repr(C)]`, starts with `struct_size: u32` at offset 0, and all
+// fields are valid when zero-filled.
+unsafe impl ExtensibleStruct for BamRequiredComponent {
+    const MIN_V0_2_SIZE: usize = Self::MIN_V0_3_SIZE;
+}
+
+// SAFETY: `BamRelationDesc` is `#[repr(C)]`, starts with `struct_size: u32` at offset 0, and all
+// fields are valid when zero-filled.
+unsafe impl ExtensibleStruct for BamRelationDesc {
+    const MIN_V0_2_SIZE: usize = Self::MIN_V0_3_SIZE;
+}
+
+// SAFETY: `BamLayoutInfo` is `#[repr(C)]`, starts with `struct_size: u32` at offset 0, and all
+// fields are valid when zero-filled.
+unsafe impl ExtensibleStruct for BamLayoutInfo {
+    const MIN_V0_2_SIZE: usize = Self::MIN_V0_3_SIZE;
+}
+
+// SAFETY: `BamScheduleSetDesc` is `#[repr(C)]`, starts with `struct_size: u32` at offset 0, and all
+// fields are valid when zero-filled.
+unsafe impl ExtensibleStruct for BamScheduleSetDesc {
+    const MIN_V0_2_SIZE: usize = Self::MIN_V0_3_SIZE;
 }

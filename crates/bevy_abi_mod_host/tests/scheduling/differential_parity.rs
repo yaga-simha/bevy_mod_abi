@@ -112,6 +112,7 @@ pub struct SparseZst;
 pub struct GlobalBiasRes {
     pub delta: i64,
     pub writes: u32,
+    pub _pad0: u32,
 }
 
 #[repr(C)]
@@ -180,6 +181,7 @@ fn register_full_schema(app: &mut App) -> SchemaHandles {
     app.insert_resource(GlobalBiasRes {
         delta: 3,
         writes: 0,
+        _pad0: 0,
     });
     app.insert_resource(GlobalFlagRes { mask: 0xA5A5 });
 

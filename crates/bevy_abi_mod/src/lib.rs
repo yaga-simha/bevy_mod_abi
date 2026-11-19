@@ -132,17 +132,24 @@
 //!
 //! # Architecture & Contributor Guide (Crate Developers)
 //!
-//! ## Eight-Crate `-sys` vs. Safe Rust Split
+//! ## Eleven-Crate `-sys` vs. Safe Rust Split
 //!
 //! The workspace strictly isolates `unsafe` FFI machinery inside `*-sys` crates while keeping
-//! high-level host, guest, macro, and CLI crates under `#![forbid(unsafe_code)]`, and keeping
-//! `bevy*` out of all wire, macro, guest, and CLI crates:
+//! high-level host, guest, macro, trust, manifest, SDK-generator, and CLI crates under
+//! `#![forbid(unsafe_code)]`, and keeping `bevy*` out of all wire, macro, trust, manifest,
+//! SDK-generator, guest, and CLI crates:
 //!
 //! - `bevy_abi_mod_sys`: `#![no_std]`, zero external dependencies. Defines the `#[repr(C)]`
-//!   `ABI 0.2.0` wire contract (`BamHostApi`, `BamManifest`, `BamSystemDesc`, `ComponentDesc`,
+//!   `ABI 0.3.0` wire contract (`BamHostApi`, `BamManifest`, `BamSystemDesc`, `ComponentDesc`,
 //!   `FfiResult`, `StrView`, `ModComponent`, `AbiPod`).
 //! - `bevy_abi_mod_macros`: `#![forbid(unsafe_code)]` proc-macro crate (`#[derive(ModComponent, AbiPod)]`). No `bevy`
 //!   dependency.
+//! - `bevy_abi_mod_trust`: `#![forbid(unsafe_code)]` OpenSSH `SSHSIG`, CA certificate, `SSHKRL`,
+//!   and `.bampack` verification engine. No `bevy` dependency.
+//! - `bevy_abi_mod_manifest`: `#![forbid(unsafe_code)]` `mod.toml` parser, SemVer DAG topological
+//!   sorter, and quarantine/mismatch types. No `bevy` dependency.
+//! - `bevy_abi_mod_sdk_gen`: `#![forbid(unsafe_code)]` deterministic C99, C++17, Zig, and modder
+//!   SDK generator. No `bevy` dependency.
 //! - `bevy_abi_mod_host_sys`: Isolates all host `unsafe` (`HOST_API`, `HostIter`, `HostCommands`,
 //!   `GuestSystem`, `ModRegistry`, `libloading` loader).
 //! - `bevy_abi_mod_host`: `#![forbid(unsafe_code)]` safe Bevy plugin, optional Bevy `0.20` bridges,
@@ -152,8 +159,8 @@
 //!   guards, host API cache). No `bevy` dependency.
 //! - `bevy_abi_mod_guest`: `#![forbid(unsafe_code)]` ergonomic Rust guest SDK. No `bevy`
 //!   dependency.
-//! - `cargo-bam`: `#![forbid(unsafe_code)]` standalone modder CLI (`new`, `build`, `header`,
-//!   `check-mods`, `doctor`, `sign`). No `bevy` dependency.
+//! - `cargo-bam`: `#![forbid(unsafe_code)]` standalone modder CLI (`new`, `build`, `export-sdk`,
+//!   `header`, `check-mods`, `doctor`, `keygen`, `sign`, `verify`). No `bevy` dependency.
 //!
 //! ## Core Invariants
 //!

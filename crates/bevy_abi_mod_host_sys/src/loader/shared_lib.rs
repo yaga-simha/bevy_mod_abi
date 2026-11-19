@@ -475,25 +475,51 @@ fn verify_source_and_sig(
         }
     })?;
 
-    let sig_bytes = read_bounded_file(&sig_path, MAX_SIGNATURE_SIDECAR_BYTES).map_err(|err| {
-        let sv_err = match err {
-            BoundedReadError::Io(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                SignatureVerificationError::MissingSignatureFile { source }
+    let sig_bytes = match read_bounded_file(&sig_path, MAX_SIGNATURE_SIDECAR_BYTES) {
+        Ok(bytes) => bytes,
+        Err(BoundedReadError::Io(source)) if source.kind() == std::io::ErrorKind::NotFound => {
+            // When no explicit sidecar path was supplied and `<mod>.sig` is absent on disk,
+            // fall back to verifying an embedded `.bam_sig` / `__bam_sig` section inside the binary.
+            if options.signature_path.is_none() {
+                match policy.verify_embedded_bam_sig(&binary_bytes) {
+                    Ok(verified) => {
+                        return Ok((binary_bytes, verified, source_path.to_path_buf()));
+                    }
+                    Err(SignatureVerificationError::MissingSignatureFile { .. }) => {}
+                    Err(other) => {
+                        return Err(ModLoadError::SignatureVerification {
+                            path: source_path.to_path_buf(),
+                            signature_path: source_path.to_path_buf(),
+                            source: other,
+                        });
+                    }
+                }
             }
-            BoundedReadError::Io(source) => {
-                SignatureVerificationError::SignatureFileRead { source }
-            }
-            BoundedReadError::TooLarge(size) => SignatureVerificationError::SignatureFileTooLarge {
-                size,
-                limit: MAX_SIGNATURE_SIDECAR_BYTES,
-            },
-        };
-        ModLoadError::SignatureVerification {
-            path: source_path.to_path_buf(),
-            signature_path: sig_path.clone(),
-            source: sv_err,
+            return Err(ModLoadError::SignatureVerification {
+                path: source_path.to_path_buf(),
+                signature_path: sig_path,
+                source: SignatureVerificationError::MissingSignatureFile { source },
+            });
         }
-    })?;
+        Err(err) => {
+            let sv_err = match err {
+                BoundedReadError::Io(source) => {
+                    SignatureVerificationError::SignatureFileRead { source }
+                }
+                BoundedReadError::TooLarge(size) => {
+                    SignatureVerificationError::SignatureFileTooLarge {
+                        size,
+                        limit: MAX_SIGNATURE_SIDECAR_BYTES,
+                    }
+                }
+            };
+            return Err(ModLoadError::SignatureVerification {
+                path: source_path.to_path_buf(),
+                signature_path: sig_path,
+                source: sv_err,
+            });
+        }
+    };
 
     let verified = policy
         .verify_bytes(&binary_bytes, &sig_bytes)
@@ -1310,13 +1336,35 @@ fn stage_pdb_sidecar_and_patch_pe(source_path: &Path, dest_dll_path: &Path) -> O
         return None;
     }
     let dest_pdb = dest_dll_path.with_extension("pdb");
-    if std::fs::copy(&source_pdb, &dest_pdb).is_err() {
+    if let Err(err) = std::fs::copy(&source_pdb, &dest_pdb) {
+        tracing::warn!(
+            source = %source_pdb.display(),
+            dest = %dest_pdb.display(),
+            error = %err,
+            "failed to copy PE .pdb sidecar alongside shadow DLL"
+        );
         return None;
     }
-    if let Ok(mut dll_bytes) = std::fs::read(dest_dll_path)
-        && patch_pe_codeview_pdb_path(&mut dll_bytes, &dest_pdb)
-    {
-        let _ = std::fs::write(dest_dll_path, &dll_bytes);
+    match std::fs::read(dest_dll_path) {
+        Ok(mut dll_bytes) => {
+            if patch_pe_codeview_pdb_path(&mut dll_bytes, &dest_pdb)
+                && let Err(err) = std::fs::write(dest_dll_path, &dll_bytes)
+            {
+                tracing::warn!(
+                    path = %dest_dll_path.display(),
+                    pdb = %dest_pdb.display(),
+                    error = %err,
+                    "failed to write patched CodeView RSDS PDB path to shadow DLL"
+                );
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %dest_dll_path.display(),
+                error = %err,
+                "failed to read shadow DLL while patching CodeView RSDS PDB path"
+            );
+        }
     }
     Some(dest_pdb)
 }

@@ -1759,7 +1759,7 @@ mod host_api_boundary_and_proc_address {
         {
             assert_eq!(core::mem::size_of::<TruncatedHostApi40>(), 40);
             assert_eq!(core::mem::align_of::<TruncatedHostApi40>(), 8);
-            assert_eq!(core::mem::size_of::<BamHostApi>(), 408);
+            assert_eq!(core::mem::size_of::<BamHostApi>(), 552);
             assert_eq!(BamHostApi::MIN_V0_2_SIZE, 224);
             assert_eq!(core::mem::align_of::<BamHostApi>(), 8);
         }
@@ -2181,7 +2181,7 @@ mod dynamic_descriptor_layouts {
         #[cfg(target_pointer_width = "64")]
         {
             assert_eq!(BamHostApi::MIN_V0_2_SIZE, 224);
-            assert_eq!(core::mem::size_of::<BamHostApi>(), 408);
+            assert_eq!(core::mem::size_of::<BamHostApi>(), 552);
             assert_eq!(core::mem::align_of::<BamHostApi>(), 8);
             assert_eq!(core::mem::offset_of!(BamHostApi, struct_size), 0);
             assert_eq!(core::mem::offset_of!(BamHostApi, abi_version), 4);
@@ -2229,6 +2229,45 @@ mod dynamic_descriptor_layouts {
             assert_eq!(core::mem::offset_of!(BamHostApi, sys_entity_get_mut), 240);
             assert_eq!(core::mem::offset_of!(BamHostApi, msg_read_batch), 248);
             assert_eq!(core::mem::offset_of!(BamHostApi, msg_send), 256);
+            assert_eq!(core::mem::offset_of!(BamHostApi, log_diagnostic), 408);
+            assert_eq!(core::mem::offset_of!(BamHostApi, report_guest_fault), 416);
+            assert_eq!(
+                core::mem::offset_of!(BamHostApi, resolve_component_by_uuid),
+                424
+            );
+            assert_eq!(
+                core::mem::offset_of!(BamHostApi, component_layout_info),
+                432
+            );
+            assert_eq!(core::mem::offset_of!(BamHostApi, register_relation), 440);
+            assert_eq!(core::mem::offset_of!(BamHostApi, intern_symbol), 448);
+            assert_eq!(core::mem::offset_of!(BamHostApi, bind_named_object), 456);
+            assert_eq!(core::mem::offset_of!(BamHostApi, iter_count), 464);
+            assert_eq!(core::mem::offset_of!(BamHostApi, iter_up_cascade), 472);
+            assert_eq!(
+                core::mem::offset_of!(BamHostApi, par_for_each_chunk_readonly),
+                480
+            );
+            assert_eq!(
+                core::mem::offset_of!(BamHostApi, register_system_handle),
+                488
+            );
+            assert_eq!(
+                core::mem::offset_of!(BamHostApi, configure_schedule_set),
+                496
+            );
+            assert_eq!(
+                core::mem::offset_of!(BamHostApi, mount_system_in_schedule),
+                504
+            );
+            assert_eq!(core::mem::offset_of!(BamHostApi, cmd_checkpoint), 512);
+            assert_eq!(core::mem::offset_of!(BamHostApi, cmd_rollback), 520);
+            assert_eq!(core::mem::offset_of!(BamHostApi, cmd_insert_relation), 528);
+            assert_eq!(core::mem::offset_of!(BamHostApi, cmd_remove_relation), 536);
+            assert_eq!(
+                core::mem::offset_of!(BamHostApi, migrate_component_column),
+                544
+            );
         }
     }
 

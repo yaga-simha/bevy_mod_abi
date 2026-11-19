@@ -132,8 +132,10 @@ public:
     }
 
     void reset(InstanceT* next = nullptr) noexcept {
-        if (ptr_ != nullptr && DestroyFn != nullptr) {
-            DestroyFn(ptr_);
+        if constexpr (DestroyFn != nullptr) {
+            if (ptr_ != nullptr) {
+                DestroyFn(ptr_);
+            }
         }
         ptr_ = next;
     }
@@ -445,8 +447,10 @@ public:
     }
 
     void reset(InstanceT* next = nullptr) noexcept {
-        if (ptr_ != nullptr && DestroyFn != nullptr) {
-            DestroyFn(ptr_);
+        if constexpr (DestroyFn != nullptr) {
+            if (ptr_ != nullptr) {
+                DestroyFn(ptr_);
+            }
         }
         ptr_ = next;
     }
@@ -755,8 +759,10 @@ public:
     }
 
     void reset(InstanceT* next = nullptr) noexcept {
-        if (ptr_ != nullptr && DestroyFn != nullptr) {
-            DestroyFn(ptr_);
+        if constexpr (DestroyFn != nullptr) {
+            if (ptr_ != nullptr) {
+                DestroyFn(ptr_);
+            }
         }
         ptr_ = next;
     }
@@ -1051,8 +1057,10 @@ public:
     }
 
     void reset(InstanceT* next = nullptr) noexcept {
-        if (ptr_ != nullptr && DestroyFn != nullptr) {
-            DestroyFn(ptr_);
+        if constexpr (DestroyFn != nullptr) {
+            if (ptr_ != nullptr) {
+                DestroyFn(ptr_);
+            }
         }
         ptr_ = next;
     }
@@ -1342,8 +1350,10 @@ public:
     }
 
     void reset(InstanceT* next = nullptr) noexcept {
-        if (ptr_ != nullptr && DestroyFn != nullptr) {
-            DestroyFn(ptr_);
+        if constexpr (DestroyFn != nullptr) {
+            if (ptr_ != nullptr) {
+                DestroyFn(ptr_);
+            }
         }
         ptr_ = next;
     }
@@ -1635,8 +1645,10 @@ public:
     }
 
     void reset(InstanceT* next = nullptr) noexcept {
-        if (ptr_ != nullptr && DestroyFn != nullptr) {
-            DestroyFn(ptr_);
+        if constexpr (DestroyFn != nullptr) {
+            if (ptr_ != nullptr) {
+                DestroyFn(ptr_);
+            }
         }
         ptr_ = next;
     }
@@ -1924,8 +1936,10 @@ public:
     }
 
     void reset(InstanceT* next = nullptr) noexcept {
-        if (ptr_ != nullptr && DestroyFn != nullptr) {
-            DestroyFn(ptr_);
+        if constexpr (DestroyFn != nullptr) {
+            if (ptr_ != nullptr) {
+                DestroyFn(ptr_);
+            }
         }
         ptr_ = next;
     }
@@ -2219,8 +2233,10 @@ public:
     }
 
     void reset(InstanceT* next = nullptr) noexcept {
-        if (ptr_ != nullptr && DestroyFn != nullptr) {
-            DestroyFn(ptr_);
+        if constexpr (DestroyFn != nullptr) {
+            if (ptr_ != nullptr) {
+                DestroyFn(ptr_);
+            }
         }
         ptr_ = next;
     }
@@ -2532,8 +2548,10 @@ public:
     }
 
     void reset(InstanceT* next = nullptr) noexcept {
-        if (ptr_ != nullptr && DestroyFn != nullptr) {
-            DestroyFn(ptr_);
+        if constexpr (DestroyFn != nullptr) {
+            if (ptr_ != nullptr) {
+                DestroyFn(ptr_);
+            }
         }
         ptr_ = next;
     }
@@ -2839,8 +2857,10 @@ public:
     }
 
     void reset(InstanceT* next = nullptr) noexcept {
-        if (ptr_ != nullptr && DestroyFn != nullptr) {
-            DestroyFn(ptr_);
+        if constexpr (DestroyFn != nullptr) {
+            if (ptr_ != nullptr) {
+                DestroyFn(ptr_);
+            }
         }
         ptr_ = next;
     }
@@ -3128,8 +3148,10 @@ public:
     }
 
     void reset(InstanceT* next = nullptr) noexcept {
-        if (ptr_ != nullptr && DestroyFn != nullptr) {
-            DestroyFn(ptr_);
+        if constexpr (DestroyFn != nullptr) {
+            if (ptr_ != nullptr) {
+                DestroyFn(ptr_);
+            }
         }
         ptr_ = next;
     }
@@ -3417,8 +3439,10 @@ public:
     }
 
     void reset(InstanceT* next = nullptr) noexcept {
-        if (ptr_ != nullptr && DestroyFn != nullptr) {
-            DestroyFn(ptr_);
+        if constexpr (DestroyFn != nullptr) {
+            if (ptr_ != nullptr) {
+                DestroyFn(ptr_);
+            }
         }
         ptr_ = next;
     }
@@ -3706,8 +3730,10 @@ public:
     }
 
     void reset(InstanceT* next = nullptr) noexcept {
-        if (ptr_ != nullptr && DestroyFn != nullptr) {
-            DestroyFn(ptr_);
+        if constexpr (DestroyFn != nullptr) {
+            if (ptr_ != nullptr) {
+                DestroyFn(ptr_);
+            }
         }
         ptr_ = next;
     }
@@ -3995,8 +4021,10 @@ public:
     }
 
     void reset(InstanceT* next = nullptr) noexcept {
-        if (ptr_ != nullptr && DestroyFn != nullptr) {
-            DestroyFn(ptr_);
+        if constexpr (DestroyFn != nullptr) {
+            if (ptr_ != nullptr) {
+                DestroyFn(ptr_);
+            }
         }
         ptr_ = next;
     }
@@ -4284,8 +4312,10 @@ public:
     }
 
     void reset(InstanceT* next = nullptr) noexcept {
-        if (ptr_ != nullptr && DestroyFn != nullptr) {
-            DestroyFn(ptr_);
+        if constexpr (DestroyFn != nullptr) {
+            if (ptr_ != nullptr) {
+                DestroyFn(ptr_);
+            }
         }
         ptr_ = next;
     }
@@ -4468,6 +4498,7 @@ typedef struct RustFilterTelemetry {
     float scale;
     uint32_t matched_rows;
     uint32_t optional_vel_hits;
+    uint32_t _pad0;
     uint64_t spawned_default_entity;
 } RustFilterTelemetry;
 
@@ -4479,14 +4510,16 @@ typedef struct RustFilterTelemetryVTable {
     BamResult (*set_matched_rows)(void* ptr, uint32_t val);
     uint32_t (*get_optional_vel_hits)(const void* ptr);
     BamResult (*set_optional_vel_hits)(void* ptr, uint32_t val);
+    uint32_t (*get__pad0)(const void* ptr);
+    BamResult (*set__pad0)(void* ptr, uint32_t val);
     uint64_t (*get_spawned_default_entity)(const void* ptr);
     BamResult (*set_spawned_default_entity)(void* ptr, uint64_t val);
 } RustFilterTelemetryVTable;
 BAM_STATIC_ASSERT(offsetof(RustFilterTelemetryVTable, header) == 0u, rustfiltertelemetryvtable_header_off);
 #if UINTPTR_MAX == UINT64_MAX
-BAM_STATIC_ASSERT(sizeof(RustFilterTelemetryVTable) == 104u, rustfiltertelemetryvtable_size64);
+BAM_STATIC_ASSERT(sizeof(RustFilterTelemetryVTable) == 120u, rustfiltertelemetryvtable_size64);
 #elif UINTPTR_MAX == UINT32_MAX
-BAM_STATIC_ASSERT(sizeof(RustFilterTelemetryVTable) == 64u, rustfiltertelemetryvtable_size32);
+BAM_STATIC_ASSERT(sizeof(RustFilterTelemetryVTable) == 72u, rustfiltertelemetryvtable_size32);
 #endif
 #ifdef __cplusplus
 extern "C++" {
@@ -4582,8 +4615,10 @@ public:
     }
 
     void reset(InstanceT* next = nullptr) noexcept {
-        if (ptr_ != nullptr && DestroyFn != nullptr) {
-            DestroyFn(ptr_);
+        if constexpr (DestroyFn != nullptr) {
+            if (ptr_ != nullptr) {
+                DestroyFn(ptr_);
+            }
         }
         ptr_ = next;
     }
@@ -4739,6 +4774,9 @@ public:
     uint32_t get_optional_vel_hits() const noexcept {
         return (ptr_ != nullptr && vt_ != nullptr && vt_->get_optional_vel_hits != nullptr) ? vt_->get_optional_vel_hits(ptr_) : uint32_t{};
     }
+    uint32_t get__pad0() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get__pad0 != nullptr) ? vt_->get__pad0(ptr_) : uint32_t{};
+    }
     uint64_t get_spawned_default_entity() const noexcept {
         return (ptr_ != nullptr && vt_ != nullptr && vt_->get_spawned_default_entity != nullptr) ? vt_->get_spawned_default_entity(ptr_) : uint64_t{};
     }
@@ -4774,6 +4812,12 @@ public:
     BamResult set_optional_vel_hits(uint32_t val) noexcept {
         return (ptr_ != nullptr && vt_ != nullptr && vt_->set_optional_vel_hits != nullptr) ? vt_->set_optional_vel_hits(ptr_, val) : BAM_RESULT_NULL_POINTER;
     }
+    uint32_t get__pad0() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get__pad0 != nullptr) ? vt_->get__pad0(ptr_) : uint32_t{};
+    }
+    BamResult set__pad0(uint32_t val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set__pad0 != nullptr) ? vt_->set__pad0(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
     uint64_t get_spawned_default_entity() const noexcept {
         return (ptr_ != nullptr && vt_ != nullptr && vt_->get_spawned_default_entity != nullptr) ? vt_->get_spawned_default_entity(ptr_) : uint64_t{};
     }
@@ -4793,6 +4837,7 @@ typedef struct CFilterTelemetry {
     float scale;
     uint32_t matched_rows;
     uint32_t optional_vel_hits;
+    uint32_t _pad0;
     uint64_t spawned_default_entity;
 } CFilterTelemetry;
 
@@ -4804,14 +4849,16 @@ typedef struct CFilterTelemetryVTable {
     BamResult (*set_matched_rows)(void* ptr, uint32_t val);
     uint32_t (*get_optional_vel_hits)(const void* ptr);
     BamResult (*set_optional_vel_hits)(void* ptr, uint32_t val);
+    uint32_t (*get__pad0)(const void* ptr);
+    BamResult (*set__pad0)(void* ptr, uint32_t val);
     uint64_t (*get_spawned_default_entity)(const void* ptr);
     BamResult (*set_spawned_default_entity)(void* ptr, uint64_t val);
 } CFilterTelemetryVTable;
 BAM_STATIC_ASSERT(offsetof(CFilterTelemetryVTable, header) == 0u, cfiltertelemetryvtable_header_off);
 #if UINTPTR_MAX == UINT64_MAX
-BAM_STATIC_ASSERT(sizeof(CFilterTelemetryVTable) == 104u, cfiltertelemetryvtable_size64);
+BAM_STATIC_ASSERT(sizeof(CFilterTelemetryVTable) == 120u, cfiltertelemetryvtable_size64);
 #elif UINTPTR_MAX == UINT32_MAX
-BAM_STATIC_ASSERT(sizeof(CFilterTelemetryVTable) == 64u, cfiltertelemetryvtable_size32);
+BAM_STATIC_ASSERT(sizeof(CFilterTelemetryVTable) == 72u, cfiltertelemetryvtable_size32);
 #endif
 #ifdef __cplusplus
 extern "C++" {
@@ -4907,8 +4954,10 @@ public:
     }
 
     void reset(InstanceT* next = nullptr) noexcept {
-        if (ptr_ != nullptr && DestroyFn != nullptr) {
-            DestroyFn(ptr_);
+        if constexpr (DestroyFn != nullptr) {
+            if (ptr_ != nullptr) {
+                DestroyFn(ptr_);
+            }
         }
         ptr_ = next;
     }
@@ -5064,6 +5113,9 @@ public:
     uint32_t get_optional_vel_hits() const noexcept {
         return (ptr_ != nullptr && vt_ != nullptr && vt_->get_optional_vel_hits != nullptr) ? vt_->get_optional_vel_hits(ptr_) : uint32_t{};
     }
+    uint32_t get__pad0() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get__pad0 != nullptr) ? vt_->get__pad0(ptr_) : uint32_t{};
+    }
     uint64_t get_spawned_default_entity() const noexcept {
         return (ptr_ != nullptr && vt_ != nullptr && vt_->get_spawned_default_entity != nullptr) ? vt_->get_spawned_default_entity(ptr_) : uint64_t{};
     }
@@ -5098,6 +5150,12 @@ public:
     }
     BamResult set_optional_vel_hits(uint32_t val) noexcept {
         return (ptr_ != nullptr && vt_ != nullptr && vt_->set_optional_vel_hits != nullptr) ? vt_->set_optional_vel_hits(ptr_, val) : BAM_RESULT_NULL_POINTER;
+    }
+    uint32_t get__pad0() const noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->get__pad0 != nullptr) ? vt_->get__pad0(ptr_) : uint32_t{};
+    }
+    BamResult set__pad0(uint32_t val) noexcept {
+        return (ptr_ != nullptr && vt_ != nullptr && vt_->set__pad0 != nullptr) ? vt_->set__pad0(ptr_, val) : BAM_RESULT_NULL_POINTER;
     }
     uint64_t get_spawned_default_entity() const noexcept {
         return (ptr_ != nullptr && vt_ != nullptr && vt_->get_spawned_default_entity != nullptr) ? vt_->get_spawned_default_entity(ptr_) : uint64_t{};
@@ -5229,8 +5287,10 @@ public:
     }
 
     void reset(InstanceT* next = nullptr) noexcept {
-        if (ptr_ != nullptr && DestroyFn != nullptr) {
-            DestroyFn(ptr_);
+        if constexpr (DestroyFn != nullptr) {
+            if (ptr_ != nullptr) {
+                DestroyFn(ptr_);
+            }
         }
         ptr_ = next;
     }
@@ -5538,8 +5598,10 @@ public:
     }
 
     void reset(InstanceT* next = nullptr) noexcept {
-        if (ptr_ != nullptr && DestroyFn != nullptr) {
-            DestroyFn(ptr_);
+        if constexpr (DestroyFn != nullptr) {
+            if (ptr_ != nullptr) {
+                DestroyFn(ptr_);
+            }
         }
         ptr_ = next;
     }

@@ -30,10 +30,12 @@ pub use shared_lib::{
 };
 #[cfg(feature = "signature-verification")]
 pub use signing::{
-    CertificateValidityPolicy, DEFAULT_KRL_SIGNATURE_NAMESPACE, DEFAULT_MAX_MOD_BINARY_BYTES,
-    DEFAULT_SIGNATURE_NAMESPACE, KrlBuilder, MAX_KRL_BYTES, MAX_SIGNATURE_SIDECAR_BYTES,
-    ModSigningError, ModTrustConfigError, ModTrustPolicy, SignatureEnforcement,
-    SignatureVerificationError, VerifiedModSignature, default_signature_path_for,
-    sign_mod_bytes_with_certificate, sign_mod_bytes_with_key,
-    sign_mod_bytes_with_openssh_certificate,
+    BAM_SIG_MACHO_SECTION_NAME, BAM_SIG_SECTION_NAME, BAMPACK_MAGIC, BAMPACK_VERSION,
+    BamPackBuilder, BamPackEntry, CertificateValidityPolicy, DEFAULT_BAMPACK_NAMESPACE,
+    DEFAULT_KRL_SIGNATURE_NAMESPACE, DEFAULT_MAX_MOD_BINARY_BYTES, DEFAULT_SIGNATURE_NAMESPACE,
+    EmbeddedSignatureSection, KrlBuilder, MAX_BAMPACK_ENTRIES, MAX_KRL_BYTES,
+    MAX_SIGNATURE_SIDECAR_BYTES, ModSigningError, ModTrustConfigError, ModTrustPolicy,
+    SignatureEnforcement, SignatureVerificationError, VerifiedBamPack, VerifiedModSignature,
+    default_signature_path_for, extract_embedded_bam_sig, sign_mod_bytes_with_certificate,
+    sign_mod_bytes_with_key, sign_mod_bytes_with_openssh_certificate, zeroed_binary_for_bam_sig,
 };

@@ -1,6 +1,6 @@
 /*
  * test_abi_layout.c
- * Empirical Cross-Language C-ABI v0.2 Verification Test.
+ * Empirical Cross-Language C-ABI v0.3 Verification Test.
  *
  * Compiles with: cc -std=c99 -Wall -Wextra -Werror -I../../include -o test_abi_layout test_abi_layout.c
  */
@@ -52,15 +52,19 @@ int main(void) {
     BamComponentDesc desc;
     BamComponentDesc bad_desc;
     BamHostApi api;
-    BamLoadCtx* mock_load_ctx = (BamLoadCtx*)0xCAFE;
+    BamLoadCtx* mock_load_ctx = (BamLoadCtx*)(uintptr_t)0xCAFEu;
     BamComponent out_comp = BAM_COMPONENT_INVALID;
     int dummy_target = 42;
 
-    printf("[C99 ABI v0.2 Layout Verification]\n");
+    printf("[C99 ABI v0.3 Layout Verification]\n");
 
     assert(BAM_COMPONENT_DESC_MIN_V0_2_SIZE == 64u);
-    assert(sizeof(BamComponentDesc) == 136u);
-    assert(BAM_ALIGNOF(BamComponentDesc) == 8u);
+#if UINTPTR_MAX == 0xffffffffffffffffULL
+    assert(sizeof(BamComponentDesc) == 176u);
+#else
+    assert(sizeof(BamComponentDesc) == 104u);
+#endif
+    assert(BAM_ALIGNOF(BamComponentDesc) == BAM_ALIGNOF(uint64_t));
     assert(offsetof(BamComponentDesc, struct_size) == 0u);
     assert(offsetof(BamComponentDesc, flags) == 4u);
     assert(offsetof(BamComponentDesc, name) == 8u);
@@ -80,8 +84,13 @@ int main(void) {
     assert(offsetof(BamComponentDesc, required_component_count) == 128u);
 
     assert(BAM_HOST_API_MIN_V0_2_SIZE == 224u);
-    assert(sizeof(BamHostApi) == 408u);
-    assert(BAM_ALIGNOF(BamHostApi) == 8u);
+#if UINTPTR_MAX == 0xffffffffffffffffULL
+    assert(sizeof(BamHostApi) == 552u);
+#else
+    assert(sizeof(BamHostApi) == 280u);
+#endif
+    assert(BAM_ALIGNOF(BamHostApi) == sizeof(void*));
+    assert(BAM_HOST_API_SLOT_COUNT == 68u);
 
     memset(&desc, 0, sizeof(desc));
     desc.struct_size = (uint32_t)sizeof(BamComponentDesc);
@@ -91,7 +100,7 @@ int main(void) {
     desc.size = 128u;
     desc.align = 16u;
     desc.drop_fn = custom_drop_callback;
-    desc.vtable_ptr = (const void*)0xDEADBEEF;
+    desc.vtable_ptr = (const void*)(uintptr_t)0xDEADBEEFull;
 
     desc.drop_fn(&dummy_target);
     assert(g_custom_drop_called == 1);
@@ -126,6 +135,6 @@ int main(void) {
     bad_desc.align = 7u;
     assert(api.register_component(mock_load_ctx, &bad_desc, &out_comp) == BAM_RESULT_INVALID_ARGUMENT);
 
-    printf("[SUCCESS] All C99 ABI v0.2 layout and dispatch tests passed!\n");
+    printf("[SUCCESS] All C99 ABI v0.3 layout and dispatch tests passed!\n");
     return 0;
 }

@@ -1,7 +1,7 @@
 //! Guest mod project scaffolding (`cargo bam new`).
 
 use crate::CliError;
-use crate::sdk::{C99_HEADER, CPP17_HEADER, ZIG_SDK};
+use crate::sdk::{CPP17_HEADER, ZIG_SDK, c99_header};
 use clap::ValueEnum;
 use std::fmt;
 use std::fs;
@@ -96,7 +96,7 @@ pub fn scaffold_new_mod(
     fs::create_dir_all(project_dir.join("src"))?;
 
     let mod_toml = format!(
-        "[mod]\nid = \"{stem}\"\nname = \"{name}\"\nversion = \"0.2.0\"\nabi_version = \"0.2.0\"\nlanguage = \"{}\"\n\n[dependencies]\n",
+        "[mod]\nid = \"{stem}\"\nname = \"{name}\"\nversion = \"0.2.0\"\nabi_version = \"0.3.0\"\nlanguage = \"{}\"\n\n[dependencies]\n",
         lang.as_str()
     );
     fs::write(project_dir.join("mod.toml"), mod_toml)?;
@@ -110,7 +110,7 @@ pub fn scaffold_new_mod(
             fs::write(project_dir.join("Cargo.toml"), cargo_toml)?;
 
             let lib_rs = format!(
-                r#"//! `{name}` guest mod (`ABI 0.2.0`).
+                r#"//! `{name}` guest mod (`ABI 0.3.0`).
 
 use bevy_abi_mod_guest::prelude::*;
 use core::ffi::CStr;
@@ -138,7 +138,7 @@ export_mod!(plugin: ModPlugin);
             fs::create_dir_all(project_dir.join("include"))?;
             fs::write(
                 project_dir.join("include").join("bevy_abi_mod.h"),
-                C99_HEADER,
+                c99_header(),
             )?;
 
             let mod_c = format!(
@@ -210,7 +210,7 @@ BAM_EXPORT void bevy_abi_mod_shutdown(BamInstance* instance) {{
             fs::create_dir_all(project_dir.join("include"))?;
             fs::write(
                 project_dir.join("include").join("bevy_abi_mod.h"),
-                C99_HEADER,
+                c99_header(),
             )?;
             fs::write(
                 project_dir.join("include").join("bevy_abi_mod.hpp"),
@@ -291,7 +291,7 @@ BAM_EXPORT void bevy_abi_mod_shutdown(BamInstance* instance) {{
             fs::create_dir_all(project_dir.join("include"))?;
             fs::write(
                 project_dir.join("include").join("bevy_abi_mod.h"),
-                C99_HEADER,
+                c99_header(),
             )?;
             fs::write(
                 project_dir.join("include").join("bevy_abi_mod.zig"),

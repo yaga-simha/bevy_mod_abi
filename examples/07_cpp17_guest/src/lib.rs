@@ -232,24 +232,81 @@ pub fn resolve_or_build_cpp17_mod() -> PathBuf {
         .clone()
 }
 
+fn is_msvc_style_driver(tool: &str) -> bool {
+    let file_name = Path::new(tool)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(tool);
+    let stem = file_name
+        .strip_suffix(".exe")
+        .or_else(|| file_name.strip_suffix(".EXE"))
+        .unwrap_or(file_name);
+    stem.eq_ignore_ascii_case("cl") || stem.eq_ignore_ascii_case("clang-cl")
+}
+
+fn find_cxx_compiler() -> String {
+    if let Ok(cxx) = std::env::var("CXX")
+        && !cxx.trim().is_empty()
+    {
+        return cxx.trim().to_owned();
+    }
+    #[cfg(target_os = "windows")]
+    let candidates = ["clang++", "clang-cl", "cl.exe", "cl", "g++", "c++"];
+    #[cfg(not(target_os = "windows"))]
+    let candidates = ["clang++", "g++", "c++"];
+    for cand in candidates {
+        let is_plain_cl = Path::new(cand)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("cl") || n.eq_ignore_ascii_case("cl.exe"));
+        let res = if is_plain_cl {
+            Command::new(cand).output()
+        } else {
+            Command::new(cand).arg("--version").output()
+        };
+        if let Ok(out) = res
+            && (out.status.success() || (is_plain_cl && !out.stderr.is_empty()))
+        {
+            return cand.to_owned();
+        }
+    }
+    if cfg!(target_os = "windows") {
+        "g++".to_owned()
+    } else {
+        "c++".to_owned()
+    }
+}
+
 fn build_cpp17_mod(cpp_dir: &Path, dylib_path: &Path, ext: &str) {
-    let cxx = std::env::var("CXX")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| {
-            if cfg!(target_os = "windows") {
-                "g++".to_owned()
-            } else {
-                "c++".to_owned()
-            }
-        });
+    let cxx = find_cxx_compiler();
     let include_dir = cpp_dir.join("../../../include");
     let pid = std::process::id();
     let tmp_path = cpp_dir.join(format!("cpp17_mod.tmp.{pid}.{ext}"));
+    let obj_path = std::env::temp_dir().join(format!("cpp17_mod_{pid}.obj"));
+    let implib_path = std::env::temp_dir().join(format!("cpp17_mod_{pid}.lib"));
+    let exp_path = std::env::temp_dir().join(format!("cpp17_mod_{pid}.exp"));
 
     let mut cmd = Command::new(&cxx);
-    cmd.current_dir(cpp_dir)
-        .args([
+    cmd.current_dir(cpp_dir);
+    if is_msvc_style_driver(&cxx) {
+        cmd.args([
+            "/nologo",
+            "/LD",
+            "/std:c++17",
+            "/Zc:__cplusplus",
+            "/EHsc",
+            "/W4",
+            "/WX",
+            "/O2",
+        ])
+        .arg(format!("/I{}", include_dir.display()))
+        .arg(format!("/Fo{}", obj_path.display()))
+        .arg("mod.cpp")
+        .arg("/link")
+        .arg(format!("/IMPLIB:{}", implib_path.display()))
+        .arg(format!("/OUT:{}", tmp_path.display()));
+    } else {
+        cmd.args([
             "-std=c++17",
             "-Wall",
             "-Wextra",
@@ -259,17 +316,21 @@ fn build_cpp17_mod(cpp_dir: &Path, dylib_path: &Path, ext: &str) {
             "-shared",
         ])
         .arg(format!("-I{}", include_dir.display()));
-    if !cfg!(target_os = "windows") {
-        cmd.args([
-            "-fPIC",
-            "-fvisibility=hidden",
-            "-fvisibility-inlines-hidden",
-        ]);
+        if !cfg!(target_os = "windows") {
+            cmd.args([
+                "-fPIC",
+                "-fvisibility=hidden",
+                "-fvisibility-inlines-hidden",
+            ]);
+        }
+        cmd.arg("mod.cpp").arg("-o").arg(&tmp_path);
     }
-    cmd.arg("mod.cpp").arg("-o").arg(&tmp_path);
     let status = cmd
         .status()
         .unwrap_or_else(|e| panic!("Failed to invoke `{cxx}` for C++17 guest mod: {e}"));
+    let _ = fs::remove_file(&obj_path);
+    let _ = fs::remove_file(&implib_path);
+    let _ = fs::remove_file(&exp_path);
     if !status.success() {
         let _ = fs::remove_file(&tmp_path);
         panic!("C++17 guest `{cxx}` compilation failed with status {status}");

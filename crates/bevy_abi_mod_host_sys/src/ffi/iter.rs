@@ -306,6 +306,28 @@ enum IterBacking<'w> {
     },
 }
 
+struct DenseTableFilters<'t> {
+    skip: bool,
+    filter_slices: [&'t [UnsafeCell<Tick>]; MAX_TERMS_PER_QUERY],
+    filter_len: usize,
+    or_slices: [&'t [UnsafeCell<Tick>]; MAX_TERMS_PER_QUERY],
+    or_slice_len: usize,
+    or_ranges: [(usize, usize); MAX_TERMS_PER_QUERY],
+    or_group_len: usize,
+}
+
+struct ArchetypeFilters<'t> {
+    skip: bool,
+    dense_filter_slices: [(usize, &'t [UnsafeCell<Tick>]); MAX_TERMS_PER_QUERY],
+    dense_filter_len: usize,
+    or_dense_slices: [&'t [UnsafeCell<Tick>]; MAX_TERMS_PER_QUERY],
+    or_dense_len: usize,
+    or_sparse_clauses: [(ComponentId, bool); MAX_TERMS_PER_QUERY],
+    or_sparse_len: usize,
+    or_ranges: [(usize, usize, usize, usize); MAX_TERMS_PER_QUERY],
+    or_group_len: usize,
+}
+
 /// Concrete `#[repr(C)]` host chunk and resource iterator backing opaque [`BamIter`].
 #[repr(C)]
 pub struct HostIter<'w> {
@@ -613,6 +635,408 @@ impl<'w> HostIter<'w> {
         true
     }
 
+    #[inline]
+    fn prepare_dense_table_filters<'t>(
+        table: &'t bevy_ecs::storage::Table,
+        full_table_len: usize,
+        plan: &QueryPlan,
+        last_run: Tick,
+        this_run: Tick,
+    ) -> DenseTableFilters<'t> {
+        let tick_filters = plan.tick_filters.as_slice();
+        let or_groups = plan.or_groups.as_slice();
+        let mut filter_slices: [&'t [UnsafeCell<Tick>]; MAX_TERMS_PER_QUERY] =
+            [&[]; MAX_TERMS_PER_QUERY];
+        let mut skip = false;
+
+        for (f_idx, tf) in tick_filters.iter().enumerate() {
+            let Some(col) = table.get_column(tf.component_id) else {
+                skip = true;
+                break;
+            };
+            if !tf.is_added
+                && let Some(summary) = col.get_summary_tick()
+                && !summary.get().is_newer_than(last_run, this_run)
+            {
+                skip = true;
+                break;
+            }
+            filter_slices[f_idx] = if tf.is_added {
+                // SAFETY: `full_table_len == table.entity_count() as usize`.
+                unsafe { col.get_added_ticks_slice(full_table_len) }
+            } else {
+                // SAFETY: `full_table_len == table.entity_count() as usize`.
+                unsafe { col.get_changed_ticks_slice(full_table_len) }
+            };
+        }
+
+        let mut or_slices: [&'t [UnsafeCell<Tick>]; MAX_TERMS_PER_QUERY] =
+            [&[]; MAX_TERMS_PER_QUERY];
+        let mut or_slice_len = 0usize;
+        let mut or_ranges: [(usize, usize); MAX_TERMS_PER_QUERY] = [(0, 0); MAX_TERMS_PER_QUERY];
+        let mut or_group_len = 0usize;
+
+        if !skip && !or_groups.is_empty() {
+            for group in or_groups {
+                let mut trivially_satisfied = false;
+                let start_slice = or_slice_len;
+                for clause in &group.terms {
+                    match clause.mode {
+                        AccessMode::FILTER_ONLY => {
+                            if table.has_column(clause.component_id) {
+                                trivially_satisfied = true;
+                                break;
+                            }
+                        }
+                        AccessMode::WITHOUT => {
+                            if !table.has_column(clause.component_id) {
+                                trivially_satisfied = true;
+                                break;
+                            }
+                        }
+                        AccessMode::CHANGED | AccessMode::ADDED => {
+                            let Some(col) = table.get_column(clause.component_id) else {
+                                continue;
+                            };
+                            let is_added = clause.mode == AccessMode::ADDED;
+                            if !is_added
+                                && let Some(summary) = col.get_summary_tick()
+                                && !summary.get().is_newer_than(last_run, this_run)
+                            {
+                                continue;
+                            }
+                            let slice = if is_added {
+                                // SAFETY: `full_table_len == table.entity_count() as usize`.
+                                unsafe { col.get_added_ticks_slice(full_table_len) }
+                            } else {
+                                // SAFETY: `full_table_len == table.entity_count() as usize`.
+                                unsafe { col.get_changed_ticks_slice(full_table_len) }
+                            };
+                            or_slices[or_slice_len] = slice;
+                            or_slice_len += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                if trivially_satisfied {
+                    or_slice_len = start_slice;
+                    continue;
+                }
+                if or_slice_len == start_slice {
+                    skip = true;
+                    break;
+                }
+                or_ranges[or_group_len] = (start_slice, or_slice_len);
+                or_group_len += 1;
+            }
+        }
+
+        DenseTableFilters {
+            skip,
+            filter_slices,
+            filter_len: tick_filters.len(),
+            or_slices,
+            or_slice_len,
+            or_ranges,
+            or_group_len,
+        }
+    }
+
+    #[inline]
+    fn prepare_archetype_filters<'t>(
+        archetype: &bevy_ecs::archetype::Archetype,
+        table: &'t bevy_ecs::storage::Table,
+        sparse_sets: &SparseSets,
+        table_len: usize,
+        plan: &QueryPlan,
+        last_run: Tick,
+        this_run: Tick,
+    ) -> ArchetypeFilters<'t> {
+        let tick_filters = plan.tick_filters.as_slice();
+        let or_groups = plan.or_groups.as_slice();
+        let mut dense_filter_slices: [(usize, &'t [UnsafeCell<Tick>]); MAX_TERMS_PER_QUERY] =
+            [(0, &[]); MAX_TERMS_PER_QUERY];
+        let mut dense_filter_len = 0usize;
+        let mut skip = false;
+
+        for (f_idx, tf) in tick_filters.iter().enumerate() {
+            if tf.is_sparse {
+                continue;
+            }
+            let Some(col) = table.get_column(tf.component_id) else {
+                skip = true;
+                break;
+            };
+            if !tf.is_added
+                && let Some(summary) = col.get_summary_tick()
+                && !summary.get().is_newer_than(last_run, this_run)
+            {
+                skip = true;
+                break;
+            }
+            let slice = if tf.is_added {
+                // SAFETY: `table_len == table.entity_count() as usize`.
+                unsafe { col.get_added_ticks_slice(table_len) }
+            } else {
+                // SAFETY: `table_len == table.entity_count() as usize`.
+                unsafe { col.get_changed_ticks_slice(table_len) }
+            };
+            dense_filter_slices[dense_filter_len] = (f_idx, slice);
+            dense_filter_len += 1;
+        }
+
+        let mut or_dense_slices: [&'t [UnsafeCell<Tick>]; MAX_TERMS_PER_QUERY] =
+            [&[]; MAX_TERMS_PER_QUERY];
+        let mut or_dense_len = 0usize;
+        let mut or_sparse_clauses: [(ComponentId, bool); MAX_TERMS_PER_QUERY] =
+            [(ComponentId::new(0), false); MAX_TERMS_PER_QUERY];
+        let mut or_sparse_len = 0usize;
+        let mut or_ranges: [(usize, usize, usize, usize); MAX_TERMS_PER_QUERY] =
+            [(0, 0, 0, 0); MAX_TERMS_PER_QUERY];
+        let mut or_group_len = 0usize;
+
+        if !skip && !or_groups.is_empty() {
+            for group in or_groups {
+                let mut trivially_satisfied = false;
+                let d_start = or_dense_len;
+                let s_start = or_sparse_len;
+                for clause in &group.terms {
+                    match clause.mode {
+                        AccessMode::FILTER_ONLY => {
+                            if archetype.contains(clause.component_id) {
+                                trivially_satisfied = true;
+                                break;
+                            }
+                        }
+                        AccessMode::WITHOUT => {
+                            if !archetype.contains(clause.component_id) {
+                                trivially_satisfied = true;
+                                break;
+                            }
+                        }
+                        AccessMode::CHANGED | AccessMode::ADDED => {
+                            if !archetype.contains(clause.component_id) {
+                                continue;
+                            }
+                            let is_added = clause.mode == AccessMode::ADDED;
+                            if clause.is_sparse {
+                                if sparse_sets.get(clause.component_id).is_some() {
+                                    or_sparse_clauses[or_sparse_len] =
+                                        (clause.component_id, is_added);
+                                    or_sparse_len += 1;
+                                }
+                            } else if let Some(col) = table.get_column(clause.component_id) {
+                                if !is_added
+                                    && let Some(summary) = col.get_summary_tick()
+                                    && !summary.get().is_newer_than(last_run, this_run)
+                                {
+                                    continue;
+                                }
+                                let slice = if is_added {
+                                    // SAFETY: `table_len == table.entity_count() as usize`.
+                                    unsafe { col.get_added_ticks_slice(table_len) }
+                                } else {
+                                    // SAFETY: `table_len == table.entity_count() as usize`.
+                                    unsafe { col.get_changed_ticks_slice(table_len) }
+                                };
+                                or_dense_slices[or_dense_len] = slice;
+                                or_dense_len += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if trivially_satisfied {
+                    or_dense_len = d_start;
+                    or_sparse_len = s_start;
+                    continue;
+                }
+                if or_dense_len == d_start && or_sparse_len == s_start {
+                    skip = true;
+                    break;
+                }
+                or_ranges[or_group_len] = (d_start, or_dense_len, s_start, or_sparse_len);
+                or_group_len += 1;
+            }
+        }
+
+        ArchetypeFilters {
+            skip,
+            dense_filter_slices,
+            dense_filter_len,
+            or_dense_slices,
+            or_dense_len,
+            or_sparse_clauses,
+            or_sparse_len,
+            or_ranges,
+            or_group_len,
+        }
+    }
+
+    /// Counts matching entities across this iterator without advancing or mutating cursor state.
+    pub(crate) fn count_matching(&self) -> usize {
+        let Some(tables) = self.tables else {
+            return 0;
+        };
+        let plan = self.plan;
+        let last_run = self.last_run;
+        let this_run = self.this_run;
+        let has_tick_filters = !plan.tick_filters.is_empty();
+        let has_or_groups = !plan.or_groups.is_empty();
+
+        match self.backing {
+            IterBacking::ResourceOnly => 0,
+            IterBacking::DenseTables {
+                matched_tables,
+                table_cursor,
+                row_cursor,
+                single_table_end_row,
+            } => {
+                let mut total = 0usize;
+                for (t_idx, &table_id) in matched_tables.iter().enumerate() {
+                    let Some(table) = tables.get(table_id) else {
+                        continue;
+                    };
+                    let full_len = table.entity_count() as usize;
+                    let limit_len = single_table_end_row
+                        .map(|end| end.min(full_len))
+                        .unwrap_or(full_len);
+                    let start = if self.in_par_iter
+                        && single_table_end_row.is_some()
+                        && t_idx == table_cursor
+                    {
+                        row_cursor.min(limit_len)
+                    } else {
+                        0
+                    };
+                    if start >= limit_len {
+                        continue;
+                    }
+                    if !has_tick_filters && !has_or_groups {
+                        total += limit_len - start;
+                        continue;
+                    }
+                    let df = Self::prepare_dense_table_filters(
+                        table, full_len, plan, last_run, this_run,
+                    );
+                    if df.skip {
+                        continue;
+                    }
+                    let active_slices = &df.filter_slices[..df.filter_len];
+                    let active_or_slices = &df.or_slices[..df.or_slice_len];
+                    let active_or_ranges = &df.or_ranges[..df.or_group_len];
+                    for row in start..limit_len {
+                        if Self::row_matches_dense_slices_and_or(
+                            active_slices,
+                            active_or_slices,
+                            active_or_ranges,
+                            row,
+                            last_run,
+                            this_run,
+                        ) {
+                            total += 1;
+                        }
+                    }
+                }
+                total
+            }
+            IterBacking::Archetypes {
+                archetypes,
+                sparse_sets,
+                matched_archetypes,
+                archetype_cursor,
+                entity_cursor,
+                single_arch_end_entity,
+            } => {
+                let tick_filters = plan.tick_filters.as_slice();
+                let mut total = 0usize;
+                for (a_idx, &arch_id) in matched_archetypes.iter().enumerate() {
+                    let Some(archetype) = archetypes.get(arch_id) else {
+                        continue;
+                    };
+                    let arch_entities = archetype.entities();
+                    let limit_entities = single_arch_end_entity
+                        .map(|end| end.min(arch_entities.len()))
+                        .unwrap_or(arch_entities.len());
+                    let start = if self.in_par_iter
+                        && single_arch_end_entity.is_some()
+                        && a_idx == archetype_cursor
+                    {
+                        entity_cursor.min(limit_entities)
+                    } else {
+                        0
+                    };
+                    if start >= limit_entities {
+                        continue;
+                    }
+                    if !has_tick_filters && !has_or_groups {
+                        total += limit_entities - start;
+                        continue;
+                    }
+                    let Some(table) = tables.get(archetype.table_id()) else {
+                        continue;
+                    };
+                    let table_len = table.entity_count() as usize;
+                    let af = Self::prepare_archetype_filters(
+                        archetype,
+                        table,
+                        sparse_sets,
+                        table_len,
+                        plan,
+                        last_run,
+                        this_run,
+                    );
+                    if af.skip {
+                        continue;
+                    }
+                    let active_dense = &af.dense_filter_slices[..af.dense_filter_len];
+                    let active_or_dense = &af.or_dense_slices[..af.or_dense_len];
+                    let active_or_sparse = &af.or_sparse_clauses[..af.or_sparse_len];
+                    let active_or_ranges = &af.or_ranges[..af.or_group_len];
+                    for cand in &arch_entities[start..limit_entities] {
+                        let row_idx = cand.table_row().index();
+                        let ok_top = !has_tick_filters
+                            || Self::entity_matches_archetypal_filters(
+                                active_dense,
+                                sparse_sets,
+                                tick_filters,
+                                cand.id(),
+                                row_idx,
+                                table_len,
+                                last_run,
+                                this_run,
+                            );
+                        let ok_or = active_or_ranges.is_empty()
+                            || Self::entity_matches_archetypal_or_groups(
+                                active_or_dense,
+                                active_or_sparse,
+                                active_or_ranges,
+                                sparse_sets,
+                                cand.id(),
+                                row_idx,
+                                table_len,
+                                last_run,
+                                this_run,
+                            );
+                        if ok_top && ok_or {
+                            total += 1;
+                        }
+                    }
+                }
+                total
+            }
+        }
+    }
+
+    /// Returns `true` if the query plan declares any mutable (`WRITE` / `OPTIONAL_WRITE`) term.
+    #[inline]
+    pub(crate) fn has_writable_terms(&self) -> bool {
+        self.plan
+            .terms
+            .iter()
+            .any(|t| matches!(t.mode, AccessMode::WRITE | AccessMode::OPTIONAL_WRITE))
+    }
+
     /// Advances to the next non-empty matching chunk, returning `0` when exhausted.
     pub fn next_chunk(&mut self) -> usize {
         let last_run = self.last_run;
@@ -673,104 +1097,22 @@ impl<'w> HostIter<'w> {
                         return run_len;
                     }
 
-                    // Resolve all top-level tick-filter slices ONCE per table, and skip the entire
-                    // table in O(1) if any `Changed<T>` summary tick is not newer than `last_run`.
-                    let mut filter_slices: [&[UnsafeCell<Tick>]; MAX_TERMS_PER_QUERY] =
-                        [&[]; MAX_TERMS_PER_QUERY];
-                    let mut skip_table = false;
-                    for (f_idx, tf) in tick_filters.iter().enumerate() {
-                        let Some(col) = table.get_column(tf.component_id) else {
-                            skip_table = true;
-                            break;
-                        };
-                        if !tf.is_added
-                            && let Some(summary) = col.get_summary_tick()
-                            && !summary.get().is_newer_than(last_run, this_run)
-                        {
-                            skip_table = true;
-                            break;
-                        }
-                        filter_slices[f_idx] = if tf.is_added {
-                            // SAFETY: `full_table_len == table.entity_count() as usize`.
-                            unsafe { col.get_added_ticks_slice(full_table_len) }
-                        } else {
-                            // SAFETY: `full_table_len == table.entity_count() as usize`.
-                            unsafe { col.get_changed_ticks_slice(full_table_len) }
-                        };
-                    }
-
-                    let mut or_slices: [&[UnsafeCell<Tick>]; MAX_TERMS_PER_QUERY] =
-                        [&[]; MAX_TERMS_PER_QUERY];
-                    let mut or_slice_count = 0usize;
-                    let mut or_ranges: [(usize, usize); MAX_TERMS_PER_QUERY] =
-                        [(0, 0); MAX_TERMS_PER_QUERY];
-                    let mut or_group_count = 0usize;
-
-                    if !skip_table && has_or_groups {
-                        for group in or_groups {
-                            let mut trivially_satisfied = false;
-                            let start_slice = or_slice_count;
-                            for clause in &group.terms {
-                                match clause.mode {
-                                    AccessMode::FILTER_ONLY => {
-                                        if table.has_column(clause.component_id) {
-                                            trivially_satisfied = true;
-                                            break;
-                                        }
-                                    }
-                                    AccessMode::WITHOUT => {
-                                        if !table.has_column(clause.component_id) {
-                                            trivially_satisfied = true;
-                                            break;
-                                        }
-                                    }
-                                    AccessMode::CHANGED | AccessMode::ADDED => {
-                                        let Some(col) = table.get_column(clause.component_id)
-                                        else {
-                                            continue;
-                                        };
-                                        let is_added = clause.mode == AccessMode::ADDED;
-                                        if !is_added
-                                            && let Some(summary) = col.get_summary_tick()
-                                            && !summary.get().is_newer_than(last_run, this_run)
-                                        {
-                                            continue;
-                                        }
-                                        let slice = if is_added {
-                                            // SAFETY: `full_table_len == table.entity_count() as usize`.
-                                            unsafe { col.get_added_ticks_slice(full_table_len) }
-                                        } else {
-                                            // SAFETY: `full_table_len == table.entity_count() as usize`.
-                                            unsafe { col.get_changed_ticks_slice(full_table_len) }
-                                        };
-                                        or_slices[or_slice_count] = slice;
-                                        or_slice_count += 1;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            if trivially_satisfied {
-                                or_slice_count = start_slice;
-                                continue;
-                            }
-                            if or_slice_count == start_slice {
-                                skip_table = true;
-                                break;
-                            }
-                            or_ranges[or_group_count] = (start_slice, or_slice_count);
-                            or_group_count += 1;
-                        }
-                    }
-
-                    if skip_table {
+                    let df = Self::prepare_dense_table_filters(
+                        table,
+                        full_table_len,
+                        plan,
+                        last_run,
+                        this_run,
+                    );
+                    if df.skip {
                         *table_cursor += 1;
                         *row_cursor = 0;
                         continue;
                     }
 
-                    let active_slices = &filter_slices[..tick_filters.len()];
-                    let active_or_slices = &or_slices[..or_slice_count];
-                    let active_or_ranges = &or_ranges[..or_group_count];
+                    let active_slices = &df.filter_slices[..df.filter_len];
+                    let active_or_slices = &df.or_slices[..df.or_slice_len];
+                    let active_or_ranges = &df.or_ranges[..df.or_group_len];
 
                     let (start_row_idx, run_len) =
                         if active_slices.is_empty() && active_or_ranges.is_empty() {
@@ -844,9 +1186,7 @@ impl<'w> HostIter<'w> {
                 single_arch_end_entity,
             } => {
                 let tick_filters = plan.tick_filters.as_slice();
-                let or_groups = plan.or_groups.as_slice();
                 let has_tick_filters = !tick_filters.is_empty();
-                let has_or_groups = !or_groups.is_empty();
                 let require_contiguous_table_rows = plan.dense_data_mask != 0;
 
                 while *archetype_cursor < matched_archetypes.len() {
@@ -874,127 +1214,25 @@ impl<'w> HostIter<'w> {
                     };
                     let table_len = table.entity_count() as usize;
 
-                    // Pre-resolve any dense tick-filter slices once for this archetype's table.
-                    let mut dense_filter_slices: [(usize, &[UnsafeCell<Tick>]);
-                        MAX_TERMS_PER_QUERY] = [(0, &[]); MAX_TERMS_PER_QUERY];
-                    let mut dense_filter_count = 0usize;
-                    let mut skip_arch = false;
-                    if has_tick_filters {
-                        for (f_idx, tf) in tick_filters.iter().enumerate() {
-                            if tf.is_sparse {
-                                continue;
-                            }
-                            let Some(col) = table.get_column(tf.component_id) else {
-                                skip_arch = true;
-                                break;
-                            };
-                            if !tf.is_added
-                                && let Some(summary) = col.get_summary_tick()
-                                && !summary.get().is_newer_than(last_run, this_run)
-                            {
-                                skip_arch = true;
-                                break;
-                            }
-                            let slice = if tf.is_added {
-                                // SAFETY: `table_len == table.entity_count() as usize`.
-                                unsafe { col.get_added_ticks_slice(table_len) }
-                            } else {
-                                // SAFETY: `table_len == table.entity_count() as usize`.
-                                unsafe { col.get_changed_ticks_slice(table_len) }
-                            };
-                            dense_filter_slices[dense_filter_count] = (f_idx, slice);
-                            dense_filter_count += 1;
-                        }
-                    }
-
-                    let mut or_dense_slices: [&[UnsafeCell<Tick>]; MAX_TERMS_PER_QUERY] =
-                        [&[]; MAX_TERMS_PER_QUERY];
-                    let mut or_dense_count = 0usize;
-                    let mut or_sparse_clauses: [(ComponentId, bool); MAX_TERMS_PER_QUERY] =
-                        [(ComponentId::new(0), false); MAX_TERMS_PER_QUERY];
-                    let mut or_sparse_count = 0usize;
-                    let mut or_ranges: [(usize, usize, usize, usize); MAX_TERMS_PER_QUERY] =
-                        [(0, 0, 0, 0); MAX_TERMS_PER_QUERY];
-                    let mut or_group_count = 0usize;
-
-                    if !skip_arch && has_or_groups {
-                        for group in or_groups {
-                            let mut trivially_satisfied = false;
-                            let d_start = or_dense_count;
-                            let s_start = or_sparse_count;
-                            for clause in &group.terms {
-                                match clause.mode {
-                                    AccessMode::FILTER_ONLY => {
-                                        if archetype.contains(clause.component_id) {
-                                            trivially_satisfied = true;
-                                            break;
-                                        }
-                                    }
-                                    AccessMode::WITHOUT => {
-                                        if !archetype.contains(clause.component_id) {
-                                            trivially_satisfied = true;
-                                            break;
-                                        }
-                                    }
-                                    AccessMode::CHANGED | AccessMode::ADDED => {
-                                        if !archetype.contains(clause.component_id) {
-                                            continue;
-                                        }
-                                        let is_added = clause.mode == AccessMode::ADDED;
-                                        if clause.is_sparse {
-                                            if sparse_sets.get(clause.component_id).is_some() {
-                                                or_sparse_clauses[or_sparse_count] =
-                                                    (clause.component_id, is_added);
-                                                or_sparse_count += 1;
-                                            }
-                                        } else if let Some(col) =
-                                            table.get_column(clause.component_id)
-                                        {
-                                            if !is_added
-                                                && let Some(summary) = col.get_summary_tick()
-                                                && !summary.get().is_newer_than(last_run, this_run)
-                                            {
-                                                continue;
-                                            }
-                                            let slice = if is_added {
-                                                // SAFETY: `table_len == table.entity_count() as usize`.
-                                                unsafe { col.get_added_ticks_slice(table_len) }
-                                            } else {
-                                                // SAFETY: `table_len == table.entity_count() as usize`.
-                                                unsafe { col.get_changed_ticks_slice(table_len) }
-                                            };
-                                            or_dense_slices[or_dense_count] = slice;
-                                            or_dense_count += 1;
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            if trivially_satisfied {
-                                or_dense_count = d_start;
-                                or_sparse_count = s_start;
-                                continue;
-                            }
-                            if or_dense_count == d_start && or_sparse_count == s_start {
-                                skip_arch = true;
-                                break;
-                            }
-                            or_ranges[or_group_count] =
-                                (d_start, or_dense_count, s_start, or_sparse_count);
-                            or_group_count += 1;
-                        }
-                    }
-
-                    if skip_arch {
+                    let af = Self::prepare_archetype_filters(
+                        archetype,
+                        table,
+                        sparse_sets,
+                        table_len,
+                        plan,
+                        last_run,
+                        this_run,
+                    );
+                    if af.skip {
                         *archetype_cursor += 1;
                         *entity_cursor = 0;
                         continue;
                     }
 
-                    let active_dense_filters = &dense_filter_slices[..dense_filter_count];
-                    let active_or_dense = &or_dense_slices[..or_dense_count];
-                    let active_or_sparse = &or_sparse_clauses[..or_sparse_count];
-                    let active_or_ranges = &or_ranges[..or_group_count];
+                    let active_dense_filters = &af.dense_filter_slices[..af.dense_filter_len];
+                    let active_or_dense = &af.or_dense_slices[..af.or_dense_len];
+                    let active_or_sparse = &af.or_sparse_clauses[..af.or_sparse_len];
+                    let active_or_ranges = &af.or_ranges[..af.or_group_len];
                     let evaluate_row_filters = has_tick_filters || !active_or_ranges.is_empty();
 
                     if evaluate_row_filters {

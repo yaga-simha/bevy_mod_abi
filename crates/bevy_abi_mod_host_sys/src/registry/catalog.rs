@@ -11,9 +11,9 @@ use bevy_abi_mod_sys::{
     AbiPod, BAM_CHILD_OF_NAME, BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET,
     BAM_COMPONENT_FLAG_SUMMARY_TICK, BAM_STORAGE_FLAG_ENTITY_EVENT, BAM_STORAGE_FLAG_EVENT,
     BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE,
-    BAM_STORAGE_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_SUMMARY_TICK, BamComponent, ComponentDesc,
-    ComponentDropFn, ComponentUuid, FfiChildOf, FfiEntity, FfiResult, FfiSlice, ModComponent,
-    RawInsertable, StrView,
+    BAM_STORAGE_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_SUMMARY_TICK, BamComponent, BamFieldDesc,
+    ComponentDesc, ComponentDropFn, ComponentUuid, FfiChildOf, FfiEntity, FfiResult, FfiSlice,
+    ModComponent, RawInsertable, StrView,
 };
 use bevy_ecs::change_detection::Tick;
 use bevy_ecs::component::ComponentId;
@@ -703,6 +703,93 @@ pub(crate) struct SymbolRecord {
     pub(crate) owner: Option<ModId>,
 }
 
+/// Retained heap strings backing dynamic [`BamFieldDesc::name`] and [`BamFieldDesc::type_tag`].
+pub type OwnedFieldStrings = Arc<[(Arc<str>, Arc<str>)]>;
+
+/// Extracts ABI `0.3` `schema_fingerprint` and host-retained [`BamFieldDesc`] metadata from a
+/// dynamic [`ComponentDesc`] when covered by `desc.struct_size`.
+///
+/// # Safety
+/// - If `desc` covers `field_count` and `desc.field_count > 0`, `desc.fields` must point to
+///   `desc.field_count` readable [`BamFieldDesc`] entries whose non-empty [`StrView`]s point to
+///   initialized bytes.
+pub(crate) unsafe fn extract_owned_dynamic_fields(
+    desc: &ComponentDesc,
+) -> Result<(u64, Arc<[BamFieldDesc]>, Option<OwnedFieldStrings>), (FfiResult, String)> {
+    let schema_fingerprint = if desc.covers_slot(
+        core::mem::offset_of!(ComponentDesc, schema_fingerprint),
+        core::mem::size_of::<u64>(),
+    ) {
+        desc.schema_fingerprint
+    } else {
+        0
+    };
+
+    let has_fields = desc.covers_slot(
+        core::mem::offset_of!(ComponentDesc, field_count),
+        core::mem::size_of::<usize>(),
+    ) && desc.field_count > 0;
+    if !has_fields {
+        return Ok((schema_fingerprint, Arc::from([]), None));
+    }
+    if desc.fields.is_null() {
+        return Err((
+            FfiResult::NULL_POINTER,
+            "ComponentDesc `fields` pointer is null with non-zero `field_count`".to_string(),
+        ));
+    }
+
+    // SAFETY: Caller guarantees `desc.fields` is readable for `desc.field_count` entries.
+    let raw_fields = unsafe { core::slice::from_raw_parts(desc.fields, desc.field_count) };
+    let mut string_pairs: Vec<(Arc<str>, Arc<str>)> = Vec::with_capacity(raw_fields.len());
+    let mut field_descs: Vec<BamFieldDesc> = Vec::with_capacity(raw_fields.len());
+
+    for (idx, field) in raw_fields.iter().enumerate() {
+        if (field.struct_size as usize) < BamFieldDesc::MIN_V0_3_SIZE {
+            return Err((
+                FfiResult::INVALID_VERSION,
+                format!(
+                    "BamFieldDesc[{idx}] struct_size ({}) < MIN_V0_3_SIZE ({})",
+                    field.struct_size,
+                    BamFieldDesc::MIN_V0_3_SIZE
+                ),
+            ));
+        }
+        // SAFETY: Caller guarantees each field `name` points to readable bytes when `len > 0`.
+        let name_str = unsafe { field.name.try_as_str() }.map_err(|err| {
+            (
+                err,
+                format!("BamFieldDesc[{idx}] `name` StrView validation failed ({err})"),
+            )
+        })?;
+        // SAFETY: Caller guarantees each field `type_tag` points to readable bytes when `len > 0`.
+        let tag_str = unsafe { field.type_tag.try_as_str() }.map_err(|err| {
+            (
+                err,
+                format!("BamFieldDesc[{idx}] `type_tag` StrView validation failed ({err})"),
+            )
+        })?;
+        string_pairs.push((Arc::from(name_str), Arc::from(tag_str)));
+    }
+
+    let owned_strings: OwnedFieldStrings = Arc::from(string_pairs);
+    for (field, (name_arc, tag_arc)) in raw_fields.iter().zip(owned_strings.iter()) {
+        field_descs.push(BamFieldDesc::new(
+            field.kind,
+            StrView::from_str(name_arc),
+            StrView::from_str(tag_arc),
+            field.offset,
+            field.size,
+            field.align,
+        ));
+    }
+    Ok((
+        schema_fingerprint,
+        Arc::from(field_descs),
+        Some(owned_strings),
+    ))
+}
+
 /// Catalog record stored for each component or singleton resource in [`RegistrySnapshot`].
 #[derive(Clone, Debug)]
 pub struct RegisteredComponent {
@@ -718,6 +805,12 @@ pub struct RegisteredComponent {
     pub size: usize,
     /// Byte alignment (`align_of::<T>()`).
     pub align: usize,
+    /// Deterministic 64-bit FNV-1a schema fingerprint (`ModComponent::SCHEMA_FINGERPRINT`).
+    pub schema_fingerprint: u64,
+    /// Host-retained ABI `0.3` compile-time field reflection metadata (`ModComponent::BAM_FIELDS`).
+    pub fields: Arc<[BamFieldDesc]>,
+    /// Owned string backing for dynamic guest [`Self::fields`] entries (`None` for `'static` host entries).
+    pub owned_field_strings: Option<OwnedFieldStrings>,
     /// Bitmask of `BAM_STORAGE_FLAG_*` (`SPARSE_SET`, `IMMUTABLE`, `RESOURCE`).
     pub storage_flags: u32,
     /// Whether this type satisfies cross-language `AbiPod`.
@@ -1332,6 +1425,9 @@ impl ModRegistry {
                 snap.entries[idx].vtable_ptr = sym_addr;
                 snap.entries[idx].size = wire_size;
                 snap.entries[idx].align = wire_align;
+                snap.entries[idx].schema_fingerprint = M::SCHEMA_FINGERPRINT;
+                snap.entries[idx].fields = Arc::from(M::BAM_FIELDS);
+                snap.entries[idx].owned_field_strings = None;
                 snap.entries[idx].is_abi_pod = is_abi_pod;
                 snap.entries[idx].create_msg_cursor_fn = Some(create_msg_cursor_impl::<M>);
                 snap.entries[idx].msg_read_batch_fn = msg_read_batch_fn;
@@ -1350,6 +1446,9 @@ impl ModRegistry {
                     component_id: messages_res_id,
                     size: wire_size,
                     align: wire_align,
+                    schema_fingerprint: M::SCHEMA_FINGERPRINT,
+                    fields: Arc::from(M::BAM_FIELDS),
+                    owned_field_strings: None,
                     storage_flags,
                     is_abi_pod,
                     is_dynamic: false,
@@ -1440,6 +1539,9 @@ impl ModRegistry {
                     component_id: child_of_id,
                     size: core::mem::size_of::<FfiChildOf>(),
                     align: core::mem::align_of::<FfiChildOf>(),
+                    schema_fingerprint: 0,
+                    fields: Arc::from([]),
+                    owned_field_strings: None,
                     storage_flags,
                     is_abi_pod: true,
                     is_dynamic: false,
@@ -1540,6 +1642,9 @@ impl ModRegistry {
             let handle = if let Some(&existing_handle) = snap.by_name.get(name_str) {
                 let idx = (existing_handle.0 - 1) as usize;
                 snap.entries[idx].vtable_ptr = sym_addr;
+                snap.entries[idx].schema_fingerprint = E::SCHEMA_FINGERPRINT;
+                snap.entries[idx].fields = Arc::from(E::BAM_FIELDS);
+                snap.entries[idx].owned_field_strings = None;
                 snap.entries[idx].event_key = Some(event_key);
                 snap.entries[idx].entity_event_trigger_fn = None;
                 snap.entries[idx].trigger_event_fn = trigger_event_fn;
@@ -1557,6 +1662,9 @@ impl ModRegistry {
                     component_id: comp_id,
                     size: E::size(),
                     align: E::align(),
+                    schema_fingerprint: E::SCHEMA_FINGERPRINT,
+                    fields: Arc::from(E::BAM_FIELDS),
+                    owned_field_strings: None,
                     storage_flags,
                     is_abi_pod: E::IS_ABI_POD,
                     is_dynamic: false,
@@ -1620,6 +1728,9 @@ impl ModRegistry {
                 let merged_default = insert_default_fn.or(snap.entries[idx].insert_default_fn);
                 let merged_raw = insert_raw_fn.or(snap.entries[idx].insert_raw_fn);
                 snap.entries[idx].vtable_ptr = sym_addr;
+                snap.entries[idx].schema_fingerprint = T::SCHEMA_FINGERPRINT;
+                snap.entries[idx].fields = Arc::from(T::BAM_FIELDS);
+                snap.entries[idx].owned_field_strings = None;
                 snap.entries[idx].insert_raw_fn = merged_raw;
                 snap.entries[idx].insert_default_fn = merged_default;
                 snap.entries[idx].is_dynamic = false;
@@ -1637,6 +1748,9 @@ impl ModRegistry {
                     component_id: comp_id,
                     size: T::size(),
                     align: T::align(),
+                    schema_fingerprint: T::SCHEMA_FINGERPRINT,
+                    fields: Arc::from(T::BAM_FIELDS),
+                    owned_field_strings: None,
                     storage_flags,
                     is_abi_pod: T::IS_ABI_POD,
                     is_dynamic: false,
@@ -1744,6 +1858,48 @@ impl ModRegistry {
         hook_slot: Option<usize>,
         required_components: Box<[BamComponent]>,
     ) -> Result<BamComponent, ComponentCollisionError> {
+        let fallback_fp = if desc.covers_slot(
+            core::mem::offset_of!(ComponentDesc, schema_fingerprint),
+            core::mem::size_of::<u64>(),
+        ) {
+            desc.schema_fingerprint
+        } else {
+            0
+        };
+        // SAFETY: Validated `ComponentDesc` passed from host helpers or FFI boundary.
+        let (schema_fingerprint, fields, owned_field_strings) =
+            unsafe { extract_owned_dynamic_fields(desc) }
+                .unwrap_or_else(|_| (fallback_fp, Arc::from([]), None));
+        self.register_dynamic_component_owned_with_schema(
+            comp_id,
+            desc,
+            name,
+            owner,
+            drop_slot,
+            hook_slot,
+            required_components,
+            schema_fingerprint,
+            fields,
+            owned_field_strings,
+        )
+    }
+
+    /// Registers a guest-owned dynamic component with pre-extracted `schema_fingerprint` and
+    /// host-retained `fields`, returning its 1-based [`BamComponent`] handle.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn register_dynamic_component_owned_with_schema(
+        &mut self,
+        comp_id: ComponentId,
+        desc: &ComponentDesc,
+        name: &str,
+        owner: Option<ModId>,
+        drop_slot: Option<usize>,
+        hook_slot: Option<usize>,
+        required_components: Box<[BamComponent]>,
+        schema_fingerprint: u64,
+        fields: Arc<[BamFieldDesc]>,
+        owned_field_strings: Option<OwnedFieldStrings>,
+    ) -> Result<BamComponent, ComponentCollisionError> {
         let storage_flags = component_flags_to_storage_flags(desc.flags);
         let expected_comp_id = self
             .snapshot
@@ -1784,6 +1940,9 @@ impl ModRegistry {
                         replaced_comp_id = Some((entry.component_id, comp_id));
                     }
                     entry.component_id = comp_id;
+                    entry.schema_fingerprint = schema_fingerprint;
+                    entry.fields = Arc::clone(&fields);
+                    entry.owned_field_strings = owned_field_strings;
                     entry.vtable_ptr = sym_addr;
                     entry.drop_fn = desc.drop_fn;
                     entry.drop_slot = drop_slot;
@@ -1808,6 +1967,9 @@ impl ModRegistry {
                     component_id: comp_id,
                     size: desc.size,
                     align: desc.align,
+                    schema_fingerprint,
+                    fields,
+                    owned_field_strings,
                     storage_flags,
                     is_abi_pod: desc.is_pod(),
                     is_dynamic: true,

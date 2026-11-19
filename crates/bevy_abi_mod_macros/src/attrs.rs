@@ -1,7 +1,16 @@
 use proc_macro_crate::FoundCrate;
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
-use syn::{Attribute, DeriveInput, Ident, LitStr, Path, Type, parse::Parse};
+use syn::{Attribute, DeriveInput, Ident, LitStr, Path, Type};
+
+/// Parsed requirement entry inside `#[mod_component(require(...))]`.
+#[derive(Clone)]
+pub(crate) struct RequiredComponentAttr {
+    /// Required component type path (`Comp`).
+    pub(crate) path: Path,
+    /// Optional custom initializer expression (`Comp = expr`).
+    pub(crate) init_expr: Option<syn::Expr>,
+}
 
 /// Parsed container-level `#[mod_component(...)]` attributes.
 pub(crate) struct ComponentAttrs {
@@ -27,8 +36,8 @@ pub(crate) struct ComponentAttrs {
     pub(crate) immutable: bool,
     /// Sets `BAM_COMPONENT_FLAG_SUMMARY_TICK` on `ModComponent::COMPONENT_FLAGS`.
     pub(crate) summary_tick: bool,
-    /// Required component types declared via `#[mod_component(require(CompA, CompB))]`.
-    pub(crate) required_components: Vec<Path>,
+    /// Required component entries declared via `#[mod_component(require(CompA, CompB = expr))]`.
+    pub(crate) required_components: Vec<RequiredComponentAttr>,
 }
 
 /// Explicit fixed-width integer representation parsed from `#[repr(...)]`.
@@ -324,18 +333,33 @@ pub(crate) fn parse_component_attrs(input: &DeriveInput) -> syn::Result<Componen
             } else if meta.path.is_ident("require") {
                 if !meta.input.peek(syn::token::Paren) {
                     return Err(meta.error(
-                        "`#[mod_component(require(...))]` requires a parenthesized list of component types",
+                        "`#[mod_component(require(...))]` requires a parenthesized list of `Comp` or `Comp = expr`",
                     ));
                 }
                 let content;
                 syn::parenthesized!(content in meta.input);
-                let paths = content.parse_terminated(Path::parse, syn::Token![,])?;
-                if paths.is_empty() {
+                let mut parsed_reqs = Vec::new();
+                while !content.is_empty() {
+                    let path: Path = content.parse()?;
+                    let init_expr = if content.peek(syn::Token![=]) {
+                        let _eq: syn::Token![=] = content.parse()?;
+                        let expr: syn::Expr = content.parse()?;
+                        Some(expr)
+                    } else {
+                        None
+                    };
+                    parsed_reqs.push(RequiredComponentAttr { path, init_expr });
+                    if content.is_empty() {
+                        break;
+                    }
+                    let _comma: syn::Token![,] = content.parse()?;
+                }
+                if parsed_reqs.is_empty() {
                     return Err(meta.error(
                         "`#[mod_component(require(...))]` requires at least one component type",
                     ));
                 }
-                attrs.required_components.extend(paths);
+                attrs.required_components.extend(parsed_reqs);
                 Ok(())
             } else {
                 Err(meta.error(

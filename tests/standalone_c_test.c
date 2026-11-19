@@ -156,7 +156,10 @@ static BamResult host_resolve_component(
         *out_component = ctx->dt_res_handle;
         return BAM_RESULT_OK;
     }
-    strcpy(((BamHostCtx*)ctx)->last_err, "component not registered in mock world");
+    {
+        static const char not_reg_msg[] = "component not registered in mock world";
+        memcpy(((BamHostCtx*)ctx)->last_err, not_reg_msg, sizeof(not_reg_msg));
+    }
     return BAM_RESULT_NOT_FOUND;
 }
 
@@ -654,14 +657,14 @@ static void mock_guest_shutdown(BamInstance* instance) {
  * ========================================================================== */
 
 static void test_versions_and_result_names(void) {
-    assert(BAM_ABI_VERSION == 0x00020000u);
+    assert(BAM_ABI_VERSION == 0x00030000u);
     assert(bam_version_major(BAM_ABI_VERSION) == 0u);
-    assert(bam_version_minor(BAM_ABI_VERSION) == 2u);
+    assert(bam_version_minor(BAM_ABI_VERSION) == 3u);
     assert(bam_version_patch(BAM_ABI_VERSION) == 0u);
 
-    assert(bam_version_is_compatible(bam_pack_abi_version(0u, 2u, 0u), bam_pack_abi_version(0u, 2u, 7u)));
-    assert(!bam_version_is_compatible(bam_pack_abi_version(0u, 2u, 0u), bam_pack_abi_version(0u, 1u, 0u)));
+    assert(bam_version_is_compatible(bam_pack_abi_version(0u, 3u, 0u), bam_pack_abi_version(0u, 3u, 7u)));
     assert(!bam_version_is_compatible(bam_pack_abi_version(0u, 3u, 0u), bam_pack_abi_version(0u, 2u, 0u)));
+    assert(!bam_version_is_compatible(bam_pack_abi_version(0u, 4u, 0u), bam_pack_abi_version(0u, 3u, 0u)));
     assert(bam_version_is_compatible(bam_pack_abi_version(1u, 2u, 0u), bam_pack_abi_version(1u, 1u, 0u)));
     assert(!bam_version_is_compatible(bam_pack_abi_version(1u, 1u, 0u), bam_pack_abi_version(1u, 2u, 0u)));
 
@@ -913,14 +916,14 @@ static void test_hierarchy_ticks_layout_and_observer_descriptors(void) {
     assert(memcmp(&dyn_desc.uuid, &expected_dyn_uuid, sizeof(BamComponentUuid)) == 0);
 
     /* 4. Observer descriptor helper & 64-bit entity packing */
-    obs_desc = bam_observer_desc(77u, 0x11223344AABBCCDDull, mock_observer_cb, (void*)0x1234);
+    obs_desc = bam_observer_desc(77u, 0x11223344AABBCCDDull, mock_observer_cb, (void*)(uintptr_t)0x1234u);
     assert(obs_desc.struct_size == (uint32_t)sizeof(BamObserverDesc));
     assert(obs_desc.flags == 0u);
     assert(obs_desc.event == 77u);
     assert(obs_desc.entity_lo == 0xAABBCCDDu);
     assert(obs_desc.entity_hi == 0x11223344u);
     assert(obs_desc.callback == mock_observer_cb);
-    assert(obs_desc.user_data == (void*)0x1234);
+    assert(obs_desc.user_data == (void*)(uintptr_t)0x1234u);
 
     /* 5. Event flags & SystemDesc.in_sets */
     assert(BAM_STORAGE_FLAG_EVENT == 0x10u);
@@ -1058,7 +1061,7 @@ static void test_wave0_wire_extensions(void) {
     assert(trig_desc.struct_size == (uint32_t)sizeof(BamTriggerDesc));
     assert(trig_desc.entity_lo == 99u && trig_desc.reserved0 == 0u);
 
-    /* 6. Extended BamSystemDesc & 50-slot BamHostApi */
+    /* 6. Extended BamSystemDesc & 68-slot BamHostApi */
     assert(strcmp(BAM_CHILDREN_NAME, "bevy_ecs::hierarchy::Children") == 0);
     memset(&sys_desc, 0, sizeof(sys_desc));
     sys_desc.struct_size = (uint32_t)sizeof(BamSystemDesc);
@@ -1068,7 +1071,10 @@ static void test_wave0_wire_extensions(void) {
     assert((sys_desc.flags & BAM_SYSTEM_KNOWN_FLAGS) == BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL);
 
     api = build_mock_host_api();
-    assert(api.struct_size >= (uint32_t)(offsetof(BamHostApi, cmd_spawn_scene) + sizeof(BamCmdSpawnSceneFn)));
+    assert(BAM_HOST_API_SLOT_COUNT == 68u);
+    assert(api.struct_size >= (uint32_t)(offsetof(BamHostApi, migrate_component_column) + sizeof(BamMigrateComponentColumnFn)));
+    assert(bam_host_api_covers_slot(&api, BAM_HOST_API_OFFSET_LOG_DIAGNOSTIC, sizeof(BamLogDiagnosticFn)));
+    assert(bam_host_api_covers_slot(&api, BAM_HOST_API_OFFSET_MIGRATE_COMPONENT_COLUMN, sizeof(BamMigrateComponentColumnFn)));
     assert(api.cmd_spawn_persistent == NULL);
     assert(api.cmd_spawn_batch == NULL);
     assert(api.cmd_despawn_all == NULL);
@@ -1081,6 +1087,24 @@ static void test_wave0_wire_extensions(void) {
     assert(api.asset_get_load_state == NULL);
     assert(api.asset_release == NULL);
     assert(api.cmd_spawn_scene == NULL);
+    assert(api.log_diagnostic == NULL);
+    assert(api.report_guest_fault == NULL);
+    assert(api.resolve_component_by_uuid == NULL);
+    assert(api.component_layout_info == NULL);
+    assert(api.register_relation == NULL);
+    assert(api.intern_symbol == NULL);
+    assert(api.bind_named_object == NULL);
+    assert(api.iter_count == NULL);
+    assert(api.iter_up_cascade == NULL);
+    assert(api.par_for_each_chunk_readonly == NULL);
+    assert(api.register_system_handle == NULL);
+    assert(api.configure_schedule_set == NULL);
+    assert(api.mount_system_in_schedule == NULL);
+    assert(api.cmd_checkpoint == NULL);
+    assert(api.cmd_rollback == NULL);
+    assert(api.cmd_insert_relation == NULL);
+    assert(api.cmd_remove_relation == NULL);
+    assert(api.migrate_component_column == NULL);
 }
 
 int main(void) {
@@ -1091,6 +1115,6 @@ int main(void) {
     test_hierarchy_ticks_layout_and_observer_descriptors();
     test_wave0_wire_extensions();
 
-    printf("All ABI v0.2.0 ISO C99 conformance & layout checks passed.\n");
+    printf("All ABI v0.3.0 ISO C99 conformance & layout checks passed.\n");
     return 0;
 }

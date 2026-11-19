@@ -80,7 +80,7 @@ cargo bam verify --pubkey ./keys/mod_dev.pub ./dist/my_mod/libmy_mod.so
 [mod]
 id = "my_mod"              # Canonical mod ID (falls back to `name` if `id` is omitted)
 version = "0.1.0"          # Mod SemVer
-abi_version = "^0.2.0"     # Optional host ABI SemVer requirement (checked against 0.2.0)
+abi_version = "^0.3.0"     # Optional host ABI SemVer requirement (checked against 0.3.0)
 language = "rust"          # Optional: rust | c99 | cpp17 | zig
 entry = "libmy_mod.so"     # Optional explicit library filename (alias: `library`)
 

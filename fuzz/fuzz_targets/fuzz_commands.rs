@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 #[repr(C)]
 #[derive(Component, Clone, Copy, Default, ModComponent)]
-#[mod_component(name = "fuzz_cmd::PaddedPod")]
+#[mod_component(name = "fuzz_cmd::PaddedPod", no_pod)]
 struct PaddedPod {
     tag: u8,
     value: u32,
