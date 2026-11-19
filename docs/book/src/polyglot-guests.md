@@ -1,6 +1,6 @@
 # ISO C99, C++17 & Zig Guest Guide
 
-All non-Rust languages target the single auto-generated header [`include/bevy_abi_mod.h`](../../../include/bevy_abi_mod.h) (`cargo xtask header`). Every wire struct is verified at compile time via `BAM_STATIC_ASSERT` (`sizeof`, `alignof`, `offsetof`) on both 64-bit and 32-bit targets.
+All non-Rust languages target the single auto-generated header [`include/bevy_abi_mod.h`](../../../include/bevy_abi_mod.h) emitted by `bevy_abi_mod_sdk_gen` (`cargo bam export-sdk --out include` or `cargo xtask header`), which also produces `bevy_abi_mod.hpp` (C++17), `bevy_abi_mod.zig` (Zig), and platform `BAM_EXPORT` macros (`__declspec(dllexport)` on Windows `_WIN32`, visibility attributes on ELF/Mach-O). Every wire struct is verified at compile time via `BAM_STATIC_ASSERT` (`sizeof`, `alignof`, `offsetof`) on both 64-bit and 32-bit targets.
 
 ---
 
@@ -34,7 +34,7 @@ typedef struct CModState {
 
 static const BamManifest MANIFEST = {
     .struct_size = (uint32_t)sizeof(BamManifest),
-    .abi_version = BAM_ABI_VERSION,
+    .abi_version = BAM_ABI_VERSION, // ABI 0.3.0 (0x00030000)
     .name        = "my_c99_mod",
     .version     = "0.2.0",
     .flags       = 0u,

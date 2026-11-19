@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "Pure-Rust, zero-Bevy (`#![forbid(unsafe_code)]`) OpenSSH SSHSIG, Ed25519 CA, SSHKRL, embedded `.bam_sig`, and `.bampack` cryptographic verification engine for `bevy_abi_mod`"
+readme = "README.md"
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true

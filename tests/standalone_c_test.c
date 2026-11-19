@@ -1,5 +1,5 @@
 /*
- * Standalone ISO C99 Conformance, Layout & Mock Lifecycle Suite (`ABI 0.2.0`)
+ * Standalone ISO C99 Conformance, Layout & Mock Lifecycle Suite (`ABI 0.3.0`)
  * Compiled with: `cc -std=c99 -Wall -Wextra -Werror -pedantic -Iinclude tests/standalone_c_test.c`
  */
 
@@ -976,7 +976,7 @@ static BamResult mock_mut_observer_cb(
     return BAM_RESULT_OK;
 }
 
-static void test_wave0_wire_extensions(void) {
+static void test_extended_wire_descriptors(void) {
     BamOptionU32 opt_u32;
     BamOptionEntity opt_ent;
     BamAssetHandle h_none;
@@ -1113,7 +1113,7 @@ int main(void) {
     test_extensible_host_api_copy_bounded();
     test_end_to_end_c99_lifecycle_and_vtable();
     test_hierarchy_ticks_layout_and_observer_descriptors();
-    test_wave0_wire_extensions();
+    test_extended_wire_descriptors();
 
     printf("All ABI v0.3.0 ISO C99 conformance & layout checks passed.\n");
     return 0;

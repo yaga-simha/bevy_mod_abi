@@ -3,16 +3,21 @@
 
 //! # `bevy_abi_mod_macros`: Procedural Macros for `#[derive(ModComponent)]` and `#[derive(AbiPod)]`
 //!
-//! This crate provides zero-Bevy-dependency procedural macros targeting ABI `0.2`:
+//! This crate provides zero-Bevy-dependency procedural macros targeting ABI `0.3.0`:
 //! - [`ModComponent`]: Generates a `#[repr(C)]` `<Struct>VTable` prefixed at byte offset `0` by
 //!   `VTableHeader` (`struct_size`, `abi_version`, `uuid`, `size`, `align`) with
 //!   `Option<unsafe extern "C" fn(...)>` field accessor slots, error-returning `FfiResult` setters,
+//!   schema-evolution witness slots (`field_info`, `export_fields`, `import_field`),
 //!   namespaced `"bam.v0.<canonical_name>.*"` symbols, deterministic 128-bit SipHash-2-4
-//!   `ComponentUuid`s, `ModComponent` metadata (`IS_ABI_POD`, `IS_RAW_INSERTABLE`), and conditional
-//!   `RawInsertable` / `AbiPod` implementations.
+//!   `ComponentUuid`s, 64-bit FNV-1a `SCHEMA_FINGERPRINT`, static `BAM_FIELDS: &[BamFieldDesc]`,
+//!   `REQUIRED_COMPONENTS`, `C_DECL` / `ZIG_DECL` declarations, and conditional `RawInsertable` /
+//!   `AbiPod` implementations across named structs, tuple structs, `Option<T>`, and
+//!   `#[repr(i8..u64)]` enums.
 //! - [`AbiPod`]: Verifies standalone `#[repr(C)]` / `#[repr(transparent)]` non-packed Plain Old
-//!   Data structs (`Copy + Send + Sync + 'static`, zero drop glue, and `assert_abi_pod::<FieldTy>()`
-//!   on every field, rejecting `u128`, `i128`, `usize`, `isize`, `bool`, `char`, enums, and heap types).
+//!   Data structs (`Copy + Send + Sync + 'static`, zero drop glue, zero implicit compiler padding via
+//!   `size_of::<Self>() == sum(size_of::<FieldTy>())`, and `assert_abi_pod::<FieldTy>()` on every
+//!   field, rejecting `u128`, `i128`, `usize`, `isize`, `bool`, `char`, enums, heap types, and
+//!   padded structs).
 //!
 //! ## Syntactic Type Classification & `#[mod_field(...)]` Precedence
 //!
@@ -49,8 +54,9 @@
 //!   `RawInsertable`.
 //! - `#[mod_component(sparse_set)]` / `#[mod_component(immutable)]` /
 //!   `#[mod_component(summary_tick)]`: Populates `ModComponent::COMPONENT_FLAGS`.
-//! - `#[mod_component(require(CompA, CompB))]`: Declares compile-time verified required
-//!   `ModComponent` dependencies (`REQUIRED_COMPONENT_NAMES`, `REQUIRED_COMPONENT_UUIDS`).
+//! - `#[mod_component(require(CompA, CompB = expr))]`: Declares compile-time verified required
+//!   `ModComponent` dependencies (`REQUIRED_COMPONENT_NAMES`, `REQUIRED_COMPONENT_UUIDS`, and
+//!   optional custom initialization byte descriptors in `ModComponent::REQUIRED_COMPONENTS`).
 //!
 //! ### Field-Level Attributes (`#[mod_field(...)]`)
 //! - `#[mod_field(skip)]`: Skips accessor generation for host-private fields.
@@ -85,7 +91,7 @@ use syn::{DeriveInput, parse_macro_input};
 /// Enforces at compile time that:
 /// 1. The target is a non-generic struct annotated with `#[repr(C)]` or `#[repr(transparent)]` (and not `packed`).
 /// 2. Every field implements `AbiPod` via `assert_abi_pod::<FieldTy>()` (`u128`, `i128`, `usize`, `isize`, `bool`, `char`, `String`, `Vec<T>`, enums, and `#[repr(Rust)]` structs are rejected).
-/// 3. The struct implements `Copy` and has no drop glue (`!core::mem::needs_drop::<Self>()`).
+/// 3. The struct implements `Copy`, has no drop glue (`!core::mem::needs_drop::<Self>()`), and has zero implicit padding (`core::mem::size_of::<Self>() == sum(size_of::<FieldTy>())`).
 #[proc_macro_derive(AbiPod, attributes(mod_component))]
 pub fn derive_abi_pod(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -111,8 +117,9 @@ pub fn derive_abi_pod(input: TokenStream) -> TokenStream {
 /// - `extern "C"` getter, setter (returning `FfiResult`), and `Vec` push trampolines for each
 ///   non-skipped field.
 /// - A `ModComponent` implementation with deterministic 128-bit SipHash-2-4 `ComponentUuid`,
-///   `SymbolEntry` registration metadata (`"bam.v0.<canonical_name>.*"`), and conditional
-///   `RawInsertable` / `AbiPod` implementations when the struct's layout and fields qualify.
+///   64-bit FNV-1a `SCHEMA_FINGERPRINT`, static `BAM_FIELDS`, `REQUIRED_COMPONENTS`, `C_DECL` /
+///   `ZIG_DECL`, witness reflection slots, `SymbolEntry` metadata (`"bam.v0.<canonical_name>.*"`),
+///   and conditional `RawInsertable` / `AbiPod` implementations when layout and fields qualify.
 #[proc_macro_derive(ModComponent, attributes(mod_component, mod_field))]
 pub fn derive_mod_component(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);

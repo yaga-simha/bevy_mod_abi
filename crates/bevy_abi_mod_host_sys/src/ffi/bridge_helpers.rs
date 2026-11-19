@@ -1,17 +1,17 @@
-//! Safe host-side wrappers for Wave 3 `bridge-reflect` (`#16`), `bridge-bsn` (`#17`), and
-//! `sub-app-extract` (`#18`) so `#![forbid(unsafe_code)]` crates (`bevy_abi_mod_host` /
+//! Safe host-side bridge helpers supporting `bridge-reflect`, `bridge-bsn`, and
+//! `sub-app-extract` so `#![forbid(unsafe_code)]` crates (`bevy_abi_mod_host` /
 //! `bevy_abi_mod`) never require `unsafe` blocks.
 //!
 //! Provides:
-//! 1. **Witness Introspection & Live World Read/Write (`#16` / `#17`)**:
+//! 1. **Witness Introspection & Live World Read/Write**:
 //!    - [`inspect_component_witness_fields`] / [`inspect_component_witness_fields_in_registry`]
 //!    - [`export_entity_component_fields`], [`export_resource_fields`]
 //!    - [`apply_entity_component_fields`], [`apply_resource_fields`]
 //!    - [`insert_entity_component_from_fields`], [`insert_or_apply_entity_component_fields`]
 //!    - [`read_entity_pod_bytes`], [`write_entity_pod_bytes`]
-//!    - Optional `bridge-reflect` helpers: `empty_reflect_unchecked_mut`,
-//!      `reflect_entity_component`, `reflect_entity_component_mut`
-//! 2. **Cross-`World` (`SubApp`) Component & Resource Extraction (`#18`)**:
+//!    - Optional `bridge-reflect` helpers: `reflect_entity_component`,
+//!      `reflect_entity_component_mut`
+//! 2. **Cross-`World` (`SubApp`) Component & Resource Extraction**:
 //!    - [`ensure_component_in_target_world`]
 //!    - [`extract_component_between_worlds`]
 //!    - [`extract_resource_between_worlds`]
@@ -24,7 +24,7 @@ use bevy_abi_mod_sys::{
 #[cfg(feature = "bridge-reflect")]
 use bevy_ecs::{
     change_detection::Mut,
-    world::{EntityRef, EntityWorldMut, unsafe_world_cell::UnsafeEntityCell},
+    world::{EntityRef, EntityWorldMut},
 };
 use bevy_ecs::{
     component::{ComponentCloneBehavior, ComponentDescriptor, ComponentId, StorageType},
@@ -701,20 +701,6 @@ pub fn write_entity_pod_bytes(
     Ok(())
 }
 
-/// Safe `unsafe fn` stub usable inside `ReflectComponentFns { reflect_unchecked_mut, .. }` from
-/// `#![forbid(unsafe_code)]` crates when direct unchecked `&mut dyn Reflect` aliasing is not
-/// applicable (e.g. dynamic C-ABI components backed by witness records).
-///
-/// # Safety
-/// May be passed as `ReflectComponentFns::reflect_unchecked_mut`; performs no pointer dereference
-/// and unconditionally returns `None`.
-#[cfg(feature = "bridge-reflect")]
-pub unsafe fn empty_reflect_unchecked_mut(
-    _entity: UnsafeEntityCell<'_>,
-) -> Option<Mut<'_, dyn Reflect>> {
-    None
-}
-
 /// Safely borrows `&dyn Reflect` from `entity` for `component_id` using `reflect_from_ptr`,
 /// verifying that `component_id`'s runtime `TypeId` in `entity`'s `World` matches
 /// `reflect_from_ptr.type_id()`.
@@ -840,7 +826,7 @@ pub fn ensure_component_in_target_world(
     );
     let _ = target_world
         .resource_mut::<ModRegistry>()
-        .register_dynamic_component_owned(target_cid, &desc, &entry.name, entry.owner, None, None);
+        .register_dynamic_component_owned(target_cid, &desc, &entry.name, entry.owner, None);
     Ok(target_cid)
 }
 
@@ -1031,7 +1017,7 @@ mod tests {
     use bevy_ecs::component::Component;
 
     #[derive(Component, Default, Debug, PartialEq, ModComponent)]
-    #[mod_component(name = "wave3_test::BioCard")]
+    #[mod_component(name = "bridge_test::BioCard")]
     struct BioCard {
         title: String,
         level: u32,
@@ -1040,7 +1026,7 @@ mod tests {
 
     #[repr(C)]
     #[derive(Component, Clone, Copy, Default, Debug, PartialEq, ModComponent)]
-    #[mod_component(name = "wave3_test::TintUniform")]
+    #[mod_component(name = "bridge_test::TintUniform")]
     struct TintUniform {
         rgba: [f32; 4],
     }
@@ -1121,7 +1107,7 @@ mod tests {
         // SAFETY: Valid POD layout with `drop = None`.
         let dyn_cid = main_world.register_component_with_descriptor(unsafe {
             ComponentDescriptor::new_with_layout(
-                "wave3_test::DynUvScale".to_owned(),
+                "bridge_test::DynUvScale".to_owned(),
                 StorageType::Table,
                 dyn_layout,
                 None,
@@ -1132,8 +1118,8 @@ mod tests {
             )
         });
         let dyn_desc = ComponentDesc::new(
-            c"wave3_test::DynUvScale".as_ptr(),
-            ComponentUuid::from_parts("wave3_test::DynUvScale", 8, 4, 0),
+            c"bridge_test::DynUvScale".as_ptr(),
+            ComponentUuid::from_parts("bridge_test::DynUvScale", 8, 4, 0),
             8,
             4,
         );
@@ -1141,8 +1127,7 @@ mod tests {
             .register_dynamic_component_owned(
                 dyn_cid,
                 &dyn_desc,
-                "wave3_test::DynUvScale",
-                None,
+                "bridge_test::DynUvScale",
                 None,
                 None,
             )
@@ -1173,7 +1158,7 @@ mod tests {
         );
         let sub_dyn_h = sub_world
             .resource::<ModRegistry>()
-            .get_by_name("wave3_test::DynUvScale")
+            .get_by_name("bridge_test::DynUvScale")
             .unwrap()
             .handle;
         assert_eq!(

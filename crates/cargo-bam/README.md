@@ -1,6 +1,6 @@
 # `cargo-bam`
 
-Standalone, `#![forbid(unsafe_code)]`, zero-Bevy CLI toolchain (`cargo bam` / `cargo-bam`) for scaffolding, building, validating, signing, and diagnosing `bevy_abi_mod` guest mods targeting host ABI `0.2.0`.
+Standalone, `#![forbid(unsafe_code)]`, zero-Bevy CLI toolchain (`cargo bam` / `cargo-bam`) for scaffolding, building, validating, signing, and diagnosing `bevy_abi_mod` guest mods targeting host ABI `0.3.0`.
 
 ## Installation
 
@@ -51,14 +51,14 @@ cargo bam build --manifest-path ./mods/my_mod/mod.toml --sign-key ./keys/mod_dev
 - `--sign-namespace <ns>`: `SSHSIG` namespace used when `--sign-key` is passed (default: `bevy_abi_mod.v1`).
 
 ### `check-mods`
-Discover `mod.toml` manifests inside `<dir>`, validate host `abi_version` (`0.2.0`), verify required/optional SemVer dependencies, reject dependency cycles, and print the deterministic topological load order:
+Discover `mod.toml` manifests inside `<dir>`, validate host `abi_version` (`0.3.0`), verify required/optional SemVer dependencies, reject dependency cycles, and print the deterministic topological load order:
 
 ```bash
 cargo bam check-mods ./dist
 ```
 
 ### `doctor`
-Inspect host ABI (`0.2.0`), Rust (`cargo` / `rustc`), C99 (`CC` / `cc` / `gcc` / `clang` / `cl`), C++17 (`CXX` / `c++` / `g++` / `clang++` / `cl`), optional `zig`, embedded SDK headers, and optionally validate a mods directory:
+Inspect host ABI (`0.3.0`), Rust (`cargo` / `rustc`), C99 (`CC` / `cc` / `gcc` / `clang` / `cl`), C++17 (`CXX` / `c++` / `g++` / `clang++` / `cl`), optional `zig`, embedded SDK headers, and optionally validate a mods directory:
 
 ```bash
 cargo bam doctor

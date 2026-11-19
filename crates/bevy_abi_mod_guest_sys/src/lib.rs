@@ -1,4 +1,4 @@
-//! Low-level `unsafe` FFI internals for `bevy_abi_mod` Rust guest modules (ABI `0.2`).
+//! Low-level `unsafe` FFI internals for `bevy_abi_mod` Rust guest modules (`ABI 0.3.0`).
 //!
 //! Isolates every guest-side `unsafe` block behind documented `# Safety` contracts:
 //! - Per-instance [`Host`] API table copy, SemVer validation, `"bam.v0.*"` custom symbol lookup,
@@ -754,7 +754,7 @@ mod tests {
     }
 
     #[test]
-    fn wave0_runtime_observer_alloc_tracking_and_unsupported_fallbacks() {
+    fn runtime_observer_alloc_tracking_and_unsupported_fallbacks() {
         static OBS_DROPS: AtomicUsize = AtomicUsize::new(0);
         struct ObsDropGuard;
         impl Drop for ObsDropGuard {

@@ -19,23 +19,16 @@
 
 ---
 
-## 2. Reference Baselines (Apple M4 Pro, `rustc 1.98.1`, Release)
+## 2. Canonical Benchmarks & Reference Baselines
 
-| Canonical Scenario | Native Bevy | `bevy_abi_mod` (`ABI 0.2.0`) | Steady-State Heap Allocs |
-|---|---:|---:|---:|
-| **Dense Iterate (`100k` `Pos + Vel`)** | `0.0900 ms` (`0.90 ns/ent`) | **`0.0263 ms`** (`0.26 ns/ent`, SoA SIMD) | `0` |
-| **`Changed<Position>` (`100k` @ `1%` mutated)** | `0.0247 ms` (`0.25 ns/ent`) | **`0.0646 ms`** (`0.65 ns/ent`) | `0` |
-| **Command Burst (`10k` `cmd_insert`s/frame)** | `0.1676 ms` (`16.8 ns/cmd`) | **`0.1964 ms`** (`19.6 ns/cmd`, `CommandArena`) | `0` |
-| **Sparse-Set Query (`10k` `SparseSet` entities)** | `0.0119 ms` (`1.19 ns/ent`) | **`0.0267 ms`** (`2.67 ns/ent`, `1` chunk) | `0` |
-| **Spawn-with-4 (`2,500` spawns/frame)** | `0.0563 ms` (static bundle) | **`0.2432 ms`** (`1.66x` faster than seq) | `0` |
-| **34-Archetype Spatial Combat (`49,152` pairs)** | `0.1863 ms` (`1.00x`) | **`0.1856 ms` C99 (`1.00x`) / `0.2151 ms` Rust (`1.15x`)** | `0` |
+Rather than duplicating numbers across documents, the complete **9-scenario benchmark suite** (`chunk_throughput.rs`), **Apple M4 Pro hardware reference baselines**, **deterministic `iai-callgrind` + zero-allocation CI gates (`benches/deterministic_gate`)**, and the **34-archetype permutation matrix (`benches/permutation_bench`)** are maintained in one place in [`docs/BENCHMARKS.md`](../../BENCHMARKS.md).
 
 ---
 
 ## 3. Running Benchmarks & Regression Gates Locally
 
 ```bash
-# Run all 5 canonical scenarios (builds Rust & C99 fixtures first)
+# Run all 9 canonical scenarios (builds Rust & C99 fixtures first)
 cargo xtask bench
 
 # Run quick mode locally

@@ -1,4 +1,4 @@
-//! Zig Guest Mod for `bevy_abi_mod` Example 08 (`ABI 0.2.0`).
+//! Zig Guest Mod for `bevy_abi_mod` Example 08 (`ABI 0.3.0`).
 //!
 //! Demonstrates:
 //! 1. Importing `generated_components.zig` (`ModComponent::ZIG_DECL`) and `bam_zig_sdk.zig`
@@ -154,7 +154,7 @@ const ZigModInstance = struct {
                 c.BAM_SCHEDULE_UPDATE,
             ));
 
-            // Optionally bind Wave 1-2 showcase: `BAM_EVENT_KIND_ADD` lifecycle observer,
+            // Bind `BAM_EVENT_KIND_ADD` lifecycle observer,
             // `BAM_ACCESS_HAS`, `BamChildOf` optional hierarchy read, and `cmd_spawn_batch`.
             if (app.tryResolveComponent("example::ZigTelemetry", &self.telemetry_res) and
                 app.tryResolveComponent(c.BAM_CHILD_OF_NAME, &self.child_of_comp))

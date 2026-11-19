@@ -1,5 +1,4 @@
-//! `GuestSystem` implementation of Bevy's `System` trait and `HostSystemCtx` (`BamSystemCtx`)
-//!.
+//! `GuestSystem` implementation of Bevy's `System` trait and `HostSystemCtx` (`BamSystemCtx`).
 
 use crate::ffi::commands::{HostCommands, HostCommandsStorage};
 use crate::ffi::iter::{HostIter, QueryPlan};

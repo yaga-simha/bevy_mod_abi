@@ -25,7 +25,7 @@ pub trait GuestPlugin: Default + Send + 'static {
     /// NUL-terminated UTF-8 SemVer mod version string (defaults to `c"0.1.0"`).
     const VERSION: &'static CStr = c"0.1.0";
 
-    /// Optional `BAM_MANIFEST_*` bitflags (`0` in ABI `0.2`).
+    /// Optional `BAM_MANIFEST_*` bitflags (`0` in ABI `0.3.0`).
     const FLAGS: u32 = 0;
 
     /// Compile-time [`BamManifest`] returned by `bevy_abi_mod_manifest()`.

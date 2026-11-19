@@ -7,5 +7,5 @@ pub mod hierarchy;
 pub mod observers;
 
 pub use builder::{GuestApp, GuestComponentOptions, IntoSystemResult, QueryBuilder, SystemBuilder};
-pub use context::{GuestRes, GuestResMut, MultiQueryContext, RunConditionContext, SystemContext};
+pub use context::{GuestRes, GuestResMut, RunConditionContext, SystemContext};
 pub use observers::ObserverBuilder;

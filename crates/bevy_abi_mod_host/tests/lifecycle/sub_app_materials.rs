@@ -81,7 +81,7 @@ impl TempAssetDir {
         static SEQ: AtomicUsize = AtomicUsize::new(0);
         let id = SEQ.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "bam_wave3_assets_{tag}_{}_{}",
+            "bam_subapp_assets_{tag}_{}_{}",
             std::process::id(),
             id
         ));

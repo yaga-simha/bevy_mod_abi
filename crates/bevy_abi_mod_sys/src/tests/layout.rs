@@ -1250,7 +1250,7 @@ fn ffi_slice_and_str_view_null_zero_and_alignment_safety() {
 }
 
 #[test]
-fn wave0_ffi_option_asset_handles_triggers_lifecycle_observers_and_modes() {
+fn ffi_option_asset_handles_triggers_lifecycle_observers_and_modes() {
     // 1. FfiOption<T>
     assert_abi_pod::<FfiOption<u32>>();
     assert_abi_pod::<FfiOption<FfiEntity>>();

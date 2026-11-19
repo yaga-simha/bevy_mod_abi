@@ -161,7 +161,7 @@ fn zig_guest_typed_views_host_vec_ffi_option_and_enum_roundtrip_or_skip() {
 }
 
 #[test]
-fn zig_guest_wave2_has_filter_lifecycle_observer_hierarchy_and_batch_spawn_or_skip() {
+fn zig_guest_has_filter_lifecycle_observer_hierarchy_and_batch_spawn_or_skip() {
     let mut app = App::new();
     app.add_plugins(AbiModPlugin::with_error_policy(ModErrorPolicy::Quarantine));
     app.register_mod_component::<Position>(
@@ -197,7 +197,7 @@ fn zig_guest_wave2_has_filter_lifecycle_observer_hierarchy_and_batch_spawn_or_sk
 
     let Some(dylib_path) = try_resolve_or_build_zig_mod() else {
         eprintln!(
-            "Skipping Zig Wave 2 runtime test because `zig` is not installed on PATH (verified host ZigTelemetry registration)."
+            "Skipping Zig runtime test because `zig` is not installed on PATH (verified host ZigTelemetry registration)."
         );
         return;
     };

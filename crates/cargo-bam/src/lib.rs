@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-//! Library implementation for the `cargo-bam` modding CLI toolchain (`ABI 0.2.0`).
+//! Library implementation for the `cargo-bam` modding CLI toolchain (`ABI 0.3.0`).
 
 pub mod builder;
 pub mod dag;

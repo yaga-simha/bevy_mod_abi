@@ -1,5 +1,4 @@
-//! Copy-on-Write (`CoW`) component, resource, VTable, and `"bam.v0.*"` symbol catalog
-//!.
+//! Copy-on-Write (`CoW`) component, resource, VTable, and `"bam.v0.*"` symbol catalog.
 
 use crate::ffi::assets_scene::{HostAssetBackend, HostSceneBackend};
 use crate::loader::ModId;
@@ -827,8 +826,6 @@ pub struct RegisteredComponent {
     pub drop_fn: Option<ComponentDropFn>,
     /// Optional drop trampoline slot index assigned in [`crate::WorldDropGuard`].
     pub drop_slot: Option<usize>,
-    /// Optional dynamic component hook (`on_add` / `on_remove`) trampoline slot index.
-    pub hook_slot: Option<usize>,
     /// Whether `on_add` hook trampoline was registered on Bevy's `ComponentHooks`.
     pub has_on_add_hook: bool,
     /// Whether `on_remove` hook trampoline was registered on Bevy's `ComponentHooks`.
@@ -915,8 +912,7 @@ pub(crate) struct ExtendedDynamicFlags {
     pub(crate) has_clone_fn: bool,
 }
 
-/// Immutable dense snapshot shared via `Arc` across `ModRegistry`, `HostContext`, and `GuestSystem`
-///.
+/// Immutable dense snapshot shared via `Arc` across `ModRegistry`, `HostContext`, and `GuestSystem`.
 #[derive(Clone, Default)]
 pub struct RegistrySnapshot {
     pub(crate) entries: Vec<RegisteredComponent>,
@@ -1457,7 +1453,6 @@ impl ModRegistry {
                     insert_default_fn: None,
                     drop_fn: None,
                     drop_slot: None,
-                    hook_slot: None,
                     has_on_add_hook: false,
                     has_on_remove_hook: false,
                     create_msg_cursor_fn: Some(create_msg_cursor_impl::<M>),
@@ -1550,7 +1545,6 @@ impl ModRegistry {
                     insert_default_fn: None,
                     drop_fn: None,
                     drop_slot: None,
-                    hook_slot: None,
                     has_on_add_hook: false,
                     has_on_remove_hook: false,
                     create_msg_cursor_fn: None,
@@ -1673,7 +1667,6 @@ impl ModRegistry {
                     insert_default_fn: None,
                     drop_fn: None,
                     drop_slot: None,
-                    hook_slot: None,
                     has_on_add_hook: false,
                     has_on_remove_hook: false,
                     create_msg_cursor_fn: None,
@@ -1759,7 +1752,6 @@ impl ModRegistry {
                     insert_default_fn,
                     drop_fn: None,
                     drop_slot: None,
-                    hook_slot: None,
                     has_on_add_hook: false,
                     has_on_remove_hook: false,
                     create_msg_cursor_fn: None,
@@ -1832,7 +1824,6 @@ impl ModRegistry {
         name: &str,
         owner: Option<ModId>,
         drop_slot: Option<usize>,
-        hook_slot: Option<usize>,
     ) -> Result<BamComponent, ComponentCollisionError> {
         self.register_dynamic_component_owned_with_required(
             comp_id,
@@ -1840,7 +1831,6 @@ impl ModRegistry {
             name,
             owner,
             drop_slot,
-            hook_slot,
             Box::new([]),
         )
     }
@@ -1855,7 +1845,6 @@ impl ModRegistry {
         name: &str,
         owner: Option<ModId>,
         drop_slot: Option<usize>,
-        hook_slot: Option<usize>,
         required_components: Box<[BamComponent]>,
     ) -> Result<BamComponent, ComponentCollisionError> {
         let fallback_fp = if desc.covers_slot(
@@ -1876,7 +1865,6 @@ impl ModRegistry {
             name,
             owner,
             drop_slot,
-            hook_slot,
             required_components,
             schema_fingerprint,
             fields,
@@ -1894,7 +1882,6 @@ impl ModRegistry {
         name: &str,
         owner: Option<ModId>,
         drop_slot: Option<usize>,
-        hook_slot: Option<usize>,
         required_components: Box<[BamComponent]>,
         schema_fingerprint: u64,
         fields: Arc<[BamFieldDesc]>,
@@ -1949,9 +1936,6 @@ impl ModRegistry {
                     // SAFETY: `comp_id` was registered in `world` with `(desc.size, desc.align)`
                     // and is safe for dynamic event dispatch.
                     entry.event_key = Some(unsafe { EventKey::new(comp_id) });
-                    if hook_slot.is_some() {
-                        entry.hook_slot = hook_slot;
-                    }
                     entry.owner = owner;
                 }
                 existing_handle
@@ -1978,7 +1962,6 @@ impl ModRegistry {
                     insert_default_fn: None,
                     drop_fn: desc.drop_fn,
                     drop_slot,
-                    hook_slot,
                     has_on_add_hook: ext_flags.has_on_add_effective,
                     has_on_remove_hook: ext_flags.has_on_remove,
                     create_msg_cursor_fn: None,

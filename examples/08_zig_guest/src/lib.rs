@@ -105,7 +105,7 @@ pub enum ZigBehaviorMode {
     Attack(u32) = 2,
 }
 
-/// Resource tracking Wave 2 lifecycle observer, `Has<T>`, hierarchy, and batch spawn telemetry.
+/// Resource tracking lifecycle observer, `Has<T>`, hierarchy, and batch spawn telemetry.
 #[repr(C)]
 #[derive(Resource, Debug, Clone, Copy, Default, PartialEq, ModComponent)]
 #[mod_component(name = "example::ZigTelemetry")]

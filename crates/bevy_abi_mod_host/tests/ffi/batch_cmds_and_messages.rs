@@ -1,4 +1,4 @@
-//! Host FFI integration tests for Task #11: Batch Commands & Persistent / Non-POD `Messages`:
+//! Host FFI integration tests for batch commands and persistent / non-POD `Messages`:
 //! - `HOST_API.cmd_spawn_batch` / `host_cmd_spawn_batch` (SoA columnar batch spawn + rollback)
 //! - `HOST_API.cmd_insert_if_new` / `host_cmd_insert_if_new` (`InsertMode::Keep` + dynamic `drop_fn` accounting)
 //! - `HOST_API.cmd_despawn_all` / `host_cmd_despawn_all` (`With`/`Without`/`Allow`/`Or`, `DefaultQueryFilters`, `IsResource` & `Observer` protection)
@@ -35,31 +35,31 @@ const MAX_SPAWN_BATCH: usize = 64;
 
 #[repr(C)]
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, ModComponent)]
-#[mod_component(name = "wave2_test::BatchTag")]
+#[mod_component(name = "batch_test::BatchTag")]
 struct BatchTag;
 
 #[repr(C)]
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, ModComponent)]
-#[mod_component(name = "wave2_test::FilterA")]
+#[mod_component(name = "batch_test::FilterA")]
 struct FilterA;
 
 #[repr(C)]
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, ModComponent)]
-#[mod_component(name = "wave2_test::FilterB")]
+#[mod_component(name = "batch_test::FilterB")]
 struct FilterB;
 
 #[repr(C)]
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, ModComponent)]
-#[mod_component(name = "wave2_test::FilterC")]
+#[mod_component(name = "batch_test::FilterC")]
 struct FilterC;
 
 #[repr(C)]
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, ModComponent)]
-#[mod_component(name = "wave2_test::FilterD")]
+#[mod_component(name = "batch_test::FilterD")]
 struct FilterD;
 
 #[derive(Component, Clone, Debug, Default, PartialEq, Eq, ModComponent)]
-#[mod_component(name = "wave2_test::ChatMsg")]
+#[mod_component(name = "batch_test::ChatMsg")]
 struct ChatMsg {
     sender: String,
     tags: Vec<u32>,
@@ -355,7 +355,7 @@ fn cmd_insert_if_new_preserves_existing_and_drops_skipped_dynamic_payloads() {
         .register_mod_component::<Position>(ComponentOptions::new())
         .unwrap();
 
-    let dyn_name = "wave2_test::TrackedDynamic";
+    let dyn_name = "batch_test::TrackedDynamic";
     let dyn_uuid = ComponentUuid::from_parts(dyn_name, 8, 8, 1);
     let mut dyn_h = BamComponent::INVALID;
     {
@@ -367,7 +367,7 @@ fn cmd_insert_if_new_preserves_existing_and_drops_skipped_dynamic_payloads() {
             app.world_mut() as *mut bevy_ecs::world::World,
             None,
         );
-        let desc = ComponentDesc::new(c"wave2_test::TrackedDynamic".as_ptr(), dyn_uuid, 8, 8)
+        let desc = ComponentDesc::new(c"batch_test::TrackedDynamic".as_ptr(), dyn_uuid, 8, 8)
             .with_drop(track_drop);
         assert_eq!(
             unsafe { host_register_component(lctx.as_ffi_ptr(), &desc, &mut dyn_h) },
@@ -895,15 +895,15 @@ fn non_pod_messages_round_trip_and_batch_cursors_work_across_ffi() {
     // Verify `ModRegistry::insert_mod_component_symbols` published witness & marker symbols.
     let snap = app.world().resource::<ModRegistry>().snapshot();
     assert!(
-        snap.resolve_symbol("bam.v0.wave2_test::ChatMsg.export_fields")
+        snap.resolve_symbol("bam.v0.batch_test::ChatMsg.export_fields")
             .is_some()
     );
     assert!(
-        snap.resolve_symbol("bam.v0.wave2_test::ChatMsg.import_field")
+        snap.resolve_symbol("bam.v0.batch_test::ChatMsg.import_field")
             .is_some()
     );
     assert!(
-        snap.resolve_symbol("bam.v0.wave2_test::ChatMsg.non_pod_message")
+        snap.resolve_symbol("bam.v0.batch_test::ChatMsg.non_pod_message")
             .is_some()
     );
     let entry = snap.get_by_handle(msg_h).unwrap();

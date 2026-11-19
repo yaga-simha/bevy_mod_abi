@@ -1,9 +1,9 @@
-# Benchmarks & Deterministic Regression Gates (`ABI 0.2.0`)
+# Benchmarks & Deterministic Regression Gates (`ABI 0.3.0`)
 
-This document records the **canonical benchmark scenarios**, **deterministic CI regression gates (`iai-callgrind` + counting allocator)**, **reference hardware baselines**, and the **full 5-dimensional permutation matrix** for `bevy_abi_mod` (`ABI 0.2.0`).
+This document records the **canonical benchmark scenarios**, **deterministic CI regression gates (`iai-callgrind` + counting allocator)**, **reference hardware baselines**, and the **full 5-dimensional permutation matrix** for `bevy_abi_mod` (`ABI 0.3.0`).
 
 ```bash
-# 1. Run all 5 canonical host benchmark scenarios (stages Rust & C99 fixtures automatically)
+# 1. Run all 9 canonical host benchmark scenarios (stages Rust & C99 fixtures automatically)
 cargo xtask bench
 
 # 2. Quick local run (short warmup / 12 rounds) or CI smoke check (--test)
@@ -21,7 +21,7 @@ cargo xtask bench --permutation
 
 ## 1. Reference Machine Specifications
 
-All baseline measurements below were recorded on the same local Apple Silicon workstation:
+All reference hardware measurements below were recorded on the same local Apple Silicon workstation on the `ABI 0.2.0` wire prior to appending the `ABI 0.3.0` extension slots (the hot-path `HostIter` / `CommandArena` wire layouts and CI regression gates carry forward identically under `ABI 0.3.0`):
 
 | Property | Specification |
 |---|---|
@@ -36,7 +36,7 @@ All baseline measurements below were recorded on the same local Apple Silicon wo
 
 ## 2. Canonical Benchmark Suite (`crates/bevy_abi_mod_host/benches/chunk_throughput.rs`)
 
-`chunk_throughput.rs` unifies the nine core `ABI 0.2.0` runtime paths into a single reproducible suite (`--bench`, `30` measured frames per scenario on `Apple M4 Pro`, `14` cores, `rustc 1.98.1`, `bench` profile `opt-level = 3`).
+`chunk_throughput.rs` unifies the nine core `ABI 0.3.0` runtime paths into a single reproducible suite (`--bench`, `30` measured frames per scenario on `Apple M4 Pro`, `14` cores, `rustc 1.98.1`, `bench` profile `opt-level = 3`; reference tables below captured before appending the `ABI 0.3.0` slots, while CI runs the deterministic gate on current `ABI 0.3.0`).
 
 ### 2.1 Scenario 1: Dense SoA Chunk Iteration (`1k` / `10k` / `100k` Entities)
 Compares native Bevy `Query<(&mut Position, &Velocity)>`, direct C-ABI `GuestSystem` contiguous SoA slice iteration (`host_iter_column_mutable` + `host_iter_column_readonly`), and loaded `.cdylib`/`.dylib` dynamic components (`RustModCustomData` and `CModCustomData`):
@@ -97,7 +97,7 @@ Spawns `2,500` 4-component entities (`Position`, `Velocity`, `Vitality`, `Armor`
 | **C-ABI Batched `host_cmd_spawn` (4 comps)** | **`0.2432 ms`** | `0.2648 ms` | **`10.1M ent/s`** | **`97.28 ns`** | **`1.66x` faster than seq** |
 | C-ABI Sequential `spawn_empty` + `4x insert` | `0.4047 ms` | `0.5419 ms` | `5.97M ent/s` | `161.88 ns` | `1.00x` |
 
-### 2.6 Scenario 6: Wave 1 Query Filter Throughput (`Allow`, `Has`, `Or` @ `10,000` Entities)
+### 2.6 Scenario 6: Query Filter Throughput (`Allow`, `Has`, `Or` @ `10,000` Entities)
 Measured on `10,000` entities (`50%` `Pos+Vel+FilterTagA`, `25%` `Pos+Vel+FilterTagB`, `25%` `Pos+Vel+FilterTagA+Disabled`) comparing default `DefaultQueryFilters` visibility against `Allow<Disabled>`, synthesized `[FfiBool]` chunk presence masks (`AccessMode::HAS`), and `or_group` disjunctions:
 
 | Filter Variant (`10k` Entities) | Median Frame | p95 Frame | Throughput (`ent/s`) | `ns / entity` |
@@ -110,7 +110,7 @@ Measured on `10,000` entities (`50%` `Pos+Vel+FilterTagA`, `25%` `Pos+Vel+Filter
 | Native Bevy `Or<(With<A>, With<B>)>` (`7,500`) | `0.0088 ms` | `0.0090 ms` | `850.8M ent/s` | `1.17 ns` |
 | **C-ABI `or_group` (`With<A> \|\| With<B>`)** | **`0.0073 ms`** | `0.0074 ms` | **`1.03B ent/s`** | **`0.97 ns`** |
 
-### 2.7 Scenario 7: Wave 2 Batch Commands (`cmd_spawn_batch` SoA & `cmd_despawn_all`)
+### 2.7 Scenario 7: Batch Commands (`cmd_spawn_batch` SoA & `cmd_despawn_all`)
 Compares single-call Structure-of-Arrays `host_cmd_spawn_batch` (4 components) against per-entity `host_cmd_spawn` loops and Native Bevy `Commands::spawn_batch`, plus single-call `host_cmd_despawn_all` against per-entity `host_cmd_despawn` loops at `1,000` and `10,000` entities:
 
 | Scale | Operation | Median Frame | p95 Frame | Throughput (`ent/s`) | `ns / entity` | Speedup |
@@ -154,7 +154,7 @@ Wall-clock microbenchmarks on shared cloud CI runners exhibit 15–40% noisy-nei
 1. **Linux CI (`cfg(target_os = "linux")`):** Uses `iai-callgrind` (`Valgrind` Callgrind) to record deterministic CPU instruction counts, L1/LL cache hits, and estimated cycles across `bench_gate_dense_1k`, `bench_gate_changed_1pct`, `bench_gate_command_arena_1k`, `bench_gate_sparse_1k`, and `bench_gate_spawn4_256`.
 2. **All Platforms (`CountingAlloc` + Step Invariants):** Wraps `std::alloc::System` in a global atomic `CountingAlloc` and asserts:
    - **`0` heap allocations** during steady-state dense chunk iteration (`run_dense_1k_gate`).
-   - **`0` entities visited** on unmutated tables (`summary-tick skip) and exact `10` entities visited at `1%` mutation (`run_changed_1pct_gate`).
+   - **`0` entities visited** on unmutated tables (`summary-tick` skip) and exact `10` entities visited at `1%` mutation (`run_changed_1pct_gate`).
    - **`0` heap allocations** during steady-state `1,000`-command `host_cmd_insert` bursts (`run_command_arena_zero_alloc_gate`).
    - **`1` batched FFI chunk** emitted for `1,000` `SparseSet` entities (`run_sparse_batching_gate`).
    - **`256` 4-component entities** materialized in one deferred flush (`run_batched_spawn4_gate`).

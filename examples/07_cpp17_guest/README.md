@@ -1,6 +1,6 @@
 # Example 07: ISO C++17 Guest Mod (`bam::GuestApp` + Typed Component Views)
 
-**Concept taught:** Authoring a strict ISO C++17 guest mod (`-std=c++17 -Wall -Wextra -Wpedantic -Werror`) against `include/bevy_abi_mod.h` (`ABI 0.2.0`) using idiomatic C++17 `noexcept` RAII wrappers (`bam_cpp17_sdk.hpp`) and macro-generated typed views (`example_components.h` from `ModComponent::C_DECL`).
+**Concept taught:** Authoring a strict ISO C++17 guest mod (`-std=c++17 -Wall -Wextra -Wpedantic -Werror`) against `include/bevy_abi_mod.h` (`ABI 0.3.0`) using idiomatic C++17 `noexcept` RAII wrappers (`bam_cpp17_sdk.hpp`) and macro-generated typed views (`example_components.h` from `ModComponent::C_DECL`).
 
 ---
 
@@ -25,7 +25,7 @@
 
 1. **Zero-copy SoA chunk & resource iteration:** Mutates `example::Position` and `example::Velocity` columns directly with `example::SimConfig`.
 2. **Typed non-POD & enum VTable views:** Safely mutates host-owned `String`, `Vec<u32>`, `FfiOption<u32>`, `bool`, and `#[repr(C, u8)]` `BehaviorMode` without crossing allocators.
-3. **Wave 1–2 Bevy `0.20` patterns:** Demonstrates `BAM_ACCESS_HAS` (`Has<ActorStats>`), `BAM_ACCESS_OPTIONAL_READ` (`BamChildOf`), `BAM_EVENT_KIND_ADD` lifecycle observers, and `cmd_spawn_batch` bulk entity spawning.
+3. **Bevy `0.20` ECS patterns:** Demonstrates `BAM_ACCESS_HAS` (`Has<ActorStats>`), `BAM_ACCESS_OPTIONAL_READ` (`BamChildOf`), `BAM_EVENT_KIND_ADD` lifecycle observers, and `cmd_spawn_batch` bulk entity spawning.
 4. **ABI Safety Guarantees:** All `extern "C"` boundaries are strict `nounwind` (`try / catch (...) -> BAM_RESULT_PANIC_CAUGHT`), per-`World` instance state uses zero globals, and host vs. guest allocations stay strictly isolated.
 
 ## Commands

@@ -14,7 +14,7 @@ Native dynamic modding inside a data-oriented parallel ECS poses four fundamenta
 2. **Asymmetric Host-Driven Zero-Copy Execution:** Rather than serializing world snapshots to JSON or Bincode, the host drives dynamic Bevy `System`s over contiguous Structure-of-Arrays (SoA) `Table` byte slices and batched `SparseSet` indirect row pointer arrays, while enforcing Bevy `FilteredAccessSet` borrow rules.
 3. **Strict Memory & Allocator Isolation:** Host allocations live and die on the host allocator; guest allocations (closures, plugin structs, `GuestInstance` state) live and die on the guest allocator inside `bevy_abi_mod_shutdown`.
 4. **Zero-Steady-State-Allocation Hot Paths:** Components, resources, and messages resolve at load time into 1-based `BamComponent` handles; systems reuse bump-allocated `CommandArena` slabs, flat command tapes, and scratch row buffers after warmup.
-5. **Audit-Friendly `-sys` Boundary Isolation:** All `unsafe` FFI code is confined inside `bevy_abi_mod_sys`, `bevy_abi_mod_host_sys`, and `bevy_abi_mod_guest_sys` (under `#![deny(unsafe_op_in_unsafe_fn, improper_ctypes_definitions, clippy::undocumented_unsafe_blocks, clippy::missing_safety_doc)]`). Every user-facing, trust, manifest, SDK-generator, and CLI crate (`bevy_abi_mod`, `bevy_abi_mod_host`, `bevy_abi_mod_guest`, `bevy_abi_mod_macros`, `bevy_abi_mod_trust`, `bevy_abi_mod_manifest`, `bevy_abi_mod_sdk_gen`, `cargo-bam`, `xtask`) enforces `#![forbid(unsafe_code)]`.
+5. **Encapsulated `-sys` Unsafe Boundary:** All `unsafe` FFI code is confined inside `bevy_abi_mod_sys`, `bevy_abi_mod_host_sys`, and `bevy_abi_mod_guest_sys` (under `#![deny(unsafe_op_in_unsafe_fn, improper_ctypes_definitions, clippy::undocumented_unsafe_blocks, clippy::missing_safety_doc)]`). Every user-facing, trust, manifest, SDK-generator, and CLI crate (`bevy_abi_mod`, `bevy_abi_mod_host`, `bevy_abi_mod_guest`, `bevy_abi_mod_macros`, `bevy_abi_mod_trust`, `bevy_abi_mod_manifest`, `bevy_abi_mod_sdk_gen`, `cargo-bam`, `xtask`) enforces `#![forbid(unsafe_code)]`.
 
 > **Native Trust Model:** Shared libraries run in-process with the host OS privileges and `nounwind` C callbacks. `bevy_abi_mod` protects against compiler ABI skew, ECS aliasing UB, allocator crossover, and accidental faults (`PANIC_CAUGHT` quarantine) for **trusted native mods**—it is not a cryptographic sandbox for untrusted user code (use Wasm for untrusted plugins). Enabling the optional `signature-verification` feature enforces load-time cryptographic authentication (`ModTrustPolicy` over OpenSSH `SSHSIG` detached `.sig` sidecars + Ed25519 CA certificates or pinned public keys) strictly **before** `dlopen` / `LoadLibraryW` so only verified publisher binaries are ever mapped.
 
@@ -27,11 +27,23 @@ flowchart TD
     subgraph HostApp["Bevy Application Process (Host Allocator + Bevy ECS v0.20+)"]
         FACADE["bevy_abi_mod\n(#![forbid(unsafe_code)] facade)"]
         HOST["bevy_abi_mod_host\n(#![forbid(unsafe_code)] AbiModPlugin & Exts)"]
-        HOSTSYS["bevy_abi_mod_host_sys\n(unsafe FFI engine, HostIter, CommandArena,\nGuestSystem, DROP_SLOTS, ModHost)"]
+        HOSTSYS["bevy_abi_mod_host_sys\n(unsafe FFI engine, HostIter, CommandArena,\nGuestSystem, DROP_PAGES, ModHost)"]
         FACADE --> HOST
         FACADE --> MACROS
         HOST --> HOSTSYS
+        HOST --> MANIFEST
         HOST --> MACROS
+        HOSTSYS -. "optional: signature-verification" .-> TRUST
+    end
+
+    subgraph SharedPureRust["Zero-Bevy Tooling, Trust & Manifests (#![forbid(unsafe_code)], zero Bevy deps)"]
+        TRUST["bevy_abi_mod_trust\n(Ed25519 SSHSIG, CA, SSHKRL, .bam_sig, .bampack)"]
+        MANIFEST["bevy_abi_mod_manifest\n(mod.toml parser & SemVer DAG sorter)"]
+        SDKGEN["bevy_abi_mod_sdk_gen\n(C99/C++17/Zig & component header codegen)"]
+        CLI["cargo-bam\n(CLI: new, export-sdk, build, check-mods, doctor, keygen, sign, verify)"]
+        CLI --> TRUST
+        CLI --> MANIFEST
+        CLI --> SDKGEN
     end
 
     SYS["bevy_abi_mod_sys\n(#![no_std], zero external deps)\nC-ABI 0.3.0 Wire Contract"]
@@ -39,6 +51,8 @@ flowchart TD
 
     HOST --> SYS
     HOSTSYS --> SYS
+    MANIFEST --> SYS
+    SDKGEN --> SYS
     MACROS -. "generated code ref" .-> SYS
 
     subgraph GuestCdylib["Native Mod .so / .dylib / .dll (Independent Allocator, Zero Bevy Deps)"]
@@ -62,8 +76,8 @@ flowchart TD
 | `bevy_abi_mod_macros` | `#![forbid(unsafe_code)]` | None | [`abi_pod.rs`](../crates/bevy_abi_mod_macros/src/abi_pod.rs) (`size_of == sum(fields)` check), [`attrs.rs`](../crates/bevy_abi_mod_macros/src/attrs.rs), [`classify.rs`](../crates/bevy_abi_mod_macros/src/classify.rs), [`codegen/vtable.rs`](../crates/bevy_abi_mod_macros/src/codegen/vtable.rs), [`codegen/c_decl.rs`](../crates/bevy_abi_mod_macros/src/codegen/c_decl.rs) (`C_DECL`, `ZIG_DECL`, `SCHEMA_FINGERPRINT`, `BAM_FIELDS`). |
 | `bevy_abi_mod_trust` | `#![forbid(unsafe_code)]` | None | Pure-Rust Ed25519 OpenSSH `SSHSIG`, CA certificate, `PROTOCOL.krl` (`SSHKRL`), `.bam_sig` ELF/Mach-O/PE verification, and `.bampack` archive verification engine. |
 | `bevy_abi_mod_manifest` | `#![forbid(unsafe_code)]` | None | Zero-Bevy `mod.toml` parser, `ModDependencyGraph` SemVer DAG topological resolver, and dependency mismatch/quarantine types. |
-| `bevy_abi_mod_sdk_gen` | `#![forbid(unsafe_code)]` | None | Deterministic generator for `include/bevy_abi_mod.h`, `include/generated/*.h`, `bam_cpp17_sdk.hpp`, `bam_zig_sdk.zig`, and `export_sdk` (`BAM_EXPORT`, `BAM_HOST_API_OFFSET_*`). |
-| `bevy_abi_mod_host_sys` | Isolated host `unsafe` | `bevy_ecs`, `bevy_app`, `bevy_tasks` | [`ffi/host_api.rs`](../crates/bevy_abi_mod_host_sys/src/ffi/host_api.rs) (`HOST_API`), [`ffi/v03_ext.rs`](../crates/bevy_abi_mod_host_sys/src/ffi/v03_ext.rs) (ABI `0.3.0` handlers), [`ffi/iter.rs`](../crates/bevy_abi_mod_host_sys/src/ffi/iter.rs) (`HostIter`, `host_par_for_each_chunk`, resource & message FFI), [`ffi/commands.rs`](../crates/bevy_abi_mod_host_sys/src/ffi/commands.rs) (`CommandArena`, `HostCommands`, checkpoints), [`ffi/register.rs`](../crates/bevy_abi_mod_host_sys/src/ffi/register.rs) (`LoadContext`, `GuestObserverBinding`), [`registry/`](../crates/bevy_abi_mod_host_sys/src/registry/mod.rs) (`ModRegistry`, `RegistrySnapshot`, `ComponentOptions`), [`system/`](../crates/bevy_abi_mod_host_sys/src/system/mod.rs) (`GuestSystem`, `ModQuarantine`, `ModErrorPolicy`), [`drop_trampoline.rs`](../crates/bevy_abi_mod_host_sys/src/drop_trampoline.rs) (`DROP_SLOTS`, `WorldDropGuard`), [`loader/`](../crates/bevy_abi_mod_host_sys/src/loader/mod.rs) (`ModHost`, `LoadOptions`, `LoadTransaction`, optional `signing.rs` re-exporting `bevy_abi_mod_trust`), [`schedule.rs`](../crates/bevy_abi_mod_host_sys/src/schedule.rs) (`ModSystemSet`, `ModNamedSystemSet`, `ModScheduleMap`, `ModVisibleSets`). |
+| `bevy_abi_mod_sdk_gen` | `#![forbid(unsafe_code)]` | None | Deterministic generator for `include/bevy_abi_mod.h`, `bevy_abi_mod.hpp`, `bevy_abi_mod.zig`, component headers (`ModComponent::C_DECL`), and `export_sdk` (`BAM_EXPORT`, `BAM_HOST_API_OFFSET_*`). |
+| `bevy_abi_mod_host_sys` | Isolated host `unsafe` | `bevy_ecs`, `bevy_app`, `bevy_tasks` | [`ffi/host_api.rs`](../crates/bevy_abi_mod_host_sys/src/ffi/host_api.rs) (`HOST_API`), [`ffi/v03_ext.rs`](../crates/bevy_abi_mod_host_sys/src/ffi/v03_ext.rs) (ABI `0.3.0` handlers), [`ffi/bridge_helpers.rs`](../crates/bevy_abi_mod_host_sys/src/ffi/bridge_helpers.rs) (optional bridge witness & extraction helpers), [`ffi/iter.rs`](../crates/bevy_abi_mod_host_sys/src/ffi/iter.rs) (`HostIter`, `host_par_for_each_chunk`, resource & message FFI), [`ffi/commands.rs`](../crates/bevy_abi_mod_host_sys/src/ffi/commands.rs) (`CommandArena`, `HostCommands`, checkpoints), [`ffi/register.rs`](../crates/bevy_abi_mod_host_sys/src/ffi/register.rs) (`LoadContext`, `GuestObserverBinding`), [`registry/`](../crates/bevy_abi_mod_host_sys/src/registry/mod.rs) (`ModRegistry`, `RegistrySnapshot`, `ComponentOptions`, `DynamicComponentHookMap`), [`system/`](../crates/bevy_abi_mod_host_sys/src/system/mod.rs) (`GuestSystem`, `ModQuarantine`, `ModErrorPolicy`), [`drop_trampoline.rs`](../crates/bevy_abi_mod_host_sys/src/drop_trampoline.rs) (`DROP_PAGES`, `WorldDropGuard`), [`loader/`](../crates/bevy_abi_mod_host_sys/src/loader/mod.rs) (`ModHost`, `LoadOptions`, `LoadTransaction`, optional `signing.rs` re-exporting `bevy_abi_mod_trust`), [`schedule.rs`](../crates/bevy_abi_mod_host_sys/src/schedule.rs) (`ModSystemSet`, `ModNamedSystemSet`, `ModScheduleMap`, `ModVisibleSets`). |
 | `bevy_abi_mod_host` | `#![forbid(unsafe_code)]` | `bevy_ecs`, `bevy_app`, optional `bevy_diagnostic` | [`plugin.rs`](../crates/bevy_abi_mod_host/src/plugin.rs) (`AbiModPlugin` / `with_trust_policy`), [`app_ext.rs`](../crates/bevy_abi_mod_host/src/app_ext.rs) (`ModAppExt`), [`world_ext.rs`](../crates/bevy_abi_mod_host/src/world_ext.rs) (`ModWorldExt`), [`commands_ext.rs`](../crates/bevy_abi_mod_host/src/commands_ext.rs) (`ModCommandsExt`), [`schedule_sets.rs`](../crates/bevy_abi_mod_host/src/schedule_sets.rs), [`events.rs`](../crates/bevy_abi_mod_host/src/events.rs), [`diagnostics.rs`](../crates/bevy_abi_mod_host/src/diagnostics.rs). |
 | `bevy_abi_mod` | `#![forbid(unsafe_code)]` | Via `bevy_abi_mod_host` | [`lib.rs`](../crates/bevy_abi_mod/src/lib.rs) re-exporting `bevy_abi_mod_host`, `ModComponent`, `AbiPod`, `bevy_abi_mod_sys`, and `prelude`. |
 | `bevy_abi_mod_guest_sys` | Isolated guest `unsafe` | None | [`host.rs`](../crates/bevy_abi_mod_guest_sys/src/host.rs) (`Host`, `ValidatedLoadCtx`), [`instance.rs`](../crates/bevy_abi_mod_guest_sys/src/instance.rs) (`GuestInstance`, `save_state`/`restore_state` trampolines), [`panic.rs`](../crates/bevy_abi_mod_guest_sys/src/panic.rs) (`catch_guest_*`), [`trampoline.rs`](../crates/bevy_abi_mod_guest_sys/src/trampoline.rs) (`ReentrantCell`, closures), [`iter.rs`](../crates/bevy_abi_mod_guest_sys/src/iter.rs), [`commands.rs`](../crates/bevy_abi_mod_guest_sys/src/commands.rs), [`component.rs`](../crates/bevy_abi_mod_guest_sys/src/component.rs). |
@@ -115,7 +129,7 @@ Every extensible wire struct (`BamManifest`, `BamHostApi`, `BamSystemDesc`, `Bam
    - Duplicate/conflicting writes within the same system trigger Bevy access validation failures (`SystemInitError`), allowing compatible systems from different mods (and host systems) to run in parallel across Bevy's multi-threaded scheduler.
 2. **Schedule & Ordering Resolution (`schedule.rs` & `schedule_sets.rs`):**
    - Built-in `ScheduleId`s (`STARTUP`, `PRE_UPDATE`, `UPDATE`, `POST_UPDATE`, `FIXED_UPDATE`, `LAST`) and custom `ScheduleId::custom(id >= 1024)` map through `ModScheduleMap` (`register_mod_schedule`).
-   - Every system joins `ModSystemSet(mod_id)` and `ModNamedSystemSet { mod_name, system_name }`.
+   - Every system joins `ModSystemSet::Mod(mod_id)` and `ModNamedSystemSet { mod_name, system_name, generation }`.
    - `.in_set()`, `.before()`, and `.after()` constraints resolve intra-mod (`"step_a"`), cross-mod (`"other_mod::step_a"` — created on demand so order does not depend on load order), and host-exported `SystemSet` handles registered via `app.register_mod_visible_set("physics", PhysicsSet)` (`"host::physics"`), preventing Bevy 0.20 schedule-randomization bugs.
    - `BAM_SYSTEM_FLAG_MAIN_THREAD` adds `SystemStateFlags::NON_SEND` alongside `SystemStateFlags::DEFERRED` in `GuestSystem::flags()` to pin thread-affine systems onto Bevy's main thread without making them exclusive `World` systems.
    - If a mod registers `ScheduleId::STARTUP` systems after Bevy `Startup` has already completed (`StartupCompleted`), the host executes those startup systems once immediately on load commit.
@@ -177,9 +191,9 @@ Key execution mechanisms:
 
 ---
 
-## 7. Runtime Dynamic Components & Safe Destructor Reclamation (`DROP_SLOTS`)
+## 7. Runtime Dynamic Components & Safe Destructor Reclamation (`DROP_PAGES` & `DynamicComponentHookMap`)
 
-Mods can define private `#[repr(C)]` ECS components (and dynamic trigger events) at runtime without recompiling the host via `register_component` (`ComponentDescriptor::new_with_layout`), attaching optional `on_add` / `on_remove` hooks (`HOOK_SLOTS`) and optional foreign destructors (`drop_fn` -> `DROP_SLOTS`).
+Mods can define private `#[repr(C)]` ECS components (and dynamic trigger events) at runtime without recompiling the host via `register_component` (`ComponentDescriptor::new_with_layout`), attaching optional foreign destructors (`drop_fn` -> `DROP_PAGES`), custom `clone_fn` handlers, transitive `required_components`, and all five Bevy `0.20` lifecycle hooks (`on_add`, `on_insert`, `on_discard`, `on_remove`, `on_despawn`) dispatched through `DynamicComponentHookMap`.
 
 Because a foreign `drop_fn` lives in a `.cdylib`'s `.text` segment while entities carrying that component live inside a Bevy `World`, **two independent hazard conditions** exist on teardown:
 1. A mod unloads while entities with its dynamic component remain alive in the `World`.
@@ -187,15 +201,15 @@ Because a foreign `drop_fn` lives in a `.cdylib`'s `.text` segment while entitie
 
 ```mermaid
 stateDiagram-v2
-    [*] --> SLOT_FREE: Initial (free_list = 0..1024)
-    SLOT_FREE --> SLOT_IN_USE: register_dynamic_component_owned allocates slot\nSLOT_LIFECYCLE[slot] = SLOT_IN_USE_BIT | 0\nWorldDropGuard records owned slot
-    SLOT_IN_USE --> SLOT_IN_USE: on_insert_hook -> fetch_add(1, AcqRel)\ndrop_trampoline -> run drop_fn if active & fetch_sub(1, AcqRel)\nmod unload -> tombstone is_active=false + prune snapshot
+    [*] --> SLOT_FREE: Initial lazy pages (64 pages x 64 slots = 4,096 max)
+    SLOT_FREE --> SLOT_IN_USE: register_dynamic_component allocates slot (allocating page on demand)\nSLOT_LIFECYCLE[slot] = SLOT_IN_USE_BIT | 0\nWorldDropGuard records owned slot + generation
+    SLOT_IN_USE --> SLOT_IN_USE: on_insert_trampoline -> fetch_add(1, AcqRel)\ndrop_trampoline -> run drop_fn if active & fetch_sub(1, AcqRel)\nmod unload -> tombstone is_active=false + clear DynamicComponentHookMap
     SLOT_IN_USE --> SLOT_CLOSING: WorldDropGuard::drop ->\nfetch_xor(SLOT_IN_USE_BIT | SLOT_CLOSING_BIT, AcqRel)
     SLOT_CLOSING --> SLOT_CLOSING: Drop of remaining entities:\nrun_uncommitted / drop_trampoline skips unmapped drop_fn (is_active=false)\n& fetch_sub(1, AcqRel)
-    SLOT_CLOSING --> SLOT_FREE: Condition met: (prev == SLOT_CLOSING_BIT | 1)\nor WorldDropGuard saw live_values == 0 ->\nreclaim_closed_slot: CAS(SLOT_CLOSING_BIT -> 0), clear snapshot, push free_list
+    SLOT_CLOSING --> SLOT_FREE: Condition met: (prev == SLOT_CLOSING_BIT | 1)\nor WorldDropGuard saw live_values == 0 ->\nreclaim_closed_slot: CAS(SLOT_CLOSING_BIT -> 0), clear snapshot, bump generation, recycle slot
 ```
 
-`MAX_DROP_TRAMPOLINES = 1024` pre-monomorphized `drop_trampoline::<SLOT>` functions avoid closure captures (matching Bevy's `fn(OwningPtr<'_>)` requirement). Packing `(state_bits | live_values)` into one `AtomicUsize` (`SLOT_LIFECYCLE[slot]`) places `WorldDropGuard::drop` (`fetch_xor`) and `drop_trampoline` (`fetch_sub`) into a single modification order, guaranteeing wait-free reads on hot paths via `ArcSwapOption<DropSlotSnapshot>` and zero use-after-`dlclose` across all interleavings. Note: Bevy `ComponentId`s for unloaded dynamic components remain registered inside `ModRegistry` (`vtable_ptr` cleared) so reloading the mod seamlessly rebinds its destructor trampoline and systems to existing entities!
+Up to `MAX_DROP_TRAMPOLINES = 4,096` (`MAX_DROP_PAGES = 64` × `DROP_PAGE_SIZE = 64`) pre-monomorphized `drop_trampoline::<SLOT>` functions avoid closure captures (matching Bevy's `fn(OwningPtr<'_>)` requirement), backed by `DROP_PAGES: [OnceLock<Box<DropPage>>; MAX_DROP_PAGES]`, `DROP_TRAMPOLINE_BLOCKS`, and `INSERT_HOOK_BLOCKS`. Packing `(state_bits | live_values)` into one `AtomicUsize` per slot places `WorldDropGuard::drop` (`fetch_xor`) and `drop_trampoline` (`fetch_sub`) into a single modification order, guaranteeing wait-free reads on hot paths via `ArcSwapOption<DropSlotSnapshot>` and zero use-after-`dlclose` across all interleavings. Note: Bevy `ComponentId`s for unloaded dynamic components remain registered inside `ModRegistry` (`vtable_ptr` cleared) so reloading the mod seamlessly rebinds its destructor trampoline, hooks, and systems to existing entities!
 
 ---
 
@@ -216,10 +230,10 @@ sequenceDiagram
     Loader->>Lib: dlopen / LoadLibraryW + validate BamManifest
     Loader->>Lib: bevy_abi_mod_init(&HOST_API, load_ctx, &instance_out)
     alt init != OK OR strict ordering validation fails
-        Loader->>Loader: LoadTransaction::drop rollback:\nis_active=false, restore DROP_SLOTS & RegistrySnapshot, despawn Observers
+        Loader->>Loader: LoadTransaction::drop rollback:\nis_active=false, restore DROP_PAGES & RegistrySnapshot, despawn Observers
         Loader->>Lib: Drop LoadedLibrary (dlclose + unlink shadow copy)
     else Validation succeeds
-        Loader->>Sched: Insert GuestSystems, ModSystemSet(id), ModNamedSystemSets
+        Loader->>Sched: Insert GuestSystems, ModSystemSet::Mod(id), ModNamedSystemSets
         Loader->>Sched: Spawn LoadedModInfo + emit Messages<ModLoaded>
         opt StartupCompleted && has STARTUP systems
             Loader->>Sched: Run late Startup systems once immediately
@@ -228,7 +242,7 @@ sequenceDiagram
 
     Note over Caller,Lib: State-Preserving Hot Reload: world.reload_mod(id)
     Caller->>Lib: save_state(old_instance, writer) -> Vec<u8>
-    Caller->>Loader: Deterministic 5-step unload(id):\n1. Excise sets from Schedules\n2. Tombstone DROP_SLOTS/HOOK_SLOTS + despawn Observers\n3. Null VTable pointers + purge bam.v0.* symbols\n4. bevy_abi_mod_shutdown(old_instance)\n5. dlclose + unlink shadow copy + emit ModUnloaded
+    Caller->>Loader: Deterministic 5-step unload(id):\n1. Excise sets from Schedules\n2. Tombstone DROP_PAGES / DynamicComponentHookMap + despawn Observers\n3. Null VTable pointers + purge bam.v0.* symbols\n4. bevy_abi_mod_shutdown(old_instance)\n5. dlclose + unlink shadow copy + emit ModUnloaded
     Caller->>Loader: Load replacement + restore_state(new_instance, saved_bytes)
 ```
 
@@ -236,9 +250,9 @@ sequenceDiagram
 - **Core Shadow Copying (`LoadOptions::shadow_copy`):** Copying `<stem>.<ext>` to a unique `<stem>.<pid>.<seq>.<ext>` file before `dlopen` bypasses POSIX inode caching (so recompiling produces fresh code instead of reusing the old image), Windows `.dll`/`.pdb` write locks during rebuilds, and macOS Apple Silicon code-signature page invalidation `SIGKILL`s. `LoadedLibrary` drops `libloading::Library` strictly before `ShadowFileGuard` unlinks the temporary file.
 - **Optional Cryptographic Signature, CA, & KRL Verification (`signature-verification`):**
   - Hosts enable `signature-verification` on `bevy_abi_mod` / `bevy_abi_mod_host` and attach a World-level `ModTrustPolicy` resource (via `AbiModPlugin::with_trust_policy(...)` or `set_mod_trust_policy(...)`) holding deduplicated OpenSSH Ed25519 Root CA public keys (`ssh-ed25519`) and/or pinned leaf keys, direct revocations (`revoke_serial`, `revoke_serial_range`, `revoke_key_id`, `revoke_fingerprint`), full OpenSSH `PROTOCOL.krl` (`SSHKRL`) binary revocation lists (`KrlBuilder`, `add_krl_bytes`/`add_krl_file`, `add_revocation_spec_str`), detached `SSHSIG` signed KRLs (`add_signed_krl_bytes`/`add_signed_krl_file` under `DEFAULT_KRL_SIGNATURE_NAMESPACE`) with monotonic `with_min_krl_version` anti-rollback, validity window policy, and optional principal / `BamManifest::name` binding.
-  - Each shared library carries a detached OpenSSH `SSHSIG` PEM sidecar (`<lib>.sig`, or `LoadOptions::with_signature_path`), compatible with standard `ssh-keygen -Y sign`, `ssh-keygen -k`/`-Q`, and pure-Rust `cargo xtask sign <keygen|cert|file|krl|verify>`.
+  - Each shared library carries a detached OpenSSH `SSHSIG` PEM sidecar (`<lib>.sig`, or `LoadOptions::with_signature_path`), embedded `.bam_sig` section, or signed `.bampack` archive, compatible with standard `ssh-keygen -Y sign`, `ssh-keygen -k`/`-Q`, `cargo bam <keygen|sign|verify>`, and `cargo xtask sign <keygen|cert|file|krl|verify>`.
   - **Strict Curve Validation, TOCTOU, & `DllMain` Prevention:** Verification executes purely in `#![forbid(unsafe_code)]` Rust (`crates/bevy_abi_mod_trust`) **before** `dlopen` / `LoadLibraryW` (so malicious static constructors never run), rejecting empty binaries, empty certificate nonces, small-order Curve25519 torsion keys, non-canonical compressed coordinates ($y \ge 2^{255}-19$), and malleable Ed25519 scalars (`ed25519_dalek::VerifyingKey::verify_strict`), and supporting detached `.sig` sidecars, embedded `.bam_sig` sections, and `.bampack` archives. Size-bounded library bytes are verified once in memory and written to an exclusively created (`create_new(true)`, `0o700` on Unix / `FILE_SHARE_READ` on Windows) file inside a verified leaf shadow directory (`0o700`, rejecting symlinks and world-writable directories) regardless of `LoadOptions::shadow_copy`, preventing file-swap races between verification and OS mapping (`ABI 0.3.0`).
-  - **Hot-Reload Pre-Verification, ECS Audit Receipt, & Runtime Eviction:** `reload_mod_with` / `reload_mod_from` run `preverify_mod_on_disk` and pre-check `verify_manifest_principal` against the running module name before unloading the live module so unsigned, tampered, revoked, or principal-mismatched replacements fail cleanly without disrupting active gameplay. After updating `ModTrustPolicy` at runtime (e.g., loading a newer signed KRL), hosts can call `evict_revoked_mods()` (`ModWorldExt` / `ModAppExt`) to surgically unload compromised or newly revoked live mods while leaving unaffected mods running. On successful load, a `VerifiedModSignature` component (recording signer fingerprint, CA fingerprint, key ID, principals, serial, namespace, and binary SHA-256) is attached to the spawned `LoadedModInfo` entity.
+  - **Hot-Reload Pre-Verification, ECS Verification Receipt, & Runtime Eviction:** `reload_mod_with` / `reload_mod_from` run `preverify_mod_on_disk` and pre-check `verify_manifest_principal` against the running module name before unloading the live module so unsigned, tampered, revoked, or principal-mismatched replacements fail cleanly without disrupting active gameplay. After updating `ModTrustPolicy` at runtime (e.g., loading a newer signed KRL), hosts can call `evict_revoked_mods()` (`ModWorldExt` / `ModAppExt`) to surgically unload compromised or newly revoked live mods while leaving unaffected mods running. On successful load, a `VerifiedModSignature` component (recording signer fingerprint, CA fingerprint, key ID, principals, serial, namespace, and binary SHA-256) is attached to the spawned `LoadedModInfo` entity.
 - **Exclusive `World` Mutation Boundary:** `unload_mod` and `reload_mod` require `&mut World` (`ModWorldExt` / `ModAppExt`) or deferred execution (`ModCommandsExt`), making concurrent `dlclose` during parallel schedule execution impossible at compile time.
 - **Fault Containment & Quarantine Recovery (`ModErrorPolicy`):**
   - Default `panic = "unwind"` Rust guests wrap every `extern "C"` callback in `catch_guest_result` / `catch_guest_bool` / `catch_guest_unit` backed by a lock-free `ReentrantCell` (`UnsafeCell` + `AtomicBool`), dropping panic payloads strictly on the guest heap and returning `FfiResult::PANIC_CAUGHT`.
@@ -246,12 +260,13 @@ sequenceDiagram
     - `ModErrorPolicy::Quarantine` *(default)*: Disables the faulting system (`AtomicBool = false`), leaving all other systems running; hosts can later restore it via `ModQuarantine::reenable(mod_id, "system_name")`.
     - `ModErrorPolicy::Log`: Quarantines and logs at `tracing::error!`.
     - `ModErrorPolicy::ReportToBevy`: Quarantines, logs at `tracing::error!`, and forwards `ModSystemError` into Bevy's native error handler pipeline.
+    - `ModErrorPolicy::DelegateToBevyFallback`: Discards uncommitted commands, emits `Messages<ModSystemFaulted>`, and delegates a contextualized `BevyError` directly to Bevy's world `FallbackErrorHandler` without auto-quarantining the system.
 
 ---
 
 ## 9. Bevy `0.20` Production Capabilities, Subsystem Bridges & Tooling
 
-Across Waves 0–3, `bevy_abi_mod` provides full Bevy `0.20.1` production parity while preserving `#![forbid(unsafe_code)]` in all safe host, guest, macro, and CLI crates:
+**Built-In Bevy `0.20` Capabilities:** `bevy_abi_mod` provides full Bevy `0.20+` ECS integration while preserving `#![forbid(unsafe_code)]` in all safe host, guest, macro, trust, manifest, SDK-gen, and CLI crates:
 
 1. **Extended ECS Queries, Commands & Hierarchy:**
    - `AccessMode::ALLOW` (`Allow<T>`), `AccessMode::HAS` (`Has<T>` `[FfiBool]` presence columns), `AccessMode::REMOVED_READ` (`RemovedComponents<T>` via `iter_read_removed`), disjunctive `BamTermDesc::or_group` (`Or<(...)>`), and `BAM_COMPONENT_FLAG_SUMMARY_TICK` archetype table-skip acceleration.
@@ -259,9 +274,9 @@ Across Waves 0–3, `bevy_abi_mod` provides full Bevy `0.20.1` production parity
 2. **Lifecycle/Mutable/Propagating Observers, Non-POD Messages & Reload Persistence:**
    - `BamObserverDesc` & `BamTriggerDesc` (`cmd_observe`, `cmd_trigger_ex`) supporting `ADD`, `INSERT`, `DISCARD`, `REMOVE`, `DESPAWN`, and `READY`, mutable `BamObserverMutFn` payloads, and stoppable upward `ChildOf` / custom relationship propagation.
    - VTable-backed non-POD `Messages<M>` (`register_mod_non_pod_message`) and persistent `PersistentMessageCursors` / `RemovedComponents` cursors across hot reloads.
-3. **Unbounded `DROP_SLAB`, 5-Hook Lifecycle, `clone_fn`, `mod.toml` DAG & Witness Migration:**
-   - Dynamically paged `DROP_SLAB` with generation-tracked slot recycling beyond 1,024 distinct dynamic component UUIDs, full `on_add`/`on_insert`/`on_discard`/`on_remove`/`on_despawn` + `EntityCloner` `clone_fn` + transitive `required_components`.
-   - `#[derive(ModComponent)]` support for C-ABI `#[repr(i8..u64)]` enums, tuple structs, `Option<T>` (`FfiOption<T>`), and witness schema export/import slots powering hot-reload field migration (`reload_mod`), debounced `ModHotReloadPlugin` (`hot-reload-watcher`), `mod.toml` SemVer DAG resolution (`load_mod_dir`), Windows `.pdb` RSDS sidecar staging, and ELF/Mach-O TLS/`DF_1_NODELETE` residency preflight.
+3. **Paged `DROP_PAGES` (4,096 slots), 5-Hook Lifecycle, `clone_fn`, `mod.toml` DAG & Witness Migration:**
+   - Lazily allocated `DROP_PAGES` (`64` pages × `64` slots = `4,096` max slots) with generation-tracked slot recycling, `DynamicComponentHookMap` dispatch for `on_add`/`on_insert`/`on_discard`/`on_remove`/`on_despawn`, `EntityCloner` `clone_fn`, and transitive `required_components`.
+   - `#[derive(ModComponent)]` support for C-ABI `#[repr(i8..u64)]` enums, tuple structs, `Option<T>` (`FfiOption<T>`), and witness schema export/import slots powering hot-reload field migration (`reload_mod`), debounced `ModHotReloadPlugin` (`hot-reload-watcher`), `mod.toml` SemVer DAG resolution (`load_mods_dir`), Windows `.pdb` RSDS sidecar staging, and ELF/Mach-O TLS/`DF_1_NODELETE` residency preflight.
 4. **Optional Bevy `0.20` Subsystem Bridges & Multi-World `SubApp` Extraction:**
    - `bridge-std-types`: `StdTypesBridgePlugin` (`Transform`, `GlobalTransform`, `Visibility`, `Name`, `Time<*>`, `ButtonInput<*>`).
    - `bridge-asset`: `ModAssetPlugin` sandboxed `mod://<namespace>/...` `AssetSource` and refcounted `FfiAssetHandle` (`Option<AssetId>`).
@@ -271,3 +286,29 @@ Across Waves 0–3, `bevy_abi_mod` provides full Bevy `0.20.1` production parity
    - `sub-app-extract`: `ModSubAppPlugin<L>` cross-world `bevy_extract` component/resource extraction across `SubApp`s and `ModWeslMaterialPlugin` data-driven `.wesl` (`Source::Wesl`), `AlignedVec` `ShaderBuffer`, `SpriteMeshMaterial`, `ExtendedMaterial2d`, and `StandardMaterial` support.
 5. **Polyglot SDKs & `cargo-bam` CLI:**
    - Header-only C99 (`include/bevy_abi_mod.h`), C++17 (`examples/07_cpp17_guest/cpp_mod/bam_cpp17_sdk.hpp`), and Zig (`examples/08_zig_guest/zig_mod/src/bam_zig_sdk.zig`) wrappers, plus `cargo-bam` (`new`, `build --sign-key`, `export-sdk`/`header`, `check-mods`, `doctor`, `keygen`, `sign`, `verify`).
+
+---
+
+## 10. Contributor Verification & CI Workflow
+
+Run these repository gates locally before pushing changes to the ABI, crates, or documentation:
+
+```bash
+# 1. Verify zero Bevy dependencies in ABI, macro, trust, manifest, sdk_gen, guest, & CLI crates (must print NOTHING)
+cargo tree -p bevy_abi_mod_sys -p bevy_abi_mod_macros -p bevy_abi_mod_trust -p bevy_abi_mod_manifest -p bevy_abi_mod_sdk_gen -p bevy_abi_mod_guest_sys -p bevy_abi_mod_guest -p cargo-bam | sed 's/ (.*//' | grep -v bevy_abi_mod | grep -i bevy
+
+# 2. Fast formatting, clippy (default + --all-features), header parity, & C99 conformance checks
+cargo xtask lint
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo xtask header --check --test-c99
+cargo xtask gen-component-headers --check
+
+# 3. Full lint, header, fixture build, & workspace test suite
+cargo xtask ci
+
+# 4. Rebuild all fixtures (including examples & benchmarks) and run E2E, Miri, & Loom suites
+cargo xtask fixtures --all
+BAM_FIXTURE_DIR="$(pwd)/target/fixtures" cargo test -p bevy_abi_mod_host --test e2e --all-features -- --test-threads=1
+MIRIFLAGS="-Zmiri-tree-borrows" cargo xtask miri --all
+cargo test -p bevy_abi_mod_host_sys --test loom_drop_trampoline --release
+```

@@ -32,20 +32,20 @@ export_mod!(plugin: PhysicsMod);
 ## 2. `AbiPod` vs. VTable-Accessed Opaque Components
 
 - **`#[repr(C)]` `AbiPod` Types (`#[derive(ModComponent)]` or `#[derive(AbiPod)]`):**
-  Eligible for zero-copy `&[T]` / `&mut [T]` slice iteration (`Chunk::component`, `Chunk::component_mut`, `Chunk::read_write`) and raw byte commands (`GuestCommands::insert`, batched `GuestCommands::spawn`).
-  - Allowed primitives: `u8`/`i8`, `u16`/`i16`, `u32`/`i32`, `u64`/`i64`, `f32`, `f64`, `FfiBool`, `BamComponent`, `FfiEntity`, `ComponentUuid`, `[T; N]`.
-  - Disallowed in `AbiPod`: `bool`, `char`, `enum`s, references (invalid bit patterns = UB), and `usize`/`isize`/`u128`/`i128` (architecture/compiler layout divergence).
+  Eligible for zero-copy `&[T]` / `&mut [T]` slice iteration (`Chunk::component`, `Chunk::component_mut`, `Chunk::read_write`) and raw byte commands (`GuestCommands::insert`, batched `GuestCommands::spawn`). Both derives verify at compile time that structs have zero implicit compiler padding (`size_of::<Self>() == sum(size_of::<Fields>())`).
+  - Allowed primitives: `u8`/`i8`, `u16`/`i16`, `u32`/`i32`, `u64`/`i64`, `f32`, `f64`, `FfiBool`, `FfiOption<T>`, `BamComponent`, `BamSystem`, `BamSystemSet`, `BamSymbol`, `FfiEntity`, `FfiChildOf`, `BamChangeTicks`, `FfiAssetHandle`, `FfiAssetLoadState`, `BamEventKind`, `BamFieldKind`, `ComponentUuid`, `[T; N]`.
+  - Disallowed in `AbiPod`: `bool`, `char`, non-`#[repr(C)]`/untagged Rust `enum`s, references (invalid bit patterns = UB), padded structs without explicit padding fields, and `usize`/`isize`/`u128`/`i128` (architecture/compiler layout divergence).
 - **Opaque Host Components (`#[repr(Rust)]`, `String`, `Vec<T>`, `bool`):**
-  Inserted via `cmds.insert_default(entity, handle)` and mutated safely through the host's generated `#[repr(C)]` `<Struct>VTable` (`app.resolve_vtable::<MyVTable>(c"bam.v0.game::UnitTag.vtable", expected_uuid)`), where every setter returns `FfiResult` (`INVALID_UTF8`, `NULL_POINTER`, `OK`).
+  Inserted via `cmds.insert_default(entity, handle)` and mutated safely through the host's generated `#[repr(C)]` `<Struct>VTable` (`unsafe { app.host().resolve_vtable::<MyVTable>(c"bam.v0.game::UnitTag.vtable", expected_uuid) }`, where `Host::resolve_vtable` requires `unsafe` because it verifies an external `VTableHeader` against `T`), where every setter returns `FfiResult` (`INVALID_UTF8`, `NULL_POINTER`, `OK`).
 
 ---
 
 ## 3. Unified System Builder (`app.system(...)`)
 
-`GuestApp::system` configures single-query and multi-query (`0..=8`) systems, schedules, ordering, `run_if` predicates, and main-thread pinning through one builder:
+`GuestApp::system` configures single-query and multi-query (`0..=8`) systems, schedules, ordering, `run_if` predicates, and main-thread pinning through one builder (you can also use `.query_typed::<(&mut Position, &Velocity)>()` with `ctx.single_query(...)` instead of numeric column indices):
 
 ```rust
-app.system(c"integrate_velocity")
+let res = app.system(c"integrate_velocity")
     .query(|q| {
         q.write::<Position>()      // term 0: &mut Position
          .read::<Velocity>()       // term 1: &Velocity
@@ -76,7 +76,10 @@ app.system(c"integrate_velocity")
             }
         }
         FfiResult::OK
-    })?;
+    });
+if !res.is_ok() {
+    return res;
+}
 ```
 
 ### Parallel Chunks, Sparse-Set Columns & Change Tracking
@@ -88,16 +91,18 @@ app.system(c"integrate_velocity")
 
 ## 4. Handle Commands, Hierarchies, Messages & Observers
 
-- **Batched Spawns & `FfiChildOf` Hierarchies:** Resolve `BamComponent` handles once in `GuestPlugin::build` (`let pos_h = app.resolve_component::<Position>()?;`), or register private mod-owned components via `app.register_component::<MyState>()` / `app.register_component_with_layout(...)`. Use `GuestCommands::spawn(&entries)` (including `SpawnEntry::new(child_of_h, &FfiChildOf(parent))`) to reserve an `FfiEntity` atomically and place components in a single `EntityWorldMut::insert_by_ids` transition during `apply_deferred`.
+- **Batched Spawns & `FfiChildOf` Hierarchies:** Resolve `BamComponent` handles once in `GuestPlugin::build` (`let pos_h = app.resolve_component::<Position>()?;`), or register private mod-owned components via `app.register_component::<MyState>()` / `app.register_component_with_layout(...)`. Use `GuestCommands::spawn(&entries)` (including `SpawnEntry::new(child_of_h, &FfiChildOf::new(parent))`) to reserve an `FfiEntity` atomically and place components in a single `EntityWorldMut::insert_by_ids` transition during `apply_deferred`.
 - **Buffered `Messages<M>`:** Declare `.message_read::<M>()` / `.message_write::<M>()` on `SystemBuilder` and drain or emit contiguous batches via `ctx.read_messages::<M>(decl_idx)` and `ctx.send_messages::<M>(decl_idx, &batch)`.
 - **Immediate Triggers & `EntityEvent` Observers:** Emit events via `cmds.trigger(&ev)` / `cmds.trigger_entity(entity, &ev)` and subscribe during `GuestPlugin::build` via `app.observe::<MyEvent, _>("on_wave", |ev, cmds| { ... })` or `app.observe_entity::<HitEntity, _>("on_hit", FfiEntity::NULL, |target, ev, cmds| { ... })`.
 
 ```rust
-let mut cmds = ctx.commands()?;
-let entity = cmds.spawn(&[
+let cmds = ctx.commands();
+let Ok(entity) = cmds.spawn(&[
     SpawnEntry::new(pos_h, &Position { x: 0.0, y: 5.0, z: 0.0 }),
     SpawnEntry::new(vel_h, &Velocity { x: 1.0, y: 0.0, z: 0.0 }),
-])?;
+]) else {
+    return FfiResult::INTERNAL_ERROR;
+};
 ```
 
 ---

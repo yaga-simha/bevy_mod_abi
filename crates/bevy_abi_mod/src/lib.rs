@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-//! Zero-serialization, asymmetric C-ABI (`ABI 0.2.0`) native modding framework for Bevy ECS (`v0.20+`).
+//! Zero-serialization, asymmetric C-ABI (`ABI 0.3.0`) native modding framework for Bevy ECS (`v0.20+`).
 //!
 //! `bevy_abi_mod` is the top-level host facade crate. It re-exports [`bevy_abi_mod_host`],
 //! [`ModComponent`], [`AbiPod`], [`bevy_abi_mod_sys`], and [`prelude`], while enforcing
@@ -13,7 +13,7 @@
 //! at runtime requires navigating three systems constraints:
 //!
 //! 1. **Zero Shared Rust ABI Assumptions:** Rust provides no stable cross-compiler ABI.
-//!    `bevy_abi_mod` communicates strictly over an `extern "C"` boundary (`ABI 0.2.0`), allowing
+//!    `bevy_abi_mod` communicates strictly over an `extern "C"` boundary (`ABI 0.3.0`), allowing
 //!    guest mods to be compiled with different `rustc` versions or written in ISO C99, C++17/20,
 //!    or Zig.
 //! 2. **Zero Serialization Overhead:** Host ECS `Table` columns are exposed directly as
@@ -130,50 +130,13 @@
 //!
 //! ---
 //!
-//! # Architecture & Contributor Guide (Crate Developers)
+//! # Workspace Architecture & Feature Flags
 //!
-//! ## Eleven-Crate `-sys` vs. Safe Rust Split
-//!
-//! The workspace strictly isolates `unsafe` FFI machinery inside `*-sys` crates while keeping
-//! high-level host, guest, macro, trust, manifest, SDK-generator, and CLI crates under
-//! `#![forbid(unsafe_code)]`, and keeping `bevy*` out of all wire, macro, trust, manifest,
-//! SDK-generator, guest, and CLI crates:
-//!
-//! - `bevy_abi_mod_sys`: `#![no_std]`, zero external dependencies. Defines the `#[repr(C)]`
-//!   `ABI 0.3.0` wire contract (`BamHostApi`, `BamManifest`, `BamSystemDesc`, `ComponentDesc`,
-//!   `FfiResult`, `StrView`, `ModComponent`, `AbiPod`).
-//! - `bevy_abi_mod_macros`: `#![forbid(unsafe_code)]` proc-macro crate (`#[derive(ModComponent, AbiPod)]`). No `bevy`
-//!   dependency.
-//! - `bevy_abi_mod_trust`: `#![forbid(unsafe_code)]` OpenSSH `SSHSIG`, CA certificate, `SSHKRL`,
-//!   and `.bampack` verification engine. No `bevy` dependency.
-//! - `bevy_abi_mod_manifest`: `#![forbid(unsafe_code)]` `mod.toml` parser, SemVer DAG topological
-//!   sorter, and quarantine/mismatch types. No `bevy` dependency.
-//! - `bevy_abi_mod_sdk_gen`: `#![forbid(unsafe_code)]` deterministic C99, C++17, Zig, and modder
-//!   SDK generator. No `bevy` dependency.
-//! - `bevy_abi_mod_host_sys`: Isolates all host `unsafe` (`HOST_API`, `HostIter`, `HostCommands`,
-//!   `GuestSystem`, `ModRegistry`, `libloading` loader).
-//! - `bevy_abi_mod_host`: `#![forbid(unsafe_code)]` safe Bevy plugin, optional Bevy `0.20` bridges,
-//!   `SubApp` extraction, extension traits, and lifecycle messages.
-//! - `bevy_abi_mod`: `#![forbid(unsafe_code)]` top-level host facade (this crate).
-//! - `bevy_abi_mod_guest_sys`: Isolates all guest `unsafe` (`extern "C"` trampolines, panic
-//!   guards, host API cache). No `bevy` dependency.
-//! - `bevy_abi_mod_guest`: `#![forbid(unsafe_code)]` ergonomic Rust guest SDK. No `bevy`
-//!   dependency.
-//! - `cargo-bam`: `#![forbid(unsafe_code)]` standalone modder CLI (`new`, `build`, `export-sdk`,
-//!   `header`, `check-mods`, `doctor`, `keygen`, `sign`, `verify`). No `bevy` dependency.
-//!
-//! ## Core Invariants
-//!
-//! - **ABI Purity:** Every wire struct in `bevy_abi_mod_sys` is `#[repr(C)]` or
-//!   `#[repr(transparent)]`, every callback is `extern "C" fn`, and strings are passed as
-//!   [`bevy_abi_mod_sys::StrView`] (never Rust `&str`, `&[T]`, or `dyn Trait` fat pointers).
-//! - **Memory & Allocator Isolation:** Host-allocated memory is freed by the host;
-//!   guest-allocated memory is freed by the guest. Never pass `Box`, `Vec`, or `String` across
-//!   the ABI boundary.
-//! - **Dynamic System Concurrency Safety:** Registered guest systems declare all component
-//!   read/write accesses in Bevy's `FilteredAccessSet` using pre-resolved `ComponentId`s,
-//!   allowing Bevy's multi-threaded scheduler to enforce borrow rules and run non-conflicting
-//!   mod and host systems in parallel.
+//! The workspace separates `unsafe` FFI machinery inside `*-sys` crates while keeping all public
+//! host, guest, macro, trust, manifest, SDK-generator, and CLI crates `#![forbid(unsafe_code)]`
+//! (and keeping `bevy*` out of all non-host crates). See [`spec.md`](../../spec.md) and
+//! [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md) for the complete 11-crate boundary map,
+//! ABI `0.3.0` wire specification, and safety proofs.
 //!
 //! # Feature Flags
 //!

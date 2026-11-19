@@ -11,5 +11,6 @@
 
 # Hosting Mods in Bevy
 - [Host Integration & Schedules](./host-integration.md)
+- [Bridges, Trust & `cargo-bam` Tooling](./bridges-and-tooling.md)
 - [Lifecycle, Quarantine & Shadow-Copy Hot Reload](./lifecycle-hot-reload.md)
 - [Performance Tuning & Benchmarks](./performance-benchmarks.md)

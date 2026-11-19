@@ -6,7 +6,7 @@
 
 ## Overview
 
-Thirty-two 3D bunny-slime entities live on a floating meadow island simulated by Bevy ECS + `avian3d` capsule colliders and rendered via a custom `wgpu` instanced pipeline. Five `#[repr(C)]` `ModComponent` types (`cute3d::Position`, `cute3d::Velocity`, `cute3d::Scale3D`, `cute3d::ColorRgba`, `cute3d::CuteSpirit`) are exposed across the `ABI 0.2.0` wire contract:
+Thirty-two 3D bunny-slime entities live on a floating meadow island simulated by Bevy ECS + `avian3d` capsule colliders and rendered via a custom `wgpu` instanced pipeline. Five `#[repr(C)]` `ModComponent` types (`cute3d::Position`, `cute3d::Velocity`, `cute3d::Scale3D`, `cute3d::ColorRgba`, `cute3d::CuteSpirit`) are exposed across the `ABI 0.3.0` wire contract:
 
 - **Core Shadow-Copy Hot-Reloading:** Loading and reloading mods uses `app.load_mod_with(&path, LoadOptions::new().with_shadow_copy(true))`, allowing guest libraries to be recompiled on disk while the 3D window stays open.
 - **Rust + ISO C99 Guest Parity:** `mod_boing` and `mod_carousel` use `#![forbid(unsafe_code)]` `bevy_abi_mod_guest` (`GuestPlugin`, `app.system(...)`), while `mod_cuddle_c99` is compiled directly from ISO C99 against `include/bevy_abi_mod.h` with per-instance `ModState*` heap state.

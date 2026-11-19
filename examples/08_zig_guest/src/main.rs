@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 //! Example 08: Minimal Zig Guest Mod (Bevy Host Application).
 //!
-//! Loads `zig_mod/src/root.zig` (`ABI 0.2.0`), executes zero-copy chunk integration, verifies Zig
+//! Loads `zig_mod/src/root.zig` (`ABI 0.3.0`), executes zero-copy chunk integration, verifies Zig
 //! error-union mapping (`error.InvalidArgument -> FfiResult::INVALID_ARGUMENT`), and gracefully
 //! skips runtime execution when `zig` is not installed locally.
 
@@ -12,7 +12,7 @@ use bevy_ecs::message::Messages;
 use example_08_zig_guest::{Position, Velocity, ZigSimConfig, try_resolve_or_build_zig_mod};
 
 fn main() {
-    println!("=== Example 08: Minimal Zig Guest Mod (ABI 0.2.0) ===");
+    println!("=== Example 08: Minimal Zig Guest Mod (ABI 0.3.0) ===");
 
     let mut app = App::new();
     app.add_plugins(AbiModPlugin::with_error_policy(ModErrorPolicy::Quarantine));

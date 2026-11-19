@@ -1,6 +1,6 @@
-//! Canonical ABI `0.2.0` Benchmark Suite.
+//! Canonical ABI `0.3.0` Benchmark Suite.
 //!
-//! Unifies the five core `bevy_abi_mod` performance scenarios into a single zero-dependency,
+//! Unifies the nine core `bevy_abi_mod` performance scenarios into a single zero-dependency,
 //! Criterion-compatible benchmark harness (`--bench`, `--test`, `--quick`, and substring filter
 //! arguments supported):
 //!
@@ -1234,7 +1234,7 @@ fn bench_spawn_with_4(cfg: &BenchConfig) {
 }
 
 // ============================================================================
-// Scenario 6: Wave 1 Query Filter Throughput (`Allow`, `Has`, `Or` @ 10k)
+// Scenario 6: Query Filter Throughput (`Allow`, `Has`, `Or` @ 10k)
 // ============================================================================
 
 unsafe extern "C" fn c_abi_query_allow_cb(
@@ -1377,7 +1377,7 @@ fn bench_query_filters(cfg: &BenchConfig) {
     let count = cfg.scale_count(10_000);
     println!("\n================================================================================");
     println!(
-        " SCENARIO 6: Wave 1 Query Filters (Baseline vs Allow<Disabled>, Has<T>, Or<...>, {count} ents)"
+        " SCENARIO 6: Query Filters (Baseline vs Allow<Disabled>, Has<T>, Or<...>, {count} ents)"
     );
     println!("================================================================================");
 
@@ -1587,7 +1587,7 @@ fn bench_query_filters(cfg: &BenchConfig) {
 }
 
 // ============================================================================
-// Scenario 7: Wave 2 Batch Commands (`cmd_spawn_batch` & `cmd_despawn_all`)
+// Scenario 7: Batch Commands (`cmd_spawn_batch` & `cmd_despawn_all`)
 // ============================================================================
 
 struct SoaSpawnBenchCtx {
@@ -2304,7 +2304,7 @@ fn main() {
 
     println!("================================================================================");
     println!(
-        " bevy_abi_mod Canonical Benchmark Suite (ABI 0.2.0) [mode={}]",
+        " bevy_abi_mod Canonical Benchmark Suite (ABI 0.3.0) [mode={}]",
         if cfg.test_mode {
             "smoke-test"
         } else if cfg.quick_mode {

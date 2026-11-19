@@ -1,6 +1,6 @@
 # `bevy_abi_mod`
 
-Top-level Bevy ECS (`v0.20+`) host facade for the zero-serialization, asymmetric C-ABI (`ABI 0.2.0`) native modding framework.
+Top-level Bevy ECS (`v0.20+`) host facade for the zero-serialization, asymmetric C-ABI (`ABI 0.3.0`) native modding framework.
 
 This crate re-exports [`bevy_abi_mod_host`](../bevy_abi_mod_host), procedural derive macros (`#[derive(ModComponent, AbiPod)]`), [`bevy_abi_mod_sys`](../bevy_abi_mod_sys), and [`prelude`], while enforcing `#![forbid(unsafe_code)]` across all public host APIs.
 
@@ -34,10 +34,17 @@ fn main() {
 
 ## Features
 
-- **`strict-ffi-checks`**: Enables extra runtime FFI pointer, alignment, and handle-generation validation in `bevy_abi_mod_host`.
-- **`diagnostics`**: Publishes Bevy `Diagnostics` counters for loaded mod counts, active systems, and faulted invocations.
-- **`signature-verification`**: Enables optional pure-Rust OpenSSH `SSHSIG` (`.sig` sidecars), Ed25519 CA certificate verification (`ModTrustPolicy`, `VerifiedModSignature`), OpenSSH `SSHKRL` / signed KRL revocation lists (`KrlBuilder`, `with_min_krl_version`) with runtime `evict_revoked_mods()`, and strict Ed25519 curve validation prior to `dlopen` / `LoadLibraryW`. Manage keys, certs, KRLs, and signatures via standard `ssh-keygen -Y`/`-k`/`-Q` or `cargo xtask sign <keygen|cert|file|krl|verify>`.
+- **`strict-ffi-checks`**: Extra runtime FFI pointer, alignment, and handle-generation validation in `bevy_abi_mod_host`.
+- **`diagnostics`**: Publishes per-mod and aggregate `bevy_diagnostic` counters (`cpu_time_us`, `fault_count`, `commands_queued`).
+- **`signature-verification`**: Enables pure-Rust OpenSSH `SSHSIG` (`.sig` sidecars, embedded `.bam_sig`, and `.bampack` archives), Ed25519 CA certificate validation, and `PROTOCOL.krl` (`SSHKRL`) revocation lists via [`bevy_abi_mod_trust`](../bevy_abi_mod_trust) (`ModTrustPolicy`, `VerifiedModSignature`, `evict_revoked_mods`) prior to `dlopen` / `LoadLibraryW`.
+- **`hot-reload-watcher`**: Debounced filesystem hot-reload watcher (`ModHotReloadPlugin`) paired with witness-schema migration.
+- **`bridge-std-types`**: Bridges Bevy `Transform`, `GlobalTransform`, `Visibility`, `Name`, `Time<*>`, and `ButtonInput<KeyCode|MouseButton>`.
+- **`bridge-asset`**: Sandboxed `mod://<namespace>/...` Bevy `AssetSource` (`ModAssetPlugin`) and refcounted `FfiAssetHandle`.
+- **`bridge-state`**: Exposes Bevy `States` (`ModStateExt::expose_mod_state`), transition schedules, and `in_state` run conditions.
+- **`bridge-reflect`**: Dynamic `bevy_reflect` (`DynamicStruct`), `bevy_remote` BRP JSON-RPC methods (`bevy_abi_mod/*`), and `bevy_settings` TOML sync (`ModReflectPlugin`).
+- **`bridge-bsn`**: Bevy Scene Notation (`bevy_scene`) spawning (`cmd_spawn_scene`) and `Ready` observer integration (`ModBsnPlugin`).
+- **`sub-app-extract`**: Cross-world `SubApp` (`RenderApp`) extraction (`ModSubAppPlugin<L>`) and custom `.wesl` shader/material support (`ModWeslMaterialPlugin`).
 
 ## Documentation
 
-See the repository [`README.md`](../../README.md) and [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md) for the complete architecture, lifecycle invariants, and polyglot C99/C++17/Zig guest integration guides.
+See the repository [`README.md`](../../README.md), [`spec.md`](../../spec.md), and [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md) for quickstarts, the 11-crate boundary map, and polyglot C99/C++17/Zig guest integration guides.

@@ -1,10 +1,10 @@
 #![allow(unreachable_pub)]
 
-//! Example 05: Cute 3D Slime Meadow (`winit` + `wgpu` + `avian3d`, `ABI 0.2.0`).
+//! Example 05: Cute 3D Slime Meadow (`winit` + `wgpu` + `avian3d`, `ABI 0.3.0`).
 //!
 //! Demonstrates driving a custom `winit` + `wgpu` 3D rendering loop and `avian3d` physics world
 //! with live-swappable Rust (`.cdylib`) and ISO C99 (`.dylib`/`.so`/`.dll`) mods using the core
-//! loader's `LoadOptions { shadow_copy: true, .. }`.
+//! loader's `LoadOptions::new().with_shadow_copy(true)`.
 
 mod components;
 mod meadow;
@@ -517,7 +517,7 @@ impl ApplicationHandler for CuteMeadowWinitApp {
         }
 
         let attrs = Window::default_attributes()
-            .with_title("Cute 3D Slime Meadow — bevy_abi_mod v0.2 (winit + wgpu)")
+            .with_title("Cute 3D Slime Meadow — bevy_abi_mod (winit + wgpu, ABI 0.3.0)")
             .with_inner_size(LogicalSize::new(1180.0, 760.0));
 
         let window = match event_loop.create_window(attrs) {

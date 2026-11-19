@@ -1,5 +1,4 @@
-//! Per-system bump-allocated deferred command queue (`HostCommands`, `CommandArena`)
-//!.
+//! Per-system bump-allocated deferred command queue (`HostCommands`, `CommandArena`).
 //!
 //! # Intent
 //! During system execution, [`UnsafeWorldCell`](bevy_ecs::world::unsafe_world_cell::UnsafeWorldCell)

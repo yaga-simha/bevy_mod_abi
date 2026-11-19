@@ -1,4 +1,4 @@
-//! Host FFI integration tests for Task #10 Query Filters:
+//! Host FFI integration tests for query filters:
 //! - `DefaultQueryFilters` (`Disabled` and custom dense/sparse disabling components) & `AccessMode::ALLOW`
 //! - `AccessMode::HAS` (`Has<T>`) dense + sparse archetypal boolean synthesis & `&mut T` parallelism
 //! - `Or<(...)>` filter groups (`BamTermDesc::or_group`) including `Changed<T>` / `Added<T>` / sparse

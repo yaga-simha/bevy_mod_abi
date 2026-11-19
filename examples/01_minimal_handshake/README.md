@@ -1,6 +1,6 @@
 # Example 01: Minimal Handshake
 
-**Concept taught:** Minimal ABI `0.2.0` handshake (`BamManifest` + per-`World` `BamInstance`), shadow-copy loading, lifecycle `Messages`, and typed column mutation.
+**Concept taught:** Minimal ABI `0.3.0` handshake (`BamManifest` + per-`World` `BamInstance`), shadow-copy loading, lifecycle `Messages`, and typed column mutation.
 
 ---
 

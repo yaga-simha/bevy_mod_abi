@@ -1,5 +1,5 @@
 //! Safe (`#![forbid(unsafe_code)]`) host bridges for Bevy standard components, resources,
-//! isolated mod assets, and Bevy states.
+//! isolated mod assets, state machines, dynamic reflection/BRP/settings, and BSN scenes.
 
 #[cfg(feature = "bridge-asset")]
 pub mod asset;

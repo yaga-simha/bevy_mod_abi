@@ -1,5 +1,4 @@
-//! Dense chunk and indirect sparse-row query iterator (`HostIter`)
-//!.
+//! Dense chunk and indirect sparse-row query iterator (`HostIter`).
 //!
 //! # Intent
 //! Serializing ECS archetype tables across an FFI boundary on every frame destroys cache

@@ -269,8 +269,7 @@ impl<'iter, 'ctx> Chunk<'iter, 'ctx> {
         )
     }
 
-    /// Materializes indirect read-only sparse-set row pointers `[ *const u8; len ]` for column `col`
-    ///.
+    /// Materializes indirect read-only sparse-set row pointers `[ *const u8; len ]` for column `col`.
     #[inline]
     pub fn rows<T: AbiPod>(&mut self, col: usize) -> Option<SparseRows<'_, T>> {
         self.iter.rows_checked::<T>(col, None)

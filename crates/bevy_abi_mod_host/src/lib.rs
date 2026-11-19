@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-//! Safe idiomatic Bevy host crate for `bevy_abi_mod` (`ABI 0.2.0`).
+//! Safe idiomatic Bevy host crate for `bevy_abi_mod` (`ABI 0.3.0`).
 //!
 //! `bevy_abi_mod_host` provides Bevy ECS (`v0.20+`) integration (`ModWorldExt`, `ModAppExt`,
 //! `ModCommandsExt`, `AbiModPlugin`) for loading, executing, quarantining, and hot-unloading
@@ -103,9 +103,7 @@ pub use bevy_abi_mod_host_sys::{
     read_entity_pod_bytes, write_entity_pod_bytes,
 };
 #[cfg(feature = "bridge-reflect")]
-pub use bevy_abi_mod_host_sys::{
-    empty_reflect_unchecked_mut, reflect_entity_component, reflect_entity_component_mut,
-};
+pub use bevy_abi_mod_host_sys::{reflect_entity_component, reflect_entity_component_mut};
 #[cfg(all(
     feature = "bridge-std-types",
     feature = "bridge-asset",
@@ -170,7 +168,7 @@ pub use watcher::{
 };
 pub use world_ext::ModWorldExt;
 
-/// Convenient prelude module for Bevy games hosting native C-ABI mods (`ABI 0.2.0`).
+/// Convenient prelude module for Bevy games hosting native C-ABI mods (`ABI 0.3.0`).
 pub mod prelude {
     pub use crate::app_ext::ModAppExt;
     #[cfg(all(

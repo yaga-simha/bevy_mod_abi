@@ -31,7 +31,9 @@ pub unsafe trait RawInsertable: Sized + Send + Sync + 'static {}
 /// `#[repr(C)]` or `#[repr(transparent)]` layout, `Copy` semantics, no drop glue, and universal
 /// bit validity across all fields.
 ///
-/// Natural C inter-field or trailing alignment padding is permitted when every field is `AbiPod`.
+/// `#[derive(AbiPod)]` enforces zero implicit compiler padding at compile time
+/// (`size_of::<Self>() == sum(size_of::<FieldTy>())`, matching `bytemuck::NoUninit`); insert explicit
+/// `_pad` byte-array fields wherever alignment gaps would otherwise occur.
 ///
 /// # Excluded Primitives
 /// - `u128` and `i128` do not implement `AbiPod` (no ISO C99 equivalent; 8-byte vs 16-byte

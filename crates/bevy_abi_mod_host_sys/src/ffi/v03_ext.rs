@@ -1,6 +1,6 @@
 //! ABI `0.3.0` (`0x0003_0000`) host FFI extension entrypoints: structured diagnostics, schema and
 //! layout introspection, iterator counting, system-handle registration, command-buffer checkpoints
-//! and rollback, plus validated Phase-2 BQL/relation/scheduling stubs.
+//! and rollback, plus reserved ABI `0.3.0` relation and scheduling slots.
 
 use crate::ffi::commands::HostCommands;
 use crate::ffi::iter::HostIter;
@@ -334,7 +334,8 @@ pub unsafe extern "C" fn host_cmd_rollback(
     cmds.rollback_to_checkpoint(checkpoint)
 }
 
-/// Validated Phase-2 stub for typed entity relationship edge registration.
+/// Reserved ABI `0.3.0` slot for typed entity relationship edge registration
+/// (validates inputs and currently returns [`FfiResult::UNSUPPORTED`]).
 ///
 /// # Safety
 /// - `load_ctx` must point to an active `LoadContext` cast to [`BamLoadCtx`], or null.
@@ -375,11 +376,12 @@ pub unsafe extern "C" fn host_register_relation(
         return err;
     }
     ctx.host_ctx
-        .set_last_error("register_relation is reserved for ABI 0.3 Phase 2");
+        .set_last_error("register_relation is reserved in ABI 0.3.0 and not yet implemented");
     FfiResult::UNSUPPORTED
 }
 
-/// Validated Phase-2 stub for symbol table string interning (`BamSymbol`).
+/// Reserved ABI `0.3.0` slot for symbol table string interning (`BamSymbol`)
+/// (validates inputs and currently returns [`FfiResult::UNSUPPORTED`]).
 ///
 /// # Safety
 /// - `ctx` must point to an active [`HostContext`] cast to [`BamHostCtx`], or null.
@@ -405,11 +407,12 @@ pub unsafe extern "C" fn host_intern_symbol(
         host_ctx.set_last_error(format!("intern_symbol `symbol` validation failed ({err})"));
         return err;
     }
-    host_ctx.set_last_error("intern_symbol is reserved for ABI 0.3 Phase 2");
+    host_ctx.set_last_error("intern_symbol is reserved in ABI 0.3.0 and not yet implemented");
     FfiResult::UNSUPPORTED
 }
 
-/// Validated Phase-2 stub for canonical entity name binding.
+/// Reserved ABI `0.3.0` slot for canonical entity name binding
+/// (validates inputs and currently returns [`FfiResult::UNSUPPORTED`]).
 ///
 /// # Safety
 /// - `ctx` must point to an active [`HostContext`] cast to [`BamHostCtx`], or null.
@@ -437,11 +440,12 @@ pub unsafe extern "C" fn host_bind_named_object(
         host_ctx.set_last_error("bind_named_object requires a valid non-null entity");
         return err;
     }
-    host_ctx.set_last_error("bind_named_object is reserved for ABI 0.3 Phase 2");
+    host_ctx.set_last_error("bind_named_object is reserved in ABI 0.3.0 and not yet implemented");
     FfiResult::UNSUPPORTED
 }
 
-/// Validated Phase-2 stub for ancestor relationship cascade lookup (`iter_up_cascade`).
+/// Reserved ABI `0.3.0` slot for ancestor relationship cascade lookup (`iter_up_cascade`)
+/// (validates inputs and currently returns [`FfiResult::UNSUPPORTED`]).
 ///
 /// # Safety
 /// - `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
@@ -482,7 +486,8 @@ pub unsafe extern "C" fn host_iter_up_cascade(
     FfiResult::UNSUPPORTED
 }
 
-/// Validated Phase-2 stub for host-driven read-only parallel chunk iteration.
+/// Reserved ABI `0.3.0` slot for host-driven read-only parallel chunk iteration
+/// (validates inputs and currently returns [`FfiResult::UNSUPPORTED`]).
 ///
 /// # Safety
 /// - `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
@@ -508,7 +513,8 @@ pub unsafe extern "C" fn host_par_for_each_chunk_readonly(
     FfiResult::UNSUPPORTED
 }
 
-/// Validated Phase-2 stub for schedule system-set configuration (`BamSystemSet`).
+/// Reserved ABI `0.3.0` slot for schedule system-set configuration (`BamSystemSet`)
+/// (validates inputs and currently returns [`FfiResult::UNSUPPORTED`]).
 ///
 /// # Safety
 /// - `load_ctx` must point to an active `LoadContext` cast to [`BamLoadCtx`], or null.
@@ -550,11 +556,12 @@ pub unsafe extern "C" fn host_configure_schedule_set(
         return err;
     }
     ctx.host_ctx
-        .set_last_error("configure_schedule_set is reserved for ABI 0.3 Phase 2");
+        .set_last_error("configure_schedule_set is reserved in ABI 0.3.0 and not yet implemented");
     FfiResult::UNSUPPORTED
 }
 
-/// Validated Phase-2 stub for mounting a [`BamSystem`] into a schedule and [`BamSystemSet`].
+/// Reserved ABI `0.3.0` slot for mounting a [`BamSystem`] into a schedule and [`BamSystemSet`]
+/// (validates inputs and currently returns [`FfiResult::UNSUPPORTED`]).
 ///
 /// # Safety
 /// `load_ctx` must point to an active `LoadContext` cast to [`BamLoadCtx`], or null.
@@ -579,12 +586,14 @@ pub unsafe extern "C" fn host_mount_system_in_schedule(
             .set_last_error("mount_system_in_schedule received an invalid ScheduleId");
         return FfiResult::INVALID_ARGUMENT;
     }
-    ctx.host_ctx
-        .set_last_error("mount_system_in_schedule is reserved for ABI 0.3 Phase 2");
+    ctx.host_ctx.set_last_error(
+        "mount_system_in_schedule is reserved in ABI 0.3.0 and not yet implemented",
+    );
     FfiResult::UNSUPPORTED
 }
 
-/// Validated Phase-2 stub for deferred typed relationship edge insertion.
+/// Reserved ABI `0.3.0` slot for deferred typed relationship edge insertion
+/// (validates inputs and currently returns [`FfiResult::UNSUPPORTED`]).
 ///
 /// # Safety
 /// - `commands` must point to an active [`HostCommands`] cast to [`BamCommands`], or null.
@@ -616,7 +625,8 @@ pub unsafe extern "C" fn host_cmd_insert_relation(
     FfiResult::UNSUPPORTED
 }
 
-/// Validated Phase-2 stub for deferred typed relationship edge removal.
+/// Reserved ABI `0.3.0` slot for deferred typed relationship edge removal
+/// (validates inputs and currently returns [`FfiResult::UNSUPPORTED`]).
 ///
 /// # Safety
 /// `commands` must point to an active [`HostCommands`] cast to [`BamCommands`], or null.
@@ -642,7 +652,8 @@ pub unsafe extern "C" fn host_cmd_remove_relation(
     FfiResult::UNSUPPORTED
 }
 
-/// Validated Phase-2 stub for live schema-fingerprint component column migration.
+/// Reserved ABI `0.3.0` slot for live schema-fingerprint component column migration
+/// (validates inputs and currently returns [`FfiResult::UNSUPPORTED`]).
 ///
 /// # Safety
 /// - `load_ctx` must point to an active `LoadContext` cast to [`BamLoadCtx`], or null.
@@ -688,8 +699,9 @@ pub unsafe extern "C" fn host_migrate_component_column(
             .set_last_error("migrate_component_column requires a non-null `migrate_fn`");
         return FfiResult::NULL_POINTER;
     }
-    ctx.host_ctx
-        .set_last_error("migrate_component_column is reserved for ABI 0.3 Phase 2");
+    ctx.host_ctx.set_last_error(
+        "migrate_component_column is reserved in ABI 0.3.0 and not yet implemented",
+    );
     FfiResult::UNSUPPORTED
 }
 
@@ -1060,7 +1072,7 @@ mod tests {
     }
 
     #[test]
-    fn phase2_stubs_validate_arguments_before_returning_unsupported() {
+    fn reserved_v03_slots_validate_arguments_before_returning_unsupported() {
         let mut world = World::new();
         let comp_id = world.register_component::<TestStats>();
         let mut registry = ModRegistry::new();

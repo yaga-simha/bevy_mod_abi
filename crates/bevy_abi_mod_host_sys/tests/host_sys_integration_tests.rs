@@ -1110,7 +1110,7 @@ fn failed_load_rollback_reclaims_fresh_slots_and_restores_hot_updated_snapshots(
 }
 
 #[test]
-fn wave0_extended_host_api_slots_asset_scene_backends_and_wire_bridges() {
+fn extended_host_api_slots_asset_scene_backends_and_wire_bridges() {
     use bevy_abi_mod_host_sys::{
         HostAssetBackend, HostSceneBackend, HostStringBridge, HostWireBridge,
         host_asset_get_load_state, host_asset_load, host_asset_release,
@@ -1120,7 +1120,7 @@ fn wave0_extended_host_api_slots_asset_scene_backends_and_wire_bridges() {
         StrView,
     };
 
-    // 1. All 50 slots of `HOST_API` are populated (`Some`) and pass `validate_for_guest`.
+    // 1. All 68 slots of `HOST_API` pass `validate_for_guest`.
     assert_eq!(HOST_API.validate_for_guest(ABI_VERSION), FfiResult::OK);
     assert!(HOST_API.cmd_spawn_persistent.is_some());
     assert!(HOST_API.cmd_spawn_batch.is_some());

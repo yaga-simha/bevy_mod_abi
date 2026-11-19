@@ -144,8 +144,8 @@ unsafe extern "C" fn pod_on_add_trampoline<T: AbiPod>(
     }
     catch_guest_unit(|| {
         // SAFETY: `user_data` was allocated via `GuestInstance::track_allocation` for
-        // `HookTrampolineState<T>`, and the host disarms `HOOK_SLOTS` via `ArcSwapOption` prior
-        // to `bevy_abi_mod_shutdown`.
+        // `HookTrampolineState<T>`, and the host clears `DynamicComponentHookMap` and disarms
+        // `is_active` prior to `bevy_abi_mod_shutdown`.
         let state = unsafe { &*user_data.cast::<HookTrampolineState<T>>() };
         dispatch_pod_hook::<T>(entity, component_ptr, &state.on_add);
     });
@@ -191,8 +191,8 @@ unsafe extern "C" fn pod_on_remove_trampoline<T: AbiPod>(
     }
     catch_guest_unit(|| {
         // SAFETY: `user_data` was allocated via `GuestInstance::track_allocation` for
-        // `HookTrampolineState<T>`, and the host disarms `HOOK_SLOTS` via `ArcSwapOption` prior
-        // to `bevy_abi_mod_shutdown`.
+        // `HookTrampolineState<T>`, and the host clears `DynamicComponentHookMap` and disarms
+        // `is_active` prior to `bevy_abi_mod_shutdown`.
         let state = unsafe { &*user_data.cast::<HookTrampolineState<T>>() };
         dispatch_pod_hook::<T>(entity, component_ptr, &state.on_remove);
     });

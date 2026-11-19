@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 
-//! Workspace build, fixture, header, benchmark, Miri, and CI automation runner (`cargo xtask`).
+//! Workspace automation runner (`cargo xtask`: `lint`, `ci`, `header`, `gen-component-headers`,
+//! `fixtures`, `bench`, `miri`, `hook`, `sign`).
 
 mod component_header_gen;
-mod header_gen;
 mod signing_cli;
 
 use std::env;
@@ -1083,7 +1083,7 @@ fn cmd_header(args: &[String]) -> Result<(), String> {
     }
 
     let root = repo_root()?;
-    header_gen::write_or_check_header(&root, check_only)?;
+    bevy_abi_mod_sdk_gen::write_or_check_header(&root, check_only)?;
     verify_c99_header_and_tests(&root, run_standalone)
 }
 
@@ -1178,7 +1178,7 @@ fn cmd_lint(args: &[String]) -> Result<(), String> {
 
     verify_zero_bevy_deps(&root)?;
     verify_forbid_unsafe(&root)?;
-    header_gen::write_or_check_header(&root, true)?;
+    bevy_abi_mod_sdk_gen::write_or_check_header(&root, true)?;
     component_header_gen::write_or_check_component_headers(&root, true)?;
     verify_c99_header_and_tests(&root, !quick)?;
     check_or_run_bevy_lint(&root)?;
@@ -1221,7 +1221,7 @@ fn cmd_ci(args: &[String]) -> Result<(), String> {
     verify_zero_bevy_deps(&root)?;
 
     let fixtures_dir = build_fixtures_internal(&root, false, false)?;
-    header_gen::write_or_check_header(&root, true)?;
+    bevy_abi_mod_sdk_gen::write_or_check_header(&root, true)?;
     component_header_gen::write_or_check_component_headers(&root, true)?;
     verify_c99_header_and_tests(&root, true)?;
 

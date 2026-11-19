@@ -4,12 +4,12 @@
     clippy::undocumented_unsafe_blocks,
     clippy::missing_safety_doc
 )]
-//! Low-level `unsafe` FFI and Bevy ECS storage internals for `bevy_abi_mod_host` (`ABI 0.2.0`).
+//! Low-level `unsafe` FFI and Bevy ECS storage internals for `bevy_abi_mod_host` (`ABI 0.3.0`).
 //!
 //! Isolates all host-side `unsafe` code (`HostIter` chunk/sparse iteration over `UnsafeWorldCell`,
 //! arena-backed `HostCommands`, `GuestSystem`, CoW `ModRegistry` handle/VTable/symbol lookup,
 //! `ArcSwapOption` drop trampolines with two-condition `WorldDropGuard` reclamation, and
-//! `libloading` shadow-copy shared-library lifecycle) behind audited invariants so
+//! `libloading` shadow-copy shared-library lifecycle) behind documented safety invariants so
 //! `bevy_abi_mod_host` and `bevy_abi_mod` enforce `#![forbid(unsafe_code)]`.
 
 pub mod drop_trampoline;
@@ -26,6 +26,16 @@ pub use ffi::assets_scene::{
     HostAssetBackend, HostSceneBackend, host_asset_get_load_state, host_asset_load,
     host_asset_release, host_cmd_spawn_scene,
 };
+pub use ffi::bridge_helpers::{
+    WitnessFieldDescriptor, apply_entity_component_fields, apply_resource_fields,
+    ensure_component_in_target_world, export_entity_component_fields, export_resource_fields,
+    extract_component_between_worlds, extract_resource_between_worlds,
+    insert_entity_component_from_fields, insert_or_apply_entity_component_fields,
+    inspect_component_witness_fields, inspect_component_witness_fields_in_registry,
+    read_entity_pod_bytes, write_entity_pod_bytes,
+};
+#[cfg(feature = "bridge-reflect")]
+pub use ffi::bridge_helpers::{reflect_entity_component, reflect_entity_component_mut};
 pub use ffi::commands::{
     CommandArena, HostCommands, HostCommandsStorage, host_cmd_despawn, host_cmd_insert,
     host_cmd_insert_default, host_cmd_remove, host_cmd_spawn, host_cmd_spawn_empty,
@@ -58,18 +68,6 @@ pub use ffi::v03_ext::{
     host_log_diagnostic, host_migrate_component_column, host_mount_system_in_schedule,
     host_par_for_each_chunk_readonly, host_register_relation, host_register_system_handle,
     host_report_guest_fault, host_resolve_component_by_uuid,
-};
-pub use ffi::wave3_helpers::{
-    WitnessFieldDescriptor, apply_entity_component_fields, apply_resource_fields,
-    ensure_component_in_target_world, export_entity_component_fields, export_resource_fields,
-    extract_component_between_worlds, extract_resource_between_worlds,
-    insert_entity_component_from_fields, insert_or_apply_entity_component_fields,
-    inspect_component_witness_fields, inspect_component_witness_fields_in_registry,
-    read_entity_pod_bytes, write_entity_pod_bytes,
-};
-#[cfg(feature = "bridge-reflect")]
-pub use ffi::wave3_helpers::{
-    empty_reflect_unchecked_mut, reflect_entity_component, reflect_entity_component_mut,
 };
 pub use handle_header::{
     COMMANDS_MAGIC, HOST_CTX_MAGIC, HandleHeader, HostContext, ITER_MAGIC, LOAD_CTX_MAGIC,

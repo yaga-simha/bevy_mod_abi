@@ -1,4 +1,4 @@
-//! Example 1: Minimal ABI `0.2.0` Guest Mod (`minimal_guest_mod`).
+//! Example 1: Minimal ABI `0.3.0` Guest Mod (`minimal_guest_mod`).
 //!
 //! Exports `bevy_abi_mod_manifest`, `bevy_abi_mod_init`, and `bevy_abi_mod_shutdown` via
 //! [`export_mod!`] with per-`World` instance state, and registers a single `Update` system that

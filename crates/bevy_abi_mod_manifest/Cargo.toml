@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "Zero-Bevy (`#![forbid(unsafe_code)]`) `mod.toml` manifest parser, SemVer validator, and Kahn topological DAG resolver for `bevy_abi_mod`"
+readme = "README.md"
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true

@@ -25,8 +25,8 @@ pub use crate::bridges::{
 };
 pub use crate::{
     app::{
-        GuestApp, GuestComponentOptions, GuestRes, GuestResMut, MultiQueryContext, ObserverBuilder,
-        QueryBuilder, RunConditionContext, SystemBuilder, SystemContext,
+        GuestApp, GuestComponentOptions, GuestRes, GuestResMut, ObserverBuilder, QueryBuilder,
+        RunConditionContext, SystemBuilder, SystemContext,
     },
     bridges::{
         BRP_METHOD_GET_COMPONENTS, BRP_METHOD_GET_RESOURCES, BRP_METHOD_INSERT_COMPONENTS,

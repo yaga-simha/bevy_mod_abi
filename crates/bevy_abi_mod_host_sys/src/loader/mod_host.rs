@@ -1,9 +1,7 @@
 //! `ModHost`, `LoadedMod`, `LoadedModInfo`, lifecycle `Message`s, and `&mut World`-scoped
 //! load/rollback/unload operations.
 
-use crate::drop_trampoline::{
-    StagedDropBinding, StagedHookBinding, WorldDropGuard, prune_drop_trampolines_for_guard,
-};
+use crate::drop_trampoline::{StagedDropBinding, WorldDropGuard, prune_drop_trampolines_for_guard};
 use crate::ffi::host_api::HOST_API;
 use crate::ffi::observers_ext::spawn_registered_observers_in_world;
 use crate::ffi::register::LoadContext;
@@ -135,7 +133,6 @@ pub struct LoadedMod {
     generation: u64,
     pre_snapshot: Arc<RegistrySnapshot>,
     staged_drop_bindings: Vec<StagedDropBinding>,
-    staged_hook_bindings: Vec<StagedHookBinding>,
     library: LoadedLibrary,
     shutdown_fn: BamShutdownFn,
     save_state_fn: Option<BamSaveStateFn>,
@@ -276,7 +273,6 @@ impl LoadedMod {
             generation: 0,
             pre_snapshot,
             staged_drop_bindings: Vec::new(),
-            staged_hook_bindings: Vec::new(),
             library: loaded_lib,
             shutdown_fn,
             save_state_fn: None,
@@ -416,7 +412,6 @@ impl ModHost {
             // Once scheduled in `World`, fresh slots are live and must only be pruned (never
             // prematurely freed before `WorldDropGuard::drop` + `live_values == 0`) on unload.
             loaded.staged_drop_bindings.clear();
-            loaded.staged_hook_bindings.clear();
         }
     }
 
@@ -596,8 +591,7 @@ impl ModHost {
             Some(mod_id),
             Some(Arc::clone(&manifest_name)),
         )
-        .with_staged_drop_bindings(tx.staged_drop_bindings())
-        .with_staged_hook_bindings(tx.staged_hook_bindings());
+        .with_staged_drop_bindings(tx.staged_drop_bindings());
 
         let mut instance_ptr: *mut BamInstance = core::ptr::null_mut();
         // SAFETY: Invoking guest `bevy_abi_mod_init` with static `HOST_API`, stack-scoped `LoadContext`
@@ -647,7 +641,7 @@ impl ModHost {
             }
         }
 
-        let (staged_drop_bindings, staged_hook_bindings) = tx.commit();
+        let staged_drop_bindings = tx.commit();
         state_guard.active_count += 1;
         drop(state_guard);
 
@@ -669,7 +663,6 @@ impl ModHost {
             generation,
             pre_snapshot,
             staged_drop_bindings,
-            staged_hook_bindings,
             library: loaded_lib,
             shutdown_fn,
             save_state_fn: manifest.save_state,
@@ -807,11 +800,9 @@ pub fn rollback_unscheduled_mod_in_world(world: &mut World, id: ModId) {
     let rollback_data = world.get_resource_mut::<ModHost>().and_then(|mut h| {
         h.get_mod_mut(id).map(|m| {
             let staged = core::mem::take(&mut m.staged_drop_bindings);
-            let staged_hooks = core::mem::take(&mut m.staged_hook_bindings);
             let observers = core::mem::take(&mut m.observer_entities);
             (
                 staged,
-                staged_hooks,
                 observers,
                 Arc::clone(&m.is_active),
                 Arc::clone(&m.pre_snapshot),
@@ -819,7 +810,7 @@ pub fn rollback_unscheduled_mod_in_world(world: &mut World, id: ModId) {
         })
     });
 
-    if let Some((staged, staged_hooks, observers, is_active, snap)) = rollback_data {
+    if let Some((staged, observers, is_active, snap)) = rollback_data {
         for obs_entity in observers {
             if let Ok(e) = world.get_entity_mut(obs_entity) {
                 e.despawn();
@@ -827,7 +818,6 @@ pub fn rollback_unscheduled_mod_in_world(world: &mut World, id: ModId) {
         }
         if let Some(mut drop_guard) = world.get_resource_mut::<WorldDropGuard>() {
             drop_guard.rollback_staged_bindings(&staged);
-            drop_guard.rollback_staged_hook_bindings(&staged_hooks);
         }
         prune_drop_trampolines_for_guard(&is_active);
         if let Some(mut registry) = world.get_resource_mut::<ModRegistry>() {
@@ -850,7 +840,7 @@ pub fn rollback_unscheduled_mod_in_world(world: &mut World, id: ModId) {
 /// 1. Excises `ModSystemSet::Mod(id)` and owned `ModNamedSystemSet`s from Bevy `Schedules`.
 /// 2. Bulk-despawns all [`ModScoped(id)`](ModScoped) entities (including `Disabled` entities) and
 ///    removes mod-owned singleton `IsResource` resources by `ComponentId`.
-/// 3. Runs `before_dlclose(world)`, disarms `is_active`, prunes `DROP_SLOTS`, and recycles any
+/// 3. Runs `before_dlclose(world)`, disarms `is_active`, prunes `DROP_PAGES`, and recycles any
 ///    drop slots with `live_values == 0` (incrementing generation).
 /// 4. Evicts guest-owned VTables/symbols in `ModRegistry` and removes `id` from `ModQuarantine`.
 /// 5. Invokes `bevy_abi_mod_shutdown(instance)` and drops `LoadedLibrary` (`dlclose` + shadow unlink).
@@ -1228,7 +1218,6 @@ mod tests {
                 insert_default_fn: None,
                 drop_fn: None,
                 drop_slot: None,
-                hook_slot: None,
                 has_on_add_hook: false,
                 has_on_remove_hook: false,
                 create_msg_cursor_fn: None,
@@ -1274,7 +1263,6 @@ mod tests {
                 generation: 0,
                 pre_snapshot,
                 staged_drop_bindings: Vec::new(),
-                staged_hook_bindings: Vec::new(),
                 library: loaded_lib,
                 shutdown_fn: test_shutdown,
                 save_state_fn: None,

@@ -1,5 +1,5 @@
 [book]
-title = "The bevy_abi_mod Developer Guide (ABI 0.2.0)"
+title = "The bevy_abi_mod Developer Guide (ABI 0.3.0)"
 description = "Asymmetric, zero-serialization C-ABI native modding framework for Bevy ECS (v0.20+)"
 authors = ["bevy_abi_mod authors"]
 language = "en"
@@ -12,5 +12,5 @@ create-missing = false
 [output.html]
 default-theme = "rust"
 preferred-dark-theme = "ayu"
-git-repository-url = "https://github.com/bevyengine/bevy"
+git-repository-url = "https://github.com/yaga-simha/bevy_mod_abi"
 no-section-label = false

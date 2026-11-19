@@ -1,6 +1,8 @@
 # 5-Minute Quickstart
 
-This walkthrough builds a minimal Bevy `0.20+` host and a decoupled Rust `.cdylib` guest mod communicating over `ABI 0.2.0` with zero `bevy` dependencies in the guest.
+This walkthrough builds a minimal Bevy `0.20+` host and a decoupled Rust `.cdylib` guest mod communicating over `ABI 0.3.0` (`0x0003_0000`) with zero `bevy` dependencies in the guest.
+
+> **Tip:** To scaffold a mod project automatically in Rust, C99, C++17, or Zig, install `cargo-bam` (`cargo install --path crates/cargo-bam`) and run `cargo bam new my_guest_mod --lang rust` — see [Bridges, Trust & `cargo-bam` Tooling](./bridges-and-tooling.md).
 
 ---
 

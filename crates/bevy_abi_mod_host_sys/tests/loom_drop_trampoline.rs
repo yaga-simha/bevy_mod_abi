@@ -10,7 +10,7 @@ use loom::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use loom::thread;
 
 struct ModelSlot {
-    /// Models `DROP_SLOTS[slot]: ArcSwapOption<DropSlotSnapshot>` pointer publication.
+    /// Models `DROP_PAGES` slot `ArcSwapOption<DropSlotSnapshot>` pointer publication.
     snapshot_ptr: AtomicPtr<Arc<AtomicBool>>,
     /// Models `SLOT_LIFECYCLE[slot]: AtomicUsize` (`state_bits | live_values`).
     lifecycle: AtomicUsize,
@@ -85,7 +85,7 @@ fn loom_concurrent_publish_drop_and_world_close_reclaims_exactly_once() {
         let guard_v2 = Arc::new(AtomicBool::new(true));
         let slot = Arc::new(ModelSlot::new_in_use(1, Arc::clone(&guard_v1)));
 
-        // Thread 1: Hot-reload publishes a new snapshot (`guard_v2`) into `DROP_SLOTS[slot]`.
+        // Thread 1: Hot-reload publishes a new snapshot (`guard_v2`) into the paged slot.
         let slot_pub = Arc::clone(&slot);
         let g2_pub = Arc::clone(&guard_v2);
         let pub_handle = thread::spawn(move || {

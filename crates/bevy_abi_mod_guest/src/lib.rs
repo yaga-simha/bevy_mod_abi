@@ -1,10 +1,10 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-//! # `bevy_abi_mod_guest`: Safe Idiomatic Rust Guest SDK (`ABI 0.2.0`)
+//! # `bevy_abi_mod_guest`: Safe Idiomatic Rust Guest SDK (`ABI 0.3.0`)
 //!
 //! Zero-Bevy-dependency safe Rust SDK for authoring native `.cdylib` mods targeting
-//! `bevy_abi_mod` (`ABI 0.2.0`).
+//! `bevy_abi_mod` (`ABI 0.3.0`).
 //!
 //! Every unsafe FFI operation, pointer check, [`VTableHeader`] layout verification, and `extern "C"`
 //! panic trampoline is isolated inside `bevy_abi_mod_guest_sys`; this crate enforces
@@ -16,22 +16,29 @@
 //!   heap-allocated per-World [`GuestInstance`](raw::GuestInstance) with **zero** process-global
 //!   mutable state—loading the same `.cdylib` into multiple Bevy `World`s simultaneously is
 //!   completely isolated.
-//! - **Unified `app.system(...)` Builder:** [`GuestApp::system`] compiles up to
-//!   [`MAX_QUERIES_PER_SYSTEM`] queries, declaration-indexed singleton resources ([`GuestRes`] /
-//!   [`GuestResMut`] with [`BamChangeTicks`]), [`ScheduleId`] selection, `.after(...)` /
-//!   `.before(...)` / `.in_set(...)` ordering (including `"host::<name>"` sets),
-//!   `.main_thread()` pinning, and lock-free `.run_if(...)` predicates into a single
-//!   [`BamSystemDesc`](raw::BamSystemDesc).
+//! - **Unified `app.system(...)` Builder & Typed Queries:** [`GuestApp::system`] compiles up to
+//!   [`MAX_QUERIES_PER_SYSTEM`] typed tuple queries (`query_typed::<(&mut A, &B, With<C>, Without<D>, Allow<E>, Has<F>, Or2<...>, Or3<...>)>()`),
+//!   `RemovedComponents<T>` cursors ([`QueryBuilder::removed`], [`SystemContext::read_removed`]), declaration-indexed singleton
+//!   resources ([`GuestRes`] / [`GuestResMut`] with [`BamChangeTicks`]), [`ScheduleId`] selection,
+//!   `.after(...)` / `.before(...)` / `.after_weak(...)` / `.in_set(...)` / `.ambiguous_with(...)`
+//!   ordering (including `"host::<name>"` sets), `.main_thread()` pinning, and lock-free
+//!   `.run_if(...)` predicates into a single [`BamSystemDesc`](raw::BamSystemDesc).
 //! - **Verified Zero-Copy Views & Parallelism:** [`Chunk`] validates [`BamColumnInfo`]
 //!   (`size`, `align`, `mode`, storage flags, and `ComponentUuid` via [`Chunk::component`]),
 //!   provides indirect sparse-set row views ([`Chunk::rows`] / [`Chunk::rows_mut`]), supports
 //!   untracked mutable slices paired with [`Chunk::mark_changed_range`], and offers
 //!   work-stealing [`ChunkIter::par_for_each`] (and [`SystemContext::par_chunks`]) iteration.
-//! - **Handle-Based Commands, Messages, & Observers:** [`GuestCommands`] enqueues
-//!   zero-steady-state-allocation deferred spawns (`spawn_empty`, single-archetype batched `spawn`
-//!   with [`FfiChildOf`]), `despawn`, `insert`, `insert_default`, `remove`, and `trigger`
-//!   (`world.trigger()`), alongside batch `Messages<M>` read/write and dynamic `Event` /
-//!   `EntityEvent` observers ([`GuestApp::observe`]).
+//! - **Deferred Commands, Dynamic Relationships, Messages & Observers:** [`GuestCommands`] enqueues
+//!   zero-steady-state-allocation spawns (`spawn_empty`, `spawn`, `spawn_persistent`,
+//!   `spawn_batch`, [`FfiChildOf`]), `despawn`, `despawn_all`, `insert`, `insert_if_new`,
+//!   `insert_default`, `remove`, `trigger`, and `trigger_ex`, alongside batch `Messages<M>`
+//!   read/write (POD and witness-backed non-POD) and dynamic global, `EntityEvent`, lifecycle,
+//!   `Ready`, mutable, and upward-propagating observers ([`GuestApp::observe`],
+//!   [`ObserverBuilder`]).
+//! - **Optional Subsystem Bridges (`bridges`):** Ergonomic guest wrappers for Bevy standard
+//!   components/inputs (`std_types`), isolated `mod://<ns>/...` assets (`GuestAssetServer`),
+//!   `States` (`GuestStateBridge`), reflection/BRP/settings (`bridges::reflect`), and BSN scenes
+//!   (`GuestScene`).
 //!
 //! ## Quickstart
 //!
@@ -111,8 +118,8 @@ pub use bevy_abi_mod_sys::{
 pub use bevy_abi_mod_macros::{AbiPod, ModComponent};
 
 pub use app::{
-    GuestApp, GuestComponentOptions, GuestRes, GuestResMut, IntoSystemResult, MultiQueryContext,
-    ObserverBuilder, QueryBuilder, RunConditionContext, SystemBuilder, SystemContext,
+    GuestApp, GuestComponentOptions, GuestRes, GuestResMut, IntoSystemResult, ObserverBuilder,
+    QueryBuilder, RunConditionContext, SystemBuilder, SystemContext,
 };
 pub use bridges::{
     BRP_METHOD_GET_COMPONENTS, BRP_METHOD_GET_RESOURCES, BRP_METHOD_INSERT_COMPONENTS,

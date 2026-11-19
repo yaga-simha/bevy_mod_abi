@@ -1,6 +1,6 @@
 # Example 08: Zig Guest Mod (`bam_zig_sdk` + `comptime` Component Views)
 
-**Concept taught:** Authoring a Zig guest mod (`zig build`) against `include/bevy_abi_mod.h` (`ABI 0.2.0`) using lightweight `comptime` SDK wrappers (`zig_mod/src/bam_zig_sdk.zig`) and macro-generated component declarations (`zig_mod/src/generated_components.zig` from `ModComponent::ZIG_DECL`).
+**Concept taught:** Authoring a Zig guest mod (`zig build`) against `include/bevy_abi_mod.h` (`ABI 0.3.0`) using lightweight `comptime` SDK wrappers (`zig_mod/src/bam_zig_sdk.zig`) and macro-generated component declarations (`zig_mod/src/generated_components.zig` from `ModComponent::ZIG_DECL`).
 
 ---
 
@@ -26,7 +26,7 @@
 
 1. **Zero-copy SoA chunk & resource iteration:** Mutates `example::Position` columns from `example::Velocity` and `example::ZigSimConfig`.
 2. **Typed non-POD & enum VTable views:** Safely mutates host-owned `String`, `Vec<u32>`, `FfiOption<u32>`, `bool`, and `#[repr(C, u8)]` `ZigBehaviorMode` without crossing allocators.
-3. **Wave 1–2 Bevy `0.20` patterns:** Demonstrates `BAM_ACCESS_HAS` (`Has<ZigActorStats>`), `BAM_ACCESS_OPTIONAL_READ` (`BamChildOf`), `BAM_EVENT_KIND_ADD` lifecycle observers, and `cmd_spawn_batch` bulk entity spawning.
+3. **Bevy `0.20` ECS patterns:** Demonstrates `BAM_ACCESS_HAS` (`Has<ZigActorStats>`), `BAM_ACCESS_OPTIONAL_READ` (`BamChildOf`), `BAM_EVENT_KIND_ADD` lifecycle observers, and `cmd_spawn_batch` bulk entity spawning.
 4. **ABI Safety Guarantees:** Every exported callback uses `callconv(.c)`, Zig error unions (`BamError!void`) convert explicitly to `BamResult` status codes without unwinding across `extern "C"`, and guest allocations (`std.heap.c_allocator`) stay strictly isolated from host allocations.
 
 ## Commands

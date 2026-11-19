@@ -21,7 +21,7 @@ Enabling `LoadOptions { shadow_copy: true, shadow_dir: None, .. }` solves all th
 
 If `bevy_abi_mod_init` returns a non-`OK` `FfiResult`—or if `LoadOptions::strict == true` rejects an unresolved schedule or ordering target—`LoadTransaction::drop` atomically:
 1. Marks the session's `is_active` tombstone `false` (`Ordering::Release`).
-2. Rolls back any staged `DROP_SLOTS` foreign destructor bindings and returns newly allocated trampoline slots to the free list.
+2. Rolls back any staged `DROP_PAGES` foreign destructor bindings and `DynamicComponentHookMap` hooks, returning newly allocated trampoline slots to the free list.
 3. Restores the pre-load `Arc<RegistrySnapshot>` in `ModRegistry`.
 4. Unmaps the library without calling `bevy_abi_mod_shutdown` (per `spec.md` §4.4, guests clean up partial state before returning `Err` from `init`).
 
@@ -30,8 +30,8 @@ If `bevy_abi_mod_init` returns a non-`OK` `FfiResult`—or if `LoadOptions::stri
 ## 3. Deterministic 5-Step Unload Sequence (`world.unload_mod(id)`)
 
 When `world.unload_mod(id)` (or `app.unload_mod(id)`) runs under exclusive `&mut World` access:
-1. **Schedule Excision:** Removes `ModSystemSet(id)` and every `ModNamedSystemSet` owned by `id` from Bevy `Schedules` (`ScheduleCleanupPolicy::RemoveSetAndSystems`).
-2. **Drop-Trampoline Disarm:** Sets `is_active = false` and prunes `id`'s foreign `ComponentDropFn` pointer from `DROP_SLOTS` (`ArcSwapOption`), while **preserving** the Bevy `ComponentId` and existing entity table columns so a reloaded version of the mod seamlessly rebinds to live entities!
+1. **Schedule Excision:** Removes `ModSystemSet::Mod(id)` and every `ModNamedSystemSet` owned by `id` from Bevy `Schedules` (`ScheduleCleanupPolicy::RemoveSetAndSystems`).
+2. **Entity Cleanup & Drop-Trampoline Disarm:** Despawns `ModScoped(id)` entities (preserving `cmd_spawn_persistent` entities), releases mod-pinned asset/scene handles, clears `DynamicComponentHookMap` entries, and sets `is_active = false` on `DROP_PAGES` (`ArcSwapOption`) while **preserving** the Bevy `ComponentId` and persistent entity columns so a reloaded version of the mod seamlessly rebinds to live entities!
 3. **Symbol & VTable Purge:** Publishes a new CoW `RegistrySnapshot` that nulls guest-owned `vtable_ptr`s and removes `"bam.v0.*"` symbols owned by `id`, preventing stale pointers into unmapped `.rodata`.
 4. **Per-Instance Guest Shutdown:** Invokes `bevy_abi_mod_shutdown(instance)` while `.text` and `.rodata` are still mapped so the guest frees its closures and heap state on its own allocator.
 5. **Library Unmap & Telemetry:** Drops `LoadedLibrary` (`dlclose` + shadow unlink), despawns the `LoadedModInfo` entity, and emits `Messages<ModUnloaded>`.
@@ -40,10 +40,11 @@ When `world.unload_mod(id)` (or `app.unload_mod(id)`) runs under exclusive `&mut
 
 ## 4. State-Preserving Hot Reload (`world.reload_mod`)
 
-`world.reload_mod(id)` (or `app.reload_mod` / `commands.reload_mod`) hot-swaps a mod cleanly while transferring optional internal guest state:
-1. Calls the active guest's optional `GuestPlugin::save_state(&self) -> Result<Vec<u8>, FfiResult>` (`BamManifest::save_state`), streaming bytes across the FFI boundary via `BamStateWriterFn` into a host `Vec<u8>`.
-2. Runs the deterministic 5-step unload sequence above (preserving registered ECS `ComponentId`s and entity data in Bevy storage).
-3. Shadow-copy loads the rebuilt library, runs `GuestPlugin::build`, and passes the saved byte slice to `GuestPlugin::restore_state(&mut self, bytes)` (`BamManifest::restore_state`).
+`world.reload_mod(id)` (or `app.reload_mod` / `commands.reload_mod`, or automatic debounced reloads via `ModHotReloadPlugin` under the `hot-reload-watcher` feature) hot-swaps a mod cleanly while transferring optional internal guest state and migrating witness-exported schema fields:
+1. When `signature-verification` is active, `reload_mod_with` / `reload_mod_from` run `preverify_mod_on_disk` and check principal affinity **before** unloading the running module (hosts can also call `evict_revoked_mods()` after updating a `SSHKRL` revocation list).
+2. Calls the active guest's optional `GuestPlugin::save_state(&self) -> Result<Vec<u8>, FfiResult>` (`BamManifest::save_state`), streaming bytes across the FFI boundary via `BamStateWriterFn` into a host `Vec<u8>`.
+3. Runs the deterministic 5-step unload sequence above (preserving registered ECS `ComponentId`s, persistent cursors, and witness-exported field values in Bevy storage).
+4. Shadow-copy loads the rebuilt library, runs `GuestPlugin::build`, migrates compatible witness schema fields, and passes the saved byte slice to `GuestPlugin::restore_state(&mut self, bytes)` (`BamManifest::restore_state`).
 
 ---
 

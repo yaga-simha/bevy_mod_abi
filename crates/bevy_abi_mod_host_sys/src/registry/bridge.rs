@@ -588,7 +588,6 @@ impl ModRegistry {
                     insert_default_fn,
                     drop_fn: None,
                     drop_slot: None,
-                    hook_slot: None,
                     has_on_add_hook: false,
                     has_on_remove_hook: false,
                     create_msg_cursor_fn: None,

@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [Unreleased]
+
+### Added / Changed
+- **Unified ABI `0.3.0` (`0x0003_0000`):** Expanded `BamHostApi` to 68 slots (`552` B on 64-bit / `280` B on 32-bit; backwards-compatible `MIN_V0_2_SIZE = 224` B / `116` B) and `ComponentDesc` to `176` / `104` B with `schema_fingerprint`, `fields` (`BamFieldDesc`), `field_count`, and `required_init_descs` / `required_init_desc_count`, plus `BamSystem`, `BamSystemSet`, `BamSymbol`, `BamLayoutInfo`, `BamRelationDesc`, and `BamRowMigrateFn`. Currently 8 of the 18 new ABI `0.3.0` host slots have active implementations while 10 are reserved slots that validate arguments and return `FfiResult::UNSUPPORTED`.
+- **Eleven-Crate Workspace Architecture:** Extracted zero-Bevy `#![forbid(unsafe_code)]` crates `bevy_abi_mod_trust` (Ed25519 `SSHSIG`, CA certificates, `SSHKRL` revocation, `.bam_sig`, and `.bampack`), `bevy_abi_mod_manifest` (`mod.toml` parsing and SemVer DAG sorting), `bevy_abi_mod_sdk_gen` (C99/C++17/Zig and component header codegen with `BAM_EXPORT` and `BAM_HOST_API_OFFSET_*`), and standalone `cargo-bam` CLI (`new`, `export-sdk`/`header`, `build`, `check-mods`, `doctor`, `keygen`, `sign`, `verify`).
+- **Soundness, Lifecycle & Tooling Improvements:** Enforced compile-time zero-implicit-padding assertions (`size_of::<Self>() == sum(size_of::<Fields>())`) in `#[derive(AbiPod)]`; added `SCHEMA_FINGERPRINT`, `BAM_FIELDS`, and `#[mod_component(require(Comp = expr))]` in `#[derive(ModComponent)]`; migrated host component destructors and lifecycle hooks to lazily paged `DROP_PAGES` (`4,096` slots) and `DynamicComponentHookMap`; expanded optional Bevy `0.20` bridges (`bridge-std-types`, `bridge-asset`, `bridge-state`, `bridge-reflect`, `bridge-bsn`, `sub-app-extract`, `hot-reload-watcher`); and fixed Windows MSVC/Clang-CL toolchain discovery and PE `.pdb` handling.
+- **Documentation & Codebase Cleanup:** Overhauled root `README.md`, synchronized `spec.md`, `docs/ARCHITECTURE.md`, `docs/BENCHMARKS.md`, `docs/book/`, examples, and crate docs with ABI `0.3.0`, and removed dead legacy hook-slot trampolines and non-semantic development labels.
+
 ## [0.2.0] - 2026-11-12
 
 ### Added

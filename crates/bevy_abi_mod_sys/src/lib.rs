@@ -2,9 +2,9 @@
 #![warn(missing_docs)]
 #![deny(clippy::undocumented_unsafe_blocks, clippy::missing_safety_doc)]
 
-//! # `bevy_abi_mod_sys`: Zero-Dependency C-ABI `0.2` Wire Contract for `bevy_abi_mod`
+//! # `bevy_abi_mod_sys`: Zero-Dependency C-ABI `0.3.0` Wire Contract for `bevy_abi_mod`
 //!
-//! This crate defines the `#![no_std]`, zero-dependency C-ABI `0.2.0` wire specification connecting
+//! This crate defines the `#![no_std]`, zero-dependency C-ABI `0.3.0` wire specification connecting
 //! Bevy ECS host applications to native dynamic guest mods (`.so`, `.dylib`, `.dll`) written in
 //! Rust, C99, C++, or Zig.
 //!

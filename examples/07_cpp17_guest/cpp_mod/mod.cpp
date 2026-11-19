@@ -1,5 +1,5 @@
 // ============================================================================
-// mod.cpp — Strict ISO C++17 Guest Mod for `bevy_abi_mod` Example 07 (`ABI 0.2.0`)
+// mod.cpp — Strict ISO C++17 Guest Mod for `bevy_abi_mod` Example 07 (`ABI 0.3.0`)
 //
 // Demonstrates:
 // 1. Idiomatic `bam::GuestApp`, `bam::SystemContext`, `bam::Chunk`, and `bam::Commands`
@@ -134,7 +134,7 @@ public:
                 return res;
             }
 
-            // Optionally bind Wave 1-2 showcase: `BAM_EVENT_KIND_ADD` lifecycle observer,
+            // Bind `BAM_EVENT_KIND_ADD` lifecycle observer,
             // `BAM_ACCESS_HAS`, `BamChildOf` optional hierarchy read, and `cmd_spawn_batch`.
             if (app.try_resolve_component("example::CppTelemetry", telemetry_res_) &&
                 app.try_resolve_component(BAM_CHILD_OF_NAME, child_of_comp_)) {

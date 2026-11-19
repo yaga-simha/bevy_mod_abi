@@ -1,4 +1,4 @@
-//! Bevy [`Plugin`] types for initializing the native C-ABI modding host (`ABI 0.2.0`).
+//! Bevy [`Plugin`] types for initializing the native C-ABI modding host (`ABI 0.3.0`).
 
 pub use crate::app_ext::ModAppExt;
 pub use crate::commands_ext::ModCommandsExt;

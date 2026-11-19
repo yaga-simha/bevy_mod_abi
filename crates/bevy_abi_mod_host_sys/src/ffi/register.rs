@@ -2,9 +2,8 @@
 //! and unified `host_register_system`.
 
 use crate::drop_trampoline::{
-    StagedDropBinding, StagedHookBinding, WorldDropGuard, increment_drop_slot_live_values,
-    on_add_hook_for_slot, on_insert_hook_for_slot, on_remove_hook_for_slot,
-    prune_drop_trampolines_for_guard,
+    MAX_DROP_TRAMPOLINES, StagedDropBinding, WorldDropGuard, increment_drop_slot_live_values,
+    on_insert_hook_for_slot, prune_drop_trampolines_for_guard,
 };
 use crate::handle_header::{
     HOST_CTX_MAGIC, HandleHeader, HostContext, LOAD_CTX_MAGIC, validate_handle_mut,
@@ -704,7 +703,6 @@ pub struct LoadContext {
     pub manifest_name: Option<Arc<str>>,
     pre_snapshot: Arc<RegistrySnapshot>,
     staged_drop_bindings: Arc<Mutex<Vec<StagedDropBinding>>>,
-    staged_hook_bindings: Arc<Mutex<Vec<StagedHookBinding>>>,
     fresh_dynamic_comp_ids: Vec<ComponentId>,
     fresh_rel_bindings: Vec<(ComponentId, ComponentId)>,
     in_init: bool,
@@ -749,7 +747,6 @@ impl LoadContext {
             manifest_name,
             pre_snapshot,
             staged_drop_bindings: Arc::new(Mutex::new(Vec::new())),
-            staged_hook_bindings: Arc::new(Mutex::new(Vec::new())),
             fresh_dynamic_comp_ids: Vec::new(),
             fresh_rel_bindings: Vec::new(),
             in_init: true,
@@ -782,21 +779,13 @@ impl LoadContext {
         ctx
     }
 
-    /// Shares the transaction's [`StagedDropBinding`] and [`StagedHookBinding`] logs so
-    /// `LoadTransaction::drop` automatically rolls back every trampoline mutation recorded during `bevy_abi_mod_init`.
+    /// Shares the transaction's [`StagedDropBinding`] log so `LoadTransaction::drop`
+    /// automatically rolls back every trampoline mutation recorded during `bevy_abi_mod_init`.
     pub(crate) fn with_staged_drop_bindings(
         mut self,
         staged: Arc<Mutex<Vec<StagedDropBinding>>>,
     ) -> Self {
         self.staged_drop_bindings = staged;
-        self
-    }
-
-    pub(crate) fn with_staged_hook_bindings(
-        mut self,
-        staged_hooks: Arc<Mutex<Vec<StagedHookBinding>>>,
-    ) -> Self {
-        self.staged_hook_bindings = staged_hooks;
         self
     }
 
@@ -831,19 +820,11 @@ impl LoadContext {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             core::mem::take(&mut *guard)
         };
-        let hook_bindings = {
-            let mut guard = self
-                .staged_hook_bindings
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            core::mem::take(&mut *guard)
-        };
         let fresh_comp_ids = core::mem::take(&mut self.fresh_dynamic_comp_ids);
         let fresh_rels = core::mem::take(&mut self.fresh_rel_bindings);
         let active_guard = Arc::clone(&self.is_active);
         if let Some(mut drop_guard) = self.world_mut().get_resource_mut::<WorldDropGuard>() {
             drop_guard.rollback_staged_bindings(&bindings);
-            drop_guard.rollback_staged_hook_bindings(&hook_bindings);
         }
         if let Some(mut hook_map) = self
             .world_mut()
@@ -1415,11 +1396,6 @@ pub unsafe extern "C" fn host_register_component(
     let is_active = Arc::clone(&ctx.is_active);
     let owner = ctx.mod_id;
     let staged_log = Arc::clone(&ctx.staged_drop_bindings);
-    let _legacy_refs = (
-        on_add_hook_for_slot as *const (),
-        on_remove_hook_for_slot as *const (),
-        WorldDropGuard::bind_or_update_hooks as *const (),
-    );
     let has_any_dynamic_hook = desc.has_hooks() || !required_boxed.is_empty();
 
     let (comp_id, drop_slot, was_fresh_id): (ComponentId, Option<usize>, bool) = {
@@ -1433,9 +1409,9 @@ pub unsafe extern "C" fn host_register_component(
                 .get_resource_mut::<WorldDropGuard>()
                 .and_then(|mut g| g.bind_or_update(desc.uuid, drop_fn, Arc::clone(&is_active)));
             let Some((slot, tramp, staged_binding)) = bound else {
-                ctx.host_ctx.set_last_error(
-                    "exhausted MAX_DROP_TRAMPOLINES (1024) foreign destructor slots",
-                );
+                ctx.host_ctx.set_last_error(format!(
+                    "exhausted MAX_DROP_TRAMPOLINES ({MAX_DROP_TRAMPOLINES}) foreign destructor slots"
+                ));
                 return FfiResult::CAPACITY_EXCEEDED;
             };
             staged_log
@@ -1523,7 +1499,6 @@ pub unsafe extern "C" fn host_register_component(
         name_ref,
         owner,
         drop_slot,
-        None,
         required_boxed,
         schema_fingerprint,
         extracted_fields,

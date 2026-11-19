@@ -184,7 +184,7 @@ fn cpp17_guest_typed_views_host_vec_ffi_option_and_enum_roundtrip() {
 }
 
 #[test]
-fn cpp17_guest_wave2_has_filter_lifecycle_observer_hierarchy_and_batch_spawn() {
+fn cpp17_guest_has_filter_lifecycle_observer_hierarchy_and_batch_spawn() {
     let dylib_path = resolve_or_build_cpp17_mod();
     let mut app = build_configured_app();
     app.register_mod_component::<ActorStats>(ComponentOptions::new().with_default())

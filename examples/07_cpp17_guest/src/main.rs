@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 //! Example 07: Minimal ISO C++17 Guest Mod (Bevy Host Application).
 //!
-//! Loads `cpp_mod/mod.cpp` (`ABI 0.2.0`), executes damped kinematics over contiguous SoA chunks,
+//! Loads `cpp_mod/mod.cpp` (`ABI 0.3.0`), executes damped kinematics over contiguous SoA chunks,
 //! demonstrates C++ exception containment (`try / catch (...) -> BAM_RESULT_PANIC_CAUGHT`), and
 //! verifies per-`World` RAII `CppModInstance` cleanup on unload.
 
@@ -12,7 +12,7 @@ use bevy_ecs::message::Messages;
 use example_07_cpp17_guest::{Position, SimConfig, Velocity, resolve_or_build_cpp17_mod};
 
 fn main() {
-    println!("=== Example 07: Minimal ISO C++17 Guest Mod (ABI 0.2.0) ===");
+    println!("=== Example 07: Minimal ISO C++17 Guest Mod (ABI 0.3.0) ===");
 
     let dylib_path = resolve_or_build_cpp17_mod();
 

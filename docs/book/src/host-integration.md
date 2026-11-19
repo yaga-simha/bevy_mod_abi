@@ -18,6 +18,7 @@ Available [`ModErrorPolicy`] modes when a guest system returns a non-`OK` `FfiRe
 - **`ModErrorPolicy::Quarantine` *(Default)*:** Quarantines the faulting guest system (`enabled = false`), discards uncommitted commands from that invocation, logs via `tracing::warn!`, emits `Messages<ModSystemFaulted>`, and returns `Ok(())` so the rest of the mod and game keep running. Quarantined systems can be re-enabled at runtime via `world.resource::<ModQuarantine>().reenable(mod_id, "system_name")`.
 - **`ModErrorPolicy::Log`:** Quarantines the faulting guest system (`enabled = false`), discards uncommitted commands, escalates logging to `tracing::error!`, emits `Messages<ModSystemFaulted>`, and returns `Ok(())` (also re-enableable via `ModQuarantine::reenable`).
 - **`ModErrorPolicy::ReportToBevy`:** Quarantines the faulting guest system, logs via `tracing::error!`, emits `Messages<ModSystemFaulted>`, and forwards `ModSystemError` via `Err(RunSystemError::from(...))` into Bevy's native error handler pipeline.
+- **`ModErrorPolicy::DelegateToBevyFallback`:** Discards uncommitted commands, emits `Messages<ModSystemFaulted>`, and delegates a contextualized `BevyError` directly to Bevy's world `FallbackErrorHandler` without auto-quarantining the system.
 
 ---
 
@@ -49,6 +50,8 @@ app.register_mod_event::<WaveStarted>()?;
 app.register_mod_entity_event::<HitEntity>()?;
 ```
 
+Additional `ComponentOptions` modifiers include `.opaque()` (disables raw byte insertion so mutations go only through VTables or `Default`) and `.summary_tick()` (`BAM_STORAGE_FLAG_SUMMARY_TICK` per-table change-tick acceleration for `Table`-stored components).
+
 Because `CommandArena` flushes deferred spawns, inserts, and removals through Bevy's `EntityWorldMut` (`insert_by_ids` / `remove_by_id`), host `ComponentHooks` (`on_add` / `on_insert` / `on_replace` / `on_remove`), `#[require(...)]` Required Components, and `ChildOf` / `Children` relationships automatically stay consistent when mutated by guest mods.
 
 ---
@@ -74,14 +77,14 @@ app.register_mod_visible_set("input", HostInputSet);
 ```
 
 - **Late `Startup` Execution:** If a mod is loaded at runtime *after* Bevy's `Startup` schedule has already run (`StartupCompleted` resource), any `ScheduleId::STARTUP` systems in that mod execute once immediately upon load commit.
-- **Scoped Named Ordering & Host Sets:** Every guest system automatically joins `ModSystemSet(mod_id)` and `ModNamedSystemSet { mod_name, system_name }`. Unqualified `.after("step_a")` orders within the same mod; `"other_mod::step_a"` orders across mods; `"host::input"` orders `.in_set()`, `.before()`, or `.after()` relative to host-exported `ModVisibleSets`.
+- **Scoped Named Ordering & Host Sets:** Every guest system automatically joins `ModSystemSet::Mod(mod_id)` and `ModNamedSystemSet { mod_name, system_name, generation }`. Unqualified `.after(c"step_a")` orders within the same mod; `c"other_mod::step_a"` orders across mods; `c"host::input"` orders `.in_set()`, `.before()`, or `.after()` relative to host-exported `ModVisibleSets`.
 - **Main-Thread Affinity:** Guests with thread-affine state set `BAM_SYSTEM_FLAG_MAIN_THREAD` (`.main_thread()` in Rust), mapping to Bevy's `SystemStateFlags::NON_SEND`.
 
 ---
 
 ## 4. Runtime Loading from Exclusive Systems or `Commands`
 
-All load and unload operations require exclusive `World` access (`ModWorldExt` on `&mut World` or deferred `ModCommandsExt` on `Commands`), making concurrent `dlclose` data races impossible at compile time:
+All load and unload operations require exclusive `World` access (`ModWorldExt` on `&mut World` or deferred `ModCommandsExt` on `Commands`), making concurrent `dlclose` data races impossible at compile time. For multi-mod directories with `mod.toml` SemVer dependencies, call `app.load_mods_dir("mods")` or `app.load_mods_dir_with("mods", &options)` (see [Bridges, Trust & `cargo-bam` Tooling](./bridges-and-tooling.md)).
 
 ```rust
 fn hot_swap_keybind_system(mut commands: Commands) {

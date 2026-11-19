@@ -111,7 +111,7 @@ pub enum BehaviorMode {
     Attack(u32) = 2,
 }
 
-/// Telemetry resource updated by C++17 Wave 1–2 systems & lifecycle observers (`"example::CppTelemetry"`).
+/// Telemetry resource updated by C++17 systems and lifecycle observers (`"example::CppTelemetry"`).
 #[repr(C)]
 #[derive(Resource, Debug, Clone, Copy, Default, PartialEq, ModComponent)]
 #[mod_component(name = "example::CppTelemetry")]

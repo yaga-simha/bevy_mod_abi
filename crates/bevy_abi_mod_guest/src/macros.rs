@@ -1,6 +1,6 @@
 //! Entry-point export macros (`export_mod!`) for guest `.cdylib` mods.
 
-/// Exports a guest mod's mandatory ABI `0.2` C entry points (`bevy_abi_mod_manifest`,
+/// Exports a guest mod's mandatory ABI `0.3.0` C entry points (`bevy_abi_mod_manifest`,
 /// `bevy_abi_mod_init`, and `bevy_abi_mod_shutdown`) backed by per-World
 /// [`GuestInstance`](crate::raw::GuestInstance) heap state and panic containment, with zero
 /// process-global mutable state.
@@ -55,14 +55,14 @@ macro_rules! export_mod {
         /// Initializes a per-World [`BamInstance`]($crate::raw::BamInstance) for this guest mod.
         ///
         /// # Safety
-        /// Caller (host loader) must supply valid ABI `0.2` `api`, `load_ctx`, and `instance_out` pointers.
+        /// Caller (host loader) must supply valid ABI `0.3.0` `api`, `load_ctx`, and `instance_out` pointers.
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn bevy_abi_mod_init(
             api: *const $crate::raw::BamHostApi,
             load_ctx: *mut $crate::raw::BamLoadCtx,
             instance_out: *mut *mut $crate::raw::BamInstance,
         ) -> $crate::FfiResult {
-            // SAFETY: Entry point invoked by the host loader with valid ABI v0.2 handshake pointers.
+            // SAFETY: Entry point invoked by the host loader with valid ABI v0.3 handshake pointers.
             unsafe {
                 $crate::raw::init_guest_instance(
                     api,
@@ -123,14 +123,14 @@ macro_rules! export_mod {
         /// Initializes a per-World [`BamInstance`]($crate::raw::BamInstance) for this guest mod.
         ///
         /// # Safety
-        /// Caller (host loader) must supply valid ABI `0.2` `api`, `load_ctx`, and `instance_out` pointers.
+        /// Caller (host loader) must supply valid ABI `0.3.0` `api`, `load_ctx`, and `instance_out` pointers.
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn bevy_abi_mod_init(
             api: *const $crate::raw::BamHostApi,
             load_ctx: *mut $crate::raw::BamLoadCtx,
             instance_out: *mut *mut $crate::raw::BamInstance,
         ) -> $crate::FfiResult {
-            // SAFETY: Entry point invoked by the host loader with valid ABI v0.2 handshake pointers.
+            // SAFETY: Entry point invoked by the host loader with valid ABI v0.3 handshake pointers.
             unsafe {
                 $crate::raw::init_guest_instance(
                     api,
@@ -195,14 +195,14 @@ macro_rules! export_mod {
         /// Initializes a per-World [`BamInstance`]($crate::raw::BamInstance) for this guest mod.
         ///
         /// # Safety
-        /// Caller (host loader) must supply valid ABI `0.2` `api`, `load_ctx`, and `instance_out` pointers.
+        /// Caller (host loader) must supply valid ABI `0.3.0` `api`, `load_ctx`, and `instance_out` pointers.
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn bevy_abi_mod_init(
             api: *const $crate::raw::BamHostApi,
             load_ctx: *mut $crate::raw::BamLoadCtx,
             instance_out: *mut *mut $crate::raw::BamInstance,
         ) -> $crate::FfiResult {
-            // SAFETY: Entry point invoked by the host loader with valid ABI v0.2 handshake pointers.
+            // SAFETY: Entry point invoked by the host loader with valid ABI v0.3 handshake pointers.
             unsafe {
                 $crate::raw::init_guest_instance(
                     api,
@@ -256,7 +256,7 @@ macro_rules! export_mod {
         /// Initializes a per-World [`BamInstance`]($crate::raw::BamInstance) for this guest mod.
         ///
         /// # Safety
-        /// Caller (host loader) must supply valid ABI `0.2` `api`, `load_ctx`, and `instance_out` pointers.
+        /// Caller (host loader) must supply valid ABI `0.3.0` `api`, `load_ctx`, and `instance_out` pointers.
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn bevy_abi_mod_init(
             api: *const $crate::raw::BamHostApi,

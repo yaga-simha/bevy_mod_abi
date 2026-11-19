@@ -1,5 +1,4 @@
-//! Fault policies, `ModQuarantine` resource, runtime system errors, and initialization diagnostics
-//!.
+//! Fault policies, `ModQuarantine` resource, runtime system errors, and initialization diagnostics.
 
 use crate::loader::ModId;
 use bevy_abi_mod_sys::FfiResult;

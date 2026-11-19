@@ -13,9 +13,9 @@
 //!   `unload_mod` or `World::drop`, a slot is returned to the global free list only once *both*
 //!   its owning guard/world has closed and `live_values` reaches `0`.
 
-use crate::sync_ptr::{GuestFnPtr, GuestUserData};
+use crate::sync_ptr::GuestFnPtr;
 use arc_swap::ArcSwapOption;
-use bevy_abi_mod_sys::{ComponentDropFn, ComponentHookFn, ComponentUuid, FfiEntity};
+use bevy_abi_mod_sys::{ComponentDropFn, ComponentUuid};
 use bevy_ecs::lifecycle::{ComponentHook, HookContext};
 use bevy_ecs::prelude::Resource;
 use bevy_ecs::ptr::OwningPtr;
@@ -404,274 +404,6 @@ pub(crate) fn on_insert_hook_for_slot(slot: usize) -> ComponentHook {
     INSERT_HOOK_BLOCKS[b256][b16][idx]
 }
 
-// ============================================================================
-// Guest Dynamic Component Lifecycle Hooks (`on_add` / `on_remove`)
-// ============================================================================
-
-#[derive(Clone)]
-struct HookEntry {
-    on_add: Option<GuestFnPtr<ComponentHookFn>>,
-    on_remove: Option<GuestFnPtr<ComponentHookFn>>,
-    user_data: GuestUserData,
-    is_active: Arc<AtomicBool>,
-}
-
-pub(crate) struct HookSlotSnapshot {
-    entries: Box<[HookEntry]>,
-}
-
-struct HookPage {
-    slots: [ArcSwapOption<HookSlotSnapshot>; DROP_PAGE_SIZE],
-}
-
-impl HookPage {
-    fn new() -> Self {
-        Self {
-            slots: core::array::from_fn(|_| ArcSwapOption::const_empty()),
-        }
-    }
-}
-
-static HOOK_PAGES: [OnceLock<Box<HookPage>>; MAX_DROP_PAGES] =
-    [const { OnceLock::new() }; MAX_DROP_PAGES];
-
-#[inline]
-fn get_hook_page(slot: usize) -> Option<(&'static HookPage, usize)> {
-    if slot >= MAX_DROP_TRAMPOLINES {
-        return None;
-    }
-    let page_idx = slot / DROP_PAGE_SIZE;
-    let in_page = slot % DROP_PAGE_SIZE;
-    let page = HOOK_PAGES[page_idx].get()?;
-    Some((page.as_ref(), in_page))
-}
-
-struct HookControlPlane {
-    allocated_pages: usize,
-    free_list: Vec<usize>,
-    entries: Vec<Vec<HookEntry>>,
-}
-
-impl HookControlPlane {
-    fn new() -> Self {
-        Self {
-            allocated_pages: 0,
-            free_list: Vec::new(),
-            entries: Vec::new(),
-        }
-    }
-
-    fn allocate_slot(&mut self) -> Option<usize> {
-        if self.free_list.is_empty() {
-            if self.allocated_pages >= MAX_DROP_PAGES {
-                return None;
-            }
-            let page_idx = self.allocated_pages;
-            let _ = HOOK_PAGES[page_idx].get_or_init(|| Box::new(HookPage::new()));
-            let base = page_idx * DROP_PAGE_SIZE;
-            self.entries.resize_with(base + DROP_PAGE_SIZE, Vec::new);
-            for slot in (base..(base + DROP_PAGE_SIZE)).rev() {
-                self.free_list.push(slot);
-            }
-            self.allocated_pages += 1;
-        }
-        self.free_list.pop()
-    }
-}
-
-static HOOK_CONTROL: LazyLock<Mutex<HookControlPlane>> =
-    LazyLock::new(|| Mutex::new(HookControlPlane::new()));
-
-/// Staged dynamic component hook mutation recorded during `bevy_abi_mod_init` so `LoadTransaction`
-/// or `rollback_unscheduled_mod_in_world` can atomically undo uncommitted hook bindings.
-#[derive(Clone)]
-pub(crate) struct StagedHookBinding {
-    uuid: ComponentUuid,
-    slot: usize,
-    fresh_slot_allocated: bool,
-    previous_snapshot: Option<Arc<HookSlotSnapshot>>,
-    is_active: Arc<AtomicBool>,
-}
-
-#[inline]
-fn on_add_trampoline_inner(slot: usize, world: DeferredWorld<'_>, ctx: HookContext) {
-    let Some((page, in_page)) = get_hook_page(slot) else {
-        return;
-    };
-    let Some(snap) = page.slots[in_page].load_full() else {
-        return;
-    };
-    let Some(entry) = snap
-        .entries
-        .iter()
-        .rev()
-        .find(|e| e.is_active.load(Ordering::Acquire))
-    else {
-        return;
-    };
-    let Some(GuestFnPtr(cb)) = entry.on_add else {
-        return;
-    };
-    let Ok(comp_ptr) = world
-        .entity(ctx.entity)
-        .get_by_id(ctx.component_id)
-        .map(|p| p.as_ptr().cast::<c_void>())
-    else {
-        return;
-    };
-    let ffi_entity = FfiEntity::from_bits(ctx.entity.to_bits());
-    // SAFETY: `entry.is_active` is `true` and exclusive `&mut World` is required before `dlclose`,
-    // so `cb` remains mapped in memory for the entire duration of this hook invocation; `comp_ptr`
-    // points to the newly inserted component storage on `ctx.entity`.
-    unsafe {
-        cb(ffi_entity, comp_ptr, entry.user_data.as_ptr());
-    }
-}
-
-#[inline]
-fn on_remove_trampoline_inner(slot: usize, world: DeferredWorld<'_>, ctx: HookContext) {
-    let Some((page, in_page)) = get_hook_page(slot) else {
-        return;
-    };
-    let Some(snap) = page.slots[in_page].load_full() else {
-        return;
-    };
-    let Some(entry) = snap
-        .entries
-        .iter()
-        .rev()
-        .find(|e| e.is_active.load(Ordering::Acquire))
-    else {
-        return;
-    };
-    let Some(GuestFnPtr(cb)) = entry.on_remove else {
-        return;
-    };
-    // Bevy executes `on_remove` strictly before removing component bytes from `Table`/`SparseSet`.
-    let Ok(comp_ptr) = world
-        .entity(ctx.entity)
-        .get_by_id(ctx.component_id)
-        .map(|p| p.as_ptr().cast::<c_void>())
-    else {
-        return;
-    };
-    let ffi_entity = FfiEntity::from_bits(ctx.entity.to_bits());
-    // SAFETY: Same liveness and read-only component pointer guarantees as `on_add_trampoline`.
-    unsafe {
-        cb(ffi_entity, comp_ptr, entry.user_data.as_ptr());
-    }
-}
-
-fn on_add_trampoline<const SLOT: usize>(world: DeferredWorld<'_>, ctx: HookContext) {
-    on_add_trampoline_inner(SLOT, world, ctx);
-}
-
-fn on_remove_trampoline<const SLOT: usize>(world: DeferredWorld<'_>, ctx: HookContext) {
-    on_remove_trampoline_inner(SLOT, world, ctx);
-}
-
-macro_rules! hook_fn_16 {
-    ($fn_ident:ident, $b:expr) => {
-        [
-            $fn_ident::<{ $b }>,
-            $fn_ident::<{ $b + 1 }>,
-            $fn_ident::<{ $b + 2 }>,
-            $fn_ident::<{ $b + 3 }>,
-            $fn_ident::<{ $b + 4 }>,
-            $fn_ident::<{ $b + 5 }>,
-            $fn_ident::<{ $b + 6 }>,
-            $fn_ident::<{ $b + 7 }>,
-            $fn_ident::<{ $b + 8 }>,
-            $fn_ident::<{ $b + 9 }>,
-            $fn_ident::<{ $b + 10 }>,
-            $fn_ident::<{ $b + 11 }>,
-            $fn_ident::<{ $b + 12 }>,
-            $fn_ident::<{ $b + 13 }>,
-            $fn_ident::<{ $b + 14 }>,
-            $fn_ident::<{ $b + 15 }>,
-        ]
-    };
-}
-
-macro_rules! hook_fn_256 {
-    ($fn_ident:ident, $b:expr) => {
-        [
-            hook_fn_16!($fn_ident, $b),
-            hook_fn_16!($fn_ident, $b + 16),
-            hook_fn_16!($fn_ident, $b + 32),
-            hook_fn_16!($fn_ident, $b + 48),
-            hook_fn_16!($fn_ident, $b + 64),
-            hook_fn_16!($fn_ident, $b + 80),
-            hook_fn_16!($fn_ident, $b + 96),
-            hook_fn_16!($fn_ident, $b + 112),
-            hook_fn_16!($fn_ident, $b + 128),
-            hook_fn_16!($fn_ident, $b + 144),
-            hook_fn_16!($fn_ident, $b + 160),
-            hook_fn_16!($fn_ident, $b + 176),
-            hook_fn_16!($fn_ident, $b + 192),
-            hook_fn_16!($fn_ident, $b + 208),
-            hook_fn_16!($fn_ident, $b + 224),
-            hook_fn_16!($fn_ident, $b + 240),
-        ]
-    };
-}
-
-static ON_ADD_HOOK_BLOCKS: [InsertHookBlock; 16] = [
-    hook_fn_256!(on_add_trampoline, 0),
-    hook_fn_256!(on_add_trampoline, 256),
-    hook_fn_256!(on_add_trampoline, 512),
-    hook_fn_256!(on_add_trampoline, 768),
-    hook_fn_256!(on_add_trampoline, 1024),
-    hook_fn_256!(on_add_trampoline, 1280),
-    hook_fn_256!(on_add_trampoline, 1536),
-    hook_fn_256!(on_add_trampoline, 1792),
-    hook_fn_256!(on_add_trampoline, 2048),
-    hook_fn_256!(on_add_trampoline, 2304),
-    hook_fn_256!(on_add_trampoline, 2560),
-    hook_fn_256!(on_add_trampoline, 2816),
-    hook_fn_256!(on_add_trampoline, 3072),
-    hook_fn_256!(on_add_trampoline, 3328),
-    hook_fn_256!(on_add_trampoline, 3584),
-    hook_fn_256!(on_add_trampoline, 3840),
-];
-
-static ON_REMOVE_HOOK_BLOCKS: [InsertHookBlock; 16] = [
-    hook_fn_256!(on_remove_trampoline, 0),
-    hook_fn_256!(on_remove_trampoline, 256),
-    hook_fn_256!(on_remove_trampoline, 512),
-    hook_fn_256!(on_remove_trampoline, 768),
-    hook_fn_256!(on_remove_trampoline, 1024),
-    hook_fn_256!(on_remove_trampoline, 1280),
-    hook_fn_256!(on_remove_trampoline, 1536),
-    hook_fn_256!(on_remove_trampoline, 1792),
-    hook_fn_256!(on_remove_trampoline, 2048),
-    hook_fn_256!(on_remove_trampoline, 2304),
-    hook_fn_256!(on_remove_trampoline, 2560),
-    hook_fn_256!(on_remove_trampoline, 2816),
-    hook_fn_256!(on_remove_trampoline, 3072),
-    hook_fn_256!(on_remove_trampoline, 3328),
-    hook_fn_256!(on_remove_trampoline, 3584),
-    hook_fn_256!(on_remove_trampoline, 3840),
-];
-
-#[inline]
-pub(crate) fn on_add_hook_for_slot(slot: usize) -> ComponentHook {
-    let b256 = slot / 256;
-    let rem = slot % 256;
-    let b16 = rem / 16;
-    let idx = rem % 16;
-    ON_ADD_HOOK_BLOCKS[b256][b16][idx]
-}
-
-#[inline]
-pub(crate) fn on_remove_hook_for_slot(slot: usize) -> ComponentHook {
-    let b256 = slot / 256;
-    let rem = slot % 256;
-    let b16 = rem / 16;
-    let idx = rem % 16;
-    ON_REMOVE_HOOK_BLOCKS[b256][b16][idx]
-}
-
 struct WorldDropSlot {
     slot: usize,
     generation: u64,
@@ -688,7 +420,6 @@ struct WorldDropSlot {
 #[derive(Resource, Default)]
 pub struct WorldDropGuard {
     slots_by_uuid: HashMap<ComponentUuid, WorldDropSlot>,
-    hook_slots_by_uuid: HashMap<ComponentUuid, usize>,
     guards: Vec<Arc<AtomicBool>>,
 }
 
@@ -911,125 +642,6 @@ impl WorldDropGuard {
 
         count
     }
-
-    /// Allocates or updates a dynamic component `on_add` / `on_remove` hook slot for `uuid`.
-    pub(crate) fn bind_or_update_hooks(
-        &mut self,
-        uuid: ComponentUuid,
-        on_add: Option<ComponentHookFn>,
-        on_remove: Option<ComponentHookFn>,
-        user_data: *mut c_void,
-        is_active: Arc<AtomicBool>,
-    ) -> Option<(usize, StagedHookBinding)> {
-        let mut ctrl = HOOK_CONTROL
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        let new_entry = HookEntry {
-            on_add: on_add.map(GuestFnPtr),
-            on_remove: on_remove.map(GuestFnPtr),
-            user_data: GuestUserData::new(user_data),
-            is_active: Arc::clone(&is_active),
-        };
-
-        if let Some(&slot) = self.hook_slots_by_uuid.get(&uuid) {
-            let (page, in_page) =
-                get_hook_page(slot).expect("bound hook slot must map to initialized HookPage");
-            let previous_snapshot = page.slots[in_page].load_full();
-            let entries = &mut ctrl.entries[slot];
-            entries.retain(|e| e.is_active.load(Ordering::Acquire));
-            if let Some(existing) = entries
-                .iter_mut()
-                .find(|e| Arc::ptr_eq(&e.is_active, &is_active))
-            {
-                *existing = new_entry;
-            } else {
-                entries.push(new_entry);
-            }
-            let snap = Arc::new(HookSlotSnapshot {
-                entries: entries.clone().into_boxed_slice(),
-            });
-            page.slots[in_page].store(Some(snap));
-            drop(ctrl);
-
-            if !self.guards.iter().any(|g| Arc::ptr_eq(g, &is_active)) {
-                self.guards.push(Arc::clone(&is_active));
-            }
-            return Some((
-                slot,
-                StagedHookBinding {
-                    uuid,
-                    slot,
-                    fresh_slot_allocated: false,
-                    previous_snapshot,
-                    is_active,
-                },
-            ));
-        }
-
-        let slot = ctrl.allocate_slot()?;
-        let (page, in_page) =
-            get_hook_page(slot).expect("allocated hook slot must map to initialized HookPage");
-        let entries = &mut ctrl.entries[slot];
-        entries.clear();
-        entries.push(new_entry);
-        let snap = Arc::new(HookSlotSnapshot {
-            entries: entries.clone().into_boxed_slice(),
-        });
-        page.slots[in_page].store(Some(snap));
-        drop(ctrl);
-
-        self.hook_slots_by_uuid.insert(uuid, slot);
-        if !self.guards.iter().any(|g| Arc::ptr_eq(g, &is_active)) {
-            self.guards.push(Arc::clone(&is_active));
-        }
-        Some((
-            slot,
-            StagedHookBinding {
-                uuid,
-                slot,
-                fresh_slot_allocated: true,
-                previous_snapshot: None,
-                is_active,
-            },
-        ))
-    }
-
-    /// Rolls back uncommitted [`StagedHookBinding`]s in reverse registration order.
-    pub(crate) fn rollback_staged_hook_bindings(&mut self, bindings: &[StagedHookBinding]) {
-        if bindings.is_empty() {
-            return;
-        }
-        for binding in bindings.iter().rev() {
-            binding.is_active.store(false, Ordering::Release);
-        }
-
-        let mut ctrl = HOOK_CONTROL
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for binding in bindings.iter().rev() {
-            let slot = binding.slot;
-            let Some((page, in_page)) = get_hook_page(slot) else {
-                continue;
-            };
-            if binding.fresh_slot_allocated {
-                self.hook_slots_by_uuid.remove(&binding.uuid);
-                page.slots[in_page].store(None);
-                ctrl.entries[slot].clear();
-                if !ctrl.free_list.contains(&slot) {
-                    ctrl.free_list.push(slot);
-                }
-            } else {
-                ctrl.entries[slot].retain(|e| {
-                    !Arc::ptr_eq(&e.is_active, &binding.is_active)
-                        && e.is_active.load(Ordering::Acquire)
-                });
-                page.slots[in_page].store(binding.previous_snapshot.clone());
-            }
-        }
-        drop(ctrl);
-        self.guards.retain(|g| g.load(Ordering::Acquire));
-    }
 }
 
 impl Drop for WorldDropGuard {
@@ -1048,79 +660,32 @@ impl Drop for WorldDropGuard {
                 }
             }
         }
-        if !self.hook_slots_by_uuid.is_empty() {
-            let mut hctrl = HOOK_CONTROL
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for &slot in self.hook_slots_by_uuid.values() {
-                if let Some((page, in_page)) = get_hook_page(slot) {
-                    page.slots[in_page].store(None);
-                }
-                hctrl.entries[slot].clear();
-                if !hctrl.free_list.contains(&slot) {
-                    hctrl.free_list.push(slot);
-                }
-            }
-        }
     }
 }
 
-/// Disarms `is_active` and prunes all drop and hook trampoline entries paired with `is_active` before `dlclose`.
+/// Disarms `is_active` and prunes all drop trampoline entries paired with `is_active` before `dlclose`.
 pub(crate) fn prune_drop_trampolines_for_guard(is_active: &Arc<AtomicBool>) {
     is_active.store(false, Ordering::Release);
-    {
-        let mut ctrl = DROP_CONTROL
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let allocated_slots = ctrl.entries.len();
-
-        for (slot, entries) in ctrl.entries.iter_mut().enumerate().take(allocated_slots) {
-            let Some((page, in_page)) = get_drop_page(slot) else {
-                continue;
-            };
-            let (state, _) = decode_slot_lifecycle(page.lifecycle[in_page].load(Ordering::Acquire));
-            if state != SLOT_IN_USE {
-                continue;
-            }
-            let before = entries.len();
-            entries.retain(|(_, g)| !Arc::ptr_eq(g, is_active) && g.load(Ordering::Acquire));
-            if entries.len() != before {
-                if entries.is_empty() {
-                    page.slots[in_page].store(None);
-                } else {
-                    let snap = Arc::new(DropSlotSnapshot {
-                        entries: entries.clone().into_boxed_slice(),
-                    });
-                    page.slots[in_page].store(Some(snap));
-                }
-            }
-        }
-    }
-
-    let mut hctrl = HOOK_CONTROL
+    let mut ctrl = DROP_CONTROL
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let allocated_hook_slots = hctrl.entries.len();
-    for (slot, entries) in hctrl
-        .entries
-        .iter_mut()
-        .enumerate()
-        .take(allocated_hook_slots)
-    {
-        if entries.is_empty() {
+    let allocated_slots = ctrl.entries.len();
+
+    for (slot, entries) in ctrl.entries.iter_mut().enumerate().take(allocated_slots) {
+        let Some((page, in_page)) = get_drop_page(slot) else {
+            continue;
+        };
+        let (state, _) = decode_slot_lifecycle(page.lifecycle[in_page].load(Ordering::Acquire));
+        if state != SLOT_IN_USE {
             continue;
         }
         let before = entries.len();
-        entries.retain(|e| {
-            !Arc::ptr_eq(&e.is_active, is_active) && e.is_active.load(Ordering::Acquire)
-        });
-        if entries.len() != before
-            && let Some((page, in_page)) = get_hook_page(slot)
-        {
+        entries.retain(|(_, g)| !Arc::ptr_eq(g, is_active) && g.load(Ordering::Acquire));
+        if entries.len() != before {
             if entries.is_empty() {
                 page.slots[in_page].store(None);
             } else {
-                let snap = Arc::new(HookSlotSnapshot {
+                let snap = Arc::new(DropSlotSnapshot {
                     entries: entries.clone().into_boxed_slice(),
                 });
                 page.slots[in_page].store(Some(snap));

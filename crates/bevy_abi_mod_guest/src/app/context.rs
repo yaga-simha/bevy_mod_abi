@@ -178,9 +178,6 @@ impl<R> core::ops::DerefMut for GuestResMut<'_, R> {
     }
 }
 
-/// Backwards-compatible alias unifying multi-query systems onto [`SystemContext`].
-pub type MultiQueryContext<'a> = SystemContext<'a>;
-
 impl<'a> SystemContext<'a> {
     pub(crate) fn from_invocation(inv: &mut ValidatedSystemInvocation<'a>) -> Self {
         let host = inv.host();

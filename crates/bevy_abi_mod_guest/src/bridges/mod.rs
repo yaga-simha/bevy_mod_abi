@@ -1,5 +1,6 @@
 //! Ergonomic `#![forbid(unsafe_code)]`, zero-Bevy guest wrappers for bridged Bevy standard
-//! components, resources, isolated mod assets, and state machines.
+//! components, resources, isolated mod assets, state machines, reflection/BRP/settings, and BSN
+//! scenes.
 
 pub mod asset;
 pub mod bsn;

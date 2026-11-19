@@ -1,4 +1,4 @@
-//! Example 1: Minimal ABI `0.2.0` Handshake (Host Application).
+//! Example 1: Minimal ABI `0.3.0` Handshake (Host Application).
 //!
 //! Demonstrates the minimal lifecycle handshake between a Bevy `World` and a native `.cdylib`
 //! guest mod: registering a `#[derive(ModComponent)]` type, shadow-copy loading with
@@ -85,7 +85,7 @@ fn ensure_guest_mod_built(manifest: &Path) -> PathBuf {
 }
 
 fn main() {
-    println!("=== Example 1: Minimal ABI 0.2.0 Handshake ===");
+    println!("=== Example 1: Minimal ABI 0.3.0 Handshake ===");
 
     let mut app = App::new();
     app.add_plugins(AbiModPlugin);
