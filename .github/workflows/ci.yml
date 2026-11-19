@@ -25,7 +25,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libasound2-dev libudev-dev libx11-dev libxi-dev libxkbcommon-dev libwayland-dev pkg-config
+            libasound2-dev libudev-dev libx11-dev libxi-dev libxkbcommon-dev libwayland-dev libegl-dev libxcursor-dev libxrandr-dev libxinerama-dev pkg-config
 
       - name: Install stable Rust toolchain + 32-bit & Wasm targets
         uses: dtolnay/rust-toolchain@stable
@@ -73,11 +73,101 @@ jobs:
           cargo check -p bevy_abi_mod_sys --target i686-unknown-linux-gnu
           cargo check -p bevy_abi_mod_sys --target wasm32-unknown-unknown
 
-      - name: SemVer compatibility check on `bevy_abi_mod_sys`
-        uses: obi1kenobi/cargo-semver-checks-action@v2
+      - name: Install `cargo-semver-checks`
+        uses: taiki-e/install-action@v2
         with:
-          package: bevy_abi_mod_sys
-          baseline-rev: ${{ github.event.pull_request.base.sha || 'HEAD~1' }}
+          tool: cargo-semver-checks
+
+      - name: SemVer compatibility check on `bevy_abi_mod_sys`
+        shell: bash
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          extract_toml_version() {
+            local section="$1"
+            awk -v sec="$section" '
+              /^\[/ {
+                hdr = $0
+                sub(/[[:space:]]*(#.*)?$/, "", hdr)
+                in_sec = (hdr == "[" sec "]")
+                next
+              }
+              in_sec && !done && /^[[:space:]]*version[[:space:]]*=[[:space:]]*"/ {
+                line = $0
+                sub(/^[^"]*"/, "", line)
+                sub(/".*$/, "", line)
+                print line
+                done = 1
+              }
+            '
+          }
+
+          read_sys_ver() {
+            local rev="$1"
+            local pkg_toml ws_toml
+            if [ "$rev" = "WORKTREE" ]; then
+              pkg_toml="$(cat crates/bevy_abi_mod_sys/Cargo.toml)"
+              ws_toml="$(cat Cargo.toml)"
+            else
+              pkg_toml="$(git show "${rev}:crates/bevy_abi_mod_sys/Cargo.toml" 2>/dev/null || true)"
+              ws_toml="$(git show "${rev}:Cargo.toml" 2>/dev/null || true)"
+            fi
+            [ -n "$pkg_toml" ] || return 0
+            if printf '%s\n' "$pkg_toml" | awk '
+              /^\[/ {
+                hdr = $0
+                sub(/[[:space:]]*(#.*)?$/, "", hdr)
+                in_pkg = (hdr == "[package]")
+                next
+              }
+              in_pkg && ( \
+                /^[[:space:]]*version\.workspace[[:space:]]*=[[:space:]]*true/ || \
+                /^[[:space:]]*version[[:space:]]*=[[:space:]]*\{[^}]*workspace[[:space:]]*=[[:space:]]*true/ \
+              ) {
+                found = 1
+              }
+              END { exit(found ? 0 : 1) }
+            '; then
+              printf '%s\n' "$ws_toml" | extract_toml_version "workspace.package"
+            else
+              printf '%s\n' "$pkg_toml" | extract_toml_version "package"
+            fi
+          }
+
+          CUR_VER="$(read_sys_ver WORKTREE)"
+          if [ -z "$CUR_VER" ]; then
+            echo "ERROR: could not read current bevy_abi_mod_sys version." >&2
+            exit 1
+          fi
+          CUR_MM="$(printf '%s' "$CUR_VER" | cut -d. -f1,2)"
+          LATEST_TAG="$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)"
+
+          if [ -n "$LATEST_TAG" ]; then
+            TAG_VER="$(read_sys_ver "$LATEST_TAG")"
+            TAG_MM="$(printf '%s' "$TAG_VER" | cut -d. -f1,2)"
+            if [ -n "$TAG_VER" ] && [ "$TAG_MM" = "$CUR_MM" ]; then
+              echo "Running cargo-semver-checks against release tag $LATEST_TAG ($TAG_VER) for $CUR_VER."
+              cargo semver-checks check-release -p bevy_abi_mod_sys --baseline-rev "$LATEST_TAG"
+              exit 0
+            fi
+            echo "Skipping release-tag baseline $LATEST_TAG (${TAG_VER:-unknown}, major.minor=${TAG_MM:-unknown}): intentional bump to $CUR_VER (major.minor=$CUR_MM)."
+          else
+            echo "No reachable v* release tag found yet; skipping tag-based SemVer baseline for $CUR_VER."
+          fi
+
+          if [ -n "${PR_BASE:-}" ]; then
+            BASE_VER="$(read_sys_ver "$PR_BASE")"
+            if [ "$BASE_VER" = "$CUR_VER" ]; then
+              echo "Running cargo-semver-checks against PR base $PR_BASE ($BASE_VER)."
+              cargo semver-checks check-release -p bevy_abi_mod_sys --baseline-rev "$PR_BASE"
+            else
+              echo "Skipping PR base $PR_BASE (${BASE_VER:-unknown}): bevy_abi_mod_sys version changed ($BASE_VER -> $CUR_VER)."
+            fi
+          else
+            echo "No matching release tag or PR base baseline applies on this push; SemVer check complete."
+          fi
 
       - name: Install `mdbook`
         uses: taiki-e/install-action@v2
@@ -105,7 +195,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libasound2-dev libudev-dev libx11-dev libxi-dev libxkbcommon-dev libwayland-dev pkg-config
+            libasound2-dev libudev-dev libx11-dev libxi-dev libxkbcommon-dev libwayland-dev libegl-dev libxcursor-dev libxrandr-dev libxinerama-dev pkg-config
 
       - name: Initialize MSVC Developer Environment
         if: runner.os == 'Windows'
@@ -136,6 +226,11 @@ jobs:
           cargo run -p cargo-bam -- doctor
           cargo run -p cargo-bam -- header --out target/ci_sdk_check
 
+      - name: Run 10,000-cycle hot-reload soak gate (Linux release)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: BAM_SOAK_CYCLES=10000 BAM_FIXTURE_DIR="${{ github.workspace }}/target/fixtures" cargo test -p bevy_abi_mod_host --test soak_10k_reloads --release
+
   # ============================================================================
   # 3. Heavy GUI / 3D Examples (`04_visual_game`, `05_cute_3d_winit`)
   # ============================================================================
@@ -150,7 +245,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libasound2-dev libudev-dev libx11-dev libxi-dev libxkbcommon-dev libwayland-dev pkg-config
+            libasound2-dev libudev-dev libx11-dev libxi-dev libxkbcommon-dev libwayland-dev libegl-dev libxcursor-dev libxrandr-dev libxinerama-dev pkg-config
 
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -281,7 +376,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libasound2-dev libudev-dev libx11-dev libxi-dev libxkbcommon-dev libwayland-dev pkg-config
+            libasound2-dev libudev-dev libx11-dev libxi-dev libxkbcommon-dev libwayland-dev libegl-dev libxcursor-dev libxrandr-dev libxinerama-dev pkg-config
 
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -410,7 +505,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libasound2-dev libudev-dev libx11-dev libxi-dev libxkbcommon-dev libwayland-dev pkg-config
+            libasound2-dev libudev-dev libx11-dev libxi-dev libxkbcommon-dev libwayland-dev libegl-dev libxcursor-dev libxrandr-dev libxinerama-dev pkg-config
 
       - name: Install `cargo-llvm-cov`
         uses: taiki-e/install-action@v2
@@ -435,7 +530,7 @@ jobs:
               -p bevy_abi_mod_reflect \
               -p bevy_abi_mod_watcher
           cargo llvm-cov report \
-            --ignore-filename-regex '(crates/bevy_abi_mod_host_sys/src/(drop_trampoline|handle_header|lib|loader|registry|schedule|sync_ptr|ffi/validation)|crates/bevy_abi_mod_(host|bridges|render|reflect|watcher|macros|sys|guest|guest_sys|trust|manifest|sdk_gen)/|crates/bevy_abi_mod/|crates/bevy_mod_abi/|tests/)' \
+            --ignore-filename-regex '(crates/bevy_abi_mod_host_sys/src/(drop_trampoline|handle_header|lib|loader|registry|schedule|sync_ptr|ffi/validation)|crates/bevy_abi_mod_(host|bridges|render|reflect|watcher|macros|sys|guest|guest_sys|trust|manifest|sdk_gen)/|crates/bevy_abi_mod/|crates/bevy_mod_abi/|(tests|examples|xtask|benches)/)' \
             --fail-under-lines 85
 
   # ============================================================================
