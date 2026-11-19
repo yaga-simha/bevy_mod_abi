@@ -1,6 +1,6 @@
 # Benchmarks & Deterministic Regression Gates (`ABI 0.3.0`)
 
-This document records the **canonical benchmark scenarios**, **deterministic CI regression gates (`iai-callgrind` + counting allocator)**, **reference hardware baselines**, and the **full 5-dimensional permutation matrix** for `bevy_abi_mod` (`ABI 0.3.0`).
+This document records the **canonical benchmark scenarios**, **deterministic CI regression gates (`iai-callgrind` + counting allocator)**, **reference hardware baselines**, the **full 5-dimensional permutation matrix**, and **ABI `0.3.0` migration / hot-rewire / soak gates** for `bevy_abi_mod` (`v0.3.0`).
 
 ```bash
 # 1. Run all 9 canonical host benchmark scenarios (stages Rust & C99 fixtures automatically)
@@ -15,6 +15,12 @@ cargo bench --manifest-path benches/deterministic_gate/Cargo.toml
 
 # 4. Full 34-archetype Debug x Release x Native/dylib/C-ABI permutation ladder
 cargo xtask bench --permutation
+
+# 5. ABI 0.3.0 migration, hot-rewire, schedule-shuffle, & 10,000-reload soak gates
+cargo test --release -p bevy_abi_mod_host_sys --test v03_migration_symbols --all-features -- --nocapture --test-threads=1
+cargo test --release -p bevy_abi_mod_host_sys --test v03_schedules_error_bridge --all-features -- --nocapture
+cargo test --release -p bevy_abi_mod_host --test soak_10k_reloads --all-features -- --nocapture
+cargo test -p bevy_abi_mod_host --test schedule_shuffle_fuzz --all-features -- --nocapture
 ```
 
 ---
@@ -192,3 +198,19 @@ Beyond single-query microbenchmarks, `permutation_bench` evaluates a **34-archet
 1. **Hoist FFI Calls to the Chunk Level:** Crossing `extern "C"` once per archetype table (`ChunkOptimized` / `Chunk::component_mut`) runs within `0–15%` of statically linked Bevy—and even faster on simple dense loops thanks to contiguous slice auto-vectorization.
 2. **Use Batched `cmd_spawn` for Multi-Component Entities:** Spawning `K` components via `cmd_spawn` writes directly into the final Bevy archetype in one transition instead of `K` table relocations.
 3. **Debug Mods Inside a Release Host:** Because the C-ABI decouples optimization profiles, modders can attach LLDB/GDB to an `-O0` guest `.cdylib`/`.dylib` inside a full-speed `--release` Bevy game at `< 7%` frame budget cost.
+
+---
+
+## 5. ABI `0.3.0` Reload, Migration, Hot-Rewire, Cascade & Soak Gates
+
+Beyond frame-loop microbenchmarks, `v0.3.0` enforces automated performance and allocation invariants across all live ABI `0.3.0` (`68/68`) subsystems:
+
+| Gate / Integration Suite | Workload | Asserted Invariant / Reference Baseline |
+|---|---|---|
+| **Zero-Copy Fingerprint Reload** (`v03_migration_symbols`) | `100,000` live entities with unchanged `schema_fingerprint` | **`0` bytes copied**, identical Bevy `ComponentId` & raw `BlobVec` pointer; **`0.117 ms`** reference (`< 1.5 ms` gate) |
+| **Contiguous Column Migration** (`v03_migration_symbols`) | `100,000` live entities (`8B -> 16B` via `migrate_component_column`) | **`0` per-entity heap allocations** (custom `#[global_allocator]` verified), atomic error abort, active + `Disabled` coverage (`~0.48 ms` buffer + transform, `8.40 ms` full Bevy `EntityWorldMut` commit) |
+| **Schedule-Only Hot-Rewire** (`v03_schedules_error_bridge`) | Live `ModScheduleSetRewirePass` schedule rebuild without re-initializing `GuestSystem`s | Identical `SystemKey`s, preserved `last_run`/`Changed<T>` state; **`61.5 µs` median** (`36.6–89.1 µs`, `< 0.4 ms` gate) |
+| **Zero-Arena Read-Only Parallelism** (`v03_cascade_par`) | `20,000`-entity multi-core `par_for_each_chunk_readonly` + `50,000`-entity 6-depth `CascadeHierarchyCache` | **`0` per-worker `HostCommands`/`CommandArena` heap allocations**, exact single-pass vs. parallel parity |
+| **Schedule Shuffle Property Fuzz** (`tests/schedule_shuffle_fuzz.rs`) | 5-mod DAG (`.chain()`, `.chain_weak()`, `PARALLEL`, observers, relations) across 256 shuffle permutations | **Bit-identical world-state hashes** across all 256 schedule permutations |
+| **10,000-Reload Soak Harness** (`tests/soak_10k_reloads.rs`) | `10,000` consecutive reloads mixing zero-copy, `migrate_component_column`, and `DROP_PAGES` churn past `4,096` slots | Bounded reload p99 latency (`< 2.0 ms`) and flat process RSS delta |
+| **Budget & Telemetry Overhead** (`mod_budgets` & `telemetry_test`) | `ModBudgetPolicy` quotas/watchdogs + `ModTelemetryPlugin` 64-byte Unix/loopback digest stream | **`0` steady-state heap allocations** in `CommandArena` hot paths; bounded non-blocking per-client drop-oldest framing |

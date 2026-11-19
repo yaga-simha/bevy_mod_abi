@@ -2,23 +2,23 @@
 
 This walkthrough builds a minimal Bevy `0.20+` host and a decoupled Rust `.cdylib` guest mod communicating over `ABI 0.3.0` (`0x0003_0000`) with zero `bevy` dependencies in the guest.
 
-> **Tip:** To scaffold a mod project automatically in Rust, C99, C++17, or Zig, install `cargo-bam` (`cargo install --path crates/cargo-bam`) and run `cargo bam new my_guest_mod --lang rust` — see [Bridges, Trust & `cargo-bam` Tooling](./bridges-and-tooling.md).
+> **Tip:** To scaffold, watch, and package a mod project automatically in Rust, C99, C++17, or Zig, install `cargo-bam` (`cargo install --path crates/cargo-bam`) and run `cargo bam new my_guest_mod --lang rust` — see [Bridges, Render, Reflect, Trust & `cargo-bam`](./bridges-and-tooling.md).
 
 ---
 
-## 1. Host Application (`bevy_abi_mod`)
+## 1. Host Application (`bevy_mod_abi` / `bevy_abi_mod`)
 
 `Cargo.toml`:
 ```toml
 [dependencies]
 bevy_app = "0.20"
 bevy_ecs = "0.20"
-bevy_abi_mod = { path = "crates/bevy_abi_mod" }
+bevy_mod_abi = "0.3.0"
 ```
 
 `src/main.rs`:
 ```rust
-use bevy_abi_mod::prelude::*;
+use bevy_mod_abi::prelude::*;
 use bevy_app::App;
 use bevy_ecs::component::Component;
 
@@ -75,7 +75,7 @@ Create a separate crate (`[workspace]` standalone `Cargo.lock`, zero `bevy` depe
 ```toml
 [package]
 name = "my_guest_mod"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 
 [workspace]
@@ -84,7 +84,7 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-bevy_abi_mod_guest = { path = "../crates/bevy_abi_mod_guest", features = ["derive"] }
+bevy_abi_mod_guest = { version = "0.3.0", features = ["derive"] }
 ```
 
 `guest_mod/src/lib.rs`:
@@ -111,7 +111,7 @@ pub struct MyGuestMod;
 
 impl GuestPlugin for MyGuestMod {
     const NAME: &'static CStr = c"my_guest_mod";
-    const VERSION: &'static CStr = c"0.2.0";
+    const VERSION: &'static CStr = c"0.3.0";
 
     fn build(&mut self, app: &mut GuestApp<'_>) -> FfiResult {
         app.system(c"nudge_positions")
@@ -136,4 +136,4 @@ impl GuestPlugin for MyGuestMod {
 export_mod!(plugin: MyGuestMod);
 ```
 
-Build the guest with `cargo build --manifest-path guest_mod/Cargo.toml --release` and run your host! See [`examples/01_minimal_handshake`](../../../examples/01_minimal_handshake) for a complete runnable project.
+Build the guest with `cargo build --manifest-path guest_mod/Cargo.toml --release` (or `cargo bam build --dir guest_mod --release`) and run your host! See [`examples/01_minimal_handshake`](../../../examples/01_minimal_handshake) for a complete runnable project.

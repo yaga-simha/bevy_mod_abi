@@ -1,6 +1,6 @@
 # ISO C99, C++17 & Zig Guest Guide
 
-All non-Rust languages target the single auto-generated header [`include/bevy_abi_mod.h`](../../../include/bevy_abi_mod.h) emitted by `bevy_abi_mod_sdk_gen` (`cargo bam export-sdk --out include` or `cargo xtask header`), which also produces `bevy_abi_mod.hpp` (C++17), `bevy_abi_mod.zig` (Zig), and platform `BAM_EXPORT` macros (`__declspec(dllexport)` on Windows `_WIN32`, visibility attributes on ELF/Mach-O). Every wire struct is verified at compile time via `BAM_STATIC_ASSERT` (`sizeof`, `alignof`, `offsetof`) on both 64-bit and 32-bit targets.
+All non-Rust languages target the single auto-generated header [`include/bevy_abi_mod.h`](../../../include/bevy_abi_mod.h) emitted by `bevy_abi_mod_sdk_gen` (`cargo bam export-sdk --out include` or `cargo xtask header`), which also produces `bevy_abi_mod.hpp` (C++17) and `bevy_abi_mod.zig` (Zig). Every export includes platform `BAM_EXPORT` macros (`__declspec(dllexport)` on Windows `_WIN32`, visibility attributes on ELF/Mach-O), `BAM_RESTRICT` non-aliasing hints (`__restrict` on MSVC, `restrict` in C99/C11, `"noalias"` in Zig), all 68 `BAM_HOST_API_OFFSET_*` slot offsets, and compile-time `BAM_STATIC_ASSERT` (`sizeof`, `alignof`, `offsetof`) verification on both 64-bit and 32-bit targets.
 
 ---
 
@@ -12,14 +12,15 @@ Every shared library must export three `extern "C"` symbols (`BAM_EXPORT`):
 3. `void bevy_abi_mod_shutdown(BamInstance* instance)`
 
 **Core Rules Across All Foreign Languages:**
-1. **Copy `BamHostApi` Boundedly:** Call `bam_host_api_copy_bounded(&local_api, sizeof(local_api), host_api)` in `init` so newer hosts with larger `struct_size` tables work seamlessly.
+1. **Copy `BamHostApi` Boundedly:** Call `bam_host_api_copy_bounded(&local_api, sizeof(local_api), host_api)` in `init` so newer hosts with larger `struct_size` tables work seamlessly, and check extended slots with `bam_host_api_covers_slot(&local_api, BAM_HOST_API_OFFSET_*, sizeof(...))`.
 2. **Zero Process Globals:** Store `local_api` and resolved `BamComponent` handles in a heap-allocated struct returned via `*instance_out` and freed in `bevy_abi_mod_shutdown(instance)`.
 3. **Never Unwind Across `extern "C"`:** Every callback is `nounwind`. Catch C++ exceptions or map Zig error unions to `BamResult` before returning.
 4. **Never Cache Scoped Handles:** `BamLoadCtx*`, `BamSystemCtx*`, `BamIter*`, and `BamCommands*` are valid strictly for the duration of the enclosing callback; debug builds and `strict-ffi-checks` poison their headers on return.
+5. **Hint Non-Aliasing Columns with `BAM_RESTRICT`:** Annotate disjoint SoA column pointers borrowed from `iter_column_readonly` / `iter_column_mutable` with `BAM_RESTRICT` so Clang/GCC/MSVC vectorize tight inner loops at parity with Rust slices.
 
 ---
 
-## 2. ISO C99 Guest Pattern (`examples/03_cross_language_interop`)
+## 2. ISO C99 Guest Pattern (`examples/03_cross_language_interop` & `examples/09_bql_wire_parity`)
 
 Compile with `-std=c99 -Wall -Wextra -Wpedantic -Werror -Iinclude -shared -fPIC`:
 
@@ -36,7 +37,7 @@ static const BamManifest MANIFEST = {
     .struct_size = (uint32_t)sizeof(BamManifest),
     .abi_version = BAM_ABI_VERSION, // ABI 0.3.0 (0x00030000)
     .name        = "my_c99_mod",
-    .version     = "0.2.0",
+    .version     = "0.3.0",
     .flags       = 0u,
     .reserved0   = 0u
 };
@@ -50,7 +51,7 @@ static BamResult step_positions(BamSystemCtx* sys_ctx, void* user_data) {
     if (res != BAM_RESULT_OK) return res;
 
     while (st->api.iter_next_chunk(iter, &len) != BAM_FALSE) {
-        float* xyz = (float*)st->api.iter_column_mutable(iter, 0u);
+        float* BAM_RESTRICT xyz = (float*)st->api.iter_column_mutable(iter, 0u);
         if (xyz == NULL) return BAM_RESULT_NULL_POINTER;
         for (size_t i = 0u; i < len * 3u; ++i) {
             xyz[i] += 1.0f;
@@ -99,11 +100,13 @@ BAM_EXPORT void bevy_abi_mod_shutdown(BamInstance* instance) {
 }
 ```
 
+See [`examples/09_bql_wire_parity`](../../../examples/09_bql_wire_parity) for a complete ISO C99 DSO exercising every ABI `0.3.0` slot (`register_relation`, `iter_up_cascade`, `par_for_each_chunk_readonly`, `cmd_checkpoint`/`cmd_rollback`, `configure_schedule_set` `.chain_weak()`, `intern_symbol`, `bind_named_object`, `BamFieldDesc`, and live v1→v2 `migrate_component_column`) in bit-identical lockstep with Safe Rust.
+
 ---
 
 ## 3. ISO C++17 Guest Pattern (`examples/07_cpp17_guest`)
 
-In C++17 (`c++ -std=c++17 -Wall -Wextra -Wpedantic -Werror`), `BAM_EXPORT` expands to `extern "C"` with visibility attributes. Wrap `init`, `shutdown`, and every `noexcept` callback trampoline in `try { ... } catch (...)` and manage per-`World` state with `std::unique_ptr`:
+In C++17 (`c++ -std=c++17 -Wall -Wextra -Wpedantic -Werror`), `BAM_EXPORT` expands to `extern "C"` with visibility attributes, and `bevy_abi_mod.hpp` provides `bam::offsets::*`, `host_api_covers_slot`, `copy_column_restricted`, and typed RAII views. Wrap `init`, `shutdown`, and every `noexcept` callback trampoline in `try { ... } catch (...)` and manage per-`World` state with `std::unique_ptr`:
 
 ```cpp
 static BamResult kinematics_trampoline(BamSystemCtx* sys_ctx, void* user_data) noexcept {
@@ -122,7 +125,7 @@ See [`examples/07_cpp17_guest/cpp_mod/mod.cpp`](../../../examples/07_cpp17_guest
 
 ## 4. Zig Guest Pattern (`examples/08_zig_guest`)
 
-Zig (`0.14`–`0.16`, `0.16.0` recommended) imports `include/bevy_abi_mod.h` directly via `@cImport` with zero manual bindings. Use `errdefer` with `std.heap.c_allocator` in `init` and map Zig error unions to `c.BamResult` inside `callconv(.c)` callbacks:
+Zig (`0.14`–`0.16`, `0.16.0` recommended) imports `include/bevy_abi_mod.h` directly via `@cImport` (or uses exported `bevy_abi_mod.zig` with `offsets.*`, `coversHostApiSlot`, `BAM_RESTRICT_QUALIFIER = "noalias"`, `BamError::CycleDetected`, and `copyColumnNoAlias`). Use `errdefer` with `std.heap.c_allocator` in `init` and map Zig error unions to `c.BamResult` inside `callconv(.c)` callbacks:
 
 ```zig
 const c = @cImport({ @cInclude("bevy_abi_mod.h"); });

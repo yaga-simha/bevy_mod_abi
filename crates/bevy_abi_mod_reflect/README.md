@@ -1,9 +1,9 @@
 # `bevy_abi_mod_reflect`
 
-Safe (`#![forbid(unsafe_code)]`) dynamic `bevy_reflect`, Bevy Remote Protocol (`bevy_remote` BRP), and `bevy_settings` TOML bridges for [`bevy_abi_mod`](../bevy_abi_mod).
+Safe (`#![forbid(unsafe_code)]`) dynamic `bevy_reflect`, Bevy Remote Protocol (`bevy_remote` BRP), `bevy-settings` TOML, persistent save-game archives, and live telemetry bridges for [`bevy_abi_mod`](../bevy_abi_mod) (`ABI 0.3.0`, `v0.3.0`).
 
 ## Overview
 
-- **`ModReflectPlugin` / `ModReflectAppExt` / `ModReflectWorldExt`:** Synthesizes `DynamicStruct` / `ReflectFromPtr` / `ReflectComponent` / `ReflectResource` registrations from `ModComponent` witness schemas and declarative ABI `0.3` `BamFieldDesc` descriptors.
-- **BRP Integration (`bevy_remote`):** Installs `bevy_abi_mod/*` JSON-RPC methods and enables standard Bevy BRP inspection/mutation for foreign C-ABI components and resources.
-- **Settings Sync (`bevy-settings`):** Synchronizes mod configuration resources with persistent TOML files.
+- **`ModReflectPlugin` / `ModReflectAppExt` / `ModReflectWorldExt`:** Synthesizes `DynamicStruct`, `ReflectFromPtr`, `ReflectComponent`, and `ReflectResource` registrations from both `ModComponent` witness schemas and declarative ABI `0.3` `BamFieldDesc` descriptors (working seamlessly for raw C99/C++17/Zig/BQL types without Rust witness VTables), installs 6 `bevy_abi_mod/*` JSON-RPC BRP methods alongside standard Bevy `world.*` BRP, and synchronizes mod configuration resources with persistent `bevy-settings` TOML files.
+- **`ModSaveGamePlugin` / `ModSaveAppExt` / `ModSaveWorldExt`:** Persists `!ModScoped` modded entities into versioned JSON or checksummed `BAMSAVE1` binary `ModSaveArchive` snapshots (recording `mod_id`, `semver`, `component_uuid`, `schema_fingerprint`, layout, and fields) with three recovery policies: `StrictRequireMods` (atomic mismatch rejection), `StripMissingModComponents` (graceful partial load with `ModSaveLoadReport`), and `MigrateOnLoad` (automatic field-name-matched `BamFieldDesc`/witness + custom `ModComponentMigrator` upgrades).
+- **`ModTelemetryPlugin` / `ModTelemetryRemoteExt` / `ModTelemetryWorldExt`:** Installs 4 `bam/*` BRP JSON-RPC methods (`bam/list_mods`, `bam/system_metrics`, `bam/component_schemas` with exact `BamFieldDesc` offsets, and deferred `bam/hot_reload`), automatically ingests `ModBudgetTelemetry::system_budget_snapshots()`, and streams 64-byte little-endian `SystemTelemetryDigest64` frames (`p50_us`, `p99_us`, `summary_tick` table skips, fault/quarantine/budget flags) over non-blocking `AF_UNIX` Unix domain sockets or cross-platform loopback TCP.
