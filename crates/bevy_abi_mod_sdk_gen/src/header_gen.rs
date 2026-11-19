@@ -15,21 +15,24 @@ use bevy_abi_mod_sys::{
     BAM_COMPONENT_FLAG_SPARSE_SET, BAM_COMPONENT_FLAG_SUMMARY_TICK, BAM_COMPONENT_KNOWN_FLAGS,
     BAM_HOST_API_SLOT_COUNT, BAM_LOG_DEBUG, BAM_LOG_ERROR, BAM_LOG_INFO, BAM_LOG_TRACE,
     BAM_LOG_WARN, BAM_MANIFEST_KNOWN_FLAGS, BAM_MAX_CHANGE_AGE, BAM_OBSERVER_FLAG_PROPAGATE,
-    BAM_OBSERVER_KNOWN_FLAGS, BAM_QUERY_KNOWN_FLAGS, BAM_RELATION_FLAG_CASCADE_DESPAWN,
-    BAM_RELATION_FLAG_EXCLUSIVE, BAM_RELATION_FLAG_SYMMETRIC, BAM_RELATION_KNOWN_FLAGS,
-    BAM_REQUIRED_FLAG_CUSTOM_BYTES, BAM_REQUIRED_FLAG_INIT_FN, BAM_REQUIRED_FLAG_RESOLVE_BY_UUID,
-    BAM_REQUIRED_KNOWN_FLAGS, BAM_SCHEDULE_SET_KNOWN_FLAGS, BAM_STORAGE_FLAG_ENTITY_EVENT,
-    BAM_STORAGE_FLAG_EVENT, BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE,
-    BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_SUMMARY_TICK,
-    BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL, BAM_SYSTEM_FLAG_MAIN_THREAD, BAM_SYSTEM_KNOWN_FLAGS,
-    BAM_TERM_KNOWN_FLAGS, BAM_TRIGGER_FLAG_PROPAGATE, BAM_TRIGGER_KNOWN_FLAGS, BamChangeTicks,
-    BamColumnInfo, BamComponent, BamEventKind, BamFieldDesc, BamFieldKind, BamHostApi,
-    BamLayoutInfo, BamManifest, BamObserverDesc, BamQueryDesc, BamRelationDesc,
-    BamRequiredComponent, BamScheduleSetDesc, BamSymbol, BamSystem, BamSystemDesc, BamSystemSet,
-    BamTermDesc, BamTriggerDesc, ComponentDesc, ComponentUuid, FfiAssetHandle, FfiAssetLoadState,
-    FfiBool, FfiChildOf, FfiEntity, FfiOption, FfiResult, MAX_QUERIES_PER_SYSTEM,
-    MAX_TERMS_PER_QUERY, MappedStringVTable, SIPHASH_KEY_0, SIPHASH_KEY_1, ScheduleId, StrView,
-    VTableHeader, offsets as host_api_offsets,
+    BAM_OBSERVER_KNOWN_FLAGS, BAM_QUERY_KNOWN_FLAGS, BAM_RELATION_FLAG_ACYCLIC,
+    BAM_RELATION_FLAG_CASCADE_DELETE, BAM_RELATION_FLAG_CASCADE_DESPAWN,
+    BAM_RELATION_FLAG_CLEANUP_REMOVE, BAM_RELATION_FLAG_EXCLUSIVE, BAM_RELATION_FLAG_SYMMETRIC,
+    BAM_RELATION_KNOWN_FLAGS, BAM_REQUIRED_FLAG_CUSTOM_BYTES, BAM_REQUIRED_FLAG_INIT_FN,
+    BAM_REQUIRED_FLAG_RESOLVE_BY_UUID, BAM_REQUIRED_KNOWN_FLAGS, BAM_SCHEDULE_SET_FLAG_AFTER_WEAK,
+    BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK, BAM_SCHEDULE_SET_FLAG_PARALLEL,
+    BAM_SCHEDULE_SET_FLAG_SEQUENCE, BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK,
+    BAM_SCHEDULE_SET_KNOWN_FLAGS, BAM_STORAGE_FLAG_ENTITY_EVENT, BAM_STORAGE_FLAG_EVENT,
+    BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE,
+    BAM_STORAGE_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_SUMMARY_TICK, BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL,
+    BAM_SYSTEM_FLAG_MAIN_THREAD, BAM_SYSTEM_KNOWN_FLAGS, BAM_TERM_KNOWN_FLAGS,
+    BAM_TRIGGER_FLAG_PROPAGATE, BAM_TRIGGER_KNOWN_FLAGS, BamChangeTicks, BamColumnInfo,
+    BamComponent, BamEventKind, BamFieldDesc, BamFieldKind, BamHostApi, BamLayoutInfo, BamManifest,
+    BamObserverDesc, BamQueryDesc, BamRelationDesc, BamRequiredComponent, BamScheduleSetDesc,
+    BamSymbol, BamSystem, BamSystemDesc, BamSystemSet, BamTermDesc, BamTriggerDesc, ComponentDesc,
+    ComponentUuid, FfiAssetHandle, FfiAssetLoadState, FfiBool, FfiChildOf, FfiEntity, FfiOption,
+    FfiResult, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, MappedStringVTable, SIPHASH_KEY_0,
+    SIPHASH_KEY_1, ScheduleId, StrView, VTableHeader, offsets as host_api_offsets,
 };
 
 #[derive(Clone, Copy)]
@@ -1912,6 +1915,7 @@ pub fn render_c99_header() -> Result<String, String> {
          #define BAM_RESULT_CAPACITY_EXCEEDED ((BamResult){}u)\n\
          #define BAM_RESULT_UNSUPPORTED       ((BamResult){}u)\n\
          #define BAM_RESULT_TYPE_MISMATCH     ((BamResult){}u)\n\
+         #define BAM_RESULT_CYCLE_DETECTED    ((BamResult){}u)\n\
          #define BAM_RESULT_INTERNAL_ERROR    ((BamResult){}u)\n\n\
          typedef uint32_t BamAccessMode;\n\
          #define BAM_ACCESS_READ           ((BamAccessMode){}u)\n\
@@ -1998,8 +2002,16 @@ pub fn render_c99_header() -> Result<String, String> {
          #define BAM_REQUIRED_KNOWN_FLAGS            0x{BAM_REQUIRED_KNOWN_FLAGS:08X}u\n\
          #define BAM_RELATION_FLAG_EXCLUSIVE         0x{BAM_RELATION_FLAG_EXCLUSIVE:08X}u\n\
          #define BAM_RELATION_FLAG_CASCADE_DESPAWN   0x{BAM_RELATION_FLAG_CASCADE_DESPAWN:08X}u\n\
+         #define BAM_RELATION_FLAG_CASCADE_DELETE    0x{BAM_RELATION_FLAG_CASCADE_DELETE:08X}u\n\
          #define BAM_RELATION_FLAG_SYMMETRIC         0x{BAM_RELATION_FLAG_SYMMETRIC:08X}u\n\
+         #define BAM_RELATION_FLAG_ACYCLIC           0x{BAM_RELATION_FLAG_ACYCLIC:08X}u\n\
+         #define BAM_RELATION_FLAG_CLEANUP_REMOVE    0x{BAM_RELATION_FLAG_CLEANUP_REMOVE:08X}u\n\
          #define BAM_RELATION_KNOWN_FLAGS            0x{BAM_RELATION_KNOWN_FLAGS:08X}u\n\
+         #define BAM_SCHEDULE_SET_FLAG_SEQUENCE      0x{BAM_SCHEDULE_SET_FLAG_SEQUENCE:08X}u\n\
+         #define BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK 0x{BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK:08X}u\n\
+         #define BAM_SCHEDULE_SET_FLAG_PARALLEL      0x{BAM_SCHEDULE_SET_FLAG_PARALLEL:08X}u\n\
+         #define BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK   0x{BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK:08X}u\n\
+         #define BAM_SCHEDULE_SET_FLAG_AFTER_WEAK    0x{BAM_SCHEDULE_SET_FLAG_AFTER_WEAK:08X}u\n\
          #define BAM_SCHEDULE_SET_KNOWN_FLAGS        0x{BAM_SCHEDULE_SET_KNOWN_FLAGS:08X}u\n\
          #define BAM_STORAGE_FLAG_SPARSE_SET         0x{BAM_STORAGE_FLAG_SPARSE_SET:08X}u\n\
          #define BAM_STORAGE_FLAG_IMMUTABLE          0x{BAM_STORAGE_FLAG_IMMUTABLE:08X}u\n\
@@ -2031,6 +2043,7 @@ pub fn render_c99_header() -> Result<String, String> {
         FfiResult::CAPACITY_EXCEEDED.0,
         FfiResult::UNSUPPORTED.0,
         FfiResult::TYPE_MISMATCH.0,
+        FfiResult::CYCLE_DETECTED.0,
         FfiResult::INTERNAL_ERROR.0,
         AccessMode::READ.0,
         AccessMode::WRITE.0,
@@ -2610,6 +2623,7 @@ pub fn render_c99_header() -> Result<String, String> {
                  case BAM_RESULT_CAPACITY_EXCEEDED: return \"CAPACITY_EXCEEDED\";\n\
                  case BAM_RESULT_UNSUPPORTED:       return \"UNSUPPORTED\";\n\
                  case BAM_RESULT_TYPE_MISMATCH:     return \"TYPE_MISMATCH\";\n\
+                 case BAM_RESULT_CYCLE_DETECTED:    return \"CYCLE_DETECTED\";\n\
                  case BAM_RESULT_INTERNAL_ERROR:    return \"INTERNAL_ERROR\";\n\
                  default:                           return \"UNKNOWN\";\n\
              }\n\

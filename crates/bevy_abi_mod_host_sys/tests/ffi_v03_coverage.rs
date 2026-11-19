@@ -656,7 +656,7 @@ fn v03_reserved_slots_exhaustive_validation() {
             FfiResult::INVALID_VERSION
         );
         let mut bad_set_flags = valid_set;
-        bad_set_flags.flags = 1;
+        bad_set_flags.flags = 1u32 << 31;
         assert_eq!(
             host_configure_schedule_set(load_ptr, &bad_set_flags, &raw mut out_set),
             FfiResult::UNSUPPORTED

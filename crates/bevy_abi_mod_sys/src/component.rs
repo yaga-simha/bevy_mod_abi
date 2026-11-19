@@ -940,12 +940,27 @@ pub const BAM_RELATION_FLAG_EXCLUSIVE: u32 = 1 << 0;
 /// Cascade-despawn relationship flag: despawning the target also despawns dependent source entities.
 pub const BAM_RELATION_FLAG_CASCADE_DESPAWN: u32 = 1 << 1;
 
+/// Alias for [`BAM_RELATION_FLAG_CASCADE_DESPAWN`] (`1 << 1`): despawning the target cascades
+/// deletion to dependent source entities.
+pub const BAM_RELATION_FLAG_CASCADE_DELETE: u32 = BAM_RELATION_FLAG_CASCADE_DESPAWN;
+
 /// Symmetric relationship flag: edge `(A -> B)` implies `(B -> A)`.
 pub const BAM_RELATION_FLAG_SYMMETRIC: u32 = 1 << 2;
 
+/// Acyclic relationship flag: inserting an edge that would create a directed cycle is rejected
+/// with [`FfiResult::CYCLE_DETECTED`].
+pub const BAM_RELATION_FLAG_ACYCLIC: u32 = 1 << 3;
+
+/// Cleanup-remove relationship flag: despawning a target strips only the relation edge from
+/// source entities rather than despawning them.
+pub const BAM_RELATION_FLAG_CLEANUP_REMOVE: u32 = 1 << 4;
+
 /// Bitmask of all recognized [`BamRelationDesc::flags`] bits in ABI `0.3`.
-pub const BAM_RELATION_KNOWN_FLAGS: u32 =
-    BAM_RELATION_FLAG_EXCLUSIVE | BAM_RELATION_FLAG_CASCADE_DESPAWN | BAM_RELATION_FLAG_SYMMETRIC;
+pub const BAM_RELATION_KNOWN_FLAGS: u32 = BAM_RELATION_FLAG_EXCLUSIVE
+    | BAM_RELATION_FLAG_CASCADE_DESPAWN
+    | BAM_RELATION_FLAG_SYMMETRIC
+    | BAM_RELATION_FLAG_ACYCLIC
+    | BAM_RELATION_FLAG_CLEANUP_REMOVE;
 
 /// Descriptor registering a typed entity relationship edge (`typedef struct BamRelationDesc BamRelationDesc;`).
 ///
@@ -1089,8 +1104,36 @@ pub type BamRowMigrateFn = unsafe extern "C" fn(
     user_data: *mut c_void,
 ) -> FfiResult;
 
-/// Bitmask of recognized [`BamScheduleSetDesc::flags`] bits in ABI `0.3` (`0`).
-pub const BAM_SCHEDULE_SET_KNOWN_FLAGS: u32 = 0;
+/// Schedule set flag: run member systems strictly sequentially (Bevy `.chain()`).
+///
+/// Mutually exclusive with [`BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK`] and
+/// [`BAM_SCHEDULE_SET_FLAG_PARALLEL`].
+pub const BAM_SCHEDULE_SET_FLAG_SEQUENCE: u32 = 1 << 0;
+
+/// Schedule set flag: run member systems sequentially with weak edges (Bevy `.chain_weak()`).
+///
+/// Mutually exclusive with [`BAM_SCHEDULE_SET_FLAG_SEQUENCE`] and
+/// [`BAM_SCHEDULE_SET_FLAG_PARALLEL`].
+pub const BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK: u32 = 1 << 1;
+
+/// Schedule set flag: explicit parallel container (member systems run concurrently unless ordered).
+///
+/// Mutually exclusive with [`BAM_SCHEDULE_SET_FLAG_SEQUENCE`] and
+/// [`BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK`].
+pub const BAM_SCHEDULE_SET_FLAG_PARALLEL: u32 = 1 << 2;
+
+/// Schedule set flag: treat `before_sets` edges as weak ordering edges (no failure if target set is absent).
+pub const BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK: u32 = 1 << 3;
+
+/// Schedule set flag: treat `after_sets` edges as weak ordering edges (no failure if target set is absent).
+pub const BAM_SCHEDULE_SET_FLAG_AFTER_WEAK: u32 = 1 << 4;
+
+/// Bitmask of recognized [`BamScheduleSetDesc::flags`] bits in ABI `0.3` (bits `0..=4`).
+pub const BAM_SCHEDULE_SET_KNOWN_FLAGS: u32 = BAM_SCHEDULE_SET_FLAG_SEQUENCE
+    | BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK
+    | BAM_SCHEDULE_SET_FLAG_PARALLEL
+    | BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK
+    | BAM_SCHEDULE_SET_FLAG_AFTER_WEAK;
 
 /// Descriptor configuring a named schedule system set and ordering edges
 /// (`typedef struct BamScheduleSetDesc BamScheduleSetDesc;`).
@@ -1103,7 +1146,7 @@ pub const BAM_SCHEDULE_SET_KNOWN_FLAGS: u32 = 0;
 pub struct BamScheduleSetDesc {
     /// Size of this struct in bytes (`offset 0`).
     pub struct_size: u32,
-    /// Reserved flags (`0` in ABI `0.3`, `offset 4`).
+    /// Bitmask of `BAM_SCHEDULE_SET_FLAG_*` (`offset 4`).
     pub flags: u32,
     /// Target schedule (`ScheduleId`, `offset 8`).
     pub schedule: ScheduleId,
@@ -1141,8 +1184,15 @@ impl BamScheduleSetDesc {
         }
     }
 
-    /// Validates `struct_size`, known flags, `reserved0 == 0`, `schedule`, non-null `name`,
-    /// and edge pointer non-nullness.
+    /// Sets `BAM_SCHEDULE_SET_FLAG_*` bitflags on this descriptor.
+    #[inline]
+    pub const fn with_flags(mut self, flags: u32) -> Self {
+        self.flags = flags;
+        self
+    }
+
+    /// Validates `struct_size`, known flags, mutually exclusive execution-mode flags,
+    /// `reserved0 == 0`, `schedule`, non-null `name`, and edge pointer non-nullness.
     #[inline]
     pub fn validate(&self) -> FfiResult {
         if (self.struct_size as usize) < Self::MIN_V0_3_SIZE {
@@ -1150,6 +1200,13 @@ impl BamScheduleSetDesc {
         }
         if (self.flags & !BAM_SCHEDULE_SET_KNOWN_FLAGS) != 0 {
             return FfiResult::UNSUPPORTED;
+        }
+        let exec_mode_bits = self.flags
+            & (BAM_SCHEDULE_SET_FLAG_SEQUENCE
+                | BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK
+                | BAM_SCHEDULE_SET_FLAG_PARALLEL);
+        if exec_mode_bits.count_ones() > 1 {
+            return FfiResult::INVALID_ARGUMENT;
         }
         if self.reserved0 != 0 || !self.schedule.is_valid() {
             return FfiResult::INVALID_ARGUMENT;

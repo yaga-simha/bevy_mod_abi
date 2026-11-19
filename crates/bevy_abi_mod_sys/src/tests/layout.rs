@@ -10,23 +10,28 @@ use crate::{
     ABI_VERSION, ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PATCH, AccessMode,
     BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_COMPONENT_FLAG_SUMMARY_TICK,
     BAM_LOG_DEBUG, BAM_LOG_ERROR, BAM_LOG_INFO, BAM_LOG_TRACE, BAM_LOG_WARN,
-    BAM_OBSERVER_FLAG_PROPAGATE, BAM_RELATION_FLAG_CASCADE_DESPAWN, BAM_RELATION_FLAG_EXCLUSIVE,
-    BAM_RELATION_FLAG_SYMMETRIC, BAM_REQUIRED_FLAG_CUSTOM_BYTES, BAM_REQUIRED_FLAG_INIT_FN,
-    BAM_REQUIRED_FLAG_RESOLVE_BY_UUID, BAM_STORAGE_FLAG_ENTITY_EVENT, BAM_STORAGE_FLAG_EVENT,
-    BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE,
-    BAM_STORAGE_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_SUMMARY_TICK, BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL,
-    BAM_SYSTEM_FLAG_MAIN_THREAD, BAM_TRIGGER_FLAG_PROPAGATE, BamAssetGetLoadStateFn,
-    BamAssetLoadFn, BamAssetReleaseFn, BamChangeTicks, BamChunkTaskFn, BamCmdDespawnAllFn,
-    BamCmdDespawnFn, BamCmdInsertDefaultFn, BamCmdInsertFn, BamCmdObserveFn, BamCmdRemoveFn,
-    BamCmdSpawnBatchFn, BamCmdSpawnEmptyFn, BamCmdSpawnFn, BamCmdSpawnSceneFn, BamCmdTriggerExFn,
-    BamCmdTriggerFn, BamColumnInfo, BamCommands, BamComponent, BamEventKind, BamFieldDesc,
-    BamFieldKind, BamGetProcAddressFn, BamHostApi, BamHostCtx, BamInitFn, BamInstance, BamIter,
-    BamIterColumnInfoFn, BamIterColumnMutableFn, BamIterColumnMutableUntrackedFn,
-    BamIterColumnReadonlyFn, BamIterColumnRowsMutableFn, BamIterColumnRowsReadonlyFn,
-    BamIterEntitiesFn, BamIterMarkChangedRangeFn, BamIterNextChunkFn, BamIterReadRemovedFn,
-    BamIterResetFn, BamLastErrorFn, BamLayoutInfo, BamLoadCtx, BamLoadHostCtxFn, BamManifest,
-    BamManifestFn, BamMsgReadBatchFn, BamMsgSendFn, BamMsgWriteBatchFn, BamObserverDesc,
-    BamObserverFn, BamObserverMutFn, BamParForEachChunkFn, BamQueryDesc, BamRegisterComponentFn,
+    BAM_OBSERVER_FLAG_PROPAGATE, BAM_RELATION_FLAG_ACYCLIC, BAM_RELATION_FLAG_CASCADE_DELETE,
+    BAM_RELATION_FLAG_CASCADE_DESPAWN, BAM_RELATION_FLAG_CLEANUP_REMOVE,
+    BAM_RELATION_FLAG_EXCLUSIVE, BAM_RELATION_FLAG_SYMMETRIC, BAM_RELATION_KNOWN_FLAGS,
+    BAM_REQUIRED_FLAG_CUSTOM_BYTES, BAM_REQUIRED_FLAG_INIT_FN, BAM_REQUIRED_FLAG_RESOLVE_BY_UUID,
+    BAM_SCHEDULE_SET_FLAG_AFTER_WEAK, BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK,
+    BAM_SCHEDULE_SET_FLAG_PARALLEL, BAM_SCHEDULE_SET_FLAG_SEQUENCE,
+    BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK, BAM_SCHEDULE_SET_KNOWN_FLAGS,
+    BAM_STORAGE_FLAG_ENTITY_EVENT, BAM_STORAGE_FLAG_EVENT, BAM_STORAGE_FLAG_IMMUTABLE,
+    BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET,
+    BAM_STORAGE_FLAG_SUMMARY_TICK, BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL, BAM_SYSTEM_FLAG_MAIN_THREAD,
+    BAM_TRIGGER_FLAG_PROPAGATE, BamAssetGetLoadStateFn, BamAssetLoadFn, BamAssetReleaseFn,
+    BamChangeTicks, BamChunkTaskFn, BamCmdDespawnAllFn, BamCmdDespawnFn, BamCmdInsertDefaultFn,
+    BamCmdInsertFn, BamCmdObserveFn, BamCmdRemoveFn, BamCmdSpawnBatchFn, BamCmdSpawnEmptyFn,
+    BamCmdSpawnFn, BamCmdSpawnSceneFn, BamCmdTriggerExFn, BamCmdTriggerFn, BamColumnInfo,
+    BamCommands, BamComponent, BamEventKind, BamFieldDesc, BamFieldKind, BamGetProcAddressFn,
+    BamHostApi, BamHostCtx, BamInitFn, BamInstance, BamIter, BamIterColumnInfoFn,
+    BamIterColumnMutableFn, BamIterColumnMutableUntrackedFn, BamIterColumnReadonlyFn,
+    BamIterColumnRowsMutableFn, BamIterColumnRowsReadonlyFn, BamIterEntitiesFn,
+    BamIterMarkChangedRangeFn, BamIterNextChunkFn, BamIterReadRemovedFn, BamIterResetFn,
+    BamLastErrorFn, BamLayoutInfo, BamLoadCtx, BamLoadHostCtxFn, BamManifest, BamManifestFn,
+    BamMsgReadBatchFn, BamMsgSendFn, BamMsgWriteBatchFn, BamObserverDesc, BamObserverFn,
+    BamObserverMutFn, BamParForEachChunkFn, BamQueryDesc, BamRegisterComponentFn,
     BamRegisterObserverFn, BamRegisterSystemFn, BamRelationDesc, BamRequiredComponent,
     BamResMutPtrFn, BamResPtrFn, BamResTicksFn, BamResolveComponentFn, BamRestoreStateFn,
     BamRunIfFn, BamSaveStateFn, BamScheduleSetDesc, BamShutdownFn, BamStateWriterFn, BamSymbol,
@@ -581,6 +586,7 @@ fn ffi_result_taxonomy_and_display() {
         (FfiResult::CAPACITY_EXCEEDED, 13, "CAPACITY_EXCEEDED"),
         (FfiResult::UNSUPPORTED, 14, "UNSUPPORTED"),
         (FfiResult::TYPE_MISMATCH, 15, "TYPE_MISMATCH"),
+        (FfiResult::CYCLE_DETECTED, 16, "CYCLE_DETECTED"),
         (FfiResult::INTERNAL_ERROR, 99, "INTERNAL_ERROR"),
     ];
 
@@ -1497,13 +1503,25 @@ fn abi_v0_3_extension_layouts_and_validation() {
     assert_eq!(req_fn.flags, BAM_REQUIRED_FLAG_INIT_FN);
 
     // 5. BamRelationDesc & BamScheduleSetDesc validation
+    assert_eq!(
+        BAM_RELATION_FLAG_CASCADE_DELETE,
+        BAM_RELATION_FLAG_CASCADE_DESPAWN
+    );
+    assert_eq!(BAM_RELATION_KNOWN_FLAGS, 0x1F);
+    assert_eq!(BAM_SCHEDULE_SET_KNOWN_FLAGS, 0x1F);
+
     let rel_uuid = ComponentUuid::from_parts("combat::TargetOf", 8, 8, 0);
     let rel = BamRelationDesc::new(c"combat::TargetOf".as_ptr(), rel_uuid)
-        .with_flags(BAM_RELATION_FLAG_EXCLUSIVE | BAM_RELATION_FLAG_CASCADE_DESPAWN)
+        .with_flags(
+            BAM_RELATION_FLAG_EXCLUSIVE
+                | BAM_RELATION_FLAG_CASCADE_DELETE
+                | BAM_RELATION_FLAG_ACYCLIC
+                | BAM_RELATION_FLAG_CLEANUP_REMOVE,
+        )
         .with_payload_layout(8, 8);
     assert_eq!(rel.validate(), FfiResult::OK);
     let bad_rel = BamRelationDesc::new(c"combat::TargetOf".as_ptr(), rel_uuid)
-        .with_flags(BAM_RELATION_FLAG_SYMMETRIC | (1 << 10));
+        .with_flags(BAM_RELATION_FLAG_SYMMETRIC | (1 << 31));
     assert_eq!(bad_rel.validate(), FfiResult::UNSUPPORTED);
     let mut bad_align = rel;
     bad_align.data_align = 3;
@@ -1511,6 +1529,49 @@ fn abi_v0_3_extension_layouts_and_validation() {
 
     let set_ok = BamScheduleSetDesc::new(c"combat::CombatSet".as_ptr());
     assert_eq!(set_ok.validate(), FfiResult::OK);
+    assert_eq!(
+        set_ok
+            .with_flags(
+                BAM_SCHEDULE_SET_FLAG_SEQUENCE
+                    | BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK
+                    | BAM_SCHEDULE_SET_FLAG_AFTER_WEAK
+            )
+            .validate(),
+        FfiResult::OK
+    );
+    assert_eq!(
+        set_ok
+            .with_flags(BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK)
+            .validate(),
+        FfiResult::OK
+    );
+    assert_eq!(
+        set_ok.with_flags(BAM_SCHEDULE_SET_FLAG_PARALLEL).validate(),
+        FfiResult::OK
+    );
+    assert_eq!(
+        set_ok
+            .with_flags(BAM_SCHEDULE_SET_FLAG_SEQUENCE | BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK)
+            .validate(),
+        FfiResult::INVALID_ARGUMENT
+    );
+    assert_eq!(
+        set_ok
+            .with_flags(BAM_SCHEDULE_SET_FLAG_SEQUENCE | BAM_SCHEDULE_SET_FLAG_PARALLEL)
+            .validate(),
+        FfiResult::INVALID_ARGUMENT
+    );
+    assert_eq!(
+        set_ok
+            .with_flags(BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK | BAM_SCHEDULE_SET_FLAG_PARALLEL)
+            .validate(),
+        FfiResult::INVALID_ARGUMENT
+    );
+    assert_eq!(set_ok.with_flags(1 << 5).validate(), FfiResult::UNSUPPORTED);
+    assert_eq!(
+        set_ok.with_flags(1 << 31).validate(),
+        FfiResult::UNSUPPORTED
+    );
     let mut set_bad_edge = set_ok;
     set_bad_edge.before_count = 1;
     assert_eq!(set_bad_edge.validate(), FfiResult::NULL_POINTER);

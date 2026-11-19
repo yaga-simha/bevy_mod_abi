@@ -75,6 +75,8 @@ impl FfiResult {
     pub const UNSUPPORTED: Self = Self(14);
     /// Component UUID, size, or alignment disagrees with an existing registration (`15`).
     pub const TYPE_MISMATCH: Self = Self(15);
+    /// Acyclic relationship edge or schedule ordering graph would form a cycle (`16`).
+    pub const CYCLE_DETECTED: Self = Self(16);
     /// Genuine internal host or guest invariant fault (`99`).
     pub const INTERNAL_ERROR: Self = Self(99);
 
@@ -111,6 +113,7 @@ impl FfiResult {
             Self::CAPACITY_EXCEEDED => "CAPACITY_EXCEEDED",
             Self::UNSUPPORTED => "UNSUPPORTED",
             Self::TYPE_MISMATCH => "TYPE_MISMATCH",
+            Self::CYCLE_DETECTED => "CYCLE_DETECTED",
             Self::INTERNAL_ERROR => "INTERNAL_ERROR",
             _ => "UNKNOWN",
         }

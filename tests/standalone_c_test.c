@@ -671,8 +671,18 @@ static void test_versions_and_result_names(void) {
     assert(strcmp(bam_result_name(BAM_RESULT_OK), "OK") == 0);
     assert(strcmp(bam_result_name(BAM_RESULT_UNSUPPORTED), "UNSUPPORTED") == 0);
     assert(strcmp(bam_result_name(BAM_RESULT_TYPE_MISMATCH), "TYPE_MISMATCH") == 0);
+    assert(strcmp(bam_result_name(BAM_RESULT_CYCLE_DETECTED), "CYCLE_DETECTED") == 0);
     assert(strcmp(bam_result_name(BAM_RESULT_INTERNAL_ERROR), "INTERNAL_ERROR") == 0);
     assert(strcmp(bam_result_name((BamResult)777u), "UNKNOWN") == 0);
+    assert(BAM_RELATION_FLAG_CASCADE_DELETE == BAM_RELATION_FLAG_CASCADE_DESPAWN);
+    assert(BAM_RELATION_KNOWN_FLAGS ==
+           (BAM_RELATION_FLAG_EXCLUSIVE | BAM_RELATION_FLAG_CASCADE_DESPAWN |
+            BAM_RELATION_FLAG_SYMMETRIC | BAM_RELATION_FLAG_ACYCLIC |
+            BAM_RELATION_FLAG_CLEANUP_REMOVE));
+    assert(BAM_SCHEDULE_SET_KNOWN_FLAGS ==
+           (BAM_SCHEDULE_SET_FLAG_SEQUENCE | BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK |
+            BAM_SCHEDULE_SET_FLAG_PARALLEL | BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK |
+            BAM_SCHEDULE_SET_FLAG_AFTER_WEAK));
 
     {
         BamStrView view = bam_str_view("bevy_abi_mod");

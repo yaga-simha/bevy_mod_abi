@@ -56,13 +56,17 @@ pub use commands::{
 };
 pub use component::{
     BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_COMPONENT_FLAG_SUMMARY_TICK,
-    BAM_COMPONENT_KNOWN_FLAGS, BAM_RELATION_FLAG_CASCADE_DESPAWN, BAM_RELATION_FLAG_EXCLUSIVE,
-    BAM_RELATION_FLAG_SYMMETRIC, BAM_RELATION_KNOWN_FLAGS, BAM_REQUIRED_FLAG_CUSTOM_BYTES,
-    BAM_REQUIRED_FLAG_INIT_FN, BAM_REQUIRED_FLAG_RESOLVE_BY_UUID, BAM_REQUIRED_KNOWN_FLAGS,
-    BAM_SCHEDULE_SET_KNOWN_FLAGS, BamFieldDesc, BamFieldKind, BamLayoutInfo, BamRelationDesc,
-    BamRequiredComponent, BamRequiredInitFn, BamRowMigrateFn, BamScheduleSetDesc, ComponentCloneFn,
-    ComponentDesc, ComponentDropFn, ComponentHookFn, MappedStringGetFn, MappedStringSetFn,
-    MappedStringVTable, MappedWireGetFn, MappedWireSetFn, MappedWireVTable, VTableHeader,
+    BAM_COMPONENT_KNOWN_FLAGS, BAM_RELATION_FLAG_ACYCLIC, BAM_RELATION_FLAG_CASCADE_DELETE,
+    BAM_RELATION_FLAG_CASCADE_DESPAWN, BAM_RELATION_FLAG_CLEANUP_REMOVE,
+    BAM_RELATION_FLAG_EXCLUSIVE, BAM_RELATION_FLAG_SYMMETRIC, BAM_RELATION_KNOWN_FLAGS,
+    BAM_REQUIRED_FLAG_CUSTOM_BYTES, BAM_REQUIRED_FLAG_INIT_FN, BAM_REQUIRED_FLAG_RESOLVE_BY_UUID,
+    BAM_REQUIRED_KNOWN_FLAGS, BAM_SCHEDULE_SET_FLAG_AFTER_WEAK, BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK,
+    BAM_SCHEDULE_SET_FLAG_PARALLEL, BAM_SCHEDULE_SET_FLAG_SEQUENCE,
+    BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK, BAM_SCHEDULE_SET_KNOWN_FLAGS, BamFieldDesc, BamFieldKind,
+    BamLayoutInfo, BamRelationDesc, BamRequiredComponent, BamRequiredInitFn, BamRowMigrateFn,
+    BamScheduleSetDesc, ComponentCloneFn, ComponentDesc, ComponentDropFn, ComponentHookFn,
+    MappedStringGetFn, MappedStringSetFn, MappedStringVTable, MappedWireGetFn, MappedWireSetFn,
+    MappedWireVTable, VTableHeader,
 };
 pub use extensible::{ExtensibleStruct, read_descriptor, read_extensible_struct};
 pub use host_api::{

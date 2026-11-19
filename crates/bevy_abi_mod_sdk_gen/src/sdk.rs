@@ -588,6 +588,7 @@ pub const BamError = error{
     NotFound,
     InvalidState,
     TypeMismatch,
+    CycleDetected,
     OutOfMemory,
     Unsupported,
     InternalError,
@@ -605,6 +606,7 @@ pub fn checkResult(res: c.BamResult) BamError!void {
         c.BAM_RESULT_NOT_FOUND => error.NotFound,
         c.BAM_RESULT_INVALID_STATE => error.InvalidState,
         c.BAM_RESULT_TYPE_MISMATCH => error.TypeMismatch,
+        c.BAM_RESULT_CYCLE_DETECTED => error.CycleDetected,
         c.BAM_RESULT_UNSUPPORTED => error.Unsupported,
         else => error.InternalError,
     };
@@ -621,6 +623,7 @@ pub fn mapError(err: BamError) c.BamResult {
         error.NotFound => c.BAM_RESULT_NOT_FOUND,
         error.InvalidState => c.BAM_RESULT_INVALID_STATE,
         error.TypeMismatch => c.BAM_RESULT_TYPE_MISMATCH,
+        error.CycleDetected => c.BAM_RESULT_CYCLE_DETECTED,
         error.Unsupported => c.BAM_RESULT_UNSUPPORTED,
         error.OutOfMemory, error.InternalError => c.BAM_RESULT_INTERNAL_ERROR,
     };
@@ -665,10 +668,20 @@ mod tests {
         let zig_content = fs::read_to_string(tmp.join("bevy_abi_mod.zig")).unwrap();
         assert!(h_content.contains("#define BAM_ABI_VERSION 0x00030000u"));
         assert!(h_content.contains("#  define BAM_RESTRICT restrict"));
+        assert!(h_content.contains("#define BAM_RESULT_CYCLE_DETECTED    ((BamResult)16u)"));
+        assert!(h_content.contains("#define BAM_RELATION_FLAG_CASCADE_DELETE    0x00000002u"));
+        assert!(h_content.contains("#define BAM_RELATION_FLAG_ACYCLIC           0x00000008u"));
+        assert!(h_content.contains("#define BAM_RELATION_FLAG_CLEANUP_REMOVE    0x00000010u"));
+        assert!(h_content.contains("#define BAM_SCHEDULE_SET_FLAG_SEQUENCE      0x00000001u"));
+        assert!(h_content.contains("#define BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK 0x00000002u"));
+        assert!(h_content.contains("#define BAM_SCHEDULE_SET_FLAG_PARALLEL      0x00000004u"));
+        assert!(h_content.contains("#define BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK   0x00000008u"));
+        assert!(h_content.contains("#define BAM_SCHEDULE_SET_FLAG_AFTER_WEAK    0x00000010u"));
         assert!(hpp_content.contains("BAM_HOST_API_OFFSET_CMD_CHECKPOINT"));
         assert!(hpp_content.contains("BAM_RESTRICT"));
         assert!(zig_content.contains("ABI 0.3.0"));
         assert!(zig_content.contains("BAM_RESTRICT_QUALIFIER"));
+        assert!(zig_content.contains("BAM_RESULT_CYCLE_DETECTED"));
         let _ = fs::remove_dir_all(&tmp);
     }
 
