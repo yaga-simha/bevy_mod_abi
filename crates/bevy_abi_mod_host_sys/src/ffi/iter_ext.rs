@@ -166,12 +166,8 @@ mod tests {
         };
         // SAFETY: `sub_iter` and `info` are valid.
         let info_rc = unsafe { host_iter_column_info(sub_iter.cast_const(), 0, &raw mut info) };
-        if info_rc.is_err() {
-            return info_rc;
-        }
-        if info.size != core::mem::size_of::<ParRoVal>() {
-            return FfiResult::TYPE_MISMATCH;
-        }
+        assert!(info_rc.is_ok(), "host_iter_column_info failed: {info_rc}");
+        assert_eq!(info.size, core::mem::size_of::<ParRoVal>());
 
         let mut len = 0usize;
         // SAFETY: `sub_iter` is an active worker `BamIter`.
@@ -180,9 +176,7 @@ mod tests {
             let col = unsafe { host_iter_column_readonly(sub_iter.cast_const(), 0) };
             // SAFETY: `sub_iter` is positioned on a valid chunk of length `len`.
             let ents = unsafe { host_iter_entities(sub_iter.cast_const()) };
-            if col.is_null() || ents.is_null() {
-                return FfiResult::INTERNAL_ERROR;
-            }
+            assert!(!col.is_null() && !ents.is_null());
             // SAFETY: `col` points to `len` contiguous `ParRoVal` elements aligned to `align_of::<ParRoVal>()`.
             #[allow(clippy::cast_ptr_alignment)]
             let slice = unsafe { core::slice::from_raw_parts(col.cast::<ParRoVal>(), len) };
@@ -207,9 +201,7 @@ mod tests {
         while unsafe { host_iter_next_chunk(sub_iter, &raw mut len) }.get() {
             // SAFETY: `sub_iter` is positioned on a valid archetypal chunk.
             let rows = unsafe { host_iter_column_rows_readonly(sub_iter, 0) };
-            if rows.is_null() {
-                return FfiResult::INTERNAL_ERROR;
-            }
+            assert!(!rows.is_null());
             // SAFETY: `rows` points to `len` non-null `*const u8` pointers to `ParRoSparse`.
             let row_ptrs = unsafe { core::slice::from_raw_parts(rows, len) };
             let mut local_sum = 0i64;
@@ -389,6 +381,338 @@ mod tests {
                 )
             };
             assert_eq!(deny, FfiResult::PERMISSION_DENIED, "mode={mode:?}");
+        }
+
+        // 5. Exercise `noop_cb` directly on read-only iter plus null `chunk_fn` / null `iter` guards.
+        iter.reset();
+        // SAFETY: `iter` is valid and read-only; intentional null guards check early returns.
+        unsafe {
+            assert_eq!(
+                par_for_each_chunk_readonly_impl(
+                    iter.as_ffi_ptr(),
+                    Some(noop_cb),
+                    core::ptr::null_mut(),
+                ),
+                FfiResult::OK
+            );
+            assert_eq!(
+                par_for_each_chunk_readonly_impl(iter.as_ffi_ptr(), None, core::ptr::null_mut()),
+                FfiResult::NULL_POINTER
+            );
+            assert_eq!(
+                par_for_each_chunk_readonly_impl(
+                    core::ptr::null_mut(),
+                    Some(noop_cb),
+                    core::ptr::null_mut(),
+                ),
+                FfiResult::NULL_POINTER
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_ptr_alignment)]
+    fn iter_read_removed_guards_and_batch_read() {
+        use super::host_iter_read_removed;
+        use bevy_abi_mod_sys::FfiEntity;
+        use bevy_ecs::entity::Entity;
+        use bevy_ecs::lifecycle::RemovedComponentEntity;
+        use bevy_ecs::message::MessageCursor;
+
+        let mut world = World::new();
+        let val_cid = world.register_component::<ParRoVal>();
+        let mk_term = |cid, mode, flags| QueryTermMeta {
+            component: BamComponent::from_raw(1),
+            component_id: cid,
+            mode,
+            uuid: ComponentUuid::from_canonical_name("iter_ext::removed"),
+            size: core::mem::size_of::<ParRoVal>(),
+            align: 8,
+            storage_flags: flags,
+            msg_read_batch_fn: None,
+            msg_send_fn: None,
+            msg_write_batch_fn: None,
+        };
+        let plan = QueryPlan::from_terms(vec![
+            mk_term(val_cid, AccessMode::REMOVED_READ, 0),
+            mk_term(val_cid, AccessMode::READ, 0),
+            mk_term(val_cid, AccessMode::REMOVED_READ, BAM_STORAGE_FLAG_RESOURCE),
+        ]);
+
+        let mut unaligned_buf = [0u64; 2];
+        let unaligned = (&raw mut unaligned_buf).cast::<u8>().wrapping_add(1);
+        let mut out_entities = [FfiEntity::NULL; 4];
+        let mut out_read = 0usize;
+
+        let mut no_world_iter = HostIter::new_dense(
+            &world.storages().tables,
+            &[],
+            &plan,
+            Tick::new(0),
+            Tick::new(1),
+        );
+        // SAFETY: Valid stack buffers and intentionally misaligned pointers (checked via `is_aligned()`).
+        unsafe {
+            assert_eq!(
+                host_iter_read_removed(
+                    no_world_iter.as_ffi_ptr(),
+                    0,
+                    out_entities.as_mut_ptr(),
+                    4,
+                    core::ptr::null_mut(),
+                ),
+                FfiResult::NULL_POINTER
+            );
+            assert_eq!(
+                host_iter_read_removed(
+                    no_world_iter.as_ffi_ptr(),
+                    0,
+                    core::ptr::null_mut(),
+                    4,
+                    &raw mut out_read,
+                ),
+                FfiResult::NULL_POINTER
+            );
+            assert_eq!(
+                host_iter_read_removed(
+                    no_world_iter.as_ffi_ptr(),
+                    0,
+                    out_entities.as_mut_ptr(),
+                    4,
+                    unaligned.cast::<usize>(),
+                ),
+                FfiResult::INVALID_ARGUMENT
+            );
+            assert_eq!(
+                host_iter_read_removed(
+                    no_world_iter.as_ffi_ptr(),
+                    0,
+                    unaligned.cast::<FfiEntity>(),
+                    4,
+                    &raw mut out_read,
+                ),
+                FfiResult::INVALID_ARGUMENT
+            );
+            assert_eq!(
+                host_iter_read_removed(
+                    core::ptr::null_mut(),
+                    0,
+                    out_entities.as_mut_ptr(),
+                    4,
+                    &raw mut out_read,
+                ),
+                FfiResult::NULL_POINTER
+            );
+
+            no_world_iter.in_par_iter = true;
+            assert_eq!(
+                host_iter_read_removed(
+                    no_world_iter.as_ffi_ptr(),
+                    0,
+                    out_entities.as_mut_ptr(),
+                    4,
+                    &raw mut out_read,
+                ),
+                FfiResult::ACCESS_CONFLICT
+            );
+            no_world_iter.in_par_iter = false;
+
+            assert_eq!(
+                host_iter_read_removed(
+                    no_world_iter.as_ffi_ptr(),
+                    9,
+                    out_entities.as_mut_ptr(),
+                    4,
+                    &raw mut out_read,
+                ),
+                FfiResult::OUT_OF_RANGE
+            );
+            assert_eq!(
+                host_iter_read_removed(
+                    no_world_iter.as_ffi_ptr(),
+                    1,
+                    out_entities.as_mut_ptr(),
+                    4,
+                    &raw mut out_read,
+                ),
+                FfiResult::PERMISSION_DENIED
+            );
+            assert_eq!(
+                host_iter_read_removed(
+                    no_world_iter.as_ffi_ptr(),
+                    2,
+                    out_entities.as_mut_ptr(),
+                    4,
+                    &raw mut out_read,
+                ),
+                FfiResult::PERMISSION_DENIED
+            );
+            assert_eq!(
+                host_iter_read_removed(
+                    no_world_iter.as_ffi_ptr(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                    &raw mut out_read,
+                ),
+                FfiResult::OK
+            );
+            // Missing `world`
+            assert_eq!(
+                host_iter_read_removed(
+                    no_world_iter.as_ffi_ptr(),
+                    0,
+                    out_entities.as_mut_ptr(),
+                    4,
+                    &raw mut out_read,
+                ),
+                FfiResult::INVALID_STATE
+            );
+        }
+        drop(no_world_iter);
+
+        // With `world` but missing `msg_cursors`, empty `msg_cursors`, wrong cursor type, then real cursor.
+        let mut iter_no_cursors = HostIter::new_dense(
+            &world.storages().tables,
+            &[],
+            &plan,
+            Tick::new(0),
+            Tick::new(1),
+        )
+        .with_world(world.as_unsafe_world_cell_readonly());
+        // SAFETY: Valid `HostIter` and stack buffers.
+        unsafe {
+            assert_eq!(
+                host_iter_read_removed(
+                    iter_no_cursors.as_ffi_ptr(),
+                    0,
+                    out_entities.as_mut_ptr(),
+                    4,
+                    &raw mut out_read,
+                ),
+                FfiResult::INVALID_STATE
+            );
+        }
+        drop(iter_no_cursors);
+
+        let mut wrong_cursors: Vec<Option<Box<dyn core::any::Any + Send + Sync>>> =
+            vec![Some(Box::new(123u32))];
+        {
+            let mut iter_wrong = HostIter::new_dense(
+                &world.storages().tables,
+                &[],
+                &plan,
+                Tick::new(0),
+                Tick::new(1),
+            )
+            .with_world(world.as_unsafe_world_cell_readonly())
+            .with_msg_cursors(&mut wrong_cursors);
+            // SAFETY: Valid `HostIter` and stack buffers.
+            unsafe {
+                assert_eq!(
+                    host_iter_read_removed(
+                        iter_wrong.as_ffi_ptr(),
+                        0,
+                        out_entities.as_mut_ptr(),
+                        4,
+                        &raw mut out_read,
+                    ),
+                    FfiResult::INVALID_STATE
+                );
+            }
+        }
+        wrong_cursors[0] = None;
+        {
+            let mut iter_none = HostIter::new_dense(
+                &world.storages().tables,
+                &[],
+                &plan,
+                Tick::new(0),
+                Tick::new(1),
+            )
+            .with_world(world.as_unsafe_world_cell_readonly())
+            .with_msg_cursors(&mut wrong_cursors);
+            // SAFETY: Valid `HostIter` and stack buffers.
+            unsafe {
+                assert_eq!(
+                    host_iter_read_removed(
+                        iter_none.as_ffi_ptr(),
+                        0,
+                        out_entities.as_mut_ptr(),
+                        4,
+                        &raw mut out_read,
+                    ),
+                    FfiResult::INVALID_STATE
+                );
+            }
+        }
+
+        // Valid cursor before any entity has removed components -> OK with 0 read.
+        let mut real_cursors: Vec<Option<Box<dyn core::any::Any + Send + Sync>>> = vec![Some(
+            Box::new(MessageCursor::<RemovedComponentEntity>::default()),
+        )];
+        {
+            let mut iter_empty = HostIter::new_dense(
+                &world.storages().tables,
+                &[],
+                &plan,
+                Tick::new(0),
+                Tick::new(1),
+            )
+            .with_world(world.as_unsafe_world_cell_readonly())
+            .with_msg_cursors(&mut real_cursors);
+            // SAFETY: Valid `HostIter` and stack buffers.
+            unsafe {
+                assert_eq!(
+                    host_iter_read_removed(
+                        iter_empty.as_ffi_ptr(),
+                        0,
+                        out_entities.as_mut_ptr(),
+                        4,
+                        &raw mut out_read,
+                    ),
+                    FfiResult::OK
+                );
+                assert_eq!(out_read, 0);
+            }
+        }
+
+        // Despawn two entities with `ParRoVal` and read removed entities cleanly.
+        let e1 = world.spawn(ParRoVal(10)).id();
+        let e2 = world.spawn(ParRoVal(20)).id();
+        world.despawn(e1);
+        world.despawn(e2);
+        {
+            let mut iter_live = HostIter::new_dense(
+                &world.storages().tables,
+                &[],
+                &plan,
+                Tick::new(0),
+                Tick::new(1),
+            )
+            .with_world(world.as_unsafe_world_cell_readonly())
+            .with_msg_cursors(&mut real_cursors);
+            // SAFETY: Valid `HostIter` and stack buffers.
+            unsafe {
+                assert_eq!(
+                    host_iter_read_removed(
+                        iter_live.as_ffi_ptr(),
+                        0,
+                        out_entities.as_mut_ptr(),
+                        4,
+                        &raw mut out_read,
+                    ),
+                    FfiResult::OK
+                );
+                assert_eq!(out_read, 2);
+                assert_eq!(
+                    [
+                        Entity::try_from_bits(out_entities[0].to_bits()).unwrap(),
+                        Entity::try_from_bits(out_entities[1].to_bits()).unwrap(),
+                    ],
+                    [e1, e2]
+                );
+            }
         }
     }
 }

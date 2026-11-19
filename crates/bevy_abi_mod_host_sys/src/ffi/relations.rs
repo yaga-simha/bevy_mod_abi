@@ -1939,4 +1939,247 @@ mod tests {
         assert!(!rem_abort);
         assert_eq!(world.resource::<ModRelationGraph>().flush_errors().len(), 2);
     }
+
+    #[test]
+    fn relation_guards_lazy_graph_init_symmetric_pending_remove_and_cleanup_branches() {
+        use bevy_abi_mod_sys::BAM_RELATION_KNOWN_FLAGS;
+
+        // 1. Direct table helpers: `is_reachable_skipping(start == goal)`, `remove_all_for_entity`
+        // leaving non-empty neighbor lists, `ensure_relation_table` replacement, missing handle hooks.
+        let e1 = Entity::from_raw_u32(1).unwrap();
+        let e2 = Entity::from_raw_u32(2).unwrap();
+        let e3 = Entity::from_raw_u32(3).unwrap();
+        let e4 = Entity::from_raw_u32(4).unwrap();
+
+        let mut world = World::new();
+        let mut registry = ModRegistry::new();
+        // Exercise unqualified name without `manifest_name` (`None`) -> covers line 885 & test helper.
+        let plain_no_ns = register_rel(
+            &mut world,
+            &mut registry,
+            "UnqualifiedNoNs",
+            BAM_RELATION_KNOWN_FLAGS & !BAM_RELATION_FLAG_EXCLUSIVE,
+            0,
+            1,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        let meta = registry.get_relation(plain_no_ns).unwrap().clone();
+        let mut table = RelationEdgeTable::new(meta.clone());
+        assert!(table.is_reachable_skipping(e1, e1, &[]));
+        table.insert_directed_raw(e1, e2, Box::new([]));
+        table.insert_directed_raw(e3, e2, Box::new([]));
+        table.insert_directed_raw(e1, e4, Box::new([]));
+        // Removing `e1` leaves `e3 -> e2` (`!in_vec.is_empty()`), and removing `e3` leaves `e1` untouched.
+        let iso1 = table.remove_all_for_entity(e1);
+        assert_eq!(iso1, vec![e4]);
+        assert!(table.has_edge(e3, e2));
+        table.insert_directed_raw(e1, e2, Box::new([]));
+        let iso2 = table.remove_all_for_entity(e2);
+        assert_eq!(iso2, vec![e3, e1]);
+        assert!(table.is_isolated(e1));
+
+        let mut graph = ModRelationGraph::new();
+        graph.ensure_relation_table(meta.clone());
+        let mut alt_meta = meta.clone();
+        alt_meta.uuid = ComponentUuid::from_canonical_name("alt::Rel");
+        alt_meta.component_id = ComponentId::new(987_654);
+        graph.ensure_relation_table(alt_meta);
+        assert_eq!(
+            graph.on_entity_despawn(BamComponent::from_raw(999), e1),
+            (vec![], vec![])
+        );
+        assert_eq!(
+            graph.on_entity_remove(BamComponent::from_raw(999), e1),
+            Vec::<Entity>::new()
+        );
+        assert_eq!(
+            check_relation_acyclic(&graph, plain_no_ns, e1, e1),
+            FfiResult::CYCLE_DETECTED
+        );
+        // `check_relation_acyclic` when `(e1 -> e2)` already exists returns `OK`.
+        let mut dag_graph = ModRelationGraph::new();
+        dag_graph.ensure_relation_table(meta);
+        dag_graph
+            .tables
+            .get_mut(&plain_no_ns)
+            .unwrap()
+            .insert_directed_raw(e1, e2, Box::new([]));
+        assert_eq!(
+            check_relation_acyclic(&dag_graph, plain_no_ns, e1, e2),
+            FfiResult::OK
+        );
+
+        // 2. Lazy `ModRelationGraph` initialization from `ModRegistry` / `RegistrySnapshot` in fresh World.
+        let mut lazy_world = World::new();
+        let mut lazy_reg = ModRegistry::new();
+        let lazy_rel = register_rel(
+            &mut lazy_world,
+            &mut lazy_reg,
+            "lazy::Rel",
+            BAM_RELATION_FLAG_ACYCLIC,
+            0,
+            1,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        lazy_world.insert_resource(lazy_reg.clone());
+        lazy_world.remove_resource::<ModRelationGraph>();
+        let la = lazy_world.spawn_empty().id();
+        let lb = lazy_world.spawn_empty().id();
+        assert_eq!(
+            ModRelationGraph::insert_edge_in_world(&mut lazy_world, lazy_rel, la, lb, &[]),
+            FfiResult::OK
+        );
+        lazy_world.remove_resource::<ModRelationGraph>();
+        assert_eq!(
+            ModRelationGraph::remove_edge_in_world(&mut lazy_world, lazy_rel, la, lb),
+            FfiResult::OK
+        );
+
+        let lazy_snap = lazy_reg.snapshot_arc();
+        let mut fresh_world_ins = World::new();
+        let fa_w = fresh_world_ins.spawn_empty().id();
+        let fb_w = fresh_world_ins.spawn_empty().id();
+        assert_eq!(
+            apply_insert_relation(&mut fresh_world_ins, &lazy_snap, fa_w, lazy_rel, fb_w, &[]),
+            (FfiResult::OK, false)
+        );
+        let mut fresh_world_rem = World::new();
+        let fa_r = fresh_world_rem.spawn_empty().id();
+        let fb_r = fresh_world_rem.spawn_empty().id();
+        assert_eq!(
+            apply_remove_relation(&mut fresh_world_rem, &lazy_snap, fa_r, lazy_rel, fb_r),
+            (FfiResult::OK, false)
+        );
+        // `ensure_marker_attached` with unregistered `ComponentId` is a safe no-op.
+        ensure_marker_attached(&mut fresh_world_rem, fa_r, ComponentId::new(999_999));
+
+        // 3. `allocate_standalone_component_id` collision loop + `register_relation` error guards.
+        let mut standalone_reg = ModRegistry::new();
+        let collide_cid = ComponentId::new(1_000_001);
+        standalone_reg
+            .register_relation_entry(
+                collide_cid,
+                "collide::Comp",
+                ComponentUuid::from_canonical_name("collide::Comp"),
+                0,
+                0,
+                1,
+                0,
+                None,
+            )
+            .unwrap();
+        let mut standalone_ctx = LoadContext::new(standalone_reg);
+        let rel_ok_desc = BamRelationDesc::new(
+            c"sa::Rel".as_ptr(),
+            ComponentUuid::from_canonical_name("sa::Rel"),
+        );
+        let mut rel_out = BamComponent::INVALID;
+        let bad_utf8 = [0xFFu8, 0xFE, 0];
+        // SAFETY: Valid standalone `LoadContext` and stack descriptors; null/bad pointers test FFI validation.
+        unsafe {
+            assert_eq!(
+                host_register_relation(standalone_ctx.as_ffi_ptr(), &rel_ok_desc, &raw mut rel_out),
+                FfiResult::OK
+            );
+            assert!(rel_out.is_valid());
+            assert_eq!(
+                host_register_relation(null_mut(), &rel_ok_desc, &raw mut rel_out),
+                FfiResult::NULL_POINTER
+            );
+            let bad_flags = BamRelationDesc::new(
+                c"sa::BadFlags".as_ptr(),
+                ComponentUuid::from_canonical_name("sa::BadFlags"),
+            )
+            .with_flags(1 << 31);
+            assert_eq!(
+                host_register_relation(standalone_ctx.as_ffi_ptr(), &bad_flags, &raw mut rel_out),
+                FfiResult::UNSUPPORTED
+            );
+            let empty_name = BamRelationDesc::new(
+                c"".as_ptr(),
+                ComponentUuid::from_canonical_name("sa::Empty"),
+            );
+            assert_eq!(
+                host_register_relation(standalone_ctx.as_ffi_ptr(), &empty_name, &raw mut rel_out),
+                FfiResult::INVALID_ARGUMENT
+            );
+            let bad_utf8_desc = BamRelationDesc::new(
+                bad_utf8.as_ptr().cast::<c_char>(),
+                ComponentUuid::from_canonical_name("sa::BadUtf8"),
+            );
+            assert_eq!(
+                host_register_relation(
+                    standalone_ctx.as_ffi_ptr(),
+                    &bad_utf8_desc,
+                    &raw mut rel_out
+                ),
+                FfiResult::INVALID_UTF8
+            );
+            assert_eq!(
+                validate_non_empty_cstr(null()),
+                Err(FfiResult::NULL_POINTER)
+            );
+        }
+        standalone_ctx.finish_init();
+
+        // 4. `cmd_insert_relation_impl` / `cmd_remove_relation_impl` null/invalid handles + pending SYMMETRIC remove.
+        let sym_acyclic = register_rel(
+            &mut world,
+            &mut registry,
+            "test::SymAcyclicRem",
+            BAM_RELATION_FLAG_SYMMETRIC | BAM_RELATION_FLAG_ACYCLIC,
+            0,
+            1,
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        let wa = world.spawn_empty().id();
+        let wb = world.spawn_empty().id();
+        let fwa = FfiEntity::from_bits(wa.to_bits());
+        let fwb = FfiEntity::from_bits(wb.to_bits());
+        let snap2 = registry.snapshot_arc();
+        let mut storage = HostCommandsStorage::new();
+        {
+            let mut cmds = HostCommands::new(&mut storage, world.entity_allocator(), &snap2);
+            let p = cmds.as_ffi_ptr();
+            // SAFETY: Valid `cmds` and null/invalid pointer guard tests.
+            unsafe {
+                assert_eq!(
+                    cmd_insert_relation_impl(null_mut(), fwa, sym_acyclic, fwb, null(), 0),
+                    FfiResult::NULL_POINTER
+                );
+                assert_eq!(
+                    cmd_remove_relation_impl(null_mut(), fwa, sym_acyclic, fwb),
+                    FfiResult::NULL_POINTER
+                );
+                assert_eq!(
+                    cmd_insert_relation_impl(p, fwa, sym_acyclic, fwb, null(), 0),
+                    FfiResult::OK
+                );
+                assert_eq!(
+                    cmd_remove_relation_impl(p, fwa, sym_acyclic, fwb),
+                    FfiResult::OK
+                );
+                // Re-inserting `wb -> wa` after symmetric pending removal succeeds cleanly.
+                assert_eq!(
+                    cmd_insert_relation_impl(p, fwb, sym_acyclic, fwa, null(), 0),
+                    FfiResult::OK
+                );
+            }
+        }
+        storage.apply_to_world(&mut world, &snap2);
+        assert!(
+            world
+                .resource::<ModRelationGraph>()
+                .has_edge(sym_acyclic, wa, wb)
+        );
+    }
 }

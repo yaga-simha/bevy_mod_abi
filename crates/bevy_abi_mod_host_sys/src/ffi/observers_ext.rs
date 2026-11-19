@@ -1693,4 +1693,542 @@ mod tests {
             vec![("ready", child_ffi), ("ready", parent_ffi)]
         );
     }
+
+    #[repr(C)]
+    #[derive(
+        bevy_ecs::prelude::Resource, Clone, Copy, Debug, bevy_abi_mod_macros::ModComponent,
+    )]
+    struct ObsTestRes;
+
+    #[repr(C)]
+    #[derive(Component, Clone, Copy, Debug, bevy_abi_mod_macros::ModComponent)]
+    struct DamageVal;
+
+    #[repr(C)]
+    #[derive(bevy_ecs::event::Event, Clone, Copy, Debug, bevy_abi_mod_macros::ModComponent)]
+    #[mod_component(name = "obs_cov::ZstHostEvt")]
+    struct ZstHostEvt;
+
+    #[repr(C)]
+    #[derive(
+        bevy_ecs::event::EntityEvent, Clone, Copy, Debug, Default, bevy_abi_mod_macros::ModComponent,
+    )]
+    #[mod_component(name = "obs_cov::HostEntEvt")]
+    struct HostEntEvt {
+        #[event_target]
+        target: crate::TargetEntity,
+    }
+
+    unsafe extern "C" fn obs_noop_cb(
+        _entity: FfiEntity,
+        _data: *const c_void,
+        _cmds: *mut BamCommands,
+        _ud: *mut c_void,
+    ) -> FfiResult {
+        FfiResult::OK
+    }
+
+    #[test]
+    #[allow(clippy::cast_ptr_alignment)]
+    fn observers_ext_all_guard_branches_and_payload_edge_cases() {
+        use crate::TargetEntity;
+        use core::ptr::{null, null_mut};
+
+        let _serial = crate::drop_trampoline::TEST_DROP_SLAB_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut world = World::new();
+        let res_cid = world.register_component::<ObsTestRes>();
+        let comp_cid = world.register_component::<DamageVal>();
+        let zst_evt_key = world.register_event_key::<ZstHostEvt>();
+        let ent_evt_key = world.register_event_key::<HostEntEvt>();
+
+        let mut reg = ModRegistry::new();
+        let res_h = reg.register_resource::<ObsTestRes>(res_cid).unwrap();
+        let comp_h = reg
+            .register_component::<DamageVal>(comp_cid, Default::default())
+            .unwrap();
+        let zst_h = reg.register_event::<ZstHostEvt>(zst_evt_key).unwrap();
+        let ent_evt_h = reg
+            .register_entity_event::<HostEntEvt>(ent_evt_key)
+            .unwrap();
+
+        let active = Arc::new(AtomicBool::new(true));
+        let mut dyn_evt_h = BamComponent::INVALID;
+        let mut bad_prop_u32_h = BamComponent::INVALID;
+        let mut drop_comp_h = BamComponent::INVALID;
+
+        unsafe extern "C" fn dummy_drop(_p: *mut c_void) {}
+        let reg = {
+            let mut ctx = LoadContext::with_world_and_mod_id(
+                reg,
+                Arc::clone(&active),
+                &mut world as *mut World,
+                Some(ModId(10)),
+            );
+            let d_evt = ComponentDesc::new(
+                c"obs_cov::DynEvt".as_ptr(),
+                ComponentUuid::from_parts("obs_cov::DynEvt", 4, 4, 0),
+                4,
+                4,
+            );
+            let d_u32 = ComponentDesc::new(
+                c"obs_cov::U32Rel".as_ptr(),
+                ComponentUuid::from_parts("obs_cov::U32Rel", 4, 4, 0),
+                4,
+                4,
+            );
+            let d_drop = ComponentDesc::new(
+                c"obs_cov::DropComp".as_ptr(),
+                ComponentUuid::from_parts("obs_cov::DropComp", 4, 4, 0),
+                4,
+                4,
+            )
+            .with_drop(dummy_drop);
+            // SAFETY: Valid `LoadContext` and descriptors.
+            unsafe {
+                assert_eq!(
+                    host_register_component(ctx.as_ffi_ptr(), &d_evt, &mut dyn_evt_h),
+                    FfiResult::OK
+                );
+                assert_eq!(
+                    host_register_component(ctx.as_ffi_ptr(), &d_u32, &mut bad_prop_u32_h),
+                    FfiResult::OK
+                );
+                assert_eq!(
+                    host_register_component(ctx.as_ffi_ptr(), &d_drop, &mut drop_comp_h),
+                    FfiResult::OK
+                );
+            }
+            let r = ctx.registry.clone();
+            ctx.finish_init();
+            r
+        };
+
+        // Direct `AlignedPayload` bad alignment & null src checks.
+        // SAFETY: Intentional invalid align / null src rejected before allocation or copy.
+        unsafe {
+            assert!(AlignedPayload::copy_from(null(), 4, 3).is_err());
+            assert!(AlignedPayload::copy_from(null(), 4, 4).is_err());
+            let zst = AlignedPayload::copy_from(null(), 0, 1).unwrap();
+            assert!(!zst.as_ptr().is_null());
+        }
+
+        let live_e = world.spawn_empty().id();
+        let live_ffi = FfiEntity::from_bits(live_e.to_bits());
+        let dead_e = world.spawn_empty().id();
+        assert!(world.despawn(dead_e));
+        let dead_ffi = FfiEntity::from_bits(dead_e.to_bits());
+        let mut bad_bits_ffi = FfiEntity::from_bits(1u64 << 32);
+        let mut placeholder_ffi = FfiEntity::from_bits(Entity::PLACEHOLDER.to_bits());
+        let mut unaligned_buf = [0u64; 2];
+        let unaligned_ent = (&raw mut unaligned_buf)
+            .cast::<u8>()
+            .wrapping_add(1)
+            .cast::<FfiEntity>();
+
+        let snap = reg.snapshot_arc();
+        let mut storage = HostCommandsStorage::new();
+        {
+            let mut cmds = HostCommands::new(&mut storage, world.entity_allocator(), &snap)
+                .with_mod_context(Some(ModId(10)), Some(Arc::clone(&active)))
+                .with_registry(&reg);
+            let cp = cmds.as_ffi_ptr();
+            let bad_cmds = (&raw const snap).cast_mut().cast::<BamCommands>();
+            let mut val4 = 123u32;
+            let val4_ptr = (&raw mut val4).cast::<u8>();
+
+            // SAFETY: Valid `cmds` and stack buffers; null/invalid/misaligned arguments test FFI guards.
+            unsafe {
+                // `host_cmd_observe` guards
+                assert_eq!(
+                    host_cmd_observe(
+                        cp,
+                        &BamObserverDesc::new(dyn_evt_h, obs_noop_cb, null_mut()),
+                        unaligned_ent
+                    ),
+                    FfiResult::INVALID_ARGUMENT
+                );
+                assert_eq!(
+                    host_cmd_observe(
+                        null_mut(),
+                        &BamObserverDesc::new(dyn_evt_h, obs_noop_cb, null_mut()),
+                        null_mut()
+                    ),
+                    FfiResult::NULL_POINTER
+                );
+                assert_eq!(
+                    host_cmd_observe(
+                        bad_cmds,
+                        &BamObserverDesc::new(dyn_evt_h, obs_noop_cb, null_mut()),
+                        null_mut()
+                    ),
+                    FfiResult::INVALID_STATE
+                );
+                assert_eq!(
+                    host_cmd_observe(cp, null(), null_mut()),
+                    FfiResult::NULL_POINTER
+                );
+                let mut short_obs = BamObserverDesc::new(dyn_evt_h, obs_noop_cb, null_mut());
+                short_obs.struct_size = 4;
+                assert_eq!(
+                    host_cmd_observe(cp, &short_obs, null_mut()),
+                    FfiResult::INVALID_VERSION
+                );
+                let bad_obs_flags =
+                    BamObserverDesc::new(dyn_evt_h, obs_noop_cb, null_mut()).with_flags(1 << 30);
+                assert_eq!(
+                    host_cmd_observe(cp, &bad_obs_flags, null_mut()),
+                    FfiResult::UNSUPPORTED
+                );
+                let bad_obs_evt =
+                    BamObserverDesc::new(BamComponent::from_raw(999), obs_noop_cb, null_mut());
+                assert_eq!(
+                    host_cmd_observe(cp, &bad_obs_evt, null_mut()),
+                    FfiResult::INVALID_COMPONENT
+                );
+
+                // `host_cmd_trigger_ex` guards
+                let ok_trig = BamTriggerDesc::new(dyn_evt_h, val4_ptr, 4);
+                assert_eq!(
+                    host_cmd_trigger_ex(null_mut(), &ok_trig),
+                    FfiResult::NULL_POINTER
+                );
+                assert_eq!(
+                    host_cmd_trigger_ex(bad_cmds, &ok_trig),
+                    FfiResult::INVALID_STATE
+                );
+                assert_eq!(host_cmd_trigger_ex(cp, null()), FfiResult::NULL_POINTER);
+                let mut short_trig = ok_trig;
+                short_trig.struct_size = 4;
+                assert_eq!(
+                    host_cmd_trigger_ex(cp, &short_trig),
+                    FfiResult::INVALID_VERSION
+                );
+                let bad_trig_flags = ok_trig.with_flags(1 << 30);
+                assert_eq!(
+                    host_cmd_trigger_ex(cp, &bad_trig_flags),
+                    FfiResult::UNSUPPORTED
+                );
+                assert_eq!(
+                    host_cmd_trigger_ex(cp, &ok_trig.with_entity(bad_bits_ffi)),
+                    FfiResult::INVALID_ENTITY
+                );
+                assert_eq!(
+                    host_cmd_trigger_ex(cp, &ok_trig.with_entity(placeholder_ffi)),
+                    FfiResult::INVALID_ENTITY
+                );
+
+                // `propagate_relationship` guards
+                assert_eq!(
+                    host_cmd_trigger_ex(
+                        cp,
+                        &ok_trig
+                            .with_entity(live_ffi)
+                            .with_propagate(BamComponent::from_raw(999)),
+                    ),
+                    FfiResult::INVALID_COMPONENT
+                );
+                assert_eq!(
+                    host_cmd_trigger_ex(cp, &ok_trig.with_entity(live_ffi).with_propagate(res_h),),
+                    FfiResult::INVALID_COMPONENT
+                );
+                assert_eq!(
+                    host_cmd_trigger_ex(
+                        cp,
+                        &ok_trig.with_entity(live_ffi).with_propagate(bad_prop_u32_h),
+                    ),
+                    FfiResult::INVALID_COMPONENT
+                );
+
+                // `watched_components` guards
+                let bad_w = [BamComponent::from_raw(999)];
+                assert_eq!(
+                    host_cmd_trigger_ex(cp, &ok_trig.with_watched_components(bad_w.as_ptr(), 1),),
+                    FfiResult::INVALID_COMPONENT
+                );
+                let res_w = [res_h];
+                assert_eq!(
+                    host_cmd_trigger_ex(cp, &ok_trig.with_watched_components(res_w.as_ptr(), 1),),
+                    FfiResult::INVALID_COMPONENT
+                );
+
+                // Custom event guards
+                assert_eq!(
+                    host_cmd_trigger_ex(
+                        cp,
+                        &BamTriggerDesc::new(BamComponent::from_raw(999), null_mut(), 0),
+                    ),
+                    FfiResult::INVALID_COMPONENT
+                );
+                assert_eq!(
+                    host_cmd_trigger_ex(cp, &BamTriggerDesc::new(drop_comp_h, val4_ptr, 4)),
+                    FfiResult::INVALID_COMPONENT
+                );
+                assert_eq!(
+                    host_cmd_trigger_ex(cp, &BamTriggerDesc::new(dyn_evt_h, val4_ptr, 8)),
+                    FfiResult::INVALID_ARGUMENT
+                );
+                assert_eq!(
+                    host_cmd_trigger_ex(cp, &ok_trig.with_propagate(BamComponent::INVALID),),
+                    FfiResult::INVALID_ENTITY
+                );
+
+                // Entity event (`HostEntEvt`) missing target / `extract_event_target_fn` returning `None`
+                let mut placeholder_evt = HostEntEvt {
+                    target: TargetEntity::from_entity(Entity::PLACEHOLDER),
+                };
+                assert_eq!(
+                    host_cmd_trigger_ex(
+                        cp,
+                        &BamTriggerDesc::new(
+                            ent_evt_h,
+                            (&raw mut placeholder_evt).cast::<u8>(),
+                            core::mem::size_of::<HostEntEvt>(),
+                        ),
+                    ),
+                    FfiResult::INVALID_ENTITY
+                );
+
+                // Lifecycle event guards
+                assert_eq!(
+                    host_cmd_trigger_ex(
+                        cp,
+                        &BamTriggerDesc::new(comp_h, null_mut(), 0)
+                            .with_event_kind(BamEventKind::ADD),
+                    ),
+                    FfiResult::INVALID_ENTITY
+                );
+                assert_eq!(
+                    host_cmd_trigger_ex(
+                        cp,
+                        &BamTriggerDesc::new(comp_h, val4_ptr, 4)
+                            .with_event_kind(BamEventKind::ADD)
+                            .with_entity(live_ffi),
+                    ),
+                    FfiResult::INVALID_ARGUMENT
+                );
+                assert_eq!(
+                    host_cmd_trigger_ex(
+                        cp,
+                        &BamTriggerDesc::new(BamComponent::from_raw(999), null_mut(), 0)
+                            .with_event_kind(BamEventKind::ADD)
+                            .with_entity(live_ffi),
+                    ),
+                    FfiResult::INVALID_COMPONENT
+                );
+                assert_eq!(
+                    host_cmd_trigger_ex(
+                        cp,
+                        &BamTriggerDesc::new(res_h, null_mut(), 0)
+                            .with_event_kind(BamEventKind::ADD)
+                            .with_entity(live_ffi),
+                    ),
+                    FfiResult::INVALID_COMPONENT
+                );
+                assert_eq!(
+                    host_cmd_trigger_ex(
+                        cp,
+                        &BamTriggerDesc::new(BamComponent::INVALID, null_mut(), 0)
+                            .with_event_kind(BamEventKind::ADD)
+                            .with_entity(live_ffi),
+                    ),
+                    FfiResult::INVALID_COMPONENT
+                );
+
+                // `READY` guards (no `Ready` registered in `reg`!)
+                assert_eq!(
+                    host_cmd_trigger_ex(
+                        cp,
+                        &BamTriggerDesc::new(BamComponent::from_raw(999), null_mut(), 0)
+                            .with_event_kind(BamEventKind::READY)
+                            .with_entity(live_ffi),
+                    ),
+                    FfiResult::INVALID_COMPONENT
+                );
+                assert_eq!(
+                    host_cmd_trigger_ex(
+                        cp,
+                        &BamTriggerDesc::new(BamComponent::INVALID, null_mut(), 0)
+                            .with_event_kind(BamEventKind::READY)
+                            .with_entity(live_ffi),
+                    ),
+                    FfiResult::NOT_FOUND
+                );
+                assert_eq!(
+                    host_cmd_trigger_ex(
+                        cp,
+                        &BamTriggerDesc::new(res_h, null_mut(), 0)
+                            .with_event_kind(BamEventKind::READY)
+                            .with_entity(live_ffi),
+                    ),
+                    FfiResult::INVALID_COMPONENT
+                );
+                assert_eq!(
+                    host_cmd_trigger_ex(
+                        cp,
+                        &BamTriggerDesc::new(dyn_evt_h, (&raw mut bad_bits_ffi).cast::<u8>(), 8)
+                            .with_event_kind(BamEventKind::READY),
+                    ),
+                    FfiResult::INVALID_ENTITY
+                );
+                assert_eq!(
+                    host_cmd_trigger_ex(
+                        cp,
+                        &BamTriggerDesc::new(dyn_evt_h, (&raw mut placeholder_ffi).cast::<u8>(), 8)
+                            .with_event_kind(BamEventKind::READY),
+                    ),
+                    FfiResult::INVALID_ENTITY
+                );
+                assert_eq!(
+                    host_cmd_trigger_ex(
+                        cp,
+                        &BamTriggerDesc::new(dyn_evt_h, val4_ptr, 2)
+                            .with_event_kind(BamEventKind::READY)
+                            .with_entity(live_ffi),
+                    ),
+                    FfiResult::INVALID_ARGUMENT
+                );
+                assert_eq!(
+                    host_cmd_trigger_ex(
+                        cp,
+                        &BamTriggerDesc::new(dyn_evt_h, null_mut(), 0)
+                            .with_event_kind(BamEventKind::READY),
+                    ),
+                    FfiResult::INVALID_ENTITY
+                );
+
+                // Dead targets skipped cleanly during flush + `ZstHostEvt` trigger + `HostEntEvt`
+                // with `Entity::PLACEHOLDER` direct `world.trigger` (`extract_target_fn` -> `None`)
+                assert_eq!(
+                    host_cmd_trigger_ex(cp, &ok_trig.with_entity(dead_ffi)),
+                    FfiResult::OK
+                );
+                assert_eq!(
+                    host_cmd_trigger_ex(
+                        cp,
+                        &BamTriggerDesc::new(comp_h, null_mut(), 0)
+                            .with_event_kind(BamEventKind::ADD)
+                            .with_entity(dead_ffi),
+                    ),
+                    FfiResult::OK
+                );
+                assert_eq!(
+                    host_cmd_trigger_ex(
+                        cp,
+                        &BamTriggerDesc::new(dyn_evt_h, val4_ptr, 4)
+                            .with_event_kind(BamEventKind::READY)
+                            .with_entity(dead_ffi),
+                    ),
+                    FfiResult::OK
+                );
+                // Propagating lifecycle event stopping cleanly at root `live_e`.
+                assert_eq!(
+                    host_cmd_trigger_ex(
+                        cp,
+                        &BamTriggerDesc::new(comp_h, null_mut(), 0)
+                            .with_event_kind(BamEventKind::ADD)
+                            .with_entity(live_ffi)
+                            .with_propagate(BamComponent::INVALID),
+                    ),
+                    FfiResult::OK
+                );
+                // ZST custom event with `TriggerEventFn` (exercises `AlignedPayload::as_ptr`).
+                assert_eq!(
+                    host_cmd_trigger_ex(cp, &BamTriggerDesc::new(zst_h, null_mut(), 0)),
+                    FfiResult::OK
+                );
+            }
+        }
+
+        // Pre-insert `DynamicTriggerState` so `DynamicTriggerGuard::drop` restores `previous` (`line 78`).
+        world.insert_resource(DynamicTriggerState {
+            current_target: None,
+            propagate: true,
+        });
+        storage.apply_to_world(&mut world, &snap);
+        assert!(world.get_resource::<DynamicTriggerState>().is_some());
+        world.remove_resource::<DynamicTriggerState>();
+
+        // Observer entity without `ModObserverState` (`line 176`), `extract_target_fn -> None` (`209`),
+        // and `binding.target_entity` fallback without `DynamicTriggerState` (`217`).
+        let mut bare_obs = Observer::with_dynamic_runner(guest_observer_runner);
+        // SAFETY: `zst_evt_key` matches `ZstHostEvt`.
+        bare_obs = unsafe { bare_obs.with_event_key(zst_evt_key) };
+        world.spawn(bare_obs);
+        world.trigger(ZstHostEvt);
+
+        let mut dyn_obs = Observer::with_dynamic_runner(guest_observer_runner);
+        let dyn_evt_key = snap.get_by_handle(dyn_evt_h).unwrap().event_key.unwrap();
+        // SAFETY: `dyn_evt_key` matches 4-byte dynamic `DynEvt`.
+        dyn_obs = unsafe { dyn_obs.with_event_key(dyn_evt_key) };
+        dyn_obs.watch_entity(live_e);
+        world.spawn((
+            dyn_obs,
+            ModObserverState(Arc::new(GuestObserverBinding {
+                name: Arc::from("watched_fallback"),
+                event: dyn_evt_h,
+                event_kind: BamEventKind::CUSTOM,
+                event_id: Some(snap.get_by_handle(dyn_evt_h).unwrap().component_id),
+                event_key: dyn_evt_key,
+                event_size: 4,
+                is_propagating: false,
+                propagate_relationship: None,
+                synthesizes_ffi_entity_payload: false,
+                target_entity: Some(live_e),
+                watched_components: Box::new([]),
+                callback: Some(GuestFnPtr(obs_noop_cb)),
+                mut_callback: None,
+                user_data: crate::sync_ptr::GuestUserData::new(null_mut()),
+                is_active: Arc::clone(&active),
+                registry: reg.clone(),
+                mod_id: Some(ModId(10)),
+                extract_target_fn: None,
+            })),
+        ));
+        let mut trig = EntityTrigger;
+        let mut payload_val: u32 = 42;
+        // SAFETY: `dyn_evt_key` matches `u32` payload and `EntityTrigger`.
+        unsafe {
+            world.trigger_dynamic_targets(
+                dyn_evt_key,
+                live_e,
+                PtrMut::from(&mut payload_val),
+                PtrMut::from(&mut trig),
+            );
+        }
+
+        let mut ent_obs = Observer::with_dynamic_runner(guest_observer_runner);
+        // SAFETY: `ent_evt_key` matches `HostEntEvt`.
+        ent_obs = unsafe { ent_obs.with_event_key(ent_evt_key) };
+        world.spawn((
+            ent_obs,
+            ModObserverState(Arc::new(GuestObserverBinding {
+                name: Arc::from("ent_placeholder_obs"),
+                event: ent_evt_h,
+                event_kind: BamEventKind::CUSTOM,
+                event_id: Some(snap.get_by_handle(ent_evt_h).unwrap().component_id),
+                event_key: ent_evt_key,
+                event_size: core::mem::size_of::<HostEntEvt>(),
+                is_propagating: false,
+                propagate_relationship: None,
+                synthesizes_ffi_entity_payload: false,
+                target_entity: None,
+                watched_components: Box::new([]),
+                callback: Some(GuestFnPtr(obs_noop_cb)),
+                mut_callback: None,
+                user_data: crate::sync_ptr::GuestUserData::new(null_mut()),
+                is_active: Arc::clone(&active),
+                registry: reg,
+                mod_id: Some(ModId(10)),
+                extract_target_fn: snap
+                    .get_by_handle(ent_evt_h)
+                    .unwrap()
+                    .extract_event_target_fn,
+            })),
+        ));
+        world.trigger(HostEntEvt {
+            target: TargetEntity::from_entity(Entity::PLACEHOLDER),
+        });
+    }
 }

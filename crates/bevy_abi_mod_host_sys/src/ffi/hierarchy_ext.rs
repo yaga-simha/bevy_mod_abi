@@ -1331,9 +1331,7 @@ mod tests {
         let mut cmds: *mut BamCommands = core::ptr::null_mut();
         // SAFETY: `sys_ctx` is an active `HostSystemCtx`.
         let rc = unsafe { host_sys_commands(sys_ctx, &mut cmds) };
-        if rc.is_err() {
-            return rc;
-        }
+        assert!(rc.is_ok(), "host_sys_commands failed: {rc}");
 
         // 1. add_child via `host_cmd_insert(FfiChildOf)`
         let link = FfiChildOf::new(plan.parent);
@@ -1347,16 +1345,12 @@ mod tests {
                 core::mem::size_of::<FfiChildOf>(),
             )
         };
-        if r_add.is_err() {
-            return r_add;
-        }
+        assert!(r_add.is_ok(), "host_cmd_insert failed: {r_add}");
 
         // 2. remove_parent via `host_cmd_remove(ChildOf)`
         // SAFETY: `cmds` is active.
         let r_rem = unsafe { host_cmd_remove(cmds, plan.detach_child, plan.child_of_handle) };
-        if r_rem.is_err() {
-            return r_rem;
-        }
+        assert!(r_rem.is_ok(), "host_cmd_remove failed: {r_rem}");
 
         // 3. spawn_child via `host_cmd_spawn([ChildOf, TestPos])`
         let pos = TestPos(77);
@@ -1376,9 +1370,7 @@ mod tests {
                 &mut spawned,
             )
         };
-        if r_spawn.is_err() {
-            return r_spawn;
-        }
+        assert!(r_spawn.is_ok(), "host_cmd_spawn failed: {r_spawn}");
         *plan.spawned_child.lock().unwrap() = spawned;
         FfiResult::OK
     }
@@ -2713,6 +2705,1073 @@ mod tests {
                 ),
                 FfiResult::INVALID_ENTITY
             );
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Component, Copy, Clone, Debug, PartialEq)]
+    #[component(summary_tick)]
+    struct SummaryParent8(FfiEntity);
+
+    #[repr(C)]
+    #[derive(Component, Copy, Clone, Debug, PartialEq, bevy_abi_mod_macros::ModComponent)]
+    struct ByteNonRel(u8);
+
+    #[repr(C)]
+    #[derive(Component, Copy, Clone, Debug, PartialEq)]
+    struct EmptyZeroZst;
+
+    #[repr(C)]
+    #[derive(
+        bevy_ecs::prelude::Resource, Copy, Clone, Debug, bevy_abi_mod_macros::ModComponent,
+    )]
+    struct HierRes;
+
+    #[repr(C)]
+    #[derive(
+        bevy_ecs::prelude::Resource, Copy, Clone, Debug, bevy_abi_mod_macros::ModComponent,
+    )]
+    struct HierRes2;
+
+    #[repr(C)]
+    #[derive(Component, Copy, Clone, Debug, PartialEq, bevy_abi_mod_macros::ModComponent)]
+    struct CovParent8U64(u64);
+
+    #[test]
+    #[allow(clippy::cast_ptr_alignment)]
+    fn sys_entity_children_guards_empty_targets_and_dynamic_missing_map() {
+        use crate::ffi::iter::{QueryPlan, QueryTermMeta};
+        use crate::system::HostSystemCtx;
+        use crate::system::guest_system::RandomQueryView;
+        use crate::system::query_group::MAX_SYSTEM_QUERIES;
+        use bevy_abi_mod_sys::{BamIter, ComponentUuid};
+        use bevy_ecs::change_detection::Tick;
+
+        let mut world = World::new();
+        let pos_cid = world.register_component::<TestPos>();
+        let followers_cid = world.register_component::<CustomFollowers>();
+        let dyn_zst_cid = world.register_component::<EmptyZeroZst>();
+
+        let mut reg = ModRegistry::new();
+        let pos_h = reg
+            .register_component::<TestPos>(pos_cid, Default::default())
+            .unwrap();
+        let followers_h = reg
+            .register_relationship_target::<CustomFollowers>(
+                "hier_cov::CustomFollowers",
+                None,
+                followers_cid,
+            )
+            .unwrap();
+
+        // Register a dynamic component WITHOUT `DynamicComponentHookMap` in world yet.
+        let mut dyn_h = BamComponent::INVALID;
+        {
+            let mut ctx = LoadContext::with_world_and_mod_id(
+                reg.clone(),
+                Arc::new(AtomicBool::new(true)),
+                &raw mut world,
+                Some(ModId(12)),
+            );
+            let d = ComponentDesc::new(
+                c"hier_cov::DynNotTarget".as_ptr(),
+                ComponentUuid::from_parts("hier_cov::DynNotTarget", 0, 1, 0),
+                0,
+                1,
+            );
+            // SAFETY: Valid `LoadContext` and descriptor.
+            unsafe {
+                assert_eq!(
+                    host_register_component(ctx.as_ffi_ptr(), &d, &mut dyn_h),
+                    FfiResult::OK
+                );
+            }
+            reg = ctx.registry.clone();
+            ctx.finish_init();
+        }
+        let dyn_cid = reg.get_by_handle(dyn_h).unwrap().component_id;
+
+        // Spawn entity with empty `CustomFollowers(vec![])` and `EmptyZeroZst`.
+        let host_e = world
+            .spawn((CustomFollowers(Vec::new()), EmptyZeroZst))
+            .id();
+        let host_e_ffi = FfiEntity::from_bits(host_e.to_bits());
+        let dead = world.spawn_empty().id();
+        assert!(world.despawn(dead));
+
+        let plan = QueryPlan::from_terms(vec![
+            QueryTermMeta {
+                component: pos_h,
+                component_id: pos_cid,
+                mode: AccessMode::READ,
+                uuid: TestPos::UUID,
+                size: 4,
+                align: 4,
+                storage_flags: 0,
+                msg_read_batch_fn: None,
+                msg_send_fn: None,
+                msg_write_batch_fn: None,
+            },
+            QueryTermMeta {
+                component: followers_h,
+                component_id: followers_cid,
+                mode: AccessMode::READ,
+                uuid: ComponentUuid::from_canonical_name("hier_cov::CustomFollowers"),
+                size: core::mem::size_of::<CustomFollowers>(),
+                align: core::mem::align_of::<CustomFollowers>(),
+                storage_flags: 0,
+                msg_read_batch_fn: None,
+                msg_send_fn: None,
+                msg_write_batch_fn: None,
+            },
+            QueryTermMeta {
+                component: dyn_h,
+                component_id: dyn_cid,
+                mode: AccessMode::READ,
+                uuid: ComponentUuid::from_parts("hier_cov::DynNotTarget", 0, 1, 0),
+                size: 0,
+                align: 1,
+                storage_flags: 0,
+                msg_read_batch_fn: None,
+                msg_send_fn: None,
+                msg_write_batch_fn: None,
+            },
+        ]);
+
+        let snap = reg.snapshot_arc();
+        let iter_ptrs = [core::ptr::null_mut::<BamIter>(); MAX_SYSTEM_QUERIES];
+        let mut views = [None; MAX_SYSTEM_QUERIES];
+        views[0] = Some(RandomQueryView {
+            plan: &plan,
+            is_dense: true,
+            matched_tables: &[],
+            matched_archetypes: &[],
+            has_query_state: true,
+        });
+
+        let mut unaligned_buf = [0u64; 2];
+        let unaligned = (&raw mut unaligned_buf).cast::<u8>().wrapping_add(1);
+        let mut out_ptr: *const FfiEntity = core::ptr::null();
+        let mut out_len: usize = 0;
+
+        // 1. `HostSystemCtx` WITHOUT world (`ctx.world == None`) returns `INVALID_STATE`.
+        let mut ctx_no_world = HostSystemCtx::new(
+            Arc::clone(&snap),
+            None,
+            String::new(),
+            iter_ptrs,
+            1,
+            core::ptr::null_mut(),
+        );
+        // SAFETY: Valid `HostSystemCtx` and intentionally misaligned pointers tested via `is_aligned()`.
+        unsafe {
+            assert_eq!(
+                host_sys_entity_children(
+                    ctx_no_world.as_ffi_ptr(),
+                    host_e_ffi,
+                    BamComponent::INVALID,
+                    core::ptr::null_mut(),
+                    &raw mut out_len,
+                ),
+                FfiResult::NULL_POINTER
+            );
+            assert_eq!(
+                host_sys_entity_children(
+                    ctx_no_world.as_ffi_ptr(),
+                    host_e_ffi,
+                    BamComponent::INVALID,
+                    &raw mut out_ptr,
+                    core::ptr::null_mut(),
+                ),
+                FfiResult::NULL_POINTER
+            );
+            assert_eq!(
+                host_sys_entity_children(
+                    ctx_no_world.as_ffi_ptr(),
+                    host_e_ffi,
+                    BamComponent::INVALID,
+                    unaligned.cast::<*const FfiEntity>(),
+                    &raw mut out_len,
+                ),
+                FfiResult::INVALID_ARGUMENT
+            );
+            assert_eq!(
+                host_sys_entity_children(
+                    ctx_no_world.as_ffi_ptr(),
+                    host_e_ffi,
+                    BamComponent::INVALID,
+                    &raw mut out_ptr,
+                    unaligned.cast::<usize>(),
+                ),
+                FfiResult::INVALID_ARGUMENT
+            );
+            assert_eq!(
+                host_sys_entity_children(
+                    ctx_no_world.as_ffi_ptr(),
+                    FfiEntity::NULL,
+                    BamComponent::INVALID,
+                    &raw mut out_ptr,
+                    &raw mut out_len,
+                ),
+                FfiResult::INVALID_ENTITY
+            );
+            assert_eq!(
+                host_sys_entity_children(
+                    ctx_no_world.as_ffi_ptr(),
+                    FfiEntity::from_bits(1u64 << 32),
+                    BamComponent::INVALID,
+                    &raw mut out_ptr,
+                    &raw mut out_len,
+                ),
+                FfiResult::INVALID_ENTITY
+            );
+            assert_eq!(
+                host_sys_entity_children(
+                    ctx_no_world.as_ffi_ptr(),
+                    FfiEntity::from_bits(Entity::PLACEHOLDER.to_bits()),
+                    BamComponent::INVALID,
+                    &raw mut out_ptr,
+                    &raw mut out_len,
+                ),
+                FfiResult::INVALID_ENTITY
+            );
+            assert_eq!(
+                host_sys_entity_children(
+                    ctx_no_world.as_ffi_ptr(),
+                    host_e_ffi,
+                    BamComponent::INVALID,
+                    &raw mut out_ptr,
+                    &raw mut out_len,
+                ),
+                FfiResult::INVALID_STATE
+            );
+        }
+        drop(ctx_no_world);
+
+        // Poisoned `HostSystemCtx` -> `INVALID_STATE`
+        let mut poisoned_ctx = HostSystemCtx::new(
+            Arc::clone(&snap),
+            None,
+            String::new(),
+            iter_ptrs,
+            1,
+            core::ptr::null_mut(),
+        );
+        poisoned_ctx.header.poison();
+        let poisoned_ptr = poisoned_ctx.as_ffi_ptr();
+        // SAFETY: Poisoned pointer is rejected by `validate_handle_ref` before dereference.
+        unsafe {
+            assert_eq!(
+                host_sys_entity_children(
+                    poisoned_ptr.cast_const(),
+                    host_e_ffi,
+                    BamComponent::INVALID,
+                    &raw mut out_ptr,
+                    &raw mut out_len,
+                ),
+                FfiResult::INVALID_STATE
+            );
+        }
+
+        // 2. Empty snapshot without `Children` -> `NOT_FOUND` for `BamComponent::INVALID`.
+        {
+            let empty_snap = ModRegistry::new().snapshot_arc();
+            let mut ctx_empty = HostSystemCtx::new(
+                empty_snap,
+                None,
+                String::new(),
+                iter_ptrs,
+                1,
+                core::ptr::null_mut(),
+            )
+            .with_world_and_queries(
+                world.as_unsafe_world_cell_readonly(),
+                views,
+                Tick::new(0),
+                Tick::new(1),
+            );
+            // SAFETY: Valid world-backed `HostSystemCtx` and stack outputs.
+            unsafe {
+                assert_eq!(
+                    host_sys_entity_children(
+                        ctx_empty.as_ffi_ptr().cast_const(),
+                        host_e_ffi,
+                        BamComponent::INVALID,
+                        &raw mut out_ptr,
+                        &raw mut out_len,
+                    ),
+                    FfiResult::NOT_FOUND
+                );
+            }
+        }
+
+        // 3. World-backed `HostSystemCtx`: `PERMISSION_DENIED` (auto-registered `Children` not in query),
+        // `INVALID_COMPONENT` (unknown target, non-target static, dynamic without hook_map, dynamic not a target),
+        // `INVALID_ENTITY` (dead), empty `CustomFollowers` (`len == 0`), empty `DynamicTarget` (`len == 0`).
+        {
+            let mut ctx_w = HostSystemCtx::new(
+                Arc::clone(&snap),
+                None,
+                String::new(),
+                iter_ptrs,
+                1,
+                core::ptr::null_mut(),
+            )
+            .with_world_and_queries(
+                world.as_unsafe_world_cell_readonly(),
+                views,
+                Tick::new(0),
+                Tick::new(1),
+            );
+            // SAFETY: Valid world-backed `HostSystemCtx` and stack outputs.
+            unsafe {
+                assert_eq!(
+                    host_sys_entity_children(
+                        ctx_w.as_ffi_ptr().cast_const(),
+                        host_e_ffi,
+                        BamComponent::INVALID,
+                        &raw mut out_ptr,
+                        &raw mut out_len,
+                    ),
+                    FfiResult::PERMISSION_DENIED
+                );
+                assert_eq!(
+                    host_sys_entity_children(
+                        ctx_w.as_ffi_ptr().cast_const(),
+                        host_e_ffi,
+                        BamComponent::from_raw(999),
+                        &raw mut out_ptr,
+                        &raw mut out_len,
+                    ),
+                    FfiResult::INVALID_COMPONENT
+                );
+                assert_eq!(
+                    host_sys_entity_children(
+                        ctx_w.as_ffi_ptr().cast_const(),
+                        FfiEntity::from_bits(dead.to_bits()),
+                        followers_h,
+                        &raw mut out_ptr,
+                        &raw mut out_len,
+                    ),
+                    FfiResult::INVALID_ENTITY
+                );
+                // Non-relationship static component `TestPos` -> `INVALID_COMPONENT`
+                assert_eq!(
+                    host_sys_entity_children(
+                        ctx_w.as_ffi_ptr().cast_const(),
+                        host_e_ffi,
+                        pos_h,
+                        &raw mut out_ptr,
+                        &raw mut out_len,
+                    ),
+                    FfiResult::INVALID_COMPONENT
+                );
+                // Empty `CustomFollowers` returns `OK` with `len == 0`.
+                assert_eq!(
+                    host_sys_entity_children(
+                        ctx_w.as_ffi_ptr().cast_const(),
+                        host_e_ffi,
+                        followers_h,
+                        &raw mut out_ptr,
+                        &raw mut out_len,
+                    ),
+                    FfiResult::OK
+                );
+                assert_eq!(out_len, 0);
+                // Dynamic component without `DynamicComponentHookMap` resource -> `INVALID_COMPONENT`
+                assert_eq!(
+                    host_sys_entity_children(
+                        ctx_w.as_ffi_ptr().cast_const(),
+                        host_e_ffi,
+                        dyn_h,
+                        &raw mut out_ptr,
+                        &raw mut out_len,
+                    ),
+                    FfiResult::INVALID_COMPONENT
+                );
+            }
+        }
+
+        // Insert `DynamicComponentHookMap` and verify:
+        // - `dyn_h` (not a registered relationship target) -> `INVALID_COMPONENT`
+        // - a registered `DynamicTarget` with 0 children -> `OK`, `out_len == 0`
+        ensure_dynamic_hook_map_in_world(&mut world);
+        let mut rel_h = BamComponent::INVALID;
+        let mut tgt_h = BamComponent::INVALID;
+        let mut bind_h = BamComponent::INVALID;
+        let reg2 = {
+            let mut ctx = LoadContext::with_world_and_mod_id(
+                reg,
+                Arc::new(AtomicBool::new(true)),
+                &raw mut world,
+                Some(ModId(13)),
+            );
+            let d_r = ComponentDesc::new(
+                c"hier_cov::R".as_ptr(),
+                ComponentUuid::from_parts("hier_cov::R", 8, 8, 0),
+                8,
+                8,
+            );
+            let d_t = ComponentDesc::new(
+                c"hier_cov::T".as_ptr(),
+                ComponentUuid::from_parts("hier_cov::T", 0, 1, 0),
+                0,
+                1,
+            );
+            // SAFETY: Valid `LoadContext` and descriptors.
+            unsafe {
+                assert_eq!(
+                    host_register_component(ctx.as_ffi_ptr(), &d_r, &mut rel_h),
+                    FfiResult::OK
+                );
+                assert_eq!(
+                    host_register_component(ctx.as_ffi_ptr(), &d_t, &mut tgt_h),
+                    FfiResult::OK
+                );
+            }
+            let bind_name =
+                std::ffi::CString::new(format!("__bam_rel_bind::{}::{}", rel_h.0, tgt_h.0))
+                    .unwrap();
+            let d_b = ComponentDesc::new(
+                bind_name.as_ptr(),
+                ComponentUuid::from_parts(bind_name.to_str().unwrap(), 0, 1, 0),
+                0,
+                1,
+            );
+            // SAFETY: Valid `LoadContext` and bind descriptor.
+            unsafe {
+                assert_eq!(
+                    host_register_component(ctx.as_ffi_ptr(), &d_b, &mut bind_h),
+                    FfiResult::OK
+                );
+            }
+            let r = ctx.registry.clone();
+            ctx.finish_init();
+            r
+        };
+        let tgt_cid = reg2.get_by_handle(tgt_h).unwrap().component_id;
+        let snap2 = reg2.snapshot_arc();
+        let plan2 = QueryPlan::from_terms(vec![
+            QueryTermMeta {
+                component: dyn_h,
+                component_id: dyn_cid,
+                mode: AccessMode::READ,
+                uuid: ComponentUuid::from_parts("hier_cov::DynNotTarget", 0, 1, 0),
+                size: 0,
+                align: 1,
+                storage_flags: 0,
+                msg_read_batch_fn: None,
+                msg_send_fn: None,
+                msg_write_batch_fn: None,
+            },
+            QueryTermMeta {
+                component: tgt_h,
+                component_id: tgt_cid,
+                mode: AccessMode::READ,
+                uuid: ComponentUuid::from_parts("hier_cov::T", 0, 1, 0),
+                size: 0,
+                align: 1,
+                storage_flags: 0,
+                msg_read_batch_fn: None,
+                msg_send_fn: None,
+                msg_write_batch_fn: None,
+            },
+        ]);
+        views[0] = Some(RandomQueryView {
+            plan: &plan2,
+            is_dense: true,
+            matched_tables: &[],
+            matched_archetypes: &[],
+            has_query_state: true,
+        });
+        let mut ctx_w2 = HostSystemCtx::new(
+            snap2,
+            None,
+            String::new(),
+            iter_ptrs,
+            1,
+            core::ptr::null_mut(),
+        )
+        .with_world_and_queries(
+            world.as_unsafe_world_cell_readonly(),
+            views,
+            Tick::new(0),
+            Tick::new(1),
+        );
+        // SAFETY: Valid `HostSystemCtx` and stack outputs.
+        unsafe {
+            assert_eq!(
+                host_sys_entity_children(
+                    ctx_w2.as_ffi_ptr().cast_const(),
+                    host_e_ffi,
+                    dyn_h,
+                    &raw mut out_ptr,
+                    &raw mut out_len,
+                ),
+                FfiResult::INVALID_COMPONENT
+            );
+            assert_eq!(
+                host_sys_entity_children(
+                    ctx_w2.as_ffi_ptr().cast_const(),
+                    host_e_ffi,
+                    tgt_h,
+                    &raw mut out_ptr,
+                    &raw mut out_len,
+                ),
+                FfiResult::OK
+            );
+            assert_eq!(out_len, 0);
+        }
+        let _ = dyn_zst_cid;
+    }
+
+    #[test]
+    fn cascade_cache_sparse_dynamic_target_summary_tick_empty_and_parallel_strata() {
+        use super::CascadeHierarchyCache;
+        use bevy_abi_mod_sys::{BAM_COMPONENT_FLAG_SPARSE_SET, ComponentUuid};
+        use bevy_ecs::component::ComponentId;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        // 1. Empty world: `ensure_built_child_of` returns `None`, `ensure_built` on unregistered /
+        // non-relation (`u8`, non-target ZST) returns `true` then `false`.
+        let mut world = World::new();
+        let u8_cid = world.register_component::<ByteNonRel>();
+        let zst_cid = world.register_component::<EmptyZeroZst>();
+        let mut cache = CascadeHierarchyCache::new();
+        assert_eq!(cache.ensure_built_child_of(&world), None);
+        let missing_cid = ComponentId::new(999_999);
+        assert!(cache.ensure_built(&world, missing_cid));
+        assert!(!cache.ensure_built(&world, missing_cid));
+        assert!(cache.ensure_built(&world, u8_cid));
+        assert!(!cache.ensure_built(&world, u8_cid));
+        assert!(cache.ensure_built(&world, zst_cid));
+        assert!(!cache.ensure_built(&world, zst_cid));
+        cache.for_each_cascade(missing_cid, |_, _, _| {});
+        cache.par_for_each_stratum(missing_cid, |_, _| {});
+
+        // Registered `ChildOf` with 0 entities (`all_nodes.is_empty()`), then with entities.
+        let child_of_cid = world.register_component::<ChildOf>();
+        assert_eq!(
+            cache.ensure_built_child_of(&world),
+            Some((child_of_cid, true))
+        );
+        assert_eq!(
+            cache.ensure_built_child_of(&world),
+            Some((child_of_cid, false))
+        );
+
+        // 2. `SummaryParent8` (`summary_tick`) + null `Entity8` + invalid `Entity4(u32::MAX)` +
+        // `SparseParent8` self-cycle & removal & mutation.
+        let sum_cid = world.register_component::<SummaryParent8>();
+        let p8_cid = world.register_component::<CustomParent8>();
+        let p4_cid = world.register_component::<CustomParent4>();
+        let sp_cid = world.register_component::<SparseParent8>();
+
+        let s_root = world.spawn_empty().id();
+        let s_child = world
+            .spawn(SummaryParent8(FfiEntity::from_bits(s_root.to_bits())))
+            .id();
+        world.spawn((CustomParent8(FfiEntity::NULL), CustomParent4(u32::MAX)));
+        let sp_self = world.spawn_empty().id();
+        world
+            .entity_mut(sp_self)
+            .insert(SparseParent8(FfiEntity::from_bits(sp_self.to_bits())));
+
+        assert!(cache.ensure_built(&world, sum_cid));
+        assert_eq!(cache.depth_of(sum_cid, s_child), Some(1));
+        world.increment_change_tick();
+        assert!(!cache.ensure_built(&world, sum_cid));
+        // Mutating `SummaryParent8` updates table summary tick -> triggers rebuild.
+        world
+            .entity_mut(s_child)
+            .get_mut::<SummaryParent8>()
+            .unwrap()
+            .0 = FfiEntity::from_bits(s_root.to_bits());
+        assert!(cache.ensure_built(&world, sum_cid));
+
+        assert!(cache.ensure_built(&world, p8_cid));
+        assert!(cache.ensure_built(&world, p4_cid));
+        assert!(cache.ensure_built(&world, sp_cid));
+        assert!(cache.has_cycles(sp_cid));
+        // Mutating `SparseParent8` in place triggers `get_changed_tick` rebuild.
+        world
+            .entity_mut(sp_self)
+            .get_mut::<SparseParent8>()
+            .unwrap()
+            .0 = FfiEntity::from_bits(s_root.to_bits());
+        assert!(cache.ensure_built(&world, sp_cid));
+        assert!(!cache.has_cycles(sp_cid));
+        // Despawn `sp_self` so `SparseSet` drops count to 0 (`len != cached_edge_count`).
+        assert!(world.despawn(sp_self));
+        assert!(cache.ensure_built(&world, sp_cid));
+
+        // 3. `find_nearest_ancestor` hitting a cycle `cyc_a <-> cyc_b` returns `None`.
+        let cyc_a = world.spawn_empty().id();
+        let cyc_b = world.spawn_empty().id();
+        world
+            .entity_mut(cyc_a)
+            .insert(CustomParent8(FfiEntity::from_bits(cyc_b.to_bits())));
+        world
+            .entity_mut(cyc_b)
+            .insert(CustomParent8(FfiEntity::from_bits(cyc_a.to_bits())));
+        assert!(cache.ensure_built(&world, p8_cid));
+        assert_eq!(cache.find_nearest_ancestor(p8_cid, cyc_a, |_| false), None);
+
+        // 4. `SparseSet` `DynamicTarget` (`BAM_COMPONENT_FLAG_SPARSE_SET`) fingerprint, rebuild,
+        // self-loop/null child skip, and `iter_up_cascade_impl` `resolve_dynamic_target_parent`.
+        ensure_dynamic_hook_map_in_world(&mut world);
+        let mut s_rel_h = BamComponent::INVALID;
+        let mut s_tgt_h = BamComponent::INVALID;
+        let mut s_bind_h = BamComponent::INVALID;
+        let reg_s = {
+            let mut ctx = LoadContext::with_world_and_mod_id(
+                ModRegistry::new(),
+                Arc::new(AtomicBool::new(true)),
+                &raw mut world,
+                Some(ModId(14)),
+            );
+            let d_r = ComponentDesc::new(
+                c"hier_cov::SparseRel".as_ptr(),
+                ComponentUuid::from_parts("hier_cov::SparseRel", 8, 8, 0),
+                8,
+                8,
+            )
+            .with_flags(BAM_COMPONENT_FLAG_SPARSE_SET);
+            let d_t = ComponentDesc::new(
+                c"hier_cov::SparseTgt".as_ptr(),
+                ComponentUuid::from_parts("hier_cov::SparseTgt", 0, 1, 0),
+                0,
+                1,
+            )
+            .with_flags(BAM_COMPONENT_FLAG_SPARSE_SET);
+            // SAFETY: Valid `LoadContext` and descriptors.
+            unsafe {
+                assert_eq!(
+                    host_register_component(ctx.as_ffi_ptr(), &d_r, &mut s_rel_h),
+                    FfiResult::OK
+                );
+                assert_eq!(
+                    host_register_component(ctx.as_ffi_ptr(), &d_t, &mut s_tgt_h),
+                    FfiResult::OK
+                );
+            }
+            let bname =
+                std::ffi::CString::new(format!("__bam_rel_bind::{}::{}", s_rel_h.0, s_tgt_h.0))
+                    .unwrap();
+            let d_b = ComponentDesc::new(
+                bname.as_ptr(),
+                ComponentUuid::from_parts(bname.to_str().unwrap(), 0, 1, 0),
+                0,
+                1,
+            );
+            // SAFETY: Valid `LoadContext` and bind descriptor.
+            unsafe {
+                assert_eq!(
+                    host_register_component(ctx.as_ffi_ptr(), &d_b, &mut s_bind_h),
+                    FfiResult::OK
+                );
+            }
+            let r = ctx.registry.clone();
+            ctx.finish_init();
+            r
+        };
+        let s_rel_cid = reg_s.get_by_handle(s_rel_h).unwrap().component_id;
+        let s_tgt_cid = reg_s.get_by_handle(s_tgt_h).unwrap().component_id;
+        let pos_cid = world.register_component::<TestPos>();
+        let sun = world.spawn(TestPos(555)).id();
+        let planet = world.spawn_empty().id();
+        let mut sun_bits = sun.to_bits();
+        // SAFETY: `s_rel_cid` has `(8, 8)` layout storing `FfiEntity`.
+        unsafe {
+            world.entity_mut(planet).insert_by_id(
+                s_rel_cid,
+                OwningPtr::new(core::ptr::NonNull::from(&mut sun_bits).cast()),
+            );
+        }
+        assert!(cache.ensure_built(&world, s_tgt_cid));
+        assert!(!cache.ensure_built(&world, s_tgt_cid));
+        assert_eq!(cache.parent_of(s_tgt_cid, planet), Some(sun));
+
+        // Upward cascade along `SparseSet` `DynamicTarget` (`s_tgt_h`) finds `TestPos(555)` on `sun`
+        // and returns `NOT_FOUND` when starting from `sun` (root).
+        {
+            use super::iter_up_cascade_impl;
+            use crate::ffi::iter::{HostIter, QueryPlan, QueryTermMeta};
+            use bevy_ecs::change_detection::Tick;
+
+            world.insert_resource(reg_s);
+            let plan = QueryPlan::from_terms(vec![QueryTermMeta {
+                component: BamComponent::from_raw(1),
+                component_id: pos_cid,
+                mode: AccessMode::READ,
+                uuid: TestPos::UUID,
+                size: 4,
+                align: 4,
+                storage_flags: 0,
+                msg_read_batch_fn: None,
+                msg_send_fn: None,
+                msg_write_batch_fn: None,
+            }]);
+            let mut iter = HostIter::new_dense(
+                &world.storages().tables,
+                &[],
+                &plan,
+                Tick::new(0),
+                Tick::new(1),
+            )
+            .with_world(world.as_unsafe_world_cell_readonly());
+            let mut out_ptr: *const c_void = core::ptr::null();
+            let mut out_owner = FfiEntity::NULL;
+            // SAFETY: Valid `HostIter` and aligned stack outputs.
+            unsafe {
+                assert_eq!(
+                    iter_up_cascade_impl(
+                        iter.as_ffi_ptr(),
+                        s_tgt_h,
+                        FfiEntity::from_bits(planet.to_bits()),
+                        0,
+                        &raw mut out_ptr,
+                        &raw mut out_owner,
+                    ),
+                    FfiResult::OK
+                );
+                assert_eq!(out_owner, FfiEntity::from_bits(sun.to_bits()));
+                assert_eq!((*out_ptr.cast::<TestPos>()).0, 555);
+
+                assert_eq!(
+                    iter_up_cascade_impl(
+                        iter.as_ffi_ptr(),
+                        s_tgt_h,
+                        FfiEntity::from_bits(sun.to_bits()),
+                        0,
+                        &raw mut out_ptr,
+                        &raw mut out_owner,
+                    ),
+                    FfiResult::NOT_FOUND
+                );
+            }
+        }
+
+        // 5. `par_for_each_stratum` multi-grain parallel dispatch (`> 256` entities in non-Miri;
+        // scaled down under Miri).
+        let par_parent = world.spawn_empty().id();
+        let fanout = if cfg!(miri) { 8usize } else { 300usize };
+        for _ in 0..fanout {
+            world.spawn(ChildOf(par_parent));
+        }
+        assert!(cache.ensure_built(&world, child_of_cid));
+        let par_seen = AtomicUsize::new(0);
+        cache.par_for_each_stratum(child_of_cid, |_, chunk| {
+            par_seen.fetch_add(chunk.len(), Ordering::Relaxed);
+        });
+        assert_eq!(par_seen.load(Ordering::Relaxed), fanout + 1);
+    }
+
+    #[test]
+    #[allow(clippy::cast_ptr_alignment)]
+    fn iter_up_cascade_all_guards_and_deep_multi_stratum_brent_walk() {
+        use super::iter_up_cascade_impl;
+        use crate::ffi::iter::{HostIter, QueryPlan, QueryTermMeta};
+        use bevy_abi_mod_sys::{BAM_STORAGE_FLAG_RESOURCE, ComponentUuid};
+        use bevy_ecs::change_detection::Tick;
+
+        let mut world = World::new();
+        let pos_cid = world.register_component::<TestPos>();
+        let res_cid = world.register_component::<HierRes>();
+        let res2_cid = world.register_component::<HierRes2>();
+        let byte_cid = world.register_component::<ByteNonRel>();
+        let p8_cid = world.register_component::<CovParent8U64>();
+
+        let mut reg = ModRegistry::new();
+        let pos_h = reg
+            .register_component::<TestPos>(pos_cid, Default::default())
+            .unwrap();
+        let res_h = reg.register_resource::<HierRes>(res_cid).unwrap();
+        let res2_h = reg.register_resource::<HierRes2>(res2_cid).unwrap();
+        let byte_h = reg
+            .register_component::<ByteNonRel>(byte_cid, Default::default())
+            .unwrap();
+        let p8_h = reg
+            .register_component::<CovParent8U64>(p8_cid, Default::default())
+            .unwrap();
+
+        // Deep 7-node chain: `n0(TestPos(42)) <- n1 <- n2 <- n3 <- n4 <- n5 <- n6`.
+        let n0 = world.spawn(TestPos(42)).id();
+        let mut curr = n0;
+        for _ in 0..6 {
+            curr = world.spawn(ChildOf(curr)).id();
+        }
+        let n6 = curr;
+
+        // Entity pointing to a despawned parent via `CovParent8U64` -> hits `world.get_entity(curr).is_err()`.
+        let dead_parent = world.spawn_empty().id();
+        assert!(world.despawn(dead_parent));
+        let orphan = world.spawn(CovParent8U64(dead_parent.to_bits())).id();
+
+        let plan = QueryPlan::from_terms(vec![
+            QueryTermMeta {
+                component: pos_h,
+                component_id: pos_cid,
+                mode: AccessMode::READ,
+                uuid: TestPos::UUID,
+                size: 4,
+                align: 4,
+                storage_flags: 0,
+                msg_read_batch_fn: None,
+                msg_send_fn: None,
+                msg_write_batch_fn: None,
+            },
+            QueryTermMeta {
+                component: res_h,
+                component_id: res_cid,
+                mode: AccessMode::RESOURCE_READ,
+                uuid: ComponentUuid::from_canonical_name("hier_cov::HierRes"),
+                size: 0,
+                align: 1,
+                storage_flags: BAM_STORAGE_FLAG_RESOURCE,
+                msg_read_batch_fn: None,
+                msg_send_fn: None,
+                msg_write_batch_fn: None,
+            },
+        ]);
+
+        let mut unaligned_buf = [0u64; 2];
+        let unaligned = (&raw mut unaligned_buf).cast::<u8>().wrapping_add(1);
+        let mut out_ptr: *const c_void = core::ptr::null();
+        let mut out_owner = FfiEntity::NULL;
+
+        // 1. Guards without `world` on `HostIter` and without `ModRegistry` in `World`.
+        let mut iter_no_world = HostIter::new_dense(
+            &world.storages().tables,
+            &[],
+            &plan,
+            Tick::new(0),
+            Tick::new(1),
+        );
+        // SAFETY: Valid stack buffers and intentionally misaligned/null pointers checked upfront.
+        unsafe {
+            assert_eq!(
+                iter_up_cascade_impl(
+                    iter_no_world.as_ffi_ptr(),
+                    BamComponent::INVALID,
+                    FfiEntity::from_bits(n6.to_bits()),
+                    0,
+                    core::ptr::null_mut(),
+                    &raw mut out_owner,
+                ),
+                FfiResult::NULL_POINTER
+            );
+            assert_eq!(
+                iter_up_cascade_impl(
+                    iter_no_world.as_ffi_ptr(),
+                    BamComponent::INVALID,
+                    FfiEntity::from_bits(n6.to_bits()),
+                    0,
+                    &raw mut out_ptr,
+                    core::ptr::null_mut(),
+                ),
+                FfiResult::NULL_POINTER
+            );
+            assert_eq!(
+                iter_up_cascade_impl(
+                    iter_no_world.as_ffi_ptr(),
+                    BamComponent::INVALID,
+                    FfiEntity::from_bits(n6.to_bits()),
+                    0,
+                    unaligned.cast::<*const c_void>(),
+                    &raw mut out_owner,
+                ),
+                FfiResult::INVALID_ARGUMENT
+            );
+            assert_eq!(
+                iter_up_cascade_impl(
+                    iter_no_world.as_ffi_ptr(),
+                    BamComponent::INVALID,
+                    FfiEntity::from_bits(n6.to_bits()),
+                    0,
+                    &raw mut out_ptr,
+                    unaligned.cast::<FfiEntity>(),
+                ),
+                FfiResult::INVALID_ARGUMENT
+            );
+            assert_eq!(
+                iter_up_cascade_impl(
+                    core::ptr::null_mut(),
+                    BamComponent::INVALID,
+                    FfiEntity::from_bits(n6.to_bits()),
+                    0,
+                    &raw mut out_ptr,
+                    &raw mut out_owner,
+                ),
+                FfiResult::NULL_POINTER
+            );
+            assert_eq!(
+                iter_up_cascade_impl(
+                    iter_no_world.as_ffi_ptr(),
+                    BamComponent::INVALID,
+                    FfiEntity::NULL,
+                    0,
+                    &raw mut out_ptr,
+                    &raw mut out_owner,
+                ),
+                FfiResult::INVALID_ENTITY
+            );
+            assert_eq!(
+                iter_up_cascade_impl(
+                    iter_no_world.as_ffi_ptr(),
+                    BamComponent::INVALID,
+                    FfiEntity::from_bits(1u64 << 32),
+                    0,
+                    &raw mut out_ptr,
+                    &raw mut out_owner,
+                ),
+                FfiResult::INVALID_ENTITY
+            );
+            assert_eq!(
+                iter_up_cascade_impl(
+                    iter_no_world.as_ffi_ptr(),
+                    BamComponent::INVALID,
+                    FfiEntity::from_bits(Entity::PLACEHOLDER.to_bits()),
+                    0,
+                    &raw mut out_ptr,
+                    &raw mut out_owner,
+                ),
+                FfiResult::INVALID_ENTITY
+            );
+            assert_eq!(
+                iter_up_cascade_impl(
+                    iter_no_world.as_ffi_ptr(),
+                    BamComponent::INVALID,
+                    FfiEntity::from_bits(n6.to_bits()),
+                    99,
+                    &raw mut out_ptr,
+                    &raw mut out_owner,
+                ),
+                FfiResult::OUT_OF_RANGE
+            );
+            assert_eq!(
+                iter_up_cascade_impl(
+                    iter_no_world.as_ffi_ptr(),
+                    BamComponent::INVALID,
+                    FfiEntity::from_bits(n6.to_bits()),
+                    0,
+                    &raw mut out_ptr,
+                    &raw mut out_owner,
+                ),
+                FfiResult::INVALID_STATE
+            );
+        }
+        drop(iter_no_world);
+
+        // 2. World without `ModRegistry` -> `INVALID_COMPONENT` for explicit relation not in plan;
+        // resource handle in query plan (`res_h`) -> `INVALID_COMPONENT`.
+        {
+            let mut iter_no_reg = HostIter::new_dense(
+                &world.storages().tables,
+                &[],
+                &plan,
+                Tick::new(0),
+                Tick::new(1),
+            )
+            .with_world(world.as_unsafe_world_cell_readonly());
+            // SAFETY: Valid `HostIter` and stack outputs.
+            unsafe {
+                assert_eq!(
+                    iter_up_cascade_impl(
+                        iter_no_reg.as_ffi_ptr(),
+                        res_h,
+                        FfiEntity::from_bits(n6.to_bits()),
+                        0,
+                        &raw mut out_ptr,
+                        &raw mut out_owner,
+                    ),
+                    FfiResult::INVALID_COMPONENT
+                );
+                assert_eq!(
+                    iter_up_cascade_impl(
+                        iter_no_reg.as_ffi_ptr(),
+                        p8_h,
+                        FfiEntity::from_bits(n6.to_bits()),
+                        0,
+                        &raw mut out_ptr,
+                        &raw mut out_owner,
+                    ),
+                    FfiResult::INVALID_COMPONENT
+                );
+            }
+        }
+
+        // 3. World WITH `ModRegistry`: unknown relation, resource relation, non-relation `u8` layout,
+        // orphan pointing at despawned entity (`NOT_FOUND`), and 6-hop multi-stratum `ChildOf` walk.
+        world.insert_resource(reg);
+        let mut iter_live = HostIter::new_dense(
+            &world.storages().tables,
+            &[],
+            &plan,
+            Tick::new(0),
+            Tick::new(1),
+        )
+        .with_world(world.as_unsafe_world_cell_readonly());
+        // SAFETY: Valid `HostIter` and stack outputs.
+        unsafe {
+            assert_eq!(
+                iter_up_cascade_impl(
+                    iter_live.as_ffi_ptr(),
+                    BamComponent::from_raw(999),
+                    FfiEntity::from_bits(n6.to_bits()),
+                    0,
+                    &raw mut out_ptr,
+                    &raw mut out_owner,
+                ),
+                FfiResult::INVALID_COMPONENT
+            );
+            assert_eq!(
+                iter_up_cascade_impl(
+                    iter_live.as_ffi_ptr(),
+                    res2_h,
+                    FfiEntity::from_bits(n6.to_bits()),
+                    0,
+                    &raw mut out_ptr,
+                    &raw mut out_owner,
+                ),
+                FfiResult::INVALID_COMPONENT
+            );
+            assert_eq!(
+                iter_up_cascade_impl(
+                    iter_live.as_ffi_ptr(),
+                    byte_h,
+                    FfiEntity::from_bits(n6.to_bits()),
+                    0,
+                    &raw mut out_ptr,
+                    &raw mut out_owner,
+                ),
+                FfiResult::INVALID_COMPONENT
+            );
+            assert_eq!(
+                iter_up_cascade_impl(
+                    iter_live.as_ffi_ptr(),
+                    p8_h,
+                    FfiEntity::from_bits(orphan.to_bits()),
+                    0,
+                    &raw mut out_ptr,
+                    &raw mut out_owner,
+                ),
+                FfiResult::NOT_FOUND
+            );
+            // 6-hop multi-stratum walk `n6 -> n5 -> n4 -> n3 -> n2 -> n1 -> n0` exercises Brent's doubling.
+            assert_eq!(
+                iter_up_cascade_impl(
+                    iter_live.as_ffi_ptr(),
+                    BamComponent::INVALID,
+                    FfiEntity::from_bits(n6.to_bits()),
+                    0,
+                    &raw mut out_ptr,
+                    &raw mut out_owner,
+                ),
+                FfiResult::OK
+            );
+            assert_eq!(out_owner, FfiEntity::from_bits(n0.to_bits()));
+            assert_eq!((*out_ptr.cast::<TestPos>()).0, 42);
         }
     }
 }

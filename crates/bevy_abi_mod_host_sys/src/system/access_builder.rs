@@ -824,4 +824,325 @@ mod tests {
             assert_eq!(rest, vec![e2, e3]);
         }
     }
+
+    #[repr(C)]
+    #[derive(bevy_ecs::component::Component, Clone, Copy, ModComponent)]
+    struct AccCompA(u32);
+
+    #[repr(C)]
+    #[derive(bevy_ecs::component::Component, Clone, Copy, ModComponent)]
+    #[component(immutable)]
+    struct AccImm(u32);
+
+    #[repr(C)]
+    #[derive(bevy_ecs::component::Component, Clone, Copy, ModComponent)]
+    #[component(storage = "SparseSet")]
+    struct AccSparse(u32);
+
+    #[repr(C)]
+    #[derive(bevy_ecs::prelude::Resource, Clone, Copy, ModComponent)]
+    struct AccRes(u32);
+
+    #[test]
+    fn access_builder_validation_conflicts_or_groups_and_find_conflicting_name() {
+        use bevy_abi_mod_sys::{BamComponent, FfiResult, ModComponent as _};
+
+        let mut world = World::new();
+        let a_cid = world.register_component::<AccCompA>();
+        let imm_cid = world.register_component::<AccImm>();
+        let sp_cid = world.register_component::<AccSparse>();
+        let res_cid = world.register_component::<AccRes>();
+
+        let mut reg = ModRegistry::new();
+        let a_h = reg
+            .register_component::<AccCompA>(a_cid, Default::default())
+            .unwrap();
+        let imm_h = reg
+            .register_component::<AccImm>(
+                imm_cid,
+                crate::registry::ComponentOptions::default().immutable(),
+            )
+            .unwrap();
+        let sp_h = reg
+            .register_component::<AccSparse>(sp_cid, Default::default())
+            .unwrap();
+        let res_h = reg.register_resource::<AccRes>(res_cid).unwrap();
+        let snap = reg.snapshot();
+
+        // 1. `find_conflicting_name` `"unknown"` fallback when `id_to_name` lacks ID.
+        let mut set_a = FilteredAccessSet::new();
+        let mut fa_a = bevy_ecs::query::FilteredAccess::default();
+        fa_a.add_write(a_cid);
+        set_a.add(fa_a.clone());
+        let empty_names = HashMap::new();
+        assert_eq!(
+            find_conflicting_name(&empty_names, &set_a, &fa_a),
+            "unknown"
+        );
+
+        // 2. `validate_system_queries_against_snapshot` error cases:
+        // > 32 terms
+        let too_many = vec![BamTermDesc::new(a_h, AccessMode::READ); MAX_TERMS_PER_QUERY + 1];
+        assert_eq!(
+            validate_system_queries_against_snapshot(snap, &[BamQuerySpecOwned::new(too_many)])
+                .unwrap_err()
+                .0,
+            FfiResult::CAPACITY_EXCEEDED
+        );
+        // Invalid mode
+        let mut bad_mode = BamTermDesc::new(a_h, AccessMode::READ);
+        bad_mode.mode = AccessMode(255);
+        assert_eq!(
+            validate_system_queries_against_snapshot(
+                snap,
+                &[BamQuerySpecOwned::new(vec![bad_mode])]
+            )
+            .unwrap_err()
+            .0,
+            FfiResult::INVALID_ARGUMENT
+        );
+        // Unknown component
+        assert_eq!(
+            validate_system_queries_against_snapshot(
+                snap,
+                &[BamQuerySpecOwned::new(vec![BamTermDesc::new(
+                    BamComponent::from_raw(999),
+                    AccessMode::READ
+                )])]
+            )
+            .unwrap_err()
+            .0,
+            FfiResult::INVALID_COMPONENT
+        );
+        // Kind mismatch
+        assert_eq!(
+            validate_system_queries_against_snapshot(
+                snap,
+                &[BamQuerySpecOwned::new(vec![BamTermDesc::new(
+                    a_h,
+                    AccessMode::RESOURCE_READ
+                )])]
+            )
+            .unwrap_err()
+            .0,
+            FfiResult::INVALID_COMPONENT
+        );
+        // Immutable write
+        assert_eq!(
+            validate_system_queries_against_snapshot(
+                snap,
+                &[BamQuerySpecOwned::new(vec![BamTermDesc::new(
+                    imm_h,
+                    AccessMode::WRITE
+                )])]
+            )
+            .unwrap_err()
+            .0,
+            FfiResult::PERMISSION_DENIED
+        );
+        // Invalid `or_group` mode
+        let mut bad_or = BamTermDesc::new(a_h, AccessMode::READ);
+        bad_or.or_group = 1;
+        assert_eq!(
+            validate_system_queries_against_snapshot(snap, &[BamQuerySpecOwned::new(vec![bad_or])])
+                .unwrap_err()
+                .0,
+            FfiResult::INVALID_ARGUMENT
+        );
+        // Intra-query read/write & write/write conflicts
+        assert_eq!(
+            validate_system_queries_against_snapshot(
+                snap,
+                &[BamQuerySpecOwned::new(vec![
+                    BamTermDesc::new(a_h, AccessMode::WRITE),
+                    BamTermDesc::new(a_h, AccessMode::READ),
+                ])]
+            )
+            .unwrap_err()
+            .0,
+            FfiResult::ACCESS_CONFLICT
+        );
+        assert_eq!(
+            validate_system_queries_against_snapshot(
+                snap,
+                &[BamQuerySpecOwned::new(vec![
+                    BamTermDesc::new(a_h, AccessMode::READ),
+                    BamTermDesc::new(a_h, AccessMode::WRITE),
+                ])]
+            )
+            .unwrap_err()
+            .0,
+            FfiResult::ACCESS_CONFLICT
+        );
+        // Resource conflicts (write->read and read->write)
+        assert_eq!(
+            validate_system_queries_against_snapshot(
+                snap,
+                &[BamQuerySpecOwned::new(vec![
+                    BamTermDesc::new(res_h, AccessMode::RESOURCE_WRITE),
+                    BamTermDesc::new(res_h, AccessMode::RESOURCE_READ),
+                ])]
+            )
+            .unwrap_err()
+            .0,
+            FfiResult::ACCESS_CONFLICT
+        );
+        assert_eq!(
+            validate_system_queries_against_snapshot(
+                snap,
+                &[BamQuerySpecOwned::new(vec![
+                    BamTermDesc::new(res_h, AccessMode::RESOURCE_READ),
+                    BamTermDesc::new(res_h, AccessMode::RESOURCE_WRITE),
+                ])]
+            )
+            .unwrap_err()
+            .0,
+            FfiResult::ACCESS_CONFLICT
+        );
+        // Inter-query borrow conflict
+        assert_eq!(
+            validate_system_queries_against_snapshot(
+                snap,
+                &[
+                    BamQuerySpecOwned::new(vec![BamTermDesc::new(a_h, AccessMode::WRITE)]),
+                    BamQuerySpecOwned::new(vec![BamTermDesc::new(a_h, AccessMode::OPTIONAL_READ)]),
+                ]
+            )
+            .unwrap_err()
+            .0,
+            FfiResult::ACCESS_CONFLICT
+        );
+
+        // Valid complex combination covering `OPTIONAL_READ`, `OPTIONAL_WRITE`, `FILTER_ONLY`,
+        // `WITHOUT`, `ALLOW`, `HAS`, `CHANGED`/`ADDED` (both inside and outside `or_group`,
+        // with and without `WRITE`).
+        let mut or_with = BamTermDesc::new(sp_h, AccessMode::FILTER_ONLY);
+        or_with.or_group = 1;
+        let mut or_without = BamTermDesc::new(imm_h, AccessMode::WITHOUT);
+        or_without.or_group = 1;
+        let mut or_changed_ro = BamTermDesc::new(imm_h, AccessMode::CHANGED);
+        or_changed_ro.or_group = 2;
+        let mut or_added_wr = BamTermDesc::new(a_h, AccessMode::ADDED);
+        or_added_wr.or_group = 2;
+
+        let valid_groups = [BamQuerySpecOwned::new(vec![
+            BamTermDesc::new(a_h, AccessMode::WRITE),
+            BamTermDesc::new(imm_h, AccessMode::OPTIONAL_READ),
+            BamTermDesc::new(sp_h, AccessMode::ALLOW),
+            BamTermDesc::new(res_h, AccessMode::RESOURCE_READ),
+            or_with,
+            or_without,
+            or_changed_ro,
+            or_added_wr,
+        ])];
+        assert!(validate_system_queries_against_snapshot(snap, &valid_groups).is_ok());
+
+        let mut cached: Vec<CachedQueryGroup> = valid_groups
+            .iter()
+            .cloned()
+            .map(CachedQueryGroup::new)
+            .collect();
+        let fas = initialize_query_groups_in_world(&mut world, snap, &mut cached).unwrap();
+        assert!(fas.combined_access().has_read(res_cid));
+
+        // 3. `initialize_query_groups_in_world` error variants:
+        let err_cases: Vec<(Vec<BamQuerySpecOwned>, SystemInitError)> = vec![
+            (
+                vec![BamQuerySpecOwned::new(vec![
+                    BamTermDesc::new(
+                        a_h,
+                        AccessMode::READ
+                    );
+                    MAX_TERMS_PER_QUERY + 1
+                ])],
+                SystemInitError::TooManyTerms,
+            ),
+            (
+                vec![BamQuerySpecOwned::new(vec![bad_mode])],
+                SystemInitError::InvalidMode { index: 0 },
+            ),
+            (
+                vec![BamQuerySpecOwned::new(vec![bad_or])],
+                SystemInitError::InvalidMode { index: 0 },
+            ),
+            (
+                vec![BamQuerySpecOwned::new(vec![BamTermDesc::new(
+                    BamComponent::from_raw(999),
+                    AccessMode::READ,
+                )])],
+                SystemInitError::UnknownComponent(String::from("BamComponent(999)")),
+            ),
+            (
+                vec![BamQuerySpecOwned::new(vec![BamTermDesc::new(
+                    a_h,
+                    AccessMode::RESOURCE_READ,
+                )])],
+                SystemInitError::KindMismatch(String::from(AccCompA::CANONICAL_NAME)),
+            ),
+            (
+                vec![BamQuerySpecOwned::new(vec![BamTermDesc::new(
+                    imm_h,
+                    AccessMode::WRITE,
+                )])],
+                SystemInitError::ImmutableWrite(String::from(AccImm::CANONICAL_NAME)),
+            ),
+            (
+                vec![BamQuerySpecOwned::new(vec![
+                    BamTermDesc::new(a_h, AccessMode::WRITE),
+                    BamTermDesc::new(a_h, AccessMode::READ),
+                ])],
+                SystemInitError::SelfConflict {
+                    a: String::from(AccCompA::CANONICAL_NAME),
+                    b: String::from(AccCompA::CANONICAL_NAME),
+                },
+            ),
+            (
+                vec![BamQuerySpecOwned::new(vec![
+                    BamTermDesc::new(a_h, AccessMode::READ),
+                    BamTermDesc::new(a_h, AccessMode::WRITE),
+                ])],
+                SystemInitError::SelfConflict {
+                    a: String::from(AccCompA::CANONICAL_NAME),
+                    b: String::from(AccCompA::CANONICAL_NAME),
+                },
+            ),
+            (
+                vec![BamQuerySpecOwned::new(vec![
+                    BamTermDesc::new(res_h, AccessMode::RESOURCE_WRITE),
+                    BamTermDesc::new(res_h, AccessMode::RESOURCE_READ),
+                ])],
+                SystemInitError::SelfConflict {
+                    a: String::from(AccRes::CANONICAL_NAME),
+                    b: String::from(AccRes::CANONICAL_NAME),
+                },
+            ),
+            (
+                vec![BamQuerySpecOwned::new(vec![
+                    BamTermDesc::new(res_h, AccessMode::RESOURCE_READ),
+                    BamTermDesc::new(res_h, AccessMode::RESOURCE_WRITE),
+                ])],
+                SystemInitError::SelfConflict {
+                    a: String::from(AccRes::CANONICAL_NAME),
+                    b: String::from(AccRes::CANONICAL_NAME),
+                },
+            ),
+            (
+                vec![
+                    BamQuerySpecOwned::new(vec![BamTermDesc::new(a_h, AccessMode::WRITE)]),
+                    BamQuerySpecOwned::new(vec![BamTermDesc::new(a_h, AccessMode::OPTIONAL_WRITE)]),
+                ],
+                SystemInitError::SelfConflict {
+                    a: String::from(AccCompA::CANONICAL_NAME),
+                    b: String::from(AccCompA::CANONICAL_NAME),
+                },
+            ),
+        ];
+
+        for (specs, expected) in err_cases {
+            let mut groups: Vec<CachedQueryGroup> =
+                specs.into_iter().map(CachedQueryGroup::new).collect();
+            let got = initialize_query_groups_in_world(&mut world, snap, &mut groups).unwrap_err();
+            assert_eq!(got, expected);
+        }
+    }
 }
