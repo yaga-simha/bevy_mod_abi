@@ -334,8 +334,8 @@ pub unsafe extern "C" fn host_cmd_rollback(
     cmds.rollback_to_checkpoint(checkpoint)
 }
 
-/// Reserved ABI `0.3.0` slot for typed entity relationship edge registration
-/// (validates inputs and currently returns [`FfiResult::UNSUPPORTED`]).
+/// Registers a typed entity relationship edge descriptor ([`BamRelationDesc`]) in `ModRegistry`
+/// and the world's `ModRelationGraph`, returning its 1-based [`BamComponent`] handle.
 ///
 /// # Safety
 /// - `load_ctx` must point to an active `LoadContext` cast to [`BamLoadCtx`], or null.
@@ -346,38 +346,8 @@ pub unsafe extern "C" fn host_register_relation(
     desc_ptr: *const BamRelationDesc,
     out_component: *mut BamComponent,
 ) -> FfiResult {
-    if out_component.is_null() {
-        return FfiResult::NULL_POINTER;
-    }
-    // SAFETY: Validates active `LoadContext` header and `in_init` state.
-    let ctx = match unsafe { validate_active_load_ctx(load_ctx) } {
-        Ok(c) => c,
-        Err(err) => return err,
-    };
-    // SAFETY: `read_descriptor` checks null and `struct_size >= BamRelationDesc::MIN_V0_3_SIZE`.
-    let desc = match unsafe { read_descriptor::<BamRelationDesc>(desc_ptr.cast::<c_void>()) } {
-        Ok(d) => d,
-        Err(err) => {
-            ctx.host_ctx
-                .set_last_error(format!("invalid BamRelationDesc header ({err})"));
-            return err;
-        }
-    };
-    let status = desc.validate();
-    if status.is_err() {
-        ctx.host_ctx
-            .set_last_error(format!("BamRelationDesc validation failed ({status})"));
-        return status;
-    }
-    // SAFETY: `desc.validate()` verified `!desc.name.is_null()`.
-    if let Err(err) = unsafe { validate_non_empty_cstr(desc.name) } {
-        ctx.host_ctx
-            .set_last_error(format!("BamRelationDesc `name` validation failed ({err})"));
-        return err;
-    }
-    ctx.host_ctx
-        .set_last_error("register_relation is reserved in ABI 0.3.0 and not yet implemented");
-    FfiResult::UNSUPPORTED
+    // SAFETY: Forwarding under caller's active `LoadContext`, readable descriptor, and writable output contract.
+    unsafe { crate::ffi::relations::register_relation_impl(load_ctx, desc_ptr, out_component) }
 }
 
 /// Reserved ABI `0.3.0` slot for symbol table string interning (`BamSymbol`)
@@ -592,8 +562,7 @@ pub unsafe extern "C" fn host_mount_system_in_schedule(
     FfiResult::UNSUPPORTED
 }
 
-/// Reserved ABI `0.3.0` slot for deferred typed relationship edge insertion
-/// (validates inputs and currently returns [`FfiResult::UNSUPPORTED`]).
+/// Enqueues deferred insertion of a typed entity relationship edge `(entity --relation--> target)`.
 ///
 /// # Safety
 /// - `commands` must point to an active [`HostCommands`] cast to [`BamCommands`], or null.
@@ -606,27 +575,15 @@ pub unsafe extern "C" fn host_cmd_insert_relation(
     data: *const c_void,
     data_size: usize,
 ) -> FfiResult {
-    if data_size > 0 && data.is_null() {
-        return FfiResult::NULL_POINTER;
+    // SAFETY: Forwarding under caller's active `HostCommands` and readable `data` buffer contract.
+    unsafe {
+        crate::ffi::relations::cmd_insert_relation_impl(
+            commands, entity, relation, target, data, data_size,
+        )
     }
-    // SAFETY: Validating `commands` against `COMMANDS_MAGIC` under `STRICT_FFI_CHECKS`.
-    let cmds = match unsafe {
-        validate_handle_mut::<HostCommands<'_>>(commands.cast::<c_void>(), COMMANDS_MAGIC, false)
-    } {
-        Ok(c) => c,
-        Err(err) => return err,
-    };
-    if !relation.is_valid() || cmds.snapshot().get_by_handle(relation).is_none() {
-        return FfiResult::INVALID_COMPONENT;
-    }
-    if validate_non_null_entity(entity).is_err() || validate_non_null_entity(target).is_err() {
-        return FfiResult::INVALID_ENTITY;
-    }
-    FfiResult::UNSUPPORTED
 }
 
-/// Reserved ABI `0.3.0` slot for deferred typed relationship edge removal
-/// (validates inputs and currently returns [`FfiResult::UNSUPPORTED`]).
+/// Enqueues deferred removal of a typed entity relationship edge `(entity --relation--> target)`.
 ///
 /// # Safety
 /// `commands` must point to an active [`HostCommands`] cast to [`BamCommands`], or null.
@@ -636,20 +593,8 @@ pub unsafe extern "C" fn host_cmd_remove_relation(
     relation: BamComponent,
     target: FfiEntity,
 ) -> FfiResult {
-    // SAFETY: Validating `commands` against `COMMANDS_MAGIC` under `STRICT_FFI_CHECKS`.
-    let cmds = match unsafe {
-        validate_handle_mut::<HostCommands<'_>>(commands.cast::<c_void>(), COMMANDS_MAGIC, false)
-    } {
-        Ok(c) => c,
-        Err(err) => return err,
-    };
-    if !relation.is_valid() || cmds.snapshot().get_by_handle(relation).is_none() {
-        return FfiResult::INVALID_COMPONENT;
-    }
-    if validate_non_null_entity(entity).is_err() || validate_non_null_entity(target).is_err() {
-        return FfiResult::INVALID_ENTITY;
-    }
-    FfiResult::UNSUPPORTED
+    // SAFETY: Forwarding under caller's active `HostCommands` contract.
+    unsafe { crate::ffi::relations::cmd_remove_relation_impl(commands, entity, relation, target) }
 }
 
 /// Reserved ABI `0.3.0` slot for live schema-fingerprint component column migration
@@ -1110,8 +1055,9 @@ mod tests {
         unsafe {
             assert_eq!(
                 host_register_relation(load_ctx.as_ffi_ptr(), &rel_desc, &raw mut rel_out),
-                FfiResult::UNSUPPORTED
+                FfiResult::OK
             );
+            assert!(rel_out.is_valid());
             assert_eq!(
                 host_register_relation(load_ctx.as_ffi_ptr(), null(), &raw mut rel_out),
                 FfiResult::NULL_POINTER
@@ -1198,11 +1144,19 @@ mod tests {
                     null(),
                     0,
                 ),
-                FfiResult::UNSUPPORTED
+                FfiResult::INVALID_COMPONENT
+            );
+            assert_eq!(
+                host_cmd_insert_relation(cmds.as_ffi_ptr(), live_ent, rel_out, live_ent, null(), 0),
+                FfiResult::OK
             );
             assert_eq!(
                 host_cmd_remove_relation(cmds.as_ffi_ptr(), live_ent, stats_handle, live_ent),
-                FfiResult::UNSUPPORTED
+                FfiResult::INVALID_COMPONENT
+            );
+            assert_eq!(
+                host_cmd_remove_relation(cmds.as_ffi_ptr(), live_ent, rel_out, live_ent),
+                FfiResult::OK
             );
         }
 

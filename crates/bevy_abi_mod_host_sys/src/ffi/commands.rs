@@ -270,6 +270,17 @@ enum RecordedCommand {
         parent: Option<Entity>,
         handle: FfiAssetHandle,
     },
+    InsertRelation {
+        entity: Entity,
+        relation: BamComponent,
+        target: Entity,
+        slice: ArenaSlice,
+    },
+    RemoveRelation {
+        entity: Entity,
+        relation: BamComponent,
+        target: Entity,
+    },
     Custom {
         idx: usize,
     },
@@ -308,6 +319,7 @@ pub struct HostCommandsStorage {
     soa_columns: Vec<SpawnSoaColumn>,
     scratch_ids: Vec<ComponentId>,
     custom_fns: Vec<Option<CustomCommandFn>>,
+    last_relation_error: Option<FfiResult>,
 }
 
 impl HostCommandsStorage {
@@ -322,7 +334,15 @@ impl HostCommandsStorage {
             soa_columns: Vec::new(),
             scratch_ids: Vec::new(),
             custom_fns: Vec::new(),
+            last_relation_error: None,
         }
+    }
+
+    /// Returns the most recent relationship flush status from the last [`Self::apply_to_world`]
+    /// call ([`FfiResult::OK`] when all relationship commands succeeded).
+    #[inline]
+    pub fn last_relation_flush_status(&self) -> FfiResult {
+        self.last_relation_error.unwrap_or(FfiResult::OK)
     }
 
     /// Returns `true` if no commands are currently queued.
@@ -546,7 +566,9 @@ impl HostCommandsStorage {
                 | RecordedCommand::InsertDefault { .. }
                 | RecordedCommand::Remove { .. }
                 | RecordedCommand::Trigger { .. }
-                | RecordedCommand::SpawnScene { .. } => {}
+                | RecordedCommand::SpawnScene { .. }
+                | RecordedCommand::InsertRelation { .. }
+                | RecordedCommand::RemoveRelation { .. } => {}
             }
         }
 
@@ -566,6 +588,7 @@ impl HostCommandsStorage {
 
     /// Applies all queued commands to `world` in FIFO order and resets all internal buffers for reuse.
     pub fn apply_to_world(&mut self, world: &mut World, snapshot: &RegistrySnapshot) {
+        self.last_relation_error = None;
         if self.commands.is_empty() {
             return;
         }
@@ -576,6 +599,7 @@ impl HostCommandsStorage {
             .as_ref()
             .map(ModRegistry::snapshot)
             .unwrap_or(snapshot);
+        let mut abort_remaining_relations = false;
 
         for i in 0..self.commands.len() {
             match self.commands[i] {
@@ -1002,6 +1026,69 @@ impl HostCommandsStorage {
                         }
                     }
                 }
+                RecordedCommand::InsertRelation {
+                    entity,
+                    relation,
+                    target,
+                    slice,
+                } => {
+                    if abort_remaining_relations {
+                        continue;
+                    }
+                    let (status, abort) = if slice.size == 0 {
+                        crate::ffi::relations::apply_insert_relation(
+                            world,
+                            active_snapshot,
+                            entity,
+                            relation,
+                            target,
+                            &[],
+                        )
+                    } else {
+                        let nn = self.arena.ptr_mut(slice);
+                        // SAFETY: `slice` holds `slice.size` initialized readable payload bytes
+                        // copied from the caller during `host_cmd_insert_relation`.
+                        let bytes = unsafe {
+                            core::slice::from_raw_parts(nn.as_ptr().cast_const(), slice.size)
+                        };
+                        crate::ffi::relations::apply_insert_relation(
+                            world,
+                            active_snapshot,
+                            entity,
+                            relation,
+                            target,
+                            bytes,
+                        )
+                    };
+                    if status.is_err() {
+                        self.last_relation_error = Some(status);
+                        if abort {
+                            abort_remaining_relations = true;
+                        }
+                    }
+                }
+                RecordedCommand::RemoveRelation {
+                    entity,
+                    relation,
+                    target,
+                } => {
+                    if abort_remaining_relations {
+                        continue;
+                    }
+                    let (status, abort) = crate::ffi::relations::apply_remove_relation(
+                        world,
+                        active_snapshot,
+                        entity,
+                        relation,
+                        target,
+                    );
+                    if status.is_err() {
+                        self.last_relation_error = Some(status);
+                        if abort {
+                            abort_remaining_relations = true;
+                        }
+                    }
+                }
                 RecordedCommand::Custom { idx } => {
                     if let Some(custom_fn) = self.custom_fns.get_mut(idx).and_then(Option::take) {
                         custom_fn(world, snapshot);
@@ -1172,6 +1259,121 @@ impl<'a> HostCommands<'a> {
             handle,
         });
         Ok(entity)
+    }
+
+    /// Validates and queues a deferred typed entity relationship edge insertion.
+    ///
+    /// # Safety
+    /// If `data_len > 0`, `data_ptr` must be non-null and readable for `data_len` initialized bytes.
+    pub(crate) unsafe fn insert_relation_raw(
+        &mut self,
+        entity: FfiEntity,
+        relation: BamComponent,
+        target: FfiEntity,
+        data_ptr: *const u8,
+        data_len: usize,
+    ) -> FfiResult {
+        if data_len > 0 && data_ptr.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if !relation.is_valid() || self.snapshot.get_by_handle(relation).is_none() {
+            return FfiResult::INVALID_COMPONENT;
+        }
+        let bevy_entity = match validate_command_entity(entity) {
+            Ok(e) => e,
+            Err(err) => return err,
+        };
+        let bevy_target = match validate_command_entity(target) {
+            Ok(t) => t,
+            Err(err) => return err,
+        };
+        let Some(rel_meta) = self.snapshot.get_relation(relation) else {
+            return FfiResult::INVALID_COMPONENT;
+        };
+        if data_len != rel_meta.data_size {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        if rel_meta.is_acyclic() {
+            let pending = self.storage.commands.iter().filter_map(|cmd| match *cmd {
+                RecordedCommand::InsertRelation {
+                    entity: e,
+                    relation: r,
+                    target: t,
+                    ..
+                } if r == relation => Some(crate::ffi::relations::PendingRelationOp::Insert {
+                    entity: e,
+                    target: t,
+                }),
+                RecordedCommand::RemoveRelation {
+                    entity: e,
+                    relation: r,
+                    target: t,
+                } if r == relation => Some(crate::ffi::relations::PendingRelationOp::Remove {
+                    entity: e,
+                    target: t,
+                }),
+                RecordedCommand::Despawn { entity: e } => {
+                    Some(crate::ffi::relations::PendingRelationOp::Despawn { entity: e })
+                }
+                _ => None,
+            });
+            let status = crate::ffi::relations::check_pending_acyclic(
+                rel_meta,
+                pending,
+                bevy_entity,
+                bevy_target,
+            );
+            if status.is_err() {
+                return status;
+            }
+        }
+
+        // SAFETY: `data_ptr` is non-null when `rel_meta.data_size > 0` and caller guarantees
+        // `data_len == rel_meta.data_size` initialized readable bytes.
+        let slice = match unsafe {
+            self.storage
+                .arena
+                .alloc_copy_raw(data_ptr, rel_meta.data_size, rel_meta.data_align)
+        } {
+            Ok(s) => s,
+            Err(err) => return err,
+        };
+        self.storage.commands.push(RecordedCommand::InsertRelation {
+            entity: bevy_entity,
+            relation,
+            target: bevy_target,
+            slice,
+        });
+        FfiResult::OK
+    }
+
+    /// Validates and queues a deferred typed entity relationship edge removal.
+    pub(crate) fn remove_relation_raw(
+        &mut self,
+        entity: FfiEntity,
+        relation: BamComponent,
+        target: FfiEntity,
+    ) -> FfiResult {
+        if !relation.is_valid() || self.snapshot.get_by_handle(relation).is_none() {
+            return FfiResult::INVALID_COMPONENT;
+        }
+        let bevy_entity = match validate_command_entity(entity) {
+            Ok(e) => e,
+            Err(err) => return err,
+        };
+        let bevy_target = match validate_command_entity(target) {
+            Ok(t) => t,
+            Err(err) => return err,
+        };
+        if self.snapshot.get_relation(relation).is_none() {
+            return FfiResult::INVALID_COMPONENT;
+        }
+        self.storage.commands.push(RecordedCommand::RemoveRelation {
+            entity: bevy_entity,
+            relation,
+            target: bevy_target,
+        });
+        FfiResult::OK
     }
 
     /// Validates and queues a deferred component insertion (`if_new == false`) or conditional

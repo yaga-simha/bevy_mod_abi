@@ -10,5 +10,6 @@ pub(crate) mod iter_ext;
 pub(crate) mod observers_ext;
 pub(crate) mod proc_address;
 pub(crate) mod register;
+pub(crate) mod relations;
 pub(crate) mod v03_ext;
 pub(crate) mod validation;

@@ -1,6 +1,10 @@
 //! Copy-on-Write (`CoW`) component, resource, VTable, and `"bam.v0.*"` symbol catalog.
 
 use crate::ffi::assets_scene::{HostAssetBackend, HostSceneBackend};
+pub use crate::ffi::relations::{
+    ModRelationGraph, RelationEdgeView, RelationFlushError, RelationFlushPolicy,
+    check_relation_acyclic, ensure_relation_graph_in_world,
+};
 use crate::loader::ModId;
 use crate::registry::bridge::ExtractRelationshipTargetsFn;
 use crate::registry::collision::ComponentCollisionError;
@@ -8,11 +12,13 @@ use crate::sync_ptr::SymbolAddress;
 use arc_swap::ArcSwap;
 use bevy_abi_mod_sys::{
     AbiPod, BAM_CHILD_OF_NAME, BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET,
-    BAM_COMPONENT_FLAG_SUMMARY_TICK, BAM_STORAGE_FLAG_ENTITY_EVENT, BAM_STORAGE_FLAG_EVENT,
-    BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE,
-    BAM_STORAGE_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_SUMMARY_TICK, BamComponent, BamFieldDesc,
-    ComponentDesc, ComponentDropFn, ComponentUuid, FfiChildOf, FfiEntity, FfiResult, FfiSlice,
-    ModComponent, RawInsertable, StrView,
+    BAM_COMPONENT_FLAG_SUMMARY_TICK, BAM_RELATION_FLAG_ACYCLIC, BAM_RELATION_FLAG_CASCADE_DESPAWN,
+    BAM_RELATION_FLAG_CLEANUP_REMOVE, BAM_RELATION_FLAG_EXCLUSIVE, BAM_RELATION_FLAG_SYMMETRIC,
+    BAM_STORAGE_FLAG_ENTITY_EVENT, BAM_STORAGE_FLAG_EVENT, BAM_STORAGE_FLAG_IMMUTABLE,
+    BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET,
+    BAM_STORAGE_FLAG_SUMMARY_TICK, BamComponent, BamFieldDesc, ComponentDesc, ComponentDropFn,
+    ComponentUuid, FfiChildOf, FfiEntity, FfiResult, FfiSlice, ModComponent, RawInsertable,
+    StrView,
 };
 use bevy_ecs::change_detection::Tick;
 use bevy_ecs::component::ComponentId;
@@ -902,6 +908,77 @@ impl RegisteredComponent {
     }
 }
 
+/// Catalog record for a typed entity relationship registered via `host_register_relation`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegisteredRelation {
+    /// 1-based [`BamComponent`] handle representing this relationship.
+    pub handle: BamComponent,
+    /// Canonical namespaced relation name (e.g. `"combat::TargetOf"`).
+    pub name: Arc<str>,
+    /// Deterministic 128-bit UUID identifying the relation.
+    pub uuid: ComponentUuid,
+    /// Bevy [`ComponentId`] of the per-relation sparse-set marker component holding
+    /// `on_despawn` and `on_remove` lifecycle hooks.
+    pub component_id: ComponentId,
+    /// Bitmask of `BAM_RELATION_FLAG_*` (`EXCLUSIVE`, `CASCADE_DESPAWN`/`CASCADE_DELETE`,
+    /// `SYMMETRIC`, `ACYCLIC`, `CLEANUP_REMOVE`).
+    pub flags: u32,
+    /// Edge payload byte size (`0` for zero-sized marker/tag edges).
+    pub data_size: usize,
+    /// Edge payload byte alignment (`>= 1`, power of two).
+    pub data_align: usize,
+    /// Optional out-degree cap (`0` = unlimited; `1` behaves identically to `EXCLUSIVE`).
+    pub max_degree: u32,
+}
+
+impl RegisteredRelation {
+    /// Returns `true` if each source entity may hold at most one outgoing edge for this relation
+    /// (`BAM_RELATION_FLAG_EXCLUSIVE` or `max_degree == 1`), replacing prior targets on insert.
+    #[inline]
+    pub const fn is_exclusive(&self) -> bool {
+        (self.flags & BAM_RELATION_FLAG_EXCLUSIVE) != 0 || self.max_degree == 1
+    }
+
+    /// Returns `true` if despawning a target entity cascades despawn to dependent source entities
+    /// (`BAM_RELATION_FLAG_CASCADE_DESPAWN` / `BAM_RELATION_FLAG_CASCADE_DELETE`).
+    #[inline]
+    pub const fn is_cascade_despawn(&self) -> bool {
+        (self.flags & BAM_RELATION_FLAG_CASCADE_DESPAWN) != 0
+    }
+
+    /// Returns `true` if edge `(A -> B)` atomically maintains reciprocal `(B -> A)`
+    /// (`BAM_RELATION_FLAG_SYMMETRIC`).
+    #[inline]
+    pub const fn is_symmetric(&self) -> bool {
+        (self.flags & BAM_RELATION_FLAG_SYMMETRIC) != 0
+    }
+
+    /// Returns `true` if directed cycles (including self-loops) are rejected with
+    /// [`FfiResult::CYCLE_DETECTED`] (`BAM_RELATION_FLAG_ACYCLIC`).
+    #[inline]
+    pub const fn is_acyclic(&self) -> bool {
+        (self.flags & BAM_RELATION_FLAG_ACYCLIC) != 0
+    }
+
+    /// Returns `true` if `BAM_RELATION_FLAG_CLEANUP_REMOVE` is set.
+    #[inline]
+    pub const fn is_cleanup_remove(&self) -> bool {
+        (self.flags & BAM_RELATION_FLAG_CLEANUP_REMOVE) != 0
+    }
+
+    /// Returns the effective per-entity outgoing degree cap, or `None` when unlimited.
+    #[inline]
+    pub const fn effective_max_degree(&self) -> Option<usize> {
+        if self.is_exclusive() {
+            Some(1)
+        } else if self.max_degree > 0 {
+            Some(self.max_degree as usize)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ExtendedDynamicFlags {
     pub(crate) has_on_add_effective: bool,
@@ -922,6 +999,7 @@ pub struct RegistrySnapshot {
     pub(crate) symbols: HashMap<Arc<str>, SymbolRecord>,
     pub(crate) required_components: HashMap<BamComponent, Box<[BamComponent]>>,
     pub(crate) extended_hook_flags: HashMap<BamComponent, ExtendedDynamicFlags>,
+    pub(crate) relations: HashMap<BamComponent, RegisteredRelation>,
     asset_backend: Option<Arc<dyn HostAssetBackend>>,
     scene_backend: Option<Arc<dyn HostSceneBackend>>,
 }
@@ -1005,6 +1083,38 @@ impl RegistrySnapshot {
         self.required_components
             .get(&handle)
             .map_or(&[], |boxed| boxed.as_ref())
+    }
+
+    /// Looks up registered relationship metadata in `O(1)` by its 1-based [`BamComponent`] handle.
+    #[inline]
+    pub fn get_relation(&self, handle: BamComponent) -> Option<&RegisteredRelation> {
+        self.relations.get(&handle)
+    }
+
+    /// Looks up registered relationship metadata by its runtime Bevy marker [`ComponentId`].
+    #[inline]
+    pub fn get_relation_by_id(&self, id: ComponentId) -> Option<&RegisteredRelation> {
+        let &handle = self.by_component_id.get(&id)?;
+        self.relations.get(&handle)
+    }
+
+    /// Looks up registered relationship metadata by deterministic 128-bit [`ComponentUuid`].
+    #[inline]
+    pub fn get_relation_by_uuid(&self, uuid: &ComponentUuid) -> Option<&RegisteredRelation> {
+        let &handle = self.by_uuid.get(uuid)?;
+        self.relations.get(&handle)
+    }
+
+    /// Returns `true` if `handle` refers to a relationship registered via `host_register_relation`.
+    #[inline]
+    pub fn is_relation(&self, handle: BamComponent) -> bool {
+        self.relations.contains_key(&handle)
+    }
+
+    /// Returns the total number of registered relationships in this snapshot.
+    #[inline]
+    pub fn relation_count(&self) -> usize {
+        self.relations.len()
     }
 }
 
@@ -1150,6 +1260,12 @@ impl ModRegistry {
         }
 
         if let Some(existing) = self.snapshot.get_by_name(name) {
+            if self.snapshot.is_relation(existing.handle) {
+                return Err(ComponentCollisionError::MetadataMismatch {
+                    name: name.to_string(),
+                    reason: "name is already registered as a relationship".to_string(),
+                });
+            }
             if existing.uuid != uuid {
                 return Err(ComponentCollisionError::MetadataMismatch {
                     name: name.to_string(),
@@ -2112,9 +2228,197 @@ impl ModRegistry {
         self.snapshot.resolve_symbol(name)
     }
 
+    /// Validates that registering relationship `(name, uuid, flags, data_size, data_align, max_degree)`
+    /// does not collide with an incompatible existing component or relationship entry.
+    ///
+    /// Returns `Ok(Some(existing))` if an identical relationship is already registered (idempotent
+    /// hot-reload re-registration), or `Ok(None)` if this is a brand-new relationship.
+    pub(crate) fn check_relation_registration_collision(
+        &self,
+        name: &str,
+        uuid: ComponentUuid,
+        flags: u32,
+        data_size: usize,
+        data_align: usize,
+        max_degree: u32,
+    ) -> Result<Option<RegisteredRelation>, ComponentCollisionError> {
+        if let Some(existing_by_uuid) = self.snapshot.get_by_uuid(&uuid)
+            && existing_by_uuid.name.as_ref() != name
+        {
+            return Err(ComponentCollisionError::UuidCollision {
+                existing_name: existing_by_uuid.name.to_string(),
+                new_name: name.to_string(),
+                uuid,
+            });
+        }
+
+        if let Some(existing) = self.snapshot.get_by_name(name) {
+            if existing.uuid != uuid {
+                return Err(ComponentCollisionError::MetadataMismatch {
+                    name: name.to_string(),
+                    reason: format!("UUID mismatch (existing={:?}, new={uuid:?})", existing.uuid),
+                });
+            }
+            let Some(existing_rel) = self.snapshot.get_relation(existing.handle) else {
+                return Err(ComponentCollisionError::MetadataMismatch {
+                    name: name.to_string(),
+                    reason: "name is already registered as a non-relationship component"
+                        .to_string(),
+                });
+            };
+            if existing_rel.flags != flags {
+                return Err(ComponentCollisionError::MetadataMismatch {
+                    name: name.to_string(),
+                    reason: format!(
+                        "relation flags mismatch (existing=0x{:x}, new=0x{:x})",
+                        existing_rel.flags, flags
+                    ),
+                });
+            }
+            if existing_rel.data_size != data_size || existing_rel.data_align != data_align {
+                return Err(ComponentCollisionError::MetadataMismatch {
+                    name: name.to_string(),
+                    reason: format!(
+                        "relation payload layout mismatch (existing=({}, {}), new=({}, {}))",
+                        existing_rel.data_size, existing_rel.data_align, data_size, data_align
+                    ),
+                });
+            }
+            if existing_rel.max_degree != max_degree {
+                return Err(ComponentCollisionError::MetadataMismatch {
+                    name: name.to_string(),
+                    reason: format!(
+                        "relation max_degree mismatch (existing={}, new={max_degree})",
+                        existing_rel.max_degree
+                    ),
+                });
+            }
+            return Ok(Some(existing_rel.clone()));
+        }
+
+        Ok(None)
+    }
+
+    /// Registers (or idempotently re-registers) a typed entity relationship entry in this registry,
+    /// returning its 1-based [`BamComponent`] handle and stored [`RegisteredRelation`] metadata.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn register_relation_entry(
+        &mut self,
+        comp_id: ComponentId,
+        name: &str,
+        uuid: ComponentUuid,
+        flags: u32,
+        data_size: usize,
+        data_align: usize,
+        max_degree: u32,
+        owner: Option<ModId>,
+    ) -> Result<RegisteredRelation, ComponentCollisionError> {
+        let existing_rel = self.check_relation_registration_collision(
+            name, uuid, flags, data_size, data_align, max_degree,
+        )?;
+        let storage_flags = BAM_STORAGE_FLAG_SPARSE_SET | BAM_STORAGE_FLAG_IMMUTABLE;
+
+        let rel_meta = {
+            let snap = Arc::make_mut(&mut self.snapshot);
+            if let Some(prev) = existing_rel {
+                let idx = (prev.handle.0 - 1) as usize;
+                snap.entries[idx].owner = owner;
+                prev
+            } else {
+                let next_raw = u32::try_from(snap.entries.len() + 1)
+                    .expect("ModRegistry exceeded u32::MAX component handles");
+                let handle = BamComponent::from_raw(next_raw);
+                let arc_name: Arc<str> = Arc::from(name);
+                let entry = RegisteredComponent {
+                    handle,
+                    name: Arc::clone(&arc_name),
+                    uuid,
+                    component_id: comp_id,
+                    // Marker component in Bevy ECS is zero-sized `(0, 1)`; edge payload layout is
+                    // tracked on `RegisteredRelation::{data_size, data_align}`.
+                    size: 0,
+                    align: 1,
+                    schema_fingerprint: 0,
+                    fields: Arc::from([]),
+                    owned_field_strings: None,
+                    storage_flags,
+                    is_abi_pod: false,
+                    is_dynamic: false,
+                    vtable_ptr: SymbolAddress::NULL,
+                    insert_raw_fn: None,
+                    insert_default_fn: None,
+                    drop_fn: None,
+                    drop_slot: None,
+                    has_on_add_hook: false,
+                    has_on_remove_hook: true,
+                    create_msg_cursor_fn: None,
+                    msg_read_batch_fn: None,
+                    msg_send_fn: None,
+                    msg_write_batch_fn: None,
+                    validates_entity_payload: false,
+                    synthesizes_ffi_entity_payload: false,
+                    event_key: None,
+                    entity_event_trigger_fn: None,
+                    trigger_event_fn: None,
+                    extract_event_target_fn: None,
+                    extract_relationship_targets_fn: None,
+                    owner,
+                };
+                let rel = RegisteredRelation {
+                    handle,
+                    name: Arc::clone(&arc_name),
+                    uuid,
+                    component_id: comp_id,
+                    flags,
+                    data_size,
+                    data_align,
+                    max_degree,
+                };
+                snap.entries.push(entry);
+                snap.by_name.insert(arc_name, handle);
+                snap.by_uuid.insert(uuid, handle);
+                snap.by_component_id.insert(comp_id, handle);
+                snap.relations.insert(handle, rel.clone());
+                rel
+            }
+        };
+        self.publish_after_mutation();
+        Ok(rel_meta)
+    }
+
     /// Returns the required [`BamComponent`] handles registered for `handle` (empty if none).
     #[inline]
     pub fn required_components(&self, handle: BamComponent) -> &[BamComponent] {
         self.snapshot.required_components(handle)
+    }
+
+    /// Looks up registered relationship metadata in `O(1)` by its 1-based [`BamComponent`] handle.
+    #[inline]
+    pub fn get_relation(&self, handle: BamComponent) -> Option<&RegisteredRelation> {
+        self.snapshot.get_relation(handle)
+    }
+
+    /// Looks up registered relationship metadata by its runtime Bevy marker [`ComponentId`].
+    #[inline]
+    pub fn get_relation_by_id(&self, id: ComponentId) -> Option<&RegisteredRelation> {
+        self.snapshot.get_relation_by_id(id)
+    }
+
+    /// Looks up registered relationship metadata by deterministic 128-bit [`ComponentUuid`].
+    #[inline]
+    pub fn get_relation_by_uuid(&self, uuid: &ComponentUuid) -> Option<&RegisteredRelation> {
+        self.snapshot.get_relation_by_uuid(uuid)
+    }
+
+    /// Returns `true` if `handle` refers to a relationship registered via `host_register_relation`.
+    #[inline]
+    pub fn is_relation(&self, handle: BamComponent) -> bool {
+        self.snapshot.is_relation(handle)
+    }
+
+    /// Returns the total number of registered relationships in this registry.
+    #[inline]
+    pub fn relation_count(&self) -> usize {
+        self.snapshot.relation_count()
     }
 }

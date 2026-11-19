@@ -566,8 +566,9 @@ fn v03_reserved_slots_exhaustive_validation() {
         );
         assert_eq!(
             host_register_relation(load_ptr, &valid_rel, &raw mut out_rel),
-            FfiResult::UNSUPPORTED
+            FfiResult::OK
         );
+        assert!(out_rel.is_valid());
 
         // 2. `host_intern_symbol`
         let mut out_sym = BamSymbol::INVALID;
@@ -1069,7 +1070,7 @@ fn v03_reserved_slots_exhaustive_validation() {
         drop(ro_iter);
 
         // 9 & 10. `host_cmd_insert_relation` & `host_cmd_remove_relation`
-        let snap = registry.snapshot_arc();
+        let snap = world.resource::<ModRegistry>().snapshot_arc();
         let mut storage = HostCommandsStorage::new();
         let mut cmds = HostCommands::new(&mut storage, world.entity_allocator(), &snap);
         let cmd_ptr = cmds.as_ffi_ptr();
@@ -1126,7 +1127,22 @@ fn v03_reserved_slots_exhaustive_validation() {
                 (&raw const edge_data).cast::<c_void>(),
                 4,
             ),
-            FfiResult::UNSUPPORTED
+            FfiResult::INVALID_COMPONENT
+        );
+        assert_eq!(
+            host_cmd_insert_relation(
+                cmd_ptr,
+                live_ent,
+                out_rel,
+                live_ent,
+                (&raw const edge_data).cast::<c_void>(),
+                4,
+            ),
+            FfiResult::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            host_cmd_insert_relation(cmd_ptr, live_ent, out_rel, live_ent, null(), 0),
+            FfiResult::OK
         );
 
         assert_eq!(
@@ -1155,7 +1171,11 @@ fn v03_reserved_slots_exhaustive_validation() {
         );
         assert_eq!(
             host_cmd_remove_relation(cmd_ptr, live_ent, pos_h, live_ent),
-            FfiResult::UNSUPPORTED
+            FfiResult::INVALID_COMPONENT
+        );
+        assert_eq!(
+            host_cmd_remove_relation(cmd_ptr, live_ent, out_rel, live_ent),
+            FfiResult::OK
         );
     }
 }
