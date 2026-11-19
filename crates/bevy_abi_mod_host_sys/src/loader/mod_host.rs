@@ -14,7 +14,7 @@ use crate::loader::signing::{ModTrustPolicy, VerifiedModSignature, default_signa
 use crate::loader::symbols::{ModNamedObjects, ensure_symbol_tables_in_world};
 use crate::loader::transaction::LoadTransaction;
 use crate::registry::{ModRegistry, RegistrySnapshot};
-use crate::schedule::{ModNamedSystemSet, ModSystemSet};
+use crate::schedule::{ModNamedSystemSet, ModScheduleSetRegistry, ModSystemSet};
 use crate::sync_ptr::GuestInstancePtr;
 use crate::system::{GuestSystem, ModQuarantine};
 use bevy_abi_mod_sys::{
@@ -602,12 +602,26 @@ impl ModHost {
         load_ctx.finish_init();
 
         if status == FfiResult::PANIC_CAUGHT {
+            if !world_ptr.is_null() {
+                // SAFETY: `world_ptr` is exclusively borrowed and `load_ctx` has finished `init`.
+                let world = unsafe { &mut *world_ptr };
+                if let Some(mut set_registry) = world.get_resource_mut::<ModScheduleSetRegistry>() {
+                    set_registry.unregister_mod(mod_id);
+                }
+            }
             return Err(ModLoadError::InitPanicked {
                 path: source_path.to_path_buf(),
                 diagnostic,
             });
         }
         if status.is_err() {
+            if !world_ptr.is_null() {
+                // SAFETY: `world_ptr` is exclusively borrowed and `load_ctx` has finished `init`.
+                let world = unsafe { &mut *world_ptr };
+                if let Some(mut set_registry) = world.get_resource_mut::<ModScheduleSetRegistry>() {
+                    set_registry.unregister_mod(mod_id);
+                }
+            }
             return Err(ModLoadError::InitFailed {
                 path: source_path.to_path_buf(),
                 status,
@@ -631,10 +645,16 @@ impl ModHost {
             );
         }
 
+        let generation = *self
+            .mod_generations
+            .get(manifest_name.as_ref())
+            .unwrap_or(&0);
+
         for sys in &mut load_ctx.registered_systems {
             sys.set_registry(load_ctx.registry.clone());
             sys.set_mod_id(mod_id);
             sys.set_mod_namespace(Some(Arc::clone(&manifest_name)));
+            sys.set_mod_generation(generation);
             if let Some(sched_override) = options.schedule_override {
                 sys.set_schedule(sched_override);
             }
@@ -648,10 +668,6 @@ impl ModHost {
         drop(state_guard);
 
         let systems = core::mem::take(&mut load_ctx.registered_systems);
-        let generation = *self
-            .mod_generations
-            .get(manifest_name.as_ref())
-            .unwrap_or(&0);
         let system_count = systems.len();
         self.loaded_libraries.push(LoadedMod {
             id: mod_id,
@@ -831,6 +847,9 @@ pub fn rollback_unscheduled_mod_in_world(world: &mut World, id: ModId) {
     if let Some(mut quarantine) = world.get_resource_mut::<ModQuarantine>() {
         quarantine.unregister_mod(id);
     }
+    if let Some(mut set_registry) = world.get_resource_mut::<ModScheduleSetRegistry>() {
+        set_registry.unregister_mod(id);
+    }
 
     if let Some(mut mod_host) = world.get_resource_mut::<ModHost>() {
         // SAFETY: `world` is exclusively borrowed, drop trampolines and registry entries are
@@ -999,6 +1018,9 @@ fn excise_and_unload_mod_inner<F: FnOnce(&mut World)>(
     }
     if let Some(mut quarantine) = world.get_resource_mut::<ModQuarantine>() {
         quarantine.unregister_mod(id);
+    }
+    if let Some(mut set_registry) = world.get_resource_mut::<ModScheduleSetRegistry>() {
+        set_registry.unregister_mod(id);
     }
 
     let (mod_name, unloaded_path, still_has_same_name) = {

@@ -1,6 +1,7 @@
 //! ABI `0.3.0` (`0x0003_0000`) host FFI extension entrypoints: structured diagnostics, schema and
 //! layout introspection, iterator counting, system-handle registration, command-buffer checkpoints
-//! and rollback, plus reserved ABI `0.3.0` relation and scheduling slots.
+//! and rollback, entity relationships, symbol interning, named object binding, ancestor cascades,
+//! read-only parallel chunk iteration, schedule sets, and live component column migration.
 
 use crate::ffi::commands::HostCommands;
 use crate::ffi::iter::HostIter;

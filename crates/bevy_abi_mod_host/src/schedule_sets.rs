@@ -1,6 +1,7 @@
 //! Schedule mapping (`ModScheduleMap`), scoped named ordering sets (`ModNamedSystemSet`),
 //! and `&mut World`-native schedule configuration helpers.
 
+use bevy_abi_mod_host_sys::schedule::{ModScheduleSetRegistry, install_mod_schedule_set_pass};
 use bevy_abi_mod_host_sys::{
     GuestSystem, ModHost, ModId, ModLoadError, ModQuarantine, record_mod_named_sets_in_world,
 };
@@ -458,20 +459,21 @@ pub(crate) fn schedule_mod_systems_in_world(
     let own_gen = resolve_mod_generation_in_world(world, mod_name);
 
     let mut deferred_immediate_startup = Vec::new();
-    let mut to_schedule: Vec<(InternedScheduleLabel, GuestSystem)> =
+    let mut to_schedule: Vec<(ScheduleId, InternedScheduleLabel, GuestSystem)> =
         Vec::with_capacity(systems.len());
 
     for sys in systems {
-        if startup_already_ran && sys.schedule() == ScheduleId::STARTUP {
+        let sched_id = sys.schedule();
+        if startup_already_ran && sched_id == ScheduleId::STARTUP {
             deferred_immediate_startup.push(sys);
-        } else if let Some(interned) = resolve_schedule_in_world(world, sys.schedule()) {
-            to_schedule.push((interned, sys));
+        } else if let Some(interned) = resolve_schedule_in_world(world, sched_id) {
+            to_schedule.push((sched_id, interned, sys));
         }
     }
 
     let batch_sets: HashSet<(InternedScheduleLabel, ModNamedSystemSet)> = to_schedule
         .iter()
-        .map(|(interned, s)| {
+        .map(|(_, interned, s)| {
             (
                 *interned,
                 ModNamedSystemSet::with_generation(mod_name, s.system_name(), own_gen),
@@ -483,8 +485,9 @@ pub(crate) fn schedule_mod_systems_in_world(
         world.insert_resource(Schedules::new());
     }
 
+    let has_schedule_sets = world.contains_resource::<ModScheduleSetRegistry>();
     let mut recorded_sets = Vec::with_capacity(to_schedule.len());
-    for (interned, sys) in to_schedule {
+    for (sched_id, interned, sys) in to_schedule {
         let cfg = build_configured_guest_system(
             world,
             mod_name,
@@ -496,6 +499,10 @@ pub(crate) fn schedule_mod_systems_in_world(
         );
 
         if let Some(mut schedules) = world.get_resource_mut::<Schedules>() {
+            if has_schedule_sets {
+                let schedule = schedules.entry(interned);
+                install_mod_schedule_set_pass(schedule, sched_id);
+            }
             schedules.add_systems(interned, cfg);
         }
     }

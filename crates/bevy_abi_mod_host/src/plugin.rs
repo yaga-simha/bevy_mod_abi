@@ -15,6 +15,9 @@ use crate::commands_ext::{PendingModLifecycleOps, flush_pending_mod_lifecycle_op
 use crate::mod_dag::ModDependencyGraph;
 #[cfg(feature = "signature-verification")]
 use bevy_abi_mod_host_sys::ModTrustPolicy;
+use bevy_abi_mod_host_sys::loader::ensure_symbol_tables_in_world;
+use bevy_abi_mod_host_sys::registry::catalog::ensure_relation_graph_in_world;
+use bevy_abi_mod_host_sys::schedule::ModScheduleSetRegistry;
 use bevy_abi_mod_host_sys::{
     ModErrorPolicy, ModErrorPolicyConfig, ModHost, ModQuarantine, ModRegistry, ModSystemFaulted,
     PersistentMessageCursors, StartupCompleted, WorldDropGuard, ensure_dynamic_hook_map_in_world,
@@ -121,6 +124,11 @@ impl Plugin for ConfiguredAbiModPlugin {
         if !app.world().contains_resource::<ModVisibleSets>() {
             app.insert_resource(ModVisibleSets::new());
         }
+        if !app.world().contains_resource::<ModScheduleSetRegistry>() {
+            app.insert_resource(ModScheduleSetRegistry::new());
+        }
+        ensure_symbol_tables_in_world(app.world_mut());
+        ensure_relation_graph_in_world(app.world_mut());
         #[cfg(feature = "signature-verification")]
         if let Some(policy) = &self.trust_policy {
             app.insert_resource(policy.clone());
