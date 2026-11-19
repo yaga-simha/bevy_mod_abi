@@ -1,14 +1,14 @@
 //! `extern "C"` host FFI callbacks, header-validated contexts, and `HOST_API` table.
 
-pub mod assets_scene;
-pub mod bridge_helpers;
-pub mod commands;
-pub mod commands_ext;
-pub mod hierarchy_ext;
-pub mod host_api;
-pub mod iter;
-pub mod iter_ext;
-pub mod observers_ext;
-pub mod proc_address;
-pub mod register;
-pub mod v03_ext;
+pub(crate) mod assets_scene;
+pub(crate) mod commands;
+pub(crate) mod commands_ext;
+pub(crate) mod hierarchy_ext;
+pub(crate) mod host_api;
+pub(crate) mod iter;
+pub(crate) mod iter_ext;
+pub(crate) mod observers_ext;
+pub(crate) mod proc_address;
+pub(crate) mod register;
+pub(crate) mod v03_ext;
+pub(crate) mod validation;

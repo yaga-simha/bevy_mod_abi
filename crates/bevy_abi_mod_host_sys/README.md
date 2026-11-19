@@ -10,7 +10,7 @@ Isolates all host-side `unsafe` code behind documented safety invariants (`#![de
 - **`HostIter` & `host_par_for_each_chunk`**: Zero-copy `Table` column slices, batched `SparseSet` indirect row pointers, non-destructive entity counts, resource change-detection ticks (`BamChangeTicks`), and parallel chunk dispatch.
 - **`HostCommands` & `CommandArena`**: Per-system bump-allocated deferred command queue with LIFO checkpoints/rollback, applying spawns, inserts, removes, despawns, and triggers via `EntityWorldMut` (`ComponentHooks`, `#[require(...)]`, `ChildOf` / `Children`).
 - **`DROP_PAGES`, `WorldDropGuard`, & `DynamicComponentHookMap`**: Wait-free `ArcSwapOption` paged drop trampolines (up to `4,096` slots) with two-condition reclamation plus 5-hook lifecycle & `clone_fn` dispatch preventing use-after-`dlclose`.
-- **`bridge_helpers`**: Safe host-side witness field introspection/migration, typed `Reflect` helpers, and cross-`World` (`SubApp`) component/resource extraction.
+- **`validation`** (`ffi/validation.rs`): Safe host-side witness field introspection/migration, typed `Reflect` helpers, and cross-`World` (`SubApp`) component/resource extraction.
 - **`ModHost` & `LoadTransaction`**: Shadow-copy library loading (`LoadOptions`), optional `signature-verification` delegated to [`bevy_abi_mod_trust`](../bevy_abi_mod_trust) (`.sig`, `.bam_sig`, `.bampack`, CA/SSHKRL), transactional init rollback, deterministic 5-step unload, and state/witness hot reload (`save_state` / `restore_state`).
 
 Application authors should depend on `bevy_abi_mod` rather than using this `-sys` crate directly.

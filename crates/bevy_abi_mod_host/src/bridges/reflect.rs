@@ -439,7 +439,7 @@ pub trait ModReflectWorldExt {
         component: BamComponent,
     ) -> Result<WitnessReflectSchema, FfiResult>;
 
-    /// Borrows a typed `Reflect` component from `entity` via [`ReflectFromPtr`] (`bridge_helpers`).
+    /// Borrows a typed `Reflect` component from `entity` via [`ReflectFromPtr`] (`ffi/validation`).
     fn reflect_mod_component(
         &self,
         entity: Entity,
@@ -447,7 +447,7 @@ pub trait ModReflectWorldExt {
     ) -> Result<&dyn Reflect, FfiResult>;
 
     /// Mutably visits a typed `Reflect` component on `entity` inside `f` via [`ReflectFromPtr`]
-    /// (`bridge_helpers::reflect_entity_component_mut`).
+    /// (`bevy_abi_mod_host_sys::reflect_entity_component_mut`).
     fn with_reflect_mod_component_mut<R>(
         &mut self,
         entity: Entity,
@@ -869,7 +869,7 @@ impl ModReflectWorldExt for World {
 }
 
 /// Mutably visits a typed `Reflect` component on `entity` inside `f` via [`ReflectFromPtr`]
-/// (`bridge_helpers::reflect_entity_component_mut`).
+/// (`bevy_abi_mod_host_sys::reflect_entity_component_mut`).
 pub fn with_reflect_mod_component_mut<R>(
     world: &mut World,
     entity: Entity,

@@ -18,16 +18,16 @@ use std::sync::Arc;
 /// Magic constant stamped at offset `0` of [`HostContext`] (`BamHostCtx`, `"BAMH"`).
 pub const HOST_CTX_MAGIC: u32 = 0x4241_4D48;
 
-/// Magic constant stamped at offset `0` of [`crate::ffi::register::LoadContext`] (`BamLoadCtx`, `"BAML"`).
+/// Magic constant stamped at offset `0` of [`crate::LoadContext`] (`BamLoadCtx`, `"BAML"`).
 pub const LOAD_CTX_MAGIC: u32 = 0x4241_4D4C;
 
 /// Magic constant stamped at offset `0` of [`crate::system::HostSystemCtx`] (`BamSystemCtx`, `"BAMS"`).
 pub const SYS_CTX_MAGIC: u32 = 0x4241_4D53;
 
-/// Magic constant stamped at offset `0` of [`crate::ffi::iter::HostIter`] (`BamIter`, `"BAMI"`).
+/// Magic constant stamped at offset `0` of [`crate::HostIter`] (`BamIter`, `"BAMI"`).
 pub const ITER_MAGIC: u32 = 0x4241_4D49;
 
-/// Magic constant stamped at offset `0` of [`crate::ffi::commands::HostCommands`] (`BamCommands`, `"BAMC"`).
+/// Magic constant stamped at offset `0` of [`crate::HostCommands`] (`BamCommands`, `"BAMC"`).
 pub const COMMANDS_MAGIC: u32 = 0x4241_4D43;
 
 /// Poisoned magic constant written into [`HandleHeader::magic`] during `Drop`.
