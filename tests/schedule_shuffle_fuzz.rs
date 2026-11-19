@@ -38,7 +38,7 @@ use bevy_ecs::schedule::{
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const NUM_SHUFFLE_SEEDS: usize = 256;
 const NUM_UNITS: usize = 8;
@@ -146,12 +146,45 @@ struct UnitPulseEvent {
 // ============================================================================
 
 struct BuiltDagMods {
-    _root_dir: PathBuf,
+    root_dir: PathBuf,
+    target_dir: PathBuf,
     mod_a: PathBuf,
     mod_b: PathBuf,
     mod_c: PathBuf,
     mod_d: PathBuf,
     mod_e: PathBuf,
+}
+
+impl Drop for BuiltDagMods {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root_dir);
+        let _ = fs::remove_dir_all(&self.target_dir);
+    }
+}
+
+fn sanitized_cargo_command() -> Command {
+    let cargo = std::env::var_os("CARGO")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "cargo".into());
+    let mut cmd = Command::new(cargo);
+    for var in [
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "LLVM_PROFILE_FILE",
+        "CARGO_LLVM_COV",
+        "CARGO_LLVM_COV_TARGET_DIR",
+        "CARGO_LLVM_COV_BUILD_DIR",
+        "RUSTC_WRAPPER",
+        "CARGO_PROFILE_RELEASE_PANIC",
+        "CARGO_PROFILE_RELEASE_OPT_LEVEL",
+        "CARGO_PROFILE_DEV_PANIC",
+        "__CARGO_LLVM_COV_RUSTC_WRAPPER",
+        "__CARGO_LLVM_COV_RUSTC_WRAPPER_RUSTFLAGS",
+        "__CARGO_LLVM_COV_RUSTC_WRAPPER_CRATE_NAMES",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd
 }
 
 const SHARED_TYPES_RS: &str = r#"
@@ -1018,44 +1051,49 @@ mod logic {
 bevy_abi_mod_guest::export_mod!(name: c"mod_e_reduce", version: c"0.3.0", logic::build);
 "#;
 
-fn build_five_dag_mods() -> &'static BuiltDagMods {
-    static BUILT: OnceLock<BuiltDagMods> = OnceLock::new();
-    BUILT.get_or_init(|| {
-        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .expect("workspace root");
-        let guest_path = workspace_root.join("crates").join("bevy_abi_mod_guest");
-        let sys_path = workspace_root.join("crates").join("bevy_abi_mod_sys");
-        let guest_clean = guest_path
-            .display()
-            .to_string()
-            .replace('\\', "/")
-            .trim_start_matches("//?/")
-            .to_owned();
-        let sys_clean = sys_path
-            .display()
-            .to_string()
-            .replace('\\', "/")
-            .trim_start_matches("//?/")
-            .to_owned();
+fn build_five_dag_mods() -> BuiltDagMods {
+    static NEXT_WORKSPACE_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = NEXT_WORKSPACE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let guest_path = workspace_root.join("crates").join("bevy_abi_mod_guest");
+    let sys_path = workspace_root.join("crates").join("bevy_abi_mod_sys");
+    let guest_clean = guest_path
+        .display()
+        .to_string()
+        .replace('\\', "/")
+        .trim_start_matches("//?/")
+        .to_owned();
+    let sys_clean = sys_path
+        .display()
+        .to_string()
+        .replace('\\', "/")
+        .trim_start_matches("//?/")
+        .to_owned();
 
-        let root_dir =
-            std::env::temp_dir().join(format!("bam_shuffle_dag_mods_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root_dir);
-        fs::create_dir_all(&root_dir).expect("create temp 5-mod DAG workspace");
+    let root_dir =
+        std::env::temp_dir().join(format!("bam_shuffle_dag_mods_{}_{seq}", std::process::id()));
+    let target_dir = std::env::temp_dir().join(format!(
+        "bam_shuffle_dag_target_{}_{seq}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root_dir);
+    let _ = fs::remove_dir_all(&target_dir);
+    fs::create_dir_all(&root_dir).expect("create temp 5-mod DAG workspace");
 
-        let members = [
-            ("mod_a_seq", MOD_A_LIB_RS),
-            ("mod_b_weak", MOD_B_LIB_RS),
-            ("mod_c_parallel", MOD_C_LIB_RS),
-            ("mod_d_relations", MOD_D_LIB_RS),
-            ("mod_e_reduce", MOD_E_LIB_RS),
-        ];
+    let members = [
+        ("mod_a_seq", MOD_A_LIB_RS),
+        ("mod_b_weak", MOD_B_LIB_RS),
+        ("mod_c_parallel", MOD_C_LIB_RS),
+        ("mod_d_relations", MOD_D_LIB_RS),
+        ("mod_e_reduce", MOD_E_LIB_RS),
+    ];
 
-        fs::write(
-            root_dir.join("Cargo.toml"),
-            r#"[workspace]
+    fs::write(
+        root_dir.join("Cargo.toml"),
+        r#"[workspace]
 resolver = "2"
 members = [
     "mod_a_seq",
@@ -1065,20 +1103,34 @@ members = [
     "mod_e_reduce",
 ]
 "#,
-        )
-        .expect("write temp workspace Cargo.toml");
+    )
+    .expect("write temp workspace Cargo.toml");
 
-        let lock_src = workspace_root.join("Cargo.lock");
-        if lock_src.is_file() {
-            let _ = fs::copy(&lock_src, root_dir.join("Cargo.lock"));
+    let lock_src = workspace_root
+        .join("tests")
+        .join("asymmetric_rust_mod")
+        .join("Cargo.lock");
+    if lock_src.is_file() {
+        let mut lock_contents =
+            fs::read_to_string(&lock_src).expect("read tests/asymmetric_rust_mod/Cargo.lock");
+        if !lock_contents.ends_with('\n') {
+            lock_contents.push('\n');
         }
+        for (crate_name, _) in members {
+            lock_contents.push_str(&format!(
+                "\n[[package]]\nname = \"{crate_name}\"\nversion = \"0.3.0\"\ndependencies = [\n \"bevy_abi_mod_guest\",\n \"bevy_abi_mod_sys\",\n]\n"
+            ));
+        }
+        fs::write(root_dir.join("Cargo.lock"), lock_contents)
+            .expect("write 5-mod DAG workspace Cargo.lock");
+    }
 
-        for (crate_name, lib_rs) in members {
-            let crate_dir = root_dir.join(crate_name);
-            let src_dir = crate_dir.join("src");
-            fs::create_dir_all(&src_dir).expect("create member src dir");
-            let manifest = format!(
-                r#"[package]
+    for (crate_name, lib_rs) in members {
+        let crate_dir = root_dir.join(crate_name);
+        let src_dir = crate_dir.join("src");
+        fs::create_dir_all(&src_dir).expect("create member src dir");
+        let manifest = format!(
+            r#"[package]
 name = "{crate_name}"
 version = "0.3.0"
 edition = "2024"
@@ -1090,48 +1142,46 @@ crate-type = ["cdylib"]
 bevy_abi_mod_guest = {{ path = "{guest_clean}", features = ["derive"] }}
 bevy_abi_mod_sys = {{ path = "{sys_clean}" }}
 "#
-            );
-            fs::write(crate_dir.join("Cargo.toml"), manifest).expect("write member Cargo.toml");
-            fs::write(src_dir.join("shared.rs"), SHARED_TYPES_RS).expect("write shared.rs");
-            fs::write(src_dir.join("lib.rs"), lib_rs).expect("write lib.rs");
-        }
-
-        let target_dir =
-            std::env::temp_dir().join(format!("bam_shuffle_dag_target_{}", std::process::id()));
-        let output = Command::new(env!("CARGO"))
-            .args(["build", "--workspace", "--offline"])
-            .current_dir(&root_dir)
-            .env("CARGO_TARGET_DIR", &target_dir)
-            .output()
-            .expect("invoke cargo build for 5-mod shuffle DAG workspace");
-        assert!(
-            output.status.success(),
-            "failed to compile 5-mod shuffle DAG workspace:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
         );
+        fs::write(crate_dir.join("Cargo.toml"), manifest).expect("write member Cargo.toml");
+        fs::write(src_dir.join("shared.rs"), SHARED_TYPES_RS).expect("write shared.rs");
+        fs::write(src_dir.join("lib.rs"), lib_rs).expect("write lib.rs");
+    }
 
-        let dylib_path = |name: &str| {
-            let filename = format!(
-                "{}{}{}",
-                std::env::consts::DLL_PREFIX,
-                name,
-                std::env::consts::DLL_SUFFIX
-            );
-            let built = target_dir.join("debug").join(&filename);
-            assert!(built.is_file(), "expected dylib at {}", built.display());
-            built
-        };
+    let output = sanitized_cargo_command()
+        .args(["build", "--workspace", "--release"])
+        .current_dir(&root_dir)
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .output()
+        .expect("invoke cargo build for 5-mod shuffle DAG workspace");
+    assert!(
+        output.status.success(),
+        "failed to compile 5-mod shuffle DAG workspace:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-        BuiltDagMods {
-            _root_dir: root_dir,
-            mod_a: dylib_path("mod_a_seq"),
-            mod_b: dylib_path("mod_b_weak"),
-            mod_c: dylib_path("mod_c_parallel"),
-            mod_d: dylib_path("mod_d_relations"),
-            mod_e: dylib_path("mod_e_reduce"),
-        }
-    })
+    let dylib_path = |name: &str| {
+        let filename = format!(
+            "{}{}{}",
+            std::env::consts::DLL_PREFIX,
+            name,
+            std::env::consts::DLL_SUFFIX
+        );
+        let built = target_dir.join("release").join(&filename);
+        assert!(built.is_file(), "expected dylib at {}", built.display());
+        built
+    };
+
+    BuiltDagMods {
+        mod_a: dylib_path("mod_a_seq"),
+        mod_b: dylib_path("mod_b_weak"),
+        mod_c: dylib_path("mod_c_parallel"),
+        mod_d: dylib_path("mod_d_relations"),
+        mod_e: dylib_path("mod_e_reduce"),
+        root_dir,
+        target_dir,
+    }
 }
 
 // ============================================================================
@@ -1426,7 +1476,7 @@ fn five_mod_dag_bit_exact_world_hash_across_256_shuffle_seeds() {
             .wrapping_add(0xD1B5_4A32_D192_ED03);
         let multi_threaded = !i.is_multiple_of(2);
 
-        let digest = run_seed(mods, seed, multi_threaded);
+        let digest = run_seed(&mods, seed, multi_threaded);
 
         assert_eq!(
             digest.trace_steps, expected_steps,

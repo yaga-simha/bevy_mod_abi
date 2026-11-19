@@ -485,10 +485,34 @@ fn compile_c99_dso(
     );
 }
 
+fn sanitized_cargo_command() -> Command {
+    let cargo = env::var_os("CARGO")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "cargo".into());
+    let mut cmd = Command::new(cargo);
+    for var in [
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "LLVM_PROFILE_FILE",
+        "CARGO_LLVM_COV",
+        "CARGO_LLVM_COV_TARGET_DIR",
+        "CARGO_LLVM_COV_BUILD_DIR",
+        "RUSTC_WRAPPER",
+        "CARGO_PROFILE_RELEASE_PANIC",
+        "CARGO_PROFILE_RELEASE_OPT_LEVEL",
+        "CARGO_PROFILE_DEV_PANIC",
+        "__CARGO_LLVM_COV_RUSTC_WRAPPER",
+        "__CARGO_LLVM_COV_RUSTC_WRAPPER_RUSTFLAGS",
+        "__CARGO_LLVM_COV_RUSTC_WRAPPER_CRATE_NAMES",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 fn compile_rust_dso(rust_manifest: &Path, cargo_target_dir: &Path, out_path: &Path, v2: bool) {
     let (prefix, ext) = dylib_prefix_and_ext();
-    let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
-    let mut cmd = Command::new(&cargo);
+    let mut cmd = sanitized_cargo_command();
     cmd.arg("build")
         .arg("--manifest-path")
         .arg(rust_manifest)

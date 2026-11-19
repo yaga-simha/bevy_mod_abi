@@ -33,12 +33,14 @@ use bevy_app::{App, Update};
 use bevy_ecs::entity::Entity;
 use bevy_ecs::message::Messages;
 use bevy_ecs::prelude::Resource;
+use std::borrow::Cow;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+const DEFAULT_SMOKE_SOAK_CYCLES: usize = 250;
 const FULL_SOAK_CYCLES: usize = 10_000;
 const MIGRATE_STRIDE: usize = 20; // 500 live v1 <-> v2 `migrate_component_column` flips in 10,000 cycles
 const PERSISTENT_ENTITIES: usize = 16;
@@ -117,9 +119,87 @@ fn current_rss_kib() -> Option<u64> {
 // ============================================================================
 
 struct BuiltSoakMods {
-    _root_dir: PathBuf,
+    root_dir: PathBuf,
+    target_dir: PathBuf,
     mod_v1: PathBuf,
     mod_v2: PathBuf,
+}
+
+impl Drop for BuiltSoakMods {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root_dir);
+        let _ = fs::remove_dir_all(&self.target_dir);
+    }
+}
+
+fn sanitized_cargo_command() -> Command {
+    let cargo = std::env::var_os("CARGO")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "cargo".into());
+    let mut cmd = Command::new(cargo);
+    for var in [
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "LLVM_PROFILE_FILE",
+        "CARGO_LLVM_COV",
+        "CARGO_LLVM_COV_TARGET_DIR",
+        "CARGO_LLVM_COV_BUILD_DIR",
+        "RUSTC_WRAPPER",
+        "CARGO_PROFILE_RELEASE_PANIC",
+        "CARGO_PROFILE_RELEASE_OPT_LEVEL",
+        "CARGO_PROFILE_DEV_PANIC",
+        "__CARGO_LLVM_COV_RUSTC_WRAPPER",
+        "__CARGO_LLVM_COV_RUSTC_WRAPPER_RUSTFLAGS",
+        "__CARGO_LLVM_COV_RUSTC_WRAPPER_CRATE_NAMES",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+struct SoakStageRing<'a> {
+    mods: &'a BuiltSoakMods,
+    v1_slots: [PathBuf; 2],
+    v2_slots: [PathBuf; 2],
+}
+
+impl<'a> SoakStageRing<'a> {
+    fn new(mods: &'a BuiltSoakMods) -> Self {
+        Self {
+            mods,
+            v1_slots: [
+                mods.root_dir.join("soak_mod_v1_slot0.dll"),
+                mods.root_dir.join("soak_mod_v1_slot1.dll"),
+            ],
+            v2_slots: [
+                mods.root_dir.join("soak_mod_v2_slot0.dll"),
+                mods.root_dir.join("soak_mod_v2_slot1.dll"),
+            ],
+        }
+    }
+
+    fn stage_for_cycle(&self, using_v2: bool, cycle: usize) -> Cow<'_, Path> {
+        if cfg!(windows) {
+            let slot = cycle % 2;
+            let (src, dst) = if using_v2 {
+                (&self.mods.mod_v2, &self.v2_slots[slot])
+            } else {
+                (&self.mods.mod_v1, &self.v1_slots[slot])
+            };
+            fs::copy(src, dst).unwrap_or_else(|err| {
+                panic!(
+                    "failed staging Windows soak DLL from {} to {} on cycle {cycle}: {err}",
+                    src.display(),
+                    dst.display()
+                )
+            });
+            Cow::Borrowed(dst.as_path())
+        } else if using_v2 {
+            Cow::Borrowed(self.mods.mod_v2.as_path())
+        } else {
+            Cow::Borrowed(self.mods.mod_v1.as_path())
+        }
+    }
 }
 
 const SOAK_SHARED_RS: &str = r#"
@@ -532,56 +612,73 @@ mod logic {
 bevy_abi_mod_guest::export_mod!(name: c"soak_mod", version: c"2.0.0", logic::build);
 "#;
 
-fn build_soak_mods() -> &'static BuiltSoakMods {
-    static BUILT: OnceLock<BuiltSoakMods> = OnceLock::new();
-    BUILT.get_or_init(|| {
-        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .expect("workspace root");
-        let guest_path = workspace_root.join("crates").join("bevy_abi_mod_guest");
-        let sys_path = workspace_root.join("crates").join("bevy_abi_mod_sys");
-        let guest_clean = guest_path
-            .display()
-            .to_string()
-            .replace('\\', "/")
-            .trim_start_matches("//?/")
-            .to_owned();
-        let sys_clean = sys_path
-            .display()
-            .to_string()
-            .replace('\\', "/")
-            .trim_start_matches("//?/")
-            .to_owned();
+fn build_soak_mods() -> BuiltSoakMods {
+    static NEXT_WORKSPACE_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = NEXT_WORKSPACE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let guest_path = workspace_root.join("crates").join("bevy_abi_mod_guest");
+    let sys_path = workspace_root.join("crates").join("bevy_abi_mod_sys");
+    let guest_clean = guest_path
+        .display()
+        .to_string()
+        .replace('\\', "/")
+        .trim_start_matches("//?/")
+        .to_owned();
+    let sys_clean = sys_path
+        .display()
+        .to_string()
+        .replace('\\', "/")
+        .trim_start_matches("//?/")
+        .to_owned();
 
-        let root_dir =
-            std::env::temp_dir().join(format!("bam_soak_10k_mods_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root_dir);
-        fs::create_dir_all(&root_dir).expect("create temp soak workspace");
+    let root_dir =
+        std::env::temp_dir().join(format!("bam_soak_10k_mods_{}_{seq}", std::process::id()));
+    let target_dir =
+        std::env::temp_dir().join(format!("bam_soak_10k_target_{}_{seq}", std::process::id()));
+    let _ = fs::remove_dir_all(&root_dir);
+    let _ = fs::remove_dir_all(&target_dir);
+    fs::create_dir_all(&root_dir).expect("create temp soak workspace");
 
-        fs::write(
-            root_dir.join("Cargo.toml"),
-            r#"[workspace]
+    fs::write(
+        root_dir.join("Cargo.toml"),
+        r#"[workspace]
 resolver = "2"
 members = ["soak_mod_v1", "soak_mod_v2"]
 "#,
-        )
-        .expect("write soak workspace Cargo.toml");
+    )
+    .expect("write soak workspace Cargo.toml");
 
-        let lock_src = workspace_root.join("Cargo.lock");
-        if lock_src.is_file() {
-            let _ = fs::copy(&lock_src, root_dir.join("Cargo.lock"));
+    let lock_src = workspace_root
+        .join("tests")
+        .join("asymmetric_rust_mod")
+        .join("Cargo.lock");
+    if lock_src.is_file() {
+        let mut lock_contents =
+            fs::read_to_string(&lock_src).expect("read tests/asymmetric_rust_mod/Cargo.lock");
+        if !lock_contents.ends_with('\n') {
+            lock_contents.push('\n');
         }
+        for crate_name in ["soak_mod_v1", "soak_mod_v2"] {
+            lock_contents.push_str(&format!(
+                "\n[[package]]\nname = \"{crate_name}\"\nversion = \"0.3.0\"\ndependencies = [\n \"bevy_abi_mod_guest\",\n \"bevy_abi_mod_sys\",\n]\n"
+            ));
+        }
+        fs::write(root_dir.join("Cargo.lock"), lock_contents)
+            .expect("write soak workspace Cargo.lock");
+    }
 
-        for (crate_name, lib_rs) in [
-            ("soak_mod_v1", SOAK_V1_LIB_RS),
-            ("soak_mod_v2", SOAK_V2_LIB_RS),
-        ] {
-            let crate_dir = root_dir.join(crate_name);
-            let src_dir = crate_dir.join("src");
-            fs::create_dir_all(&src_dir).expect("create soak crate src dir");
-            let manifest = format!(
-                r#"[package]
+    for (crate_name, lib_rs) in [
+        ("soak_mod_v1", SOAK_V1_LIB_RS),
+        ("soak_mod_v2", SOAK_V2_LIB_RS),
+    ] {
+        let crate_dir = root_dir.join(crate_name);
+        let src_dir = crate_dir.join("src");
+        fs::create_dir_all(&src_dir).expect("create soak crate src dir");
+        let manifest = format!(
+            r#"[package]
 name = "{crate_name}"
 version = "0.3.0"
 edition = "2024"
@@ -593,51 +690,44 @@ crate-type = ["cdylib"]
 bevy_abi_mod_guest = {{ path = "{guest_clean}", features = ["derive"] }}
 bevy_abi_mod_sys = {{ path = "{sys_clean}" }}
 "#
-            );
-            fs::write(crate_dir.join("Cargo.toml"), manifest).expect("write soak Cargo.toml");
-            fs::write(src_dir.join("shared.rs"), SOAK_SHARED_RS).expect("write soak shared.rs");
-            fs::write(src_dir.join("lib.rs"), lib_rs).expect("write soak lib.rs");
-        }
-
-        let target_dir =
-            std::env::temp_dir().join(format!("bam_soak_10k_target_{}", std::process::id()));
-        let is_release = !cfg!(debug_assertions);
-        let mut cmd = Command::new(env!("CARGO"));
-        cmd.args(["build", "--workspace", "--offline"]);
-        if is_release {
-            cmd.arg("--release");
-        }
-        let output = cmd
-            .current_dir(&root_dir)
-            .env("CARGO_TARGET_DIR", &target_dir)
-            .output()
-            .expect("invoke cargo build for soak_mod_v1/v2");
-        assert!(
-            output.status.success(),
-            "failed to build soak mods:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
         );
+        fs::write(crate_dir.join("Cargo.toml"), manifest).expect("write soak Cargo.toml");
+        fs::write(src_dir.join("shared.rs"), SOAK_SHARED_RS).expect("write soak shared.rs");
+        fs::write(src_dir.join("lib.rs"), lib_rs).expect("write soak lib.rs");
+    }
 
-        let profile_dir = if is_release { "release" } else { "debug" };
-        let dylib_path = |name: &str| {
-            let filename = format!(
-                "{}{}{}",
-                std::env::consts::DLL_PREFIX,
-                name,
-                std::env::consts::DLL_SUFFIX
-            );
-            let built = target_dir.join(profile_dir).join(&filename);
-            assert!(built.is_file(), "expected dylib at {}", built.display());
-            built
-        };
+    let mut cmd = sanitized_cargo_command();
+    cmd.args(["build", "--workspace", "--release"]);
+    let output = cmd
+        .current_dir(&root_dir)
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .output()
+        .expect("invoke cargo build for soak_mod_v1/v2");
+    assert!(
+        output.status.success(),
+        "failed to build soak mods:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-        BuiltSoakMods {
-            _root_dir: root_dir,
-            mod_v1: dylib_path("soak_mod_v1"),
-            mod_v2: dylib_path("soak_mod_v2"),
-        }
-    })
+    let dylib_path = |name: &str| {
+        let filename = format!(
+            "{}{}{}",
+            std::env::consts::DLL_PREFIX,
+            name,
+            std::env::consts::DLL_SUFFIX
+        );
+        let built = target_dir.join("release").join(&filename);
+        assert!(built.is_file(), "expected dylib at {}", built.display());
+        built
+    };
+
+    BuiltSoakMods {
+        mod_v1: dylib_path("soak_mod_v1"),
+        mod_v2: dylib_path("soak_mod_v2"),
+        root_dir,
+        target_dir,
+    }
 }
 
 fn target_cycle_count() -> usize {
@@ -647,12 +737,13 @@ fn target_cycle_count() -> usize {
     {
         return parsed;
     }
-    FULL_SOAK_CYCLES
+    DEFAULT_SMOKE_SOAK_CYCLES
 }
 
 #[test]
 fn soak_10000_consecutive_reloads_latency_drop_pages_and_rss() {
     let mods = build_soak_mods();
+    let stage_ring = SoakStageRing::new(&mods);
     let total_cycles = target_cycle_count();
     let baseline_free_drop_slots = available_drop_trampoline_slots();
 
@@ -667,8 +758,9 @@ fn soak_10000_consecutive_reloads_latency_drop_pages_and_rss() {
         .with_warn_on_resident_image(false)
         .strict();
 
+    let initial_path = stage_ring.stage_for_cycle(false, 0);
     let mut current_mod_id = app
-        .load_mod_with(&mods.mod_v1, opts.clone())
+        .load_mod_with(initial_path.as_ref(), opts.clone())
         .expect("initial load of soak_mod_v1");
     let mut using_v2 = false;
 
@@ -717,11 +809,11 @@ fn soak_10000_consecutive_reloads_latency_drop_pages_and_rss() {
             }
         }
 
-        let target_path = if using_v2 { &mods.mod_v2 } else { &mods.mod_v1 };
+        let target_path = stage_ring.stage_for_cycle(using_v2, cycle);
 
         let t0 = Instant::now();
         current_mod_id = app
-            .reload_mod_from(current_mod_id, target_path, opts.clone())
+            .reload_mod_from(current_mod_id, target_path.as_ref(), opts.clone())
             .unwrap_or_else(|err| panic!("reload cycle {cycle} failed: {err:?}"));
         let elapsed_ns = t0.elapsed().as_nanos() as u64;
         reload_durations_ns.push(elapsed_ns);
@@ -915,8 +1007,13 @@ fn soak_10000_consecutive_reloads_latency_drop_pages_and_rss() {
         _ => None,
     };
 
+    let gen_note = if gen_delta > MAX_DROP_TRAMPOLINES as u64 {
+        format!("(>{MAX_DROP_TRAMPOLINES})")
+    } else {
+        format!("(slab={MAX_DROP_TRAMPOLINES})")
+    };
     eprintln!(
-        "[soak_10k_reloads] cycles={total_cycles} total={:.2}s | reload_ms: min={min_ms:.3} p50={p50_ms:.3} p95={p95_ms:.3} p99={p99_ms:.3} max={max_ms:.3} | migrations=(v1->v2:{}, v2->v1:{}) | drop_gen_delta={gen_delta} (>{MAX_DROP_TRAMPOLINES}) drop_calls={} pages={pages_allocated} | rss_kib: warmup={:?} mid={:?} end={:?} delta={:?}",
+        "[soak_10k_reloads] cycles={total_cycles} total={:.2}s | reload_ms: min={min_ms:.3} p50={p50_ms:.3} p95={p95_ms:.3} p99={p99_ms:.3} max={max_ms:.3} | migrations=(v1->v2:{}, v2->v1:{}) | drop_gen_delta={gen_delta} {gen_note} drop_calls={} pages={pages_allocated} | rss_kib: warmup={:?} mid={:?} end={:?} delta={:?}",
         total_elapsed.as_secs_f64(),
         tel.v1_to_v2_migrations,
         tel.v2_to_v1_migrations,

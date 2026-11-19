@@ -212,8 +212,33 @@ fn dylib_naming() -> (&'static str, &'static str) {
     }
 }
 
+fn sanitized_cargo_command() -> Command {
+    let cargo = std::env::var_os("CARGO")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "cargo".into());
+    let mut cmd = Command::new(cargo);
+    for var in [
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "LLVM_PROFILE_FILE",
+        "CARGO_LLVM_COV",
+        "CARGO_LLVM_COV_TARGET_DIR",
+        "CARGO_LLVM_COV_BUILD_DIR",
+        "RUSTC_WRAPPER",
+        "CARGO_PROFILE_RELEASE_PANIC",
+        "CARGO_PROFILE_RELEASE_OPT_LEVEL",
+        "CARGO_PROFILE_DEV_PANIC",
+        "__CARGO_LLVM_COV_RUSTC_WRAPPER",
+        "__CARGO_LLVM_COV_RUSTC_WRAPPER_RUSTFLAGS",
+        "__CARGO_LLVM_COV_RUSTC_WRAPPER_CRATE_NAMES",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 fn build_guest_variant(guest_manifest: &Path, target_dir: &Path, extra_args: &[&str]) -> PathBuf {
-    let mut cmd = Command::new("cargo");
+    let mut cmd = sanitized_cargo_command();
     cmd.arg("build")
         .arg("--manifest-path")
         .arg(guest_manifest)
