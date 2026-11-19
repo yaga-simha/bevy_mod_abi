@@ -674,8 +674,9 @@ fn v03_reserved_slots_exhaustive_validation() {
         );
         assert_eq!(
             host_configure_schedule_set(load_ptr, &valid_set, &raw mut out_set),
-            FfiResult::UNSUPPORTED
+            FfiResult::OK
         );
+        assert_eq!(out_set, BamSystemSet::from_raw(0));
 
         // 5. `host_mount_system_in_schedule`
         let sys_desc = BamSystemDesc::new(
@@ -737,7 +738,7 @@ fn v03_reserved_slots_exhaustive_validation() {
                 ScheduleId::UPDATE,
                 BamSystemSet::INVALID
             ),
-            FfiResult::UNSUPPORTED
+            FfiResult::OK
         );
 
         // 6. `host_migrate_component_column`

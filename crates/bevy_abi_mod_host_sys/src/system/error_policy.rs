@@ -1,10 +1,16 @@
 //! Fault policies, `ModQuarantine` resource, runtime system errors, and initialization diagnostics.
 
 use crate::loader::ModId;
-use bevy_abi_mod_sys::FfiResult;
+use bevy_abi_mod_sys::{BamHostCtx, FfiResult};
+use bevy_ecs::change_detection::Tick;
+use bevy_ecs::error::{BevyError, ContextExt, ErrorContext, Severity};
 use bevy_ecs::message::Message;
 use bevy_ecs::prelude::Resource;
+use bevy_ecs::utils::DebugName;
+use bevy_ecs::world::World;
 use bevy_platform::collections::HashMap;
+use core::cell::RefCell;
+use core::fmt;
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
@@ -24,7 +30,7 @@ pub enum ModErrorPolicy {
     ReportToBevy,
     /// Discards uncommitted commands, emits [`ModSystemFaulted`], and delegates fault handling
     /// directly to Bevy's world [`FallbackErrorHandler`](bevy_ecs::error::FallbackErrorHandler)
-    /// with a contextualized [`BevyError`](bevy_ecs::error::BevyError) (`.with_context(...)`)
+    /// with a contextualized [`BevyError`] (`.with_context(...)`)
     /// without auto-quarantining the system.
     DelegateToBevyFallback,
 }
@@ -137,21 +143,102 @@ impl SystemInitError {
     }
 }
 
-/// Typed error reported to Bevy when [`ModErrorPolicy::ReportToBevy`] is active and a guest system
-/// faults.
+/// Typed error reported to Bevy's [`FallbackErrorHandler`](bevy_ecs::error::FallbackErrorHandler)
+/// when [`ModErrorPolicy::ReportToBevy`] or [`ModErrorPolicy::DelegateToBevyFallback`] is active
+/// and a guest system faults.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error(
-    "guest mod system '{system_name}' (mod_id={mod_id:?}) faulted with {status} (panicked={panicked})"
-)]
 pub struct ModSystemError {
     /// Optional [`ModId`] owning the faulting system.
     pub mod_id: Option<ModId>,
+    /// Optional canonical module namespace (`BamManifest::name`).
+    pub mod_namespace: Option<String>,
+    /// Reload generation of the owning module when the system was initialized.
+    pub generation: u64,
     /// Registered name of the faulting guest system.
     pub system_name: String,
-    /// Error status returned by the callback.
+    /// Error status returned by the callback (or `FfiResult::INTERNAL_ERROR` for fault reports).
     pub status: FfiResult,
     /// Whether the guest reported a caught panic (`FfiResult::PANIC_CAUGHT`).
     pub panicked: bool,
+    /// Optional structured guest diagnostic / fault message captured from `last_error` or
+    /// `host_report_guest_fault`.
+    pub last_error: Option<String>,
+}
+
+impl fmt::Display for ModSystemError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "guest mod system '{}' (mod_id={:?}, namespace={}, gen={}) faulted with {} (panicked={})",
+            self.system_name,
+            self.mod_id,
+            self.mod_namespace.as_deref().unwrap_or("unscoped"),
+            self.generation,
+            self.status,
+            self.panicked,
+        )?;
+        if let Some(detail) = self.last_error.as_deref()
+            && !detail.is_empty()
+        {
+            write!(f, ": {detail}")?;
+        }
+        Ok(())
+    }
+}
+
+impl ModSystemError {
+    /// Converts this [`ModSystemError`] into a contextualized [`BevyError`] (`.with_context(...)`)
+    /// with [`Severity::Error`] so Bevy 0.20's default `FallbackErrorHandler` (`match_severity`)
+    /// reports the fault cleanly without aborting the process.
+    pub fn into_bevy_error(self) -> BevyError {
+        self.into_bevy_error_with_severity(Severity::Error)
+    }
+
+    /// Converts this [`ModSystemError`] into a contextualized [`BevyError`] (`.with_context(...)`)
+    /// tagged with `severity`, preserving `downcast_ref::<ModSystemError>()`.
+    pub fn into_bevy_error_with_severity(self, severity: Severity) -> BevyError {
+        let mod_id = self.mod_id;
+        let sys_name = self.system_name.clone();
+        let status = self.status;
+        let ns = self
+            .mod_namespace
+            .clone()
+            .unwrap_or_else(|| String::from("unscoped"));
+        let generation = self.generation;
+        let detail = self.last_error.clone();
+        let err_res: Result<(), Self> = Err(self);
+        err_res
+            .with_context(|| match detail.as_deref() {
+                Some(msg) if !msg.is_empty() => format!(
+                    "guest mod {mod_id:?} system {sys_name:?} faulted with {status} [namespace={ns}, generation={generation}, last_error={msg:?}]"
+                ),
+                _ => format!(
+                    "guest mod {mod_id:?} system {sys_name:?} faulted with {status} [namespace={ns}, generation={generation}]"
+                ),
+            })
+            .unwrap_err()
+            .with_severity(severity)
+    }
+}
+
+/// Dispatches a structured [`ModSystemError`] directly to `world`'s Bevy `0.20`
+/// [`FallbackErrorHandler`](bevy_ecs::error::FallbackErrorHandler) (`world.fallback_error_handler()`)
+/// with [`ErrorContext::System`] and [`Severity::Error`].
+pub fn dispatch_mod_fault_to_fallback_handler(
+    world: &World,
+    error: ModSystemError,
+    last_run: Tick,
+) {
+    let sys_name = error.system_name.clone();
+    let bevy_err = error.into_bevy_error();
+    let handler = world.fallback_error_handler();
+    handler(
+        bevy_err,
+        ErrorContext::System {
+            name: DebugName::owned(sys_name),
+            last_run,
+        },
+    );
 }
 
 /// Buffered Bevy [`Message`] emitted once via `Messages<ModSystemFaulted>` whenever a guest system
@@ -160,12 +247,117 @@ pub struct ModSystemError {
 pub struct ModSystemFaulted {
     /// [`ModId`] owning the faulting system, if tracked.
     pub mod_id: Option<ModId>,
+    /// Canonical module namespace (`BamManifest::name`), if tracked.
+    pub mod_namespace: Option<String>,
+    /// Reload generation of the owning module when the system was initialized.
+    pub generation: u64,
     /// Name of the faulting guest system.
     pub system_name: String,
     /// Fault [`FfiResult`] status code.
     pub status: FfiResult,
     /// `true` if the guest reported a caught panic (`FfiResult::PANIC_CAUGHT`).
     pub panicked: bool,
+    /// Optional structured guest diagnostic / fault message captured from `last_error` or
+    /// `host_report_guest_fault`.
+    pub last_error: Option<String>,
     /// Structured initialization failure when the fault occurred during `System::initialize`.
     pub init_error: Option<SystemInitError>,
+}
+
+/// Metadata returned to `host_report_guest_fault` when a fault is reported inside an active
+/// [`crate::GuestSystem`] callback on the current thread.
+#[derive(Debug, Clone)]
+pub(crate) struct ActiveGuestFaultMeta {
+    pub(crate) mod_id: Option<ModId>,
+    pub(crate) mod_namespace: Option<Arc<str>>,
+    pub(crate) generation: u64,
+    pub(crate) system_name: Arc<str>,
+}
+
+#[derive(Debug)]
+struct ActiveGuestFaultSlot {
+    host_ctx_addr: usize,
+    meta: ActiveGuestFaultMeta,
+    reported_message: Option<String>,
+}
+
+thread_local! {
+    static ACTIVE_GUEST_FAULT: RefCell<Option<ActiveGuestFaultSlot>> = const { RefCell::new(None) };
+}
+
+/// Scoped RAII guard binding the current thread's active `GuestSystem` context so
+/// `host_report_guest_fault` can attach structured fault context without modifying `HostContext`.
+pub(crate) struct ActiveGuestFaultGuard {
+    previous: Option<ActiveGuestFaultSlot>,
+    finished: bool,
+}
+
+impl ActiveGuestFaultGuard {
+    /// Installs an active guest-fault capture slot for `host_ctx_ptr` on the current thread.
+    pub(crate) fn enter(
+        host_ctx_ptr: *const BamHostCtx,
+        mod_id: Option<ModId>,
+        mod_namespace: Option<Arc<str>>,
+        generation: u64,
+        system_name: Arc<str>,
+    ) -> Self {
+        let slot = ActiveGuestFaultSlot {
+            host_ctx_addr: host_ctx_ptr as usize,
+            meta: ActiveGuestFaultMeta {
+                mod_id,
+                mod_namespace,
+                generation,
+                system_name,
+            },
+            reported_message: None,
+        };
+        let previous = ACTIVE_GUEST_FAULT.with(|cell| cell.borrow_mut().replace(slot));
+        Self {
+            previous,
+            finished: false,
+        }
+    }
+
+    /// Restores the previous thread-local slot and returns any message recorded via
+    /// `host_report_guest_fault` during this scope.
+    pub(crate) fn finish(mut self) -> Option<String> {
+        self.finished = true;
+        let prev = self.previous.take();
+        ACTIVE_GUEST_FAULT
+            .with(|cell| core::mem::replace(&mut *cell.borrow_mut(), prev))
+            .and_then(|slot| slot.reported_message)
+    }
+}
+
+impl Drop for ActiveGuestFaultGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            let prev = self.previous.take();
+            let _ = ACTIVE_GUEST_FAULT.try_with(|cell| {
+                *cell.borrow_mut() = prev;
+            });
+        }
+    }
+}
+
+/// Records `message` into the current thread's active [`crate::GuestSystem`] fault capture slot
+/// when `host_ctx_ptr` matches the active system's [`crate::HostContext`], returning the active
+/// system's structured metadata for diagnostic logging.
+pub(crate) fn record_active_guest_fault(
+    host_ctx_ptr: *const BamHostCtx,
+    message: &str,
+) -> Option<ActiveGuestFaultMeta> {
+    let addr = host_ctx_ptr as usize;
+    ACTIVE_GUEST_FAULT
+        .try_with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let slot = guard.as_mut()?;
+            if slot.host_ctx_addr != addr {
+                return None;
+            }
+            slot.reported_message = Some(message.to_owned());
+            Some(slot.meta.clone())
+        })
+        .ok()
+        .flatten()
 }

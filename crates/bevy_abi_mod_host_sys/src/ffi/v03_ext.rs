@@ -9,8 +9,15 @@ use crate::handle_header::{
     COMMANDS_MAGIC, HOST_CTX_MAGIC, HostContext, ITER_MAGIC, validate_handle_mut,
     validate_handle_ref,
 };
+use crate::loader::ModHost;
+use crate::schedule::{
+    ModNamedSystemSet, ModScheduleSetRegistry, ScheduleSetMode,
+    ensure_mod_schedule_set_pass_if_schedules_present, resolve_schedule_id_in_world,
+};
+use crate::system::error_policy::record_active_guest_fault;
 use bevy_abi_mod_sys::{
-    BAM_LOG_DEBUG, BAM_LOG_ERROR, BAM_LOG_INFO, BAM_LOG_TRACE, BAM_LOG_WARN, BamChunkTaskFn,
+    BAM_LOG_DEBUG, BAM_LOG_ERROR, BAM_LOG_INFO, BAM_LOG_TRACE, BAM_LOG_WARN,
+    BAM_SCHEDULE_SET_FLAG_AFTER_WEAK, BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK, BamChunkTaskFn,
     BamCommands, BamComponent, BamHostCtx, BamIter, BamLayoutInfo, BamLoadCtx, BamRelationDesc,
     BamRowMigrateFn, BamScheduleSetDesc, BamSymbol, BamSystem, BamSystemDesc, BamSystemSet,
     ComponentDesc, ComponentUuid, FfiEntity, FfiResult, ScheduleId, StrView, read_descriptor,
@@ -18,6 +25,7 @@ use bevy_abi_mod_sys::{
 use bevy_ecs::entity::Entity;
 use core::ffi::{CStr, c_char, c_void};
 use core::ptr::null;
+use std::sync::Arc;
 
 #[inline]
 unsafe fn validate_str_view<'a>(view: StrView) -> Result<&'a str, FfiResult> {
@@ -111,8 +119,10 @@ pub unsafe extern "C" fn host_log_diagnostic(
     FfiResult::OK
 }
 
-/// Records a guest-reported fault message onto `ctx`'s per-context `last_error` buffer and emits
-/// a structured `tracing::error!` event.
+/// Records a guest-reported fault message onto `ctx`'s per-context `last_error` buffer, attaches
+/// structured fault context to any active [`crate::GuestSystem`] invocation on the current thread
+/// (so it surfaces in `ModSystemFaulted`, `ModSystemError`, and Bevy `0.20`'s
+/// `FallbackErrorHandler`), and emits a structured `tracing::error!` event.
 ///
 /// # Safety
 /// - `ctx` must point to an active [`HostContext`] cast to [`BamHostCtx`], or null.
@@ -137,7 +147,19 @@ pub unsafe extern "C" fn host_report_guest_fault(
 
     host_ctx.set_last_error(msg);
     let ns = host_ctx.default_namespace().unwrap_or("<host>");
-    tracing::error!(target: "bevy_abi_mod::guest_fault", namespace = ns, "{msg}");
+    if let Some(active) = record_active_guest_fault(ctx, msg) {
+        let active_ns = active.mod_namespace.as_deref().unwrap_or(ns);
+        tracing::error!(
+            target: "bevy_abi_mod::guest_fault",
+            namespace = active_ns,
+            mod_id = ?active.mod_id,
+            generation = active.generation,
+            system = %active.system_name,
+            "{msg}"
+        );
+    } else {
+        tracing::error!(target: "bevy_abi_mod::guest_fault", namespace = ns, "{msg}");
+    }
     FfiResult::OK
 }
 
@@ -460,12 +482,15 @@ pub unsafe extern "C" fn host_par_for_each_chunk_readonly(
     unsafe { crate::ffi::iter_ext::par_for_each_chunk_readonly_impl(iter, chunk_fn, user_data) }
 }
 
-/// Reserved ABI `0.3.0` slot for schedule system-set configuration (`BamSystemSet`)
-/// (validates inputs and currently returns [`FfiResult::UNSUPPORTED`]).
+/// Configures a decoupled ABI `0.3.0` schedule system-set container ([`BamSystemSet`]) mapped to
+/// a mod- and generation-scoped [`ModNamedSystemSet`], recording its execution mode (`SEQUENCE`,
+/// `SEQUENCE_WEAK`, or `PARALLEL`) and `before_sets` / `after_sets` ordering edges.
 ///
 /// # Safety
 /// - `load_ctx` must point to an active `LoadContext` cast to [`BamLoadCtx`], or null.
 /// - `desc_ptr` must point to a readable [`BamScheduleSetDesc`], or null.
+/// - When `desc.before_count > 0` / `desc.after_count > 0`, `desc.before_sets` / `desc.after_sets`
+///   must point to that many readable [`BamSystemSet`] handles.
 /// - `out_set` must point to writable [`BamSystemSet`] storage, or null.
 pub unsafe extern "C" fn host_configure_schedule_set(
     load_ctx: *mut BamLoadCtx,
@@ -496,19 +521,108 @@ pub unsafe extern "C" fn host_configure_schedule_set(
         return status;
     }
     // SAFETY: `desc.validate()` verified `!desc.name.is_null()`.
-    if let Err(err) = unsafe { validate_non_empty_cstr(desc.name) } {
+    let raw_name = match unsafe { validate_non_empty_cstr(desc.name) } {
+        Ok(s) => s,
+        Err(err) => {
+            ctx.host_ctx.set_last_error(format!(
+                "BamScheduleSetDesc `name` validation failed ({err})"
+            ));
+            return err;
+        }
+    };
+
+    let default_mod_name = ctx
+        .manifest_name
+        .as_deref()
+        .or_else(|| ctx.host_ctx.default_namespace())
+        .unwrap_or("unscoped");
+    let Some(parsed) = ModNamedSystemSet::parse_target(raw_name, default_mod_name) else {
         ctx.host_ctx.set_last_error(format!(
-            "BamScheduleSetDesc `name` validation failed ({err})"
+            "BamScheduleSetDesc `name` '{raw_name}' has invalid set target syntax"
         ));
-        return err;
+        return FfiResult::INVALID_ARGUMENT;
+    };
+
+    if ctx.world_ptr.is_null() {
+        ctx.host_ctx.set_last_error(
+            "configure_schedule_set requires a LoadContext bound to an active World",
+        );
+        return FfiResult::INVALID_STATE;
     }
-    ctx.host_ctx
-        .set_last_error("configure_schedule_set is reserved in ABI 0.3.0 and not yet implemented");
-    FfiResult::UNSUPPORTED
+
+    let mut before_sets = Vec::with_capacity(desc.before_count as usize);
+    for i in 0..(desc.before_count as usize) {
+        // SAFETY: `desc.validate()` verified `!desc.before_sets.is_null()` when `before_count > 0`,
+        // and caller guarantees `before_count` readable `BamSystemSet` elements.
+        let handle = unsafe { core::ptr::read_unaligned(desc.before_sets.add(i)) };
+        before_sets.push(handle);
+    }
+
+    let mut after_sets = Vec::with_capacity(desc.after_count as usize);
+    for i in 0..(desc.after_count as usize) {
+        // SAFETY: `desc.validate()` verified `!desc.after_sets.is_null()` when `after_count > 0`,
+        // and caller guarantees `after_count` readable `BamSystemSet` elements.
+        let handle = unsafe { core::ptr::read_unaligned(desc.after_sets.add(i)) };
+        after_sets.push(handle);
+    }
+
+    // SAFETY: `ctx.world_ptr` was checked non-null and references the exclusively borrowed
+    // `&mut World` for the duration of `bevy_abi_mod_init`.
+    let world = unsafe { &mut *ctx.world_ptr };
+
+    if resolve_schedule_id_in_world(world, desc.schedule).is_none() {
+        ctx.host_ctx.set_last_error(format!(
+            "configure_schedule_set schedule {} is not registered in ModScheduleMap",
+            desc.schedule.0
+        ));
+        return FfiResult::NOT_FOUND;
+    }
+
+    let generation = world
+        .get_resource::<ModHost>()
+        .map(|h| h.mod_generation(parsed.mod_name.as_ref()))
+        .unwrap_or(0);
+    let mode = ScheduleSetMode::from_abi_flags(desc.flags);
+    let before_weak = (desc.flags & BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK) != 0;
+    let after_weak = (desc.flags & BAM_SCHEDULE_SET_FLAG_AFTER_WEAK) != 0;
+
+    if !world.contains_resource::<ModScheduleSetRegistry>() {
+        world.insert_resource(ModScheduleSetRegistry::new());
+    }
+    let handle = match world
+        .resource_mut::<ModScheduleSetRegistry>()
+        .configure_set(
+            ctx.mod_id,
+            parsed.mod_name,
+            parsed.system_name,
+            generation,
+            desc.schedule,
+            mode,
+            before_sets,
+            after_sets,
+            before_weak,
+            after_weak,
+        ) {
+        Ok(h) => h,
+        Err((err, msg)) => {
+            ctx.host_ctx.set_last_error(msg);
+            return err;
+        }
+    };
+
+    ensure_mod_schedule_set_pass_if_schedules_present(world, desc.schedule);
+
+    // SAFETY: `out_set` was checked non-null and caller guarantees aligned writable `BamSystemSet`.
+    unsafe {
+        *out_set = handle;
+    }
+    FfiResult::OK
 }
 
-/// Reserved ABI `0.3.0` slot for mounting a [`BamSystem`] into a schedule and [`BamSystemSet`]
-/// (validates inputs and currently returns [`FfiResult::UNSUPPORTED`]).
+/// Mounts a registered [`BamSystem`] handle (previously returned by `host_register_system_handle`)
+/// into `schedule` and, when `set != BamSystemSet::INVALID`, into the configured [`BamSystemSet`]
+/// container in mount order (enabling `.chain()` / `.chain_weak()` ordering for `SEQUENCE` /
+/// `SEQUENCE_WEAK` containers).
 ///
 /// # Safety
 /// `load_ctx` must point to an active `LoadContext` cast to [`BamLoadCtx`], or null.
@@ -516,14 +630,17 @@ pub unsafe extern "C" fn host_mount_system_in_schedule(
     load_ctx: *mut BamLoadCtx,
     system: BamSystem,
     schedule: ScheduleId,
-    _set: BamSystemSet,
+    set: BamSystemSet,
 ) -> FfiResult {
     // SAFETY: Validates active `LoadContext` header and `in_init` state.
     let ctx = match unsafe { validate_active_load_ctx(load_ctx) } {
         Ok(c) => c,
         Err(err) => return err,
     };
-    if !system.is_valid() || (system.to_raw() as usize) > ctx.registered_systems.len() {
+    if !system.is_valid()
+        || system.to_raw() == 0
+        || (system.to_raw() as usize) > ctx.registered_systems.len()
+    {
         ctx.host_ctx
             .set_last_error("mount_system_in_schedule requires a registered BamSystem handle");
         return FfiResult::INVALID_ARGUMENT;
@@ -533,10 +650,124 @@ pub unsafe extern "C" fn host_mount_system_in_schedule(
             .set_last_error("mount_system_in_schedule received an invalid ScheduleId");
         return FfiResult::INVALID_ARGUMENT;
     }
-    ctx.host_ctx.set_last_error(
-        "mount_system_in_schedule is reserved in ABI 0.3.0 and not yet implemented",
-    );
-    FfiResult::UNSUPPORTED
+
+    let sys_idx = (system.to_raw() - 1) as usize;
+    let needs_world = set.is_valid() || schedule.is_custom();
+    if needs_world && ctx.world_ptr.is_null() {
+        ctx.host_ctx.set_last_error(
+            "mount_system_in_schedule requires a LoadContext bound to an active World",
+        );
+        return FfiResult::INVALID_STATE;
+    }
+
+    if !ctx.world_ptr.is_null() {
+        // SAFETY: `ctx.world_ptr` was checked non-null and references the exclusively borrowed
+        // `&mut World` for the duration of `bevy_abi_mod_init`.
+        let world = unsafe { &mut *ctx.world_ptr };
+
+        if resolve_schedule_id_in_world(world, schedule).is_none() {
+            ctx.host_ctx.set_last_error(format!(
+                "mount_system_in_schedule custom schedule {} is not registered in ModScheduleMap",
+                schedule.0
+            ));
+            return FfiResult::NOT_FOUND;
+        }
+
+        let sys_mod_name: Arc<str> = ctx
+            .manifest_name
+            .clone()
+            .or_else(|| {
+                ctx.registered_systems[sys_idx]
+                    .mod_namespace()
+                    .map(Arc::from)
+            })
+            .unwrap_or_else(|| Arc::from("unscoped"));
+        let sys_gen = world
+            .get_resource::<ModHost>()
+            .map(|h| h.mod_generation(sys_mod_name.as_ref()))
+            .unwrap_or(0);
+        let sys_name_arc = ctx.registered_systems[sys_idx].system_name_arc();
+        let sys_own_set =
+            ModNamedSystemSet::with_generation(Arc::clone(&sys_mod_name), sys_name_arc, sys_gen);
+
+        let prev_schedule = ctx.registered_systems[sys_idx].schedule();
+        let schedule_changed = prev_schedule != schedule;
+
+        // Pre-validate `set` before mutating `sys` or prior mounts so failures leave state intact.
+        if set.is_valid() {
+            let Some(reg) = world.get_resource::<ModScheduleSetRegistry>() else {
+                ctx.host_ctx.set_last_error(format!(
+                    "mount_system_in_schedule set handle {} is not registered",
+                    set.0
+                ));
+                return FfiResult::NOT_FOUND;
+            };
+            let Some(entry) = reg.get(set) else {
+                ctx.host_ctx.set_last_error(format!(
+                    "mount_system_in_schedule set handle {} is not registered",
+                    set.0
+                ));
+                return FfiResult::NOT_FOUND;
+            };
+            if entry.schedule != schedule {
+                ctx.host_ctx.set_last_error(format!(
+                    "mount_system_in_schedule set handle {} belongs to schedule {}, not schedule {}",
+                    set.0, entry.schedule.0, schedule.0
+                ));
+                return FfiResult::INVALID_ARGUMENT;
+            }
+        }
+
+        if schedule_changed {
+            let old_sets: Vec<BamSystemSet> = ctx.registered_systems[sys_idx]
+                .mounted_schedule_sets()
+                .to_vec();
+            if let Some(mut reg) = world.get_resource_mut::<ModScheduleSetRegistry>() {
+                for old_h in &old_sets {
+                    if let Some(old_entry) = reg.get(*old_h) {
+                        let old_canonical = old_entry.canonical_name();
+                        ctx.registered_systems[sys_idx].remove_in_set(&old_canonical);
+                    }
+                }
+                reg.unmount_system_from_schedule(prev_schedule, &sys_own_set);
+            }
+            ctx.registered_systems[sys_idx].clear_mounted_schedule_sets();
+        }
+
+        let sys = &mut ctx.registered_systems[sys_idx];
+        sys.set_schedule(schedule);
+        if let Some(ns) = ctx.manifest_name.as_ref()
+            && sys.mod_namespace().is_none()
+        {
+            sys.set_mod_namespace(Some(Arc::clone(ns)));
+        }
+
+        if set.is_valid() {
+            let canonical_set_name = match world
+                .resource_mut::<ModScheduleSetRegistry>()
+                .mount_system(set, schedule, sys_own_set)
+            {
+                Ok(entry) => entry.canonical_name(),
+                Err((err, msg)) => {
+                    ctx.host_ctx.set_last_error(msg);
+                    return err;
+                }
+            };
+            sys.add_in_set(canonical_set_name);
+            sys.add_mounted_schedule_set(set);
+            ensure_mod_schedule_set_pass_if_schedules_present(world, schedule);
+        }
+        return FfiResult::OK;
+    }
+
+    let sys = &mut ctx.registered_systems[sys_idx];
+    sys.set_schedule(schedule);
+    if let Some(ns) = ctx.manifest_name.as_ref()
+        && sys.mod_namespace().is_none()
+    {
+        sys.set_mod_namespace(Some(Arc::clone(ns)));
+    }
+    FfiResult::OK
 }
 
 /// Enqueues deferred insertion of a typed entity relationship edge `(entity --relation--> target)`.
@@ -1060,8 +1291,9 @@ mod tests {
 
             assert_eq!(
                 host_configure_schedule_set(load_ctx.as_ffi_ptr(), &set_desc, &raw mut set_out),
-                FfiResult::UNSUPPORTED
+                FfiResult::OK
             );
+            assert_eq!(set_out, BamSystemSet::from_raw(0));
             assert_eq!(
                 host_mount_system_in_schedule(
                     load_ctx.as_ffi_ptr(),

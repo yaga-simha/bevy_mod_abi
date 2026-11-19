@@ -11,17 +11,17 @@ use crate::schedule::ModSystemSet;
 use crate::sync_ptr::{GuestFnPtr, GuestUserData};
 use crate::system::access_builder::initialize_query_groups_in_world;
 use crate::system::error_policy::{
-    ModErrorPolicy, ModErrorPolicyConfig, ModSystemError, ModSystemFaulted, SystemInitError,
+    ActiveGuestFaultGuard, ModErrorPolicy, ModErrorPolicyConfig, ModSystemError, ModSystemFaulted,
+    SystemInitError, dispatch_mod_fault_to_fallback_handler,
 };
 use crate::system::query_group::{BamQuerySpecOwned, CachedQueryGroup, MAX_SYSTEM_QUERIES};
 use bevy_abi_mod_sys::{
     AccessMode, BamChangeTicks, BamCommands, BamComponent, BamHostCtx, BamIter, BamRunIfFn,
-    BamSystemCtx, BamSystemFn, FfiEntity, FfiResult, ScheduleId,
+    BamSystemCtx, BamSystemFn, BamSystemSet, FfiEntity, FfiResult, ScheduleId,
 };
 use bevy_ecs::archetype::ArchetypeId;
 use bevy_ecs::change_detection::{CheckChangeTicks, Tick};
 use bevy_ecs::entity::Entity;
-use bevy_ecs::error::{BevyError, ContextExt};
 use bevy_ecs::message::Messages;
 #[cfg(feature = "diagnostics")]
 use bevy_ecs::prelude::Resource;
@@ -162,6 +162,12 @@ impl<'w> HostSystemCtx<'w> {
     #[inline]
     pub fn as_ffi_ptr(&mut self) -> *mut BamSystemCtx {
         (self as *mut Self).cast::<BamSystemCtx>()
+    }
+
+    /// Returns the opaque [`BamHostCtx`] pointer for this invocation's embedded [`HostContext`].
+    #[inline]
+    pub(crate) fn host_ctx_ffi_ptr(&self) -> *const BamHostCtx {
+        self.host_ctx.as_ffi_ptr()
     }
 
     /// Borrows the system's active [`RegistrySnapshot`] and [`UnsafeWorldCell`].
@@ -609,6 +615,8 @@ pub struct GuestSystem {
 
     mod_id: Option<ModId>,
     mod_namespace: Option<Arc<str>>,
+    mod_generation: u64,
+    mod_generation_explicit: bool,
     schedule: ScheduleId,
     is_main_thread: bool,
     after_systems: Vec<String>,
@@ -616,6 +624,7 @@ pub struct GuestSystem {
     after_weak_systems: Vec<String>,
     before_weak_systems: Vec<String>,
     in_sets: Vec<String>,
+    mounted_schedule_sets: Vec<BamSystemSet>,
     ambiguous_with_systems: Vec<String>,
     ambiguous_with_all: bool,
     error_policy: ModErrorPolicy,
@@ -626,6 +635,7 @@ pub struct GuestSystem {
     commands_storage: HostCommandsStorage,
     fault_queue: CommandQueue,
     last_error_buf: String,
+    init_count: u64,
 
     registry: ModRegistry,
     cached_registry_gen: u64,
@@ -663,6 +673,8 @@ impl GuestSystem {
             run_if: None,
             mod_id: None,
             mod_namespace: None,
+            mod_generation: 0,
+            mod_generation_explicit: false,
             schedule: ScheduleId::UPDATE,
             is_main_thread: false,
             after_systems: Vec::new(),
@@ -670,6 +682,7 @@ impl GuestSystem {
             after_weak_systems: Vec::new(),
             before_weak_systems: Vec::new(),
             in_sets: Vec::new(),
+            mounted_schedule_sets: Vec::new(),
             ambiguous_with_systems: Vec::new(),
             ambiguous_with_all: false,
             error_policy: ModErrorPolicy::Quarantine,
@@ -679,6 +692,7 @@ impl GuestSystem {
             commands_storage: HostCommandsStorage::new(),
             fault_queue: CommandQueue::default(),
             last_error_buf: String::new(),
+            init_count: 0,
             registry,
             cached_registry_gen,
             snapshot,
@@ -769,6 +783,12 @@ impl GuestSystem {
         self.mod_id = Some(mod_id);
     }
 
+    /// Returns the canonical module namespace (`BamManifest::name`), if attached.
+    #[inline]
+    pub fn mod_namespace(&self) -> Option<&str> {
+        self.mod_namespace.as_deref()
+    }
+
     /// Sets the canonical module namespace (`BamManifest::name`) attached to `BamHostCtx`.
     #[inline]
     pub fn set_mod_namespace(&mut self, namespace: Option<Arc<str>>) {
@@ -780,6 +800,40 @@ impl GuestSystem {
     pub fn with_mod_namespace(mut self, namespace: impl Into<Arc<str>>) -> Self {
         self.mod_namespace = Some(namespace.into());
         self
+    }
+
+    /// Returns the reload generation associated with this system's owning module.
+    #[inline]
+    pub const fn mod_generation(&self) -> u64 {
+        self.mod_generation
+    }
+
+    /// Explicitly sets the reload generation associated with this system's owning module.
+    #[inline]
+    pub fn set_mod_generation(&mut self, generation: u64) {
+        self.mod_generation = generation;
+        self.mod_generation_explicit = true;
+    }
+
+    /// Builder helper to set the reload generation associated with this system's owning module.
+    #[inline]
+    pub const fn with_mod_generation(mut self, generation: u64) -> Self {
+        self.mod_generation = generation;
+        self.mod_generation_explicit = true;
+        self
+    }
+
+    /// Returns how many times `System::initialize` has been invoked on this `GuestSystem`.
+    #[inline]
+    pub const fn initialize_count(&self) -> u64 {
+        self.init_count
+    }
+
+    /// Returns the most recent diagnostic / fault message recorded on `BamHostCtx` during this
+    /// system's last run, if non-empty.
+    #[inline]
+    pub fn last_error(&self) -> Option<&str> {
+        (!self.last_error_buf.is_empty()).then_some(self.last_error_buf.as_str())
     }
 
     /// Builder helper to associate this system with a [`ModId`].
@@ -877,6 +931,38 @@ impl GuestSystem {
         &self.in_sets
     }
 
+    /// Appends a target system-set name to `in_sets` if not already present.
+    pub fn add_in_set(&mut self, set_name: impl Into<String>) {
+        let name = set_name.into();
+        if !self.in_sets.iter().any(|existing| existing == &name) {
+            self.in_sets.push(name);
+        }
+    }
+
+    /// Removes a target system-set name from `in_sets`.
+    pub fn remove_in_set(&mut self, set_name: &str) {
+        self.in_sets.retain(|existing| existing != set_name);
+    }
+
+    /// Configured ABI `0.3` [`BamSystemSet`] handles this system was mounted into via
+    /// `host_mount_system_in_schedule`.
+    #[inline]
+    pub fn mounted_schedule_sets(&self) -> &[BamSystemSet] {
+        &self.mounted_schedule_sets
+    }
+
+    /// Records a [`BamSystemSet`] handle into which this system has been mounted.
+    pub fn add_mounted_schedule_set(&mut self, set: BamSystemSet) {
+        if set.is_valid() && !self.mounted_schedule_sets.contains(&set) {
+            self.mounted_schedule_sets.push(set);
+        }
+    }
+
+    /// Clears recorded [`BamSystemSet`] mounts (used when remounting across schedules).
+    pub fn clear_mounted_schedule_sets(&mut self) {
+        self.mounted_schedule_sets.clear();
+    }
+
     /// Configures explicit `ambiguous_with` target names (`BamSystemDesc::ambiguous_with`).
     pub fn with_ambiguous_with(mut self, ambiguous_with: Vec<String>) -> Self {
         self.ambiguous_with_systems = ambiguous_with;
@@ -965,6 +1051,7 @@ impl GuestSystem {
         &mut self,
         status: FfiResult,
         panicked: bool,
+        last_error: Option<String>,
     ) -> Result<(), RunSystemError> {
         if self.error_policy != ModErrorPolicy::DelegateToBevyFallback {
             self.enabled_flag.store(false, Ordering::Release);
@@ -973,15 +1060,22 @@ impl GuestSystem {
         self.commands_storage.clear();
 
         let mod_id = self.mod_id;
+        let mod_namespace = self.mod_namespace.as_deref().map(str::to_owned);
+        let ns_label = mod_namespace.as_deref().unwrap_or("unscoped");
+        let generation = self.mod_generation;
         let sys_name = self.name.to_string();
+        let last_error = last_error.filter(|s| !s.is_empty());
 
         match self.error_policy {
             ModErrorPolicy::Quarantine => {
                 tracing::warn!(
                     system = %sys_name,
                     mod_id = ?mod_id,
+                    namespace = %ns_label,
+                    generation,
                     %status,
                     panicked,
+                    last_error = ?last_error,
                     "quarantined faulting guest mod system"
                 );
             }
@@ -989,8 +1083,11 @@ impl GuestSystem {
                 tracing::error!(
                     system = %sys_name,
                     mod_id = ?mod_id,
+                    namespace = %ns_label,
+                    generation,
                     %status,
                     panicked,
+                    last_error = ?last_error,
                     "guest mod system faulted"
                 );
             }
@@ -998,8 +1095,11 @@ impl GuestSystem {
                 tracing::debug!(
                     system = %sys_name,
                     mod_id = ?mod_id,
+                    namespace = %ns_label,
+                    generation,
                     %status,
                     panicked,
+                    last_error = ?last_error,
                     "delegating guest mod system fault to Bevy FallbackErrorHandler"
                 );
             }
@@ -1007,9 +1107,12 @@ impl GuestSystem {
 
         let fault_msg = ModSystemFaulted {
             mod_id,
+            mod_namespace: mod_namespace.clone(),
+            generation,
             system_name: sys_name.clone(),
             status,
             panicked,
+            last_error: last_error.clone(),
             init_error: None,
         };
         self.fault_queue.push(move |world: &mut World| {
@@ -1023,28 +1126,17 @@ impl GuestSystem {
 
         match self.error_policy {
             ModErrorPolicy::Quarantine | ModErrorPolicy::Log => Ok(()),
-            ModErrorPolicy::ReportToBevy => Err(RunSystemError::from(ModSystemError {
-                mod_id,
-                system_name: sys_name,
-                status,
-                panicked,
-            })),
-            ModErrorPolicy::DelegateToBevyFallback => {
-                let err_res: Result<(), ModSystemError> = Err(ModSystemError {
+            ModErrorPolicy::ReportToBevy | ModErrorPolicy::DelegateToBevyFallback => {
+                let mod_err = ModSystemError {
                     mod_id,
-                    system_name: sys_name.clone(),
+                    mod_namespace,
+                    generation,
+                    system_name: sys_name,
                     status,
                     panicked,
-                });
-                let bevy_err: BevyError = err_res
-                    .with_context(|| {
-                        format!(
-                            "guest mod {:?} system {:?} faulted with {}",
-                            mod_id, sys_name, status
-                        )
-                    })
-                    .unwrap_err();
-                Err(RunSystemError::Failed(bevy_err))
+                    last_error,
+                };
+                Err(RunSystemError::Failed(mod_err.into_bevy_error()))
             }
         }
     }
@@ -1075,6 +1167,7 @@ impl System for GuestSystem {
     }
 
     fn initialize(&mut self, world: &mut World) -> SystemAccess {
+        self.init_count = self.init_count.saturating_add(1);
         self.this_run = world.change_tick();
         self.last_run = Tick::new(world.change_tick().get().wrapping_sub(Tick::MAX.get()));
         self.self_conflict = false;
@@ -1084,6 +1177,13 @@ impl System for GuestSystem {
             && let Some(cfg) = world.get_resource::<ModErrorPolicyConfig>()
         {
             self.error_policy = cfg.0;
+        }
+
+        if !self.mod_generation_explicit
+            && let Some(ns) = self.mod_namespace.as_deref()
+            && let Some(mod_host) = world.get_resource::<ModHost>()
+        {
+            self.mod_generation = mod_host.mod_generation(ns);
         }
 
         if let Some(world_reg) = world.get_resource::<ModRegistry>() {
@@ -1136,11 +1236,17 @@ impl System for GuestSystem {
                     self.self_conflict = true;
                 }
                 let status = err.status_code();
+                let err_detail = err.to_string();
+                let mod_namespace = self.mod_namespace.as_deref().map(str::to_owned);
+                let ns_label = mod_namespace.as_deref().unwrap_or("unscoped");
+                let generation = self.mod_generation;
                 self.init_error = Some(err.clone());
 
                 tracing::error!(
                     system = %self.name,
                     mod_id = ?self.mod_id,
+                    namespace = %ns_label,
+                    generation,
                     error = %err,
                     "guest mod system failed initialization and was quarantined"
                 );
@@ -1151,13 +1257,35 @@ impl System for GuestSystem {
 
                 let fault_msg = ModSystemFaulted {
                     mod_id: self.mod_id,
+                    mod_namespace: mod_namespace.clone(),
+                    generation,
                     system_name: self.name.to_string(),
                     status,
                     panicked: false,
+                    last_error: Some(err_detail.clone()),
                     init_error: Some(err),
                 };
                 if let Some(mut msgs) = world.get_resource_mut::<Messages<ModSystemFaulted>>() {
                     msgs.write(fault_msg);
+                }
+
+                if matches!(
+                    self.error_policy,
+                    ModErrorPolicy::ReportToBevy | ModErrorPolicy::DelegateToBevyFallback
+                ) {
+                    dispatch_mod_fault_to_fallback_handler(
+                        world,
+                        ModSystemError {
+                            mod_id: self.mod_id,
+                            mod_namespace,
+                            generation,
+                            system_name: self.name.to_string(),
+                            status,
+                            panicked: false,
+                            last_error: Some(err_detail),
+                        },
+                        self.last_run,
+                    );
                 }
 
                 self.access.clone()
@@ -1266,7 +1394,7 @@ impl System for GuestSystem {
         #[cfg(feature = "diagnostics")]
         let start_time = std::time::Instant::now();
 
-        let status = {
+        let (status, reported_fault) = {
             let mut host_commands = HostCommands::new(
                 &mut self.commands_storage,
                 world.entity_allocator(),
@@ -1285,13 +1413,22 @@ impl System for GuestSystem {
                 commands_ptr,
             )
             .with_world_and_queries(world, query_views, last_run, change_tick);
+            let host_ctx_ptr = sys_ctx.host_ctx_ffi_ptr();
             let sys_ctx_ptr = sys_ctx.as_ffi_ptr();
             let GuestFnPtr(callback) = self.callback;
+            let fault_guard = ActiveGuestFaultGuard::enter(
+                host_ctx_ptr,
+                self.mod_id,
+                self.mod_namespace.clone(),
+                self.mod_generation,
+                Arc::clone(&self.name),
+            );
             // SAFETY: Calling foreign `extern "C"` callback with stack-scoped `HostSystemCtx`,
             // `HostIter`s, and `HostCommands` whose headers are poisoned when this block exits.
             let res = unsafe { callback(sys_ctx_ptr, self.user_data.as_ptr()) };
+            let reported = fault_guard.finish();
             self.last_error_buf = sys_ctx.reclaim_error_buffer();
-            res
+            (res, reported)
         };
 
         let mut total_chunks = 0usize;
@@ -1310,7 +1447,8 @@ impl System for GuestSystem {
             sys_span.record("commands", commands_queued);
         }
 
-        let faulted = status == FfiResult::PANIC_CAUGHT || status.is_err();
+        let faulted =
+            status == FfiResult::PANIC_CAUGHT || status.is_err() || reported_fault.is_some();
 
         #[cfg(feature = "diagnostics")]
         if let Some(col_id) = self.diagnostics_collector_id {
@@ -1337,7 +1475,19 @@ impl System for GuestSystem {
         self.last_run = change_tick;
 
         if faulted {
-            return self.record_fault_and_apply_policy(status, status == FfiResult::PANIC_CAUGHT);
+            let effective_status = if status == FfiResult::PANIC_CAUGHT || status.is_err() {
+                status
+            } else {
+                FfiResult::INTERNAL_ERROR
+            };
+            let last_error = reported_fault
+                .filter(|s| !s.is_empty())
+                .or_else(|| (!self.last_error_buf.is_empty()).then(|| self.last_error_buf.clone()));
+            return self.record_fault_and_apply_policy(
+                effective_status,
+                effective_status == FfiResult::PANIC_CAUGHT,
+                last_error,
+            );
         }
 
         Ok(())
