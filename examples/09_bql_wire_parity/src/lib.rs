@@ -625,8 +625,8 @@ struct ComponentSig {
 }
 
 /// Computes a deterministic SHA-256 + FNV-1a 64-bit hash over ALL sorted archetype component column
-/// bytes, host resources ([`SimClock`], [`FrameAccumulator`]), [`ModRelationGraph`] edges/payloads,
-/// [`BamSymbolTable`], and [`ModNamedObjects`].
+/// bytes, host resources ([`SimClock`], [`FrameAccumulator`]), `ModRelationGraph` relation
+/// participants, [`BamSymbolTable`], and [`ModNamedObjects`].
 pub fn hash_world_state(world: &World) -> WorldStateDigest {
     let mut hasher = DualHasher::new();
 
