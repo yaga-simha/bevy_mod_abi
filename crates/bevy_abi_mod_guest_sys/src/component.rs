@@ -4,13 +4,14 @@ use core::ffi::{CStr, c_void};
 use std::ffi::CString;
 
 use bevy_abi_mod_sys::{
-    AbiPod, BamComponent, BamLoadCtx, ComponentCloneFn, ComponentDesc, ComponentDropFn,
-    ComponentHookFn, ComponentUuid, FfiEntity, FfiResult,
+    AbiPod, BamComponent, BamHostApi, BamLoadCtx, BamMigrateComponentColumnFn,
+    BamRegisterRelationFn, BamRelationDesc, BamRowMigrateFn, ComponentCloneFn, ComponentDesc,
+    ComponentDropFn, ComponentHookFn, ComponentUuid, FfiEntity, FfiResult, ModComponent,
 };
 
 use crate::{
     host::Host,
-    instance::GuestInstance,
+    instance::{GuestInstance, qualify_mod_component_identity},
     panic::{catch_guest_result, catch_guest_unit},
     trampoline::ReentrantCell,
 };
@@ -547,4 +548,437 @@ pub fn resolve_component(
         return Err(FfiResult::INVALID_COMPONENT);
     }
     Ok(out)
+}
+
+/// Registers a caller-constructed [`BamRelationDesc`] on `load_ctx` via
+/// `BamHostApi::register_relation` and returns its 1-based [`BamComponent`] handle.
+///
+/// Returns [`FfiResult::UNSUPPORTED`] if the host's [`BamHostApi`] table does not cover or
+/// populate slot 54 (`register_relation`).
+///
+/// # Safety
+/// - `load_ctx` must be a non-null, active [`BamLoadCtx`] during `bevy_abi_mod_init`.
+/// - `desc` must satisfy [`BamRelationDesc::validate`], and `desc.name` must point to a valid
+///   NUL-terminated UTF-8 C string for at least the duration of the host registration.
+pub unsafe fn register_relation_raw(
+    load_ctx: *mut BamLoadCtx,
+    host: &Host,
+    desc: &BamRelationDesc,
+) -> Result<BamComponent, FfiResult> {
+    if load_ctx.is_null() {
+        return Err(FfiResult::NULL_POINTER);
+    }
+    let validation = desc.validate();
+    if !validation.is_ok() {
+        return Err(validation);
+    }
+    if !host.api().covers_slot(
+        core::mem::offset_of!(BamHostApi, register_relation),
+        core::mem::size_of::<Option<BamRegisterRelationFn>>(),
+    ) {
+        return Err(FfiResult::UNSUPPORTED);
+    }
+    let Some(register_fn) = host.api().register_relation else {
+        return Err(FfiResult::UNSUPPORTED);
+    };
+    let mut out = BamComponent::INVALID;
+    // SAFETY: `load_ctx` is non-null and active per caller contract, `desc` passed validation, and
+    // `out` is aligned writable stack storage.
+    let status = unsafe { register_fn(load_ctx, desc, &mut out) };
+    if !status.is_ok() {
+        return Err(status);
+    }
+    if !out.is_valid() {
+        return Err(FfiResult::INVALID_COMPONENT);
+    }
+    Ok(out)
+}
+
+/// Registers a typed entity relationship edge described by `(name, uuid, flags, data_size,
+/// data_align, max_degree)` via `BamHostApi::register_relation`, storing an owned copy of `name`
+/// inside `instance`.
+///
+/// # Safety
+/// `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance` during
+/// `bevy_abi_mod_init`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn register_relation(
+    instance: &mut GuestInstance,
+    load_ctx: *mut BamLoadCtx,
+    name: &CStr,
+    uuid: ComponentUuid,
+    flags: u32,
+    data_size: usize,
+    data_align: usize,
+    max_degree: u32,
+) -> Result<BamComponent, FfiResult> {
+    if load_ctx.is_null() {
+        return Err(FfiResult::NULL_POINTER);
+    }
+    if name.to_bytes().is_empty() {
+        return Err(FfiResult::INVALID_ARGUMENT);
+    }
+    if name.to_str().is_err() {
+        return Err(FfiResult::INVALID_UTF8);
+    }
+    let host = *instance.host();
+    if !host.api().covers_slot(
+        core::mem::offset_of!(BamHostApi, register_relation),
+        core::mem::size_of::<Option<BamRegisterRelationFn>>(),
+    ) || host.api().register_relation.is_none()
+    {
+        return Err(FfiResult::UNSUPPORTED);
+    }
+    let mut probe_desc = BamRelationDesc::new(name.as_ptr(), uuid)
+        .with_flags(flags)
+        .with_payload_layout(data_size, data_align);
+    probe_desc.max_degree = max_degree;
+    let validation = probe_desc.validate();
+    if !validation.is_ok() {
+        return Err(validation);
+    }
+    let owned_name = CString::from(name);
+    let raw_name = instance.track_allocation(Box::new(owned_name));
+    // SAFETY: `raw_name` was allocated via `instance.track_allocation` and stays pinned and valid
+    // until `bevy_abi_mod_shutdown` (or init rollback).
+    let name_ptr = unsafe { (*raw_name).as_ptr() };
+    let mut desc = BamRelationDesc::new(name_ptr, uuid)
+        .with_flags(flags)
+        .with_payload_layout(data_size, data_align);
+    desc.max_degree = max_degree;
+    // SAFETY: `load_ctx` is active per caller contract and `name_ptr` is owned by `instance`.
+    unsafe { register_relation_raw(load_ctx, &host, &desc) }
+}
+
+struct RowMigrateCtx<F> {
+    func: F,
+}
+
+unsafe extern "C" fn row_migrate_trampoline<Old, New, F>(
+    src_row: *const c_void,
+    dst_row: *mut c_void,
+    user_data: *mut c_void,
+) -> FfiResult
+where
+    Old: AbiPod,
+    New: AbiPod,
+    F: FnMut(&Old) -> Result<New, FfiResult>,
+{
+    catch_guest_result(|| {
+        if user_data.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        let old_ref: &Old = if core::mem::size_of::<Old>() == 0 {
+            // SAFETY: Zero-sized `Old: AbiPod` may be referenced via `NonNull::dangling()`.
+            unsafe { core::ptr::NonNull::<Old>::dangling().as_ref() }
+        } else {
+            if src_row.is_null() {
+                return FfiResult::NULL_POINTER;
+            }
+            if !(src_row as usize).is_multiple_of(core::mem::align_of::<Old>()) {
+                return FfiResult::INVALID_ARGUMENT;
+            }
+            // SAFETY: Host guarantees `src_row` points to a readable, initialized `Old` value for
+            // the synchronous duration of this migration callback.
+            unsafe { &*src_row.cast::<Old>() }
+        };
+        if core::mem::size_of::<New>() > 0 {
+            if dst_row.is_null() {
+                return FfiResult::NULL_POINTER;
+            }
+            if !(dst_row as usize).is_multiple_of(core::mem::align_of::<New>()) {
+                return FfiResult::INVALID_ARGUMENT;
+            }
+        }
+        // SAFETY: `user_data` points to a stack-pinned `RowMigrateCtx<F>` inside
+        // `migrate_component_column_pod`, invoked sequentially per row during the synchronous
+        // `migrate_component_column` host call.
+        let ctx = unsafe { &mut *user_data.cast::<RowMigrateCtx<F>>() };
+        match (ctx.func)(old_ref) {
+            Ok(new_val) => {
+                if core::mem::size_of::<New>() == 0 {
+                    let _ = new_val;
+                } else {
+                    // SAFETY: Verified `dst_row` is non-null and aligned for `New`, and the host
+                    // guarantees `dst_row` points to uninitialized writable storage of
+                    // `size_of::<New>()` bytes.
+                    unsafe {
+                        core::ptr::write(dst_row.cast::<New>(), new_val);
+                    }
+                }
+                FfiResult::OK
+            }
+            Err(err) => err,
+        }
+    })
+}
+
+/// Raw wrapper invoking `BamHostApi::migrate_component_column` (slot 67) after checking
+/// `covers_slot`, `load_ctx`, `component`, and `new_desc.validate()`.
+///
+/// # Safety
+/// - `load_ctx` must be a non-null, active [`BamLoadCtx`] during `bevy_abi_mod_init`.
+/// - `new_desc` must satisfy [`ComponentDesc::validate`] with pointers valid across the call.
+/// - `migrate_fn` and `user_data` must satisfy [`BamRowMigrateFn`]'s safety and nounwind contract.
+pub unsafe fn migrate_component_column_raw(
+    load_ctx: *mut BamLoadCtx,
+    host: &Host,
+    component: BamComponent,
+    old_fingerprint: u64,
+    new_desc: &ComponentDesc,
+    migrate_fn: BamRowMigrateFn,
+    user_data: *mut c_void,
+) -> FfiResult {
+    if load_ctx.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    if !component.is_valid() {
+        return FfiResult::INVALID_COMPONENT;
+    }
+    let validation = new_desc.validate();
+    if !validation.is_ok() {
+        return validation;
+    }
+    if !host.api().covers_slot(
+        core::mem::offset_of!(BamHostApi, migrate_component_column),
+        core::mem::size_of::<Option<BamMigrateComponentColumnFn>>(),
+    ) {
+        return FfiResult::UNSUPPORTED;
+    }
+    let Some(mig_fn) = host.api().migrate_component_column else {
+        return FfiResult::UNSUPPORTED;
+    };
+    // SAFETY: `load_ctx` is active per caller contract, `new_desc` passed validation, and
+    // `migrate_fn`/`user_data` satisfy the `BamRowMigrateFn` contract.
+    unsafe {
+        mig_fn(
+            load_ctx,
+            component,
+            old_fingerprint,
+            new_desc,
+            Some(migrate_fn),
+            user_data,
+        )
+    }
+}
+
+/// Panic-guarded typed row migration over `BamHostApi::migrate_component_column` for POD
+/// components (`Old: AbiPod`, `New: AbiPod`).
+///
+/// Verifies `new_desc`'s `(size, align)` match `New`, checks the currently registered layout of
+/// `component` against `Old` when `component_layout_info` is available, and wraps `migrate` in a
+/// panic-catching `extern "C"` [`BamRowMigrateFn`] trampoline.
+///
+/// # Safety
+/// - `load_ctx` must be a non-null, active [`BamLoadCtx`] during `bevy_abi_mod_init`.
+/// - `new_desc`'s pointers (`name`, `vtable_ptr`, `fields`, `required_init_descs`) must remain
+///   valid for as long as required by the host registry.
+pub unsafe fn migrate_component_column_pod<Old, New, F>(
+    load_ctx: *mut BamLoadCtx,
+    host: &Host,
+    component: BamComponent,
+    old_fingerprint: u64,
+    new_desc: &ComponentDesc,
+    migrate: F,
+) -> FfiResult
+where
+    Old: AbiPod,
+    New: AbiPod,
+    F: FnMut(&Old) -> Result<New, FfiResult>,
+{
+    if load_ctx.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    if !component.is_valid() {
+        return FfiResult::INVALID_COMPONENT;
+    }
+    if new_desc.size != core::mem::size_of::<New>()
+        || new_desc.align != core::mem::align_of::<New>()
+    {
+        return FfiResult::TYPE_MISMATCH;
+    }
+    let validation = new_desc.validate();
+    if !validation.is_ok() {
+        return validation;
+    }
+    if !host.api().covers_slot(
+        core::mem::offset_of!(BamHostApi, migrate_component_column),
+        core::mem::size_of::<Option<BamMigrateComponentColumnFn>>(),
+    ) || host.api().migrate_component_column.is_none()
+    {
+        return FfiResult::UNSUPPORTED;
+    }
+    match host.component_layout_info(component) {
+        Ok(info) => {
+            if info.size != core::mem::size_of::<Old>()
+                || info.align != core::mem::align_of::<Old>()
+            {
+                return FfiResult::TYPE_MISMATCH;
+            }
+        }
+        Err(FfiResult::UNSUPPORTED) => {}
+        Err(err) => return err,
+    }
+    let mut ctx = RowMigrateCtx { func: migrate };
+    // SAFETY: `load_ctx` and `new_desc` satisfy caller contracts; `ctx` lives on this stack frame
+    // across the synchronous `migrate_component_column` call, and `row_migrate_trampoline` catches
+    // any guest panic without unwinding across FFI.
+    unsafe {
+        migrate_component_column_raw(
+            load_ctx,
+            host,
+            component,
+            old_fingerprint,
+            new_desc,
+            row_migrate_trampoline::<Old, New, F>,
+            core::ptr::from_mut(&mut ctx).cast::<c_void>(),
+        )
+    }
+}
+
+/// Migrates live rows of `component` from `Old: ModComponent + AbiPod` (`Old::SCHEMA_FINGERPRINT`)
+/// to `New: ModComponent + AbiPod`, constructing a full ABI `0.3.0` [`ComponentDesc`] stamped with
+/// `New`'s qualified identity, VTable, `SCHEMA_FINGERPRINT`, `BAM_FIELDS`, and
+/// `REQUIRED_COMPONENTS`.
+///
+/// # Safety
+/// `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance` during
+/// `bevy_abi_mod_init`.
+pub unsafe fn migrate_mod_component_column<Old, New, F>(
+    instance: &mut GuestInstance,
+    load_ctx: *mut BamLoadCtx,
+    component: BamComponent,
+    flags: u32,
+    migrate: F,
+) -> FfiResult
+where
+    Old: ModComponent + AbiPod,
+    New: ModComponent + AbiPod,
+    F: FnMut(&Old) -> Result<New, FfiResult>,
+{
+    if load_ctx.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    if !component.is_valid() {
+        return FfiResult::INVALID_COMPONENT;
+    }
+    let host = *instance.host();
+    if !host.api().covers_slot(
+        core::mem::offset_of!(BamHostApi, migrate_component_column),
+        core::mem::size_of::<Option<BamMigrateComponentColumnFn>>(),
+    ) || host.api().migrate_component_column.is_none()
+    {
+        return FfiResult::UNSUPPORTED;
+    }
+    let (qualified_name, uuid) =
+        match qualify_mod_component_identity::<New>(instance.manifest_name()) {
+            Ok(id) => id,
+            Err(err) => return err,
+        };
+    let Ok(owned_name) = CString::new(qualified_name.as_bytes()) else {
+        return FfiResult::INVALID_ARGUMENT;
+    };
+    let raw_name = instance.track_allocation(Box::new(owned_name));
+    // SAFETY: `raw_name` was allocated via `instance.track_allocation` and stays pinned and valid
+    // until `bevy_abi_mod_shutdown` (or init rollback).
+    let name_ptr = unsafe { (*raw_name).as_ptr() };
+    let mut new_desc = ComponentDesc::new(
+        name_ptr,
+        uuid,
+        core::mem::size_of::<New>(),
+        core::mem::align_of::<New>(),
+    )
+    .with_flags(flags | New::COMPONENT_FLAGS)
+    .with_vtable(New::erased_vtable_ptr())
+    .with_schema_fingerprint(New::SCHEMA_FINGERPRINT);
+    if !New::BAM_FIELDS.is_empty() {
+        new_desc = new_desc.with_fields(New::BAM_FIELDS.as_ptr(), New::BAM_FIELDS.len());
+    }
+    if !New::REQUIRED_COMPONENTS.is_empty() {
+        new_desc = new_desc.with_required_init_descs(
+            New::REQUIRED_COMPONENTS.as_ptr(),
+            New::REQUIRED_COMPONENTS.len(),
+        );
+    }
+    // SAFETY: `load_ctx` is active per caller contract; `name_ptr` is owned by `instance`, and
+    // `New::erased_vtable_ptr()` / `BAM_FIELDS` / `REQUIRED_COMPONENTS` are `'static`.
+    unsafe {
+        migrate_component_column_pod::<Old, New, F>(
+            load_ctx,
+            &host,
+            component,
+            Old::SCHEMA_FINGERPRINT,
+            &new_desc,
+            migrate,
+        )
+    }
+}
+
+/// Migrates live rows of `component` from `Old: AbiPod` to `New: AbiPod` using explicit
+/// `(old_fingerprint, new_name, new_uuid, new_flags, new_fingerprint)` metadata.
+///
+/// # Safety
+/// `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance` during
+/// `bevy_abi_mod_init`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn migrate_pod_component_column<Old, New, F>(
+    instance: &mut GuestInstance,
+    load_ctx: *mut BamLoadCtx,
+    component: BamComponent,
+    old_fingerprint: u64,
+    new_name: &CStr,
+    new_uuid: ComponentUuid,
+    new_flags: u32,
+    new_fingerprint: u64,
+    migrate: F,
+) -> FfiResult
+where
+    Old: AbiPod,
+    New: AbiPod,
+    F: FnMut(&Old) -> Result<New, FfiResult>,
+{
+    if load_ctx.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    if !component.is_valid() {
+        return FfiResult::INVALID_COMPONENT;
+    }
+    if new_name.to_bytes().is_empty() {
+        return FfiResult::INVALID_ARGUMENT;
+    }
+    if new_name.to_str().is_err() {
+        return FfiResult::INVALID_UTF8;
+    }
+    let host = *instance.host();
+    if !host.api().covers_slot(
+        core::mem::offset_of!(BamHostApi, migrate_component_column),
+        core::mem::size_of::<Option<BamMigrateComponentColumnFn>>(),
+    ) || host.api().migrate_component_column.is_none()
+    {
+        return FfiResult::UNSUPPORTED;
+    }
+    let owned_name = CString::from(new_name);
+    let raw_name = instance.track_allocation(Box::new(owned_name));
+    // SAFETY: `raw_name` was allocated via `instance.track_allocation` and stays pinned and valid
+    // until `bevy_abi_mod_shutdown` (or init rollback).
+    let name_ptr = unsafe { (*raw_name).as_ptr() };
+    let new_desc = ComponentDesc::new(
+        name_ptr,
+        new_uuid,
+        core::mem::size_of::<New>(),
+        core::mem::align_of::<New>(),
+    )
+    .with_flags(new_flags)
+    .with_schema_fingerprint(new_fingerprint);
+    // SAFETY: `load_ctx` is active per caller contract and `name_ptr` is owned by `instance`.
+    unsafe {
+        migrate_component_column_pod::<Old, New, F>(
+            load_ctx,
+            &host,
+            component,
+            old_fingerprint,
+            &new_desc,
+            migrate,
+        )
+    }
 }

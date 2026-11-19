@@ -10,11 +10,13 @@ use core::{
 use std::ffi::CString;
 
 use bevy_abi_mod_sys::{
-    AbiPod, BAM_SYSTEM_KNOWN_FLAGS, BamChangeTicks, BamCommands, BamComponent, BamEventKind,
-    BamHostApi, BamIter, BamLoadCtx, BamObserverDesc, BamObserverFn, BamObserverMutFn,
-    BamQueryDesc, BamRegisterObserverFn, BamRunIfFn, BamSysEntityChildrenFn, BamSysEntityGetFn,
-    BamSysEntityGetMutFn, BamSysHostCtxFn, BamSysResMutPtrFn, BamSysResPtrFn, BamSystemCtx,
-    BamSystemDesc, BamSystemFn, BamTermDesc, ComponentUuid, FfiBool, FfiEntity, FfiResult,
+    AbiPod, BAM_SYSTEM_KNOWN_FLAGS, BamChangeTicks, BamCommands, BamComponent,
+    BamConfigureScheduleSetFn, BamEventKind, BamHostApi, BamIter, BamLoadCtx,
+    BamMountSystemInScheduleFn, BamObserverDesc, BamObserverFn, BamObserverMutFn, BamQueryDesc,
+    BamRegisterObserverFn, BamRegisterSystemHandleFn, BamRunIfFn, BamScheduleSetDesc,
+    BamSysEntityChildrenFn, BamSysEntityGetFn, BamSysEntityGetMutFn, BamSysHostCtxFn,
+    BamSysResMutPtrFn, BamSysResPtrFn, BamSystem, BamSystemCtx, BamSystemDesc, BamSystemFn,
+    BamSystemSet, BamTermDesc, ComponentUuid, FfiBool, FfiEntity, FfiResult,
     MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent, ScheduleId,
 };
 
@@ -911,62 +913,52 @@ struct OwnedDescriptorStorage {
 // never mutated after construction.
 unsafe impl Send for OwnedDescriptorStorage {}
 
-/// Validates and registers a unified [`BamSystemDesc`] on `load_ctx`, tracking all closure state
-/// and owned descriptor buffers inside `instance`.
-///
-/// # Safety
-/// `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance` during
-/// `bevy_abi_mod_init`.
-pub unsafe fn register_system_closure<F>(
+fn prepare_system_desc<F>(
     instance: &mut GuestInstance,
-    load_ctx: *mut BamLoadCtx,
     config: &SystemRegistrationConfig<'_>,
     run_if: Option<(BamRunIfFn, *mut c_void)>,
     closure: F,
-) -> FfiResult
+) -> Result<BamSystemDesc, FfiResult>
 where
     F: FnMut(&mut ValidatedSystemInvocation<'_>) -> FfiResult + Send + 'static,
 {
-    if load_ctx.is_null() {
-        return FfiResult::NULL_POINTER;
-    }
     if config.name.to_bytes().is_empty() {
-        return FfiResult::INVALID_ARGUMENT;
+        return Err(FfiResult::INVALID_ARGUMENT);
     }
     if config.name.to_str().is_err() {
-        return FfiResult::INVALID_UTF8;
+        return Err(FfiResult::INVALID_UTF8);
     }
     if !config.schedule.is_valid() {
-        return FfiResult::INVALID_ARGUMENT;
+        return Err(FfiResult::INVALID_ARGUMENT);
     }
     if (config.flags & !BAM_SYSTEM_KNOWN_FLAGS) != 0 {
-        return FfiResult::UNSUPPORTED;
+        return Err(FfiResult::UNSUPPORTED);
     }
 
     let has_sys_resources = !config.system_resources.is_empty();
     let total_query_count = config.user_queries.len() + usize::from(has_sys_resources);
     if total_query_count > MAX_QUERIES_PER_SYSTEM {
-        return FfiResult::CAPACITY_EXCEEDED;
+        return Err(FfiResult::CAPACITY_EXCEEDED);
     }
     if config.system_resources.len() > MAX_TERMS_PER_QUERY {
-        return FfiResult::CAPACITY_EXCEEDED;
+        return Err(FfiResult::CAPACITY_EXCEEDED);
     }
 
     for terms in config.user_queries {
         if terms.len() > MAX_TERMS_PER_QUERY {
-            return FfiResult::CAPACITY_EXCEEDED;
+            return Err(FfiResult::CAPACITY_EXCEEDED);
         }
         for term in *terms {
             let status = term.validate();
             if !status.is_ok() {
-                return status;
+                return Err(status);
             }
         }
     }
     for term in config.system_resources {
         let status = term.validate();
         if !status.is_ok() {
-            return status;
+            return Err(status);
         }
     }
     for set_name in config
@@ -979,10 +971,10 @@ where
         .chain(config.ambiguous_with.iter())
     {
         if set_name.to_bytes().is_empty() {
-            return FfiResult::INVALID_ARGUMENT;
+            return Err(FfiResult::INVALID_ARGUMENT);
         }
         if set_name.to_str().is_err() {
-            return FfiResult::INVALID_UTF8;
+            return Err(FfiResult::INVALID_UTF8);
         }
     }
 
@@ -1101,15 +1093,231 @@ where
 
     let validation = desc.validate();
     if !validation.is_ok() {
-        return validation;
+        return Err(validation);
     }
+    Ok(desc)
+}
 
+/// Validates and registers a unified [`BamSystemDesc`] on `load_ctx`, tracking all closure state
+/// and owned descriptor buffers inside `instance`.
+///
+/// # Safety
+/// `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance` during
+/// `bevy_abi_mod_init`.
+pub unsafe fn register_system_closure<F>(
+    instance: &mut GuestInstance,
+    load_ctx: *mut BamLoadCtx,
+    config: &SystemRegistrationConfig<'_>,
+    run_if: Option<(BamRunIfFn, *mut c_void)>,
+    closure: F,
+) -> FfiResult
+where
+    F: FnMut(&mut ValidatedSystemInvocation<'_>) -> FfiResult + Send + 'static,
+{
+    if load_ctx.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
     let Some(register_fn) = instance.host().api().register_system else {
         return FfiResult::NULL_POINTER;
+    };
+    let desc = match prepare_system_desc(instance, config, run_if, closure) {
+        Ok(d) => d,
+        Err(err) => return err,
     };
     // SAFETY: `load_ctx` is active per caller contract and `desc` passed full validation with all
     // pointed-to strings, term slices, and closures owned by `instance`.
     unsafe { register_fn(load_ctx, &desc) }
+}
+
+/// Validates and registers a unified [`BamSystemDesc`] via `BamHostApi::register_system_handle`
+/// (slot 60), returning the assigned [`BamSystem`] handle.
+///
+/// Returns [`FfiResult::UNSUPPORTED`] on ABI `0.2` hosts without allocating closure state.
+///
+/// # Safety
+/// `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance` during
+/// `bevy_abi_mod_init`.
+pub unsafe fn register_system_handle_closure<F>(
+    instance: &mut GuestInstance,
+    load_ctx: *mut BamLoadCtx,
+    config: &SystemRegistrationConfig<'_>,
+    run_if: Option<(BamRunIfFn, *mut c_void)>,
+    closure: F,
+) -> Result<BamSystem, FfiResult>
+where
+    F: FnMut(&mut ValidatedSystemInvocation<'_>) -> FfiResult + Send + 'static,
+{
+    if load_ctx.is_null() {
+        return Err(FfiResult::NULL_POINTER);
+    }
+    if !instance.host().api().covers_slot(
+        core::mem::offset_of!(BamHostApi, register_system_handle),
+        core::mem::size_of::<Option<BamRegisterSystemHandleFn>>(),
+    ) {
+        return Err(FfiResult::UNSUPPORTED);
+    }
+    let Some(register_handle_fn) = instance.host().api().register_system_handle else {
+        return Err(FfiResult::UNSUPPORTED);
+    };
+    let desc = prepare_system_desc(instance, config, run_if, closure)?;
+    let mut out = BamSystem::INVALID;
+    // SAFETY: `load_ctx` is active per caller contract, `desc` passed validation with all pointed-to
+    // buffers owned by `instance`, and `&mut out` is aligned writable stack storage.
+    let status = unsafe { register_handle_fn(load_ctx, &desc, &mut out) };
+    if !status.is_ok() {
+        return Err(status);
+    }
+    if !out.is_valid() {
+        return Err(FfiResult::INVALID_ARGUMENT);
+    }
+    Ok(out)
+}
+
+/// Raw wrapper invoking `BamHostApi::configure_schedule_set` (slot 61) after checking
+/// `covers_slot`, `load_ctx`, and `desc.validate()`.
+///
+/// # Safety
+/// - `load_ctx` must be a non-null, active [`BamLoadCtx`] during `bevy_abi_mod_init`.
+/// - `desc` must satisfy [`BamScheduleSetDesc::validate`] with valid `name`, `before_sets`, and
+///   `after_sets` pointers for the duration of this call.
+pub unsafe fn configure_schedule_set_raw(
+    load_ctx: *mut BamLoadCtx,
+    host: &Host,
+    desc: &BamScheduleSetDesc,
+) -> Result<BamSystemSet, FfiResult> {
+    if load_ctx.is_null() {
+        return Err(FfiResult::NULL_POINTER);
+    }
+    let validation = desc.validate();
+    if !validation.is_ok() {
+        return Err(validation);
+    }
+    if !host.api().covers_slot(
+        core::mem::offset_of!(BamHostApi, configure_schedule_set),
+        core::mem::size_of::<Option<BamConfigureScheduleSetFn>>(),
+    ) {
+        return Err(FfiResult::UNSUPPORTED);
+    }
+    let Some(configure_fn) = host.api().configure_schedule_set else {
+        return Err(FfiResult::UNSUPPORTED);
+    };
+    let mut out = BamSystemSet::INVALID;
+    // SAFETY: `load_ctx` is active per caller contract, `desc` passed validation, and `&mut out`
+    // is aligned writable stack storage.
+    let status = unsafe { configure_fn(load_ctx, desc, &mut out) };
+    if !status.is_ok() {
+        return Err(status);
+    }
+    if !out.is_valid() {
+        return Err(FfiResult::INVALID_ARGUMENT);
+    }
+    Ok(out)
+}
+
+/// Configures a named schedule system set via `BamHostApi::configure_schedule_set` (slot 61),
+/// storing an owned copy of `name` inside `instance` and returning its assigned [`BamSystemSet`].
+///
+/// # Safety
+/// `load_ctx` must be a non-null, active [`BamLoadCtx`] belonging to `instance` during
+/// `bevy_abi_mod_init`.
+pub unsafe fn configure_schedule_set(
+    instance: &mut GuestInstance,
+    load_ctx: *mut BamLoadCtx,
+    name: &CStr,
+    schedule: ScheduleId,
+    flags: u32,
+    before_sets: &[BamSystemSet],
+    after_sets: &[BamSystemSet],
+) -> Result<BamSystemSet, FfiResult> {
+    if load_ctx.is_null() {
+        return Err(FfiResult::NULL_POINTER);
+    }
+    if name.to_bytes().is_empty() {
+        return Err(FfiResult::INVALID_ARGUMENT);
+    }
+    if name.to_str().is_err() {
+        return Err(FfiResult::INVALID_UTF8);
+    }
+    if before_sets.iter().any(|s| !s.is_valid()) || after_sets.iter().any(|s| !s.is_valid()) {
+        return Err(FfiResult::INVALID_ARGUMENT);
+    }
+    let before_count =
+        u32::try_from(before_sets.len()).map_err(|_| FfiResult::CAPACITY_EXCEEDED)?;
+    let after_count = u32::try_from(after_sets.len()).map_err(|_| FfiResult::CAPACITY_EXCEEDED)?;
+    let host = *instance.host();
+    if !host.api().covers_slot(
+        core::mem::offset_of!(BamHostApi, configure_schedule_set),
+        core::mem::size_of::<Option<BamConfigureScheduleSetFn>>(),
+    ) || host.api().configure_schedule_set.is_none()
+    {
+        return Err(FfiResult::UNSUPPORTED);
+    }
+    let before_ptr = if before_sets.is_empty() {
+        core::ptr::null()
+    } else {
+        before_sets.as_ptr()
+    };
+    let after_ptr = if after_sets.is_empty() {
+        core::ptr::null()
+    } else {
+        after_sets.as_ptr()
+    };
+    let mut probe_desc = BamScheduleSetDesc::new(name.as_ptr()).with_flags(flags);
+    probe_desc.schedule = schedule;
+    probe_desc.before_count = before_count;
+    probe_desc.after_count = after_count;
+    probe_desc.before_sets = before_ptr;
+    probe_desc.after_sets = after_ptr;
+    let validation = probe_desc.validate();
+    if !validation.is_ok() {
+        return Err(validation);
+    }
+
+    let owned_name = CString::from(name);
+    let raw_name = instance.track_allocation(Box::new(owned_name));
+    // SAFETY: `raw_name` stays pinned inside `instance` until `bevy_abi_mod_shutdown` (or rollback).
+    let name_ptr = unsafe { (*raw_name).as_ptr() };
+    let mut desc = BamScheduleSetDesc::new(name_ptr).with_flags(flags);
+    desc.schedule = schedule;
+    desc.before_count = before_count;
+    desc.after_count = after_count;
+    desc.before_sets = before_ptr;
+    desc.after_sets = after_ptr;
+    // SAFETY: `load_ctx` is active per caller contract, `name_ptr` is owned by `instance`, and
+    // `before_sets`/`after_sets` slices stay live across the synchronous host FFI call.
+    unsafe { configure_schedule_set_raw(load_ctx, &host, &desc) }
+}
+
+/// Mounts a previously registered [`BamSystem`] handle into `schedule` and optional `set`
+/// (`BamSystemSet::INVALID` for ungrouped mounting) via `BamHostApi::mount_system_in_schedule`
+/// (slot 62).
+///
+/// # Safety
+/// `load_ctx` must be a non-null, active [`BamLoadCtx`] during `bevy_abi_mod_init`.
+pub unsafe fn mount_system_in_schedule(
+    load_ctx: *mut BamLoadCtx,
+    host: &Host,
+    system: BamSystem,
+    schedule: ScheduleId,
+    set: BamSystemSet,
+) -> FfiResult {
+    if load_ctx.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    if !system.is_valid() || !schedule.is_valid() {
+        return FfiResult::INVALID_ARGUMENT;
+    }
+    if !host.api().covers_slot(
+        core::mem::offset_of!(BamHostApi, mount_system_in_schedule),
+        core::mem::size_of::<Option<BamMountSystemInScheduleFn>>(),
+    ) {
+        return FfiResult::UNSUPPORTED;
+    }
+    let Some(mount_fn) = host.api().mount_system_in_schedule else {
+        return FfiResult::UNSUPPORTED;
+    };
+    // SAFETY: `load_ctx` is active per caller contract and `system`/`schedule` passed validation.
+    unsafe { mount_fn(load_ctx, system, schedule, set) }
 }
 
 struct ObserverTrampolineState<F> {

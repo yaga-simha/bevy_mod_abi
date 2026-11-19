@@ -6,9 +6,9 @@ use std::ffi::CString;
 
 use bevy_abi_mod_sys::{
     AbiPod, AccessMode, BamChangeTicks, BamColumnInfo, BamComponent, BamHostApi, BamIter,
-    BamIterReadRemovedFn, BamMsgReadBatchFn, BamMsgSendFn, BamMsgWriteBatchFn,
-    BamParForEachChunkFn, BamResTicksFn, ComponentUuid, FfiBool, FfiEntity, FfiResult, FfiSlice,
-    MAX_TERMS_PER_QUERY, ModComponent, StrView,
+    BamIterCountFn, BamIterReadRemovedFn, BamIterUpCascadeFn, BamMsgReadBatchFn, BamMsgSendFn,
+    BamMsgWriteBatchFn, BamParForEachChunkFn, BamResTicksFn, ComponentUuid, FfiBool, FfiEntity,
+    FfiResult, FfiSlice, MAX_TERMS_PER_QUERY, ModComponent, StrView,
 };
 
 use crate::{
@@ -1790,6 +1790,147 @@ impl<'a> ValidatedIter<'a> {
                 (&raw const task_ctx).cast_mut().cast::<c_void>(),
             )
         }
+    }
+
+    /// Executes `f` in parallel across disjoint read-only sub-range chunks via
+    /// `BamHostApi::par_for_each_chunk_readonly` (slot 59), catching panics per worker task.
+    ///
+    /// Hosts reject iterators containing writable terms with [`FfiResult::PERMISSION_DENIED`],
+    /// and older ABI `0.2` hosts return [`FfiResult::UNSUPPORTED`].
+    pub fn par_for_each_chunk_readonly<F>(&mut self, f: F) -> FfiResult
+    where
+        F: Fn(&mut ValidatedIter<'_>) -> FfiResult + Sync,
+    {
+        if self.raw.is_null() {
+            return FfiResult::OK;
+        }
+        if !self.host.api().covers_slot(
+            core::mem::offset_of!(BamHostApi, par_for_each_chunk_readonly),
+            core::mem::size_of::<Option<BamParForEachChunkFn>>(),
+        ) {
+            return FfiResult::UNSUPPORTED;
+        }
+        let Some(par_fn) = self.host.api().par_for_each_chunk_readonly else {
+            return FfiResult::UNSUPPORTED;
+        };
+        self.current_len = 0;
+        let task_ctx = ParChunkTaskContext {
+            host: self.host,
+            func: f,
+        };
+        // SAFETY: `self.raw` is an active top-level `BamIter`, `task_ctx` lives on the stack across
+        // the synchronous `par_fn` scope, `F: Sync` permits concurrent calls across worker threads,
+        // and `par_chunk_task_trampoline` catches any panic on the guest heap.
+        unsafe {
+            par_fn(
+                self.raw,
+                Some(par_chunk_task_trampoline::<F>),
+                (&raw const task_ctx).cast_mut().cast::<c_void>(),
+            )
+        }
+    }
+
+    /// Non-destructively counts all matching entities in this query via `BamHostApi::iter_count`
+    /// (slot 57) without advancing or resetting the chunk cursor.
+    ///
+    /// Returns [`FfiResult::UNSUPPORTED`] when connected to an ABI `0.2` host.
+    #[inline]
+    pub fn count(&mut self) -> Result<usize, FfiResult> {
+        if self.raw.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        if !self.host.api().covers_slot(
+            core::mem::offset_of!(BamHostApi, iter_count),
+            core::mem::size_of::<Option<BamIterCountFn>>(),
+        ) {
+            return Err(FfiResult::UNSUPPORTED);
+        }
+        let Some(count_fn) = self.host.api().iter_count else {
+            return Err(FfiResult::UNSUPPORTED);
+        };
+        let mut out = 0usize;
+        // SAFETY: `self.raw` is an active `BamIter` for `'a` and `&mut out` is aligned writable storage.
+        let status = unsafe { count_fn(self.raw, &mut out) };
+        if status.is_ok() { Ok(out) } else { Err(status) }
+    }
+
+    /// Walks an ancestor relationship chain upward along `relation` (`BamComponent::INVALID` selects
+    /// the host's default `ChildOf` hierarchy when supported) starting from `entity` via
+    /// `BamHostApi::iter_up_cascade` (slot 58) until locating an ancestor carrying the read-only
+    /// component declared at `term_index`.
+    ///
+    /// Validates `(mode, size, align)` and optional `expected_uuid` via [`Self::column_info`],
+    /// rejecting writable terms with [`FfiResult::PERMISSION_DENIED`] and mismatched types with
+    /// [`FfiResult::TYPE_MISMATCH`]. Returns `Ok(None)` when no ancestor carries the component
+    /// (whether reported by [`FfiResult::NOT_FOUND`] or a null output pointer/owner).
+    pub fn up_cascade_checked<T: AbiPod>(
+        &mut self,
+        relation: BamComponent,
+        entity: FfiEntity,
+        term_index: usize,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Result<Option<(FfiEntity, &T)>, FfiResult> {
+        if self.raw.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        if entity.is_null() {
+            return Err(FfiResult::INVALID_ENTITY);
+        }
+        if !self.host.api().covers_slot(
+            core::mem::offset_of!(BamHostApi, iter_up_cascade),
+            core::mem::size_of::<Option<BamIterUpCascadeFn>>(),
+        ) {
+            return Err(FfiResult::UNSUPPORTED);
+        }
+        let Some(cascade_fn) = self.host.api().iter_up_cascade else {
+            return Err(FfiResult::UNSUPPORTED);
+        };
+        let info = self.column_info(term_index)?;
+        if info.mode.is_mutable() {
+            return Err(FfiResult::PERMISSION_DENIED);
+        }
+        if !info.mode.has_entity_column_data() || info.is_resource() || info.is_message() {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        if info.size != core::mem::size_of::<T>() || info.align != core::mem::align_of::<T>() {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        if let Some(filter) = expected_uuid
+            && !filter.matches(info.uuid)
+        {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        let mut ptr: *const c_void = core::ptr::null();
+        let mut owner = FfiEntity::NULL;
+        // SAFETY: `self.raw` is an active `BamIter` under `&'b mut self` (preventing concurrent
+        // iterator advancement or mutable column aliasing for `'b`), and `ptr`/`owner` are aligned
+        // writable stack slots.
+        let status =
+            unsafe { cascade_fn(self.raw, relation, entity, term_index, &mut ptr, &mut owner) };
+        if status == FfiResult::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_ok() {
+            return Err(status);
+        }
+        if owner.is_null() {
+            return Ok(None);
+        }
+        if core::mem::size_of::<T>() == 0 {
+            // SAFETY: Zero-sized `T: AbiPod` may be referenced via `NonNull::dangling()`.
+            return Ok(Some((owner, unsafe {
+                core::ptr::NonNull::<T>::dangling().as_ref()
+            })));
+        }
+        if ptr.is_null() {
+            return Ok(None);
+        }
+        if !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        // SAFETY: `column_info` verified `T`'s layout, read-only mode, and optional UUID; `ptr` is
+        // non-null, aligned for `T`, and valid for shared reads throughout `'b`.
+        Ok(Some((owner, unsafe { &*ptr.cast::<T>() })))
     }
 
     /// Reads up to `max_count` unread POD messages from `term_index` (`MESSAGE_READ` or

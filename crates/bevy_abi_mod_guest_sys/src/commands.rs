@@ -1,9 +1,10 @@
 //! Validated handle-based and batched deferred command wrappers over [`BamCommands`].
 
-use core::marker::PhantomData;
+use core::{ffi::c_void, marker::PhantomData};
 
 use bevy_abi_mod_sys::{
-    AbiPod, BamCmdDespawnAllFn, BamCmdInsertFn, BamCmdObserveFn, BamCmdSpawnBatchFn, BamCmdSpawnFn,
+    AbiPod, BamCmdCheckpointFn, BamCmdDespawnAllFn, BamCmdInsertFn, BamCmdInsertRelationFn,
+    BamCmdObserveFn, BamCmdRemoveRelationFn, BamCmdRollbackFn, BamCmdSpawnBatchFn, BamCmdSpawnFn,
     BamCmdSpawnSceneFn, BamCmdTriggerExFn, BamCmdTriggerFn, BamCommands, BamComponent,
     BamEventKind, BamHostApi, BamObserverDesc, BamTermDesc, BamTriggerDesc, FfiAssetHandle,
     FfiEntity, FfiResult,
@@ -932,5 +933,166 @@ impl<'a> ValidatedCommands<'a> {
         // SAFETY: `self.raw` is active and `scene_handle` / `&mut out` are aligned stack references.
         let status = unsafe { spawn_scene_fn(self.raw, scene_handle, parent, &mut out) };
         if status.is_ok() { Ok(out) } else { Err(status) }
+    }
+
+    /// Reborrows this command buffer for a shorter exclusive lifetime `'b` (used by scoped
+    /// transactions without aliasing `&mut ValidatedCommands`).
+    #[inline]
+    pub const fn reborrow<'b>(&'b mut self) -> ValidatedCommands<'b> {
+        ValidatedCommands {
+            raw: self.raw,
+            host: self.host,
+        }
+    }
+
+    /// Captures an opaque command-buffer checkpoint token via `BamHostApi::cmd_checkpoint`
+    /// (slot 63), returning [`FfiResult::UNSUPPORTED`] if the host does not support ABI `0.3.0`
+    /// command checkpoints.
+    #[inline]
+    pub fn checkpoint(&mut self) -> Result<usize, FfiResult> {
+        if self.raw.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        if !self.host.api().covers_slot(
+            core::mem::offset_of!(BamHostApi, cmd_checkpoint),
+            core::mem::size_of::<Option<BamCmdCheckpointFn>>(),
+        ) {
+            return Err(FfiResult::UNSUPPORTED);
+        }
+        let Some(cp_fn) = self.host.api().cmd_checkpoint else {
+            return Err(FfiResult::UNSUPPORTED);
+        };
+        let mut token = 0usize;
+        // SAFETY: `self.raw` is an active `BamCommands` for `'a` and `&mut token` is writable stack storage.
+        let status = unsafe { cp_fn(self.raw, &mut token) };
+        if status.is_ok() {
+            Ok(token)
+        } else {
+            Err(status)
+        }
+    }
+
+    /// Rolls back all deferred commands queued after `checkpoint` via `BamHostApi::cmd_rollback`
+    /// (slot 64), returning [`FfiResult::UNSUPPORTED`] if the host does not support ABI `0.3.0`
+    /// command rollback.
+    #[inline]
+    pub fn rollback(&mut self, checkpoint: usize) -> FfiResult {
+        if self.raw.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if !self.host.api().covers_slot(
+            core::mem::offset_of!(BamHostApi, cmd_rollback),
+            core::mem::size_of::<Option<BamCmdRollbackFn>>(),
+        ) {
+            return FfiResult::UNSUPPORTED;
+        }
+        let Some(rb_fn) = self.host.api().cmd_rollback else {
+            return FfiResult::UNSUPPORTED;
+        };
+        // SAFETY: `self.raw` is an active `BamCommands` for `'a` under `&mut self`.
+        unsafe { rb_fn(self.raw, checkpoint) }
+    }
+
+    /// Queues deferred insertion of a typed relationship edge `entity --[relation]--> target`
+    /// carrying raw payload `data[0..data_size]` via `BamHostApi::cmd_insert_relation` (slot 65).
+    ///
+    /// # Safety
+    /// If `data_size > 0`, `data` must be non-null and readable for `data_size` initialized bytes
+    /// matching the registered payload layout of `relation`.
+    pub unsafe fn insert_relation_raw(
+        &mut self,
+        entity: FfiEntity,
+        relation: BamComponent,
+        target: FfiEntity,
+        data: *const c_void,
+        data_size: usize,
+    ) -> FfiResult {
+        if self.raw.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if entity.is_null() || target.is_null() {
+            return FfiResult::INVALID_ENTITY;
+        }
+        if !relation.is_valid() {
+            return FfiResult::INVALID_COMPONENT;
+        }
+        if data_size > 0 && data.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if !self.host.api().covers_slot(
+            core::mem::offset_of!(BamHostApi, cmd_insert_relation),
+            core::mem::size_of::<Option<BamCmdInsertRelationFn>>(),
+        ) {
+            return FfiResult::UNSUPPORTED;
+        }
+        let Some(insert_rel_fn) = self.host.api().cmd_insert_relation else {
+            return FfiResult::UNSUPPORTED;
+        };
+        // SAFETY: `self.raw` is active and caller guarantees `data` is readable for `data_size` bytes.
+        unsafe { insert_rel_fn(self.raw, entity, relation, target, data, data_size) }
+    }
+
+    /// Queues deferred insertion of a marker/tag relationship edge `entity --[relation]--> target`
+    /// (`data = null`, `data_size = 0`) via `BamHostApi::cmd_insert_relation`.
+    #[inline]
+    pub fn insert_relation(
+        &mut self,
+        entity: FfiEntity,
+        relation: BamComponent,
+        target: FfiEntity,
+    ) -> FfiResult {
+        // SAFETY: `data_size == 0`, so `null` payload pointer is valid per `cmd_insert_relation` contract.
+        unsafe { self.insert_relation_raw(entity, relation, target, core::ptr::null(), 0) }
+    }
+
+    /// Queues deferred insertion of a payload-carrying relationship edge
+    /// `entity --[relation(payload)]--> target` (`T: AbiPod`) via `BamHostApi::cmd_insert_relation`.
+    #[inline]
+    pub fn insert_relation_with_payload<T: AbiPod>(
+        &mut self,
+        entity: FfiEntity,
+        relation: BamComponent,
+        target: FfiEntity,
+        payload: &T,
+    ) -> FfiResult {
+        let data_size = core::mem::size_of::<T>();
+        let data_ptr = if data_size == 0 {
+            core::ptr::null()
+        } else {
+            core::ptr::from_ref(payload).cast::<c_void>()
+        };
+        // SAFETY: `payload` is a live `&T` (`T: AbiPod`) readable for `size_of::<T>()` bytes.
+        unsafe { self.insert_relation_raw(entity, relation, target, data_ptr, data_size) }
+    }
+
+    /// Queues deferred removal of a typed relationship edge `entity --[relation]--> target` via
+    /// `BamHostApi::cmd_remove_relation` (slot 66).
+    #[inline]
+    pub fn remove_relation(
+        &mut self,
+        entity: FfiEntity,
+        relation: BamComponent,
+        target: FfiEntity,
+    ) -> FfiResult {
+        if self.raw.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
+        if entity.is_null() || target.is_null() {
+            return FfiResult::INVALID_ENTITY;
+        }
+        if !relation.is_valid() {
+            return FfiResult::INVALID_COMPONENT;
+        }
+        if !self.host.api().covers_slot(
+            core::mem::offset_of!(BamHostApi, cmd_remove_relation),
+            core::mem::size_of::<Option<BamCmdRemoveRelationFn>>(),
+        ) {
+            return FfiResult::UNSUPPORTED;
+        }
+        let Some(remove_rel_fn) = self.host.api().cmd_remove_relation else {
+            return FfiResult::UNSUPPORTED;
+        };
+        // SAFETY: `self.raw` is active and `entity`/`target`/`relation` were validated non-null/valid.
+        unsafe { remove_rel_fn(self.raw, entity, relation, target) }
     }
 }

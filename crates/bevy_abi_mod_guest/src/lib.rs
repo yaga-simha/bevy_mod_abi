@@ -17,21 +17,28 @@
 //!   mutable state—loading the same `.cdylib` into multiple Bevy `World`s simultaneously is
 //!   completely isolated.
 //! - **Unified `app.system(...)` Builder & Typed Queries:** [`GuestApp::system`] compiles up to
-//!   [`MAX_QUERIES_PER_SYSTEM`] typed tuple queries (`query_typed::<(&mut A, &B, With<C>, Without<D>, Allow<E>, Has<F>, Or2<...>, Or3<...>)>()`),
+//!   [`MAX_QUERIES_PER_SYSTEM`] typed tuple queries (`query_typed::<(&mut A, &B, With<C>, Without<D>, Allow<E>, Has<F>, Or<(With<G>, Added<H>)>)>()`
+//!   up to 16 query terms, plus [`Or2`] / [`Or3`] aliases),
 //!   `RemovedComponents<T>` cursors ([`QueryBuilder::removed`], [`SystemContext::read_removed`]), declaration-indexed singleton
 //!   resources ([`GuestRes`] / [`GuestResMut`] with [`BamChangeTicks`]), [`ScheduleId`] selection,
 //!   `.after(...)` / `.before(...)` / `.after_weak(...)` / `.in_set(...)` / `.ambiguous_with(...)`
-//!   ordering (including `"host::<name>"` sets), `.main_thread()` pinning, and lock-free
+//!   ordering (including `"host::<name>"` sets), decoupled [`SystemBuilder::register_handle`] +
+//!   [`ScheduleSetBuilder`] + [`GuestApp::mount_system`], `.main_thread()` pinning, and lock-free
 //!   `.run_if(...)` predicates into a single [`BamSystemDesc`](raw::BamSystemDesc).
 //! - **Verified Zero-Copy Views & Parallelism:** [`Chunk`] validates [`BamColumnInfo`]
 //!   (`size`, `align`, `mode`, storage flags, and `ComponentUuid` via [`Chunk::component`]),
 //!   provides indirect sparse-set row views ([`Chunk::rows`] / [`Chunk::rows_mut`]), supports
-//!   untracked mutable slices paired with [`Chunk::mark_changed_range`], and offers
-//!   work-stealing [`ChunkIter::par_for_each`] (and [`SystemContext::par_chunks`]) iteration.
-//! - **Deferred Commands, Dynamic Relationships, Messages & Observers:** [`GuestCommands`] enqueues
-//!   zero-steady-state-allocation spawns (`spawn_empty`, `spawn`, `spawn_persistent`,
+//!   untracked mutable slices paired with [`Chunk::mark_changed_range`], non-destructive
+//!   [`ChunkIter::count`] / [`ChunkIter::up_cascade`] ancestor lookups, and offers work-stealing
+//!   [`ChunkIter::par_for_each`] / [`ChunkIter::par_for_each_chunk_readonly`] (and
+//!   [`SystemContext::par_chunks`] / [`SystemContext::par_chunks_readonly`]) iteration.
+//! - **Deferred Commands, Transactions, Relationships, Messages & Observers:** [`GuestCommands`]
+//!   enqueues zero-steady-state-allocation spawns (`spawn_empty`, `spawn`, `spawn_persistent`,
 //!   `spawn_batch`, [`FfiChildOf`]), `despawn`, `despawn_all`, `insert`, `insert_if_new`,
-//!   `insert_default`, `remove`, `trigger`, and `trigger_ex`, alongside batch `Messages<M>`
+//!   `insert_default`, `remove`, `trigger`, `trigger_ex`, typed relationships
+//!   ([`RelationDescBuilder`], [`GuestApp::register_relation`], [`GuestCommands::insert_relation`],
+//!   [`GuestCommands::remove_relation`]), and RAII command transactions
+//!   ([`GuestCommands::transaction`], [`GuestTransaction`]), alongside batch `Messages<M>`
 //!   read/write (POD and witness-backed non-POD) and dynamic global, `EntityEvent`, lifecycle,
 //!   `Ready`, mutable, and upward-propagating observers ([`GuestApp::observe`],
 //!   [`ObserverBuilder`]).
@@ -104,14 +111,22 @@ pub use bevy_abi_mod_guest_sys::SpawnEntry;
 pub use bevy_abi_mod_sys::{
     ABI_VERSION, ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PATCH, AbiPod, AccessMode,
     BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_COMPONENT_FLAG_SUMMARY_TICK,
-    BAM_OBSERVER_FLAG_PROPAGATE, BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE,
-    BAM_STORAGE_FLAG_RESOURCE, BAM_STORAGE_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_SUMMARY_TICK,
-    BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL, BAM_SYSTEM_FLAG_MAIN_THREAD, BAM_TRIGGER_FLAG_PROPAGATE,
-    BamChangeTicks, BamColumnInfo, BamComponent, BamEventKind, BamManifest, BamObserverDesc,
-    BamObserverFn, BamObserverMutFn, BamTermDesc, BamTriggerDesc, ComponentDesc, ComponentUuid,
-    FfiAssetHandle, FfiAssetLoadState, FfiBool, FfiChildOf, FfiEntity, FfiOption, FfiResult,
-    FfiSlice, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent, RawInsertable, ScheduleId,
-    StrView, SymbolEntry, VTableHeader,
+    BAM_LOG_DEBUG, BAM_LOG_ERROR, BAM_LOG_INFO, BAM_LOG_TRACE, BAM_LOG_WARN,
+    BAM_OBSERVER_FLAG_PROPAGATE, BAM_RELATION_FLAG_ACYCLIC, BAM_RELATION_FLAG_CASCADE_DELETE,
+    BAM_RELATION_FLAG_CASCADE_DESPAWN, BAM_RELATION_FLAG_CLEANUP_REMOVE,
+    BAM_RELATION_FLAG_EXCLUSIVE, BAM_RELATION_FLAG_SYMMETRIC, BAM_SCHEDULE_SET_FLAG_AFTER_WEAK,
+    BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK, BAM_SCHEDULE_SET_FLAG_PARALLEL,
+    BAM_SCHEDULE_SET_FLAG_SEQUENCE, BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK,
+    BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE,
+    BAM_STORAGE_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_SUMMARY_TICK, BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL,
+    BAM_SYSTEM_FLAG_MAIN_THREAD, BAM_TRIGGER_FLAG_PROPAGATE, BamChangeTicks, BamColumnInfo,
+    BamComponent, BamEventKind, BamFieldDesc, BamFieldKind, BamLayoutInfo, BamManifest,
+    BamObserverDesc, BamObserverFn, BamObserverMutFn, BamRelationDesc, BamRequiredComponent,
+    BamRowMigrateFn, BamScheduleSetDesc, BamSymbol, BamSystem, BamSystemSet, BamTermDesc,
+    BamTriggerDesc, ComponentDesc, ComponentUuid, FfiAssetHandle, FfiAssetLoadState, FfiBool,
+    FfiChildOf, FfiEntity, FfiOption, FfiResult, FfiSlice, MAX_QUERIES_PER_SYSTEM,
+    MAX_TERMS_PER_QUERY, ModComponent, RawInsertable, ScheduleId, StrView, SymbolEntry,
+    VTableHeader,
 };
 
 #[cfg(feature = "derive")]
@@ -119,7 +134,8 @@ pub use bevy_abi_mod_macros::{AbiPod, ModComponent};
 
 pub use app::{
     GuestApp, GuestComponentOptions, GuestRes, GuestResMut, IntoSystemResult, ObserverBuilder,
-    QueryBuilder, RunConditionContext, SystemBuilder, SystemContext,
+    QueryBuilder, RelationDescBuilder, RunConditionContext, ScheduleSetBuilder, SystemBuilder,
+    SystemContext,
 };
 pub use bridges::{
     BRP_METHOD_GET_COMPONENTS, BRP_METHOD_GET_RESOURCES, BRP_METHOD_INSERT_COMPONENTS,
@@ -138,11 +154,12 @@ pub use bridges::{
     GuestTimeFixedBridge, GuestTimeRealBridge, GuestTimeVirtualBridge, GuestTransformBridge,
     GuestVisibilityBridge, GuestWireBridge,
 };
-pub use commands::GuestCommands;
+pub use commands::{GuestCommands, GuestTransaction};
 pub use component::{GuestComponent, GuestComponentHooks, guest_component_uuid};
 pub use iter::{
-    Added, Allow, Changed, Chunk, ChunkIter, ChunkSlice, ChunkSliceMut, Has, Or2, Or3, QueryTerm,
-    QueryTuple, SparseRows, SparseRowsIter, SparseRowsMut, TypedChunkIter, With, Without,
+    Added, Allow, Changed, Chunk, ChunkIter, ChunkSlice, ChunkSliceMut, Has, Or, Or2, Or3,
+    OrFilterTerm, OrFilterTuple, QueryTerm, QueryTuple, SparseRows, SparseRowsIter, SparseRowsMut,
+    TypedChunkIter, With, Without,
 };
 pub use lifecycle::{GuestPlugin, build_guest_fn, build_guest_plugin};
 

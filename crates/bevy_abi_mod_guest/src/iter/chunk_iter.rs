@@ -4,7 +4,8 @@ use core::marker::PhantomData;
 
 use bevy_abi_mod_guest_sys::{Host, SparseRows, SparseRowsMut, UuidFilter, ValidatedIter};
 use bevy_abi_mod_sys::{
-    AbiPod, BamChangeTicks, BamColumnInfo, BamIter, FfiEntity, FfiResult, ModComponent,
+    AbiPod, BamChangeTicks, BamColumnInfo, BamComponent, BamIter, FfiEntity, FfiResult,
+    ModComponent,
 };
 
 use crate::{
@@ -98,6 +99,45 @@ impl<'a> ChunkIter<'a> {
     #[inline]
     pub fn reset(&mut self) -> FfiResult {
         self.inner.reset()
+    }
+
+    /// Non-destructively counts all matching entities in this query via `BamHostApi::iter_count`
+    /// (slot 57) without advancing or resetting the active chunk cursor.
+    #[inline]
+    pub fn count(&mut self) -> Result<usize, FfiResult> {
+        self.inner.count()
+    }
+
+    /// Walks an ancestor relationship chain upward along `relation` (`BamComponent::INVALID` selects
+    /// Bevy's default `ChildOf` hierarchy on ABI `0.3.0` hosts) starting from `entity` via
+    /// `BamHostApi::iter_up_cascade` (slot 58) until locating an ancestor carrying read-only
+    /// component `T: GuestComponent` at `term_index`, validating `T`'s layout and UUID.
+    ///
+    /// Returns `Ok(Some((owner, value)))` if an ancestor carries `T`, `Ok(None)` if no ancestor
+    /// carries `T`, or `Err(status)` on permission/layout/cycle/unsupported errors.
+    #[inline]
+    pub fn up_cascade<T: GuestComponent>(
+        &mut self,
+        relation: BamComponent,
+        entity: FfiEntity,
+        term_index: usize,
+    ) -> Result<Option<(FfiEntity, &T)>, FfiResult> {
+        let filter = guest_uuid_filter::<T>(self.inner.host().manifest_name());
+        self.inner
+            .up_cascade_checked::<T>(relation, entity, term_index, Some(filter))
+    }
+
+    /// POD variant of [`Self::up_cascade`] for any `T: AbiPod` (validating `(size, align)` and
+    /// read-only mode without checking a `GuestComponent::UUID`).
+    #[inline]
+    pub fn up_cascade_pod<T: AbiPod>(
+        &mut self,
+        relation: BamComponent,
+        entity: FfiEntity,
+        term_index: usize,
+    ) -> Result<Option<(FfiEntity, &T)>, FfiResult> {
+        self.inner
+            .up_cascade_checked::<T>(relation, entity, term_index, None)
     }
 
     /// Queries [`BamColumnInfo`] metadata for `term_index`.
@@ -275,6 +315,45 @@ impl<'a> ChunkIter<'a> {
                 len,
             })
             .into_ffi_result()
+        })
+    }
+
+    /// Processes disjoint chunk partitions in parallel on the host `ComputeTaskPool` in strictly
+    /// read-only mode via `BamHostApi::par_for_each_chunk_readonly` (slot 59).
+    ///
+    /// Passes `&Chunk<'_, '_>` to `f` so mutable column borrows are prevented at compile time,
+    /// while the host rejects queries declaring writable terms with [`FfiResult::PERMISSION_DENIED`].
+    #[inline]
+    pub fn par_for_each_chunk_readonly<F>(&mut self, f: F) -> FfiResult
+    where
+        F: Fn(&Chunk<'_, '_>) + Sync,
+    {
+        self.inner.par_for_each_chunk_readonly(|task_iter| {
+            let len = task_iter.current_len();
+            let chunk = Chunk {
+                iter: task_iter,
+                len,
+            };
+            f(&chunk);
+            FfiResult::OK
+        })
+    }
+
+    /// Fallible variant of [`Self::par_for_each_chunk_readonly`] propagating non-`OK`
+    /// [`IntoSystemResult`] returns.
+    #[inline]
+    pub fn par_try_for_each_chunk_readonly<F, R>(&mut self, f: F) -> FfiResult
+    where
+        F: Fn(&Chunk<'_, '_>) -> R + Sync,
+        R: IntoSystemResult,
+    {
+        self.inner.par_for_each_chunk_readonly(|task_iter| {
+            let len = task_iter.current_len();
+            let chunk = Chunk {
+                iter: task_iter,
+                len,
+            };
+            f(&chunk).into_ffi_result()
         })
     }
 

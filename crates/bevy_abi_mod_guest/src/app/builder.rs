@@ -9,7 +9,7 @@ use bevy_abi_mod_guest_sys::{
 use bevy_abi_mod_sys::{
     AbiPod, AccessMode, BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET,
     BAM_COMPONENT_FLAG_SUMMARY_TICK, BAM_SYSTEM_FLAG_AMBIGUOUS_WITH_ALL,
-    BAM_SYSTEM_FLAG_MAIN_THREAD, BamComponent, BamHostApi, BamLoadCtx, BamTermDesc,
+    BAM_SYSTEM_FLAG_MAIN_THREAD, BamComponent, BamHostApi, BamLoadCtx, BamSystem, BamTermDesc,
     ComponentDropFn, ComponentUuid, FfiEntity, FfiResult, MAX_QUERIES_PER_SYSTEM,
     MAX_TERMS_PER_QUERY, ScheduleId,
 };
@@ -1063,6 +1063,42 @@ impl<'b, 'a> SystemBuilder<'b, 'a> {
             ambiguous_with: &self.ambiguous_with,
         };
         self.app.load_ctx.register_system(
+            self.app.instance,
+            &config,
+            self.run_if,
+            move |inv: &mut ValidatedSystemInvocation<'_>| {
+                let mut ctx = SystemContext::from_invocation(inv);
+                callback(&mut ctx).into_ffi_result()
+            },
+        )
+    }
+
+    /// Finalizes and registers the system via `BamHostApi::register_system_handle` (slot 60),
+    /// returning its assigned [`BamSystem`] handle for decoupled scheduling with
+    /// [`GuestApp::mount_system`].
+    pub fn register_handle<F, R>(self, mut callback: F) -> Result<BamSystem, FfiResult>
+    where
+        F: FnMut(&mut SystemContext<'_>) -> R + Send + 'static,
+        R: IntoSystemResult,
+    {
+        if let Some(err) = self.first_error {
+            return Err(err);
+        }
+        let query_slices: Vec<&[BamTermDesc]> = self.queries.iter().map(Vec::as_slice).collect();
+        let config = SystemRegistrationConfig {
+            name: self.name,
+            user_queries: &query_slices,
+            system_resources: &self.system_resources,
+            schedule: self.schedule,
+            flags: self.flags,
+            after: &self.after,
+            before: &self.before,
+            in_sets: &self.in_sets,
+            after_weak: &self.after_weak,
+            before_weak: &self.before_weak,
+            ambiguous_with: &self.ambiguous_with,
+        };
+        self.app.load_ctx.register_system_handle(
             self.app.instance,
             &config,
             self.run_if,

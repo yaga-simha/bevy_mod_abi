@@ -4,23 +4,28 @@
 use core::ffi::{CStr, c_void};
 
 use bevy_abi_mod_sys::{
-    ABI_VERSION, AbiPod, BamAssetGetLoadStateFn, BamAssetLoadFn, BamAssetReleaseFn, BamComponent,
-    BamEventKind, BamHostApi, BamHostCtx, BamLoadCtx, ComponentUuid, FfiAssetHandle,
-    FfiAssetLoadState, FfiResult, MappedStringVTable, MappedWireVTable, StrView, VTableHeader,
-    read_descriptor,
+    ABI_VERSION, AbiPod, BamAssetGetLoadStateFn, BamAssetLoadFn, BamAssetReleaseFn,
+    BamBindNamedObjectFn, BamComponent, BamComponentLayoutInfoFn, BamEventKind, BamHostApi,
+    BamHostCtx, BamInternSymbolFn, BamLayoutInfo, BamLoadCtx, BamLogDiagnosticFn, BamRelationDesc,
+    BamReportGuestFaultFn, BamResolveComponentByUuidFn, BamRowMigrateFn, BamScheduleSetDesc,
+    BamSymbol, BamSystem, BamSystemSet, ComponentDesc, ComponentUuid, FfiAssetHandle,
+    FfiAssetLoadState, FfiEntity, FfiResult, MappedStringVTable, MappedWireVTable, ModComponent,
+    ScheduleId, StrView, VTableHeader, read_descriptor,
 };
 
 use crate::{
     component::{
-        PodComponentHooks, register_component_with_layout, register_pod_component,
-        register_pod_component_with_hooks,
+        PodComponentHooks, migrate_component_column_pod, migrate_component_column_raw,
+        migrate_mod_component_column, migrate_pod_component_column, register_component_with_layout,
+        register_pod_component, register_pod_component_with_hooks, register_relation,
+        register_relation_raw,
     },
     instance::{GuestInstance, RuntimeAllocTracker},
     trampoline::{
-        PreparedRunIf, SystemRegistrationConfig, ValidatedSystemInvocation,
-        register_lifecycle_observer_closure, register_observer_closure,
-        register_observer_closure_with_options, register_observer_mut_closure,
-        register_system_closure,
+        PreparedRunIf, SystemRegistrationConfig, ValidatedSystemInvocation, configure_schedule_set,
+        configure_schedule_set_raw, mount_system_in_schedule, register_lifecycle_observer_closure,
+        register_observer_closure, register_observer_closure_with_options,
+        register_observer_mut_closure, register_system_closure, register_system_handle_closure,
     },
 };
 
@@ -531,6 +536,162 @@ impl Host {
         // SAFETY: `self.host_ctx.0` is valid and `handle` is an aligned shared reference.
         unsafe { release_fn(self.host_ctx.0, handle) }
     }
+
+    /// Emits a structured guest diagnostic message via `BamHostApi::log_diagnostic` (slot 50)
+    /// without clobbering `last_error`.
+    ///
+    /// Returns [`FfiResult::UNSUPPORTED`] when connected to an ABI `0.2` host.
+    #[inline]
+    pub fn log_diagnostic(&self, level: u32, message: &str) -> FfiResult {
+        if !self.api.covers_slot(
+            core::mem::offset_of!(BamHostApi, log_diagnostic),
+            core::mem::size_of::<Option<BamLogDiagnosticFn>>(),
+        ) {
+            return FfiResult::UNSUPPORTED;
+        }
+        let Some(log_fn) = self.api.log_diagnostic else {
+            return FfiResult::UNSUPPORTED;
+        };
+        // SAFETY: `self.host_ctx.0` is a valid active `BamHostCtx`, and `StrView::from_str(message)`
+        // borrows valid UTF-8 bytes for the synchronous duration of this call.
+        unsafe { log_fn(self.host_ctx.0, level, StrView::from_str(message)) }
+    }
+
+    /// Records a guest-reported fault message on this world's host context via
+    /// `BamHostApi::report_guest_fault` (slot 51) without unwinding across FFI.
+    ///
+    /// Returns [`FfiResult::UNSUPPORTED`] when connected to an ABI `0.2` host.
+    #[inline]
+    pub fn report_guest_fault(&self, message: &str) -> FfiResult {
+        if !self.api.covers_slot(
+            core::mem::offset_of!(BamHostApi, report_guest_fault),
+            core::mem::size_of::<Option<BamReportGuestFaultFn>>(),
+        ) {
+            return FfiResult::UNSUPPORTED;
+        }
+        let Some(fault_fn) = self.api.report_guest_fault else {
+            return FfiResult::UNSUPPORTED;
+        };
+        // SAFETY: `self.host_ctx.0` is a valid active `BamHostCtx`, and `StrView::from_str(message)`
+        // borrows valid UTF-8 bytes for the synchronous duration of this call.
+        unsafe { fault_fn(self.host_ctx.0, StrView::from_str(message)) }
+    }
+
+    /// Resolves a registered component or resource handle strictly by its 128-bit
+    /// [`ComponentUuid`] via `BamHostApi::resolve_component_by_uuid` (slot 52).
+    ///
+    /// Returns [`FfiResult::UNSUPPORTED`] when connected to an ABI `0.2` host.
+    #[inline]
+    pub fn resolve_component_by_uuid(
+        &self,
+        uuid: ComponentUuid,
+    ) -> Result<BamComponent, FfiResult> {
+        if !self.api.covers_slot(
+            core::mem::offset_of!(BamHostApi, resolve_component_by_uuid),
+            core::mem::size_of::<Option<BamResolveComponentByUuidFn>>(),
+        ) {
+            return Err(FfiResult::UNSUPPORTED);
+        }
+        let Some(resolve_fn) = self.api.resolve_component_by_uuid else {
+            return Err(FfiResult::UNSUPPORTED);
+        };
+        let mut out = BamComponent::INVALID;
+        // SAFETY: `self.host_ctx.0` is an active `BamHostCtx`, `&uuid` is readable, and `&mut out`
+        // is aligned writable stack storage.
+        let status = unsafe { resolve_fn(self.host_ctx.0, &uuid, &mut out) };
+        if !status.is_ok() {
+            return Err(status);
+        }
+        if !out.is_valid() {
+            return Err(FfiResult::INVALID_COMPONENT);
+        }
+        Ok(out)
+    }
+
+    /// Queries ABI `0.3.0` layout metadata (`size`, `align`, `schema_fingerprint`, `storage_flags`,
+    /// and host-retained field metadata) for `component` via `BamHostApi::component_layout_info`
+    /// (slot 53).
+    ///
+    /// Returns [`FfiResult::UNSUPPORTED`] when connected to an ABI `0.2` host.
+    #[inline]
+    pub fn component_layout_info(
+        &self,
+        component: BamComponent,
+    ) -> Result<BamLayoutInfo, FfiResult> {
+        if !component.is_valid() {
+            return Err(FfiResult::INVALID_COMPONENT);
+        }
+        if !self.api.covers_slot(
+            core::mem::offset_of!(BamHostApi, component_layout_info),
+            core::mem::size_of::<Option<BamComponentLayoutInfoFn>>(),
+        ) {
+            return Err(FfiResult::UNSUPPORTED);
+        }
+        let Some(info_fn) = self.api.component_layout_info else {
+            return Err(FfiResult::UNSUPPORTED);
+        };
+        let mut out = BamLayoutInfo::empty();
+        // SAFETY: `self.host_ctx.0` is an active `BamHostCtx` and `&mut out` is aligned writable storage.
+        let status = unsafe { info_fn(self.host_ctx.0, component, &mut out) };
+        if status.is_ok() { Ok(out) } else { Err(status) }
+    }
+
+    /// Interns a non-empty UTF-8 symbol string to an `O(1)` comparable [`BamSymbol`] handle via
+    /// `BamHostApi::intern_symbol` (slot 55).
+    ///
+    /// Returns [`FfiResult::UNSUPPORTED`] when connected to an ABI `0.2` host.
+    #[inline]
+    pub fn intern_symbol(&self, symbol: &str) -> Result<BamSymbol, FfiResult> {
+        if symbol.is_empty() {
+            return Err(FfiResult::INVALID_ARGUMENT);
+        }
+        if !self.api.covers_slot(
+            core::mem::offset_of!(BamHostApi, intern_symbol),
+            core::mem::size_of::<Option<BamInternSymbolFn>>(),
+        ) {
+            return Err(FfiResult::UNSUPPORTED);
+        }
+        let Some(intern_fn) = self.api.intern_symbol else {
+            return Err(FfiResult::UNSUPPORTED);
+        };
+        let mut out = BamSymbol::INVALID;
+        // SAFETY: `self.host_ctx.0` is an active `BamHostCtx`, `StrView::from_str(symbol)` borrows
+        // valid UTF-8 bytes for this call, and `&mut out` is aligned writable stack storage.
+        let status = unsafe { intern_fn(self.host_ctx.0, StrView::from_str(symbol), &mut out) };
+        if !status.is_ok() {
+            return Err(status);
+        }
+        if !out.is_valid() {
+            return Err(FfiResult::INVALID_ARGUMENT);
+        }
+        Ok(out)
+    }
+
+    /// Binds a canonical non-empty UTF-8 lookup `name` to `entity` in the host symbol registry via
+    /// `BamHostApi::bind_named_object` (slot 56).
+    ///
+    /// Returns [`FfiResult::UNSUPPORTED`] when connected to an ABI `0.2` host.
+    #[inline]
+    pub fn bind_named_object(&self, name: &str, entity: FfiEntity) -> FfiResult {
+        if name.is_empty() {
+            return FfiResult::INVALID_ARGUMENT;
+        }
+        if entity.is_null() {
+            return FfiResult::INVALID_ENTITY;
+        }
+        if !self.api.covers_slot(
+            core::mem::offset_of!(BamHostApi, bind_named_object),
+            core::mem::size_of::<Option<BamBindNamedObjectFn>>(),
+        ) {
+            return FfiResult::UNSUPPORTED;
+        }
+        let Some(bind_fn) = self.api.bind_named_object else {
+            return FfiResult::UNSUPPORTED;
+        };
+        // SAFETY: `self.host_ctx.0` is an active `BamHostCtx` and `StrView::from_str(name)` borrows
+        // valid UTF-8 bytes for this synchronous call.
+        unsafe { bind_fn(self.host_ctx.0, StrView::from_str(name), entity) }
+    }
 }
 
 /// Validated init-only [`BamLoadCtx`] wrapper tied to the duration of `bevy_abi_mod_init`.
@@ -790,6 +951,250 @@ impl<'a> ValidatedLoadCtx<'a> {
                 config,
                 run_if.map(PreparedRunIf::into_raw),
                 closure,
+            )
+        }
+    }
+
+    /// Registers a unified [`bevy_abi_mod_sys::BamSystemDesc`] via
+    /// `BamHostApi::register_system_handle` (slot 60) and returns its assigned [`BamSystem`]
+    /// handle.
+    #[inline]
+    pub fn register_system_handle<F>(
+        &self,
+        instance: &mut GuestInstance,
+        config: &SystemRegistrationConfig<'_>,
+        run_if: Option<PreparedRunIf>,
+        closure: F,
+    ) -> Result<BamSystem, FfiResult>
+    where
+        F: FnMut(&mut ValidatedSystemInvocation<'_>) -> FfiResult + Send + 'static,
+    {
+        // SAFETY: `self.raw` was validated as an active `BamLoadCtx` in `ValidatedLoadCtx::from_raw`,
+        // and `PreparedRunIf` encapsulates a valid `(BamRunIfFn, *mut c_void)` pair.
+        unsafe {
+            register_system_handle_closure(
+                instance,
+                self.raw,
+                config,
+                run_if.map(PreparedRunIf::into_raw),
+                closure,
+            )
+        }
+    }
+
+    /// Registers a caller-constructed [`BamRelationDesc`] on this validated load context via
+    /// `BamHostApi::register_relation` (slot 54).
+    ///
+    /// # Safety
+    /// `desc` must satisfy [`BamRelationDesc::validate`], and `desc.name` must point to a valid
+    /// NUL-terminated UTF-8 C string for the duration required by the host.
+    #[inline]
+    pub unsafe fn register_relation_raw(
+        &self,
+        desc: &BamRelationDesc,
+    ) -> Result<BamComponent, FfiResult> {
+        // SAFETY: `self.raw` was validated in `ValidatedLoadCtx::from_raw`, and caller upholds
+        // `desc`'s lifetime and pointer invariants.
+        unsafe { register_relation_raw(self.raw, self.host, desc) }
+    }
+
+    /// Registers a typed entity relationship edge via `BamHostApi::register_relation` (slot 54),
+    /// storing an owned copy of `name` inside `instance`.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_relation(
+        &self,
+        instance: &mut GuestInstance,
+        name: &CStr,
+        uuid: ComponentUuid,
+        flags: u32,
+        data_size: usize,
+        data_align: usize,
+        max_degree: u32,
+    ) -> Result<BamComponent, FfiResult> {
+        // SAFETY: `self.raw` was validated as an active `BamLoadCtx` in `ValidatedLoadCtx::from_raw`.
+        unsafe {
+            register_relation(
+                instance, self.raw, name, uuid, flags, data_size, data_align, max_degree,
+            )
+        }
+    }
+
+    /// Configures a schedule system set from a caller-constructed [`BamScheduleSetDesc`] via
+    /// `BamHostApi::configure_schedule_set` (slot 61).
+    ///
+    /// # Safety
+    /// `desc` must satisfy [`BamScheduleSetDesc::validate`] with valid `name`, `before_sets`, and
+    /// `after_sets` pointers for the duration of this call.
+    #[inline]
+    pub unsafe fn configure_schedule_set_raw(
+        &self,
+        desc: &BamScheduleSetDesc,
+    ) -> Result<BamSystemSet, FfiResult> {
+        // SAFETY: `self.raw` was validated in `ValidatedLoadCtx::from_raw`, and caller upholds
+        // `desc`'s pointer validity invariants.
+        unsafe { configure_schedule_set_raw(self.raw, self.host, desc) }
+    }
+
+    /// Configures a named schedule system set and its ordering edges via
+    /// `BamHostApi::configure_schedule_set` (slot 61), storing an owned copy of `name` inside
+    /// `instance`.
+    #[inline]
+    pub fn configure_schedule_set(
+        &self,
+        instance: &mut GuestInstance,
+        name: &CStr,
+        schedule: ScheduleId,
+        flags: u32,
+        before_sets: &[BamSystemSet],
+        after_sets: &[BamSystemSet],
+    ) -> Result<BamSystemSet, FfiResult> {
+        // SAFETY: `self.raw` was validated as an active `BamLoadCtx` in `ValidatedLoadCtx::from_raw`.
+        unsafe {
+            configure_schedule_set(
+                instance,
+                self.raw,
+                name,
+                schedule,
+                flags,
+                before_sets,
+                after_sets,
+            )
+        }
+    }
+
+    /// Mounts a registered [`BamSystem`] handle into `schedule` and optional `set`
+    /// (`BamSystemSet::INVALID` for ungrouped mounting) via `BamHostApi::mount_system_in_schedule`
+    /// (slot 62).
+    #[inline]
+    pub fn mount_system_in_schedule(
+        &self,
+        system: BamSystem,
+        schedule: ScheduleId,
+        set: BamSystemSet,
+    ) -> FfiResult {
+        // SAFETY: `self.raw` was validated as an active `BamLoadCtx` in `ValidatedLoadCtx::from_raw`.
+        unsafe { mount_system_in_schedule(self.raw, self.host, system, schedule, set) }
+    }
+
+    /// Raw wrapper invoking `BamHostApi::migrate_component_column` (slot 67).
+    ///
+    /// # Safety
+    /// `new_desc`, `migrate_fn`, and `user_data` must satisfy [`migrate_component_column_raw`].
+    #[inline]
+    pub unsafe fn migrate_component_column_raw(
+        &self,
+        component: BamComponent,
+        old_fingerprint: u64,
+        new_desc: &ComponentDesc,
+        migrate_fn: BamRowMigrateFn,
+        user_data: *mut c_void,
+    ) -> FfiResult {
+        // SAFETY: `self.raw` was validated in `ValidatedLoadCtx::from_raw`; forwarding caller
+        // guarantees on `new_desc`, `migrate_fn`, and `user_data`.
+        unsafe {
+            migrate_component_column_raw(
+                self.raw,
+                self.host,
+                component,
+                old_fingerprint,
+                new_desc,
+                migrate_fn,
+                user_data,
+            )
+        }
+    }
+
+    /// Panic-guarded typed row migration over `BamHostApi::migrate_component_column` (slot 67)
+    /// using an explicit [`ComponentDesc`] for `New: AbiPod`.
+    ///
+    /// # Safety
+    /// `new_desc`'s pointed-to buffers (`name`, `vtable_ptr`, `fields`, `required_init_descs`)
+    /// must remain valid for as long as required by the host registry.
+    #[inline]
+    pub unsafe fn migrate_component_column<Old, New, F>(
+        &self,
+        component: BamComponent,
+        old_fingerprint: u64,
+        new_desc: &ComponentDesc,
+        migrate: F,
+    ) -> FfiResult
+    where
+        Old: AbiPod,
+        New: AbiPod,
+        F: FnMut(&Old) -> Result<New, FfiResult>,
+    {
+        // SAFETY: `self.raw` was validated in `ValidatedLoadCtx::from_raw`; caller guarantees
+        // `new_desc`'s pointed-to buffers remain valid.
+        unsafe {
+            migrate_component_column_pod::<Old, New, F>(
+                self.raw,
+                self.host,
+                component,
+                old_fingerprint,
+                new_desc,
+                migrate,
+            )
+        }
+    }
+
+    /// Safe panic-guarded row migration of `component` from `Old: ModComponent + AbiPod` to
+    /// `New: ModComponent + AbiPod`, stamping `New`'s qualified identity, VTable,
+    /// `SCHEMA_FINGERPRINT`, `BAM_FIELDS`, and `REQUIRED_COMPONENTS` on `new_desc`.
+    #[inline]
+    pub fn migrate_mod_component_column<Old, New, F>(
+        &self,
+        instance: &mut GuestInstance,
+        component: BamComponent,
+        flags: u32,
+        migrate: F,
+    ) -> FfiResult
+    where
+        Old: ModComponent + AbiPod,
+        New: ModComponent + AbiPod,
+        F: FnMut(&Old) -> Result<New, FfiResult>,
+    {
+        // SAFETY: `self.raw` was validated as an active `BamLoadCtx` in `ValidatedLoadCtx::from_raw`.
+        unsafe {
+            migrate_mod_component_column::<Old, New, F>(
+                instance, self.raw, component, flags, migrate,
+            )
+        }
+    }
+
+    /// Safe panic-guarded row migration of `component` from `Old: AbiPod` to `New: AbiPod` with
+    /// explicit name, UUID, flags, and fingerprints (storing an owned copy of `new_name` in
+    /// `instance`).
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn migrate_pod_component_column<Old, New, F>(
+        &self,
+        instance: &mut GuestInstance,
+        component: BamComponent,
+        old_fingerprint: u64,
+        new_name: &CStr,
+        new_uuid: ComponentUuid,
+        new_flags: u32,
+        new_fingerprint: u64,
+        migrate: F,
+    ) -> FfiResult
+    where
+        Old: AbiPod,
+        New: AbiPod,
+        F: FnMut(&Old) -> Result<New, FfiResult>,
+    {
+        // SAFETY: `self.raw` was validated as an active `BamLoadCtx` in `ValidatedLoadCtx::from_raw`.
+        unsafe {
+            migrate_pod_component_column::<Old, New, F>(
+                instance,
+                self.raw,
+                component,
+                old_fingerprint,
+                new_name,
+                new_uuid,
+                new_flags,
+                new_fingerprint,
+                migrate,
             )
         }
     }

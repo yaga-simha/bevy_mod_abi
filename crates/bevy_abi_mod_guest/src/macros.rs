@@ -1,4 +1,62 @@
-//! Entry-point export macros (`export_mod!`) for guest `.cdylib` mods.
+//! Entry-point export (`export_mod!`) and diagnostic logging (`guest_log!`) macros for guest
+//! `.cdylib` mods.
+
+/// Emits a structured ABI `0.3.0` diagnostic message through any context exposing
+/// `.log_diagnostic(level, msg)` ([`GuestApp`](crate::GuestApp),
+/// [`SystemContext`](crate::SystemContext), [`RunConditionContext`](crate::RunConditionContext), or
+/// [`Host`](crate::raw::Host)) via `BamHostApi::log_diagnostic` (slot 50).
+///
+/// Static messages without format arguments take a zero-allocation fast path via
+/// [`core::fmt::Arguments::as_str`]; formatted messages allocate only when formatting is needed.
+///
+/// # Supported Levels
+/// - `trace` -> [`BAM_LOG_TRACE`](crate::BAM_LOG_TRACE)
+/// - `debug` -> [`BAM_LOG_DEBUG`](crate::BAM_LOG_DEBUG)
+/// - `info` -> [`BAM_LOG_INFO`](crate::BAM_LOG_INFO)
+/// - `warn` -> [`BAM_LOG_WARN`](crate::BAM_LOG_WARN)
+/// - `error` -> [`BAM_LOG_ERROR`](crate::BAM_LOG_ERROR)
+/// - Or any explicit `u32` `BAM_LOG_*` expression.
+///
+/// # Example
+///
+/// ```no_run
+/// use bevy_abi_mod_guest::prelude::*;
+///
+/// fn log_example(ctx: &SystemContext<'_>, count: usize) -> FfiResult {
+///     let _ = guest_log!(ctx, info, "tick started");
+///     guest_log!(ctx, debug, "processed {} entities", count)
+/// }
+/// ```
+#[macro_export]
+macro_rules! guest_log {
+    ($ctx:expr, trace, $($arg:tt)+) => {
+        $crate::guest_log!(@emit $ctx, $crate::BAM_LOG_TRACE, $($arg)+)
+    };
+    ($ctx:expr, debug, $($arg:tt)+) => {
+        $crate::guest_log!(@emit $ctx, $crate::BAM_LOG_DEBUG, $($arg)+)
+    };
+    ($ctx:expr, info, $($arg:tt)+) => {
+        $crate::guest_log!(@emit $ctx, $crate::BAM_LOG_INFO, $($arg)+)
+    };
+    ($ctx:expr, warn, $($arg:tt)+) => {
+        $crate::guest_log!(@emit $ctx, $crate::BAM_LOG_WARN, $($arg)+)
+    };
+    ($ctx:expr, error, $($arg:tt)+) => {
+        $crate::guest_log!(@emit $ctx, $crate::BAM_LOG_ERROR, $($arg)+)
+    };
+    ($ctx:expr, $level:expr, $($arg:tt)+) => {
+        $crate::guest_log!(@emit $ctx, $level, $($arg)+)
+    };
+    (@emit $ctx:expr, $level:expr, $($arg:tt)+) => {{
+        let __bam_args = ::core::format_args!($($arg)+);
+        if let ::core::option::Option::Some(__bam_static) = __bam_args.as_str() {
+            ($ctx).log_diagnostic($level, __bam_static)
+        } else {
+            let __bam_formatted = ::std::fmt::format(__bam_args);
+            ($ctx).log_diagnostic($level, __bam_formatted.as_str())
+        }
+    }};
+}
 
 /// Exports a guest mod's mandatory ABI `0.3.0` C entry points (`bevy_abi_mod_manifest`,
 /// `bevy_abi_mod_init`, and `bevy_abi_mod_shutdown`) backed by per-World

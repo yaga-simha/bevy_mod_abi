@@ -13,11 +13,14 @@ pub use bevy_abi_mod_guest_sys::{
     SystemRegistrationConfig, UuidFilter, ValidatedCommands, ValidatedIter, ValidatedLoadCtx,
     ValidatedSlice, ValidatedSliceMut, ValidatedSystemInvocation, ValidatedSystemRef,
     allocate_run_if_trampoline, allocate_system_trampoline, catch_guest_bool, catch_guest_result,
-    catch_guest_unit, generic_drop_trampoline, guest_restore_state_trampoline,
-    guest_save_state_trampoline, init_guest_instance, register_component_raw,
+    catch_guest_unit, configure_schedule_set, configure_schedule_set_raw, generic_drop_trampoline,
+    guest_restore_state_trampoline, guest_save_state_trampoline, init_guest_instance,
+    migrate_component_column_pod, migrate_component_column_raw, migrate_mod_component_column,
+    migrate_pod_component_column, mount_system_in_schedule, register_component_raw,
     register_component_with_layout, register_dynamic_component_with_drop,
     register_observer_closure, register_pod_component, register_pod_component_with_hooks,
-    register_system_closure, resolve_component, shutdown_guest_instance, wrap_run_condition,
+    register_relation, register_relation_raw, register_system_closure,
+    register_system_handle_closure, resolve_component, shutdown_guest_instance, wrap_run_condition,
     wrap_system_callback,
 };
 

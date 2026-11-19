@@ -32,9 +32,11 @@ pub use bevy_abi_mod_sys::{BamSystemCtx, FfiBool, FfiResult};
 
 pub use commands::{SpawnBatchColumn, SpawnEntry, ValidatedCommands};
 pub use component::{
-    PodComponentHooks, generic_drop_trampoline, pod_clone_trampoline, register_component_raw,
-    register_component_with_layout, register_dynamic_component_with_drop, register_pod_component,
-    register_pod_component_with_hooks, resolve_component,
+    PodComponentHooks, generic_drop_trampoline, migrate_component_column_pod,
+    migrate_component_column_raw, migrate_mod_component_column, migrate_pod_component_column,
+    pod_clone_trampoline, register_component_raw, register_component_with_layout,
+    register_dynamic_component_with_drop, register_pod_component,
+    register_pod_component_with_hooks, register_relation, register_relation_raw, resolve_component,
 };
 pub use host::{
     CUSTOM_SYMBOL_PREFIX, Host, ValidatedLoadCtx, ValidatedStringVTable, ValidatedWireVTable,
@@ -51,11 +53,12 @@ pub use iter::{
 pub use panic::{catch_guest_bool, catch_guest_result, catch_guest_unit};
 pub use trampoline::{
     PreparedRunIf, ReentrantCell, SystemRegistrationConfig, ValidatedSystemInvocation,
-    ValidatedSystemRef, allocate_run_if_trampoline, allocate_system_trampoline, iter_dynamic_slice,
-    iter_dynamic_slice_mut, iter_entities_and_dynamic_slice_mut,
+    ValidatedSystemRef, allocate_run_if_trampoline, allocate_system_trampoline,
+    configure_schedule_set, configure_schedule_set_raw, iter_dynamic_slice, iter_dynamic_slice_mut,
+    iter_entities_and_dynamic_slice_mut, mount_system_in_schedule,
     register_lifecycle_observer_closure, register_observer_closure,
     register_observer_closure_with_options, register_observer_mut_closure, register_system_closure,
-    verify_same_mod_dynamic_component,
+    register_system_handle_closure, verify_same_mod_dynamic_component,
 };
 
 #[cfg(test)]

@@ -587,7 +587,18 @@ impl<'a> ValidatedLoadCtx<'a> {
             core::mem::align_of::<T>(),
         )
         .with_flags(flags | T::COMPONENT_FLAGS)
-        .with_vtable(T::erased_vtable_ptr());
+        .with_vtable(T::erased_vtable_ptr())
+        .with_schema_fingerprint(T::SCHEMA_FINGERPRINT);
+
+        if !T::BAM_FIELDS.is_empty() {
+            desc = desc.with_fields(T::BAM_FIELDS.as_ptr(), T::BAM_FIELDS.len());
+        }
+        if !T::REQUIRED_COMPONENTS.is_empty() {
+            desc = desc.with_required_init_descs(
+                T::REQUIRED_COMPONENTS.as_ptr(),
+                T::REQUIRED_COMPONENTS.len(),
+            );
+        }
 
         if core::mem::needs_drop::<T>() {
             desc = desc.with_drop(generic_drop_trampoline::<T>);
