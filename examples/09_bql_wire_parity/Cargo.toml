@@ -1,0 +1,43 @@
+[package]
+name = "example_09_bql_wire_parity"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "example_09_bql_wire_parity"
+path = "src/lib.rs"
+
+[[bin]]
+name = "example_09_bql_wire_parity"
+path = "src/main.rs"
+
+[[test]]
+name = "bql_wire_contract_test"
+path = "../../tests/bql_wire_contract_test.rs"
+
+[dependencies]
+bevy_app = { version = "0.20.1", default-features = false, features = ["std"] }
+bevy_ecs = { version = "0.20.1", default-features = false, features = ["std", "async_executor"] }
+bevy_reflect = { version = "0.20.1", default-features = false, features = ["std"] }
+bevy_abi_mod = { path = "../../crates/bevy_abi_mod", features = ["bridge-reflect"] }
+bevy_abi_mod_host_sys = { path = "../../crates/bevy_abi_mod_host_sys" }
+bevy_abi_mod_sys = { path = "../../crates/bevy_abi_mod_sys" }
+sha2 = "0.10"
+tempfile = "3"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+improper_ctypes_definitions = "deny"
+unreachable_pub = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+ptr_as_ptr = "warn"
+cast_ptr_alignment = "warn"
+transmute_ptr_to_ptr = "warn"
+needless_pass_by_ref_mut = "warn"
+redundant_clone = "warn"
+match_same_arms = "warn"
