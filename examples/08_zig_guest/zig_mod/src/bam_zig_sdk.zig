@@ -4,7 +4,7 @@
 //! `bam::Commands` from the C++17 example SDK using Zig `comptime` generics.
 
 const std = @import("std");
-pub const c = @import("generated_components.zig").bam;
+pub const c = @import("bam_c");
 
 pub const Commands = struct {
     api: *const c.BamHostApi,

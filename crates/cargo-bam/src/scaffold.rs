@@ -305,13 +305,30 @@ pub fn build(b: *std.Build) void {{
     const target = b.standardTargetOptions(.{{}});
     const optimize = b.standardOptimizeOption(.{{}});
 
+    const translate_c = b.addTranslateC(.{{
+        .root_source_file = b.path("include/bevy_abi_mod.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    }});
+    translate_c.addIncludePath(b.path("include"));
+    const bam_c_mod = translate_c.createModule();
+
+    const bevy_abi_mod = b.createModule(.{{
+        .root_source_file = b.path("include/bevy_abi_mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    }});
+    bevy_abi_mod.addImport("bam_c", bam_c_mod);
+
     const mod = b.createModule(.{{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     }});
-    mod.addIncludePath(b.path("include"));
+    mod.addImport("bam_c", bam_c_mod);
+    mod.addImport("bevy_abi_mod", bevy_abi_mod);
 
     const lib = b.addLibrary(.{{
         .linkage = .dynamic,
@@ -327,9 +344,7 @@ pub fn build(b: *std.Build) void {{
 
             let root_zig = format!(
                 r#"const std = @import("std");
-const c = @cImport({{
-    @cInclude("bevy_abi_mod.h");
-}});
+const c = @import("bam_c");
 
 const ZigModInstance = struct {{
     api: c.BamHostApi,

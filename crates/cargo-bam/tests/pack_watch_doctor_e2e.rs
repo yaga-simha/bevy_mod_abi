@@ -767,3 +767,105 @@ fn e2e_doctor_cli_reports_toolchains_abi_layout_sdk_parity_and_dag_health() {
         "expected ABI mismatch message in stderr, got: {bad_stderr}"
     );
 }
+
+#[test]
+fn e2e_zig_scaffold_uses_translate_c_and_builds_when_zig_available() {
+    let tmp = TempDir::new().unwrap();
+
+    let new_out = Command::new(cargo_bam_bin())
+        .args([
+            "bam",
+            "new",
+            "zig_scaffold_demo",
+            "--lang",
+            "zig",
+            "--dir",
+            tmp.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        new_out.status.success(),
+        "new --lang zig failed: {}",
+        String::from_utf8_lossy(&new_out.stderr)
+    );
+
+    let proj = tmp.path().join("zig_scaffold_demo");
+    let build_zig = fs::read_to_string(proj.join("build.zig")).unwrap();
+    let root_zig = fs::read_to_string(proj.join("src/root.zig")).unwrap();
+    let sdk_zig = fs::read_to_string(proj.join("include/bevy_abi_mod.zig")).unwrap();
+
+    assert!(
+        build_zig.contains("b.addTranslateC("),
+        "build.zig missing b.addTranslateC:\n{build_zig}"
+    );
+    assert!(
+        build_zig.contains("mod.addImport(\"bam_c\", bam_c_mod)"),
+        "build.zig missing bam_c import:\n{build_zig}"
+    );
+    assert!(
+        root_zig.contains("@import(\"bam_c\")"),
+        "src/root.zig missing @import(\"bam_c\"):\n{root_zig}"
+    );
+    assert!(
+        sdk_zig.contains("@import(\"bam_c\")"),
+        "include/bevy_abi_mod.zig missing @import(\"bam_c\"):\n{sdk_zig}"
+    );
+    for (label, contents) in [
+        ("build.zig", &build_zig),
+        ("src/root.zig", &root_zig),
+        ("include/bevy_abi_mod.zig", &sdk_zig),
+    ] {
+        assert!(
+            !contents.contains(concat!("@", "cImport"))
+                && !contents.contains(concat!("@", "cInclude")),
+            "{label} must not emit legacy Zig C-import directives:\n{contents}"
+        );
+    }
+
+    let zig_available = Command::new("zig")
+        .arg("version")
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if !zig_available {
+        return;
+    }
+
+    let dist = tmp.path().join("dist");
+    let build_out = Command::new(cargo_bam_bin())
+        .args([
+            "build",
+            "--dir",
+            proj.to_str().unwrap(),
+            "--release",
+            "--out-dir",
+            dist.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        build_out.status.success(),
+        "cargo bam build for Zig scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build_out.stdout),
+        String::from_utf8_lossy(&build_out.stderr)
+    );
+    let staged_lib = find_staged_library(&dist.join("zig_scaffold_demo"));
+    assert!(staged_lib.is_file());
+
+    // Also verify `include/bevy_abi_mod.zig` (`ZIG_SDK`) compiles cleanly as `"bevy_abi_mod"`.
+    let updated_root = format!(
+        "{root_zig}\nconst bam_sdk = @import(\"bevy_abi_mod\");\ncomptime {{\n    _ = bam_sdk.offsets.MIGRATE_COMPONENT_COLUMN;\n    _ = bam_sdk.coversHostApiSlot;\n    _ = bam_sdk.copyColumnNoAlias;\n    _ = bam_sdk.checkResult;\n    _ = bam_sdk.mapError;\n}}\n"
+    );
+    fs::write(proj.join("src/root.zig"), updated_root).unwrap();
+    let sdk_build = Command::new("zig")
+        .current_dir(&proj)
+        .args(["build", "-Doptimize=ReleaseFast"])
+        .output()
+        .unwrap();
+    assert!(
+        sdk_build.status.success(),
+        "zig build using bevy_abi_mod module failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&sdk_build.stdout),
+        String::from_utf8_lossy(&sdk_build.stderr)
+    );
+}

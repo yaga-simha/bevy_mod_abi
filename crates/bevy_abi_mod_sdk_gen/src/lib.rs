@@ -4,8 +4,8 @@
 //! Deterministic, `#![forbid(unsafe_code)]`, zero-Bevy SDK generator for `bevy_abi_mod`.
 //!
 //! Emits the canonical strict ISO C99 ABI header (`include/bevy_abi_mod.h`), `#[derive(ModComponent)]`
-//! C99/C++17 component headers, ISO C++17 RAII wrappers (`bevy_abi_mod.hpp`), and Zig `@cImport`
-//! bindings (`bevy_abi_mod.zig`) directly from `bevy_abi_mod_sys` layout constants.
+//! C99/C++17 component headers, ISO C++17 RAII wrappers (`bevy_abi_mod.hpp`), and Zig `addTranslateC`
+//! (`"bam_c"` module) bindings (`bevy_abi_mod.zig`) directly from `bevy_abi_mod_sys` layout constants.
 
 pub mod component_header;
 pub mod header_gen;

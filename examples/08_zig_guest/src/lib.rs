@@ -131,7 +131,7 @@ pub fn render_example_zig_components() -> String {
     let mut out = String::with_capacity(16 * 1024);
     out.push_str("//! AUTO-GENERATED FROM `ModComponent::ZIG_DECL` — DO NOT EDIT BY HAND.\n\n");
     out.push_str("const std = @import(\"std\");\n");
-    out.push_str("pub const bam = @cImport({\n    @cInclude(\"bevy_abi_mod.h\");\n});\n\n");
+    out.push_str("pub const bam = @import(\"bam_c\");\n\n");
     for decl in [
         <Position as ModComponentTrait>::ZIG_DECL,
         <Velocity as ModComponentTrait>::ZIG_DECL,

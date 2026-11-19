@@ -394,12 +394,13 @@ private:
 #endif // BEVY_ABI_MOD_HPP
 "#;
 
-/// Zig SDK wrapper over `bevy_abi_mod.h` (`ABI 0.3.0` `@cImport`).
+/// Zig SDK wrapper over `bevy_abi_mod.h` (`ABI 0.3.0` `b.addTranslateC` `"bam_c"` module).
 pub const ZIG_SDK: &str = r#"//! Zig SDK bindings for `bevy_abi_mod` (`ABI 0.3.0`).
+//!
+//! Expects `build.zig` to translate `bevy_abi_mod.h` via `b.addTranslateC(...)`
+//! and attach the resulting module as `"bam_c"` (`mod.addImport("bam_c", bam_c_mod)`).
 
-pub const c = @cImport({
-    @cInclude("bevy_abi_mod.h");
-});
+pub const c = @import("bam_c");
 
 /// Zig expresses C99/MSVC `BAM_RESTRICT` non-aliasing guarantees on SoA column pointers via the
 /// built-in `noalias` parameter qualifier (for example:
@@ -680,6 +681,10 @@ mod tests {
         assert!(hpp_content.contains("BAM_HOST_API_OFFSET_CMD_CHECKPOINT"));
         assert!(hpp_content.contains("BAM_RESTRICT"));
         assert!(zig_content.contains("ABI 0.3.0"));
+        assert!(zig_content.contains("addTranslateC"));
+        assert!(zig_content.contains("@import(\"bam_c\")"));
+        assert!(!zig_content.contains(concat!("@", "cImport")));
+        assert!(!zig_content.contains(concat!("@", "cInclude")));
         assert!(zig_content.contains("BAM_RESTRICT_QUALIFIER"));
         assert!(zig_content.contains("BAM_RESULT_CYCLE_DETECTED"));
         let _ = fs::remove_dir_all(&tmp);

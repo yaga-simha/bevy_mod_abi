@@ -1,9 +1,7 @@
 //! AUTO-GENERATED FROM `ModComponent::ZIG_DECL` — DO NOT EDIT BY HAND.
 
 const std = @import("std");
-pub const bam = @cImport({
-    @cInclude("bevy_abi_mod.h");
-});
+pub const bam = @import("bam_c");
 
 pub const Position = extern struct {
     x: f32,
