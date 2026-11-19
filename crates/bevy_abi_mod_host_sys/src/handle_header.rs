@@ -10,7 +10,7 @@
 
 use crate::registry::RegistrySnapshot;
 use bevy_abi_mod_sys::{BamHostCtx, FfiResult};
-use core::cell::RefCell;
+use core::cell::{RefCell, UnsafeCell};
 use core::ffi::{c_char, c_void};
 use core::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -173,7 +173,11 @@ pub(crate) unsafe fn validate_handle_mut<'a, T>(
 pub struct HostContext {
     /// Validation header (`HOST_CTX_MAGIC`) at byte offset `0`.
     pub header: HandleHeader,
-    snapshot: Arc<RegistrySnapshot>,
+    /// Active registry snapshot stored in an `UnsafeCell` so updating the snapshot inside
+    /// `LoadContext` during `bevy_abi_mod_init` (`register_component`, `register_relation`,
+    /// `migrate_component_column`) does not invalidate cached `*const BamHostCtx` pointers
+    /// previously returned by `host_load_host_ctx` under Tree Borrows / Stacked Borrows.
+    snapshot: UnsafeCell<Arc<RegistrySnapshot>>,
     default_namespace: Option<Arc<str>>,
     last_error: RefCell<String>,
 }
@@ -193,7 +197,7 @@ impl HostContext {
         error_buf.clear();
         Self {
             header: HandleHeader::new(HOST_CTX_MAGIC),
-            snapshot,
+            snapshot: UnsafeCell::new(snapshot),
             default_namespace: None,
             last_error: RefCell::new(error_buf),
         }
@@ -215,19 +219,23 @@ impl HostContext {
     /// Borrows the current immutable [`RegistrySnapshot`].
     #[inline]
     pub fn snapshot(&self) -> &RegistrySnapshot {
-        &self.snapshot
+        // SAFETY: `HostContext` is `!Sync` (single-threaded) and `snapshot` is only ever
+        // mutated via `set_snapshot(&mut self)` between FFI calls when no `&RegistrySnapshot`
+        // borrow is live.
+        unsafe { &*self.snapshot.get() }
     }
 
     /// Clones the `Arc<RegistrySnapshot>` handle (`O(1)`).
     #[inline]
     pub fn snapshot_arc(&self) -> Arc<RegistrySnapshot> {
-        Arc::clone(&self.snapshot)
+        // SAFETY: Same single-threaded non-overlapping invariant as `snapshot()`.
+        Arc::clone(unsafe { &*self.snapshot.get() })
     }
 
     /// Replaces the active [`RegistrySnapshot`] (used by `LoadContext` after dynamic component registration).
     #[inline]
     pub fn set_snapshot(&mut self, snapshot: Arc<RegistrySnapshot>) {
-        self.snapshot = snapshot;
+        *self.snapshot.get_mut() = snapshot;
     }
 
     /// Records a human-readable UTF-8 diagnostic message on this context.
