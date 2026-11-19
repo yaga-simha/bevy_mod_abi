@@ -117,6 +117,11 @@ path = "tests/lifecycle/main.rs"
 name = "e2e"
 path = "tests/e2e/main.rs"
 
+[[test]]
+name = "reflect_bam_fields"
+path = "tests/reflect_bam_fields.rs"
+required-features = ["bridge-reflect"]
+
 [[bench]]
 name = "chunk_throughput"
 path = "benches/chunk_throughput.rs"

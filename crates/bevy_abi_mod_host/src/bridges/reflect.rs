@@ -3,13 +3,17 @@
 
 use bevy_abi_mod_host_sys::loader::ExportedFieldRecord;
 use bevy_abi_mod_host_sys::{
-    ComponentCollisionError, ComponentOptions, ModRegistry, WitnessFieldDescriptor,
-    apply_entity_component_fields, apply_resource_fields, export_entity_component_fields,
-    export_resource_fields, insert_or_apply_entity_component_fields,
-    inspect_component_witness_fields, inspect_component_witness_fields_in_registry,
-    reflect_entity_component, reflect_entity_component_mut,
+    BamFieldBytePatch, BamFieldDescriptor, BamFieldPodKind, ComponentCollisionError,
+    ComponentOptions, ModRegistry, WitnessFieldDescriptor, apply_entity_component_fields,
+    apply_resource_fields, export_entity_component_fields, export_resource_fields,
+    insert_entity_pod_with_field_patches, insert_or_apply_entity_component_fields,
+    inspect_component_bam_fields, inspect_component_witness_fields,
+    inspect_component_witness_fields_in_registry, read_entity_bam_field_bytes,
+    read_resource_bam_field_bytes, reflect_entity_component, reflect_entity_component_mut,
+    reflect_resource_component, reflect_resource_component_mut, register_bam_field_reflect_type,
+    write_entity_bam_field_bytes, write_resource_bam_field_bytes,
 };
-use bevy_abi_mod_sys::{BamComponent, FfiResult, ModComponent};
+use bevy_abi_mod_sys::{BamComponent, BamFieldKind, FfiResult, ModComponent};
 use bevy_app::{App, Plugin};
 use bevy_ecs::change_detection::Mut;
 use bevy_ecs::component::Component;
@@ -150,6 +154,33 @@ pub struct WitnessReflectSchema {
     pub fields: Vec<WitnessFieldDescriptor>,
 }
 
+/// Cached declarative reflection schema synthesized from ABI `0.3` [`bevy_abi_mod_sys::BamFieldDesc`]
+/// descriptors (for C99, C++17, Zig, or raw `ComponentDesc` components/resources without Rust
+/// proc-macro witness VTables).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BamFieldReflectSchema {
+    /// Handle in [`ModRegistry`].
+    pub component: BamComponent,
+    /// Canonical component/resource name.
+    pub canonical_name: String,
+    /// Byte size of the enclosing component or resource.
+    pub size: usize,
+    /// Byte alignment of the enclosing component or resource.
+    pub align: usize,
+    /// `true` when this handle refers to a singleton `Resource`.
+    pub is_resource: bool,
+    /// `true` when mutations are disallowed (`BAM_STORAGE_FLAG_IMMUTABLE`).
+    pub is_immutable: bool,
+    /// `true` when the component is plain-old-data without drop glue.
+    pub is_abi_pod: bool,
+    /// Registered dynamic [`TypeId`] in [`AppTypeRegistry`] (carrying `StructInfo`,
+    /// [`ReflectFromPtr`], [`ReflectComponent`], and [`ReflectResource`] when applicable),
+    /// if an in-place zero-copy adapter was bound.
+    pub reflected_type_id: Option<TypeId>,
+    /// Validated declarative field descriptors in declaration order.
+    pub fields: Vec<BamFieldDescriptor>,
+}
+
 /// Typed `Reflect` bridge descriptor recorded for host-registered `Reflect` components/resources.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TypedReflectBridgeEntry {
@@ -165,10 +196,12 @@ pub struct TypedReflectBridgeEntry {
     pub is_resource: bool,
 }
 
-/// Host resource caching synthesized witness schemas and typed `Reflect` bridge entries.
+/// Host resource caching synthesized witness schemas, declarative `BamFieldDesc` schemas, and
+/// typed `Reflect` bridge entries.
 #[derive(Resource, Default, Clone)]
 pub struct ModReflectRegistry {
     witness_schemas: HashMap<BamComponent, WitnessReflectSchema>,
+    bam_field_schemas: HashMap<BamComponent, BamFieldReflectSchema>,
     typed_entries: HashMap<BamComponent, TypedReflectBridgeEntry>,
 }
 
@@ -177,6 +210,12 @@ impl ModReflectRegistry {
     #[inline]
     pub fn witness_schema(&self, component: BamComponent) -> Option<&WitnessReflectSchema> {
         self.witness_schemas.get(&component)
+    }
+
+    /// Returns the declarative `BamFieldDesc` reflection schema for `component`, if registered.
+    #[inline]
+    pub fn bam_field_schema(&self, component: BamComponent) -> Option<&BamFieldReflectSchema> {
+        self.bam_field_schemas.get(&component)
     }
 
     /// Returns the typed `Reflect` bridge entry for `component`, if registered.
@@ -191,6 +230,12 @@ impl ModReflectRegistry {
         self.witness_schemas.values()
     }
 
+    /// Iterates over all cached declarative `BamFieldDesc` schemas.
+    #[inline]
+    pub fn bam_field_schemas(&self) -> impl Iterator<Item = &BamFieldReflectSchema> {
+        self.bam_field_schemas.values()
+    }
+
     /// Iterates over all registered typed `Reflect` bridge entries.
     #[inline]
     pub fn typed_entries(&self) -> impl Iterator<Item = &TypedReflectBridgeEntry> {
@@ -201,8 +246,8 @@ impl ModReflectRegistry {
 /// Target binding inside [`ModSettingsRegistry`].
 #[derive(Clone, Debug)]
 enum SettingsBindingKind {
-    /// Witness-backed mod resource (`export_resource_fields` / `apply_resource_fields`).
-    WitnessResource(BamComponent),
+    /// Witness-backed or declarative `BamFieldDesc` mod resource.
+    ModResource(BamComponent),
     /// Native Bevy `SettingsGroup` + `Reflect` resource registered in `AppTypeRegistry`.
     ReflectedSettingsGroup(TypeId),
 }
@@ -253,6 +298,7 @@ impl Plugin for ModReflectPlugin {
             install_mod_brp_methods(app.world_mut());
         }
         let _ = sync_witness_reflection_schemas(app.world_mut());
+        let _ = sync_bam_field_reflection_schemas(app.world_mut());
     }
 }
 
@@ -265,12 +311,32 @@ fn register_standard_witness_types(app_types: &AppTypeRegistry) {
     reg.register::<i32>();
     reg.register::<i64>();
     reg.register::<i128>();
+    reg.register::<isize>();
     reg.register::<u8>();
     reg.register::<u16>();
     reg.register::<u32>();
     reg.register::<u64>();
     reg.register::<u128>();
+    reg.register::<usize>();
     reg.register::<bool>();
+    reg.register::<Entity>();
+    reg.register::<[f32; 2]>();
+    reg.register::<[f32; 3]>();
+    reg.register::<[f32; 4]>();
+    reg.register::<[f64; 2]>();
+    reg.register::<[f64; 3]>();
+    reg.register::<[f64; 4]>();
+    reg.register::<[u32; 2]>();
+    reg.register::<[u32; 3]>();
+    reg.register::<[u32; 4]>();
+    reg.register::<[i32; 2]>();
+    reg.register::<[i32; 3]>();
+    reg.register::<[i32; 4]>();
+    reg.register::<[u8; 2]>();
+    reg.register::<[u8; 3]>();
+    reg.register::<[u8; 4]>();
+    reg.register::<[u8; 8]>();
+    reg.register::<[u8; 16]>();
     reg.register::<String>();
     reg.register::<Vec<u8>>();
     reg.register::<Vec<u32>>();
@@ -391,8 +457,132 @@ pub fn sync_witness_reflection_schemas(world: &mut World) -> usize {
     count
 }
 
-/// Safe [`World`] extension methods for `bridge-reflect`, witness `DynamicStruct` round-trips,
-/// `bevy_remote` BRP dispatch, and `bevy_settings` TOML sync (`#![forbid(unsafe_code)]`).
+fn ensure_standard_reflect_types_registered(world: &mut World) {
+    if !world.contains_resource::<AppTypeRegistry>() {
+        world.insert_resource(AppTypeRegistry::default());
+    }
+    let app_types = world.resource::<AppTypeRegistry>().clone();
+    let needs_init = {
+        let reg = app_types.read();
+        !reg.contains(TypeId::of::<[f32; 3]>()) || !reg.contains(TypeId::of::<Entity>())
+    };
+    if needs_init {
+        register_standard_witness_types(&app_types);
+    }
+}
+
+/// Synchronizes all mod-registered components and resources carrying non-empty ABI `0.3`
+/// [`bevy_abi_mod_sys::BamFieldDesc`] metadata (e.g. C99, C++17, Zig, or raw `ComponentDesc`
+/// registrations without Rust proc-macro witness VTables) into [`AppTypeRegistry`] (with dynamic
+/// `StructInfo`, [`ReflectFromPtr`], [`ReflectComponent`], and [`ReflectResource`]) and
+/// [`ModReflectRegistry`], returning the number of synchronized schemas.
+pub fn sync_bam_field_reflection_schemas(world: &mut World) -> usize {
+    ensure_standard_reflect_types_registered(world);
+    if !world.contains_resource::<ModReflectRegistry>() {
+        world.insert_resource(ModReflectRegistry::default());
+    }
+
+    let candidates: Vec<(BamComponent, String, usize, usize, bool, bool, bool)> = {
+        let Some(reg) = world.get_resource::<ModRegistry>() else {
+            return 0;
+        };
+        reg.snapshot()
+            .entries()
+            .iter()
+            .filter(|e| !e.is_message() && !e.is_event() && !e.fields.is_empty())
+            .map(|e| {
+                (
+                    e.handle,
+                    e.name.to_string(),
+                    e.size,
+                    e.align,
+                    e.is_resource(),
+                    e.is_immutable(),
+                    e.is_abi_pod,
+                )
+            })
+            .collect()
+    };
+
+    let mut discovered = Vec::new();
+    for (handle, canonical_name, size, align, is_resource, is_immutable, is_abi_pod) in candidates {
+        // Never shadow an explicitly registered native Rust `#[derive(Reflect)]` type.
+        if world
+            .get_resource::<ModReflectRegistry>()
+            .is_some_and(|r| r.typed_entries.contains_key(&handle))
+        {
+            continue;
+        }
+        let has_native_reflect = {
+            let comp_id = world
+                .get_resource::<ModRegistry>()
+                .and_then(|r| r.get_by_handle(handle))
+                .map(|e| e.component_id);
+            let native_tid = comp_id
+                .and_then(|cid| world.components().get_info(cid))
+                .and_then(|info| info.type_id());
+            native_tid.is_some_and(|tid| {
+                world
+                    .resource::<AppTypeRegistry>()
+                    .read()
+                    .get(tid)
+                    .is_some_and(|reg| reg.data::<ReflectFromPtr>().is_some())
+            })
+        };
+        if has_native_reflect {
+            continue;
+        }
+
+        let Ok(Some(fields)) = inspect_component_bam_fields(world, handle) else {
+            continue;
+        };
+        let has_non_pod_fields = fields
+            .iter()
+            .any(|f| f.pod_kind.is_none() && f.kind != BamFieldKind::OPAQUE);
+        if has_non_pod_fields && inspect_component_witness_fields(world, handle).is_some() {
+            // Witness VTable covers non-POD fields (`String`/`Vec`/`FfiOption`); avoid shadowing it
+            // with a partial POD-only adapter.
+            continue;
+        }
+        if !fields.iter().any(|f| f.pod_kind.is_some()) {
+            continue;
+        }
+
+        let reflected_type_id = register_bam_field_reflect_type(world, handle)
+            .ok()
+            .flatten();
+        discovered.push((
+            handle,
+            BamFieldReflectSchema {
+                component: handle,
+                canonical_name,
+                size,
+                align,
+                is_resource,
+                is_immutable,
+                is_abi_pod,
+                reflected_type_id,
+                fields,
+            },
+        ));
+    }
+
+    let count = discovered.len();
+    let mut reflect_reg = world.resource_mut::<ModReflectRegistry>();
+    for (handle, schema) in discovered {
+        reflect_reg.bam_field_schemas.insert(handle, schema);
+    }
+    count
+}
+
+fn sync_all_mod_reflection_schemas(world: &mut World) {
+    let _ = sync_witness_reflection_schemas(world);
+    let _ = sync_bam_field_reflection_schemas(world);
+}
+
+/// Safe [`World`] extension methods for `bridge-reflect`, witness & declarative `BamFieldDesc`
+/// reflection (`ReflectFromPtr` / `DynamicStruct`), `bevy_remote` BRP dispatch, and
+/// `bevy_settings` TOML sync (`#![forbid(unsafe_code)]`).
 pub trait ModReflectWorldExt {
     /// Registers host component `T` in both [`ModRegistry`] and [`AppTypeRegistry`] (recording
     /// `ReflectComponent` and `ReflectFromPtr` metadata).
@@ -425,8 +615,8 @@ pub trait ModReflectWorldExt {
         &mut self,
     ) -> Result<BamComponent, ComponentCollisionError>;
 
-    /// Binds a witness-backed mod singleton resource `resource` to TOML section `[group_name]` in
-    /// [`ModSettingsRegistry`].
+    /// Binds a witness-backed or declarative `BamFieldDesc` mod singleton resource `resource` to
+    /// TOML section `[group_name]` in [`ModSettingsRegistry`].
     fn register_mod_settings_resource(
         &mut self,
         resource: BamComponent,
@@ -439,15 +629,29 @@ pub trait ModReflectWorldExt {
         component: BamComponent,
     ) -> Result<WitnessReflectSchema, FfiResult>;
 
-    /// Borrows a typed `Reflect` component from `entity` via [`ReflectFromPtr`] (`ffi/validation`).
+    /// Validates declarative ABI `0.3` [`bevy_abi_mod_sys::BamFieldDesc`] metadata for
+    /// `component`, binds a dynamic `StructInfo` + [`ReflectFromPtr`] + [`ReflectComponent`]
+    /// (and [`ReflectResource`] for resources) adapter in [`AppTypeRegistry`] when layout permits,
+    /// and caches [`BamFieldReflectSchema`] in [`ModReflectRegistry`].
+    fn register_bam_field_reflection(
+        &mut self,
+        component: BamComponent,
+    ) -> Result<BamFieldReflectSchema, FfiResult>;
+
+    /// Synchronizes all mod-registered components & resources carrying declarative `BamFieldDesc`
+    /// metadata into [`AppTypeRegistry`] and [`ModReflectRegistry`].
+    fn sync_bam_field_reflection(&mut self) -> usize;
+
+    /// Borrows a typed or declarative `BamFieldDesc` `Reflect` component from `entity` via
+    /// [`ReflectFromPtr`] (`ffi/validation`).
     fn reflect_mod_component(
         &self,
         entity: Entity,
         component: BamComponent,
     ) -> Result<&dyn Reflect, FfiResult>;
 
-    /// Mutably visits a typed `Reflect` component on `entity` inside `f` via [`ReflectFromPtr`]
-    /// (`bevy_abi_mod_host_sys::reflect_entity_component_mut`).
+    /// Mutably visits a typed or declarative `BamFieldDesc` `Reflect` component on `entity` inside
+    /// `f` via [`ReflectFromPtr`] (`bevy_abi_mod_host_sys::reflect_entity_component_mut`).
     fn with_reflect_mod_component_mut<R>(
         &mut self,
         entity: Entity,
@@ -455,9 +659,21 @@ pub trait ModReflectWorldExt {
         f: impl FnOnce(Mut<'_, dyn Reflect>) -> R,
     ) -> Result<R, FfiResult>;
 
+    /// Borrows a typed or declarative `BamFieldDesc` `Reflect` singleton resource via
+    /// [`ReflectFromPtr`] (`bevy_abi_mod_host_sys::reflect_resource_component`).
+    fn reflect_mod_resource(&self, resource: BamComponent) -> Result<&dyn Reflect, FfiResult>;
+
+    /// Mutably visits a typed or declarative `BamFieldDesc` `Reflect` singleton resource inside `f`
+    /// via [`ReflectFromPtr`] (`bevy_abi_mod_host_sys::reflect_resource_component_mut`).
+    fn with_reflect_mod_resource_mut<R>(
+        &mut self,
+        resource: BamComponent,
+        f: impl FnOnce(Mut<'_, dyn Reflect>) -> R,
+    ) -> Result<R, FfiResult>;
+
     /// Clones a mod component on `entity` into a boxed dynamic representation using Bevy `0.20`'s
-    /// fallible [`PartialReflect::to_dynamic`] (for typed `Reflect` types) or witness
-    /// `DynamicStruct` synthesis (for dynamic C-ABI components).
+    /// fallible [`PartialReflect::to_dynamic`] (for typed `Reflect` and in-place `BamFieldDesc`
+    /// types), witness `DynamicStruct` synthesis, or byte-offset `BamFieldDesc` decoding.
     fn clone_mod_component_dynamic(
         &self,
         entity: Entity,
@@ -494,10 +710,43 @@ pub trait ModReflectWorldExt {
         dyn_struct: &DynamicStruct,
     ) -> Result<(), FfiResult>;
 
+    /// Exports an entity's declarative `BamFieldDesc` POD component into a synthesized
+    /// [`DynamicStruct`] by reading exact validated field byte offsets.
+    fn export_bam_fields_dynamic_struct(
+        &self,
+        entity: Entity,
+        component: BamComponent,
+    ) -> Result<DynamicStruct, FfiResult>;
+
+    /// Applies fields from `dyn_struct` back onto an existing entity component using validated
+    /// declarative `BamFieldDesc` byte offsets.
+    fn apply_bam_fields_dynamic_struct(
+        &mut self,
+        entity: Entity,
+        component: BamComponent,
+        dyn_struct: &DynamicStruct,
+    ) -> Result<(), FfiResult>;
+
+    /// Exports a declarative `BamFieldDesc` POD singleton resource into a synthesized
+    /// [`DynamicStruct`].
+    fn export_bam_fields_resource_dynamic_struct(
+        &self,
+        resource: BamComponent,
+    ) -> Result<DynamicStruct, FfiResult>;
+
+    /// Applies fields from `dyn_struct` back onto an existing declarative `BamFieldDesc` POD
+    /// singleton resource.
+    fn apply_bam_fields_resource_dynamic_struct(
+        &mut self,
+        resource: BamComponent,
+        dyn_struct: &DynamicStruct,
+    ) -> Result<(), FfiResult>;
+
     /// Executes a Bevy Remote Protocol [`BrpRequest`] synchronously against `self`.
     fn dispatch_mod_brp_request(&mut self, request: BrpRequest) -> BrpResult;
 
-    /// Serializes all registered mod settings groups (`SettingsGroup` + witness resources) to TOML.
+    /// Serializes all registered mod settings groups (`SettingsGroup` + witness/declarative
+    /// resources) to TOML.
     fn export_mod_settings_toml(&self) -> Result<String, ModSettingsError>;
 
     /// Deserializes TOML settings sections and applies matching values into live world resources.
@@ -509,6 +758,53 @@ pub trait ModReflectWorldExt {
     /// Reads TOML settings from `path` and applies them to live world resources.
     fn load_mod_settings_file(&mut self, path: impl AsRef<Path>)
     -> Result<usize, ModSettingsError>;
+}
+
+fn resolve_reflected_type_id(world: &World, handle: BamComponent) -> Result<TypeId, FfiResult> {
+    let reg = world
+        .get_resource::<ModRegistry>()
+        .ok_or(FfiResult::INVALID_STATE)?;
+    let entry = reg
+        .get_by_handle(handle)
+        .ok_or(FfiResult::INVALID_COMPONENT)?;
+    let info = world
+        .components()
+        .get_info(entry.component_id)
+        .ok_or(FfiResult::INVALID_COMPONENT)?;
+    if let Some(native_tid) = info.type_id()
+        && let Some(app_types) = world.get_resource::<AppTypeRegistry>()
+        && app_types
+            .read()
+            .get(native_tid)
+            .is_some_and(|reg| reg.data::<ReflectFromPtr>().is_some())
+    {
+        return Ok(native_tid);
+    }
+    if let Some(slot_tid) = world
+        .get_resource::<ModReflectRegistry>()
+        .and_then(|r| r.bam_field_schema(handle))
+        .and_then(|s| s.reflected_type_id)
+    {
+        return Ok(slot_tid);
+    }
+    info.type_id().ok_or(FfiResult::UNSUPPORTED)
+}
+
+fn resolve_bam_field_descriptors(
+    world: &World,
+    handle: BamComponent,
+) -> Result<(Vec<BamFieldDescriptor>, Option<TypeId>), FfiResult> {
+    if let Some(schema) = world
+        .get_resource::<ModReflectRegistry>()
+        .and_then(|r| r.bam_field_schema(handle))
+    {
+        return Ok((schema.fields.clone(), schema.reflected_type_id));
+    }
+    let fields = inspect_component_bam_fields(world, handle)?.ok_or(FfiResult::UNSUPPORTED)?;
+    if !fields.iter().any(|f| f.pod_kind.is_some()) {
+        return Err(FfiResult::UNSUPPORTED);
+    }
+    Ok((fields, None))
 }
 
 impl ModReflectWorldExt for World {
@@ -653,7 +949,9 @@ impl ModReflectWorldExt for World {
         if !entry.is_resource() {
             return Err(FfiResult::INVALID_COMPONENT);
         }
-        let _ = self.register_witness_reflection(resource)?;
+        if self.register_witness_reflection(resource).is_err() {
+            let _ = self.register_bam_field_reflection(resource)?;
+        }
         if !self.contains_resource::<ModSettingsRegistry>() {
             self.insert_resource(ModSettingsRegistry::default());
         }
@@ -665,7 +963,7 @@ impl ModReflectWorldExt for World {
         settings_reg.bindings.retain(|b| b.group_name != group_name);
         settings_reg.bindings.push(ModSettingsBinding {
             group_name,
-            kind: SettingsBindingKind::WitnessResource(resource),
+            kind: SettingsBindingKind::ModResource(resource),
         });
         Ok(())
     }
@@ -712,6 +1010,60 @@ impl ModReflectWorldExt for World {
         Ok(schema)
     }
 
+    fn register_bam_field_reflection(
+        &mut self,
+        component: BamComponent,
+    ) -> Result<BamFieldReflectSchema, FfiResult> {
+        ensure_standard_reflect_types_registered(self);
+        let (canonical_name, size, align, is_resource, is_immutable, is_abi_pod) = {
+            let reg = self
+                .get_resource::<ModRegistry>()
+                .ok_or(FfiResult::INVALID_STATE)?;
+            let entry = reg
+                .get_by_handle(component)
+                .ok_or(FfiResult::INVALID_COMPONENT)?;
+            if entry.is_message() || entry.is_event() {
+                return Err(FfiResult::INVALID_COMPONENT);
+            }
+            (
+                entry.name.to_string(),
+                entry.size,
+                entry.align,
+                entry.is_resource(),
+                entry.is_immutable(),
+                entry.is_abi_pod,
+            )
+        };
+        let fields =
+            inspect_component_bam_fields(self, component)?.ok_or(FfiResult::UNSUPPORTED)?;
+        if !fields.iter().any(|f| f.pod_kind.is_some()) {
+            return Err(FfiResult::UNSUPPORTED);
+        }
+        let reflected_type_id = register_bam_field_reflect_type(self, component)?;
+        let schema = BamFieldReflectSchema {
+            component,
+            canonical_name,
+            size,
+            align,
+            is_resource,
+            is_immutable,
+            is_abi_pod,
+            reflected_type_id,
+            fields,
+        };
+        if !self.contains_resource::<ModReflectRegistry>() {
+            self.insert_resource(ModReflectRegistry::default());
+        }
+        self.resource_mut::<ModReflectRegistry>()
+            .bam_field_schemas
+            .insert(component, schema.clone());
+        Ok(schema)
+    }
+
+    fn sync_bam_field_reflection(&mut self) -> usize {
+        sync_bam_field_reflection_schemas(self)
+    }
+
     fn reflect_mod_component(
         &self,
         entity: Entity,
@@ -723,14 +1075,13 @@ impl ModReflectWorldExt for World {
         let entry = reg
             .get_by_handle(component)
             .ok_or(FfiResult::INVALID_COMPONENT)?;
+        if entry.is_resource() || entry.is_message() {
+            return Err(FfiResult::INVALID_COMPONENT);
+        }
         let entity_ref = self
             .get_entity(entity)
             .map_err(|_| FfiResult::INVALID_ENTITY)?;
-        let info = self
-            .components()
-            .get_info(entry.component_id)
-            .ok_or(FfiResult::INVALID_COMPONENT)?;
-        let type_id = info.type_id().ok_or(FfiResult::UNSUPPORTED)?;
+        let type_id = resolve_reflected_type_id(self, component)?;
         let app_types = self
             .get_resource::<AppTypeRegistry>()
             .ok_or(FfiResult::INVALID_STATE)?;
@@ -752,6 +1103,37 @@ impl ModReflectWorldExt for World {
         with_reflect_mod_component_mut(self, entity, component, f)
     }
 
+    fn reflect_mod_resource(&self, resource: BamComponent) -> Result<&dyn Reflect, FfiResult> {
+        let reg = self
+            .get_resource::<ModRegistry>()
+            .ok_or(FfiResult::INVALID_STATE)?;
+        let entry = reg
+            .get_by_handle(resource)
+            .ok_or(FfiResult::INVALID_COMPONENT)?;
+        if !entry.is_resource() {
+            return Err(FfiResult::INVALID_COMPONENT);
+        }
+        let type_id = resolve_reflected_type_id(self, resource)?;
+        let app_types = self
+            .get_resource::<AppTypeRegistry>()
+            .ok_or(FfiResult::INVALID_STATE)?;
+        let types = app_types.read();
+        let registration = types.get(type_id).ok_or(FfiResult::NOT_FOUND)?;
+        let reflect_from_ptr = registration
+            .data::<ReflectFromPtr>()
+            .ok_or(FfiResult::UNSUPPORTED)?;
+        reflect_resource_component(self, entry.component_id, reflect_from_ptr)
+            .ok_or(FfiResult::NOT_FOUND)
+    }
+
+    fn with_reflect_mod_resource_mut<R>(
+        &mut self,
+        resource: BamComponent,
+        f: impl FnOnce(Mut<'_, dyn Reflect>) -> R,
+    ) -> Result<R, FfiResult> {
+        with_reflect_mod_resource_mut(self, resource, f)
+    }
+
     fn clone_mod_component_dynamic(
         &self,
         entity: Entity,
@@ -760,7 +1142,10 @@ impl ModReflectWorldExt for World {
         if let Ok(typed) = self.reflect_mod_component(entity, component) {
             return typed.to_dynamic().map_err(ModReflectError::from);
         }
-        let dyn_struct = self.export_witness_dynamic_struct(entity, component)?;
+        if let Ok(dyn_struct) = self.export_witness_dynamic_struct(entity, component) {
+            return Ok(Box::new(dyn_struct));
+        }
+        let dyn_struct = self.export_bam_fields_dynamic_struct(entity, component)?;
         Ok(Box::new(dyn_struct))
     }
 
@@ -836,6 +1221,81 @@ impl ModReflectWorldExt for World {
         apply_resource_fields(self, resource, &records)
     }
 
+    fn export_bam_fields_dynamic_struct(
+        &self,
+        entity: Entity,
+        component: BamComponent,
+    ) -> Result<DynamicStruct, FfiResult> {
+        let (fields, reflected_type_id) = resolve_bam_field_descriptors(self, component)?;
+        let mut out = DynamicStruct::default();
+        for field in &fields {
+            let Some(pod_kind) = field.pod_kind else {
+                continue;
+            };
+            let bytes =
+                read_entity_bam_field_bytes(self, entity, component, field.offset, field.size)?;
+            let val =
+                decode_bam_field_to_reflect(pod_kind, &bytes).ok_or(FfiResult::INVALID_ARGUMENT)?;
+            out.insert_boxed(field.name.clone(), val);
+        }
+        if let Some(tid) = reflected_type_id
+            && let Some(app_types) = self.get_resource::<AppTypeRegistry>()
+        {
+            let types = app_types.read();
+            if let Some(reg) = types.get(tid) {
+                out.set_represented_type(Some(reg.type_info()));
+            }
+        }
+        Ok(out)
+    }
+
+    fn apply_bam_fields_dynamic_struct(
+        &mut self,
+        entity: Entity,
+        component: BamComponent,
+        dyn_struct: &DynamicStruct,
+    ) -> Result<(), FfiResult> {
+        let (fields, _) = resolve_bam_field_descriptors(self, component)?;
+        let patches = dynamic_struct_to_bam_field_patches(dyn_struct, &fields)?;
+        write_entity_bam_field_bytes(self, entity, component, &patches)
+    }
+
+    fn export_bam_fields_resource_dynamic_struct(
+        &self,
+        resource: BamComponent,
+    ) -> Result<DynamicStruct, FfiResult> {
+        let (fields, reflected_type_id) = resolve_bam_field_descriptors(self, resource)?;
+        let mut out = DynamicStruct::default();
+        for field in &fields {
+            let Some(pod_kind) = field.pod_kind else {
+                continue;
+            };
+            let bytes = read_resource_bam_field_bytes(self, resource, field.offset, field.size)?;
+            let val =
+                decode_bam_field_to_reflect(pod_kind, &bytes).ok_or(FfiResult::INVALID_ARGUMENT)?;
+            out.insert_boxed(field.name.clone(), val);
+        }
+        if let Some(tid) = reflected_type_id
+            && let Some(app_types) = self.get_resource::<AppTypeRegistry>()
+        {
+            let types = app_types.read();
+            if let Some(reg) = types.get(tid) {
+                out.set_represented_type(Some(reg.type_info()));
+            }
+        }
+        Ok(out)
+    }
+
+    fn apply_bam_fields_resource_dynamic_struct(
+        &mut self,
+        resource: BamComponent,
+        dyn_struct: &DynamicStruct,
+    ) -> Result<(), FfiResult> {
+        let (fields, _) = resolve_bam_field_descriptors(self, resource)?;
+        let patches = dynamic_struct_to_bam_field_patches(dyn_struct, &fields)?;
+        write_resource_bam_field_bytes(self, resource, &patches)
+    }
+
     fn dispatch_mod_brp_request(&mut self, request: BrpRequest) -> BrpResult {
         handle_mod_brp_request(self, &request)
     }
@@ -868,31 +1328,43 @@ impl ModReflectWorldExt for World {
     }
 }
 
-/// Mutably visits a typed `Reflect` component on `entity` inside `f` via [`ReflectFromPtr`]
-/// (`bevy_abi_mod_host_sys::reflect_entity_component_mut`).
+/// Mutably visits a typed or declarative `BamFieldDesc` `Reflect` component on `entity` inside `f`
+/// via [`ReflectFromPtr`] (`bevy_abi_mod_host_sys::reflect_entity_component_mut`).
 pub fn with_reflect_mod_component_mut<R>(
     world: &mut World,
     entity: Entity,
     component: BamComponent,
     f: impl FnOnce(Mut<'_, dyn Reflect>) -> R,
 ) -> Result<R, FfiResult> {
-    let (comp_id, is_immutable) = {
+    let (comp_id, is_immutable, is_resource, is_message, has_bam_fields) = {
         let reg = world
             .get_resource::<ModRegistry>()
             .ok_or(FfiResult::INVALID_STATE)?;
         let entry = reg
             .get_by_handle(component)
             .ok_or(FfiResult::INVALID_COMPONENT)?;
-        (entry.component_id, entry.is_immutable())
+        (
+            entry.component_id,
+            entry.is_immutable(),
+            entry.is_resource(),
+            entry.is_message(),
+            !entry.fields.is_empty(),
+        )
     };
+    if is_resource || is_message {
+        return Err(FfiResult::INVALID_COMPONENT);
+    }
     if is_immutable {
         return Err(FfiResult::PERMISSION_DENIED);
     }
-    let info = world
-        .components()
-        .get_info(comp_id)
-        .ok_or(FfiResult::INVALID_COMPONENT)?;
-    let type_id = info.type_id().ok_or(FfiResult::UNSUPPORTED)?;
+    let type_id = match resolve_reflected_type_id(world, component) {
+        Ok(tid) => tid,
+        Err(_) if has_bam_fields => world
+            .register_bam_field_reflection(component)?
+            .reflected_type_id
+            .ok_or(FfiResult::UNSUPPORTED)?,
+        Err(err) => return Err(err),
+    };
     let reflect_from_ptr = {
         let app_types = world
             .get_resource::<AppTypeRegistry>()
@@ -908,6 +1380,57 @@ pub fn with_reflect_mod_component_mut<R>(
         .get_entity_mut(entity)
         .map_err(|_| FfiResult::INVALID_ENTITY)?;
     let reflected = reflect_entity_component_mut(&mut ent_mut, comp_id, &reflect_from_ptr)
+        .ok_or(FfiResult::NOT_FOUND)?;
+    Ok(f(reflected))
+}
+
+/// Mutably visits a typed or declarative `BamFieldDesc` `Reflect` singleton resource inside `f`
+/// via [`ReflectFromPtr`] (`bevy_abi_mod_host_sys::reflect_resource_component_mut`).
+pub fn with_reflect_mod_resource_mut<R>(
+    world: &mut World,
+    resource: BamComponent,
+    f: impl FnOnce(Mut<'_, dyn Reflect>) -> R,
+) -> Result<R, FfiResult> {
+    let (comp_id, is_immutable, is_resource, has_bam_fields) = {
+        let reg = world
+            .get_resource::<ModRegistry>()
+            .ok_or(FfiResult::INVALID_STATE)?;
+        let entry = reg
+            .get_by_handle(resource)
+            .ok_or(FfiResult::INVALID_COMPONENT)?;
+        (
+            entry.component_id,
+            entry.is_immutable(),
+            entry.is_resource(),
+            !entry.fields.is_empty(),
+        )
+    };
+    if !is_resource {
+        return Err(FfiResult::INVALID_COMPONENT);
+    }
+    if is_immutable {
+        return Err(FfiResult::PERMISSION_DENIED);
+    }
+    let type_id = match resolve_reflected_type_id(world, resource) {
+        Ok(tid) => tid,
+        Err(_) if has_bam_fields => world
+            .register_bam_field_reflection(resource)?
+            .reflected_type_id
+            .ok_or(FfiResult::UNSUPPORTED)?,
+        Err(err) => return Err(err),
+    };
+    let reflect_from_ptr = {
+        let app_types = world
+            .get_resource::<AppTypeRegistry>()
+            .ok_or(FfiResult::INVALID_STATE)?;
+        let types = app_types.read();
+        let registration = types.get(type_id).ok_or(FfiResult::NOT_FOUND)?;
+        registration
+            .data::<ReflectFromPtr>()
+            .ok_or(FfiResult::UNSUPPORTED)?
+            .clone()
+    };
+    let reflected = reflect_resource_component_mut(world, comp_id, &reflect_from_ptr)
         .ok_or(FfiResult::NOT_FOUND)?;
     Ok(f(reflected))
 }
@@ -943,12 +1466,24 @@ pub trait ModReflectAppExt {
         &mut self,
     ) -> Result<BamComponent, ComponentCollisionError>;
 
-    /// Binds a witness-backed mod singleton resource `resource` to TOML section `[group_name]`.
+    /// Binds a witness-backed or declarative `BamFieldDesc` mod singleton resource `resource` to
+    /// TOML section `[group_name]`.
     fn register_mod_settings_resource(
         &mut self,
         resource: BamComponent,
         group_name: impl Into<String>,
     ) -> Result<(), FfiResult>;
+
+    /// Registers declarative `BamFieldDesc` reflection for `component` into [`AppTypeRegistry`]
+    /// and [`ModReflectRegistry`].
+    fn register_bam_field_reflection(
+        &mut self,
+        component: BamComponent,
+    ) -> Result<BamFieldReflectSchema, FfiResult>;
+
+    /// Synchronizes all declarative `BamFieldDesc` components and resources into
+    /// [`AppTypeRegistry`] and [`ModReflectRegistry`].
+    fn sync_bam_field_reflection(&mut self) -> usize;
 }
 
 impl ModReflectAppExt for App {
@@ -994,6 +1529,19 @@ impl ModReflectAppExt for App {
     ) -> Result<(), FfiResult> {
         self.world_mut()
             .register_mod_settings_resource(resource, group_name)
+    }
+
+    #[inline]
+    fn register_bam_field_reflection(
+        &mut self,
+        component: BamComponent,
+    ) -> Result<BamFieldReflectSchema, FfiResult> {
+        self.world_mut().register_bam_field_reflection(component)
+    }
+
+    #[inline]
+    fn sync_bam_field_reflection(&mut self) -> usize {
+        self.world_mut().sync_bam_field_reflection()
     }
 }
 
@@ -1351,6 +1899,9 @@ fn reflect_value_to_json(value: &dyn PartialReflect) -> Option<Value> {
     if let Some(v) = value.try_downcast_ref::<i64>() {
         return Some(Value::from(*v));
     }
+    if let Some(v) = value.try_downcast_ref::<isize>() {
+        return Some(Value::from(*v as i64));
+    }
     if let Some(v) = value.try_downcast_ref::<u8>() {
         return Some(Value::from(*v));
     }
@@ -1363,8 +1914,14 @@ fn reflect_value_to_json(value: &dyn PartialReflect) -> Option<Value> {
     if let Some(v) = value.try_downcast_ref::<u64>() {
         return Some(Value::from(*v));
     }
+    if let Some(v) = value.try_downcast_ref::<usize>() {
+        return Some(Value::from(*v as u64));
+    }
     if let Some(v) = value.try_downcast_ref::<bool>() {
         return Some(Value::Bool(*v));
+    }
+    if let Some(v) = value.try_downcast_ref::<Entity>() {
+        return Some(Value::from(v.to_bits()));
     }
     if let Some(v) = value.try_downcast_ref::<String>() {
         return Some(Value::String(v.clone()));
@@ -1405,7 +1962,578 @@ fn reflect_value_to_json(value: &dyn PartialReflect) -> Option<Value> {
             None => Value::Null,
         });
     }
+    if let bevy_reflect::ReflectRef::Array(arr) = value.reflect_ref() {
+        let mut items = Vec::with_capacity(arr.len());
+        for elem in arr.iter() {
+            items.push(reflect_value_to_json(elem)?);
+        }
+        return Some(Value::Array(items));
+    }
     None
+}
+
+// ============================================================================
+// Declarative `BamFieldDesc` <-> DynamicStruct / Bytes / JSON Codec
+// ============================================================================
+
+fn decode_f32_array<const N: usize>(bytes: &[u8]) -> Option<[f32; N]> {
+    if bytes.len() != N * 4 {
+        return None;
+    }
+    let mut out = [0.0f32; N];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let chunk: [u8; 4] = bytes[i * 4..(i + 1) * 4].try_into().ok()?;
+        *slot = f32::from_ne_bytes(chunk);
+    }
+    Some(out)
+}
+
+fn decode_f64_array<const N: usize>(bytes: &[u8]) -> Option<[f64; N]> {
+    if bytes.len() != N * 8 {
+        return None;
+    }
+    let mut out = [0.0f64; N];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let chunk: [u8; 8] = bytes[i * 8..(i + 1) * 8].try_into().ok()?;
+        *slot = f64::from_ne_bytes(chunk);
+    }
+    Some(out)
+}
+
+fn decode_u32_array<const N: usize>(bytes: &[u8]) -> Option<[u32; N]> {
+    if bytes.len() != N * 4 {
+        return None;
+    }
+    let mut out = [0u32; N];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let chunk: [u8; 4] = bytes[i * 4..(i + 1) * 4].try_into().ok()?;
+        *slot = u32::from_ne_bytes(chunk);
+    }
+    Some(out)
+}
+
+fn decode_i32_array<const N: usize>(bytes: &[u8]) -> Option<[i32; N]> {
+    if bytes.len() != N * 4 {
+        return None;
+    }
+    let mut out = [0i32; N];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let chunk: [u8; 4] = bytes[i * 4..(i + 1) * 4].try_into().ok()?;
+        *slot = i32::from_ne_bytes(chunk);
+    }
+    Some(out)
+}
+
+fn decode_bam_field_to_reflect(
+    kind: BamFieldPodKind,
+    bytes: &[u8],
+) -> Option<Box<dyn PartialReflect>> {
+    match kind {
+        BamFieldPodKind::Bool => Some(Box::new(*bytes.first()? != 0)),
+        BamFieldPodKind::U8 => Some(Box::new(*bytes.first()?)),
+        BamFieldPodKind::I8 => Some(Box::new(i8::from_ne_bytes(bytes.try_into().ok()?))),
+        BamFieldPodKind::U16 => Some(Box::new(u16::from_ne_bytes(bytes.try_into().ok()?))),
+        BamFieldPodKind::I16 => Some(Box::new(i16::from_ne_bytes(bytes.try_into().ok()?))),
+        BamFieldPodKind::U32 | BamFieldPodKind::Component => {
+            Some(Box::new(u32::from_ne_bytes(bytes.try_into().ok()?)))
+        }
+        BamFieldPodKind::I32 => Some(Box::new(i32::from_ne_bytes(bytes.try_into().ok()?))),
+        BamFieldPodKind::U64 | BamFieldPodKind::Entity => {
+            Some(Box::new(u64::from_ne_bytes(bytes.try_into().ok()?)))
+        }
+        BamFieldPodKind::I64 => Some(Box::new(i64::from_ne_bytes(bytes.try_into().ok()?))),
+        BamFieldPodKind::Usize => Some(Box::new(usize::from_ne_bytes(bytes.try_into().ok()?))),
+        BamFieldPodKind::Isize => Some(Box::new(isize::from_ne_bytes(bytes.try_into().ok()?))),
+        BamFieldPodKind::F32 => Some(Box::new(f32::from_ne_bytes(bytes.try_into().ok()?))),
+        BamFieldPodKind::F64 => Some(Box::new(f64::from_ne_bytes(bytes.try_into().ok()?))),
+        BamFieldPodKind::Vec2 => Some(Box::new(decode_f32_array::<2>(bytes)?)),
+        BamFieldPodKind::Vec3 => Some(Box::new(decode_f32_array::<3>(bytes)?)),
+        BamFieldPodKind::Vec4 => Some(Box::new(decode_f32_array::<4>(bytes)?)),
+        BamFieldPodKind::DVec2 => Some(Box::new(decode_f64_array::<2>(bytes)?)),
+        BamFieldPodKind::DVec3 => Some(Box::new(decode_f64_array::<3>(bytes)?)),
+        BamFieldPodKind::DVec4 => Some(Box::new(decode_f64_array::<4>(bytes)?)),
+        BamFieldPodKind::UVec2 => Some(Box::new(decode_u32_array::<2>(bytes)?)),
+        BamFieldPodKind::UVec3 => Some(Box::new(decode_u32_array::<3>(bytes)?)),
+        BamFieldPodKind::UVec4 => Some(Box::new(decode_u32_array::<4>(bytes)?)),
+        BamFieldPodKind::IVec2 => Some(Box::new(decode_i32_array::<2>(bytes)?)),
+        BamFieldPodKind::IVec3 => Some(Box::new(decode_i32_array::<3>(bytes)?)),
+        BamFieldPodKind::IVec4 => Some(Box::new(decode_i32_array::<4>(bytes)?)),
+        BamFieldPodKind::Bytes2 => Some(Box::new(<[u8; 2]>::try_from(bytes).ok()?)),
+        BamFieldPodKind::Bytes3 => Some(Box::new(<[u8; 3]>::try_from(bytes).ok()?)),
+        BamFieldPodKind::Bytes4 => Some(Box::new(<[u8; 4]>::try_from(bytes).ok()?)),
+        BamFieldPodKind::Bytes8 => Some(Box::new(<[u8; 8]>::try_from(bytes).ok()?)),
+        BamFieldPodKind::Bytes16 => Some(Box::new(<[u8; 16]>::try_from(bytes).ok()?)),
+    }
+}
+
+fn reflect_as_f64(value: &dyn PartialReflect) -> Option<f64> {
+    if let Some(v) = value.try_downcast_ref::<f32>() {
+        return Some(f64::from(*v));
+    }
+    if let Some(v) = value.try_downcast_ref::<f64>() {
+        return Some(*v);
+    }
+    if let Some(v) = value.try_downcast_ref::<i8>() {
+        return Some(f64::from(*v));
+    }
+    if let Some(v) = value.try_downcast_ref::<i16>() {
+        return Some(f64::from(*v));
+    }
+    if let Some(v) = value.try_downcast_ref::<i32>() {
+        return Some(f64::from(*v));
+    }
+    if let Some(v) = value.try_downcast_ref::<i64>() {
+        return Some(*v as f64);
+    }
+    if let Some(v) = value.try_downcast_ref::<u8>() {
+        return Some(f64::from(*v));
+    }
+    if let Some(v) = value.try_downcast_ref::<u16>() {
+        return Some(f64::from(*v));
+    }
+    if let Some(v) = value.try_downcast_ref::<u32>() {
+        return Some(f64::from(*v));
+    }
+    if let Some(v) = value.try_downcast_ref::<u64>() {
+        return Some(*v as f64);
+    }
+    None
+}
+
+fn reflect_as_i128(value: &dyn PartialReflect) -> Option<i128> {
+    if let Some(v) = value.try_downcast_ref::<i8>() {
+        return Some(i128::from(*v));
+    }
+    if let Some(v) = value.try_downcast_ref::<i16>() {
+        return Some(i128::from(*v));
+    }
+    if let Some(v) = value.try_downcast_ref::<i32>() {
+        return Some(i128::from(*v));
+    }
+    if let Some(v) = value.try_downcast_ref::<i64>() {
+        return Some(i128::from(*v));
+    }
+    if let Some(v) = value.try_downcast_ref::<i128>() {
+        return Some(*v);
+    }
+    if let Some(v) = value.try_downcast_ref::<isize>() {
+        return Some(*v as i128);
+    }
+    if let Some(v) = value.try_downcast_ref::<u8>() {
+        return Some(i128::from(*v));
+    }
+    if let Some(v) = value.try_downcast_ref::<u16>() {
+        return Some(i128::from(*v));
+    }
+    if let Some(v) = value.try_downcast_ref::<u32>() {
+        return Some(i128::from(*v));
+    }
+    if let Some(v) = value.try_downcast_ref::<u64>() {
+        return Some(i128::from(*v));
+    }
+    if let Some(v) = value.try_downcast_ref::<usize>() {
+        return Some(*v as i128);
+    }
+    if let Some(v) = value.try_downcast_ref::<Entity>() {
+        return Some(i128::from(v.to_bits()));
+    }
+    None
+}
+
+fn reflect_sequence_items(value: &dyn PartialReflect) -> Option<Vec<&dyn PartialReflect>> {
+    match value.reflect_ref() {
+        bevy_reflect::ReflectRef::Array(arr) => Some(arr.iter().collect()),
+        bevy_reflect::ReflectRef::List(list) => Some(list.iter().collect()),
+        _ => None,
+    }
+}
+
+fn encode_reflect_array_elems<T>(
+    value: &dyn PartialReflect,
+    expected_len: usize,
+    mut parse_elem: impl FnMut(&dyn PartialReflect) -> Result<T, FfiResult>,
+    mut push_bytes: impl FnMut(T, &mut Vec<u8>),
+    elem_size: usize,
+) -> Result<Vec<u8>, FfiResult> {
+    let items = reflect_sequence_items(value).ok_or(FfiResult::TYPE_MISMATCH)?;
+    if items.len() != expected_len {
+        return Err(FfiResult::INVALID_ARGUMENT);
+    }
+    let mut out = Vec::with_capacity(expected_len * elem_size);
+    for item in items {
+        let parsed = parse_elem(item)?;
+        push_bytes(parsed, &mut out);
+    }
+    Ok(out)
+}
+
+fn encode_reflect_to_bam_field_bytes(
+    kind: BamFieldPodKind,
+    value: &dyn PartialReflect,
+) -> Result<Vec<u8>, FfiResult> {
+    match kind {
+        BamFieldPodKind::Bool => value
+            .try_downcast_ref::<bool>()
+            .map(|b| vec![u8::from(*b)])
+            .ok_or(FfiResult::TYPE_MISMATCH),
+        BamFieldPodKind::U8 => {
+            let n = reflect_as_i128(value).ok_or(FfiResult::TYPE_MISMATCH)?;
+            u8::try_from(n)
+                .map(|x| x.to_ne_bytes().to_vec())
+                .map_err(|_| FfiResult::INVALID_ARGUMENT)
+        }
+        BamFieldPodKind::I8 => {
+            let n = reflect_as_i128(value).ok_or(FfiResult::TYPE_MISMATCH)?;
+            i8::try_from(n)
+                .map(|x| x.to_ne_bytes().to_vec())
+                .map_err(|_| FfiResult::INVALID_ARGUMENT)
+        }
+        BamFieldPodKind::U16 => {
+            let n = reflect_as_i128(value).ok_or(FfiResult::TYPE_MISMATCH)?;
+            u16::try_from(n)
+                .map(|x| x.to_ne_bytes().to_vec())
+                .map_err(|_| FfiResult::INVALID_ARGUMENT)
+        }
+        BamFieldPodKind::I16 => {
+            let n = reflect_as_i128(value).ok_or(FfiResult::TYPE_MISMATCH)?;
+            i16::try_from(n)
+                .map(|x| x.to_ne_bytes().to_vec())
+                .map_err(|_| FfiResult::INVALID_ARGUMENT)
+        }
+        BamFieldPodKind::U32 | BamFieldPodKind::Component => {
+            let n = reflect_as_i128(value).ok_or(FfiResult::TYPE_MISMATCH)?;
+            u32::try_from(n)
+                .map(|x| x.to_ne_bytes().to_vec())
+                .map_err(|_| FfiResult::INVALID_ARGUMENT)
+        }
+        BamFieldPodKind::I32 => {
+            let n = reflect_as_i128(value).ok_or(FfiResult::TYPE_MISMATCH)?;
+            i32::try_from(n)
+                .map(|x| x.to_ne_bytes().to_vec())
+                .map_err(|_| FfiResult::INVALID_ARGUMENT)
+        }
+        BamFieldPodKind::U64 | BamFieldPodKind::Entity => {
+            let n = reflect_as_i128(value).ok_or(FfiResult::TYPE_MISMATCH)?;
+            u64::try_from(n)
+                .map(|x| x.to_ne_bytes().to_vec())
+                .map_err(|_| FfiResult::INVALID_ARGUMENT)
+        }
+        BamFieldPodKind::I64 => {
+            let n = reflect_as_i128(value).ok_or(FfiResult::TYPE_MISMATCH)?;
+            i64::try_from(n)
+                .map(|x| x.to_ne_bytes().to_vec())
+                .map_err(|_| FfiResult::INVALID_ARGUMENT)
+        }
+        BamFieldPodKind::Usize => {
+            let n = reflect_as_i128(value).ok_or(FfiResult::TYPE_MISMATCH)?;
+            usize::try_from(n)
+                .map(|x| x.to_ne_bytes().to_vec())
+                .map_err(|_| FfiResult::INVALID_ARGUMENT)
+        }
+        BamFieldPodKind::Isize => {
+            let n = reflect_as_i128(value).ok_or(FfiResult::TYPE_MISMATCH)?;
+            isize::try_from(n)
+                .map(|x| x.to_ne_bytes().to_vec())
+                .map_err(|_| FfiResult::INVALID_ARGUMENT)
+        }
+        BamFieldPodKind::F32 => {
+            let f = reflect_as_f64(value).ok_or(FfiResult::TYPE_MISMATCH)?;
+            Ok((f as f32).to_ne_bytes().to_vec())
+        }
+        BamFieldPodKind::F64 => {
+            let f = reflect_as_f64(value).ok_or(FfiResult::TYPE_MISMATCH)?;
+            Ok(f.to_ne_bytes().to_vec())
+        }
+        BamFieldPodKind::Vec2 | BamFieldPodKind::Vec3 | BamFieldPodKind::Vec4 => {
+            let len = kind.byte_size() / 4;
+            encode_reflect_array_elems(
+                value,
+                len,
+                |el| {
+                    reflect_as_f64(el)
+                        .map(|f| f as f32)
+                        .ok_or(FfiResult::TYPE_MISMATCH)
+                },
+                |v, out| out.extend_from_slice(&v.to_ne_bytes()),
+                4,
+            )
+        }
+        BamFieldPodKind::DVec2 | BamFieldPodKind::DVec3 | BamFieldPodKind::DVec4 => {
+            let len = kind.byte_size() / 8;
+            encode_reflect_array_elems(
+                value,
+                len,
+                |el| reflect_as_f64(el).ok_or(FfiResult::TYPE_MISMATCH),
+                |v, out| out.extend_from_slice(&v.to_ne_bytes()),
+                8,
+            )
+        }
+        BamFieldPodKind::UVec2 | BamFieldPodKind::UVec3 | BamFieldPodKind::UVec4 => {
+            let len = kind.byte_size() / 4;
+            encode_reflect_array_elems(
+                value,
+                len,
+                |el| {
+                    let n = reflect_as_i128(el).ok_or(FfiResult::TYPE_MISMATCH)?;
+                    u32::try_from(n).map_err(|_| FfiResult::INVALID_ARGUMENT)
+                },
+                |v, out| out.extend_from_slice(&v.to_ne_bytes()),
+                4,
+            )
+        }
+        BamFieldPodKind::IVec2 | BamFieldPodKind::IVec3 | BamFieldPodKind::IVec4 => {
+            let len = kind.byte_size() / 4;
+            encode_reflect_array_elems(
+                value,
+                len,
+                |el| {
+                    let n = reflect_as_i128(el).ok_or(FfiResult::TYPE_MISMATCH)?;
+                    i32::try_from(n).map_err(|_| FfiResult::INVALID_ARGUMENT)
+                },
+                |v, out| out.extend_from_slice(&v.to_ne_bytes()),
+                4,
+            )
+        }
+        BamFieldPodKind::Bytes2
+        | BamFieldPodKind::Bytes3
+        | BamFieldPodKind::Bytes4
+        | BamFieldPodKind::Bytes8
+        | BamFieldPodKind::Bytes16 => {
+            let len = kind.byte_size();
+            encode_reflect_array_elems(
+                value,
+                len,
+                |el| {
+                    let n = reflect_as_i128(el).ok_or(FfiResult::TYPE_MISMATCH)?;
+                    u8::try_from(n).map_err(|_| FfiResult::INVALID_ARGUMENT)
+                },
+                |v, out| out.push(v),
+                1,
+            )
+        }
+    }
+}
+
+fn dynamic_struct_to_bam_field_patches(
+    dyn_struct: &DynamicStruct,
+    fields: &[BamFieldDescriptor],
+) -> Result<Vec<BamFieldBytePatch>, FfiResult> {
+    let mut patches = Vec::new();
+    for (name, value) in dyn_struct.iter_fields() {
+        let desc = fields
+            .iter()
+            .find(|f| f.name == name)
+            .ok_or(FfiResult::NOT_FOUND)?;
+        let pod_kind = desc.pod_kind.ok_or(FfiResult::UNSUPPORTED)?;
+        let bytes = encode_reflect_to_bam_field_bytes(pod_kind, value)?;
+        if bytes.len() != desc.size {
+            return Err(FfiResult::INVALID_ARGUMENT);
+        }
+        patches.push(BamFieldBytePatch {
+            offset: desc.offset,
+            bytes,
+        });
+    }
+    Ok(patches)
+}
+
+fn json_number_as_u64(field_name: &str, val: &Value) -> Result<u64, String> {
+    val.as_u64()
+        .ok_or_else(|| format!("field '{field_name}' expected unsigned integer"))
+}
+
+fn json_number_as_i64(field_name: &str, val: &Value) -> Result<i64, String> {
+    val.as_i64()
+        .ok_or_else(|| format!("field '{field_name}' expected signed integer"))
+}
+
+fn json_number_as_f64(field_name: &str, val: &Value) -> Result<f64, String> {
+    val.as_f64()
+        .ok_or_else(|| format!("field '{field_name}' expected finite number"))
+}
+
+fn json_to_bam_field_bytes(
+    field_name: &str,
+    kind: BamFieldPodKind,
+    val: &Value,
+) -> Result<Vec<u8>, String> {
+    match kind {
+        BamFieldPodKind::Bool => val
+            .as_bool()
+            .map(|b| vec![u8::from(b)])
+            .ok_or_else(|| format!("field '{field_name}' expected bool")),
+        BamFieldPodKind::U8 => {
+            let u = json_number_as_u64(field_name, val)?;
+            u8::try_from(u)
+                .map(|x| x.to_ne_bytes().to_vec())
+                .map_err(|_| format!("field '{field_name}' out of u8 range"))
+        }
+        BamFieldPodKind::I8 => {
+            let i = json_number_as_i64(field_name, val)?;
+            i8::try_from(i)
+                .map(|x| x.to_ne_bytes().to_vec())
+                .map_err(|_| format!("field '{field_name}' out of i8 range"))
+        }
+        BamFieldPodKind::U16 => {
+            let u = json_number_as_u64(field_name, val)?;
+            u16::try_from(u)
+                .map(|x| x.to_ne_bytes().to_vec())
+                .map_err(|_| format!("field '{field_name}' out of u16 range"))
+        }
+        BamFieldPodKind::I16 => {
+            let i = json_number_as_i64(field_name, val)?;
+            i16::try_from(i)
+                .map(|x| x.to_ne_bytes().to_vec())
+                .map_err(|_| format!("field '{field_name}' out of i16 range"))
+        }
+        BamFieldPodKind::U32 | BamFieldPodKind::Component => {
+            let u = json_number_as_u64(field_name, val)?;
+            u32::try_from(u)
+                .map(|x| x.to_ne_bytes().to_vec())
+                .map_err(|_| format!("field '{field_name}' out of u32 range"))
+        }
+        BamFieldPodKind::I32 => {
+            let i = json_number_as_i64(field_name, val)?;
+            i32::try_from(i)
+                .map(|x| x.to_ne_bytes().to_vec())
+                .map_err(|_| format!("field '{field_name}' out of i32 range"))
+        }
+        BamFieldPodKind::U64 | BamFieldPodKind::Entity => {
+            let u = json_number_as_u64(field_name, val)?;
+            Ok(u.to_ne_bytes().to_vec())
+        }
+        BamFieldPodKind::I64 => {
+            let i = json_number_as_i64(field_name, val)?;
+            Ok(i.to_ne_bytes().to_vec())
+        }
+        BamFieldPodKind::Usize => {
+            let u = json_number_as_u64(field_name, val)?;
+            usize::try_from(u)
+                .map(|x| x.to_ne_bytes().to_vec())
+                .map_err(|_| format!("field '{field_name}' out of usize range"))
+        }
+        BamFieldPodKind::Isize => {
+            let i = json_number_as_i64(field_name, val)?;
+            isize::try_from(i)
+                .map(|x| x.to_ne_bytes().to_vec())
+                .map_err(|_| format!("field '{field_name}' out of isize range"))
+        }
+        BamFieldPodKind::F32 => {
+            let f = json_number_as_f64(field_name, val)?;
+            Ok((f as f32).to_ne_bytes().to_vec())
+        }
+        BamFieldPodKind::F64 => {
+            let f = json_number_as_f64(field_name, val)?;
+            Ok(f.to_ne_bytes().to_vec())
+        }
+        BamFieldPodKind::Vec2 | BamFieldPodKind::Vec3 | BamFieldPodKind::Vec4 => {
+            let len = kind.byte_size() / 4;
+            let arr = val
+                .as_array()
+                .ok_or_else(|| format!("field '{field_name}' expected [f32; {len}]"))?;
+            if arr.len() != len {
+                return Err(format!("field '{field_name}' expected {len} elements"));
+            }
+            let mut out = Vec::with_capacity(kind.byte_size());
+            for item in arr {
+                let f = json_number_as_f64(field_name, item)?;
+                out.extend_from_slice(&(f as f32).to_ne_bytes());
+            }
+            Ok(out)
+        }
+        BamFieldPodKind::DVec2 | BamFieldPodKind::DVec3 | BamFieldPodKind::DVec4 => {
+            let len = kind.byte_size() / 8;
+            let arr = val
+                .as_array()
+                .ok_or_else(|| format!("field '{field_name}' expected [f64; {len}]"))?;
+            if arr.len() != len {
+                return Err(format!("field '{field_name}' expected {len} elements"));
+            }
+            let mut out = Vec::with_capacity(kind.byte_size());
+            for item in arr {
+                let f = json_number_as_f64(field_name, item)?;
+                out.extend_from_slice(&f.to_ne_bytes());
+            }
+            Ok(out)
+        }
+        BamFieldPodKind::UVec2 | BamFieldPodKind::UVec3 | BamFieldPodKind::UVec4 => {
+            let len = kind.byte_size() / 4;
+            let arr = val
+                .as_array()
+                .ok_or_else(|| format!("field '{field_name}' expected [u32; {len}]"))?;
+            if arr.len() != len {
+                return Err(format!("field '{field_name}' expected {len} elements"));
+            }
+            let mut out = Vec::with_capacity(kind.byte_size());
+            for item in arr {
+                let u = json_number_as_u64(field_name, item)?;
+                let v = u32::try_from(u)
+                    .map_err(|_| format!("field '{field_name}' element out of u32 range"))?;
+                out.extend_from_slice(&v.to_ne_bytes());
+            }
+            Ok(out)
+        }
+        BamFieldPodKind::IVec2 | BamFieldPodKind::IVec3 | BamFieldPodKind::IVec4 => {
+            let len = kind.byte_size() / 4;
+            let arr = val
+                .as_array()
+                .ok_or_else(|| format!("field '{field_name}' expected [i32; {len}]"))?;
+            if arr.len() != len {
+                return Err(format!("field '{field_name}' expected {len} elements"));
+            }
+            let mut out = Vec::with_capacity(kind.byte_size());
+            for item in arr {
+                let i = json_number_as_i64(field_name, item)?;
+                let v = i32::try_from(i)
+                    .map_err(|_| format!("field '{field_name}' element out of i32 range"))?;
+                out.extend_from_slice(&v.to_ne_bytes());
+            }
+            Ok(out)
+        }
+        BamFieldPodKind::Bytes2
+        | BamFieldPodKind::Bytes3
+        | BamFieldPodKind::Bytes4
+        | BamFieldPodKind::Bytes8
+        | BamFieldPodKind::Bytes16 => {
+            let len = kind.byte_size();
+            let arr = val
+                .as_array()
+                .ok_or_else(|| format!("field '{field_name}' expected [u8; {len}]"))?;
+            if arr.len() != len {
+                return Err(format!("field '{field_name}' expected {len} byte elements"));
+            }
+            let mut out = Vec::with_capacity(len);
+            for item in arr {
+                let u = json_number_as_u64(field_name, item)?;
+                let b = u8::try_from(u)
+                    .map_err(|_| format!("field '{field_name}' element out of u8 range"))?;
+                out.push(b);
+            }
+            Ok(out)
+        }
+    }
+}
+
+fn json_map_to_bam_field_patches(
+    obj: &Map<String, Value>,
+    fields: &[BamFieldDescriptor],
+) -> Result<Vec<BamFieldBytePatch>, String> {
+    let mut patches = Vec::with_capacity(obj.len());
+    for (k, v) in obj {
+        let desc = fields
+            .iter()
+            .find(|f| f.name == *k)
+            .ok_or_else(|| format!("unknown field '{k}'"))?;
+        let pod_kind = desc
+            .pod_kind
+            .ok_or_else(|| format!("field '{k}' is opaque/non-POD and cannot be mutated"))?;
+        let bytes = json_to_bam_field_bytes(k, pod_kind, v)?;
+        patches.push(BamFieldBytePatch {
+            offset: desc.offset,
+            bytes,
+        });
+    }
+    Ok(patches)
 }
 
 fn json_to_record(
@@ -1635,7 +2763,7 @@ fn brp_mutate_resources_system(In(params): In<Option<Value>>, world: &mut World)
 }
 
 fn brp_list_components_impl(world: &mut World, params: Option<&Value>) -> BrpResult {
-    let _ = sync_witness_reflection_schemas(world);
+    sync_all_mod_reflection_schemas(world);
     let entity_opt = parse_entity_param(params)?;
     let entity_ref = match entity_opt {
         Some(e) => Some(world.get_entity(e).map_err(|_| {
@@ -1677,6 +2805,26 @@ fn brp_list_components_impl(world: &mut World, params: Option<&Value>) -> BrpRes
                     })
                     .collect()
             })
+            .or_else(|| {
+                reflect_reg
+                    .and_then(|r| r.bam_field_schema(entry.handle))
+                    .map(|schema| {
+                        schema
+                            .fields
+                            .iter()
+                            .map(|f| {
+                                serde_json::json!({
+                                    "name": f.name,
+                                    "type_tag": f.type_tag,
+                                    "kind": format!("{:?}", f.kind),
+                                    "offset": f.offset,
+                                    "size": f.size,
+                                    "align": f.align,
+                                })
+                            })
+                            .collect()
+                    })
+            })
             .unwrap_or_default();
         items.push(serde_json::json!({
             "name": entry.name.as_ref(),
@@ -1691,7 +2839,7 @@ fn brp_list_components_impl(world: &mut World, params: Option<&Value>) -> BrpRes
 }
 
 fn brp_get_components_impl(world: &mut World, params: Option<&Value>) -> BrpResult {
-    let _ = sync_witness_reflection_schemas(world);
+    sync_all_mod_reflection_schemas(world);
     let params = params.ok_or_else(|| brp_err(error_codes::INVALID_PARAMS, "missing params"))?;
     let entity = parse_entity_param(Some(params))?
         .ok_or_else(|| brp_err(error_codes::INVALID_PARAMS, "missing `entity` parameter"))?;
@@ -1725,6 +2873,8 @@ fn brp_get_components_impl(world: &mut World, params: Option<&Value>) -> BrpResu
         if let Ok(records) = export_entity_component_fields(world, entity, handle) {
             let dyn_struct = records_to_dynamic_struct(&records);
             components_map.insert(name.to_owned(), dynamic_struct_to_json(&dyn_struct));
+        } else if let Ok(dyn_struct) = world.export_bam_fields_dynamic_struct(entity, handle) {
+            components_map.insert(name.to_owned(), dynamic_struct_to_json(&dyn_struct));
         } else if let Some(typed_json) = serialize_typed_reflect_to_json(world, entity, handle) {
             components_map.insert(name.to_owned(), typed_json);
         } else {
@@ -1747,20 +2897,17 @@ fn apply_typed_reflect_json(
     component: BamComponent,
     value_json: &Value,
 ) -> Result<(), BrpError> {
-    let (comp_id, type_id, canonical) = {
+    let canonical = {
         let reg = world
             .get_resource::<ModRegistry>()
             .ok_or_else(|| brp_err(error_codes::INTERNAL_ERROR, "ModRegistry missing"))?;
-        let entry = reg
-            .get_by_handle(component)
-            .ok_or_else(|| brp_err(error_codes::COMPONENT_ERROR, "invalid handle"))?;
-        let tid = world
-            .components()
-            .get_info(entry.component_id)
-            .and_then(|i| i.type_id())
-            .ok_or_else(|| brp_err(error_codes::COMPONENT_ERROR, "component has no TypeId"))?;
-        (entry.component_id, tid, entry.name.to_string())
+        reg.get_by_handle(component)
+            .ok_or_else(|| brp_err(error_codes::COMPONENT_ERROR, "invalid handle"))?
+            .name
+            .to_string()
     };
+    let type_id = resolve_reflected_type_id(world, component)
+        .map_err(|_| brp_err(error_codes::COMPONENT_ERROR, "component has no TypeId"))?;
     let app_types = world
         .get_resource::<AppTypeRegistry>()
         .ok_or_else(|| brp_err(error_codes::INTERNAL_ERROR, "AppTypeRegistry missing"))?
@@ -1781,15 +2928,61 @@ fn apply_typed_reflect_json(
             )
         })?
     };
-    let _ = comp_id;
     with_reflect_mod_component_mut(world, entity, component, |mut target| {
         target.apply(deserialized.as_partial_reflect());
     })
     .map_err(|e| brp_err(error_codes::COMPONENT_ERROR, format!("apply failed: {e:?}")))
 }
 
+fn mutate_one_brp_component(
+    world: &mut World,
+    entity: Entity,
+    handle: BamComponent,
+    val_obj: &Value,
+) -> Result<(), BrpError> {
+    if let Some(fields_schema) = world
+        .get_resource::<ModReflectRegistry>()
+        .and_then(|r| r.witness_schema(handle).map(|s| s.fields.clone()))
+    {
+        let map = val_obj.as_object().ok_or_else(|| {
+            brp_err(
+                error_codes::INVALID_PARAMS,
+                "component value must be object",
+            )
+        })?;
+        let records = json_map_to_records(map, &fields_schema)
+            .map_err(|m| brp_err(error_codes::INVALID_PARAMS, m))?;
+        apply_entity_component_fields(world, entity, handle, &records).map_err(|e| {
+            brp_err(
+                error_codes::COMPONENT_ERROR,
+                format!("mutate failed: {e:?}"),
+            )
+        })
+    } else if let Some(bam_fields) = world
+        .get_resource::<ModReflectRegistry>()
+        .and_then(|r| r.bam_field_schema(handle).map(|s| s.fields.clone()))
+    {
+        let map = val_obj.as_object().ok_or_else(|| {
+            brp_err(
+                error_codes::INVALID_PARAMS,
+                "component value must be object",
+            )
+        })?;
+        let patches = json_map_to_bam_field_patches(map, &bam_fields)
+            .map_err(|m| brp_err(error_codes::INVALID_PARAMS, m))?;
+        write_entity_bam_field_bytes(world, entity, handle, &patches).map_err(|e| {
+            brp_err(
+                error_codes::COMPONENT_ERROR,
+                format!("mutate failed: {e:?}"),
+            )
+        })
+    } else {
+        apply_typed_reflect_json(world, entity, handle, val_obj)
+    }
+}
+
 fn brp_mutate_components_impl(world: &mut World, params: Option<&Value>) -> BrpResult {
-    let _ = sync_witness_reflection_schemas(world);
+    sync_all_mod_reflection_schemas(world);
     let params = params.ok_or_else(|| brp_err(error_codes::INVALID_PARAMS, "missing params"))?;
     let entity = parse_entity_param(Some(params))?
         .ok_or_else(|| brp_err(error_codes::INVALID_PARAMS, "missing `entity` parameter"))?;
@@ -1805,51 +2998,14 @@ fn brp_mutate_components_impl(world: &mut World, params: Option<&Value>) -> BrpR
         params.get("value"),
     ) {
         let handle = resolve_mod_handle_by_name(world, comp_name)?;
-        if let Some(fields_schema) = world
-            .get_resource::<ModReflectRegistry>()
-            .and_then(|r| r.witness_schema(handle).map(|s| s.fields.clone()))
-        {
-            let map = val_obj
-                .as_object()
-                .ok_or_else(|| brp_err(error_codes::INVALID_PARAMS, "`value` must be an object"))?;
-            let records = json_map_to_records(map, &fields_schema)
-                .map_err(|m| brp_err(error_codes::INVALID_PARAMS, m))?;
-            apply_entity_component_fields(world, entity, handle, &records).map_err(|e| {
-                brp_err(
-                    error_codes::COMPONENT_ERROR,
-                    format!("mutate failed: {e:?}"),
-                )
-            })?;
-        } else {
-            apply_typed_reflect_json(world, entity, handle, val_obj)?;
-        }
+        mutate_one_brp_component(world, entity, handle, val_obj)?;
         return Ok(Value::Null);
     }
 
     if let Some(components_obj) = params.get("components").and_then(Value::as_object) {
         for (comp_name, val_obj) in components_obj {
             let handle = resolve_mod_handle_by_name(world, comp_name)?;
-            if let Some(fields_schema) = world
-                .get_resource::<ModReflectRegistry>()
-                .and_then(|r| r.witness_schema(handle).map(|s| s.fields.clone()))
-            {
-                let map = val_obj.as_object().ok_or_else(|| {
-                    brp_err(
-                        error_codes::INVALID_PARAMS,
-                        "component value must be object",
-                    )
-                })?;
-                let records = json_map_to_records(map, &fields_schema)
-                    .map_err(|m| brp_err(error_codes::INVALID_PARAMS, m))?;
-                apply_entity_component_fields(world, entity, handle, &records).map_err(|e| {
-                    brp_err(
-                        error_codes::COMPONENT_ERROR,
-                        format!("mutate failed: {e:?}"),
-                    )
-                })?;
-            } else {
-                apply_typed_reflect_json(world, entity, handle, val_obj)?;
-            }
+            mutate_one_brp_component(world, entity, handle, val_obj)?;
         }
         return Ok(Value::Null);
     }
@@ -1861,7 +3017,7 @@ fn brp_mutate_components_impl(world: &mut World, params: Option<&Value>) -> BrpR
 }
 
 fn brp_insert_components_impl(world: &mut World, params: Option<&Value>) -> BrpResult {
-    let _ = sync_witness_reflection_schemas(world);
+    sync_all_mod_reflection_schemas(world);
     let params = params.ok_or_else(|| brp_err(error_codes::INVALID_PARAMS, "missing params"))?;
     let entity = parse_entity_param(Some(params))?
         .ok_or_else(|| brp_err(error_codes::INVALID_PARAMS, "missing `entity` parameter"))?;
@@ -1898,10 +3054,41 @@ fn brp_insert_components_impl(world: &mut World, params: Option<&Value>) -> BrpR
                     )
                 },
             )?;
+        } else if let Some(bam_fields) = world
+            .get_resource::<ModReflectRegistry>()
+            .and_then(|r| r.bam_field_schema(handle).map(|s| s.fields.clone()))
+        {
+            let map = val_obj.as_object().ok_or_else(|| {
+                brp_err(
+                    error_codes::INVALID_PARAMS,
+                    "component value must be object",
+                )
+            })?;
+            let patches = json_map_to_bam_field_patches(map, &bam_fields)
+                .map_err(|m| brp_err(error_codes::INVALID_PARAMS, m))?;
+            let already_present = world
+                .get_resource::<ModRegistry>()
+                .and_then(|r| r.get_by_handle(handle))
+                .is_some_and(|entry| {
+                    world
+                        .get_entity(entity)
+                        .is_ok_and(|e| e.contains_id(entry.component_id))
+                });
+            let res = if already_present {
+                write_entity_bam_field_bytes(world, entity, handle, &patches)
+            } else {
+                insert_entity_pod_with_field_patches(world, entity, handle, &patches)
+            };
+            res.map_err(|e| {
+                brp_err(
+                    error_codes::COMPONENT_ERROR,
+                    format!("insert failed: {e:?}"),
+                )
+            })?;
         } else {
             return Err(brp_err(
                 error_codes::COMPONENT_ERROR,
-                format!("component '{comp_name}' has no witness schema for insert"),
+                format!("component '{comp_name}' has no witness or declarative schema for insert"),
             ));
         }
     }
@@ -1909,7 +3096,7 @@ fn brp_insert_components_impl(world: &mut World, params: Option<&Value>) -> BrpR
 }
 
 fn brp_get_resources_impl(world: &mut World, params: Option<&Value>) -> BrpResult {
-    let _ = sync_witness_reflection_schemas(world);
+    sync_all_mod_reflection_schemas(world);
     let params = params.ok_or_else(|| brp_err(error_codes::INVALID_PARAMS, "missing params"))?;
     let names = params
         .get("resources")
@@ -1926,20 +3113,25 @@ fn brp_get_resources_impl(world: &mut World, params: Option<&Value>) -> BrpResul
         };
         let handle = resolve_mod_handle_by_name(world, name)
             .map_err(|e| brp_err(error_codes::RESOURCE_ERROR, e.message))?;
-        let records = export_resource_fields(world, handle).map_err(|e| {
-            brp_err(
-                error_codes::RESOURCE_NOT_PRESENT,
-                format!("failed exporting resource '{name}': {e:?}"),
-            )
-        })?;
-        let dyn_struct = records_to_dynamic_struct(&records);
+        let dyn_struct = if let Ok(records) = export_resource_fields(world, handle) {
+            records_to_dynamic_struct(&records)
+        } else {
+            world
+                .export_bam_fields_resource_dynamic_struct(handle)
+                .map_err(|e| {
+                    brp_err(
+                        error_codes::RESOURCE_NOT_PRESENT,
+                        format!("failed exporting resource '{name}': {e:?}"),
+                    )
+                })?
+        };
         out.insert(name.to_owned(), dynamic_struct_to_json(&dyn_struct));
     }
     Ok(Value::Object(out))
 }
 
 fn brp_mutate_resources_impl(world: &mut World, params: Option<&Value>) -> BrpResult {
-    let _ = sync_witness_reflection_schemas(world);
+    sync_all_mod_reflection_schemas(world);
     let params = params.ok_or_else(|| brp_err(error_codes::INVALID_PARAMS, "missing params"))?;
     let name = params
         .get("resource")
@@ -1951,24 +3143,38 @@ fn brp_mutate_resources_impl(world: &mut World, params: Option<&Value>) -> BrpRe
         .ok_or_else(|| brp_err(error_codes::INVALID_PARAMS, "missing `value` object"))?;
     let handle = resolve_mod_handle_by_name(world, name)
         .map_err(|e| brp_err(error_codes::RESOURCE_ERROR, e.message))?;
-    let fields_schema = world
+    if let Some(fields_schema) = world
         .get_resource::<ModReflectRegistry>()
         .and_then(|r| r.witness_schema(handle).map(|s| s.fields.clone()))
-        .ok_or_else(|| {
+    {
+        let records = json_map_to_records(value_map, &fields_schema)
+            .map_err(|m| brp_err(error_codes::INVALID_PARAMS, m))?;
+        apply_resource_fields(world, handle, &records).map_err(|e| {
             brp_err(
                 error_codes::RESOURCE_ERROR,
-                format!("resource '{name}' has no witness schema"),
+                format!("mutate resource failed: {e:?}"),
             )
         })?;
-    let records = json_map_to_records(value_map, &fields_schema)
-        .map_err(|m| brp_err(error_codes::INVALID_PARAMS, m))?;
-    apply_resource_fields(world, handle, &records).map_err(|e| {
-        brp_err(
-            error_codes::RESOURCE_ERROR,
-            format!("mutate resource failed: {e:?}"),
-        )
-    })?;
-    Ok(Value::Null)
+        return Ok(Value::Null);
+    }
+    if let Some(bam_fields) = world
+        .get_resource::<ModReflectRegistry>()
+        .and_then(|r| r.bam_field_schema(handle).map(|s| s.fields.clone()))
+    {
+        let patches = json_map_to_bam_field_patches(value_map, &bam_fields)
+            .map_err(|m| brp_err(error_codes::INVALID_PARAMS, m))?;
+        write_resource_bam_field_bytes(world, handle, &patches).map_err(|e| {
+            brp_err(
+                error_codes::RESOURCE_ERROR,
+                format!("mutate resource failed: {e:?}"),
+            )
+        })?;
+        return Ok(Value::Null);
+    }
+    Err(brp_err(
+        error_codes::RESOURCE_ERROR,
+        format!("resource '{name}' has no witness or declarative schema"),
+    ))
 }
 
 // ============================================================================
@@ -2085,9 +3291,12 @@ fn export_mod_settings_toml_from_world(world: &World) -> Result<String, ModSetti
 
     for binding in &settings_reg.bindings {
         match &binding.kind {
-            SettingsBindingKind::WitnessResource(handle) => {
-                let records = export_resource_fields(world, *handle)?;
-                let dyn_struct = records_to_dynamic_struct(&records);
+            SettingsBindingKind::ModResource(handle) => {
+                let dyn_struct = if let Ok(records) = export_resource_fields(world, *handle) {
+                    records_to_dynamic_struct(&records)
+                } else {
+                    world.export_bam_fields_resource_dynamic_struct(*handle)?
+                };
                 if let Some(toml::Value::Table(tbl)) =
                     json_to_toml_value(dynamic_struct_to_json(&dyn_struct))
                 {
@@ -2112,7 +3321,7 @@ fn import_mod_settings_toml_into_world(
     world: &mut World,
     toml_str: &str,
 ) -> Result<usize, ModSettingsError> {
-    let _ = sync_witness_reflection_schemas(world);
+    sync_all_mod_reflection_schemas(world);
     let parsed: toml::Table = toml::from_str(toml_str)?;
     let bindings = world
         .get_resource::<ModSettingsRegistry>()
@@ -2125,24 +3334,45 @@ fn import_mod_settings_toml_into_world(
             continue;
         };
         match binding.kind {
-            SettingsBindingKind::WitnessResource(handle) => {
-                let Some(fields_schema) = world
+            SettingsBindingKind::ModResource(handle) => {
+                if let Some(fields_schema) = world
                     .get_resource::<ModReflectRegistry>()
                     .and_then(|r| r.witness_schema(handle).map(|s| s.fields.clone()))
-                else {
-                    continue;
-                };
-                let mut records = Vec::new();
-                for (k, v) in group_tbl {
-                    if let Some(desc) = fields_schema.iter().find(|f| f.name == *k)
-                        && let Ok(rec) = json_to_record(k, &desc.type_tag, &toml_to_json_value(v))
-                    {
-                        records.push(rec);
+                {
+                    let mut records = Vec::new();
+                    for (k, v) in group_tbl {
+                        if let Some(desc) = fields_schema.iter().find(|f| f.name == *k)
+                            && let Ok(rec) =
+                                json_to_record(k, &desc.type_tag, &toml_to_json_value(v))
+                        {
+                            records.push(rec);
+                        }
                     }
-                }
-                if !records.is_empty() {
-                    apply_resource_fields(world, handle, &records)?;
-                    applied_groups += 1;
+                    if !records.is_empty() {
+                        apply_resource_fields(world, handle, &records)?;
+                        applied_groups += 1;
+                    }
+                } else if let Some(bam_fields) = world
+                    .get_resource::<ModReflectRegistry>()
+                    .and_then(|r| r.bam_field_schema(handle).map(|s| s.fields.clone()))
+                {
+                    let mut patches = Vec::new();
+                    for (k, v) in group_tbl {
+                        if let Some(desc) = bam_fields.iter().find(|f| f.name == *k)
+                            && let Some(pod_kind) = desc.pod_kind
+                            && let Ok(bytes) =
+                                json_to_bam_field_bytes(k, pod_kind, &toml_to_json_value(v))
+                        {
+                            patches.push(BamFieldBytePatch {
+                                offset: desc.offset,
+                                bytes,
+                            });
+                        }
+                    }
+                    if !patches.is_empty() {
+                        write_resource_bam_field_bytes(world, handle, &patches)?;
+                        applied_groups += 1;
+                    }
                 }
             }
             SettingsBindingKind::ReflectedSettingsGroup(tid) => {

@@ -62,15 +62,21 @@ pub use ffi::v03_ext::{
     host_report_guest_fault, host_resolve_component_by_uuid,
 };
 pub use ffi::validation::{
-    WitnessFieldDescriptor, apply_entity_component_fields, apply_resource_fields,
-    ensure_component_in_target_world, export_entity_component_fields, export_resource_fields,
-    extract_component_between_worlds, extract_resource_between_worlds,
-    insert_entity_component_from_fields, insert_or_apply_entity_component_fields,
+    BamFieldBytePatch, BamFieldDescriptor, BamFieldPodKind, WitnessFieldDescriptor,
+    apply_entity_component_fields, apply_resource_fields, ensure_component_in_target_world,
+    export_entity_component_fields, export_resource_fields, extract_component_between_worlds,
+    extract_resource_between_worlds, insert_entity_component_from_fields,
+    insert_entity_pod_with_field_patches, insert_or_apply_entity_component_fields,
+    inspect_component_bam_fields, inspect_component_bam_fields_in_registry,
     inspect_component_witness_fields, inspect_component_witness_fields_in_registry,
-    read_entity_pod_bytes, write_entity_pod_bytes,
+    read_entity_bam_field_bytes, read_entity_pod_bytes, read_resource_bam_field_bytes,
+    write_entity_bam_field_bytes, write_entity_pod_bytes, write_resource_bam_field_bytes,
 };
 #[cfg(feature = "bridge-reflect")]
-pub use ffi::validation::{reflect_entity_component, reflect_entity_component_mut};
+pub use ffi::validation::{
+    reflect_entity_component, reflect_entity_component_mut, reflect_resource_component,
+    reflect_resource_component_mut, register_bam_field_reflect_type,
+};
 pub use handle_header::{
     COMMANDS_MAGIC, HOST_CTX_MAGIC, HandleHeader, HostContext, ITER_MAGIC, LOAD_CTX_MAGIC,
     POISONED_MAGIC, STRICT_FFI_CHECKS, SYS_CTX_MAGIC, host_last_error,
