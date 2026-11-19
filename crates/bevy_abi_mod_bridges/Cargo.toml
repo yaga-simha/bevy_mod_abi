@@ -43,12 +43,15 @@ bridge-picking = [
 ]
 bridge-audio = [
     "dep:bevy_audio",
+    "dep:bevy_math",
     "bridge-asset",
 ]
 bridge-light = [
     "dep:bevy_light",
     "dep:bevy_camera",
     "dep:bevy_color",
+    "dep:bevy_render",
+    "dep:bevy_pbr",
 ]
 bridge-ui = [
     "dep:bevy_ui",
@@ -70,6 +73,7 @@ bridge-camera-controller = [
     "bevy_camera_controller/pan_camera",
     "bevy_camera_controller/pan_orbit_camera",
     "dep:bevy_camera",
+    "dep:bevy_math",
 ]
 bridge-solari = [
     "dep:bevy_solari",
@@ -100,6 +104,8 @@ bevy_reflect = { workspace = true, optional = true }
 bevy_picking = { workspace = true, optional = true }
 bevy_audio = { workspace = true, optional = true }
 bevy_light = { workspace = true, optional = true }
+bevy_render = { workspace = true, optional = true }
+bevy_pbr = { workspace = true, optional = true }
 bevy_ui = { workspace = true, optional = true }
 bevy_text = { workspace = true, optional = true }
 bevy_ui_widgets = { workspace = true, optional = true }
@@ -111,6 +117,7 @@ bevy_solari = { workspace = true, optional = true }
 [dev-dependencies]
 bevy_abi_mod_host_sys = { workspace = true, features = ["test-utils"] }
 bevy_reflect = { workspace = true }
+rodio = { version = "0.22", default-features = false }
 
 [[test]]
 name = "bridge_bsn"

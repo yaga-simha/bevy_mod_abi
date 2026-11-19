@@ -30,6 +30,7 @@ pn = "pn"
 
 [default.extend-words]
 # Domain acronyms & technical terms
+lod = "lod"
 soa = "soa"
 ratatui = "ratatui"
 winit = "winit"

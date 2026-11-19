@@ -21,8 +21,16 @@
 
 #[cfg(feature = "bridge-asset")]
 pub mod asset;
+#[cfg(feature = "bridge-audio")]
+pub mod audio;
 #[cfg(feature = "bridge-bsn")]
 pub mod bsn;
+#[cfg(any(
+    feature = "bridge-light",
+    feature = "bridge-camera-controller",
+    feature = "bridge-solari"
+))]
+pub mod camera_light;
 #[cfg(any(feature = "bridge-picking", feature = "bridge-std-types"))]
 pub mod input_ext;
 #[cfg(feature = "bridge-picking")]
@@ -39,10 +47,31 @@ pub use asset::{
     AssetOverlayPolicy, ConfiguredModAssetPlugin, ModAssetAppExt, ModAssetPlugin, ModAssetRegistry,
     ModAssetWorldExt, OVERLAY_NAMESPACE,
 };
+#[cfg(feature = "bridge-audio")]
+pub use audio::{
+    AudioBridgeSystems, FfiAudioPlaybackSettings, FfiAudioPlayerSpec, FfiSpatialAudioSinkControl,
+    ModAudioBridgePlugin, register_audio_bridges,
+};
 #[cfg(feature = "bridge-bsn")]
 pub use bsn::{
     CANONICAL_READY_NAME, HostSceneRegistry, ModBsnAppExt, ModBsnPlugin, ModBsnWorldExt,
     SCENE_PATCH_ALIAS,
+};
+#[cfg(feature = "bridge-camera-controller")]
+pub use camera_light::FfiPanOrbitCamera;
+#[cfg(feature = "bridge-solari")]
+pub use camera_light::FfiSolariLighting;
+#[cfg(any(
+    feature = "bridge-light",
+    feature = "bridge-camera-controller",
+    feature = "bridge-solari"
+))]
+pub use camera_light::{
+    CameraLightBridgeSystems, ModCameraLightBridgePlugin, register_camera_light_bridges,
+};
+#[cfg(feature = "bridge-light")]
+pub use camera_light::{
+    FfiCamera2d, FfiCamera3d, FfiDirectionalLight, FfiPointLight, FfiSpotLight,
 };
 #[cfg(feature = "bridge-picking")]
 pub use input_ext::{FfiGamepadButton, FfiGamepadRumble, FfiGamepadState};
@@ -128,8 +157,27 @@ pub mod prelude {
         AssetOverlayPolicy, ConfiguredModAssetPlugin, ModAssetAppExt, ModAssetPlugin,
         ModAssetRegistry, ModAssetWorldExt, OVERLAY_NAMESPACE,
     };
+    #[cfg(feature = "bridge-audio")]
+    pub use crate::audio::{
+        AudioBridgeSystems, FfiAudioPlaybackSettings, FfiAudioPlayerSpec,
+        FfiSpatialAudioSinkControl, ModAudioBridgePlugin,
+    };
     #[cfg(feature = "bridge-bsn")]
     pub use crate::bsn::{HostSceneRegistry, ModBsnAppExt, ModBsnPlugin, ModBsnWorldExt};
+    #[cfg(feature = "bridge-camera-controller")]
+    pub use crate::camera_light::FfiPanOrbitCamera;
+    #[cfg(feature = "bridge-solari")]
+    pub use crate::camera_light::FfiSolariLighting;
+    #[cfg(any(
+        feature = "bridge-light",
+        feature = "bridge-camera-controller",
+        feature = "bridge-solari"
+    ))]
+    pub use crate::camera_light::{CameraLightBridgeSystems, ModCameraLightBridgePlugin};
+    #[cfg(feature = "bridge-light")]
+    pub use crate::camera_light::{
+        FfiCamera2d, FfiCamera3d, FfiDirectionalLight, FfiPointLight, FfiSpotLight,
+    };
     #[cfg(feature = "bridge-picking")]
     pub use crate::input_ext::{FfiGamepadButton, FfiGamepadRumble, FfiGamepadState};
     #[cfg(any(feature = "bridge-picking", feature = "bridge-std-types"))]
