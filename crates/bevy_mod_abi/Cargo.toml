@@ -1,0 +1,53 @@
+[package]
+name = "bevy_mod_abi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Umbrella crate for zero-serialization, asymmetric C-ABI native modding in Bevy ECS (`ABI 0.3.0`), re-exporting `bevy_abi_mod`"
+readme = "README.md"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+strict-ffi-checks = ["bevy_abi_mod/strict-ffi-checks"]
+diagnostics = ["bevy_abi_mod/diagnostics"]
+signature-verification = ["bevy_abi_mod/signature-verification"]
+hot-reload-watcher = ["bevy_abi_mod/hot-reload-watcher"]
+bridge-std-types = ["bevy_abi_mod/bridge-std-types"]
+bridge-asset = ["bevy_abi_mod/bridge-asset"]
+bridge-state = ["bevy_abi_mod/bridge-state"]
+bridge-reflect = ["bevy_abi_mod/bridge-reflect"]
+bridge-bsn = [
+    "bevy_abi_mod/bridge-bsn",
+    "bridge-asset",
+]
+sub-app-extract = [
+    "bevy_abi_mod/sub-app-extract",
+    "bridge-asset",
+]
+bridge-picking = ["bevy_abi_mod/bridge-picking"]
+bridge-audio = [
+    "bevy_abi_mod/bridge-audio",
+    "bridge-asset",
+]
+bridge-light = ["bevy_abi_mod/bridge-light"]
+bridge-ui = ["bevy_abi_mod/bridge-ui"]
+bridge-feathers = [
+    "bevy_abi_mod/bridge-feathers",
+    "bridge-ui",
+]
+bridge-camera-controller = ["bevy_abi_mod/bridge-camera-controller"]
+bridge-solari = ["bevy_abi_mod/bridge-solari"]
+
+[dependencies]
+bevy_abi_mod = { workspace = true }
+
+[dev-dependencies]
+bevy_app = { workspace = true }
+bevy_ecs = { workspace = true }

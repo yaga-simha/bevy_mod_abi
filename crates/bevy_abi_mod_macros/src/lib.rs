@@ -520,6 +520,28 @@ mod tests {
             ":: renamed_sys"
         );
 
+        assert_eq!(
+            resolve_sys_crate_with(None, Some("my_game"), |pkg| {
+                (pkg == "bevy_mod_abi").then(|| FoundCrate::Name("bevy_mod_abi".to_owned()))
+            })
+            .to_string(),
+            ":: bevy_mod_abi :: bevy_abi_mod_sys"
+        );
+        assert_eq!(
+            resolve_sys_crate_with(None, Some("bevy_mod_abi"), |pkg| {
+                (pkg == "bevy_mod_abi").then_some(FoundCrate::Itself)
+            })
+            .to_string(),
+            ":: bevy_mod_abi :: bevy_abi_mod_sys"
+        );
+        assert_eq!(
+            resolve_sys_crate_with(None, Some("umbrella_reexports"), |pkg| {
+                (pkg == "bevy_mod_abi").then_some(FoundCrate::Itself)
+            })
+            .to_string(),
+            ":: bevy_mod_abi :: bevy_abi_mod_sys"
+        );
+
         for facade in ["bevy_abi_mod", "bevy_abi_mod_host", "bevy_abi_mod_guest"] {
             assert_eq!(
                 resolve_sys_crate_with(None, Some("my_game"), |pkg| {

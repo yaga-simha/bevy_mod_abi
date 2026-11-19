@@ -1821,6 +1821,7 @@ fn verify_forbid_unsafe(root: &Path) -> Result<(), String> {
     );
     let safe_crates = [
         "crates/bevy_abi_mod/src/lib.rs",
+        "crates/bevy_mod_abi/src/lib.rs",
         "crates/bevy_abi_mod_host/src/lib.rs",
         "crates/bevy_abi_mod_bridges/src/lib.rs",
         "crates/bevy_abi_mod_render/src/lib.rs",

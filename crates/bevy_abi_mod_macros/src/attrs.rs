@@ -413,9 +413,10 @@ pub(crate) fn parse_abi_pod_crate_override(input: &DeriveInput) -> syn::Result<O
 /// Resolves the token path to `bevy_abi_mod_sys`, respecting an explicit `crate = ...` override
 /// or probing Cargo dependencies in order:
 /// 1. `bevy_abi_mod_sys`
-/// 2. `bevy_abi_mod` (`<crate>::bevy_abi_mod_sys`)
-/// 3. `bevy_abi_mod_host` (`<crate>::bevy_abi_mod_sys`)
-/// 4. `bevy_abi_mod_guest` (`<crate>::bevy_abi_mod_sys`)
+/// 2. `bevy_mod_abi` (`<crate>::bevy_abi_mod_sys`)
+/// 3. `bevy_abi_mod` (`<crate>::bevy_abi_mod_sys`)
+/// 4. `bevy_abi_mod_host` (`<crate>::bevy_abi_mod_sys`)
+/// 5. `bevy_abi_mod_guest` (`<crate>::bevy_abi_mod_sys`)
 pub(crate) fn resolve_sys_crate_path(crate_override: Option<&Path>) -> TokenStream {
     let current_crate = std::env::var("CARGO_CRATE_NAME").ok();
     resolve_sys_crate_with(crate_override, current_crate.as_deref(), |pkg| {
@@ -444,6 +445,16 @@ where
             FoundCrate::Name(name) => {
                 let ident = Ident::new(&name, Span::call_site());
                 quote! { ::#ident }
+            }
+        };
+    }
+
+    if let Some(found) = lookup("bevy_mod_abi") {
+        return match found {
+            FoundCrate::Itself => quote! { ::bevy_mod_abi::bevy_abi_mod_sys },
+            FoundCrate::Name(name) => {
+                let ident = Ident::new(&name, Span::call_site());
+                quote! { ::#ident::bevy_abi_mod_sys }
             }
         };
     }

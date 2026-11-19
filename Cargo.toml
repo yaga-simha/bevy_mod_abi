@@ -12,6 +12,7 @@ members = [
     "crates/bevy_abi_mod_guest_sys",
     "crates/bevy_abi_mod_guest",
     "crates/bevy_abi_mod",
+    "crates/bevy_mod_abi",
     "crates/bevy_abi_mod_trust",
     "crates/bevy_abi_mod_manifest",
     "crates/bevy_abi_mod_sdk_gen",
@@ -40,6 +41,7 @@ default-members = [
     "crates/bevy_abi_mod_guest_sys",
     "crates/bevy_abi_mod_guest",
     "crates/bevy_abi_mod",
+    "crates/bevy_mod_abi",
     "crates/bevy_abi_mod_trust",
     "crates/bevy_abi_mod_manifest",
     "crates/bevy_abi_mod_sdk_gen",
@@ -75,7 +77,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
@@ -99,19 +101,21 @@ redundant_clone = "warn"
 match_same_arms = "warn"
 
 [workspace.dependencies]
-bevy_abi_mod_sys = { version = "0.2.0", path = "crates/bevy_abi_mod_sys" }
-bevy_abi_mod_macros = { version = "0.2.0", path = "crates/bevy_abi_mod_macros" }
-bevy_abi_mod_host_sys = { version = "0.2.0", path = "crates/bevy_abi_mod_host_sys" }
-bevy_abi_mod_host = { version = "0.2.0", path = "crates/bevy_abi_mod_host" }
-bevy_abi_mod_bridges = { version = "0.2.0", path = "crates/bevy_abi_mod_bridges" }
-bevy_abi_mod_render = { version = "0.2.0", path = "crates/bevy_abi_mod_render" }
-bevy_abi_mod_reflect = { version = "0.2.0", path = "crates/bevy_abi_mod_reflect" }
-bevy_abi_mod_watcher = { version = "0.2.0", path = "crates/bevy_abi_mod_watcher" }
-bevy_abi_mod_guest_sys = { version = "0.2.0", path = "crates/bevy_abi_mod_guest_sys" }
-bevy_abi_mod = { version = "0.2.0", path = "crates/bevy_abi_mod" }
-bevy_abi_mod_trust = { version = "0.2.0", path = "crates/bevy_abi_mod_trust" }
-bevy_abi_mod_manifest = { version = "0.2.0", path = "crates/bevy_abi_mod_manifest" }
-bevy_abi_mod_sdk_gen = { version = "0.2.0", path = "crates/bevy_abi_mod_sdk_gen" }
+bevy_abi_mod_sys = { version = "0.3.0", path = "crates/bevy_abi_mod_sys" }
+bevy_abi_mod_macros = { version = "0.3.0", path = "crates/bevy_abi_mod_macros" }
+bevy_abi_mod_host_sys = { version = "0.3.0", path = "crates/bevy_abi_mod_host_sys" }
+bevy_abi_mod_host = { version = "0.3.0", path = "crates/bevy_abi_mod_host" }
+bevy_abi_mod_bridges = { version = "0.3.0", path = "crates/bevy_abi_mod_bridges" }
+bevy_abi_mod_render = { version = "0.3.0", path = "crates/bevy_abi_mod_render" }
+bevy_abi_mod_reflect = { version = "0.3.0", path = "crates/bevy_abi_mod_reflect" }
+bevy_abi_mod_watcher = { version = "0.3.0", path = "crates/bevy_abi_mod_watcher" }
+bevy_abi_mod_guest_sys = { version = "0.3.0", path = "crates/bevy_abi_mod_guest_sys" }
+bevy_abi_mod_guest = { version = "0.3.0", path = "crates/bevy_abi_mod_guest" }
+bevy_abi_mod = { version = "0.3.0", path = "crates/bevy_abi_mod" }
+bevy_mod_abi = { version = "0.3.0", path = "crates/bevy_mod_abi" }
+bevy_abi_mod_trust = { version = "0.3.0", path = "crates/bevy_abi_mod_trust" }
+bevy_abi_mod_manifest = { version = "0.3.0", path = "crates/bevy_abi_mod_manifest" }
+bevy_abi_mod_sdk_gen = { version = "0.3.0", path = "crates/bevy_abi_mod_sdk_gen" }
 bevy_ecs = { version = "0.20.1", default-features = false, features = ["std", "async_executor"] }
 bevy_app = { version = "0.20.1", default-features = false, features = ["std"] }
 bevy_platform = { version = "0.20.1", default-features = false, features = ["std"] }
@@ -137,7 +141,6 @@ bevy_render = { version = "0.20.1", default-features = false }
 bevy_sprite = { version = "0.20.1", default-features = false }
 bevy_sprite_render = { version = "0.20.1", default-features = false }
 bevy_pbr = { version = "0.20.1", default-features = false }
-bevy_mesh = { version = "0.20.1", default-features = false }
 bevy_image = { version = "0.20.1", default-features = false }
 bevy_picking = { version = "0.20.1", default-features = false }
 bevy_audio = { version = "0.20.1", default-features = false }

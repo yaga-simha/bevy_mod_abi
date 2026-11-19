@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_abi_mod"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bevy_abi_mod_bridges",
  "bevy_abi_mod_host",
@@ -460,7 +460,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_abi_mod_bridges"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bevy_abi_mod_host",
  "bevy_abi_mod_host_sys",
@@ -498,7 +498,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_abi_mod_guest"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bevy_abi_mod_guest_sys",
  "bevy_abi_mod_macros",
@@ -507,14 +507,14 @@ dependencies = [
 
 [[package]]
 name = "bevy_abi_mod_guest_sys"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bevy_abi_mod_sys",
 ]
 
 [[package]]
 name = "bevy_abi_mod_host"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bevy_abi_mod_host_sys",
  "bevy_abi_mod_macros",
@@ -535,7 +535,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_abi_mod_host_sys"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arc-swap",
  "bevy_abi_mod_macros",
@@ -557,7 +557,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_abi_mod_macros"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bevy_abi_mod_sys",
  "proc-macro-crate",
@@ -569,7 +569,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_abi_mod_manifest"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bevy_abi_mod_sys",
  "semver",
@@ -580,7 +580,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_abi_mod_reflect"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bevy-settings",
  "bevy_abi_mod_host",
@@ -599,7 +599,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_abi_mod_render"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bevy_abi_mod_bridges",
  "bevy_abi_mod_host",
@@ -625,18 +625,18 @@ dependencies = [
 
 [[package]]
 name = "bevy_abi_mod_sdk_gen"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bevy_abi_mod_sys",
 ]
 
 [[package]]
 name = "bevy_abi_mod_sys"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "bevy_abi_mod_trust"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ed25519-dalek",
  "proptest",
@@ -650,7 +650,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_abi_mod_watcher"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bevy_abi_mod_host",
  "bevy_abi_mod_host_sys",
@@ -1404,6 +1404,15 @@ name = "bevy_mikktspace"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bff34eb29ff4b8a8688bc7299f14fb6b597461ca80fec03ed7d22939ab33e48f"
+
+[[package]]
+name = "bevy_mod_abi"
+version = "0.3.0"
+dependencies = [
+ "bevy_abi_mod",
+ "bevy_app",
+ "bevy_ecs",
+]
 
 [[package]]
 name = "bevy_pbr"
@@ -2300,7 +2309,7 @@ dependencies = [
 
 [[package]]
 name = "cargo-bam"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bevy_abi_mod_manifest",
  "bevy_abi_mod_sdk_gen",
@@ -2637,7 +2646,7 @@ dependencies = [
 
 [[package]]
 name = "coupled_rust_mod"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "shared_scenario",
 ]
@@ -3185,7 +3194,7 @@ dependencies = [
 
 [[package]]
 name = "example_01_minimal_handshake"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bevy_abi_mod",
  "bevy_abi_mod_sys",
@@ -3195,7 +3204,7 @@ dependencies = [
 
 [[package]]
 name = "example_02_multi_system_pipeline"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bevy_abi_mod",
  "bevy_abi_mod_sys",
@@ -3205,7 +3214,7 @@ dependencies = [
 
 [[package]]
 name = "example_03_cross_language_interop"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bevy_abi_mod",
  "bevy_abi_mod_sys",
@@ -3246,7 +3255,7 @@ dependencies = [
 
 [[package]]
 name = "example_06_cross_mod_components"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bevy_abi_mod",
  "bevy_abi_mod_sys",
@@ -3256,7 +3265,7 @@ dependencies = [
 
 [[package]]
 name = "example_07_cpp17_guest"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bevy_abi_mod",
  "bevy_abi_mod_sys",
@@ -3266,7 +3275,7 @@ dependencies = [
 
 [[package]]
 name = "example_08_zig_guest"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bevy_abi_mod",
  "bevy_abi_mod_sys",
@@ -5338,7 +5347,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "permutation_bench"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "libloading",
  "shared_scenario",
@@ -8198,7 +8207,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bevy_abi_mod_macros",
  "bevy_abi_mod_manifest",
