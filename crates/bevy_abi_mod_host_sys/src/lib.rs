@@ -34,7 +34,9 @@ pub use ffi::commands::{
 pub use ffi::commands_ext::{
     host_cmd_despawn_all, host_cmd_insert_if_new, host_cmd_spawn_batch, host_cmd_spawn_persistent,
 };
-pub use ffi::hierarchy_ext::{ensure_children_registered_in_world, host_sys_entity_children};
+pub use ffi::hierarchy_ext::{
+    CascadeHierarchyCache, ensure_children_registered_in_world, host_sys_entity_children,
+};
 pub use ffi::host_api::HOST_API;
 pub use ffi::iter::{
     HostIter, QueryPlan, QueryTermMeta, SparseRowScratch, TickFilterTerm, host_iter_column_info,

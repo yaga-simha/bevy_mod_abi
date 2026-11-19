@@ -879,6 +879,18 @@ fn v03_reserved_slots_exhaustive_validation() {
                 msg_send_fn: None,
                 msg_write_batch_fn: None,
             },
+            QueryTermMeta {
+                component: vel_h,
+                component_id: vel_id,
+                mode: AccessMode::FILTER_ONLY,
+                uuid: CovVel::UUID,
+                size: 8,
+                align: 4,
+                storage_flags: 0,
+                msg_read_batch_fn: None,
+                msg_send_fn: None,
+                msg_write_batch_fn: None,
+            },
         ]);
         let ro_plan = QueryPlan::from_terms(vec![QueryTermMeta {
             component: pos_h,
@@ -912,7 +924,8 @@ fn v03_reserved_slots_exhaustive_validation() {
             &ro_plan,
             Tick::new(0),
             Tick::new(1),
-        );
+        )
+        .with_world(world.as_unsafe_world_cell_readonly());
         let mut out_ptr: *const c_void = null();
         let mut out_owner = FfiEntity::NULL;
 
@@ -962,8 +975,8 @@ fn v03_reserved_slots_exhaustive_validation() {
         );
         assert_eq!(
             host_iter_up_cascade(
-                mixed_iter.as_ffi_ptr(),
-                BamComponent::INVALID,
+                ro_iter.as_ffi_ptr(),
+                BamComponent::from_raw(999),
                 live_ent,
                 0,
                 &raw mut out_ptr,
@@ -1009,34 +1022,38 @@ fn v03_reserved_slots_exhaustive_validation() {
                 mixed_iter.as_ffi_ptr(),
                 pos_h,
                 live_ent,
-                1,
+                3,
                 &raw mut out_ptr,
                 &raw mut out_owner
             ),
             FfiResult::PERMISSION_DENIED
         );
+        // `mixed_iter` has no attached world -> `INVALID_STATE` for valid READ/WRITE terms.
         assert_eq!(
             host_iter_up_cascade(
                 mixed_iter.as_ffi_ptr(),
                 pos_h,
                 live_ent,
-                2,
+                1,
                 &raw mut out_ptr,
                 &raw mut out_owner
             ),
-            FfiResult::PERMISSION_DENIED
+            FfiResult::INVALID_STATE
         );
+        // `ro_iter` with world attached: `BamComponent::INVALID` defaults to `ChildOf` (`NOT_FOUND` for root).
         assert_eq!(
             host_iter_up_cascade(
-                mixed_iter.as_ffi_ptr(),
-                pos_h,
+                ro_iter.as_ffi_ptr(),
+                BamComponent::INVALID,
                 live_ent,
                 0,
                 &raw mut out_ptr,
                 &raw mut out_owner
             ),
-            FfiResult::UNSUPPORTED
+            FfiResult::NOT_FOUND
         );
+        assert!(out_ptr.is_null());
+        assert_eq!(out_owner, FfiEntity::NULL);
 
         assert_eq!(
             host_par_for_each_chunk_readonly(ro_iter.as_ffi_ptr(), None, null_mut()),
@@ -1064,7 +1081,7 @@ fn v03_reserved_slots_exhaustive_validation() {
                 Some(noop_chunk_task),
                 null_mut()
             ),
-            FfiResult::UNSUPPORTED
+            FfiResult::OK
         );
         drop(mixed_iter);
         drop(ro_iter);

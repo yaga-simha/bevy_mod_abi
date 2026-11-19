@@ -10,11 +10,10 @@ use crate::handle_header::{
     validate_handle_ref,
 };
 use bevy_abi_mod_sys::{
-    AccessMode, BAM_LOG_DEBUG, BAM_LOG_ERROR, BAM_LOG_INFO, BAM_LOG_TRACE, BAM_LOG_WARN,
-    BamChunkTaskFn, BamCommands, BamComponent, BamHostCtx, BamIter, BamLayoutInfo, BamLoadCtx,
-    BamRelationDesc, BamRowMigrateFn, BamScheduleSetDesc, BamSymbol, BamSystem, BamSystemDesc,
-    BamSystemSet, ComponentDesc, ComponentUuid, FfiEntity, FfiResult, ScheduleId, StrView,
-    read_descriptor,
+    BAM_LOG_DEBUG, BAM_LOG_ERROR, BAM_LOG_INFO, BAM_LOG_TRACE, BAM_LOG_WARN, BamChunkTaskFn,
+    BamCommands, BamComponent, BamHostCtx, BamIter, BamLayoutInfo, BamLoadCtx, BamRelationDesc,
+    BamRowMigrateFn, BamScheduleSetDesc, BamSymbol, BamSystem, BamSystemDesc, BamSystemSet,
+    ComponentDesc, ComponentUuid, FfiEntity, FfiResult, ScheduleId, StrView, read_descriptor,
 };
 use bevy_ecs::entity::Entity;
 use core::ffi::{CStr, c_char, c_void};
@@ -414,13 +413,18 @@ pub unsafe extern "C" fn host_bind_named_object(
     FfiResult::UNSUPPORTED
 }
 
-/// Reserved ABI `0.3.0` slot for ancestor relationship cascade lookup (`iter_up_cascade`)
-/// (validates inputs and currently returns [`FfiResult::UNSUPPORTED`]).
+/// Walks upward from `entity`'s parent along `relation` (`BamComponent::INVALID` defaults to
+/// Bevy's built-in `ChildOf`) with cycle guarding to locate the nearest ancestor owning the
+/// component declared at `term_index`.
+///
+/// On match, writes the component pointer into `*out_ptr` and owning ancestor into `*out_owner`
+/// and returns [`FfiResult::OK`]. When no ancestor carries the component, zeroes `*out_ptr` and
+/// `*out_owner` and returns [`FfiResult::NOT_FOUND`].
 ///
 /// # Safety
 /// - `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
-/// - `out_ptr` must point to writable `*const c_void` storage, or null.
-/// - `out_owner` must point to writable [`FfiEntity`] storage, or null.
+/// - `out_ptr` must point to aligned writable `*const c_void` storage, or null.
+/// - `out_owner` must point to aligned writable [`FfiEntity`] storage, or null.
 pub unsafe extern "C" fn host_iter_up_cascade(
     iter: *mut BamIter,
     relation: BamComponent,
@@ -429,58 +433,31 @@ pub unsafe extern "C" fn host_iter_up_cascade(
     out_ptr: *mut *const c_void,
     out_owner: *mut FfiEntity,
 ) -> FfiResult {
-    if out_ptr.is_null() || out_owner.is_null() {
-        return FfiResult::NULL_POINTER;
+    // SAFETY: Caller upholds `iter`, `out_ptr`, and `out_owner` FFI contract.
+    unsafe {
+        crate::ffi::hierarchy_ext::iter_up_cascade_impl(
+            iter, relation, entity, term_index, out_ptr, out_owner,
+        )
     }
-    // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
-    let host_iter = match unsafe {
-        validate_handle_mut::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false)
-    } {
-        Ok(it) => it,
-        Err(err) => return err,
-    };
-    if !relation.is_valid() {
-        return FfiResult::INVALID_COMPONENT;
-    }
-    if let Err(err) = validate_non_null_entity(entity) {
-        return err;
-    }
-    if term_index >= host_iter.plan.terms.len() {
-        return FfiResult::OUT_OF_RANGE;
-    }
-    if host_iter.plan.terms[term_index].mode == AccessMode::WRITE
-        || host_iter.plan.terms[term_index].mode == AccessMode::OPTIONAL_WRITE
-    {
-        return FfiResult::PERMISSION_DENIED;
-    }
-    FfiResult::UNSUPPORTED
 }
 
-/// Reserved ABI `0.3.0` slot for host-driven read-only parallel chunk iteration
-/// (validates inputs and currently returns [`FfiResult::UNSUPPORTED`]).
+/// Host-driven zero-arena read-only parallel chunk iteration across Bevy's `ComputeTaskPool`.
+///
+/// Rejects any query declaring a writable term (`WRITE`, `OPTIONAL_WRITE`, `RESOURCE_WRITE`, or
+/// `MESSAGE_WRITE`) with [`FfiResult::PERMISSION_DENIED`] and dispatches disjoint table/archetype
+/// sub-ranges with zero per-worker command-arena allocations.
 ///
 /// # Safety
 /// - `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
-/// - If `chunk_fn` is `Some`, it must uphold [`BamChunkTaskFn`]'s nounwind safety contract.
+/// - If `chunk_fn` is `Some`, it must uphold [`BamChunkTaskFn`]'s thread-safety and nounwind
+///   safety contract.
 pub unsafe extern "C" fn host_par_for_each_chunk_readonly(
     iter: *mut BamIter,
     chunk_fn: Option<BamChunkTaskFn>,
-    _user_data: *mut c_void,
+    user_data: *mut c_void,
 ) -> FfiResult {
-    if chunk_fn.is_none() {
-        return FfiResult::NULL_POINTER;
-    }
-    // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
-    let host_iter = match unsafe {
-        validate_handle_mut::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false)
-    } {
-        Ok(it) => it,
-        Err(err) => return err,
-    };
-    if host_iter.has_writable_terms() {
-        return FfiResult::PERMISSION_DENIED;
-    }
-    FfiResult::UNSUPPORTED
+    // SAFETY: Caller upholds `iter`, `chunk_fn`, and `user_data` FFI contract.
+    unsafe { crate::ffi::iter_ext::par_for_each_chunk_readonly_impl(iter, chunk_fn, user_data) }
 }
 
 /// Reserved ABI `0.3.0` slot for schedule system-set configuration (`BamSystemSet`)
@@ -663,7 +640,7 @@ mod tests {
     use crate::loader::ModId;
     use crate::registry::{ComponentOptions, ModRegistry};
     use bevy_abi_mod_macros::ModComponent;
-    use bevy_abi_mod_sys::{BamFieldDesc, BamFieldKind, FfiBool, ModComponent as _};
+    use bevy_abi_mod_sys::{AccessMode, BamFieldDesc, BamFieldKind, FfiBool, ModComponent as _};
     use bevy_ecs::change_detection::Tick;
     use bevy_ecs::prelude::Component;
     use bevy_ecs::world::World;

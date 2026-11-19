@@ -1027,13 +1027,11 @@ impl<'w> HostIter<'w> {
         }
     }
 
-    /// Returns `true` if the query plan declares any mutable (`WRITE` / `OPTIONAL_WRITE`) term.
+    /// Returns `true` if the query plan declares any mutable term (`WRITE`, `OPTIONAL_WRITE`,
+    /// `RESOURCE_WRITE`, or `MESSAGE_WRITE`).
     #[inline]
     pub(crate) fn has_writable_terms(&self) -> bool {
-        self.plan
-            .terms
-            .iter()
-            .any(|t| matches!(t.mode, AccessMode::WRITE | AccessMode::OPTIONAL_WRITE))
+        self.plan.terms.iter().any(|t| t.mode.is_mutable())
     }
 
     /// Advances to the next non-empty matching chunk, returning `0` when exhausted.
@@ -1513,6 +1511,10 @@ impl<'w> HostIter<'w> {
         run_len: usize,
         mut is_present: impl FnMut(ComponentId) -> bool,
     ) {
+        const STATIC_HAS_LEN: usize = 4096;
+        static STATIC_HAS_TRUE: [FfiBool; STATIC_HAS_LEN] = [FfiBool::TRUE; STATIC_HAS_LEN];
+        static STATIC_HAS_FALSE: [FfiBool; STATIC_HAS_LEN] = [FfiBool::FALSE; STATIC_HAS_LEN];
+
         if self.plan.has_indices.is_empty() || run_len == 0 {
             return;
         }
@@ -1529,19 +1531,27 @@ impl<'w> HostIter<'w> {
                 need_false = true;
             }
         }
-        if need_true && self.has_true_buf.len() < run_len {
-            self.has_true_buf.resize(run_len, FfiBool::TRUE);
-        }
-        if need_false && self.has_false_buf.len() < run_len {
-            self.has_false_buf.resize(run_len, FfiBool::FALSE);
-        }
         let true_ptr = if need_true {
-            self.has_true_buf.as_ptr().cast_mut().cast::<u8>()
+            if run_len <= STATIC_HAS_LEN {
+                STATIC_HAS_TRUE.as_ptr().cast_mut().cast::<u8>()
+            } else {
+                if self.has_true_buf.len() < run_len {
+                    self.has_true_buf.resize(run_len, FfiBool::TRUE);
+                }
+                self.has_true_buf.as_ptr().cast_mut().cast::<u8>()
+            }
         } else {
             core::ptr::null_mut()
         };
         let false_ptr = if need_false {
-            self.has_false_buf.as_ptr().cast_mut().cast::<u8>()
+            if run_len <= STATIC_HAS_LEN {
+                STATIC_HAS_FALSE.as_ptr().cast_mut().cast::<u8>()
+            } else {
+                if self.has_false_buf.len() < run_len {
+                    self.has_false_buf.resize(run_len, FfiBool::FALSE);
+                }
+                self.has_false_buf.as_ptr().cast_mut().cast::<u8>()
+            }
         } else {
             core::ptr::null_mut()
         };
@@ -2301,21 +2311,20 @@ struct ArchetypeParPartition {
 }
 
 /// Executes `chunk_fn(task_iter, user_data)` in parallel across Bevy's [`ComputeTaskPool`] over
-/// disjoint matched table/archetype sub-ranges.
+/// disjoint matched table/archetype sub-ranges with zero command-arena allocations per worker.
 ///
-/// Each worker task receives a scoped `BamIter` already positioned on an active non-empty chunk.
-/// Non-reentrant (`in_par_iter == true` rejects nested `par_for_each_chunk` with `ACCESS_CONFLICT`),
-/// and any non-`OK` `FfiResult` returned by a task (including `PANIC_CAUGHT`) aborts remaining
-/// chunk dispatches and is returned deterministically to the caller.
+/// When `require_readonly` is `true`, rejects any query plan declaring a mutable term (`WRITE`,
+/// `OPTIONAL_WRITE`, `RESOURCE_WRITE`, or `MESSAGE_WRITE`) with [`FfiResult::PERMISSION_DENIED`].
 ///
 /// # Safety
 /// - `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
 /// - `chunk_fn` and `user_data` must be thread-safe (`Sync`) across concurrent worker invocations
-///   on disjoint entity chunks.
-pub unsafe extern "C" fn host_par_for_each_chunk(
+///   on disjoint entity chunks and must never unwind across `extern "C"`.
+pub(crate) unsafe fn par_for_each_chunk_impl(
     iter: *mut BamIter,
     chunk_fn: Option<BamChunkTaskFn>,
     user_data: *mut c_void,
+    require_readonly: bool,
 ) -> FfiResult {
     let Some(task_cb) = chunk_fn else {
         return FfiResult::NULL_POINTER;
@@ -2329,6 +2338,9 @@ pub unsafe extern "C" fn host_par_for_each_chunk(
     };
     if host_iter.in_par_iter {
         return FfiResult::ACCESS_CONFLICT;
+    }
+    if require_readonly && host_iter.has_writable_terms() {
+        return FfiResult::PERMISSION_DENIED;
     }
 
     let Some(tables) = host_iter.tables else {
@@ -2368,12 +2380,13 @@ pub unsafe extern "C" fn host_par_for_each_chunk(
             let mut total_rows = 0usize;
             let start_tc = *table_cursor;
             let start_rc = *row_cursor;
-            for &tid in &matched_tables[start_tc..] {
+            for (rel_idx, &tid) in matched_tables[start_tc..].iter().enumerate() {
                 if let Some(t) = tables.get(tid) {
-                    let len = single_table_end_row
+                    let end = single_table_end_row
                         .map(|e| e.min(t.entity_count() as usize))
                         .unwrap_or(t.entity_count() as usize);
-                    total_rows += len;
+                    let start = if rel_idx == 0 { start_rc } else { 0 };
+                    total_rows += end.saturating_sub(start);
                 }
             }
             *table_cursor = matched_tables.len();
@@ -2414,6 +2427,8 @@ pub unsafe extern "C" fn host_par_for_each_chunk(
                 let sw = send_world;
                 let tables_ref = st.0;
                 let table_slice = core::slice::from_ref(&part.table_id);
+                // Zero-arena stack-scoped sub-iterator: no `HostCommands`, no `CommandArena`,
+                // and no per-worker heap allocations.
                 let mut sub_iter = HostIter {
                     header: HandleHeader::new(ITER_MAGIC),
                     tables: Some(tables_ref),
@@ -2486,12 +2501,13 @@ pub unsafe extern "C" fn host_par_for_each_chunk(
             let start_ac = *archetype_cursor;
             let start_ec = *entity_cursor;
             let mut total_ents = 0usize;
-            for &aid in &matched_archetypes[start_ac..] {
+            for (rel_idx, &aid) in matched_archetypes[start_ac..].iter().enumerate() {
                 if let Some(a) = archetypes.get(aid) {
-                    let len = single_arch_end_entity
+                    let end = single_arch_end_entity
                         .map(|e| e.min(a.entities().len()))
                         .unwrap_or(a.entities().len());
-                    total_ents += len;
+                    let start = if rel_idx == 0 { start_ec } else { 0 };
+                    total_ents += end.saturating_sub(start);
                 }
             }
             *archetype_cursor = matched_archetypes.len();
@@ -2526,6 +2542,7 @@ pub unsafe extern "C" fn host_par_for_each_chunk(
             let send_tables = TablesSend(tables);
             let send_archetypes = ArchetypesSend(archetypes);
             let send_sparse_sets = SparseSetsSend(sparse_sets);
+            let needs_sparse_scratch_terms = plan.sparse_data_mask != 0;
             let run_arch_partition = |part: ArchetypeParPartition| {
                 if first_err.load(Ordering::Acquire) != FfiResult::OK.0 {
                     return;
@@ -2538,7 +2555,9 @@ pub unsafe extern "C" fn host_par_for_each_chunk(
                 let archetypes_ref = sa.0;
                 let sparse_sets_ref = ss.0;
                 let mut local_scratch = SparseRowScratch::default();
-                local_scratch.ensure_terms(plan.terms.len());
+                if needs_sparse_scratch_terms {
+                    local_scratch.ensure_terms(plan.terms.len());
+                }
                 let arch_slice = core::slice::from_ref(&part.arch_id);
                 let mut sub_iter = HostIter {
                     header: HandleHeader::new(ITER_MAGIC),
@@ -2608,4 +2627,25 @@ pub unsafe extern "C" fn host_par_for_each_chunk(
     host_iter.chunks_yielded += total_chunks.load(Ordering::Relaxed);
     host_iter.entities_yielded += total_entities.load(Ordering::Relaxed);
     FfiResult(first_err.load(Ordering::Acquire))
+}
+
+/// Executes `chunk_fn(task_iter, user_data)` in parallel across Bevy's [`ComputeTaskPool`] over
+/// disjoint matched table/archetype sub-ranges.
+///
+/// Each worker task receives a scoped `BamIter` yielding only its disjoint sub-range via
+/// `iter_next_chunk`. Non-reentrant (`in_par_iter == true` rejects nested `par_for_each_chunk`
+/// with `ACCESS_CONFLICT`), and any non-`OK` `FfiResult` returned by a task (including
+/// `PANIC_CAUGHT`) aborts remaining chunk dispatches and is returned deterministically.
+///
+/// # Safety
+/// - `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
+/// - `chunk_fn` and `user_data` must be thread-safe (`Sync`) across concurrent worker invocations
+///   on disjoint entity chunks.
+pub unsafe extern "C" fn host_par_for_each_chunk(
+    iter: *mut BamIter,
+    chunk_fn: Option<BamChunkTaskFn>,
+    user_data: *mut c_void,
+) -> FfiResult {
+    // SAFETY: Caller upholds `iter`, `chunk_fn`, and `user_data` safety contract.
+    unsafe { par_for_each_chunk_impl(iter, chunk_fn, user_data, false) }
 }
