@@ -15,11 +15,18 @@
 //!   schedules, `in_state` run conditions, and `DespawnOnExit`/`DespawnOnEnter` markers.
 //! - `bridge-bsn`: Bevy Scene Notation (`bevy_scene`) spawning (`cmd_spawn_scene`) and
 //!   `bevy_scene::Ready` observer integration (`ModBsnPlugin`).
+//! - `bridge-picking`: Flattened Bevy `0.20` `bevy_picking` observer event bridge, `EntityCursor`
+//!   sync (`ModPickingBridgePlugin`), and extended mouse motion/scroll + `Gamepad` input & rumble
+//!   bridges (`ModInputExtBridgePlugin`).
 
 #[cfg(feature = "bridge-asset")]
 pub mod asset;
 #[cfg(feature = "bridge-bsn")]
 pub mod bsn;
+#[cfg(any(feature = "bridge-picking", feature = "bridge-std-types"))]
+pub mod input_ext;
+#[cfg(feature = "bridge-picking")]
+pub mod picking;
 #[cfg(feature = "bridge-state")]
 pub mod state;
 #[cfg(feature = "bridge-std-types")]
@@ -31,6 +38,19 @@ pub use asset::{ModAssetAppExt, ModAssetPlugin, ModAssetRegistry, ModAssetWorldE
 pub use bsn::{
     CANONICAL_READY_NAME, HostSceneRegistry, ModBsnAppExt, ModBsnPlugin, ModBsnWorldExt,
     SCENE_PATCH_ALIAS,
+};
+#[cfg(feature = "bridge-picking")]
+pub use input_ext::{FfiGamepadButton, FfiGamepadRumble, FfiGamepadState};
+#[cfg(any(feature = "bridge-picking", feature = "bridge-std-types"))]
+pub use input_ext::{
+    FfiMouseMotion, FfiMouseScroll, InputExtBridgeSet, ModInputExtBridgePlugin,
+    register_input_ext_bridges,
+};
+#[cfg(feature = "bridge-picking")]
+pub use picking::{
+    FfiEntityCursor, FfiPointerButton, FfiPointerClick, FfiPointerDrag, FfiPointerKind,
+    FfiPointerMove, FfiPointerOut, FfiPointerOver, FfiPointerPress, FfiPointerRelease,
+    ModPickingBridgePlugin, PickingBridgeSet, register_picking_bridges,
 };
 #[cfg(feature = "bridge-state")]
 pub use state::{ModNextState, ModStateError, ModStateExt, ModStateSpec};
@@ -85,6 +105,18 @@ pub mod prelude {
     pub use crate::asset::{ModAssetAppExt, ModAssetPlugin, ModAssetRegistry, ModAssetWorldExt};
     #[cfg(feature = "bridge-bsn")]
     pub use crate::bsn::{HostSceneRegistry, ModBsnAppExt, ModBsnPlugin, ModBsnWorldExt};
+    #[cfg(feature = "bridge-picking")]
+    pub use crate::input_ext::{FfiGamepadButton, FfiGamepadRumble, FfiGamepadState};
+    #[cfg(any(feature = "bridge-picking", feature = "bridge-std-types"))]
+    pub use crate::input_ext::{
+        FfiMouseMotion, FfiMouseScroll, InputExtBridgeSet, ModInputExtBridgePlugin,
+    };
+    #[cfg(feature = "bridge-picking")]
+    pub use crate::picking::{
+        FfiEntityCursor, FfiPointerButton, FfiPointerClick, FfiPointerDrag, FfiPointerKind,
+        FfiPointerMove, FfiPointerOut, FfiPointerOver, FfiPointerPress, FfiPointerRelease,
+        ModPickingBridgePlugin, PickingBridgeSet,
+    };
     #[cfg(feature = "bridge-state")]
     pub use crate::state::{ModNextState, ModStateError, ModStateExt, ModStateSpec};
     #[cfg(feature = "bridge-std-types")]
