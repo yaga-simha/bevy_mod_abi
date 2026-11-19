@@ -35,7 +35,10 @@ pub mod std_types;
 pub mod ui;
 
 #[cfg(feature = "bridge-asset")]
-pub use asset::{ModAssetAppExt, ModAssetPlugin, ModAssetRegistry, ModAssetWorldExt};
+pub use asset::{
+    AssetOverlayPolicy, ConfiguredModAssetPlugin, ModAssetAppExt, ModAssetPlugin, ModAssetRegistry,
+    ModAssetWorldExt, OVERLAY_NAMESPACE,
+};
 #[cfg(feature = "bridge-bsn")]
 pub use bsn::{
     CANONICAL_READY_NAME, HostSceneRegistry, ModBsnAppExt, ModBsnPlugin, ModBsnWorldExt,
@@ -55,12 +58,16 @@ pub use picking::{
     ModPickingBridgePlugin, PickingBridgeSet, register_picking_bridges,
 };
 #[cfg(feature = "bridge-state")]
-pub use state::{ModNextState, ModStateError, ModStateExt, ModStateSpec};
+pub use state::{
+    ModDespawnOnEnter, ModDespawnOnExit, ModNextState, ModStateEntry, ModStateError, ModStateExt,
+    ModStateHandle, ModStateKind, ModStateSlab, ModStateSpec, ModStateTransitionRequest,
+    STATE_ABSENT_DISCRIMINANT,
+};
 #[cfg(feature = "bridge-std-types")]
 pub use std_types::{
-    FfiGlobalTransform, FfiKeyCode, FfiKeyboardInput, FfiMouseButton, FfiMouseInput, FfiTimeFixed,
-    FfiTimeReal, FfiTimeVirtual, FfiTransform, FfiVisibility, StdTypesBridgePlugin,
-    register_std_types_bridges,
+    CANONICAL_DISABLED_NAME, FfiGlobalTransform, FfiKeyCode, FfiKeyboardInput, FfiMouseButton,
+    FfiMouseInput, FfiTimeFixed, FfiTimeReal, FfiTimeVirtual, FfiTransform, FfiVisibility,
+    StdTypesBridgePlugin, register_std_types_bridges,
 };
 #[cfg(feature = "bridge-ui")]
 pub use ui::{
@@ -117,7 +124,10 @@ pub mod prelude {
     ))]
     pub use crate::ModBridgesPlugin;
     #[cfg(feature = "bridge-asset")]
-    pub use crate::asset::{ModAssetAppExt, ModAssetPlugin, ModAssetRegistry, ModAssetWorldExt};
+    pub use crate::asset::{
+        AssetOverlayPolicy, ConfiguredModAssetPlugin, ModAssetAppExt, ModAssetPlugin,
+        ModAssetRegistry, ModAssetWorldExt, OVERLAY_NAMESPACE,
+    };
     #[cfg(feature = "bridge-bsn")]
     pub use crate::bsn::{HostSceneRegistry, ModBsnAppExt, ModBsnPlugin, ModBsnWorldExt};
     #[cfg(feature = "bridge-picking")]
@@ -133,11 +143,15 @@ pub mod prelude {
         ModPickingBridgePlugin, PickingBridgeSet,
     };
     #[cfg(feature = "bridge-state")]
-    pub use crate::state::{ModNextState, ModStateError, ModStateExt, ModStateSpec};
+    pub use crate::state::{
+        ModDespawnOnEnter, ModDespawnOnExit, ModNextState, ModStateEntry, ModStateError,
+        ModStateExt, ModStateHandle, ModStateKind, ModStateSlab, ModStateSpec,
+        ModStateTransitionRequest, STATE_ABSENT_DISCRIMINANT,
+    };
     #[cfg(feature = "bridge-std-types")]
     pub use crate::std_types::{
-        FfiGlobalTransform, FfiKeyCode, FfiKeyboardInput, FfiMouseButton, FfiMouseInput,
-        FfiTimeFixed, FfiTimeReal, FfiTimeVirtual, FfiTransform, FfiVisibility,
+        CANONICAL_DISABLED_NAME, FfiGlobalTransform, FfiKeyCode, FfiKeyboardInput, FfiMouseButton,
+        FfiMouseInput, FfiTimeFixed, FfiTimeReal, FfiTimeVirtual, FfiTransform, FfiVisibility,
         StdTypesBridgePlugin,
     };
     #[cfg(feature = "bridge-ui")]

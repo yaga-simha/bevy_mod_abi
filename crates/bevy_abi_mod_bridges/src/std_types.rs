@@ -1,8 +1,8 @@
 //! Core Bevy `0.20` standard component and resource bridges (`StdTypesBridgePlugin`).
 //!
-//! Exposes `Transform`, `GlobalTransform`, `Visibility`, `Name`, `Time<Virtual>`, `Time<Fixed>`,
-//! `Time<Real>`, `ButtonInput<KeyCode>`, and `ButtonInput<MouseButton>` to native C-ABI mods
-//! via [`HostWireBridge`] and [`HostStringBridge`] with `#![forbid(unsafe_code)]`.
+//! Exposes `Transform`, `GlobalTransform`, `Visibility`, `Name`, `Disabled`, `Time<Virtual>`,
+//! `Time<Fixed>`, `Time<Real>`, `ButtonInput<KeyCode>`, and `ButtonInput<MouseButton>` to native
+//! C-ABI mods via [`HostWireBridge`] and [`HostStringBridge`] with `#![forbid(unsafe_code)]`.
 
 use bevy_abi_mod_host_sys::{
     ComponentCollisionError, HostStringBridge, HostWireBridge, ModRegistry,
@@ -11,6 +11,7 @@ use bevy_abi_mod_macros::AbiPod;
 use bevy_abi_mod_sys::{FfiBool, FfiResult};
 use bevy_app::{App, Plugin};
 use bevy_camera::visibility::Visibility;
+use bevy_ecs::entity_disabling::Disabled;
 use bevy_ecs::name::Name;
 use bevy_ecs::world::World;
 use bevy_input::ButtonInput;
@@ -29,6 +30,8 @@ pub const CANONICAL_GLOBAL_TRANSFORM_NAME: &str =
 pub const CANONICAL_VISIBILITY_NAME: &str = "bevy_camera::visibility::Visibility";
 /// Canonical ABI name for bridged `Name`.
 pub const CANONICAL_NAME_NAME: &str = "bevy_ecs::name::Name";
+/// Canonical ABI name for bridged `bevy_ecs::entity_disabling::Disabled`.
+pub const CANONICAL_DISABLED_NAME: &str = "bevy_ecs::entity_disabling::Disabled";
 /// Canonical ABI name for bridged `Time<Virtual>`.
 pub const CANONICAL_TIME_VIRTUAL_NAME: &str = "bevy_time::Time<Virtual>";
 /// Canonical ABI name for bridged `Time<Fixed>`.
@@ -771,9 +774,23 @@ impl HostWireBridge<ButtonInput<MouseButton>> for MouseInputBridge {
     }
 }
 
+struct DisabledBridge;
+impl HostWireBridge<Disabled> for DisabledBridge {
+    type Wire = FfiBool;
+    const CANONICAL_NAME: &'static str = CANONICAL_DISABLED_NAME;
+    const ALIAS: Option<&'static str> = Some("Disabled");
+    const SUPPORTS_SET: bool = false;
+
+    #[inline]
+    fn to_wire(_value: &Disabled) -> FfiBool {
+        FfiBool::TRUE
+    }
+}
+
 /// Registers all core Bevy `0.20` standard component and resource bridges on `world`'s
-/// [`ModRegistry`] (`Transform`, `GlobalTransform`, `Visibility`, `Name`, `Time<Virtual>`,
-/// `Time<Fixed>`, `Time<Real>`, `ButtonInput<KeyCode>`, `ButtonInput<MouseButton>`).
+/// [`ModRegistry`] (`Transform`, `GlobalTransform`, `Visibility`, `Name`, `Disabled`,
+/// `Time<Virtual>`, `Time<Fixed>`, `Time<Real>`, `ButtonInput<KeyCode>`,
+/// `ButtonInput<MouseButton>`).
 pub fn register_std_types_bridges(world: &mut World) -> Result<(), ComponentCollisionError> {
     if !world.contains_resource::<ModRegistry>() {
         world.insert_resource(ModRegistry::new());
@@ -783,6 +800,7 @@ pub fn register_std_types_bridges(world: &mut World) -> Result<(), ComponentColl
     let global_transform_id = world.register_component::<GlobalTransform>();
     let visibility_id = world.register_component::<Visibility>();
     let name_id = world.register_component::<Name>();
+    let disabled_id = world.register_component::<Disabled>();
     let time_virtual_id = world.register_component::<Time<Virtual>>();
     let time_fixed_id = world.register_component::<Time<Fixed>>();
     let time_real_id = world.register_component::<Time<Real>>();
@@ -810,6 +828,11 @@ pub fn register_std_types_bridges(world: &mut World) -> Result<(), ComponentColl
         0,
         Some(ModRegistry::default_inserter_for::<Name>()),
     )?;
+    reg.register_bridged_component::<Disabled, DisabledBridge>(
+        disabled_id,
+        0,
+        Some(ModRegistry::default_inserter_for::<Disabled>()),
+    )?;
     reg.register_bridged_resource::<Time<Virtual>, TimeVirtualBridge>(time_virtual_id)?;
     reg.register_bridged_resource::<Time<Fixed>, TimeFixedBridge>(time_fixed_id)?;
     reg.register_bridged_resource::<Time<Real>, TimeRealBridge>(time_real_id)?;
@@ -819,8 +842,8 @@ pub fn register_std_types_bridges(world: &mut World) -> Result<(), ComponentColl
 }
 
 /// Bevy [`Plugin`] exposing core Bevy `0.20` components (`Transform`, `GlobalTransform`,
-/// `Visibility`, `Name`) and resources (`Time<Virtual|Fixed|Real>`, `ButtonInput<KeyCode|MouseButton>`)
-/// to native mods via [`ModRegistry`].
+/// `Visibility`, `Name`, `Disabled`) and resources (`Time<Virtual|Fixed|Real>`,
+/// `ButtonInput<KeyCode|MouseButton>`) to native mods via [`ModRegistry`].
 #[derive(Default, Debug, Clone, Copy)]
 pub struct StdTypesBridgePlugin;
 
@@ -912,6 +935,21 @@ mod tests {
                     .is_some()
             );
 
+            let disabled_entry = reg.get_by_name("Disabled").unwrap();
+            assert_eq!(
+                disabled_entry.uuid,
+                ComponentUuid::from_canonical_name(CANONICAL_DISABLED_NAME)
+            );
+            assert_eq!(disabled_entry.size, 0);
+            assert_eq!(disabled_entry.align, 1);
+            assert!(disabled_entry.is_immutable());
+            assert!(disabled_entry.insert_default_fn.is_some());
+            assert!(reg.resolve_symbol("bam.v0.Disabled.vtable").is_some());
+            assert!(
+                reg.resolve_symbol("bam.v0.bevy_ecs::entity_disabling::Disabled.vtable")
+                    .is_some()
+            );
+
             for res_name in [
                 "Time<Virtual>",
                 "Time<Fixed>",
@@ -985,8 +1023,9 @@ mod tests {
         assert!(w_ms.pressed(FfiMouseButton::from_bevy(MouseButton::Other(2)).unwrap()));
         assert!(!w_ms.pressed(FfiMouseButton::RIGHT));
 
-        // Verify `insert_default_fn` inserts host `Transform`, `Visibility`, and `Name`.
-        let (tf_ins, vis_ins, name_ins) = {
+        // Verify `insert_default_fn` inserts host `Transform`, `Visibility`, `Name`, and `Disabled`.
+        assert_eq!(DisabledBridge::to_wire(&Disabled), FfiBool::TRUE);
+        let (tf_ins, vis_ins, name_ins, disabled_ins) = {
             let reg = app.world().resource::<ModRegistry>();
             (
                 reg.get_by_name("Transform")
@@ -998,11 +1037,16 @@ mod tests {
                     .insert_default_fn
                     .unwrap(),
                 reg.get_by_name("Name").unwrap().insert_default_fn.unwrap(),
+                reg.get_by_name("Disabled")
+                    .unwrap()
+                    .insert_default_fn
+                    .unwrap(),
             )
         };
         tf_ins(app.world_mut(), bare);
         vis_ins(app.world_mut(), bare);
         name_ins(app.world_mut(), bare);
+        disabled_ins(app.world_mut(), bare);
 
         assert_eq!(
             *app.world().get::<Transform>(bare).unwrap(),
@@ -1013,6 +1057,7 @@ mod tests {
             Visibility::Inherited
         );
         assert!(app.world().get::<Name>(bare).is_some());
+        assert!(app.world().get::<Disabled>(bare).is_some());
 
         let _ = (
             core::mem::size_of::<MappedWireVTable<FfiTransform>>(),
