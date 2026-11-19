@@ -27,9 +27,9 @@ pub use ffi::assets_scene::{
     host_asset_release, host_cmd_spawn_scene,
 };
 pub use ffi::commands::{
-    CommandArena, HostCommands, HostCommandsStorage, MAX_SPAWN_BATCH_COMPONENTS, host_cmd_despawn,
-    host_cmd_insert, host_cmd_insert_default, host_cmd_remove, host_cmd_spawn,
-    host_cmd_spawn_empty, host_cmd_trigger,
+    CommandArena, CommandQuotaLimits, HostCommands, HostCommandsStorage,
+    MAX_SPAWN_BATCH_COMPONENTS, host_cmd_despawn, host_cmd_insert, host_cmd_insert_default,
+    host_cmd_remove, host_cmd_spawn, host_cmd_spawn_empty, host_cmd_trigger,
 };
 pub use ffi::commands_ext::{
     host_cmd_despawn_all, host_cmd_insert_if_new, host_cmd_spawn_batch, host_cmd_spawn_persistent,
@@ -113,11 +113,11 @@ pub use schedule::{
 };
 pub use sync_ptr::{GuestFnPtr, GuestInstancePtr, GuestUserData, SymbolAddress};
 pub use system::{
-    BamQuerySpecOwned, GuestSystem, HostSystemCtx, MAX_SYSTEM_QUERIES, ModErrorPolicy,
-    ModErrorPolicyConfig, ModQuarantine, ModSystemError, ModSystemFaulted,
-    PersistentMessageCursors, SystemInitError, host_sys_commands, host_sys_entity_get,
-    host_sys_entity_get_mut, host_sys_host_ctx, host_sys_query, host_sys_res_mut_ptr,
-    host_sys_res_ptr,
+    BamQuerySpecOwned, BudgetWatchdogAction, GuestSystem, GuestSystemRunMetrics, HostSystemCtx,
+    MAX_SYSTEM_QUERIES, ModBudgetHook, ModBudgetRuntime, ModErrorPolicy, ModErrorPolicyConfig,
+    ModQuarantine, ModSystemError, ModSystemFaulted, PersistentMessageCursors, SystemInitError,
+    host_sys_commands, host_sys_entity_get, host_sys_entity_get_mut, host_sys_host_ctx,
+    host_sys_query, host_sys_res_mut_ptr, host_sys_res_ptr,
 };
 #[cfg(feature = "diagnostics")]
 pub use system::{ModDiagnosticsCollector, ModDiagnosticsSample};

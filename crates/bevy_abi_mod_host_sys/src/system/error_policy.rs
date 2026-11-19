@@ -1,5 +1,6 @@
 //! Fault policies, `ModQuarantine` resource, runtime system errors, and initialization diagnostics.
 
+use crate::ffi::commands::CommandQuotaLimits;
 use crate::loader::ModId;
 use bevy_abi_mod_sys::{BamHostCtx, FfiResult};
 use bevy_ecs::change_detection::Tick;
@@ -11,7 +12,7 @@ use bevy_ecs::world::World;
 use bevy_platform::collections::HashMap;
 use core::cell::RefCell;
 use core::fmt;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -360,4 +361,175 @@ pub(crate) fn record_active_guest_fault(
         })
         .ok()
         .flatten()
+}
+
+/// Execution and quota metrics captured for one [`crate::GuestSystem`] invocation and passed to
+/// [`ModBudgetHook::record_system_run`].
+#[derive(Clone, Debug)]
+pub struct GuestSystemRunMetrics {
+    /// Owning [`ModId`], if associated with a mod.
+    pub mod_id: Option<ModId>,
+    /// Canonical module namespace (`BamManifest::name` or `"unscoped"`).
+    pub mod_name: Arc<str>,
+    /// Registered name of the guest system.
+    pub system_name: Arc<str>,
+    /// Wall-clock callback execution duration in microseconds.
+    pub duration_us: u64,
+    /// Number of entities matched or processed during this invocation.
+    pub matched_entities: u64,
+    /// Number of non-empty ECS tables/archetypes matched by this system's queries.
+    pub matched_tables: u64,
+    /// Number of matched tables skipped via `BAM_COMPONENT_FLAG_SUMMARY_TICK`.
+    pub skipped_summary_tick_tables: u64,
+    /// Number of query chunks yielded during this invocation.
+    pub chunks_yielded: usize,
+    /// Number of deferred commands accepted during this invocation (`0` when faulted).
+    pub commands_queued: usize,
+    /// Peak `CommandArena` payload bytes bump-allocated during this invocation.
+    pub arena_bytes_used: usize,
+    /// Number of deferred entity spawns accepted during this invocation (`0` when faulted).
+    pub spawns_queued: usize,
+    /// Number of command payload allocations rejected due to `max_arena_bytes`.
+    pub arena_breaches: usize,
+    /// Number of deferred entity spawns rejected due to `max_spawns_per_frame`.
+    pub spawn_breaches: usize,
+    /// `true` if the guest callback returned an error, panicked, or reported a fault.
+    pub faulted: bool,
+}
+
+/// Immediate watchdog action returned by [`ModBudgetHook::record_system_run`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BudgetWatchdogAction {
+    /// When `true`, [`crate::GuestSystem`] immediately quarantines itself (`enabled = false`),
+    /// increments `ModHost` fault count, and emits [`ModSystemFaulted`].
+    pub quarantine: bool,
+    /// Optional diagnostic summary recorded in `ModSystemFaulted::last_error`.
+    pub reason: Option<String>,
+}
+
+/// Safe runtime quota & frame-time watchdog hook installed into [`ModBudgetRuntime`] by
+/// `bevy_abi_mod_host` (`#![forbid(unsafe_code)]`).
+pub trait ModBudgetHook: Send + Sync + 'static {
+    /// Resolves active [`CommandQuotaLimits`] and an optional shared per-mod frame spawn counter
+    /// enforced atomically across parallel systems in the same frame.
+    fn prepare_system_quotas(
+        &self,
+        mod_id: Option<ModId>,
+        mod_name: &str,
+    ) -> (CommandQuotaLimits, Option<Arc<AtomicUsize>>);
+
+    /// Records completed execution metrics for a [`crate::GuestSystem`] run and returns any
+    /// immediate watchdog quarantine decision.
+    fn record_system_run(&self, metrics: GuestSystemRunMetrics) -> BudgetWatchdogAction;
+}
+
+/// World [`Resource`] bridging [`crate::GuestSystem`] and [`crate::HostCommands`] to a safe
+/// [`ModBudgetHook`] implementation without placing policy logic inside `bevy_abi_mod_host_sys`.
+#[derive(Resource, Clone)]
+pub struct ModBudgetRuntime {
+    hook: Arc<dyn ModBudgetHook>,
+}
+
+impl ModBudgetRuntime {
+    /// Creates a new [`ModBudgetRuntime`] backed by `hook`.
+    #[inline]
+    pub fn new(hook: Arc<dyn ModBudgetHook>) -> Self {
+        Self { hook }
+    }
+
+    /// Resolves active [`CommandQuotaLimits`] and optional shared per-mod frame spawn counter for
+    /// `(mod_id, mod_name)`.
+    #[inline]
+    pub fn prepare_system_quotas(
+        &self,
+        mod_id: Option<ModId>,
+        mod_name: &str,
+    ) -> (CommandQuotaLimits, Option<Arc<AtomicUsize>>) {
+        self.hook.prepare_system_quotas(mod_id, mod_name)
+    }
+
+    /// Records completed execution metrics for a guest system run and returns any watchdog action.
+    #[inline]
+    pub fn record_system_run(&self, metrics: GuestSystemRunMetrics) -> BudgetWatchdogAction {
+        self.hook.record_system_run(metrics)
+    }
+}
+
+impl fmt::Debug for ModBudgetRuntime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ModBudgetRuntime").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct DummyBudgetHook {
+        limits: CommandQuotaLimits,
+        counter: Arc<AtomicUsize>,
+        recorded: Mutex<Vec<GuestSystemRunMetrics>>,
+        trigger_quarantine: bool,
+    }
+
+    impl ModBudgetHook for DummyBudgetHook {
+        fn prepare_system_quotas(
+            &self,
+            _mod_id: Option<ModId>,
+            _mod_name: &str,
+        ) -> (CommandQuotaLimits, Option<Arc<AtomicUsize>>) {
+            (self.limits, Some(Arc::clone(&self.counter)))
+        }
+
+        fn record_system_run(&self, metrics: GuestSystemRunMetrics) -> BudgetWatchdogAction {
+            self.recorded.lock().unwrap().push(metrics);
+            BudgetWatchdogAction {
+                quarantine: self.trigger_quarantine,
+                reason: self
+                    .trigger_quarantine
+                    .then(|| String::from("p99 budget exceeded")),
+            }
+        }
+    }
+
+    #[test]
+    fn mod_budget_runtime_delegates_prepare_and_record() {
+        let hook = Arc::new(DummyBudgetHook {
+            limits: CommandQuotaLimits {
+                max_arena_bytes: Some(256),
+                max_spawns_per_frame: Some(4),
+            },
+            counter: Arc::new(AtomicUsize::new(0)),
+            recorded: Mutex::new(Vec::new()),
+            trigger_quarantine: true,
+        });
+        let runtime = ModBudgetRuntime::new(Arc::clone(&hook) as Arc<dyn ModBudgetHook>);
+        assert!(format!("{runtime:?}").contains("ModBudgetRuntime"));
+
+        let (limits, shared) = runtime.prepare_system_quotas(Some(ModId(9)), "test_mod");
+        assert_eq!(limits.max_arena_bytes, Some(256));
+        assert_eq!(limits.max_spawns_per_frame, Some(4));
+        assert!(shared.is_some());
+
+        let action = runtime.record_system_run(GuestSystemRunMetrics {
+            mod_id: Some(ModId(9)),
+            mod_name: Arc::from("test_mod"),
+            system_name: Arc::from("tick"),
+            duration_us: 999,
+            matched_entities: 10,
+            matched_tables: 2,
+            skipped_summary_tick_tables: 1,
+            chunks_yielded: 1,
+            commands_queued: 3,
+            arena_bytes_used: 128,
+            spawns_queued: 2,
+            arena_breaches: 0,
+            spawn_breaches: 1,
+            faulted: false,
+        });
+        assert!(action.quarantine);
+        assert_eq!(action.reason.as_deref(), Some("p99 budget exceeded"));
+        assert_eq!(hook.recorded.lock().unwrap().len(), 1);
+    }
 }

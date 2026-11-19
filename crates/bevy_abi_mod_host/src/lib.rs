@@ -49,6 +49,7 @@
 //! ```
 
 pub mod app_ext;
+pub mod budgets;
 pub mod commands_ext;
 #[cfg(feature = "diagnostics")]
 pub mod diagnostics;
@@ -90,6 +91,11 @@ pub use bevy_abi_mod_host_sys::{
     inspect_library_residency, inspect_library_residency_file, is_abi_version_compatible,
     read_entity_pod_bytes, write_entity_pod_bytes,
 };
+pub use budgets::{
+    DEFAULT_BUDGET_WINDOW_SIZE, DEFAULT_MAX_CONSECUTIVE_BREACHES, ModBudgetBreach,
+    ModBudgetBreachKind, ModBudgetExt, ModBudgetLimits, ModBudgetPolicy, ModBudgetSnapshot,
+    ModBudgetTelemetry, flush_mod_budgets, sync_mod_budget_policy,
+};
 pub use commands_ext::ModCommandsExt;
 pub use events::{
     LoadedModInfo, ModLoaded, ModSystemError, ModSystemFaulted, ModUnloaded, SystemInitError,
@@ -110,6 +116,11 @@ pub use world_ext::{
 /// Convenient prelude module for Bevy games hosting native C-ABI mods (`ABI 0.3.0`).
 pub mod prelude {
     pub use crate::app_ext::ModAppExt;
+    pub use crate::budgets::{
+        DEFAULT_BUDGET_WINDOW_SIZE, DEFAULT_MAX_CONSECUTIVE_BREACHES, ModBudgetBreach,
+        ModBudgetBreachKind, ModBudgetExt, ModBudgetLimits, ModBudgetPolicy, ModBudgetSnapshot,
+        ModBudgetTelemetry,
+    };
     pub use crate::commands_ext::ModCommandsExt;
     #[cfg(feature = "signature-verification")]
     pub use crate::events::VerifiedModSignature;

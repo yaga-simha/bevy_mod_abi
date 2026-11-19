@@ -1,6 +1,6 @@
 //! `GuestSystem` implementation of Bevy's `System` trait and `HostSystemCtx` (`BamSystemCtx`).
 
-use crate::ffi::commands::{HostCommands, HostCommandsStorage};
+use crate::ffi::commands::{CommandQuotaLimits, HostCommands, HostCommandsStorage};
 use crate::ffi::iter::{HostIter, QueryPlan};
 use crate::handle_header::{
     HandleHeader, HostContext, SYS_CTX_MAGIC, validate_handle_mut, validate_handle_ref,
@@ -11,8 +11,9 @@ use crate::schedule::ModSystemSet;
 use crate::sync_ptr::{GuestFnPtr, GuestUserData};
 use crate::system::access_builder::initialize_query_groups_in_world;
 use crate::system::error_policy::{
-    ActiveGuestFaultGuard, ModErrorPolicy, ModErrorPolicyConfig, ModSystemError, ModSystemFaulted,
-    SystemInitError, dispatch_mod_fault_to_fallback_handler,
+    ActiveGuestFaultGuard, GuestSystemRunMetrics, ModBudgetRuntime, ModErrorPolicy,
+    ModErrorPolicyConfig, ModQuarantine, ModSystemError, ModSystemFaulted, SystemInitError,
+    dispatch_mod_fault_to_fallback_handler,
 };
 use crate::system::query_group::{BamQuerySpecOwned, CachedQueryGroup, MAX_SYSTEM_QUERIES};
 use bevy_abi_mod_sys::{
@@ -640,6 +641,7 @@ pub struct GuestSystem {
     registry: ModRegistry,
     cached_registry_gen: u64,
     snapshot: Arc<RegistrySnapshot>,
+    budget_runtime_id: Option<bevy_ecs::component::ComponentId>,
     #[cfg(feature = "diagnostics")]
     diagnostics_collector_id: Option<bevy_ecs::component::ComponentId>,
 }
@@ -696,6 +698,7 @@ impl GuestSystem {
             registry,
             cached_registry_gen,
             snapshot,
+            budget_runtime_id: None,
             #[cfg(feature = "diagnostics")]
             diagnostics_collector_id: None,
         }
@@ -1195,6 +1198,16 @@ impl System for GuestSystem {
             self.registry = world_reg.clone();
         }
 
+        if let Some(mod_id) = self.mod_id
+            && let Some(mut quarantine) = world.get_resource_mut::<ModQuarantine>()
+        {
+            quarantine.register_system(
+                mod_id,
+                Arc::clone(&self.name),
+                Arc::clone(&self.enabled_flag),
+            );
+        }
+
         // Bind each query group to this system's `(mod_namespace, system_name)` identity so
         // message / removed-component cursors persist across `reload_mod` through
         // `PersistentMessageCursors`. Unscoped (host-constructed) systems never persist cursors,
@@ -1208,10 +1221,15 @@ impl System for GuestSystem {
         }
 
         match initialize_query_groups_in_world(world, &self.snapshot, &mut self.query_groups) {
-            Ok(access_set) => {
+            Ok(mut access_set) => {
+                if let Some(budget_id) = world.components().component_id::<ModBudgetRuntime>() {
+                    access_set.add_resource_read(budget_id);
+                    self.budget_runtime_id = Some(budget_id);
+                } else {
+                    self.budget_runtime_id = None;
+                }
                 #[cfg(feature = "diagnostics")]
-                let access_set = {
-                    let mut access_set = access_set;
+                {
                     if let Some(col_id) =
                         world.components().component_id::<ModDiagnosticsCollector>()
                     {
@@ -1220,8 +1238,7 @@ impl System for GuestSystem {
                     } else {
                         self.diagnostics_collector_id = None;
                     }
-                    access_set
-                };
+                }
                 self.access = SystemAccess::Shared(access_set);
                 let cell = world.as_unsafe_world_cell();
                 for group in &mut self.query_groups {
@@ -1333,6 +1350,33 @@ impl System for GuestSystem {
         let storages = unsafe { world.storages() };
         let archetypes = world.archetypes();
 
+        let budget_runtime: Option<&ModBudgetRuntime> = self.budget_runtime_id.and_then(|bid| {
+            // SAFETY: Shared read access to `ModBudgetRuntime` (`bid`) was declared in `FilteredAccessSet`.
+            unsafe { world.get_resource_by_id(bid) }.map(|ptr| {
+                // SAFETY: `bid` is `ModBudgetRuntime`'s `ComponentId`.
+                unsafe { ptr.deref::<ModBudgetRuntime>() }
+            })
+        });
+
+        let mod_label = self.mod_namespace.as_deref().unwrap_or("unscoped");
+        let (quota_limits, shared_frame_spawns, table_metrics) = if let Some(rt) = budget_runtime {
+            let (limits, shared) = rt.prepare_system_quotas(self.mod_id, mod_label);
+            let tm = compute_query_table_metrics(
+                &self.query_groups,
+                &storages.tables,
+                archetypes,
+                last_run,
+                change_tick,
+            );
+            (limits, shared, tm)
+        } else {
+            (
+                CommandQuotaLimits::UNLIMITED,
+                None,
+                QueryTableMetrics::default(),
+            )
+        };
+
         let count = self.query_groups.len().min(MAX_SYSTEM_QUERIES);
         let mut host_iters: [Option<HostIter<'_>>; MAX_SYSTEM_QUERIES] =
             [const { None }; MAX_SYSTEM_QUERIES];
@@ -1380,7 +1424,6 @@ impl System for GuestSystem {
             }
         }
 
-        let mod_label = self.mod_namespace.as_deref().unwrap_or("unscoped");
         let sys_span = tracing::debug_span!(
             "bam_guest_system",
             mod_name = %mod_label,
@@ -1391,8 +1434,17 @@ impl System for GuestSystem {
         );
         let _span_guard = sys_span.enter();
 
+        if self.commands_storage.is_empty() {
+            self.commands_storage.reset_invocation_counters();
+        }
+
         #[cfg(feature = "diagnostics")]
-        let start_time = std::time::Instant::now();
+        let has_diagnostics = self.diagnostics_collector_id.is_some();
+        #[cfg(not(feature = "diagnostics"))]
+        let has_diagnostics = false;
+
+        let start_time =
+            (has_diagnostics || budget_runtime.is_some()).then(std::time::Instant::now);
 
         let (status, reported_fault) = {
             let mut host_commands = HostCommands::new(
@@ -1401,7 +1453,8 @@ impl System for GuestSystem {
                 &self.snapshot,
             )
             .with_mod_context(self.mod_id, Some(Arc::clone(&self.is_active)))
-            .with_registry(&self.registry);
+            .with_registry(&self.registry)
+            .with_quotas(quota_limits, shared_frame_spawns.as_deref());
             let commands_ptr = host_commands.as_ffi_ptr();
             let err_buf = core::mem::take(&mut self.last_error_buf);
             let mut sys_ctx = HostSystemCtx::new(
@@ -1431,6 +1484,8 @@ impl System for GuestSystem {
             (res, reported)
         };
 
+        let elapsed = start_time.map(|t| t.elapsed());
+
         let mut total_chunks = 0usize;
         let mut total_entities = 0usize;
         for it in host_iters.iter().take(count).flatten() {
@@ -1441,6 +1496,10 @@ impl System for GuestSystem {
         drop(host_iters);
 
         let commands_queued = self.commands_storage.len();
+        let arena_bytes_used = self.commands_storage.arena_bytes_used();
+        let spawns_queued = self.commands_storage.spawns_queued();
+        let arena_breaches = self.commands_storage.arena_breaches();
+        let spawn_breaches = self.commands_storage.spawn_breaches();
         if !sys_span.is_disabled() {
             sys_span.record("chunks", total_chunks);
             sys_span.record("entities", total_entities);
@@ -1450,23 +1509,88 @@ impl System for GuestSystem {
         let faulted =
             status == FfiResult::PANIC_CAUGHT || status.is_err() || reported_fault.is_some();
 
+        let mut watchdog_quarantined = false;
+        if let Some(rt) = budget_runtime {
+            let duration_us = elapsed
+                .map(|d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            let matched_entities = if total_chunks > 0 || table_metrics.has_row_filters {
+                total_entities as u64
+            } else {
+                table_metrics.unfiltered_entities
+            };
+            let action = rt.record_system_run(GuestSystemRunMetrics {
+                mod_id: self.mod_id,
+                mod_name: self.mod_namespace.clone().unwrap_or_else(unscoped_mod_name),
+                system_name: Arc::clone(&self.name),
+                duration_us,
+                matched_entities,
+                matched_tables: table_metrics.matched_tables,
+                skipped_summary_tick_tables: table_metrics.skipped_summary_tick_tables,
+                chunks_yielded: total_chunks,
+                commands_queued: if faulted { 0 } else { commands_queued },
+                arena_bytes_used,
+                spawns_queued: if faulted { 0 } else { spawns_queued },
+                arena_breaches,
+                spawn_breaches,
+                faulted,
+            });
+            if !faulted && action.quarantine {
+                watchdog_quarantined = true;
+                self.enabled_flag.store(false, Ordering::Release);
+                let mod_id = self.mod_id;
+                let mod_namespace = self.mod_namespace.as_deref().map(str::to_owned);
+                let ns_label = mod_namespace.as_deref().unwrap_or("unscoped");
+                let generation = self.mod_generation;
+                let sys_name = self.name.to_string();
+                let reason = action.reason.unwrap_or_else(|| {
+                    format!("guest system '{sys_name}' exceeded max_p99_system_micros budget")
+                });
+                tracing::warn!(
+                    system = %sys_name,
+                    mod_id = ?mod_id,
+                    namespace = %ns_label,
+                    generation,
+                    duration_us,
+                    reason = %reason,
+                    "quarantined guest mod system due to frame-time budget breach"
+                );
+                let fault_msg = ModSystemFaulted {
+                    mod_id,
+                    mod_namespace,
+                    generation,
+                    system_name: sys_name,
+                    status: FfiResult::CAPACITY_EXCEEDED,
+                    panicked: false,
+                    last_error: Some(reason),
+                    init_error: None,
+                };
+                self.fault_queue.push(move |world: &mut World| {
+                    if let Some(id) = mod_id {
+                        ModHost::record_fault_in_world(world, id);
+                    }
+                    if let Some(mut msgs) = world.get_resource_mut::<Messages<ModSystemFaulted>>() {
+                        msgs.write(fault_msg);
+                    }
+                });
+            }
+        }
+        let _ = watchdog_quarantined;
+
         #[cfg(feature = "diagnostics")]
         if let Some(col_id) = self.diagnostics_collector_id {
-            let cpu_time_us = start_time.elapsed().as_secs_f64() * 1_000_000.0;
+            let cpu_time_us = elapsed.map_or(0.0, |d| d.as_secs_f64() * 1_000_000.0);
             // SAFETY: Shared read access to `ModDiagnosticsCollector` (`col_id`) was declared in `FilteredAccessSet`.
             if let Some(ptr) = unsafe { world.get_resource_by_id(col_id) } {
                 // SAFETY: `col_id` is `ModDiagnosticsCollector`'s `ComponentId`.
                 let collector = unsafe { ptr.deref::<ModDiagnosticsCollector>() };
                 collector.push(ModDiagnosticsSample {
                     mod_id: self.mod_id,
-                    mod_name: self
-                        .mod_namespace
-                        .clone()
-                        .unwrap_or_else(|| Arc::from("unscoped")),
+                    mod_name: self.mod_namespace.clone().unwrap_or_else(unscoped_mod_name),
                     system_name: Arc::clone(&self.name),
                     cpu_time_us,
                     commands_queued: if faulted { 0 } else { commands_queued },
-                    faulted,
+                    faulted: faulted || watchdog_quarantined,
                 });
             }
         }
@@ -1534,5 +1658,352 @@ impl System for GuestSystem {
 
     fn set_last_run(&mut self, last_run: Tick) {
         self.last_run = last_run;
+    }
+}
+
+#[inline]
+fn unscoped_mod_name() -> Arc<str> {
+    static UNSCOPED: std::sync::OnceLock<Arc<str>> = std::sync::OnceLock::new();
+    Arc::clone(UNSCOPED.get_or_init(|| Arc::from("unscoped")))
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct QueryTableMetrics {
+    matched_tables: u64,
+    skipped_summary_tick_tables: u64,
+    unfiltered_entities: u64,
+    has_row_filters: bool,
+}
+
+fn table_skipped_by_summary_tick(
+    table: &bevy_ecs::storage::Table,
+    plan: &QueryPlan,
+    last_run: Tick,
+    this_run: Tick,
+) -> bool {
+    for tf in &plan.tick_filters {
+        if tf.is_sparse {
+            continue;
+        }
+        if !tf.is_added
+            && let Some(col) = table.get_column(tf.component_id)
+            && let Some(summary) = col.get_summary_tick()
+            && !summary.get().is_newer_than(last_run, this_run)
+        {
+            return true;
+        }
+    }
+    for group in &plan.or_groups {
+        let mut trivially_satisfied = false;
+        let mut saw_summary_skip = false;
+        let mut has_active_clause = false;
+        for clause in &group.terms {
+            match clause.mode {
+                AccessMode::FILTER_ONLY => {
+                    if table.has_column(clause.component_id) {
+                        trivially_satisfied = true;
+                        break;
+                    }
+                }
+                AccessMode::WITHOUT => {
+                    if !table.has_column(clause.component_id) {
+                        trivially_satisfied = true;
+                        break;
+                    }
+                }
+                AccessMode::CHANGED | AccessMode::ADDED => {
+                    if clause.is_sparse {
+                        has_active_clause = true;
+                        continue;
+                    }
+                    let Some(col) = table.get_column(clause.component_id) else {
+                        continue;
+                    };
+                    if clause.mode == AccessMode::CHANGED
+                        && let Some(summary) = col.get_summary_tick()
+                        && !summary.get().is_newer_than(last_run, this_run)
+                    {
+                        saw_summary_skip = true;
+                        continue;
+                    }
+                    has_active_clause = true;
+                }
+                _ => {}
+            }
+        }
+        if !trivially_satisfied && saw_summary_skip && !has_active_clause {
+            return true;
+        }
+    }
+    false
+}
+
+fn compute_query_table_metrics(
+    query_groups: &[CachedQueryGroup],
+    tables: &bevy_ecs::storage::Tables,
+    archetypes: &bevy_ecs::archetype::Archetypes,
+    last_run: Tick,
+    this_run: Tick,
+) -> QueryTableMetrics {
+    let mut out = QueryTableMetrics::default();
+    for group in query_groups.iter().take(MAX_SYSTEM_QUERIES) {
+        if !group.plan.has_entity_terms {
+            continue;
+        }
+        let has_filters = !group.plan.tick_filters.is_empty() || !group.plan.or_groups.is_empty();
+        out.has_row_filters |= has_filters;
+        if group.is_dense {
+            for &table_id in &group.matched_tables {
+                let Some(table) = tables.get(table_id) else {
+                    continue;
+                };
+                let len = table.entity_count() as u64;
+                if len == 0 {
+                    continue;
+                }
+                out.matched_tables = out.matched_tables.saturating_add(1);
+                if has_filters
+                    && table_skipped_by_summary_tick(table, &group.plan, last_run, this_run)
+                {
+                    out.skipped_summary_tick_tables =
+                        out.skipped_summary_tick_tables.saturating_add(1);
+                } else {
+                    out.unfiltered_entities = out.unfiltered_entities.saturating_add(len);
+                }
+            }
+        } else {
+            for &arch_id in &group.matched_archetypes {
+                let Some(arch) = archetypes.get(arch_id) else {
+                    continue;
+                };
+                let len = arch.len() as u64;
+                if len == 0 {
+                    continue;
+                }
+                out.matched_tables = out.matched_tables.saturating_add(1);
+                if has_filters
+                    && let Some(table) = tables.get(arch.table_id())
+                    && table_skipped_by_summary_tick(table, &group.plan, last_run, this_run)
+                {
+                    out.skipped_summary_tick_tables =
+                        out.skipped_summary_tick_tables.saturating_add(1);
+                } else {
+                    out.unfiltered_entities = out.unfiltered_entities.saturating_add(len);
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ffi::iter::host_iter_next_chunk;
+    use crate::registry::ComponentOptions;
+    use crate::system::error_policy::{BudgetWatchdogAction, ModBudgetHook};
+    use bevy_abi_mod_sys::{
+        AbiPod, BAM_STORAGE_FLAG_SUMMARY_TICK, BamTermDesc, ComponentUuid, ModComponent,
+        RawInsertable, SymbolEntry, VTableHeader,
+    };
+    use bevy_ecs::component::Component;
+    use core::ffi::CStr;
+    use core::sync::atomic::AtomicUsize;
+    use std::sync::Mutex;
+
+    #[repr(C)]
+    #[derive(Component, Clone, Copy, Default)]
+    #[component(summary_tick)]
+    struct SummaryVal(f32);
+
+    // SAFETY: `f32` has universal bit validity.
+    unsafe impl RawInsertable for SummaryVal {}
+    // SAFETY: `#[repr(C)]` `f32` POD.
+    unsafe impl AbiPod for SummaryVal {}
+    impl ModComponent for SummaryVal {
+        const CANONICAL_NAME: &'static str = "guest_sys_unit::SummaryVal";
+        const COMPONENT_CSTR: &'static CStr = c"guest_sys_unit::SummaryVal";
+        const UUID: ComponentUuid =
+            ComponentUuid::from_canonical_name("guest_sys_unit::SummaryVal");
+        const IS_ABI_POD: bool = true;
+        const IS_RAW_INSERTABLE: bool = true;
+        type VTable = VTableHeader;
+        fn vtable() -> &'static Self::VTable {
+            static VT: VTableHeader =
+                VTableHeader::new::<VTableHeader, SummaryVal>(SummaryVal::UUID);
+            &VT
+        }
+        fn symbols() -> &'static [SymbolEntry] {
+            &[]
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Component, Clone, Copy, Default)]
+    #[component(storage = "SparseSet")]
+    struct SparseFlag(u32);
+
+    // SAFETY: `u32` has universal bit validity.
+    unsafe impl RawInsertable for SparseFlag {}
+    // SAFETY: `#[repr(C)]` `u32` POD.
+    unsafe impl AbiPod for SparseFlag {}
+    impl ModComponent for SparseFlag {
+        const CANONICAL_NAME: &'static str = "guest_sys_unit::SparseFlag";
+        const COMPONENT_CSTR: &'static CStr = c"guest_sys_unit::SparseFlag";
+        const UUID: ComponentUuid =
+            ComponentUuid::from_canonical_name("guest_sys_unit::SparseFlag");
+        const IS_ABI_POD: bool = true;
+        const IS_RAW_INSERTABLE: bool = true;
+        type VTable = VTableHeader;
+        fn vtable() -> &'static Self::VTable {
+            static VT: VTableHeader =
+                VTableHeader::new::<VTableHeader, SparseFlag>(SparseFlag::UUID);
+            &VT
+        }
+        fn symbols() -> &'static [SymbolEntry] {
+            &[]
+        }
+    }
+
+    struct RecordingBudgetHook {
+        quarantine_on_run: AtomicUsize,
+        run_count: AtomicUsize,
+        runs: Mutex<Vec<GuestSystemRunMetrics>>,
+        shared_spawns: Arc<AtomicUsize>,
+    }
+
+    impl ModBudgetHook for RecordingBudgetHook {
+        fn prepare_system_quotas(
+            &self,
+            _mod_id: Option<ModId>,
+            _mod_name: &str,
+        ) -> (CommandQuotaLimits, Option<Arc<AtomicUsize>>) {
+            (
+                CommandQuotaLimits::default(),
+                Some(Arc::clone(&self.shared_spawns)),
+            )
+        }
+
+        fn record_system_run(&self, metrics: GuestSystemRunMetrics) -> BudgetWatchdogAction {
+            let n = self.run_count.fetch_add(1, Ordering::SeqCst) + 1;
+            self.runs.lock().unwrap().push(metrics);
+            if self.quarantine_on_run.load(Ordering::SeqCst) == n {
+                BudgetWatchdogAction {
+                    quarantine: true,
+                    reason: Some(String::from("simulated p99 overrun")),
+                }
+            } else {
+                BudgetWatchdogAction::default()
+            }
+        }
+    }
+
+    unsafe extern "C" fn drain_iter_cb(sys_ctx: *mut BamSystemCtx, _ud: *mut c_void) -> FfiResult {
+        let mut iter: *mut BamIter = core::ptr::null_mut();
+        // SAFETY: Valid active `sys_ctx` and writable `iter`.
+        if unsafe { host_sys_query(sys_ctx, 0, &mut iter) }.is_ok() && !iter.is_null() {
+            let mut chunk_len = 0usize;
+            // SAFETY: Valid active `BamIter` and writable `chunk_len`.
+            while unsafe { host_iter_next_chunk(iter, &mut chunk_len) }.get() {}
+        }
+        FfiResult::OK
+    }
+
+    #[test]
+    fn guest_system_budget_runtime_tracks_summary_tick_skips_and_watchdog_quarantine() {
+        let mut world = World::new();
+        world.insert_resource(ModQuarantine::new());
+        world.insert_resource(ModHost::new());
+        world.init_resource::<Messages<ModSystemFaulted>>();
+
+        let hook = Arc::new(RecordingBudgetHook {
+            quarantine_on_run: AtomicUsize::new(2),
+            run_count: AtomicUsize::new(0),
+            runs: Mutex::new(Vec::new()),
+            shared_spawns: Arc::new(AtomicUsize::new(0)),
+        });
+        world.insert_resource(ModBudgetRuntime::new(
+            Arc::clone(&hook) as Arc<dyn ModBudgetHook>
+        ));
+
+        let val_id = world.register_component::<SummaryVal>();
+        let sparse_id = world.register_component::<SparseFlag>();
+        let mut reg = ModRegistry::new();
+        let val_h = reg
+            .register_component_with_world_flags::<SummaryVal>(
+                val_id,
+                ComponentOptions::new().with_raw_insert(),
+                BAM_STORAGE_FLAG_SUMMARY_TICK,
+            )
+            .unwrap();
+        let sparse_h = reg
+            .register_component::<SparseFlag>(
+                sparse_id,
+                ComponentOptions::new().with_raw_insert().sparse_set(),
+            )
+            .unwrap();
+        world.insert_resource(reg.clone());
+
+        // Spawn 2 dense entities and 1 sparse-tagged entity in separate archetypes/tables.
+        world.spawn(SummaryVal(1.0));
+        world.spawn(SummaryVal(2.0));
+        world.spawn((SummaryVal(3.0), SparseFlag(9)));
+
+        // Query 0 (dense): Changed<SummaryVal>; Query 1 (archetypal): Changed<SummaryVal> + Read<SparseFlag>
+        let mut or_term = BamTermDesc::new(val_h, AccessMode::CHANGED);
+        or_term.or_group = 1;
+        let q0 = BamQuerySpecOwned::new(vec![BamTermDesc::new(val_h, AccessMode::CHANGED)]);
+        let q1 =
+            BamQuerySpecOwned::new(vec![or_term, BamTermDesc::new(sparse_h, AccessMode::READ)]);
+
+        let mod_id = ModId(55);
+        let mut sys = GuestSystem::new(
+            "summary_watcher",
+            vec![q0, q1],
+            drain_iter_cb,
+            core::ptr::null_mut(),
+            reg,
+        )
+        .with_mod_id(mod_id)
+        .with_mod_namespace("watcher_mod");
+
+        sys.initialize(&mut world);
+        assert!(
+            !world
+                .resource::<ModQuarantine>()
+                .is_quarantined(mod_id, "summary_watcher")
+        );
+
+        // Run 1: all entities newly added -> 0 summary_tick skips, matched_tables > 0.
+        sys.run((), &mut world).unwrap();
+        // Run 2: nothing changed since Run 1 -> tables skipped by summary_tick AND watchdog triggers quarantine!
+        sys.run((), &mut world).unwrap();
+        // Run 3: quarantined -> must not invoke callback or record a 3rd run.
+        sys.run((), &mut world).unwrap();
+
+        assert!(
+            world
+                .resource::<ModQuarantine>()
+                .is_quarantined(mod_id, "summary_watcher")
+        );
+        assert_eq!(world.resource::<Messages<ModSystemFaulted>>().len(), 1);
+
+        let runs = hook.runs.lock().unwrap();
+        assert_eq!(runs.len(), 2);
+        assert!(runs[0].matched_tables >= 2);
+        assert_eq!(runs[0].skipped_summary_tick_tables, 0);
+        assert!(runs[1].matched_tables >= 2);
+        assert_eq!(runs[1].skipped_summary_tick_tables, runs[1].matched_tables);
+        assert_eq!(runs[1].matched_entities, 0);
+        drop(runs);
+
+        // Re-enable via `ModQuarantine::reenable` -> Run 4 executes cleanly again.
+        assert!(
+            world
+                .resource::<ModQuarantine>()
+                .reenable(mod_id, "summary_watcher")
+        );
+        sys.run((), &mut world).unwrap();
+        assert_eq!(hook.runs.lock().unwrap().len(), 3);
     }
 }

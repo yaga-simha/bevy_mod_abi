@@ -58,6 +58,10 @@ path = "tests/lifecycle/main.rs"
 name = "e2e"
 path = "tests/e2e/main.rs"
 
+[[test]]
+name = "mod_budgets"
+path = "tests/mod_budgets.rs"
+
 [[bench]]
 name = "chunk_throughput"
 path = "benches/chunk_throughput.rs"

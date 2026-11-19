@@ -35,12 +35,29 @@ use bevy_ecs::world::World;
 use core::ffi::c_void;
 use core::mem::MaybeUninit;
 use core::num::NonZeroUsize;
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::sync::Arc;
 
 /// Maximum number of components accepted in a single [`host_cmd_spawn`] batch (`FfiResult::CAPACITY_EXCEEDED`).
 pub const MAX_SPAWN_BATCH_COMPONENTS: usize = 64;
+
+/// Per-invocation deferred command quota caps enforced synchronously by [`HostCommands`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CommandQuotaLimits {
+    /// Hard cap on per-system [`CommandArena`] payload bytes (`None` = unlimited).
+    pub max_arena_bytes: Option<usize>,
+    /// Hard cap on deferred entity spawns queued within a frame (`None` = unlimited).
+    pub max_spawns_per_frame: Option<usize>,
+}
+
+impl CommandQuotaLimits {
+    /// Unlimited quota configuration (`None` caps).
+    pub const UNLIMITED: Self = Self {
+        max_arena_bytes: None,
+        max_spawns_per_frame: None,
+    };
+}
 
 const DEFAULT_SLAB_BYTES: usize = 64 * 1024;
 const SLAB_BASE_ALIGN: usize = 64;
@@ -69,19 +86,36 @@ impl ArenaSlab {
     }
 
     #[inline]
-    fn try_alloc(&mut self, size: usize, align: usize) -> Option<*mut MaybeUninit<u8>> {
+    fn try_alloc(
+        &mut self,
+        size: usize,
+        align: usize,
+        bytes_used: usize,
+        max_bytes: Option<usize>,
+    ) -> Result<Option<(*mut MaybeUninit<u8>, usize)>, FfiResult> {
         if align > self.layout.align() {
-            return None;
+            return Ok(None);
         }
-        let aligned_offset = self.cursor.checked_add(align - 1)? & !(align - 1);
-        let end = aligned_offset.checked_add(size)?;
+        let Some(aligned_offset) = self.cursor.checked_add(align - 1).map(|v| v & !(align - 1))
+        else {
+            return Ok(None);
+        };
+        let Some(end) = aligned_offset.checked_add(size) else {
+            return Ok(None);
+        };
         if end > self.layout.size() {
-            return None;
+            return Ok(None);
+        }
+        let consumed = end - self.cursor;
+        if let Some(limit) = max_bytes
+            && bytes_used.checked_add(consumed).is_none_or(|t| t > limit)
+        {
+            return Err(FfiResult::CAPACITY_EXCEEDED);
         }
         self.cursor = end;
         // SAFETY: `aligned_offset + size <= self.layout.size()`, and `self.ptr` is aligned to
         // `self.layout.align() >= align`, so `self.ptr.add(aligned_offset)` is aligned to `align`.
-        Some(unsafe { self.ptr.add(aligned_offset) })
+        Ok(Some((unsafe { self.ptr.add(aligned_offset) }, consumed)))
     }
 }
 
@@ -107,11 +141,19 @@ struct ArenaSlice {
     align: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ArenaWatermark {
+    active_slab: usize,
+    cursor: usize,
+    bytes_used: usize,
+}
+
 /// Reusable multi-slab aligned bump arena storing `MaybeUninit<u8>` component payloads.
 #[derive(Default)]
 pub struct CommandArena {
     slabs: Vec<ArenaSlab>,
     active_slab: usize,
+    bytes_used: usize,
 }
 
 impl CommandArena {
@@ -121,18 +163,67 @@ impl CommandArena {
         Self {
             slabs: Vec::new(),
             active_slab: 0,
+            bytes_used: 0,
         }
     }
 
-    /// Copies `size` raw `MaybeUninit<u8>` bytes from `src` into `align`-aligned arena storage.
+    /// Returns the number of payload/alignment bytes bump-allocated in this arena since the last
+    /// [`Self::reset`].
+    #[inline]
+    pub const fn bytes_used(&self) -> usize {
+        self.bytes_used
+    }
+
+    /// Returns the total backing slab capacity currently allocated on the host heap.
+    #[inline]
+    pub fn allocated_bytes(&self) -> usize {
+        self.slabs.iter().map(|s| s.layout.size()).sum()
+    }
+
+    #[inline]
+    fn watermark(&self) -> ArenaWatermark {
+        let cursor = self.slabs.get(self.active_slab).map_or(0, |s| s.cursor);
+        ArenaWatermark {
+            active_slab: self.active_slab,
+            cursor,
+            bytes_used: self.bytes_used,
+        }
+    }
+
+    #[inline]
+    fn rewind(&mut self, wm: ArenaWatermark) {
+        if let Some(slab) = self.slabs.get_mut(wm.active_slab) {
+            slab.cursor = wm.cursor;
+        }
+        for slab in self.slabs.iter_mut().skip(wm.active_slab.saturating_add(1)) {
+            slab.cursor = 0;
+        }
+        self.active_slab = wm.active_slab;
+        self.bytes_used = wm.bytes_used;
+    }
+
+    #[inline]
+    fn would_exceed(&self, additional_bytes: usize, max_bytes: Option<usize>) -> bool {
+        let Some(limit) = max_bytes else {
+            return false;
+        };
+        self.bytes_used
+            .checked_add(additional_bytes)
+            .is_none_or(|total| total > limit)
+    }
+
+    /// Copies `size` raw `MaybeUninit<u8>` bytes from `src` into `align`-aligned arena storage,
+    /// returning [`FfiResult::CAPACITY_EXCEEDED`] without growing host slabs if `max_bytes` would
+    /// be exceeded.
     ///
     /// # Safety
     /// If `size > 0`, `src` must be non-null and readable for `size` `MaybeUninit<u8>` bytes.
-    unsafe fn alloc_copy_raw(
+    unsafe fn alloc_copy_raw_bounded(
         &mut self,
         src: *const u8,
         size: usize,
         align: usize,
+        max_bytes: Option<usize>,
     ) -> Result<ArenaSlice, FfiResult> {
         let align = align.max(1);
         if !align.is_power_of_two() {
@@ -149,16 +240,22 @@ impl CommandArena {
         if src.is_null() {
             return Err(FfiResult::NULL_POINTER);
         }
+        if self.would_exceed(size, max_bytes) {
+            return Err(FfiResult::CAPACITY_EXCEEDED);
+        }
 
         while self.active_slab < self.slabs.len() {
             let slab_idx = self.active_slab;
             let base = self.slabs[slab_idx].ptr as usize;
-            if let Some(dst) = self.slabs[slab_idx].try_alloc(size, align) {
+            if let Some((dst, consumed)) =
+                self.slabs[slab_idx].try_alloc(size, align, self.bytes_used, max_bytes)?
+            {
                 // SAFETY: Caller guarantees `src` is readable for `size` `MaybeUninit<u8>` bytes;
                 // `dst` is freshly bump-allocated inside `slabs[slab_idx]` and non-overlapping.
                 unsafe {
                     core::ptr::copy_nonoverlapping(src.cast::<MaybeUninit<u8>>(), dst, size);
                 }
+                self.bytes_used = self.bytes_used.saturating_add(consumed);
                 return Ok(ArenaSlice {
                     slab_idx: slab_idx as u32,
                     offset: (dst as usize) - base,
@@ -171,8 +268,8 @@ impl CommandArena {
 
         let mut slab = ArenaSlab::new(size, align);
         let base = slab.ptr as usize;
-        let dst = slab
-            .try_alloc(size, align)
+        let (dst, consumed) = slab
+            .try_alloc(size, align, self.bytes_used, max_bytes)?
             .expect("freshly allocated ArenaSlab must fit requested payload");
         // SAFETY: Same as above; copying as `MaybeUninit<u8>` avoids forming `&[u8]` over padding.
         unsafe {
@@ -181,6 +278,7 @@ impl CommandArena {
         let slab_idx = self.slabs.len();
         self.slabs.push(slab);
         self.active_slab = slab_idx;
+        self.bytes_used = self.bytes_used.saturating_add(consumed);
 
         Ok(ArenaSlice {
             slab_idx: slab_idx as u32,
@@ -197,7 +295,7 @@ impl CommandArena {
             return core::ptr::NonNull::<u8>::without_provenance(nz);
         }
         let slab = &mut self.slabs[slice.slab_idx as usize];
-        // SAFETY: `slice` was produced by `alloc_copy_raw` from `slabs[slice.slab_idx]` with
+        // SAFETY: `slice` was produced by `alloc_copy_raw_bounded` from `slabs[slice.slab_idx]` with
         // `offset + size <= slab.layout.size()` and `slab.ptr` is non-null.
         let raw = unsafe { slab.ptr.add(slice.offset).cast::<u8>() };
         // SAFETY: `slab.ptr` is non-null, so `slab.ptr.add(slice.offset)` is non-null.
@@ -215,6 +313,7 @@ impl CommandArena {
             slab.cursor = 0;
         }
         self.active_slab = 0;
+        self.bytes_used = 0;
     }
 }
 
@@ -320,6 +419,9 @@ pub struct HostCommandsStorage {
     scratch_ids: Vec<ComponentId>,
     custom_fns: Vec<Option<CustomCommandFn>>,
     last_relation_error: Option<FfiResult>,
+    spawns_queued: usize,
+    arena_breaches: usize,
+    spawn_breaches: usize,
 }
 
 impl HostCommandsStorage {
@@ -335,6 +437,9 @@ impl HostCommandsStorage {
             scratch_ids: Vec::new(),
             custom_fns: Vec::new(),
             last_relation_error: None,
+            spawns_queued: 0,
+            arena_breaches: 0,
+            spawn_breaches: 0,
         }
     }
 
@@ -355,6 +460,45 @@ impl HostCommandsStorage {
     #[inline]
     pub fn len(&self) -> usize {
         self.commands.len()
+    }
+
+    /// Returns the number of payload/alignment bytes bump-allocated in [`CommandArena`] since the
+    /// last [`Self::clear`] or [`Self::apply_to_world`].
+    #[inline]
+    pub const fn arena_bytes_used(&self) -> usize {
+        self.arena.bytes_used()
+    }
+
+    /// Returns the total host slab memory currently allocated by [`CommandArena`].
+    #[inline]
+    pub fn arena_allocated_bytes(&self) -> usize {
+        self.arena.allocated_bytes()
+    }
+
+    /// Returns the number of deferred entity spawns accepted in the current invocation.
+    #[inline]
+    pub const fn spawns_queued(&self) -> usize {
+        self.spawns_queued
+    }
+
+    /// Returns the number of command payload allocations rejected due to `max_arena_bytes`.
+    #[inline]
+    pub const fn arena_breaches(&self) -> usize {
+        self.arena_breaches
+    }
+
+    /// Returns the number of spawn commands rejected due to `max_spawns_per_frame`.
+    #[inline]
+    pub const fn spawn_breaches(&self) -> usize {
+        self.spawn_breaches
+    }
+
+    /// Resets per-invocation spawn and quota-breach counters without touching queued commands.
+    #[inline]
+    pub fn reset_invocation_counters(&mut self) {
+        self.spawns_queued = 0;
+        self.arena_breaches = 0;
+        self.spawn_breaches = 0;
     }
 
     /// Invokes foreign destructors on any uncommitted dynamic `drop_fn` payloads still held in
@@ -462,6 +606,7 @@ impl HostCommandsStorage {
         self.scratch_ids.clear();
         self.custom_fns.clear();
         self.arena.reset();
+        self.reset_invocation_counters();
     }
 
     /// Captures an opaque checkpoint token representing the current command-buffer watermark.
@@ -590,6 +735,7 @@ impl HostCommandsStorage {
     pub fn apply_to_world(&mut self, world: &mut World, snapshot: &RegistrySnapshot) {
         self.last_relation_error = None;
         if self.commands.is_empty() {
+            self.reset_invocation_counters();
             return;
         }
         // Prefer the latest `ModRegistry` snapshot in `world` when available so commands queued
@@ -1118,6 +1264,8 @@ pub struct HostCommands<'a> {
     mod_id: Option<ModId>,
     is_active: Option<Arc<AtomicBool>>,
     registry: Option<&'a ModRegistry>,
+    quota_limits: CommandQuotaLimits,
+    shared_frame_spawns: Option<&'a AtomicUsize>,
 }
 
 const _: () = assert!(core::mem::offset_of!(HostCommands<'_>, header) == 0);
@@ -1138,6 +1286,8 @@ impl<'a> HostCommands<'a> {
             mod_id: None,
             is_active: None,
             registry: None,
+            quota_limits: CommandQuotaLimits::UNLIMITED,
+            shared_frame_spawns: None,
         }
     }
 
@@ -1157,7 +1307,109 @@ impl<'a> HostCommands<'a> {
             mod_id: None,
             is_active: None,
             registry: None,
+            quota_limits: CommandQuotaLimits::UNLIMITED,
+            shared_frame_spawns: None,
         }
+    }
+
+    /// Attaches active [`CommandQuotaLimits`] and an optional shared per-mod frame spawn counter
+    /// enforced atomically across parallel systems in the same frame.
+    #[inline]
+    pub const fn with_quotas(
+        mut self,
+        limits: CommandQuotaLimits,
+        shared_frame_spawns: Option<&'a AtomicUsize>,
+    ) -> Self {
+        self.quota_limits = limits;
+        self.shared_frame_spawns = shared_frame_spawns;
+        self
+    }
+
+    #[inline]
+    fn check_arena_capacity(&mut self, additional_bytes: usize) -> Result<(), FfiResult> {
+        if self
+            .storage
+            .arena
+            .would_exceed(additional_bytes, self.quota_limits.max_arena_bytes)
+        {
+            self.storage.arena_breaches = self.storage.arena_breaches.saturating_add(1);
+            return Err(FfiResult::CAPACITY_EXCEEDED);
+        }
+        Ok(())
+    }
+
+    /// Allocates and copies `size` raw payload bytes into [`CommandArena`] subject to
+    /// `self.quota_limits.max_arena_bytes`.
+    ///
+    /// # Safety
+    /// If `size > 0`, `src` must be non-null and readable for `size` `MaybeUninit<u8>` bytes.
+    #[inline]
+    unsafe fn alloc_arena_copy(
+        &mut self,
+        src: *const u8,
+        size: usize,
+        align: usize,
+    ) -> Result<ArenaSlice, FfiResult> {
+        // SAFETY: Caller upholds readability of `src` for `size` `MaybeUninit<u8>` bytes.
+        match unsafe {
+            self.storage.arena.alloc_copy_raw_bounded(
+                src,
+                size,
+                align,
+                self.quota_limits.max_arena_bytes,
+            )
+        } {
+            Ok(slice) => Ok(slice),
+            Err(err) => {
+                if err == FfiResult::CAPACITY_EXCEEDED {
+                    self.storage.arena_breaches = self.storage.arena_breaches.saturating_add(1);
+                }
+                Err(err)
+            }
+        }
+    }
+
+    #[inline]
+    fn try_reserve_spawns(&mut self, count: usize) -> Result<(), FfiResult> {
+        if count == 0 {
+            return Ok(());
+        }
+        if let Some(limit) = self.quota_limits.max_spawns_per_frame {
+            if let Some(shared) = self.shared_frame_spawns {
+                if shared
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                        cur.checked_add(count).filter(|&next| next <= limit)
+                    })
+                    .is_err()
+                {
+                    self.storage.spawn_breaches = self.storage.spawn_breaches.saturating_add(1);
+                    return Err(FfiResult::CAPACITY_EXCEEDED);
+                }
+            } else if self
+                .storage
+                .spawns_queued
+                .checked_add(count)
+                .is_none_or(|next| next > limit)
+            {
+                self.storage.spawn_breaches = self.storage.spawn_breaches.saturating_add(1);
+                return Err(FfiResult::CAPACITY_EXCEEDED);
+            }
+        } else if let Some(shared) = self.shared_frame_spawns {
+            shared.fetch_add(count, Ordering::AcqRel);
+        }
+        self.storage.spawns_queued = self.storage.spawns_queued.saturating_add(count);
+        Ok(())
+    }
+
+    #[inline]
+    fn release_reserved_spawns(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        if let Some(shared) = self.shared_frame_spawns {
+            shared.fetch_sub(count, Ordering::AcqRel);
+        }
+        self.storage.spawns_queued = self.storage.spawns_queued.saturating_sub(count);
     }
 
     /// Attaches the owning [`ModId`] and shared module liveness flag (`is_active`) to this
@@ -1252,6 +1504,7 @@ impl<'a> HostCommands<'a> {
         if let Err((code, _msg)) = backend.validate_scene_handle(self.snapshot, &handle) {
             return Err(code);
         }
+        self.try_reserve_spawns(1)?;
         let entity = self.allocator.alloc();
         self.storage.commands.push(RecordedCommand::SpawnScene {
             entity,
@@ -1331,9 +1584,7 @@ impl<'a> HostCommands<'a> {
         // SAFETY: `data_ptr` is non-null when `rel_meta.data_size > 0` and caller guarantees
         // `data_len == rel_meta.data_size` initialized readable bytes.
         let slice = match unsafe {
-            self.storage
-                .arena
-                .alloc_copy_raw(data_ptr, rel_meta.data_size, rel_meta.data_align)
+            self.alloc_arena_copy(data_ptr, rel_meta.data_size, rel_meta.data_align)
         } {
             Ok(s) => s,
             Err(err) => return err,
@@ -1427,11 +1678,7 @@ impl<'a> HostCommands<'a> {
         }
 
         // SAFETY: `data_ptr` is non-null when `data_len > 0` and readable for `meta.size` bytes.
-        let slice = match unsafe {
-            self.storage
-                .arena
-                .alloc_copy_raw(data_ptr, meta.size, meta.align)
-        } {
+        let slice = match unsafe { self.alloc_arena_copy(data_ptr, meta.size, meta.align) } {
             Ok(s) => s,
             Err(err) => return err,
         };
@@ -1575,34 +1822,49 @@ impl<'a> HostCommands<'a> {
             return FfiResult::OK;
         }
 
+        let mut total_payload_bytes = 0usize;
+        for entry in &validated[..component_count] {
+            let Some(next) = total_payload_bytes.checked_add(entry.total_bytes) else {
+                self.storage.arena_breaches = self.storage.arena_breaches.saturating_add(1);
+                return FfiResult::CAPACITY_EXCEEDED;
+            };
+            total_payload_bytes = next;
+        }
+        if let Err(err) = self.check_arena_capacity(total_payload_bytes) {
+            return err;
+        }
+        if let Err(err) = self.try_reserve_spawns(entity_count) {
+            return err;
+        }
+
+        let arena_wm = self.storage.arena.watermark();
         let col_start = self.storage.soa_columns.len();
         for entry in &validated[..component_count] {
             // SAFETY: `entry.ptr` is non-null when `entry.total_bytes > 0` and caller guarantees
             // `entry.total_bytes` readable bytes.
-            let slice = match unsafe {
-                self.storage
-                    .arena
-                    .alloc_copy_raw(entry.ptr, entry.total_bytes, entry.align)
-            } {
-                Ok(s) => s,
-                Err(err) => {
-                    for col in &mut self.storage.soa_columns[col_start..] {
-                        if let Some((slot, expected_gen)) = col.drop_slot.take() {
-                            let base = self.storage.arena.ptr_mut(col.slice);
-                            for r in 0..entity_count {
-                                // SAFETY: `base` holds `entity_count` uncommitted payloads.
-                                let elem_ptr = unsafe { base.as_ptr().add(r * col.elem_size) };
-                                // SAFETY: Partial batch failed before commit; clean up copied payloads.
-                                unsafe {
-                                    run_uncommitted_slot_drop(slot, expected_gen, elem_ptr);
+            let slice =
+                match unsafe { self.alloc_arena_copy(entry.ptr, entry.total_bytes, entry.align) } {
+                    Ok(s) => s,
+                    Err(err) => {
+                        for col in &mut self.storage.soa_columns[col_start..] {
+                            if let Some((slot, expected_gen)) = col.drop_slot.take() {
+                                let base = self.storage.arena.ptr_mut(col.slice);
+                                for r in 0..entity_count {
+                                    // SAFETY: `base` holds `entity_count` uncommitted payloads.
+                                    let elem_ptr = unsafe { base.as_ptr().add(r * col.elem_size) };
+                                    // SAFETY: Partial batch failed before commit; clean up copied payloads.
+                                    unsafe {
+                                        run_uncommitted_slot_drop(slot, expected_gen, elem_ptr);
+                                    }
                                 }
                             }
                         }
+                        self.storage.soa_columns.truncate(col_start);
+                        self.storage.arena.rewind(arena_wm);
+                        self.release_reserved_spawns(entity_count);
+                        return err;
                     }
-                    self.storage.soa_columns.truncate(col_start);
-                    return err;
-                }
-            };
+                };
             self.storage.soa_columns.push(SpawnSoaColumn {
                 component: entry.handle,
                 component_id: entry.component_id,
@@ -1789,6 +2051,10 @@ pub unsafe extern "C" fn host_cmd_spawn_empty(
         Err(err) => return err,
     };
 
+    if let Err(err) = cmds.try_reserve_spawns(1) {
+        return err;
+    }
+
     let entity = cmds.allocator.alloc();
     cmds.storage.commands.push(RecordedCommand::SpawnEmpty {
         entity,
@@ -1822,6 +2088,9 @@ pub(crate) unsafe fn spawn_batch_with_scope(
         return FfiResult::CAPACITY_EXCEEDED;
     }
     if count == 0 {
+        if let Err(err) = cmds.try_reserve_spawns(1) {
+            return err;
+        }
         let entity = cmds.allocator.alloc();
         cmds.storage.commands.push(RecordedCommand::SpawnEmpty {
             entity,
@@ -1917,15 +2186,27 @@ pub(crate) unsafe fn spawn_batch_with_scope(
         }
     }
 
+    let mut total_payload_bytes = 0usize;
+    for entry in &validated[..count] {
+        let Some(next) = total_payload_bytes.checked_add(entry.size) else {
+            cmds.storage.arena_breaches = cmds.storage.arena_breaches.saturating_add(1);
+            return FfiResult::CAPACITY_EXCEEDED;
+        };
+        total_payload_bytes = next;
+    }
+    if let Err(err) = cmds.check_arena_capacity(total_payload_bytes) {
+        return err;
+    }
+    if let Err(err) = cmds.try_reserve_spawns(1) {
+        return err;
+    }
+
     // Pass 2: Copy payloads into `CommandArena` and record single `SpawnBatch`.
+    let arena_wm = cmds.storage.arena.watermark();
     let batch_start = cmds.storage.batch_items.len();
     for entry in &validated[..count] {
         // SAFETY: `entry.ptr` was verified non-null when `entry.size > 0`, and caller guarantees `entry.size` readable bytes.
-        let slice = match unsafe {
-            cmds.storage
-                .arena
-                .alloc_copy_raw(entry.ptr, entry.size, entry.align)
-        } {
+        let slice = match unsafe { cmds.alloc_arena_copy(entry.ptr, entry.size, entry.align) } {
             Ok(s) => s,
             Err(err) => {
                 for item in &mut cmds.storage.batch_items[batch_start..] {
@@ -1938,6 +2219,8 @@ pub(crate) unsafe fn spawn_batch_with_scope(
                     }
                 }
                 cmds.storage.batch_items.truncate(batch_start);
+                cmds.storage.arena.rewind(arena_wm);
+                cmds.release_reserved_spawns(1);
                 return err;
             }
         };
@@ -2192,11 +2475,7 @@ pub unsafe extern "C" fn host_cmd_trigger(
     }
 
     // SAFETY: `data_ptr` is non-null when `meta.size > 0` and readable for `meta.size` bytes.
-    let slice = match unsafe {
-        cmds.storage
-            .arena
-            .alloc_copy_raw(data_ptr, meta.size, meta.align)
-    } {
+    let slice = match unsafe { cmds.alloc_arena_copy(data_ptr, meta.size, meta.align) } {
         Ok(s) => s,
         Err(err) => return err,
     };
@@ -2499,5 +2778,416 @@ mod tests {
         assert_eq!(DROP_B_COUNT.load(Ordering::SeqCst), 0);
 
         let _ = available_drop_trampoline_slots();
+    }
+
+    #[test]
+    fn command_quotas_enforce_arena_and_spawn_caps_and_rewind_cleanly() {
+        use crate::ffi::assets_scene::{HostSceneBackend, host_cmd_spawn_scene};
+        use crate::ffi::commands_ext::{
+            host_cmd_insert_if_new, host_cmd_spawn_batch, host_cmd_spawn_persistent,
+        };
+        use crate::ffi::register::{LoadContext, host_register_component};
+        use crate::ffi::v03_ext::{host_cmd_insert_relation, host_register_relation};
+        use crate::{ComponentOptions, WorldDropGuard};
+        use bevy_abi_mod_sys::{
+            AbiPod, BamRelationDesc, ComponentDesc, ComponentUuid, FfiAssetHandle, ModComponent,
+            RawInsertable, SymbolEntry, VTableHeader,
+        };
+        use bevy_ecs::component::Component;
+        use bevy_ecs::event::Event;
+        use core::ffi::CStr;
+
+        #[repr(C)]
+        #[derive(Component, Clone, Copy, Default)]
+        struct TinyByte(u8);
+        // SAFETY: `u8` has universal bit validity.
+        unsafe impl RawInsertable for TinyByte {}
+        // SAFETY: `#[repr(C)]` `u8` POD.
+        unsafe impl AbiPod for TinyByte {}
+        impl ModComponent for TinyByte {
+            const CANONICAL_NAME: &'static str = "cmd_quota::TinyByte";
+            const COMPONENT_CSTR: &'static CStr = c"cmd_quota::TinyByte";
+            const UUID: ComponentUuid = ComponentUuid::from_canonical_name("cmd_quota::TinyByte");
+            const IS_ABI_POD: bool = true;
+            const IS_RAW_INSERTABLE: bool = true;
+            type VTable = VTableHeader;
+            fn vtable() -> &'static Self::VTable {
+                static VT: VTableHeader =
+                    VTableHeader::new::<VTableHeader, TinyByte>(TinyByte::UUID);
+                &VT
+            }
+            fn symbols() -> &'static [SymbolEntry] {
+                &[]
+            }
+        }
+
+        #[repr(C)]
+        #[derive(Component, Clone, Copy, Default)]
+        struct AlignedWord(u64);
+        // SAFETY: `u64` has universal bit validity.
+        unsafe impl RawInsertable for AlignedWord {}
+        // SAFETY: `#[repr(C)]` `u64` POD.
+        unsafe impl AbiPod for AlignedWord {}
+        impl ModComponent for AlignedWord {
+            const CANONICAL_NAME: &'static str = "cmd_quota::AlignedWord";
+            const COMPONENT_CSTR: &'static CStr = c"cmd_quota::AlignedWord";
+            const UUID: ComponentUuid =
+                ComponentUuid::from_canonical_name("cmd_quota::AlignedWord");
+            const IS_ABI_POD: bool = true;
+            const IS_RAW_INSERTABLE: bool = true;
+            type VTable = VTableHeader;
+            fn vtable() -> &'static Self::VTable {
+                static VT: VTableHeader =
+                    VTableHeader::new::<VTableHeader, AlignedWord>(AlignedWord::UUID);
+                &VT
+            }
+            fn symbols() -> &'static [SymbolEntry] {
+                &[]
+            }
+        }
+
+        #[repr(C)]
+        #[derive(Event, Clone, Copy, Default)]
+        struct QuotaEvt(u64);
+        // SAFETY: `u64` has universal bit validity.
+        unsafe impl RawInsertable for QuotaEvt {}
+        // SAFETY: `#[repr(C)]` `u64` POD.
+        unsafe impl AbiPod for QuotaEvt {}
+        impl ModComponent for QuotaEvt {
+            const CANONICAL_NAME: &'static str = "cmd_quota::QuotaEvt";
+            const COMPONENT_CSTR: &'static CStr = c"cmd_quota::QuotaEvt";
+            const UUID: ComponentUuid = ComponentUuid::from_canonical_name("cmd_quota::QuotaEvt");
+            const IS_ABI_POD: bool = true;
+            const IS_RAW_INSERTABLE: bool = true;
+            type VTable = VTableHeader;
+            fn vtable() -> &'static Self::VTable {
+                static VT: VTableHeader =
+                    VTableHeader::new::<VTableHeader, QuotaEvt>(QuotaEvt::UUID);
+                &VT
+            }
+            fn symbols() -> &'static [SymbolEntry] {
+                &[]
+            }
+        }
+
+        struct MockSceneBackend;
+        impl HostSceneBackend for MockSceneBackend {
+            fn spawn_scene(
+                &self,
+                _world: &mut World,
+                _snapshot: &RegistrySnapshot,
+                _root_entity: Entity,
+                _parent: Option<Entity>,
+                _scene_handle: &FfiAssetHandle,
+            ) -> Result<(), FfiResult> {
+                Ok(())
+            }
+        }
+
+        static REWIND_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn rewind_drop(_ptr: *mut c_void) {
+            REWIND_DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+        REWIND_DROP_COUNT.store(0, Ordering::SeqCst);
+
+        let _serial = crate::drop_trampoline::TEST_DROP_SLAB_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let mut world = World::new();
+        world.insert_resource(WorldDropGuard::new());
+        let tiny_id = world.register_component::<TinyByte>();
+        let word_id = world.register_component::<AlignedWord>();
+        let evt_key = world.register_event_key::<QuotaEvt>();
+        crate::registry::catalog::ensure_relation_graph_in_world(&mut world);
+
+        let mut reg = ModRegistry::new();
+        let tiny_h = reg
+            .register_component::<TinyByte>(tiny_id, ComponentOptions::new().with_raw_insert())
+            .unwrap();
+        let word_h = reg
+            .register_component::<AlignedWord>(word_id, ComponentOptions::new().with_raw_insert())
+            .unwrap();
+        let evt_h = reg.register_event::<QuotaEvt>(evt_key).unwrap();
+        reg.set_scene_backend(Arc::new(MockSceneBackend));
+        world.insert_resource(reg);
+
+        // Register a 1-byte dynamic drop component and an 8-byte relation payload for rewind & relation tests.
+        let active = Arc::new(AtomicBool::new(true));
+        let mut dyn_tiny_h = BamComponent::INVALID;
+        let mut rel_h = BamComponent::INVALID;
+        {
+            let reg_clone = world.resource::<ModRegistry>().clone();
+            let mut lctx = LoadContext::with_world_and_mod_id(
+                reg_clone,
+                Arc::clone(&active),
+                &mut world as *mut World,
+                Some(ModId(77)),
+            );
+            let desc = ComponentDesc::new(
+                c"cmd_quota::DynTiny".as_ptr(),
+                ComponentUuid::from_parts("cmd_quota::DynTiny", 1, 1, 1),
+                1,
+                1,
+            )
+            .with_drop(rewind_drop);
+            // SAFETY: Valid active `LoadContext`, `ComponentDesc`, and output handle.
+            let st_comp =
+                unsafe { host_register_component(lctx.as_ffi_ptr(), &desc, &mut dyn_tiny_h) };
+            assert_eq!(st_comp, FfiResult::OK);
+            let rel_desc = BamRelationDesc::new(
+                c"cmd_quota::Edge".as_ptr(),
+                ComponentUuid::from_parts("cmd_quota::Edge", 8, 8, 1),
+            )
+            .with_payload_layout(8, 8);
+            // SAFETY: Valid active `LoadContext`, `BamRelationDesc`, and output handle.
+            let st_rel =
+                unsafe { host_register_relation(lctx.as_ffi_ptr(), &rel_desc, &mut rel_h) };
+            assert_eq!(st_rel, FfiResult::OK);
+            let updated = lctx.registry.clone();
+            lctx.finish_init();
+            world.insert_resource(updated);
+        }
+
+        let target = world.spawn_empty().id();
+        let target_ffi = FfiEntity::from_bits(target.to_bits());
+        let snap = world.resource::<ModRegistry>().snapshot_arc();
+        let mut storage = HostCommandsStorage::new();
+
+        // 1. Arena cap of 0 bytes rejects `insert`, `insert_if_new`, `trigger`, `insert_relation`
+        //    without allocating any slab!
+        {
+            let mut cmds = HostCommands::new(&mut storage, world.entity_allocator(), &snap)
+                .with_quotas(
+                    CommandQuotaLimits {
+                        max_arena_bytes: Some(0),
+                        max_spawns_per_frame: None,
+                    },
+                    None,
+                );
+            let word = AlignedWord(123);
+            let word_ptr = (&raw const word).cast::<u8>();
+            // SAFETY: Valid `HostCommands` and readable `AlignedWord` bytes.
+            unsafe {
+                assert_eq!(
+                    host_cmd_insert(cmds.as_ffi_ptr(), target_ffi, word_h, word_ptr, 8),
+                    FfiResult::CAPACITY_EXCEEDED
+                );
+                assert_eq!(
+                    host_cmd_insert_if_new(cmds.as_ffi_ptr(), target_ffi, word_h, word_ptr, 8),
+                    FfiResult::CAPACITY_EXCEEDED
+                );
+                assert_eq!(
+                    host_cmd_trigger(cmds.as_ffi_ptr(), evt_h, FfiEntity::NULL, word_ptr, 8),
+                    FfiResult::CAPACITY_EXCEEDED
+                );
+                assert_eq!(
+                    host_cmd_insert_relation(
+                        cmds.as_ffi_ptr(),
+                        target_ffi,
+                        rel_h,
+                        target_ffi,
+                        word_ptr.cast::<c_void>(),
+                        8,
+                    ),
+                    FfiResult::CAPACITY_EXCEEDED
+                );
+            }
+        }
+        assert_eq!(storage.arena_allocated_bytes(), 0);
+        assert_eq!(storage.arena_bytes_used(), 0);
+        assert_eq!(storage.arena_breaches(), 4);
+        assert!(storage.is_empty());
+        // Empty `apply_to_world` must still reset invocation counters cleanly.
+        storage.apply_to_world(&mut world, &snap);
+        assert_eq!(storage.arena_breaches(), 0);
+
+        // 2. Alignment-padding Pass 2 overflow in `cmd_spawn` and `cmd_spawn_batch` rewinds arena,
+        //    invokes uncommitted `drop_fn` on `dyn_tiny_h`, and releases reserved spawn quota!
+        let shared_spawns = AtomicUsize::new(0);
+        {
+            let mut cmds = HostCommands::new(&mut storage, world.entity_allocator(), &snap)
+                .with_quotas(
+                    CommandQuotaLimits {
+                        // 1 byte + 8 bytes = 9 payload bytes (passes Pass 1 sum check <= 10),
+                        // but 7 bytes of alignment padding for `u64` makes slab consumption 16 > 10!
+                        max_arena_bytes: Some(10),
+                        max_spawns_per_frame: Some(3),
+                    },
+                    Some(&shared_spawns),
+                );
+            let tiny_b = 7u8;
+            let word = AlignedWord(42);
+            let comps = [dyn_tiny_h, word_h];
+            let ptrs = [
+                (&raw const tiny_b).cast::<u8>(),
+                (&raw const word).cast::<u8>(),
+            ];
+            let mut out_e = FfiEntity::NULL;
+            // SAFETY: Valid `HostCommands`, component handles, and readable payload pointers.
+            unsafe {
+                assert_eq!(
+                    host_cmd_spawn(
+                        cmds.as_ffi_ptr(),
+                        comps.as_ptr(),
+                        ptrs.as_ptr(),
+                        2,
+                        &mut out_e
+                    ),
+                    FfiResult::CAPACITY_EXCEEDED
+                );
+                // Same alignment-padding rewind check on `host_cmd_spawn_batch`!
+                let mut out_batch = [FfiEntity::NULL; 1];
+                assert_eq!(
+                    host_cmd_spawn_batch(
+                        cmds.as_ffi_ptr(),
+                        comps.as_ptr(),
+                        ptrs.as_ptr(),
+                        2,
+                        1,
+                        out_batch.as_mut_ptr(),
+                    ),
+                    FfiResult::CAPACITY_EXCEEDED
+                );
+            }
+            assert_eq!(shared_spawns.load(Ordering::Acquire), 0);
+            assert_eq!(REWIND_DROP_COUNT.load(Ordering::SeqCst), 2);
+
+            // 3. Spawn quota across `spawn_empty`, `spawn(count=0)`, `spawn_persistent`,
+            //    `spawn_scene`, and `spawn_batch` (cap = 3).
+            let mut e1 = FfiEntity::NULL;
+            let mut e2 = FfiEntity::NULL;
+            let mut e3 = FfiEntity::NULL;
+            let mut e4 = FfiEntity::NULL;
+            let scene_handle = FfiAssetHandle::from_index(BamComponent::from_raw(1), 1, 0);
+            // SAFETY: Valid `HostCommands` and writable `FfiEntity` outputs.
+            unsafe {
+                assert_eq!(
+                    host_cmd_spawn_empty(cmds.as_ffi_ptr(), &mut e1),
+                    FfiResult::OK
+                );
+                assert_eq!(
+                    host_cmd_spawn_persistent(
+                        cmds.as_ffi_ptr(),
+                        core::ptr::null(),
+                        core::ptr::null(),
+                        0,
+                        &mut e2,
+                    ),
+                    FfiResult::OK
+                );
+                assert_eq!(
+                    host_cmd_spawn_scene(
+                        cmds.as_ffi_ptr(),
+                        &scene_handle,
+                        FfiEntity::NULL,
+                        &mut e3
+                    ),
+                    FfiResult::OK
+                );
+                // Now at 3/3 spawns: every spawn variant must return `CAPACITY_EXCEEDED`!
+                assert_eq!(
+                    host_cmd_spawn_empty(cmds.as_ffi_ptr(), &mut e4),
+                    FfiResult::CAPACITY_EXCEEDED
+                );
+                assert_eq!(
+                    host_cmd_spawn(
+                        cmds.as_ffi_ptr(),
+                        core::ptr::null(),
+                        core::ptr::null(),
+                        0,
+                        &mut e4,
+                    ),
+                    FfiResult::CAPACITY_EXCEEDED
+                );
+                let tb = TinyByte(1);
+                let c_one = [tiny_h];
+                let p_one = [(&raw const tb).cast::<u8>()];
+                assert_eq!(
+                    host_cmd_spawn(
+                        cmds.as_ffi_ptr(),
+                        c_one.as_ptr(),
+                        p_one.as_ptr(),
+                        1,
+                        &mut e4
+                    ),
+                    FfiResult::CAPACITY_EXCEEDED
+                );
+                assert_eq!(
+                    host_cmd_spawn_batch(
+                        cmds.as_ffi_ptr(),
+                        c_one.as_ptr(),
+                        p_one.as_ptr(),
+                        1,
+                        1,
+                        &mut e4,
+                    ),
+                    FfiResult::CAPACITY_EXCEEDED
+                );
+                assert_eq!(
+                    host_cmd_spawn_scene(
+                        cmds.as_ffi_ptr(),
+                        &scene_handle,
+                        FfiEntity::NULL,
+                        &mut e4,
+                    ),
+                    FfiResult::CAPACITY_EXCEEDED
+                );
+            }
+        }
+        assert_eq!(shared_spawns.load(Ordering::Acquire), 3);
+        assert_eq!(storage.spawns_queued(), 3);
+        assert_eq!(storage.spawn_breaches(), 5);
+        assert_eq!(storage.arena_bytes_used(), 0);
+        storage.clear();
+
+        // 4. Local-only spawn cap (no shared counter) and unlimited-with-shared-counter path.
+        let shared_unbounded = AtomicUsize::new(0);
+        {
+            let mut cmds = HostCommands::new(&mut storage, world.entity_allocator(), &snap)
+                .with_quotas(
+                    CommandQuotaLimits {
+                        max_arena_bytes: None,
+                        max_spawns_per_frame: Some(1),
+                    },
+                    None,
+                );
+            let mut e = FfiEntity::NULL;
+            // SAFETY: Valid `HostCommands` and writable `e`.
+            unsafe {
+                assert_eq!(
+                    host_cmd_spawn_empty(cmds.as_ffi_ptr(), &mut e),
+                    FfiResult::OK
+                );
+                assert_eq!(
+                    host_cmd_spawn_empty(cmds.as_ffi_ptr(), &mut e),
+                    FfiResult::CAPACITY_EXCEEDED
+                );
+            }
+        }
+        assert_eq!(storage.spawns_queued(), 1);
+        assert_eq!(storage.spawn_breaches(), 1);
+        storage.clear();
+
+        {
+            let mut cmds = HostCommands::new(&mut storage, world.entity_allocator(), &snap)
+                .with_quotas(CommandQuotaLimits::default(), Some(&shared_unbounded));
+            let mut e = FfiEntity::NULL;
+            // SAFETY: Valid `HostCommands` and writable `e`.
+            unsafe {
+                assert_eq!(
+                    host_cmd_spawn_empty(cmds.as_ffi_ptr(), &mut e),
+                    FfiResult::OK
+                );
+            }
+        }
+        assert_eq!(shared_unbounded.load(Ordering::Acquire), 1);
+        storage.clear();
+
+        // Clean up dynamic slot registered by this test.
+        crate::drop_trampoline::prune_drop_trampolines_for_guard(&active);
+        let _ = world
+            .resource_mut::<WorldDropGuard>()
+            .recycle_slots_for_guard(&active);
     }
 }

@@ -1,5 +1,7 @@
-//! Optional `bevy_diagnostic` integration for guest mod CPU time, fault counts, and queued commands.
+//! Optional `bevy_diagnostic` integration for guest mod CPU time, fault counts, queued commands,
+//! and per-mod resource/frame-time budget telemetry.
 
+use crate::budgets::ModBudgetTelemetry;
 use bevy_abi_mod_host_sys::{ModDiagnosticsCollector, ModHost};
 use bevy_diagnostic::{Diagnostic, DiagnosticMeasurement, DiagnosticPath, DiagnosticsStore};
 use bevy_ecs::system::{Res, ResMut};
@@ -19,6 +21,21 @@ pub const TOTAL_FAULT_COUNT_PATH: DiagnosticPath =
 /// Aggregate deferred commands queued across all guest systems per frame (`"bevy_abi_mod/total/commands_queued"`).
 pub const TOTAL_COMMANDS_QUEUED_PATH: DiagnosticPath =
     DiagnosticPath::const_new("bevy_abi_mod/total/commands_queued");
+
+/// Aggregate cumulative budget breaches across all tracked guest systems
+/// (`"bevy_abi_mod/total/budget_breach_count"`).
+pub const TOTAL_BUDGET_BREACH_COUNT_PATH: DiagnosticPath =
+    DiagnosticPath::const_new("bevy_abi_mod/total/budget_breach_count");
+
+/// Aggregate deferred entity spawns queued across all guest systems per frame
+/// (`"bevy_abi_mod/total/spawns_queued"`).
+pub const TOTAL_SPAWNS_QUEUED_PATH: DiagnosticPath =
+    DiagnosticPath::const_new("bevy_abi_mod/total/spawns_queued");
+
+/// Maximum observed per-system `CommandArena` payload byte peak across all guest systems
+/// (`"bevy_abi_mod/total/arena_bytes_peak"`).
+pub const TOTAL_ARENA_BYTES_PEAK_PATH: DiagnosticPath =
+    DiagnosticPath::const_new("bevy_abi_mod/total/arena_bytes_peak");
 
 fn sanitize_diag_segment(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len().max(1));
@@ -53,6 +70,34 @@ pub fn mod_commands_queued_path(mod_name: &str) -> DiagnosticPath {
     DiagnosticPath::new(format!("bevy_abi_mod/mod/{seg}/commands_queued"))
 }
 
+/// Returns the per-mod cumulative budget breach count [`DiagnosticPath`]
+/// (`"bevy_abi_mod/mod/<mod_name>/budget_breach_count"`).
+pub fn mod_budget_breach_count_path(mod_name: &str) -> DiagnosticPath {
+    let seg = sanitize_diag_segment(mod_name);
+    DiagnosticPath::new(format!("bevy_abi_mod/mod/{seg}/budget_breach_count"))
+}
+
+/// Returns the per-mod peak sliding-window `p99` system duration [`DiagnosticPath`]
+/// (`"bevy_abi_mod/mod/<mod_name>/p99_time_us"`).
+pub fn mod_p99_time_path(mod_name: &str) -> DiagnosticPath {
+    let seg = sanitize_diag_segment(mod_name);
+    DiagnosticPath::new(format!("bevy_abi_mod/mod/{seg}/p99_time_us"))
+}
+
+/// Returns the per-mod deferred entity spawns queued in the last frame [`DiagnosticPath`]
+/// (`"bevy_abi_mod/mod/<mod_name>/spawns_queued"`).
+pub fn mod_spawns_queued_path(mod_name: &str) -> DiagnosticPath {
+    let seg = sanitize_diag_segment(mod_name);
+    DiagnosticPath::new(format!("bevy_abi_mod/mod/{seg}/spawns_queued"))
+}
+
+/// Returns the per-mod peak `CommandArena` payload bytes [`DiagnosticPath`]
+/// (`"bevy_abi_mod/mod/<mod_name>/arena_bytes_peak"`).
+pub fn mod_arena_bytes_peak_path(mod_name: &str) -> DiagnosticPath {
+    let seg = sanitize_diag_segment(mod_name);
+    DiagnosticPath::new(format!("bevy_abi_mod/mod/{seg}/arena_bytes_peak"))
+}
+
 /// Ensures [`ModDiagnosticsCollector`], [`DiagnosticsStore`], and aggregate diagnostic entries exist in `world`.
 pub(crate) fn ensure_diagnostics_resources(world: &mut World) {
     if !world.contains_resource::<ModDiagnosticsCollector>() {
@@ -71,15 +116,29 @@ pub(crate) fn ensure_diagnostics_resources(world: &mut World) {
         if store.get(&TOTAL_COMMANDS_QUEUED_PATH).is_none() {
             store.add(Diagnostic::new(TOTAL_COMMANDS_QUEUED_PATH));
         }
+        if store.get(&TOTAL_BUDGET_BREACH_COUNT_PATH).is_none() {
+            store.add(Diagnostic::new(TOTAL_BUDGET_BREACH_COUNT_PATH));
+        }
+        if store.get(&TOTAL_SPAWNS_QUEUED_PATH).is_none() {
+            store.add(Diagnostic::new(TOTAL_SPAWNS_QUEUED_PATH));
+        }
+        if store.get(&TOTAL_ARENA_BYTES_PEAK_PATH).is_none() {
+            store.add(Diagnostic::new(TOTAL_ARENA_BYTES_PEAK_PATH).with_suffix(" B"));
+        }
     }
 }
 
-/// Registers per-mod `Diagnostic` entries (`cpu_time_us`, `fault_count`, `commands_queued`) in `world`.
+/// Registers per-mod `Diagnostic` entries (`cpu_time_us`, `fault_count`, `commands_queued`, and
+/// budget telemetry paths) in `world`.
 pub(crate) fn register_mod_diagnostics_in_world(world: &mut World, mod_name: &str) {
     ensure_diagnostics_resources(world);
     let cpu_path = mod_cpu_time_path(mod_name);
     let fault_path = mod_fault_count_path(mod_name);
     let cmd_path = mod_commands_queued_path(mod_name);
+    let breach_path = mod_budget_breach_count_path(mod_name);
+    let p99_path = mod_p99_time_path(mod_name);
+    let spawns_path = mod_spawns_queued_path(mod_name);
+    let arena_path = mod_arena_bytes_peak_path(mod_name);
     if let Some(mut store) = world.get_resource_mut::<DiagnosticsStore>() {
         if store.get(&cpu_path).is_none() {
             store.add(Diagnostic::new(cpu_path).with_suffix(" us"));
@@ -89,6 +148,18 @@ pub(crate) fn register_mod_diagnostics_in_world(world: &mut World, mod_name: &st
         }
         if store.get(&cmd_path).is_none() {
             store.add(Diagnostic::new(cmd_path));
+        }
+        if store.get(&breach_path).is_none() {
+            store.add(Diagnostic::new(breach_path));
+        }
+        if store.get(&p99_path).is_none() {
+            store.add(Diagnostic::new(p99_path).with_suffix(" us"));
+        }
+        if store.get(&spawns_path).is_none() {
+            store.add(Diagnostic::new(spawns_path));
+        }
+        if store.get(&arena_path).is_none() {
+            store.add(Diagnostic::new(arena_path).with_suffix(" B"));
         }
     }
 }
@@ -110,10 +181,12 @@ fn push_measurement(
     }
 }
 
-/// `Last`-schedule Bevy system draining [`ModDiagnosticsCollector`] into [`DiagnosticsStore`].
+/// `Last`-schedule Bevy system draining [`ModDiagnosticsCollector`] and [`ModBudgetTelemetry`]
+/// into [`DiagnosticsStore`].
 pub fn flush_mod_diagnostics(
     collector: Res<ModDiagnosticsCollector>,
     host: Option<Res<ModHost>>,
+    budget_telemetry: Option<Res<ModBudgetTelemetry>>,
     mut store: ResMut<DiagnosticsStore>,
 ) {
     let samples = collector.drain();
@@ -184,5 +257,85 @@ pub fn flush_mod_diagnostics(
             now,
             faults as f64,
         );
+    }
+
+    if let Some(ref telemetry) = budget_telemetry {
+        let snapshots = telemetry.system_budget_snapshots();
+        let mut total_breaches = 0u64;
+        let mut total_spawns = 0usize;
+        let mut total_arena_peak = 0usize;
+        let mut per_mod_breaches: HashMap<String, u64> = HashMap::default();
+        let mut per_mod_p99: HashMap<String, u64> = HashMap::default();
+        let mut per_mod_spawns: HashMap<String, usize> = HashMap::default();
+        let mut per_mod_arena_peak: HashMap<String, usize> = HashMap::default();
+
+        for snap in snapshots {
+            total_breaches = total_breaches.saturating_add(snap.breach_count);
+            total_spawns = total_spawns.saturating_add(snap.spawns_last_frame);
+            total_arena_peak = total_arena_peak.max(snap.arena_bytes_peak);
+
+            *per_mod_breaches.entry(snap.mod_name.clone()).or_insert(0) += snap.breach_count;
+            let p99_entry = per_mod_p99.entry(snap.mod_name.clone()).or_insert(0);
+            *p99_entry = (*p99_entry).max(snap.p99_us);
+            *per_mod_spawns.entry(snap.mod_name.clone()).or_insert(0) += snap.spawns_last_frame;
+            let arena_entry = per_mod_arena_peak.entry(snap.mod_name).or_insert(0);
+            *arena_entry = (*arena_entry).max(snap.arena_bytes_peak);
+        }
+
+        push_measurement(
+            &mut store,
+            TOTAL_BUDGET_BREACH_COUNT_PATH,
+            "",
+            now,
+            total_breaches as f64,
+        );
+        push_measurement(
+            &mut store,
+            TOTAL_SPAWNS_QUEUED_PATH,
+            "",
+            now,
+            total_spawns as f64,
+        );
+        push_measurement(
+            &mut store,
+            TOTAL_ARENA_BYTES_PEAK_PATH,
+            " B",
+            now,
+            total_arena_peak as f64,
+        );
+
+        for (mod_name, breaches) in per_mod_breaches {
+            let p99 = per_mod_p99.get(&mod_name).copied().unwrap_or(0);
+            let spawns = per_mod_spawns.get(&mod_name).copied().unwrap_or(0);
+            let arena_peak = per_mod_arena_peak.get(&mod_name).copied().unwrap_or(0);
+            push_measurement(
+                &mut store,
+                mod_budget_breach_count_path(&mod_name),
+                "",
+                now,
+                breaches as f64,
+            );
+            push_measurement(
+                &mut store,
+                mod_p99_time_path(&mod_name),
+                " us",
+                now,
+                p99 as f64,
+            );
+            push_measurement(
+                &mut store,
+                mod_spawns_queued_path(&mod_name),
+                "",
+                now,
+                spawns as f64,
+            );
+            push_measurement(
+                &mut store,
+                mod_arena_bytes_peak_path(&mod_name),
+                " B",
+                now,
+                arena_peak as f64,
+            );
+        }
     }
 }

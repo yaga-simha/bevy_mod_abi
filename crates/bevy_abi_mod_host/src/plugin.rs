@@ -1,14 +1,23 @@
 //! Bevy [`Plugin`] types for initializing the native C-ABI modding host (`ABI 0.3.0`).
 
 pub use crate::app_ext::ModAppExt;
+pub use crate::budgets::{
+    ModBudgetBreach, ModBudgetBreachKind, ModBudgetExt, ModBudgetLimits, ModBudgetPolicy,
+    ModBudgetSnapshot, ModBudgetTelemetry,
+};
 pub use crate::commands_ext::ModCommandsExt;
 pub use crate::events::{LoadedModInfo, ModLoaded, ModUnloaded};
 pub use crate::schedule_sets::{ModNamedSystemSet, ModScheduleMap, ModVisibleSets};
 pub use crate::world_ext::ModWorldExt;
 
+use crate::budgets::{
+    BudgetSystemsInstalled, cleanup_mod_budgets_in_world, ensure_budget_resources,
+    flush_mod_budgets, sync_mod_budget_policy,
+};
 use crate::commands_ext::{PendingModLifecycleOps, flush_pending_mod_lifecycle_ops};
 use crate::mod_dag::ModDependencyGraph;
-use crate::world_ext::ModUnloadHooks;
+use crate::schedule_sets::ModSystemSet;
+use crate::world_ext::{ModUnloadHooks, register_mod_unload_hook_in_world};
 #[cfg(feature = "signature-verification")]
 use bevy_abi_mod_host_sys::ModTrustPolicy;
 use bevy_abi_mod_host_sys::loader::ensure_symbol_tables_in_world;
@@ -19,8 +28,9 @@ use bevy_abi_mod_host_sys::{
     PersistentMessageCursors, StartupCompleted, WorldDropGuard, ensure_dynamic_hook_map_in_world,
     mark_startup_completed,
 };
-use bevy_app::{App, Last, Plugin, PostStartup, Update};
+use bevy_app::{App, First, Last, Plugin, PostStartup, Update};
 use bevy_ecs::message::Messages;
+use bevy_ecs::schedule::IntoScheduleConfigs;
 
 pub(crate) fn ensure_startup_tracker(app: &mut App) {
     if !app.world().contains_resource::<StartupCompleted>() {
@@ -43,6 +53,17 @@ impl AbiModPlugin {
     pub const fn with_error_policy(policy: ModErrorPolicy) -> ConfiguredAbiModPlugin {
         ConfiguredAbiModPlugin {
             error_policy: policy,
+            budget_policy: None,
+            #[cfg(feature = "signature-verification")]
+            trust_policy: None,
+        }
+    }
+
+    /// Returns a configured plugin enforcing the specified [`ModBudgetPolicy`].
+    pub fn with_budget_policy(policy: ModBudgetPolicy) -> ConfiguredAbiModPlugin {
+        ConfiguredAbiModPlugin {
+            error_policy: ModErrorPolicy::default(),
+            budget_policy: Some(policy),
             #[cfg(feature = "signature-verification")]
             trust_policy: None,
         }
@@ -53,6 +74,7 @@ impl AbiModPlugin {
     pub fn with_trust_policy(policy: ModTrustPolicy) -> ConfiguredAbiModPlugin {
         ConfiguredAbiModPlugin {
             error_policy: ModErrorPolicy::default(),
+            budget_policy: None,
             trust_policy: Some(policy),
         }
     }
@@ -64,13 +86,14 @@ impl Plugin for AbiModPlugin {
     }
 }
 
-/// Configurable variant of [`AbiModPlugin`] created via [`AbiModPlugin::with_error_policy`]
-/// or `AbiModPlugin::with_trust_policy`.
+/// Configurable variant of [`AbiModPlugin`] created via [`AbiModPlugin::with_error_policy`],
+/// [`AbiModPlugin::with_budget_policy`], or `AbiModPlugin::with_trust_policy`.
 #[derive(Default, Debug, Clone)]
-#[cfg_attr(not(feature = "signature-verification"), derive(Copy))]
 pub struct ConfiguredAbiModPlugin {
     /// Default [`ModErrorPolicy`] inserted into [`ModErrorPolicyConfig`].
     pub error_policy: ModErrorPolicy,
+    /// Optional [`ModBudgetPolicy`] inserted into `World` on plugin build.
+    pub budget_policy: Option<ModBudgetPolicy>,
     /// Optional [`ModTrustPolicy`] inserted into `World` on plugin build.
     #[cfg(feature = "signature-verification")]
     pub trust_policy: Option<ModTrustPolicy>,
@@ -81,6 +104,13 @@ impl ConfiguredAbiModPlugin {
     #[must_use]
     pub const fn with_error_policy(mut self, policy: ModErrorPolicy) -> Self {
         self.error_policy = policy;
+        self
+    }
+
+    /// Overrides the [`ModBudgetPolicy`] inserted into `World` when building the plugin.
+    #[must_use]
+    pub fn with_budget_policy(mut self, policy: ModBudgetPolicy) -> Self {
+        self.budget_policy = Some(policy);
         self
     }
 
@@ -135,7 +165,24 @@ impl Plugin for ConfiguredAbiModPlugin {
             app.insert_resource(ModTrustPolicy::disabled());
         }
         app.insert_resource(ModErrorPolicyConfig(self.error_policy));
+        if let Some(policy) = &self.budget_policy {
+            app.insert_resource(policy.clone());
+        }
+        if !app.world().contains_resource::<Messages<ModBudgetBreach>>() {
+            app.add_message::<ModBudgetBreach>();
+        }
+        ensure_budget_resources(app.world_mut());
+        register_mod_unload_hook_in_world(
+            app.world_mut(),
+            "bevy_abi_mod_host::budgets",
+            cleanup_mod_budgets_in_world,
+        );
         app.init_schedule(Update);
+        if !app.world().contains_resource::<BudgetSystemsInstalled>() {
+            app.init_resource::<BudgetSystemsInstalled>();
+            app.add_systems(First, sync_mod_budget_policy.before(ModSystemSet::All));
+            app.add_systems(Last, flush_mod_budgets);
+        }
         if !app.world().contains_resource::<PendingModLifecycleOps>() {
             app.init_resource::<PendingModLifecycleOps>();
             app.add_systems(Last, flush_pending_mod_lifecycle_ops);
@@ -144,7 +191,10 @@ impl Plugin for ConfiguredAbiModPlugin {
         #[cfg(feature = "diagnostics")]
         {
             crate::diagnostics::ensure_diagnostics_resources(app.world_mut());
-            app.add_systems(Last, crate::diagnostics::flush_mod_diagnostics);
+            app.add_systems(
+                Last,
+                crate::diagnostics::flush_mod_diagnostics.after(flush_mod_budgets),
+            );
         }
 
         ensure_startup_tracker(app);
