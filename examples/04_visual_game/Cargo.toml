@@ -11,8 +11,8 @@ bevy_app = { version = "0.20.1", default-features = false, features = ["std"] }
 bevy_ecs = { version = "0.20.1", default-features = false, features = ["std", "async_executor"] }
 bevy_abi_mod = { workspace = true }
 bevy_abi_mod_sys = { workspace = true }
-ratatui = { version = "0.29.0", default-features = false, features = ["crossterm"] }
-crossterm = { version = "0.28.1" }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+crossterm = { version = "0.29" }
 
 [lints]
 workspace = true

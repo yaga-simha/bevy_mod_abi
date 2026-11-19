@@ -8,10 +8,9 @@ exclude-dev = false
 [advisories]
 version = 2
 yanked = "warn"
-ignore = [
-    # Transitive via `ratatui 0.29.0` (`example_04_visual_game`); no safe upstream upgrade exists.
-    "RUSTSEC-2024-0436",
-]
+# Note: `bevy_abi_mod_trust` compiles `ssh-key` strictly with `default-features = false, features = ["std", "ed25519"]`,
+# so optional `rsa` (`RUSTSEC-2023-0071`), `p256`, and `crypto-bigint` (`RUSTSEC-2026-0387`) dependencies are never activated.
+ignore = []
 
 [licenses]
 version = 2

@@ -15,7 +15,7 @@ bevy_transform = "0.20.1"
 bevy_abi_mod = { workspace = true }
 bevy_abi_mod_sys = { workspace = true }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
-wgpu = "29.0.4"
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "dx12", "metal", "vulkan", "wgsl"] }
 glam = "0.33"
 bytemuck = { version = "1.25", features = ["derive"] }
 futures-executor = "0.3.34"

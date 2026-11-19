@@ -245,6 +245,7 @@ impl CuteRenderer {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
+                apply_limit_buckets: false,
             }))
             .map_err(|e| format!("No suitable GPU adapter found: {e}"))?;
 
@@ -270,6 +271,7 @@ impl CuteRenderer {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width,
             height,
             present_mode: wgpu::PresentMode::AutoVsync,
@@ -334,7 +336,7 @@ impl CuteRenderer {
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
                 buffers: &[
-                    wgpu::VertexBufferLayout {
+                    Some(wgpu::VertexBufferLayout {
                         array_stride: core::mem::size_of::<MeshVertex>() as u64,
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &[
@@ -349,8 +351,8 @@ impl CuteRenderer {
                                 format: wgpu::VertexFormat::Float32x3,
                             },
                         ],
-                    },
-                    wgpu::VertexBufferLayout {
+                    }),
+                    Some(wgpu::VertexBufferLayout {
                         array_stride: core::mem::size_of::<ModelInstance>() as u64,
                         step_mode: wgpu::VertexStepMode::Instance,
                         attributes: &[
@@ -380,7 +382,7 @@ impl CuteRenderer {
                                 format: wgpu::VertexFormat::Float32x4,
                             },
                         ],
-                    },
+                    }),
                 ],
             },
             fragment: Some(wgpu::FragmentState {
@@ -427,7 +429,7 @@ impl CuteRenderer {
                 module: &shader_ui,
                 entry_point: Some("vs_ui"),
                 compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: core::mem::size_of::<UiVertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &[
@@ -442,7 +444,7 @@ impl CuteRenderer {
                             format: wgpu::VertexFormat::Float32x4,
                         },
                     ],
-                }],
+                })],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader_ui,
@@ -733,7 +735,7 @@ impl CuteRenderer {
         }
 
         self.queue.submit(core::iter::once(encoder.finish()));
-        frame.present();
+        self.queue.present(frame);
     }
 }
 
