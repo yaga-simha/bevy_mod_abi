@@ -636,6 +636,9 @@ pub type BamMigrateComponentColumnFn = unsafe extern "C" fn(
     user_data: *mut c_void,
 ) -> FfiResult;
 
+/// Total number of function-pointer slots in the ABI `0.3.0` [`BamHostApi`] table (`68`).
+pub const BAM_HOST_API_SLOT_COUNT: usize = 68;
+
 /// Complete versioned host function table passed to `bevy_abi_mod_init`
 /// (`typedef struct BamHostApi BamHostApi;`).
 ///
@@ -1124,4 +1127,600 @@ const _: () = {
 // function pointer field is `Option<unsafe extern "C" fn(...)>` (all-bits-zero = `None`).
 unsafe impl ExtensibleStruct for BamHostApi {
     const MIN_V0_2_SIZE: usize = Self::MIN_V0_2_SIZE;
+}
+
+/// Compile-time byte offsets for every header field and function-pointer slot of [`BamHostApi`].
+///
+/// Exports three constant families for all 70 fields of [`BamHostApi`] (`struct_size`,
+/// `abi_version`, and all 68 function-pointer slots):
+///
+/// - `<FIELD>`: Pointer-width-native byte offset (`core::mem::offset_of!(BamHostApi, <field>)`)
+///   for the active compilation target.
+/// - `OFF64_<FIELD>`: Architecture-independent 64-bit byte offset (`struct_size` at `0`,
+///   `abi_version` at `4`, slot `k` at `8 + 8 * k`, total [`offsets::SIZE_64`] = `552` bytes).
+/// - `OFF32_<FIELD>`: Architecture-independent 32-bit byte offset (`struct_size` at `0`,
+///   `abi_version` at `4`, slot `k` at `8 + 4 * k`, total [`offsets::SIZE_32`] = `280` bytes).
+///
+/// Cross-target code generators and JIT backends (such as `bql_jit`) can import exact slot
+/// offsets without hardcoding magic numbers, while compile-time assertions guarantee agreement
+/// with `core::mem::offset_of!` on both 64-bit and 32-bit targets.
+pub mod offsets {
+    use super::{BAM_HOST_API_SLOT_COUNT, BamHostApi};
+
+    /// Total number of function-pointer slots in ABI `0.3.0` [`BamHostApi`] (`68`).
+    pub const SLOT_COUNT: usize = BAM_HOST_API_SLOT_COUNT;
+
+    /// Total byte size of ABI `0.3.0` [`BamHostApi`] on 64-bit targets (`552` bytes).
+    pub const SIZE_64: usize = 552;
+
+    /// Total byte size of ABI `0.3.0` [`BamHostApi`] on 32-bit targets (`280` bytes).
+    pub const SIZE_32: usize = 280;
+
+    macro_rules! define_host_api_offsets {
+        (
+            header: [
+                $(($h_field:ident, $h_native:ident, $h_off64:ident, $h_val64:expr, $h_off32:ident, $h_val32:expr)),* $(,)?
+            ],
+            slots: [
+                $(($slot_idx:expr, $s_field:ident, $s_native:ident, $s_off64:ident, $s_val64:expr, $s_off32:ident, $s_val32:expr)),* $(,)?
+            ]
+        ) => {
+            $(
+                #[doc = concat!(
+                    "Target-native byte offset of header field `BamHostApi::",
+                    stringify!($h_field),
+                    "` (`",
+                    stringify!($h_val64),
+                    "` on 64-bit, `",
+                    stringify!($h_val32),
+                    "` on 32-bit)."
+                )]
+                pub const $h_native: usize = core::mem::offset_of!(BamHostApi, $h_field);
+
+                #[doc = concat!(
+                    "64-bit byte offset of header field `BamHostApi::",
+                    stringify!($h_field),
+                    "` (`",
+                    stringify!($h_val64),
+                    "` bytes)."
+                )]
+                pub const $h_off64: usize = $h_val64;
+
+                #[doc = concat!(
+                    "32-bit byte offset of header field `BamHostApi::",
+                    stringify!($h_field),
+                    "` (`",
+                    stringify!($h_val32),
+                    "` bytes)."
+                )]
+                pub const $h_off32: usize = $h_val32;
+            )*
+
+            $(
+                #[doc = concat!(
+                    "Target-native byte offset of slot ",
+                    stringify!($slot_idx),
+                    " (`BamHostApi::",
+                    stringify!($s_field),
+                    "`, `",
+                    stringify!($s_val64),
+                    "` on 64-bit, `",
+                    stringify!($s_val32),
+                    "` on 32-bit)."
+                )]
+                pub const $s_native: usize = core::mem::offset_of!(BamHostApi, $s_field);
+
+                #[doc = concat!(
+                    "64-bit byte offset of slot ",
+                    stringify!($slot_idx),
+                    " (`BamHostApi::",
+                    stringify!($s_field),
+                    "`, `",
+                    stringify!($s_val64),
+                    "` bytes)."
+                )]
+                pub const $s_off64: usize = $s_val64;
+
+                #[doc = concat!(
+                    "32-bit byte offset of slot ",
+                    stringify!($slot_idx),
+                    " (`BamHostApi::",
+                    stringify!($s_field),
+                    "`, `",
+                    stringify!($s_val32),
+                    "` bytes)."
+                )]
+                pub const $s_off32: usize = $s_val32;
+            )*
+
+            const _: () = {
+                assert!(SLOT_COUNT == 68);
+                assert!(SIZE_64 == 8 + 8 * SLOT_COUNT);
+                assert!(SIZE_32 == 8 + 4 * SLOT_COUNT);
+                $(
+                    assert!($s_off64 == 8 + 8 * $slot_idx);
+                    assert!($s_off32 == 8 + 4 * $slot_idx);
+                )*
+
+                #[cfg(target_pointer_width = "64")]
+                {
+                    assert!(core::mem::size_of::<BamHostApi>() == SIZE_64);
+                    $(
+                        assert!($h_native == $h_off64);
+                    )*
+                    $(
+                        assert!($s_native == $s_off64);
+                    )*
+                }
+
+                #[cfg(target_pointer_width = "32")]
+                {
+                    assert!(core::mem::size_of::<BamHostApi>() == SIZE_32);
+                    $(
+                        assert!($h_native == $h_off32);
+                    )*
+                    $(
+                        assert!($s_native == $s_off32);
+                    )*
+                }
+            };
+        };
+    }
+
+    define_host_api_offsets! {
+        header: [
+            (struct_size, STRUCT_SIZE, OFF64_STRUCT_SIZE, 0, OFF32_STRUCT_SIZE, 0),
+            (abi_version, ABI_VERSION, OFF64_ABI_VERSION, 4, OFF32_ABI_VERSION, 4),
+        ],
+        slots: [
+            (0, get_proc_address, GET_PROC_ADDRESS, OFF64_GET_PROC_ADDRESS, 8, OFF32_GET_PROC_ADDRESS, 8),
+            (1, last_error, LAST_ERROR, OFF64_LAST_ERROR, 16, OFF32_LAST_ERROR, 12),
+            (2, load_host_ctx, LOAD_HOST_CTX, OFF64_LOAD_HOST_CTX, 24, OFF32_LOAD_HOST_CTX, 16),
+            (3, register_component, REGISTER_COMPONENT, OFF64_REGISTER_COMPONENT, 32, OFF32_REGISTER_COMPONENT, 20),
+            (4, resolve_component, RESOLVE_COMPONENT, OFF64_RESOLVE_COMPONENT, 40, OFF32_RESOLVE_COMPONENT, 24),
+            (5, register_system, REGISTER_SYSTEM, OFF64_REGISTER_SYSTEM, 48, OFF32_REGISTER_SYSTEM, 28),
+            (6, sys_host_ctx, SYS_HOST_CTX, OFF64_SYS_HOST_CTX, 56, OFF32_SYS_HOST_CTX, 32),
+            (7, sys_query, SYS_QUERY, OFF64_SYS_QUERY, 64, OFF32_SYS_QUERY, 36),
+            (8, sys_commands, SYS_COMMANDS, OFF64_SYS_COMMANDS, 72, OFF32_SYS_COMMANDS, 40),
+            (9, iter_next_chunk, ITER_NEXT_CHUNK, OFF64_ITER_NEXT_CHUNK, 80, OFF32_ITER_NEXT_CHUNK, 44),
+            (10, iter_reset, ITER_RESET, OFF64_ITER_RESET, 88, OFF32_ITER_RESET, 48),
+            (11, iter_entities, ITER_ENTITIES, OFF64_ITER_ENTITIES, 96, OFF32_ITER_ENTITIES, 52),
+            (12, iter_column_readonly, ITER_COLUMN_READONLY, OFF64_ITER_COLUMN_READONLY, 104, OFF32_ITER_COLUMN_READONLY, 56),
+            (13, iter_column_mutable, ITER_COLUMN_MUTABLE, OFF64_ITER_COLUMN_MUTABLE, 112, OFF32_ITER_COLUMN_MUTABLE, 60),
+            (14, iter_column_mutable_untracked, ITER_COLUMN_MUTABLE_UNTRACKED, OFF64_ITER_COLUMN_MUTABLE_UNTRACKED, 120, OFF32_ITER_COLUMN_MUTABLE_UNTRACKED, 64),
+            (15, iter_mark_changed_range, ITER_MARK_CHANGED_RANGE, OFF64_ITER_MARK_CHANGED_RANGE, 128, OFF32_ITER_MARK_CHANGED_RANGE, 68),
+            (16, iter_column_rows_readonly, ITER_COLUMN_ROWS_READONLY, OFF64_ITER_COLUMN_ROWS_READONLY, 136, OFF32_ITER_COLUMN_ROWS_READONLY, 72),
+            (17, iter_column_rows_mutable, ITER_COLUMN_ROWS_MUTABLE, OFF64_ITER_COLUMN_ROWS_MUTABLE, 144, OFF32_ITER_COLUMN_ROWS_MUTABLE, 76),
+            (18, iter_column_info, ITER_COLUMN_INFO, OFF64_ITER_COLUMN_INFO, 152, OFF32_ITER_COLUMN_INFO, 80),
+            (19, res_ptr, RES_PTR, OFF64_RES_PTR, 160, OFF32_RES_PTR, 84),
+            (20, res_mut_ptr, RES_MUT_PTR, OFF64_RES_MUT_PTR, 168, OFF32_RES_MUT_PTR, 88),
+            (21, cmd_spawn_empty, CMD_SPAWN_EMPTY, OFF64_CMD_SPAWN_EMPTY, 176, OFF32_CMD_SPAWN_EMPTY, 92),
+            (22, cmd_spawn, CMD_SPAWN, OFF64_CMD_SPAWN, 184, OFF32_CMD_SPAWN, 96),
+            (23, cmd_despawn, CMD_DESPAWN, OFF64_CMD_DESPAWN, 192, OFF32_CMD_DESPAWN, 100),
+            (24, cmd_insert, CMD_INSERT, OFF64_CMD_INSERT, 200, OFF32_CMD_INSERT, 104),
+            (25, cmd_insert_default, CMD_INSERT_DEFAULT, OFF64_CMD_INSERT_DEFAULT, 208, OFF32_CMD_INSERT_DEFAULT, 108),
+            (26, cmd_remove, CMD_REMOVE, OFF64_CMD_REMOVE, 216, OFF32_CMD_REMOVE, 112),
+            (27, par_for_each_chunk, PAR_FOR_EACH_CHUNK, OFF64_PAR_FOR_EACH_CHUNK, 224, OFF32_PAR_FOR_EACH_CHUNK, 116),
+            (28, sys_entity_get, SYS_ENTITY_GET, OFF64_SYS_ENTITY_GET, 232, OFF32_SYS_ENTITY_GET, 120),
+            (29, sys_entity_get_mut, SYS_ENTITY_GET_MUT, OFF64_SYS_ENTITY_GET_MUT, 240, OFF32_SYS_ENTITY_GET_MUT, 124),
+            (30, msg_read_batch, MSG_READ_BATCH, OFF64_MSG_READ_BATCH, 248, OFF32_MSG_READ_BATCH, 128),
+            (31, msg_send, MSG_SEND, OFF64_MSG_SEND, 256, OFF32_MSG_SEND, 132),
+            (32, msg_write_batch, MSG_WRITE_BATCH, OFF64_MSG_WRITE_BATCH, 264, OFF32_MSG_WRITE_BATCH, 136),
+            (33, res_ticks, RES_TICKS, OFF64_RES_TICKS, 272, OFF32_RES_TICKS, 140),
+            (34, sys_res_ptr, SYS_RES_PTR, OFF64_SYS_RES_PTR, 280, OFF32_SYS_RES_PTR, 144),
+            (35, sys_res_mut_ptr, SYS_RES_MUT_PTR, OFF64_SYS_RES_MUT_PTR, 288, OFF32_SYS_RES_MUT_PTR, 148),
+            (36, register_observer, REGISTER_OBSERVER, OFF64_REGISTER_OBSERVER, 296, OFF32_REGISTER_OBSERVER, 152),
+            (37, cmd_trigger, CMD_TRIGGER, OFF64_CMD_TRIGGER, 304, OFF32_CMD_TRIGGER, 156),
+            (38, cmd_spawn_persistent, CMD_SPAWN_PERSISTENT, OFF64_CMD_SPAWN_PERSISTENT, 312, OFF32_CMD_SPAWN_PERSISTENT, 160),
+            (39, cmd_spawn_batch, CMD_SPAWN_BATCH, OFF64_CMD_SPAWN_BATCH, 320, OFF32_CMD_SPAWN_BATCH, 164),
+            (40, cmd_despawn_all, CMD_DESPAWN_ALL, OFF64_CMD_DESPAWN_ALL, 328, OFF32_CMD_DESPAWN_ALL, 168),
+            (41, cmd_insert_if_new, CMD_INSERT_IF_NEW, OFF64_CMD_INSERT_IF_NEW, 336, OFF32_CMD_INSERT_IF_NEW, 172),
+            (42, cmd_trigger_ex, CMD_TRIGGER_EX, OFF64_CMD_TRIGGER_EX, 344, OFF32_CMD_TRIGGER_EX, 176),
+            (43, cmd_observe, CMD_OBSERVE, OFF64_CMD_OBSERVE, 352, OFF32_CMD_OBSERVE, 180),
+            (44, iter_read_removed, ITER_READ_REMOVED, OFF64_ITER_READ_REMOVED, 360, OFF32_ITER_READ_REMOVED, 184),
+            (45, sys_entity_children, SYS_ENTITY_CHILDREN, OFF64_SYS_ENTITY_CHILDREN, 368, OFF32_SYS_ENTITY_CHILDREN, 188),
+            (46, asset_load, ASSET_LOAD, OFF64_ASSET_LOAD, 376, OFF32_ASSET_LOAD, 192),
+            (47, asset_get_load_state, ASSET_GET_LOAD_STATE, OFF64_ASSET_GET_LOAD_STATE, 384, OFF32_ASSET_GET_LOAD_STATE, 196),
+            (48, asset_release, ASSET_RELEASE, OFF64_ASSET_RELEASE, 392, OFF32_ASSET_RELEASE, 200),
+            (49, cmd_spawn_scene, CMD_SPAWN_SCENE, OFF64_CMD_SPAWN_SCENE, 400, OFF32_CMD_SPAWN_SCENE, 204),
+            (50, log_diagnostic, LOG_DIAGNOSTIC, OFF64_LOG_DIAGNOSTIC, 408, OFF32_LOG_DIAGNOSTIC, 208),
+            (51, report_guest_fault, REPORT_GUEST_FAULT, OFF64_REPORT_GUEST_FAULT, 416, OFF32_REPORT_GUEST_FAULT, 212),
+            (52, resolve_component_by_uuid, RESOLVE_COMPONENT_BY_UUID, OFF64_RESOLVE_COMPONENT_BY_UUID, 424, OFF32_RESOLVE_COMPONENT_BY_UUID, 216),
+            (53, component_layout_info, COMPONENT_LAYOUT_INFO, OFF64_COMPONENT_LAYOUT_INFO, 432, OFF32_COMPONENT_LAYOUT_INFO, 220),
+            (54, register_relation, REGISTER_RELATION, OFF64_REGISTER_RELATION, 440, OFF32_REGISTER_RELATION, 224),
+            (55, intern_symbol, INTERN_SYMBOL, OFF64_INTERN_SYMBOL, 448, OFF32_INTERN_SYMBOL, 228),
+            (56, bind_named_object, BIND_NAMED_OBJECT, OFF64_BIND_NAMED_OBJECT, 456, OFF32_BIND_NAMED_OBJECT, 232),
+            (57, iter_count, ITER_COUNT, OFF64_ITER_COUNT, 464, OFF32_ITER_COUNT, 236),
+            (58, iter_up_cascade, ITER_UP_CASCADE, OFF64_ITER_UP_CASCADE, 472, OFF32_ITER_UP_CASCADE, 240),
+            (59, par_for_each_chunk_readonly, PAR_FOR_EACH_CHUNK_READONLY, OFF64_PAR_FOR_EACH_CHUNK_READONLY, 480, OFF32_PAR_FOR_EACH_CHUNK_READONLY, 244),
+            (60, register_system_handle, REGISTER_SYSTEM_HANDLE, OFF64_REGISTER_SYSTEM_HANDLE, 488, OFF32_REGISTER_SYSTEM_HANDLE, 248),
+            (61, configure_schedule_set, CONFIGURE_SCHEDULE_SET, OFF64_CONFIGURE_SCHEDULE_SET, 496, OFF32_CONFIGURE_SCHEDULE_SET, 252),
+            (62, mount_system_in_schedule, MOUNT_SYSTEM_IN_SCHEDULE, OFF64_MOUNT_SYSTEM_IN_SCHEDULE, 504, OFF32_MOUNT_SYSTEM_IN_SCHEDULE, 256),
+            (63, cmd_checkpoint, CMD_CHECKPOINT, OFF64_CMD_CHECKPOINT, 512, OFF32_CMD_CHECKPOINT, 260),
+            (64, cmd_rollback, CMD_ROLLBACK, OFF64_CMD_ROLLBACK, 520, OFF32_CMD_ROLLBACK, 264),
+            (65, cmd_insert_relation, CMD_INSERT_RELATION, OFF64_CMD_INSERT_RELATION, 528, OFF32_CMD_INSERT_RELATION, 268),
+            (66, cmd_remove_relation, CMD_REMOVE_RELATION, OFF64_CMD_REMOVE_RELATION, 536, OFF32_CMD_REMOVE_RELATION, 272),
+            (67, migrate_component_column, MIGRATE_COMPONENT_COLUMN, OFF64_MIGRATE_COMPONENT_COLUMN, 544, OFF32_MIGRATE_COMPONENT_COLUMN, 276),
+        ]
+    }
+}
+
+#[cfg(test)]
+mod offset_tests {
+    use super::{BAM_HOST_API_SLOT_COUNT, BamHostApi, offsets};
+
+    #[test]
+    fn host_api_offset_constants_cover_all_68_slots_monotonically() {
+        assert_eq!(BAM_HOST_API_SLOT_COUNT, 68);
+        assert_eq!(offsets::SLOT_COUNT, 68);
+        assert_eq!(offsets::SIZE_64, 552);
+        assert_eq!(offsets::SIZE_32, 280);
+        assert_eq!(offsets::STRUCT_SIZE, 0);
+        assert_eq!(offsets::OFF64_STRUCT_SIZE, 0);
+        assert_eq!(offsets::OFF32_STRUCT_SIZE, 0);
+        assert_eq!(offsets::ABI_VERSION, 4);
+        assert_eq!(offsets::OFF64_ABI_VERSION, 4);
+        assert_eq!(offsets::OFF32_ABI_VERSION, 4);
+
+        let all_slots: [(usize, usize, usize); BAM_HOST_API_SLOT_COUNT] = [
+            (
+                offsets::GET_PROC_ADDRESS,
+                offsets::OFF64_GET_PROC_ADDRESS,
+                offsets::OFF32_GET_PROC_ADDRESS,
+            ),
+            (
+                offsets::LAST_ERROR,
+                offsets::OFF64_LAST_ERROR,
+                offsets::OFF32_LAST_ERROR,
+            ),
+            (
+                offsets::LOAD_HOST_CTX,
+                offsets::OFF64_LOAD_HOST_CTX,
+                offsets::OFF32_LOAD_HOST_CTX,
+            ),
+            (
+                offsets::REGISTER_COMPONENT,
+                offsets::OFF64_REGISTER_COMPONENT,
+                offsets::OFF32_REGISTER_COMPONENT,
+            ),
+            (
+                offsets::RESOLVE_COMPONENT,
+                offsets::OFF64_RESOLVE_COMPONENT,
+                offsets::OFF32_RESOLVE_COMPONENT,
+            ),
+            (
+                offsets::REGISTER_SYSTEM,
+                offsets::OFF64_REGISTER_SYSTEM,
+                offsets::OFF32_REGISTER_SYSTEM,
+            ),
+            (
+                offsets::SYS_HOST_CTX,
+                offsets::OFF64_SYS_HOST_CTX,
+                offsets::OFF32_SYS_HOST_CTX,
+            ),
+            (
+                offsets::SYS_QUERY,
+                offsets::OFF64_SYS_QUERY,
+                offsets::OFF32_SYS_QUERY,
+            ),
+            (
+                offsets::SYS_COMMANDS,
+                offsets::OFF64_SYS_COMMANDS,
+                offsets::OFF32_SYS_COMMANDS,
+            ),
+            (
+                offsets::ITER_NEXT_CHUNK,
+                offsets::OFF64_ITER_NEXT_CHUNK,
+                offsets::OFF32_ITER_NEXT_CHUNK,
+            ),
+            (
+                offsets::ITER_RESET,
+                offsets::OFF64_ITER_RESET,
+                offsets::OFF32_ITER_RESET,
+            ),
+            (
+                offsets::ITER_ENTITIES,
+                offsets::OFF64_ITER_ENTITIES,
+                offsets::OFF32_ITER_ENTITIES,
+            ),
+            (
+                offsets::ITER_COLUMN_READONLY,
+                offsets::OFF64_ITER_COLUMN_READONLY,
+                offsets::OFF32_ITER_COLUMN_READONLY,
+            ),
+            (
+                offsets::ITER_COLUMN_MUTABLE,
+                offsets::OFF64_ITER_COLUMN_MUTABLE,
+                offsets::OFF32_ITER_COLUMN_MUTABLE,
+            ),
+            (
+                offsets::ITER_COLUMN_MUTABLE_UNTRACKED,
+                offsets::OFF64_ITER_COLUMN_MUTABLE_UNTRACKED,
+                offsets::OFF32_ITER_COLUMN_MUTABLE_UNTRACKED,
+            ),
+            (
+                offsets::ITER_MARK_CHANGED_RANGE,
+                offsets::OFF64_ITER_MARK_CHANGED_RANGE,
+                offsets::OFF32_ITER_MARK_CHANGED_RANGE,
+            ),
+            (
+                offsets::ITER_COLUMN_ROWS_READONLY,
+                offsets::OFF64_ITER_COLUMN_ROWS_READONLY,
+                offsets::OFF32_ITER_COLUMN_ROWS_READONLY,
+            ),
+            (
+                offsets::ITER_COLUMN_ROWS_MUTABLE,
+                offsets::OFF64_ITER_COLUMN_ROWS_MUTABLE,
+                offsets::OFF32_ITER_COLUMN_ROWS_MUTABLE,
+            ),
+            (
+                offsets::ITER_COLUMN_INFO,
+                offsets::OFF64_ITER_COLUMN_INFO,
+                offsets::OFF32_ITER_COLUMN_INFO,
+            ),
+            (
+                offsets::RES_PTR,
+                offsets::OFF64_RES_PTR,
+                offsets::OFF32_RES_PTR,
+            ),
+            (
+                offsets::RES_MUT_PTR,
+                offsets::OFF64_RES_MUT_PTR,
+                offsets::OFF32_RES_MUT_PTR,
+            ),
+            (
+                offsets::CMD_SPAWN_EMPTY,
+                offsets::OFF64_CMD_SPAWN_EMPTY,
+                offsets::OFF32_CMD_SPAWN_EMPTY,
+            ),
+            (
+                offsets::CMD_SPAWN,
+                offsets::OFF64_CMD_SPAWN,
+                offsets::OFF32_CMD_SPAWN,
+            ),
+            (
+                offsets::CMD_DESPAWN,
+                offsets::OFF64_CMD_DESPAWN,
+                offsets::OFF32_CMD_DESPAWN,
+            ),
+            (
+                offsets::CMD_INSERT,
+                offsets::OFF64_CMD_INSERT,
+                offsets::OFF32_CMD_INSERT,
+            ),
+            (
+                offsets::CMD_INSERT_DEFAULT,
+                offsets::OFF64_CMD_INSERT_DEFAULT,
+                offsets::OFF32_CMD_INSERT_DEFAULT,
+            ),
+            (
+                offsets::CMD_REMOVE,
+                offsets::OFF64_CMD_REMOVE,
+                offsets::OFF32_CMD_REMOVE,
+            ),
+            (
+                offsets::PAR_FOR_EACH_CHUNK,
+                offsets::OFF64_PAR_FOR_EACH_CHUNK,
+                offsets::OFF32_PAR_FOR_EACH_CHUNK,
+            ),
+            (
+                offsets::SYS_ENTITY_GET,
+                offsets::OFF64_SYS_ENTITY_GET,
+                offsets::OFF32_SYS_ENTITY_GET,
+            ),
+            (
+                offsets::SYS_ENTITY_GET_MUT,
+                offsets::OFF64_SYS_ENTITY_GET_MUT,
+                offsets::OFF32_SYS_ENTITY_GET_MUT,
+            ),
+            (
+                offsets::MSG_READ_BATCH,
+                offsets::OFF64_MSG_READ_BATCH,
+                offsets::OFF32_MSG_READ_BATCH,
+            ),
+            (
+                offsets::MSG_SEND,
+                offsets::OFF64_MSG_SEND,
+                offsets::OFF32_MSG_SEND,
+            ),
+            (
+                offsets::MSG_WRITE_BATCH,
+                offsets::OFF64_MSG_WRITE_BATCH,
+                offsets::OFF32_MSG_WRITE_BATCH,
+            ),
+            (
+                offsets::RES_TICKS,
+                offsets::OFF64_RES_TICKS,
+                offsets::OFF32_RES_TICKS,
+            ),
+            (
+                offsets::SYS_RES_PTR,
+                offsets::OFF64_SYS_RES_PTR,
+                offsets::OFF32_SYS_RES_PTR,
+            ),
+            (
+                offsets::SYS_RES_MUT_PTR,
+                offsets::OFF64_SYS_RES_MUT_PTR,
+                offsets::OFF32_SYS_RES_MUT_PTR,
+            ),
+            (
+                offsets::REGISTER_OBSERVER,
+                offsets::OFF64_REGISTER_OBSERVER,
+                offsets::OFF32_REGISTER_OBSERVER,
+            ),
+            (
+                offsets::CMD_TRIGGER,
+                offsets::OFF64_CMD_TRIGGER,
+                offsets::OFF32_CMD_TRIGGER,
+            ),
+            (
+                offsets::CMD_SPAWN_PERSISTENT,
+                offsets::OFF64_CMD_SPAWN_PERSISTENT,
+                offsets::OFF32_CMD_SPAWN_PERSISTENT,
+            ),
+            (
+                offsets::CMD_SPAWN_BATCH,
+                offsets::OFF64_CMD_SPAWN_BATCH,
+                offsets::OFF32_CMD_SPAWN_BATCH,
+            ),
+            (
+                offsets::CMD_DESPAWN_ALL,
+                offsets::OFF64_CMD_DESPAWN_ALL,
+                offsets::OFF32_CMD_DESPAWN_ALL,
+            ),
+            (
+                offsets::CMD_INSERT_IF_NEW,
+                offsets::OFF64_CMD_INSERT_IF_NEW,
+                offsets::OFF32_CMD_INSERT_IF_NEW,
+            ),
+            (
+                offsets::CMD_TRIGGER_EX,
+                offsets::OFF64_CMD_TRIGGER_EX,
+                offsets::OFF32_CMD_TRIGGER_EX,
+            ),
+            (
+                offsets::CMD_OBSERVE,
+                offsets::OFF64_CMD_OBSERVE,
+                offsets::OFF32_CMD_OBSERVE,
+            ),
+            (
+                offsets::ITER_READ_REMOVED,
+                offsets::OFF64_ITER_READ_REMOVED,
+                offsets::OFF32_ITER_READ_REMOVED,
+            ),
+            (
+                offsets::SYS_ENTITY_CHILDREN,
+                offsets::OFF64_SYS_ENTITY_CHILDREN,
+                offsets::OFF32_SYS_ENTITY_CHILDREN,
+            ),
+            (
+                offsets::ASSET_LOAD,
+                offsets::OFF64_ASSET_LOAD,
+                offsets::OFF32_ASSET_LOAD,
+            ),
+            (
+                offsets::ASSET_GET_LOAD_STATE,
+                offsets::OFF64_ASSET_GET_LOAD_STATE,
+                offsets::OFF32_ASSET_GET_LOAD_STATE,
+            ),
+            (
+                offsets::ASSET_RELEASE,
+                offsets::OFF64_ASSET_RELEASE,
+                offsets::OFF32_ASSET_RELEASE,
+            ),
+            (
+                offsets::CMD_SPAWN_SCENE,
+                offsets::OFF64_CMD_SPAWN_SCENE,
+                offsets::OFF32_CMD_SPAWN_SCENE,
+            ),
+            (
+                offsets::LOG_DIAGNOSTIC,
+                offsets::OFF64_LOG_DIAGNOSTIC,
+                offsets::OFF32_LOG_DIAGNOSTIC,
+            ),
+            (
+                offsets::REPORT_GUEST_FAULT,
+                offsets::OFF64_REPORT_GUEST_FAULT,
+                offsets::OFF32_REPORT_GUEST_FAULT,
+            ),
+            (
+                offsets::RESOLVE_COMPONENT_BY_UUID,
+                offsets::OFF64_RESOLVE_COMPONENT_BY_UUID,
+                offsets::OFF32_RESOLVE_COMPONENT_BY_UUID,
+            ),
+            (
+                offsets::COMPONENT_LAYOUT_INFO,
+                offsets::OFF64_COMPONENT_LAYOUT_INFO,
+                offsets::OFF32_COMPONENT_LAYOUT_INFO,
+            ),
+            (
+                offsets::REGISTER_RELATION,
+                offsets::OFF64_REGISTER_RELATION,
+                offsets::OFF32_REGISTER_RELATION,
+            ),
+            (
+                offsets::INTERN_SYMBOL,
+                offsets::OFF64_INTERN_SYMBOL,
+                offsets::OFF32_INTERN_SYMBOL,
+            ),
+            (
+                offsets::BIND_NAMED_OBJECT,
+                offsets::OFF64_BIND_NAMED_OBJECT,
+                offsets::OFF32_BIND_NAMED_OBJECT,
+            ),
+            (
+                offsets::ITER_COUNT,
+                offsets::OFF64_ITER_COUNT,
+                offsets::OFF32_ITER_COUNT,
+            ),
+            (
+                offsets::ITER_UP_CASCADE,
+                offsets::OFF64_ITER_UP_CASCADE,
+                offsets::OFF32_ITER_UP_CASCADE,
+            ),
+            (
+                offsets::PAR_FOR_EACH_CHUNK_READONLY,
+                offsets::OFF64_PAR_FOR_EACH_CHUNK_READONLY,
+                offsets::OFF32_PAR_FOR_EACH_CHUNK_READONLY,
+            ),
+            (
+                offsets::REGISTER_SYSTEM_HANDLE,
+                offsets::OFF64_REGISTER_SYSTEM_HANDLE,
+                offsets::OFF32_REGISTER_SYSTEM_HANDLE,
+            ),
+            (
+                offsets::CONFIGURE_SCHEDULE_SET,
+                offsets::OFF64_CONFIGURE_SCHEDULE_SET,
+                offsets::OFF32_CONFIGURE_SCHEDULE_SET,
+            ),
+            (
+                offsets::MOUNT_SYSTEM_IN_SCHEDULE,
+                offsets::OFF64_MOUNT_SYSTEM_IN_SCHEDULE,
+                offsets::OFF32_MOUNT_SYSTEM_IN_SCHEDULE,
+            ),
+            (
+                offsets::CMD_CHECKPOINT,
+                offsets::OFF64_CMD_CHECKPOINT,
+                offsets::OFF32_CMD_CHECKPOINT,
+            ),
+            (
+                offsets::CMD_ROLLBACK,
+                offsets::OFF64_CMD_ROLLBACK,
+                offsets::OFF32_CMD_ROLLBACK,
+            ),
+            (
+                offsets::CMD_INSERT_RELATION,
+                offsets::OFF64_CMD_INSERT_RELATION,
+                offsets::OFF32_CMD_INSERT_RELATION,
+            ),
+            (
+                offsets::CMD_REMOVE_RELATION,
+                offsets::OFF64_CMD_REMOVE_RELATION,
+                offsets::OFF32_CMD_REMOVE_RELATION,
+            ),
+            (
+                offsets::MIGRATE_COMPONENT_COLUMN,
+                offsets::OFF64_MIGRATE_COMPONENT_COLUMN,
+                offsets::OFF32_MIGRATE_COMPONENT_COLUMN,
+            ),
+        ];
+
+        for (slot_idx, (native, off64, off32)) in all_slots.iter().enumerate() {
+            assert_eq!(*off64, 8 + 8 * slot_idx);
+            assert_eq!(*off32, 8 + 4 * slot_idx);
+            #[cfg(target_pointer_width = "64")]
+            assert_eq!(*native, *off64);
+            #[cfg(target_pointer_width = "32")]
+            assert_eq!(*native, *off32);
+        }
+
+        assert_eq!(
+            BamHostApi::MIN_V0_2_SIZE,
+            offsets::CMD_REMOVE + core::mem::size_of::<usize>()
+        );
+        assert_eq!(
+            BamHostApi::MIN_V0_3_SIZE,
+            offsets::MIGRATE_COMPONENT_COLUMN + core::mem::size_of::<usize>()
+        );
+    }
 }

@@ -34,7 +34,7 @@ mod access;
 mod commands;
 mod component;
 mod extensible;
-mod host_api;
+pub mod host_api;
 mod iter;
 mod primitives;
 mod system;
@@ -66,18 +66,18 @@ pub use component::{
 };
 pub use extensible::{ExtensibleStruct, read_descriptor, read_extensible_struct};
 pub use host_api::{
-    BAM_LOG_DEBUG, BAM_LOG_ERROR, BAM_LOG_INFO, BAM_LOG_TRACE, BAM_LOG_WARN,
-    BAM_MANIFEST_KNOWN_FLAGS, BamAssetGetLoadStateFn, BamAssetLoadFn, BamAssetReleaseFn,
-    BamBindNamedObjectFn, BamCmdCheckpointFn, BamCmdInsertRelationFn, BamCmdRemoveRelationFn,
-    BamCmdRollbackFn, BamComponentLayoutInfoFn, BamConfigureScheduleSetFn, BamGetProcAddressFn,
-    BamHostApi, BamInitFn, BamInstance, BamInternSymbolFn, BamIterCountFn, BamIterUpCascadeFn,
-    BamLastErrorFn, BamLoadHostCtxFn, BamLogDiagnosticFn, BamManifest, BamManifestFn,
-    BamMigrateComponentColumnFn, BamMountSystemInScheduleFn, BamRegisterComponentFn,
+    BAM_HOST_API_SLOT_COUNT, BAM_LOG_DEBUG, BAM_LOG_ERROR, BAM_LOG_INFO, BAM_LOG_TRACE,
+    BAM_LOG_WARN, BAM_MANIFEST_KNOWN_FLAGS, BamAssetGetLoadStateFn, BamAssetLoadFn,
+    BamAssetReleaseFn, BamBindNamedObjectFn, BamCmdCheckpointFn, BamCmdInsertRelationFn,
+    BamCmdRemoveRelationFn, BamCmdRollbackFn, BamComponentLayoutInfoFn, BamConfigureScheduleSetFn,
+    BamGetProcAddressFn, BamHostApi, BamInitFn, BamInstance, BamInternSymbolFn, BamIterCountFn,
+    BamIterUpCascadeFn, BamLastErrorFn, BamLoadHostCtxFn, BamLogDiagnosticFn, BamManifest,
+    BamManifestFn, BamMigrateComponentColumnFn, BamMountSystemInScheduleFn, BamRegisterComponentFn,
     BamRegisterObserverFn, BamRegisterRelationFn, BamRegisterSystemFn, BamRegisterSystemHandleFn,
     BamReportGuestFaultFn, BamResolveComponentByUuidFn, BamResolveComponentFn, BamRestoreStateFn,
     BamSaveStateFn, BamShutdownFn, BamStateWriterFn, BamSysCommandsFn, BamSysEntityChildrenFn,
     BamSysEntityGetFn, BamSysEntityGetMutFn, BamSysHostCtxFn, BamSysQueryFn, BamSysResMutPtrFn,
-    BamSysResPtrFn,
+    BamSysResPtrFn, offsets,
 };
 pub use iter::{
     BAM_MAX_CHANGE_AGE, BAM_STORAGE_FLAG_ENTITY_EVENT, BAM_STORAGE_FLAG_EVENT,

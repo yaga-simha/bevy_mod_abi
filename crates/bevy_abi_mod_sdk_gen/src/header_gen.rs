@@ -13,8 +13,8 @@ use bevy_abi_mod_sys::{
     ABI_VERSION, ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PATCH, AccessMode,
     BAM_CHILD_OF_NAME, BAM_CHILDREN_NAME, BAM_COMPONENT_FLAG_IMMUTABLE,
     BAM_COMPONENT_FLAG_SPARSE_SET, BAM_COMPONENT_FLAG_SUMMARY_TICK, BAM_COMPONENT_KNOWN_FLAGS,
-    BAM_LOG_DEBUG, BAM_LOG_ERROR, BAM_LOG_INFO, BAM_LOG_TRACE, BAM_LOG_WARN,
-    BAM_MANIFEST_KNOWN_FLAGS, BAM_MAX_CHANGE_AGE, BAM_OBSERVER_FLAG_PROPAGATE,
+    BAM_HOST_API_SLOT_COUNT, BAM_LOG_DEBUG, BAM_LOG_ERROR, BAM_LOG_INFO, BAM_LOG_TRACE,
+    BAM_LOG_WARN, BAM_MANIFEST_KNOWN_FLAGS, BAM_MAX_CHANGE_AGE, BAM_OBSERVER_FLAG_PROPAGATE,
     BAM_OBSERVER_KNOWN_FLAGS, BAM_QUERY_KNOWN_FLAGS, BAM_RELATION_FLAG_CASCADE_DESPAWN,
     BAM_RELATION_FLAG_EXCLUSIVE, BAM_RELATION_FLAG_SYMMETRIC, BAM_RELATION_KNOWN_FLAGS,
     BAM_REQUIRED_FLAG_CUSTOM_BYTES, BAM_REQUIRED_FLAG_INIT_FN, BAM_REQUIRED_FLAG_RESOLVE_BY_UUID,
@@ -29,7 +29,7 @@ use bevy_abi_mod_sys::{
     BamTermDesc, BamTriggerDesc, ComponentDesc, ComponentUuid, FfiAssetHandle, FfiAssetLoadState,
     FfiBool, FfiChildOf, FfiEntity, FfiOption, FfiResult, MAX_QUERIES_PER_SYSTEM,
     MAX_TERMS_PER_QUERY, MappedStringVTable, SIPHASH_KEY_0, SIPHASH_KEY_1, ScheduleId, StrView,
-    VTableHeader,
+    VTableHeader, offsets as host_api_offsets,
 };
 
 #[derive(Clone, Copy)]
@@ -1242,432 +1242,432 @@ fn wire_struct_specs() -> Vec<StructLayoutSpec> {
         StructLayoutSpec {
             c_name: "BamHostApi",
             assert_stem: "bam_host_api",
-            size_64: 552,
+            size_64: host_api_offsets::SIZE_64,
             align_64: 8,
-            size_32: 280,
+            size_32: host_api_offsets::SIZE_32,
             align_32: Align32::Fixed(4),
             rust_host_size: size_of::<BamHostApi>(),
             rust_host_align: align_of::<BamHostApi>(),
             fields: &[
                 FieldLayoutSpec {
                     c_name: "struct_size",
-                    offset_64: 0,
-                    offset_32: 0,
-                    rust_host_offset: offset_of!(BamHostApi, struct_size),
+                    offset_64: host_api_offsets::OFF64_STRUCT_SIZE,
+                    offset_32: host_api_offsets::OFF32_STRUCT_SIZE,
+                    rust_host_offset: host_api_offsets::STRUCT_SIZE,
                 },
                 FieldLayoutSpec {
                     c_name: "abi_version",
-                    offset_64: 4,
-                    offset_32: 4,
-                    rust_host_offset: offset_of!(BamHostApi, abi_version),
+                    offset_64: host_api_offsets::OFF64_ABI_VERSION,
+                    offset_32: host_api_offsets::OFF32_ABI_VERSION,
+                    rust_host_offset: host_api_offsets::ABI_VERSION,
                 },
                 FieldLayoutSpec {
                     c_name: "get_proc_address",
-                    offset_64: 8,
-                    offset_32: 8,
-                    rust_host_offset: offset_of!(BamHostApi, get_proc_address),
+                    offset_64: host_api_offsets::OFF64_GET_PROC_ADDRESS,
+                    offset_32: host_api_offsets::OFF32_GET_PROC_ADDRESS,
+                    rust_host_offset: host_api_offsets::GET_PROC_ADDRESS,
                 },
                 FieldLayoutSpec {
                     c_name: "last_error",
-                    offset_64: 16,
-                    offset_32: 12,
-                    rust_host_offset: offset_of!(BamHostApi, last_error),
+                    offset_64: host_api_offsets::OFF64_LAST_ERROR,
+                    offset_32: host_api_offsets::OFF32_LAST_ERROR,
+                    rust_host_offset: host_api_offsets::LAST_ERROR,
                 },
                 FieldLayoutSpec {
                     c_name: "load_host_ctx",
-                    offset_64: 24,
-                    offset_32: 16,
-                    rust_host_offset: offset_of!(BamHostApi, load_host_ctx),
+                    offset_64: host_api_offsets::OFF64_LOAD_HOST_CTX,
+                    offset_32: host_api_offsets::OFF32_LOAD_HOST_CTX,
+                    rust_host_offset: host_api_offsets::LOAD_HOST_CTX,
                 },
                 FieldLayoutSpec {
                     c_name: "register_component",
-                    offset_64: 32,
-                    offset_32: 20,
-                    rust_host_offset: offset_of!(BamHostApi, register_component),
+                    offset_64: host_api_offsets::OFF64_REGISTER_COMPONENT,
+                    offset_32: host_api_offsets::OFF32_REGISTER_COMPONENT,
+                    rust_host_offset: host_api_offsets::REGISTER_COMPONENT,
                 },
                 FieldLayoutSpec {
                     c_name: "resolve_component",
-                    offset_64: 40,
-                    offset_32: 24,
-                    rust_host_offset: offset_of!(BamHostApi, resolve_component),
+                    offset_64: host_api_offsets::OFF64_RESOLVE_COMPONENT,
+                    offset_32: host_api_offsets::OFF32_RESOLVE_COMPONENT,
+                    rust_host_offset: host_api_offsets::RESOLVE_COMPONENT,
                 },
                 FieldLayoutSpec {
                     c_name: "register_system",
-                    offset_64: 48,
-                    offset_32: 28,
-                    rust_host_offset: offset_of!(BamHostApi, register_system),
+                    offset_64: host_api_offsets::OFF64_REGISTER_SYSTEM,
+                    offset_32: host_api_offsets::OFF32_REGISTER_SYSTEM,
+                    rust_host_offset: host_api_offsets::REGISTER_SYSTEM,
                 },
                 FieldLayoutSpec {
                     c_name: "sys_host_ctx",
-                    offset_64: 56,
-                    offset_32: 32,
-                    rust_host_offset: offset_of!(BamHostApi, sys_host_ctx),
+                    offset_64: host_api_offsets::OFF64_SYS_HOST_CTX,
+                    offset_32: host_api_offsets::OFF32_SYS_HOST_CTX,
+                    rust_host_offset: host_api_offsets::SYS_HOST_CTX,
                 },
                 FieldLayoutSpec {
                     c_name: "sys_query",
-                    offset_64: 64,
-                    offset_32: 36,
-                    rust_host_offset: offset_of!(BamHostApi, sys_query),
+                    offset_64: host_api_offsets::OFF64_SYS_QUERY,
+                    offset_32: host_api_offsets::OFF32_SYS_QUERY,
+                    rust_host_offset: host_api_offsets::SYS_QUERY,
                 },
                 FieldLayoutSpec {
                     c_name: "sys_commands",
-                    offset_64: 72,
-                    offset_32: 40,
-                    rust_host_offset: offset_of!(BamHostApi, sys_commands),
+                    offset_64: host_api_offsets::OFF64_SYS_COMMANDS,
+                    offset_32: host_api_offsets::OFF32_SYS_COMMANDS,
+                    rust_host_offset: host_api_offsets::SYS_COMMANDS,
                 },
                 FieldLayoutSpec {
                     c_name: "iter_next_chunk",
-                    offset_64: 80,
-                    offset_32: 44,
-                    rust_host_offset: offset_of!(BamHostApi, iter_next_chunk),
+                    offset_64: host_api_offsets::OFF64_ITER_NEXT_CHUNK,
+                    offset_32: host_api_offsets::OFF32_ITER_NEXT_CHUNK,
+                    rust_host_offset: host_api_offsets::ITER_NEXT_CHUNK,
                 },
                 FieldLayoutSpec {
                     c_name: "iter_reset",
-                    offset_64: 88,
-                    offset_32: 48,
-                    rust_host_offset: offset_of!(BamHostApi, iter_reset),
+                    offset_64: host_api_offsets::OFF64_ITER_RESET,
+                    offset_32: host_api_offsets::OFF32_ITER_RESET,
+                    rust_host_offset: host_api_offsets::ITER_RESET,
                 },
                 FieldLayoutSpec {
                     c_name: "iter_entities",
-                    offset_64: 96,
-                    offset_32: 52,
-                    rust_host_offset: offset_of!(BamHostApi, iter_entities),
+                    offset_64: host_api_offsets::OFF64_ITER_ENTITIES,
+                    offset_32: host_api_offsets::OFF32_ITER_ENTITIES,
+                    rust_host_offset: host_api_offsets::ITER_ENTITIES,
                 },
                 FieldLayoutSpec {
                     c_name: "iter_column_readonly",
-                    offset_64: 104,
-                    offset_32: 56,
-                    rust_host_offset: offset_of!(BamHostApi, iter_column_readonly),
+                    offset_64: host_api_offsets::OFF64_ITER_COLUMN_READONLY,
+                    offset_32: host_api_offsets::OFF32_ITER_COLUMN_READONLY,
+                    rust_host_offset: host_api_offsets::ITER_COLUMN_READONLY,
                 },
                 FieldLayoutSpec {
                     c_name: "iter_column_mutable",
-                    offset_64: 112,
-                    offset_32: 60,
-                    rust_host_offset: offset_of!(BamHostApi, iter_column_mutable),
+                    offset_64: host_api_offsets::OFF64_ITER_COLUMN_MUTABLE,
+                    offset_32: host_api_offsets::OFF32_ITER_COLUMN_MUTABLE,
+                    rust_host_offset: host_api_offsets::ITER_COLUMN_MUTABLE,
                 },
                 FieldLayoutSpec {
                     c_name: "iter_column_mutable_untracked",
-                    offset_64: 120,
-                    offset_32: 64,
-                    rust_host_offset: offset_of!(BamHostApi, iter_column_mutable_untracked),
+                    offset_64: host_api_offsets::OFF64_ITER_COLUMN_MUTABLE_UNTRACKED,
+                    offset_32: host_api_offsets::OFF32_ITER_COLUMN_MUTABLE_UNTRACKED,
+                    rust_host_offset: host_api_offsets::ITER_COLUMN_MUTABLE_UNTRACKED,
                 },
                 FieldLayoutSpec {
                     c_name: "iter_mark_changed_range",
-                    offset_64: 128,
-                    offset_32: 68,
-                    rust_host_offset: offset_of!(BamHostApi, iter_mark_changed_range),
+                    offset_64: host_api_offsets::OFF64_ITER_MARK_CHANGED_RANGE,
+                    offset_32: host_api_offsets::OFF32_ITER_MARK_CHANGED_RANGE,
+                    rust_host_offset: host_api_offsets::ITER_MARK_CHANGED_RANGE,
                 },
                 FieldLayoutSpec {
                     c_name: "iter_column_rows_readonly",
-                    offset_64: 136,
-                    offset_32: 72,
-                    rust_host_offset: offset_of!(BamHostApi, iter_column_rows_readonly),
+                    offset_64: host_api_offsets::OFF64_ITER_COLUMN_ROWS_READONLY,
+                    offset_32: host_api_offsets::OFF32_ITER_COLUMN_ROWS_READONLY,
+                    rust_host_offset: host_api_offsets::ITER_COLUMN_ROWS_READONLY,
                 },
                 FieldLayoutSpec {
                     c_name: "iter_column_rows_mutable",
-                    offset_64: 144,
-                    offset_32: 76,
-                    rust_host_offset: offset_of!(BamHostApi, iter_column_rows_mutable),
+                    offset_64: host_api_offsets::OFF64_ITER_COLUMN_ROWS_MUTABLE,
+                    offset_32: host_api_offsets::OFF32_ITER_COLUMN_ROWS_MUTABLE,
+                    rust_host_offset: host_api_offsets::ITER_COLUMN_ROWS_MUTABLE,
                 },
                 FieldLayoutSpec {
                     c_name: "iter_column_info",
-                    offset_64: 152,
-                    offset_32: 80,
-                    rust_host_offset: offset_of!(BamHostApi, iter_column_info),
+                    offset_64: host_api_offsets::OFF64_ITER_COLUMN_INFO,
+                    offset_32: host_api_offsets::OFF32_ITER_COLUMN_INFO,
+                    rust_host_offset: host_api_offsets::ITER_COLUMN_INFO,
                 },
                 FieldLayoutSpec {
                     c_name: "res_ptr",
-                    offset_64: 160,
-                    offset_32: 84,
-                    rust_host_offset: offset_of!(BamHostApi, res_ptr),
+                    offset_64: host_api_offsets::OFF64_RES_PTR,
+                    offset_32: host_api_offsets::OFF32_RES_PTR,
+                    rust_host_offset: host_api_offsets::RES_PTR,
                 },
                 FieldLayoutSpec {
                     c_name: "res_mut_ptr",
-                    offset_64: 168,
-                    offset_32: 88,
-                    rust_host_offset: offset_of!(BamHostApi, res_mut_ptr),
+                    offset_64: host_api_offsets::OFF64_RES_MUT_PTR,
+                    offset_32: host_api_offsets::OFF32_RES_MUT_PTR,
+                    rust_host_offset: host_api_offsets::RES_MUT_PTR,
                 },
                 FieldLayoutSpec {
                     c_name: "cmd_spawn_empty",
-                    offset_64: 176,
-                    offset_32: 92,
-                    rust_host_offset: offset_of!(BamHostApi, cmd_spawn_empty),
+                    offset_64: host_api_offsets::OFF64_CMD_SPAWN_EMPTY,
+                    offset_32: host_api_offsets::OFF32_CMD_SPAWN_EMPTY,
+                    rust_host_offset: host_api_offsets::CMD_SPAWN_EMPTY,
                 },
                 FieldLayoutSpec {
                     c_name: "cmd_spawn",
-                    offset_64: 184,
-                    offset_32: 96,
-                    rust_host_offset: offset_of!(BamHostApi, cmd_spawn),
+                    offset_64: host_api_offsets::OFF64_CMD_SPAWN,
+                    offset_32: host_api_offsets::OFF32_CMD_SPAWN,
+                    rust_host_offset: host_api_offsets::CMD_SPAWN,
                 },
                 FieldLayoutSpec {
                     c_name: "cmd_despawn",
-                    offset_64: 192,
-                    offset_32: 100,
-                    rust_host_offset: offset_of!(BamHostApi, cmd_despawn),
+                    offset_64: host_api_offsets::OFF64_CMD_DESPAWN,
+                    offset_32: host_api_offsets::OFF32_CMD_DESPAWN,
+                    rust_host_offset: host_api_offsets::CMD_DESPAWN,
                 },
                 FieldLayoutSpec {
                     c_name: "cmd_insert",
-                    offset_64: 200,
-                    offset_32: 104,
-                    rust_host_offset: offset_of!(BamHostApi, cmd_insert),
+                    offset_64: host_api_offsets::OFF64_CMD_INSERT,
+                    offset_32: host_api_offsets::OFF32_CMD_INSERT,
+                    rust_host_offset: host_api_offsets::CMD_INSERT,
                 },
                 FieldLayoutSpec {
                     c_name: "cmd_insert_default",
-                    offset_64: 208,
-                    offset_32: 108,
-                    rust_host_offset: offset_of!(BamHostApi, cmd_insert_default),
+                    offset_64: host_api_offsets::OFF64_CMD_INSERT_DEFAULT,
+                    offset_32: host_api_offsets::OFF32_CMD_INSERT_DEFAULT,
+                    rust_host_offset: host_api_offsets::CMD_INSERT_DEFAULT,
                 },
                 FieldLayoutSpec {
                     c_name: "cmd_remove",
-                    offset_64: 216,
-                    offset_32: 112,
-                    rust_host_offset: offset_of!(BamHostApi, cmd_remove),
+                    offset_64: host_api_offsets::OFF64_CMD_REMOVE,
+                    offset_32: host_api_offsets::OFF32_CMD_REMOVE,
+                    rust_host_offset: host_api_offsets::CMD_REMOVE,
                 },
                 FieldLayoutSpec {
                     c_name: "par_for_each_chunk",
-                    offset_64: 224,
-                    offset_32: 116,
-                    rust_host_offset: offset_of!(BamHostApi, par_for_each_chunk),
+                    offset_64: host_api_offsets::OFF64_PAR_FOR_EACH_CHUNK,
+                    offset_32: host_api_offsets::OFF32_PAR_FOR_EACH_CHUNK,
+                    rust_host_offset: host_api_offsets::PAR_FOR_EACH_CHUNK,
                 },
                 FieldLayoutSpec {
                     c_name: "sys_entity_get",
-                    offset_64: 232,
-                    offset_32: 120,
-                    rust_host_offset: offset_of!(BamHostApi, sys_entity_get),
+                    offset_64: host_api_offsets::OFF64_SYS_ENTITY_GET,
+                    offset_32: host_api_offsets::OFF32_SYS_ENTITY_GET,
+                    rust_host_offset: host_api_offsets::SYS_ENTITY_GET,
                 },
                 FieldLayoutSpec {
                     c_name: "sys_entity_get_mut",
-                    offset_64: 240,
-                    offset_32: 124,
-                    rust_host_offset: offset_of!(BamHostApi, sys_entity_get_mut),
+                    offset_64: host_api_offsets::OFF64_SYS_ENTITY_GET_MUT,
+                    offset_32: host_api_offsets::OFF32_SYS_ENTITY_GET_MUT,
+                    rust_host_offset: host_api_offsets::SYS_ENTITY_GET_MUT,
                 },
                 FieldLayoutSpec {
                     c_name: "msg_read_batch",
-                    offset_64: 248,
-                    offset_32: 128,
-                    rust_host_offset: offset_of!(BamHostApi, msg_read_batch),
+                    offset_64: host_api_offsets::OFF64_MSG_READ_BATCH,
+                    offset_32: host_api_offsets::OFF32_MSG_READ_BATCH,
+                    rust_host_offset: host_api_offsets::MSG_READ_BATCH,
                 },
                 FieldLayoutSpec {
                     c_name: "msg_send",
-                    offset_64: 256,
-                    offset_32: 132,
-                    rust_host_offset: offset_of!(BamHostApi, msg_send),
+                    offset_64: host_api_offsets::OFF64_MSG_SEND,
+                    offset_32: host_api_offsets::OFF32_MSG_SEND,
+                    rust_host_offset: host_api_offsets::MSG_SEND,
                 },
                 FieldLayoutSpec {
                     c_name: "msg_write_batch",
-                    offset_64: 264,
-                    offset_32: 136,
-                    rust_host_offset: offset_of!(BamHostApi, msg_write_batch),
+                    offset_64: host_api_offsets::OFF64_MSG_WRITE_BATCH,
+                    offset_32: host_api_offsets::OFF32_MSG_WRITE_BATCH,
+                    rust_host_offset: host_api_offsets::MSG_WRITE_BATCH,
                 },
                 FieldLayoutSpec {
                     c_name: "res_ticks",
-                    offset_64: 272,
-                    offset_32: 140,
-                    rust_host_offset: offset_of!(BamHostApi, res_ticks),
+                    offset_64: host_api_offsets::OFF64_RES_TICKS,
+                    offset_32: host_api_offsets::OFF32_RES_TICKS,
+                    rust_host_offset: host_api_offsets::RES_TICKS,
                 },
                 FieldLayoutSpec {
                     c_name: "sys_res_ptr",
-                    offset_64: 280,
-                    offset_32: 144,
-                    rust_host_offset: offset_of!(BamHostApi, sys_res_ptr),
+                    offset_64: host_api_offsets::OFF64_SYS_RES_PTR,
+                    offset_32: host_api_offsets::OFF32_SYS_RES_PTR,
+                    rust_host_offset: host_api_offsets::SYS_RES_PTR,
                 },
                 FieldLayoutSpec {
                     c_name: "sys_res_mut_ptr",
-                    offset_64: 288,
-                    offset_32: 148,
-                    rust_host_offset: offset_of!(BamHostApi, sys_res_mut_ptr),
+                    offset_64: host_api_offsets::OFF64_SYS_RES_MUT_PTR,
+                    offset_32: host_api_offsets::OFF32_SYS_RES_MUT_PTR,
+                    rust_host_offset: host_api_offsets::SYS_RES_MUT_PTR,
                 },
                 FieldLayoutSpec {
                     c_name: "register_observer",
-                    offset_64: 296,
-                    offset_32: 152,
-                    rust_host_offset: offset_of!(BamHostApi, register_observer),
+                    offset_64: host_api_offsets::OFF64_REGISTER_OBSERVER,
+                    offset_32: host_api_offsets::OFF32_REGISTER_OBSERVER,
+                    rust_host_offset: host_api_offsets::REGISTER_OBSERVER,
                 },
                 FieldLayoutSpec {
                     c_name: "cmd_trigger",
-                    offset_64: 304,
-                    offset_32: 156,
-                    rust_host_offset: offset_of!(BamHostApi, cmd_trigger),
+                    offset_64: host_api_offsets::OFF64_CMD_TRIGGER,
+                    offset_32: host_api_offsets::OFF32_CMD_TRIGGER,
+                    rust_host_offset: host_api_offsets::CMD_TRIGGER,
                 },
                 FieldLayoutSpec {
                     c_name: "cmd_spawn_persistent",
-                    offset_64: 312,
-                    offset_32: 160,
-                    rust_host_offset: offset_of!(BamHostApi, cmd_spawn_persistent),
+                    offset_64: host_api_offsets::OFF64_CMD_SPAWN_PERSISTENT,
+                    offset_32: host_api_offsets::OFF32_CMD_SPAWN_PERSISTENT,
+                    rust_host_offset: host_api_offsets::CMD_SPAWN_PERSISTENT,
                 },
                 FieldLayoutSpec {
                     c_name: "cmd_spawn_batch",
-                    offset_64: 320,
-                    offset_32: 164,
-                    rust_host_offset: offset_of!(BamHostApi, cmd_spawn_batch),
+                    offset_64: host_api_offsets::OFF64_CMD_SPAWN_BATCH,
+                    offset_32: host_api_offsets::OFF32_CMD_SPAWN_BATCH,
+                    rust_host_offset: host_api_offsets::CMD_SPAWN_BATCH,
                 },
                 FieldLayoutSpec {
                     c_name: "cmd_despawn_all",
-                    offset_64: 328,
-                    offset_32: 168,
-                    rust_host_offset: offset_of!(BamHostApi, cmd_despawn_all),
+                    offset_64: host_api_offsets::OFF64_CMD_DESPAWN_ALL,
+                    offset_32: host_api_offsets::OFF32_CMD_DESPAWN_ALL,
+                    rust_host_offset: host_api_offsets::CMD_DESPAWN_ALL,
                 },
                 FieldLayoutSpec {
                     c_name: "cmd_insert_if_new",
-                    offset_64: 336,
-                    offset_32: 172,
-                    rust_host_offset: offset_of!(BamHostApi, cmd_insert_if_new),
+                    offset_64: host_api_offsets::OFF64_CMD_INSERT_IF_NEW,
+                    offset_32: host_api_offsets::OFF32_CMD_INSERT_IF_NEW,
+                    rust_host_offset: host_api_offsets::CMD_INSERT_IF_NEW,
                 },
                 FieldLayoutSpec {
                     c_name: "cmd_trigger_ex",
-                    offset_64: 344,
-                    offset_32: 176,
-                    rust_host_offset: offset_of!(BamHostApi, cmd_trigger_ex),
+                    offset_64: host_api_offsets::OFF64_CMD_TRIGGER_EX,
+                    offset_32: host_api_offsets::OFF32_CMD_TRIGGER_EX,
+                    rust_host_offset: host_api_offsets::CMD_TRIGGER_EX,
                 },
                 FieldLayoutSpec {
                     c_name: "cmd_observe",
-                    offset_64: 352,
-                    offset_32: 180,
-                    rust_host_offset: offset_of!(BamHostApi, cmd_observe),
+                    offset_64: host_api_offsets::OFF64_CMD_OBSERVE,
+                    offset_32: host_api_offsets::OFF32_CMD_OBSERVE,
+                    rust_host_offset: host_api_offsets::CMD_OBSERVE,
                 },
                 FieldLayoutSpec {
                     c_name: "iter_read_removed",
-                    offset_64: 360,
-                    offset_32: 184,
-                    rust_host_offset: offset_of!(BamHostApi, iter_read_removed),
+                    offset_64: host_api_offsets::OFF64_ITER_READ_REMOVED,
+                    offset_32: host_api_offsets::OFF32_ITER_READ_REMOVED,
+                    rust_host_offset: host_api_offsets::ITER_READ_REMOVED,
                 },
                 FieldLayoutSpec {
                     c_name: "sys_entity_children",
-                    offset_64: 368,
-                    offset_32: 188,
-                    rust_host_offset: offset_of!(BamHostApi, sys_entity_children),
+                    offset_64: host_api_offsets::OFF64_SYS_ENTITY_CHILDREN,
+                    offset_32: host_api_offsets::OFF32_SYS_ENTITY_CHILDREN,
+                    rust_host_offset: host_api_offsets::SYS_ENTITY_CHILDREN,
                 },
                 FieldLayoutSpec {
                     c_name: "asset_load",
-                    offset_64: 376,
-                    offset_32: 192,
-                    rust_host_offset: offset_of!(BamHostApi, asset_load),
+                    offset_64: host_api_offsets::OFF64_ASSET_LOAD,
+                    offset_32: host_api_offsets::OFF32_ASSET_LOAD,
+                    rust_host_offset: host_api_offsets::ASSET_LOAD,
                 },
                 FieldLayoutSpec {
                     c_name: "asset_get_load_state",
-                    offset_64: 384,
-                    offset_32: 196,
-                    rust_host_offset: offset_of!(BamHostApi, asset_get_load_state),
+                    offset_64: host_api_offsets::OFF64_ASSET_GET_LOAD_STATE,
+                    offset_32: host_api_offsets::OFF32_ASSET_GET_LOAD_STATE,
+                    rust_host_offset: host_api_offsets::ASSET_GET_LOAD_STATE,
                 },
                 FieldLayoutSpec {
                     c_name: "asset_release",
-                    offset_64: 392,
-                    offset_32: 200,
-                    rust_host_offset: offset_of!(BamHostApi, asset_release),
+                    offset_64: host_api_offsets::OFF64_ASSET_RELEASE,
+                    offset_32: host_api_offsets::OFF32_ASSET_RELEASE,
+                    rust_host_offset: host_api_offsets::ASSET_RELEASE,
                 },
                 FieldLayoutSpec {
                     c_name: "cmd_spawn_scene",
-                    offset_64: 400,
-                    offset_32: 204,
-                    rust_host_offset: offset_of!(BamHostApi, cmd_spawn_scene),
+                    offset_64: host_api_offsets::OFF64_CMD_SPAWN_SCENE,
+                    offset_32: host_api_offsets::OFF32_CMD_SPAWN_SCENE,
+                    rust_host_offset: host_api_offsets::CMD_SPAWN_SCENE,
                 },
                 FieldLayoutSpec {
                     c_name: "log_diagnostic",
-                    offset_64: 408,
-                    offset_32: 208,
-                    rust_host_offset: offset_of!(BamHostApi, log_diagnostic),
+                    offset_64: host_api_offsets::OFF64_LOG_DIAGNOSTIC,
+                    offset_32: host_api_offsets::OFF32_LOG_DIAGNOSTIC,
+                    rust_host_offset: host_api_offsets::LOG_DIAGNOSTIC,
                 },
                 FieldLayoutSpec {
                     c_name: "report_guest_fault",
-                    offset_64: 416,
-                    offset_32: 212,
-                    rust_host_offset: offset_of!(BamHostApi, report_guest_fault),
+                    offset_64: host_api_offsets::OFF64_REPORT_GUEST_FAULT,
+                    offset_32: host_api_offsets::OFF32_REPORT_GUEST_FAULT,
+                    rust_host_offset: host_api_offsets::REPORT_GUEST_FAULT,
                 },
                 FieldLayoutSpec {
                     c_name: "resolve_component_by_uuid",
-                    offset_64: 424,
-                    offset_32: 216,
-                    rust_host_offset: offset_of!(BamHostApi, resolve_component_by_uuid),
+                    offset_64: host_api_offsets::OFF64_RESOLVE_COMPONENT_BY_UUID,
+                    offset_32: host_api_offsets::OFF32_RESOLVE_COMPONENT_BY_UUID,
+                    rust_host_offset: host_api_offsets::RESOLVE_COMPONENT_BY_UUID,
                 },
                 FieldLayoutSpec {
                     c_name: "component_layout_info",
-                    offset_64: 432,
-                    offset_32: 220,
-                    rust_host_offset: offset_of!(BamHostApi, component_layout_info),
+                    offset_64: host_api_offsets::OFF64_COMPONENT_LAYOUT_INFO,
+                    offset_32: host_api_offsets::OFF32_COMPONENT_LAYOUT_INFO,
+                    rust_host_offset: host_api_offsets::COMPONENT_LAYOUT_INFO,
                 },
                 FieldLayoutSpec {
                     c_name: "register_relation",
-                    offset_64: 440,
-                    offset_32: 224,
-                    rust_host_offset: offset_of!(BamHostApi, register_relation),
+                    offset_64: host_api_offsets::OFF64_REGISTER_RELATION,
+                    offset_32: host_api_offsets::OFF32_REGISTER_RELATION,
+                    rust_host_offset: host_api_offsets::REGISTER_RELATION,
                 },
                 FieldLayoutSpec {
                     c_name: "intern_symbol",
-                    offset_64: 448,
-                    offset_32: 228,
-                    rust_host_offset: offset_of!(BamHostApi, intern_symbol),
+                    offset_64: host_api_offsets::OFF64_INTERN_SYMBOL,
+                    offset_32: host_api_offsets::OFF32_INTERN_SYMBOL,
+                    rust_host_offset: host_api_offsets::INTERN_SYMBOL,
                 },
                 FieldLayoutSpec {
                     c_name: "bind_named_object",
-                    offset_64: 456,
-                    offset_32: 232,
-                    rust_host_offset: offset_of!(BamHostApi, bind_named_object),
+                    offset_64: host_api_offsets::OFF64_BIND_NAMED_OBJECT,
+                    offset_32: host_api_offsets::OFF32_BIND_NAMED_OBJECT,
+                    rust_host_offset: host_api_offsets::BIND_NAMED_OBJECT,
                 },
                 FieldLayoutSpec {
                     c_name: "iter_count",
-                    offset_64: 464,
-                    offset_32: 236,
-                    rust_host_offset: offset_of!(BamHostApi, iter_count),
+                    offset_64: host_api_offsets::OFF64_ITER_COUNT,
+                    offset_32: host_api_offsets::OFF32_ITER_COUNT,
+                    rust_host_offset: host_api_offsets::ITER_COUNT,
                 },
                 FieldLayoutSpec {
                     c_name: "iter_up_cascade",
-                    offset_64: 472,
-                    offset_32: 240,
-                    rust_host_offset: offset_of!(BamHostApi, iter_up_cascade),
+                    offset_64: host_api_offsets::OFF64_ITER_UP_CASCADE,
+                    offset_32: host_api_offsets::OFF32_ITER_UP_CASCADE,
+                    rust_host_offset: host_api_offsets::ITER_UP_CASCADE,
                 },
                 FieldLayoutSpec {
                     c_name: "par_for_each_chunk_readonly",
-                    offset_64: 480,
-                    offset_32: 244,
-                    rust_host_offset: offset_of!(BamHostApi, par_for_each_chunk_readonly),
+                    offset_64: host_api_offsets::OFF64_PAR_FOR_EACH_CHUNK_READONLY,
+                    offset_32: host_api_offsets::OFF32_PAR_FOR_EACH_CHUNK_READONLY,
+                    rust_host_offset: host_api_offsets::PAR_FOR_EACH_CHUNK_READONLY,
                 },
                 FieldLayoutSpec {
                     c_name: "register_system_handle",
-                    offset_64: 488,
-                    offset_32: 248,
-                    rust_host_offset: offset_of!(BamHostApi, register_system_handle),
+                    offset_64: host_api_offsets::OFF64_REGISTER_SYSTEM_HANDLE,
+                    offset_32: host_api_offsets::OFF32_REGISTER_SYSTEM_HANDLE,
+                    rust_host_offset: host_api_offsets::REGISTER_SYSTEM_HANDLE,
                 },
                 FieldLayoutSpec {
                     c_name: "configure_schedule_set",
-                    offset_64: 496,
-                    offset_32: 252,
-                    rust_host_offset: offset_of!(BamHostApi, configure_schedule_set),
+                    offset_64: host_api_offsets::OFF64_CONFIGURE_SCHEDULE_SET,
+                    offset_32: host_api_offsets::OFF32_CONFIGURE_SCHEDULE_SET,
+                    rust_host_offset: host_api_offsets::CONFIGURE_SCHEDULE_SET,
                 },
                 FieldLayoutSpec {
                     c_name: "mount_system_in_schedule",
-                    offset_64: 504,
-                    offset_32: 256,
-                    rust_host_offset: offset_of!(BamHostApi, mount_system_in_schedule),
+                    offset_64: host_api_offsets::OFF64_MOUNT_SYSTEM_IN_SCHEDULE,
+                    offset_32: host_api_offsets::OFF32_MOUNT_SYSTEM_IN_SCHEDULE,
+                    rust_host_offset: host_api_offsets::MOUNT_SYSTEM_IN_SCHEDULE,
                 },
                 FieldLayoutSpec {
                     c_name: "cmd_checkpoint",
-                    offset_64: 512,
-                    offset_32: 260,
-                    rust_host_offset: offset_of!(BamHostApi, cmd_checkpoint),
+                    offset_64: host_api_offsets::OFF64_CMD_CHECKPOINT,
+                    offset_32: host_api_offsets::OFF32_CMD_CHECKPOINT,
+                    rust_host_offset: host_api_offsets::CMD_CHECKPOINT,
                 },
                 FieldLayoutSpec {
                     c_name: "cmd_rollback",
-                    offset_64: 520,
-                    offset_32: 264,
-                    rust_host_offset: offset_of!(BamHostApi, cmd_rollback),
+                    offset_64: host_api_offsets::OFF64_CMD_ROLLBACK,
+                    offset_32: host_api_offsets::OFF32_CMD_ROLLBACK,
+                    rust_host_offset: host_api_offsets::CMD_ROLLBACK,
                 },
                 FieldLayoutSpec {
                     c_name: "cmd_insert_relation",
-                    offset_64: 528,
-                    offset_32: 268,
-                    rust_host_offset: offset_of!(BamHostApi, cmd_insert_relation),
+                    offset_64: host_api_offsets::OFF64_CMD_INSERT_RELATION,
+                    offset_32: host_api_offsets::OFF32_CMD_INSERT_RELATION,
+                    rust_host_offset: host_api_offsets::CMD_INSERT_RELATION,
                 },
                 FieldLayoutSpec {
                     c_name: "cmd_remove_relation",
-                    offset_64: 536,
-                    offset_32: 272,
-                    rust_host_offset: offset_of!(BamHostApi, cmd_remove_relation),
+                    offset_64: host_api_offsets::OFF64_CMD_REMOVE_RELATION,
+                    offset_32: host_api_offsets::OFF32_CMD_REMOVE_RELATION,
+                    rust_host_offset: host_api_offsets::CMD_REMOVE_RELATION,
                 },
                 FieldLayoutSpec {
                     c_name: "migrate_component_column",
-                    offset_64: 544,
-                    offset_32: 276,
-                    rust_host_offset: offset_of!(BamHostApi, migrate_component_column),
+                    offset_64: host_api_offsets::OFF64_MIGRATE_COMPONENT_COLUMN,
+                    offset_32: host_api_offsets::OFF32_MIGRATE_COMPONENT_COLUMN,
+                    rust_host_offset: host_api_offsets::MIGRATE_COMPONENT_COLUMN,
                 },
             ],
         },
@@ -1754,6 +1754,11 @@ pub fn render_c99_header() -> Result<String, String> {
         .iter()
         .filter(|f| f.c_name != "struct_size" && f.c_name != "abi_version")
         .count();
+    if host_api_slot_count != BAM_HOST_API_SLOT_COUNT {
+        return Err(format!(
+            "BamHostApi slot count mismatch: layout spec has {host_api_slot_count}, expected {BAM_HOST_API_SLOT_COUNT}"
+        ));
+    }
 
     let mut out = String::with_capacity(48 * 1024);
 
@@ -1819,6 +1824,13 @@ pub fn render_c99_header() -> Result<String, String> {
          #  define BAM_UNUSED __attribute__((unused))\n\
          #else\n\
          #  define BAM_UNUSED\n\
+         #endif\n\n\
+         #if defined(_MSC_VER)\n\
+         #  define BAM_RESTRICT __restrict\n\
+         #elif !defined(__cplusplus) && defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L)\n\
+         #  define BAM_RESTRICT restrict\n\
+         #else\n\
+         #  define BAM_RESTRICT\n\
          #endif\n\n\
          #if defined(__cplusplus) && ((__cplusplus >= 201103L) || (defined(_MSVC_LANG) && _MSVC_LANG >= 201103L))\n\
          #  define BAM_ALIGNOF(type) alignof(type)\n\
@@ -3127,6 +3139,22 @@ pub fn write_or_check_header(root: &Path, check_only: bool) -> Result<(), String
     Ok(())
 }
 
+/// Returns the canonical ordered C field names for all 68 `BamHostApi` function-pointer slots.
+#[cfg(test)]
+pub(crate) fn host_api_slot_names() -> Vec<&'static str> {
+    let specs = wire_struct_specs();
+    let host_api = specs
+        .iter()
+        .find(|s| s.c_name == "BamHostApi")
+        .expect("BamHostApi spec must exist");
+    host_api
+        .fields
+        .iter()
+        .map(|f| f.c_name)
+        .filter(|&name| name != "struct_size" && name != "abi_version")
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3140,6 +3168,22 @@ mod tests {
         assert!(first.contains("#define BAM_HOST_API_SLOT_COUNT    68u"));
         assert!(first.contains("define BAM_EXPORT"));
         assert!(first.contains("__declspec(dllexport)"));
+        assert!(first.contains("#if defined(_MSC_VER)\n#  define BAM_RESTRICT __restrict\n"));
+        assert!(first.contains(
+            "#elif !defined(__cplusplus) && defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L)\n#  define BAM_RESTRICT restrict\n"
+        ));
+        assert!(first.contains("#else\n#  define BAM_RESTRICT\n#endif"));
+        let slots = host_api_slot_names();
+        assert_eq!(slots.len(), BAM_HOST_API_SLOT_COUNT);
+        for slot in &slots {
+            let upper = slot.to_ascii_uppercase();
+            let expected =
+                format!("#define BAM_HOST_API_OFFSET_{upper} offsetof(BamHostApi, {slot})");
+            assert!(
+                first.contains(&expected),
+                "generated C99 header missing macro: {expected}"
+            );
+        }
         assert!(first.contains(
             "#define BAM_HOST_API_OFFSET_LOG_DIAGNOSTIC offsetof(BamHostApi, log_diagnostic)"
         ));

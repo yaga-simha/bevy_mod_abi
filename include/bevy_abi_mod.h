@@ -63,6 +63,14 @@ extern "C" {
 #  define BAM_UNUSED
 #endif
 
+#if defined(_MSC_VER)
+#  define BAM_RESTRICT __restrict
+#elif !defined(__cplusplus) && defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L)
+#  define BAM_RESTRICT restrict
+#else
+#  define BAM_RESTRICT
+#endif
+
 #if defined(__cplusplus) && ((__cplusplus >= 201103L) || (defined(_MSVC_LANG) && _MSVC_LANG >= 201103L))
 #  define BAM_ALIGNOF(type) alignof(type)
 #elif defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
