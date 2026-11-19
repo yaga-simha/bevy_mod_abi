@@ -1,16 +1,10 @@
 [package]
 name = "example_10_bevy20_full_companion"
-version = "0.3.0"
-edition = "2024"
-rust-version = "1.95"
-license = "MIT OR Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 publish = false
-
-# Standalone workspace header for isolated branch verification prior to root workspace merge.
-# Integrator: remove this `[workspace]` block when adding `"examples/10_bevy20_full_companion"`
-# to root `Cargo.toml` `members` (and `"examples/10_bevy20_full_companion/guest_mod"` to `exclude`).
-[workspace]
-exclude = ["guest_mod"]
 
 [dependencies]
 bevy_abi_mod = { path = "../../crates/bevy_abi_mod", features = [

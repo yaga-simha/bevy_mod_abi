@@ -3284,6 +3284,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "example_10_bevy20_full_companion"
+version = "0.3.0"
+dependencies = [
+ "bevy_abi_mod",
+ "bevy_abi_mod_sys",
+ "bevy_app",
+ "bevy_asset",
+ "bevy_audio",
+ "bevy_camera",
+ "bevy_camera_controller",
+ "bevy_diagnostic",
+ "bevy_ecs",
+ "bevy_extract",
+ "bevy_feathers",
+ "bevy_input",
+ "bevy_light",
+ "bevy_material",
+ "bevy_math",
+ "bevy_pbr",
+ "bevy_picking",
+ "bevy_remote",
+ "bevy_render",
+ "bevy_shader",
+ "bevy_sprite",
+ "bevy_sprite_render",
+ "bevy_state",
+ "bevy_text",
+ "bevy_transform",
+ "bevy_ui",
+ "bevy_ui_widgets",
+ "serde_json",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
