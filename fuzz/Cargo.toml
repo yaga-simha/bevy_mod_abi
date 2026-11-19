@@ -23,6 +23,7 @@ bevy_abi_mod_manifest = { path = "../crates/bevy_abi_mod_manifest" }
 bevy_abi_mod_host_sys = { path = "../crates/bevy_abi_mod_host_sys", features = ["strict-ffi-checks", "signature-verification"] }
 bevy_abi_mod_host = { path = "../crates/bevy_abi_mod_host", features = ["strict-ffi-checks"] }
 bevy_ecs = { version = "0.20.1", default-features = false, features = ["std", "async_executor"] }
+semver = "1"
 
 [[bin]]
 name = "fuzz_read_extensible"
@@ -62,6 +63,20 @@ bench = false
 [[bin]]
 name = "fuzz_mod_manifest"
 path = "fuzz_targets/fuzz_mod_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_v03_relations"
+path = "fuzz_targets/fuzz_v03_relations.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_bampack_manifest"
+path = "fuzz_targets/fuzz_bampack_manifest.rs"
 test = false
 doc = false
 bench = false

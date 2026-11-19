@@ -107,6 +107,7 @@ dependencies = [
  "bevy_abi_mod_trust",
  "bevy_ecs",
  "libfuzzer-sys",
+ "semver",
 ]
 
 [[package]]
@@ -121,7 +122,6 @@ dependencies = [
  "bevy_ecs",
  "bevy_platform",
  "semver",
- "serde",
  "toml",
  "tracing",
 ]

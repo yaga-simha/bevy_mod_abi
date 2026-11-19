@@ -62,6 +62,14 @@ path = "tests/e2e/main.rs"
 name = "mod_budgets"
 path = "tests/mod_budgets.rs"
 
+[[test]]
+name = "schedule_shuffle_fuzz"
+path = "../../tests/schedule_shuffle_fuzz.rs"
+
+[[test]]
+name = "soak_10k_reloads"
+path = "../../tests/soak_10k_reloads.rs"
+
 [[bench]]
 name = "chunk_throughput"
 path = "benches/chunk_throughput.rs"
