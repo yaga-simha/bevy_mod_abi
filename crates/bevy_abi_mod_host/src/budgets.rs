@@ -19,7 +19,22 @@ use bevy_platform::collections::HashMap;
 use core::fmt;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+#[inline]
+fn lock_unpoison<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[inline]
+fn read_unpoison<T>(l: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(|e| e.into_inner())
+}
+
+#[inline]
+fn write_unpoison<T>(l: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Default sliding-window length (`32` system executions) used for `p50_us` / `p99_us` calculation.
 pub const DEFAULT_BUDGET_WINDOW_SIZE: usize = 32;
@@ -59,6 +74,51 @@ impl Default for ModBudgetLimits {
     }
 }
 
+macro_rules! impl_budget_limit_builders {
+    () => {
+        /// Sets the per-system `CommandArena` byte cap.
+        #[inline]
+        #[must_use]
+        pub const fn with_max_arena_bytes_per_system(mut self, bytes: Option<usize>) -> Self {
+            self.max_arena_bytes_per_system = bytes;
+            self
+        }
+
+        /// Sets the per-mod deferred entity spawn cap per frame.
+        #[inline]
+        #[must_use]
+        pub const fn with_max_spawns_per_frame(mut self, spawns: Option<usize>) -> Self {
+            self.max_spawns_per_frame = spawns;
+            self
+        }
+
+        /// Sets the sliding-window `p99` execution time ceiling in microseconds.
+        #[inline]
+        #[must_use]
+        pub const fn with_max_p99_system_micros(mut self, micros: Option<u64>) -> Self {
+            self.max_p99_system_micros = micros;
+            self
+        }
+
+        /// Sets the sliding-window sample count (clamped to `>= 1` at runtime).
+        #[inline]
+        #[must_use]
+        pub const fn with_window_size(mut self, window_size: usize) -> Self {
+            self.window_size = window_size;
+            self
+        }
+
+        /// Sets the consecutive over-budget evaluation threshold before auto-quarantine
+        /// (clamped to `>= 1` at runtime).
+        #[inline]
+        #[must_use]
+        pub const fn with_max_consecutive_breaches(mut self, breaches: u32) -> Self {
+            self.max_consecutive_breaches = breaches;
+            self
+        }
+    };
+}
+
 impl ModBudgetLimits {
     /// Returns an unlimited [`ModBudgetLimits`] profile (all caps `None`, default sliding window).
     #[inline]
@@ -72,46 +132,7 @@ impl ModBudgetLimits {
         }
     }
 
-    /// Sets the per-system `CommandArena` byte cap.
-    #[inline]
-    #[must_use]
-    pub const fn with_max_arena_bytes_per_system(mut self, bytes: Option<usize>) -> Self {
-        self.max_arena_bytes_per_system = bytes;
-        self
-    }
-
-    /// Sets the per-mod deferred entity spawn cap per frame.
-    #[inline]
-    #[must_use]
-    pub const fn with_max_spawns_per_frame(mut self, spawns: Option<usize>) -> Self {
-        self.max_spawns_per_frame = spawns;
-        self
-    }
-
-    /// Sets the sliding-window `p99` execution time ceiling in microseconds.
-    #[inline]
-    #[must_use]
-    pub const fn with_max_p99_system_micros(mut self, micros: Option<u64>) -> Self {
-        self.max_p99_system_micros = micros;
-        self
-    }
-
-    /// Sets the sliding-window sample count (clamped to `>= 1` at runtime).
-    #[inline]
-    #[must_use]
-    pub const fn with_window_size(mut self, window_size: usize) -> Self {
-        self.window_size = window_size;
-        self
-    }
-
-    /// Sets the consecutive over-budget evaluation threshold before auto-quarantine
-    /// (clamped to `>= 1` at runtime).
-    #[inline]
-    #[must_use]
-    pub const fn with_max_consecutive_breaches(mut self, breaches: u32) -> Self {
-        self.max_consecutive_breaches = breaches;
-        self
-    }
+    impl_budget_limit_builders!();
 
     /// Returns the effective sliding-window sample count (`>= 1`).
     #[inline]
@@ -198,45 +219,7 @@ impl ModBudgetPolicy {
         }
     }
 
-    /// Sets the default per-system `CommandArena` byte cap.
-    #[inline]
-    #[must_use]
-    pub const fn with_max_arena_bytes_per_system(mut self, bytes: Option<usize>) -> Self {
-        self.max_arena_bytes_per_system = bytes;
-        self
-    }
-
-    /// Sets the default per-mod deferred entity spawn cap per frame.
-    #[inline]
-    #[must_use]
-    pub const fn with_max_spawns_per_frame(mut self, spawns: Option<usize>) -> Self {
-        self.max_spawns_per_frame = spawns;
-        self
-    }
-
-    /// Sets the default sliding-window `p99` system duration ceiling in microseconds.
-    #[inline]
-    #[must_use]
-    pub const fn with_max_p99_system_micros(mut self, micros: Option<u64>) -> Self {
-        self.max_p99_system_micros = micros;
-        self
-    }
-
-    /// Sets the default sliding-window sample count.
-    #[inline]
-    #[must_use]
-    pub const fn with_window_size(mut self, window_size: usize) -> Self {
-        self.window_size = window_size;
-        self
-    }
-
-    /// Sets the default consecutive breach threshold before auto-quarantine.
-    #[inline]
-    #[must_use]
-    pub const fn with_max_consecutive_breaches(mut self, breaches: u32) -> Self {
-        self.max_consecutive_breaches = breaches;
-        self
-    }
+    impl_budget_limit_builders!();
 
     /// Attaches a per-[`ModId`] budget override.
     #[must_use]
@@ -385,6 +368,7 @@ struct SystemBudgetKey {
     system_name: Arc<str>,
 }
 
+#[derive(Default)]
 struct LatencyWindow {
     samples: Vec<u64>,
     scratch: Vec<u64>,
@@ -465,6 +449,7 @@ impl LatencyWindow {
     }
 }
 
+#[derive(Default)]
 struct SystemBudgetEntry {
     window: LatencyWindow,
     p50_us: u64,
@@ -487,20 +472,7 @@ impl SystemBudgetEntry {
     fn new(window_size: usize) -> Self {
         Self {
             window: LatencyWindow::new(window_size),
-            p50_us: 0,
-            p99_us: 0,
-            last_duration_us: 0,
-            matched_entities: 0,
-            matched_tables: 0,
-            skipped_summary_tick_tables: 0,
-            chunks_yielded: 0,
-            commands_queued: 0,
-            arena_bytes_peak: 0,
-            spawns_this_frame: 0,
-            spawns_last_frame: 0,
-            breach_count: 0,
-            consecutive_p99_breaches: 0,
-            quarantined: false,
+            ..Self::default()
         }
     }
 
@@ -545,14 +517,8 @@ impl BudgetRuntimeState {
         }
     }
 
-    fn sync_policy(&self, policy: &ModBudgetPolicy) {
-        let mut guard = self.policy.write().unwrap_or_else(|e| e.into_inner());
-        *guard = policy.clone();
-    }
-
     fn effective_limits(&self, mod_id: Option<ModId>, mod_name: &str) -> ModBudgetLimits {
-        let guard = self.policy.read().unwrap_or_else(|e| e.into_inner());
-        guard.effective_limits(mod_id, Some(mod_name))
+        read_unpoison(&self.policy).effective_limits(mod_id, Some(mod_name))
     }
 
     fn get_or_create_spawn_counter(
@@ -561,38 +527,21 @@ impl BudgetRuntimeState {
         mod_name: &str,
     ) -> Arc<AtomicUsize> {
         if let Some(id) = mod_id {
-            if let Some(existing) = self
-                .spawn_counters_by_mod
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&id)
-            {
+            if let Some(existing) = read_unpoison(&self.spawn_counters_by_mod).get(&id) {
                 return Arc::clone(existing);
             }
-            let mut guard = self
-                .spawn_counters_by_mod
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
             return Arc::clone(
-                guard
+                write_unpoison(&self.spawn_counters_by_mod)
                     .entry(id)
                     .or_insert_with(|| Arc::new(AtomicUsize::new(0))),
             );
         }
 
         // Borrow `&str` on read lookup so unscoped steady-state runs perform zero heap allocations.
-        if let Some(existing) = self
-            .spawn_counters_by_ns
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(mod_name)
-        {
+        if let Some(existing) = read_unpoison(&self.spawn_counters_by_ns).get(mod_name) {
             return Arc::clone(existing);
         }
-        let mut guard = self
-            .spawn_counters_by_ns
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut guard = write_unpoison(&self.spawn_counters_by_ns);
         if let Some(existing) = guard.get(mod_name) {
             return Arc::clone(existing);
         }
@@ -605,125 +554,32 @@ impl BudgetRuntimeState {
         if breaches.iter().all(Option::is_none) {
             return;
         }
-        let mut guard = self
-            .pending_breaches
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut guard = lock_unpoison(&self.pending_breaches);
         for breach in breaches.into_iter().flatten() {
             if guard.len() < MAX_PENDING_BREACHES {
                 guard.push(breach);
             }
         }
     }
+}
 
-    fn drain_pending_breaches(&self) -> Vec<ModBudgetBreach> {
-        let mut guard = self
-            .pending_breaches
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        core::mem::take(&mut *guard)
-    }
-
-    fn end_frame(&self, quarantine: Option<&ModQuarantine>) {
-        {
-            let mut systems = self.systems.lock().unwrap_or_else(|e| e.into_inner());
-            for (key, entry) in systems.iter_mut() {
-                entry.spawns_last_frame = entry.spawns_this_frame;
-                entry.spawns_this_frame = 0;
-                if entry.quarantined
-                    && let Some(q) = quarantine
-                    && let Some(mod_id) = key.mod_id
-                    && !q.is_quarantined(mod_id, &key.system_name)
-                {
-                    entry.quarantined = false;
-                    entry.window.clear();
-                    entry.consecutive_p99_breaches = 0;
-                }
-            }
-        }
-        {
-            let counters = self
-                .spawn_counters_by_mod
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            for counter in counters.values() {
-                counter.store(0, Ordering::Release);
-            }
-        }
-        {
-            let counters = self
-                .spawn_counters_by_ns
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            for counter in counters.values() {
-                counter.store(0, Ordering::Release);
-            }
-        }
-    }
-
-    fn cleanup_mod(&self, mod_id: ModId) {
-        self.spawn_counters_by_mod
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&mod_id);
-        self.systems
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|key, _| key.mod_id != Some(mod_id));
-    }
-
-    fn snapshots(&self) -> Vec<ModBudgetSnapshot> {
-        let guard = self.systems.lock().unwrap_or_else(|e| e.into_inner());
-        let mut out: Vec<ModBudgetSnapshot> = guard
-            .iter()
-            .map(|(key, entry)| entry.to_snapshot(key))
-            .collect();
-        out.sort_by(|a, b| {
-            a.mod_id
-                .cmp(&b.mod_id)
-                .then_with(|| a.mod_name.cmp(&b.mod_name))
-                .then_with(|| a.system_name.cmp(&b.system_name))
-        });
-        out
-    }
-
-    fn snapshot_for(&self, mod_id: Option<ModId>, system_name: &str) -> Option<ModBudgetSnapshot> {
-        let guard = self.systems.lock().unwrap_or_else(|e| e.into_inner());
-        guard
-            .iter()
-            .find(|(key, _)| key.mod_id == mod_id && key.system_name.as_ref() == system_name)
-            .map(|(key, entry)| entry.to_snapshot(key))
-    }
-
-    fn mod_snapshots(&self, mod_id: ModId) -> Vec<ModBudgetSnapshot> {
-        let guard = self.systems.lock().unwrap_or_else(|e| e.into_inner());
-        let mut out: Vec<ModBudgetSnapshot> = guard
-            .iter()
-            .filter(|(key, _)| key.mod_id == Some(mod_id))
-            .map(|(key, entry)| entry.to_snapshot(key))
-            .collect();
-        out.sort_by(|a, b| a.system_name.cmp(&b.system_name));
-        out
-    }
-
-    fn mod_spawns_last_frame(&self, mod_id: ModId) -> usize {
-        let guard = self.systems.lock().unwrap_or_else(|e| e.into_inner());
-        guard
-            .iter()
-            .filter(|(key, _)| key.mod_id == Some(mod_id))
-            .map(|(_, entry)| entry.spawns_last_frame)
-            .sum()
-    }
-
-    fn total_breach_count(&self) -> u64 {
-        let guard = self.systems.lock().unwrap_or_else(|e| e.into_inner());
-        guard
-            .values()
-            .fold(0u64, |acc, e| acc.saturating_add(e.breach_count))
-    }
-
-    fn system_count(&self) -> usize {
-        self.systems.lock().unwrap_or_else(|e| e.into_inner()).len()
+fn make_breach(
+    metrics: &GuestSystemRunMetrics,
+    kind: ModBudgetBreachKind,
+    observed: u64,
+    limit: u64,
+    count: u64,
+    quarantined: bool,
+) -> ModBudgetBreach {
+    ModBudgetBreach {
+        mod_id: metrics.mod_id,
+        mod_name: metrics.mod_name.to_string(),
+        system_name: metrics.system_name.to_string(),
+        kind,
+        observed,
+        limit,
+        count,
+        quarantined,
     }
 }
 
@@ -759,7 +615,7 @@ impl ModBudgetHook for BudgetRuntimeState {
         let mut action = BudgetWatchdogAction::default();
 
         {
-            let mut systems = self.systems.lock().unwrap_or_else(|e| e.into_inner());
+            let mut systems = lock_unpoison(&self.systems);
             let entry = systems
                 .entry(key)
                 .or_insert_with(|| SystemBudgetEntry::new(window_size));
@@ -803,16 +659,14 @@ impl ModBudgetHook for BudgetRuntimeState {
                     rejected_ops = metrics.arena_breaches,
                     "guest mod system exceeded max_arena_bytes_per_system budget"
                 );
-                pending[0] = Some(ModBudgetBreach {
-                    mod_id: metrics.mod_id,
-                    mod_name: metrics.mod_name.to_string(),
-                    system_name: metrics.system_name.to_string(),
-                    kind: ModBudgetBreachKind::ArenaBytesExceeded,
-                    observed: metrics.arena_bytes_used as u64,
-                    limit: limit_bytes,
-                    count: metrics.arena_breaches as u64,
-                    quarantined: false,
-                });
+                pending[0] = Some(make_breach(
+                    &metrics,
+                    ModBudgetBreachKind::ArenaBytesExceeded,
+                    metrics.arena_bytes_used as u64,
+                    limit_bytes,
+                    metrics.arena_breaches as u64,
+                    false,
+                ));
             }
 
             if metrics.spawn_breaches > 0 {
@@ -829,16 +683,14 @@ impl ModBudgetHook for BudgetRuntimeState {
                     rejected_ops = metrics.spawn_breaches,
                     "guest mod system exceeded max_spawns_per_frame budget"
                 );
-                pending[1] = Some(ModBudgetBreach {
-                    mod_id: metrics.mod_id,
-                    mod_name: metrics.mod_name.to_string(),
-                    system_name: metrics.system_name.to_string(),
-                    kind: ModBudgetBreachKind::SpawnsPerFrameExceeded,
-                    observed: entry.spawns_this_frame as u64,
-                    limit: limit_spawns,
-                    count: metrics.spawn_breaches as u64,
-                    quarantined: false,
-                });
+                pending[1] = Some(make_breach(
+                    &metrics,
+                    ModBudgetBreachKind::SpawnsPerFrameExceeded,
+                    entry.spawns_this_frame as u64,
+                    limit_spawns,
+                    metrics.spawn_breaches as u64,
+                    false,
+                ));
             }
 
             if let Some(limit_us) = limits.max_p99_system_micros {
@@ -852,16 +704,14 @@ impl ModBudgetHook for BudgetRuntimeState {
                             "guest system '{}' exceeded frame-time budget (p99={}us > limit={}us for {} consecutive runs)",
                             metrics.system_name, p99_us, limit_us, entry.consecutive_p99_breaches
                         );
-                        pending[2] = Some(ModBudgetBreach {
-                            mod_id: metrics.mod_id,
-                            mod_name: metrics.mod_name.to_string(),
-                            system_name: metrics.system_name.to_string(),
-                            kind: ModBudgetBreachKind::FrameTimeP99Exceeded,
-                            observed: p99_us,
-                            limit: limit_us,
-                            count: u64::from(entry.consecutive_p99_breaches),
-                            quarantined: true,
-                        });
+                        pending[2] = Some(make_breach(
+                            &metrics,
+                            ModBudgetBreachKind::FrameTimeP99Exceeded,
+                            p99_us,
+                            limit_us,
+                            u64::from(entry.consecutive_p99_breaches),
+                            true,
+                        ));
                         action = BudgetWatchdogAction {
                             quarantine: true,
                             reason: Some(reason),
@@ -896,25 +746,54 @@ impl ModBudgetTelemetry {
     }
 
     pub(crate) fn sync_policy(&self, policy: &ModBudgetPolicy) {
-        self.state.sync_policy(policy);
+        *write_unpoison(&self.state.policy) = policy.clone();
     }
 
     pub(crate) fn drain_pending_breaches(&self) -> Vec<ModBudgetBreach> {
-        self.state.drain_pending_breaches()
+        core::mem::take(&mut *lock_unpoison(&self.state.pending_breaches))
     }
 
     pub(crate) fn end_frame(&self, quarantine: Option<&ModQuarantine>) {
-        self.state.end_frame(quarantine);
+        for (key, entry) in lock_unpoison(&self.state.systems).iter_mut() {
+            entry.spawns_last_frame = entry.spawns_this_frame;
+            entry.spawns_this_frame = 0;
+            if entry.quarantined
+                && let Some(q) = quarantine
+                && let Some(mod_id) = key.mod_id
+                && !q.is_quarantined(mod_id, &key.system_name)
+            {
+                entry.quarantined = false;
+                entry.window.clear();
+                entry.consecutive_p99_breaches = 0;
+            }
+        }
+        for counter in read_unpoison(&self.state.spawn_counters_by_mod).values() {
+            counter.store(0, Ordering::Release);
+        }
+        for counter in read_unpoison(&self.state.spawn_counters_by_ns).values() {
+            counter.store(0, Ordering::Release);
+        }
     }
 
     pub(crate) fn cleanup_mod(&self, mod_id: ModId) {
-        self.state.cleanup_mod(mod_id);
+        write_unpoison(&self.state.spawn_counters_by_mod).remove(&mod_id);
+        lock_unpoison(&self.state.systems).retain(|key, _| key.mod_id != Some(mod_id));
     }
 
     /// Returns a deterministically sorted snapshot of every tracked guest system's budget and
     /// execution metrics.
     pub fn system_budget_snapshots(&self) -> Vec<ModBudgetSnapshot> {
-        self.state.snapshots()
+        let mut out: Vec<ModBudgetSnapshot> = lock_unpoison(&self.state.systems)
+            .iter()
+            .map(|(key, entry)| entry.to_snapshot(key))
+            .collect();
+        out.sort_by(|a, b| {
+            a.mod_id
+                .cmp(&b.mod_id)
+                .then_with(|| a.mod_name.cmp(&b.mod_name))
+                .then_with(|| a.system_name.cmp(&b.system_name))
+        });
+        out
     }
 
     /// Returns the latest [`ModBudgetSnapshot`] for `(mod_id, system_name)`, if recorded.
@@ -923,27 +802,42 @@ impl ModBudgetTelemetry {
         mod_id: Option<ModId>,
         system_name: &str,
     ) -> Option<ModBudgetSnapshot> {
-        self.state.snapshot_for(mod_id, system_name)
+        lock_unpoison(&self.state.systems)
+            .iter()
+            .find(|(key, _)| key.mod_id == mod_id && key.system_name.as_ref() == system_name)
+            .map(|(key, entry)| entry.to_snapshot(key))
     }
 
     /// Returns snapshots for all tracked guest systems belonging to `mod_id`.
     pub fn mod_snapshots(&self, mod_id: ModId) -> Vec<ModBudgetSnapshot> {
-        self.state.mod_snapshots(mod_id)
+        let mut out: Vec<ModBudgetSnapshot> = lock_unpoison(&self.state.systems)
+            .iter()
+            .filter(|(key, _)| key.mod_id == Some(mod_id))
+            .map(|(key, entry)| entry.to_snapshot(key))
+            .collect();
+        out.sort_by(|a, b| a.system_name.cmp(&b.system_name));
+        out
     }
 
     /// Returns the aggregate deferred entity spawns queued by `mod_id` in the most recent frame.
     pub fn mod_spawns_last_frame(&self, mod_id: ModId) -> usize {
-        self.state.mod_spawns_last_frame(mod_id)
+        lock_unpoison(&self.state.systems)
+            .iter()
+            .filter(|(key, _)| key.mod_id == Some(mod_id))
+            .map(|(_, entry)| entry.spawns_last_frame)
+            .sum()
     }
 
     /// Returns the cumulative count of budget breaches across all tracked guest systems.
     pub fn total_breach_count(&self) -> u64 {
-        self.state.total_breach_count()
+        lock_unpoison(&self.state.systems)
+            .values()
+            .fold(0u64, |acc, e| acc.saturating_add(e.breach_count))
     }
 
     /// Returns the number of tracked guest systems.
     pub fn len(&self) -> usize {
-        self.state.system_count()
+        lock_unpoison(&self.state.systems).len()
     }
 
     /// Returns `true` if no guest system executions have been recorded yet.
@@ -969,10 +863,11 @@ pub(crate) struct BudgetSystemsInstalled;
 /// Ensures [`ModBudgetPolicy`], [`ModBudgetRuntime`], [`ModBudgetTelemetry`], and
 /// `Messages<ModBudgetBreach>` exist and are synchronized inside `world`.
 pub(crate) fn ensure_budget_resources(world: &mut World) {
-    if !world.contains_resource::<ModBudgetPolicy>() {
-        world.insert_resource(ModBudgetPolicy::default());
-    }
-    let policy_snapshot = world.resource::<ModBudgetPolicy>().clone();
+    world.init_resource::<ModBudgetPolicy>();
+    let policy_snapshot = world
+        .get_resource::<ModBudgetPolicy>()
+        .cloned()
+        .unwrap_or_default();
 
     if !world.contains_resource::<ModBudgetTelemetry>()
         || !world.contains_resource::<ModBudgetRuntime>()
@@ -986,9 +881,7 @@ pub(crate) fn ensure_budget_resources(world: &mut World) {
         telemetry.sync_policy(&policy_snapshot);
     }
 
-    if !world.contains_resource::<Messages<ModBudgetBreach>>() {
-        world.init_resource::<Messages<ModBudgetBreach>>();
-    }
+    world.init_resource::<Messages<ModBudgetBreach>>();
 }
 
 /// Mod-unload cleanup hook removing stale per-`ModId` runtime counters and telemetry entries when
@@ -1045,6 +938,18 @@ pub trait ModBudgetExt {
     fn system_budget_snapshots(&self) -> Vec<ModBudgetSnapshot>;
 }
 
+fn update_policy_override(world: &mut World, mutate: impl FnOnce(&mut ModBudgetPolicy)) {
+    ensure_budget_resources(world);
+    let updated = world.get_resource_mut::<ModBudgetPolicy>().map(|mut p| {
+        mutate(&mut p);
+        p.clone()
+    });
+    if let (Some(updated), Some(telemetry)) = (updated, world.get_resource::<ModBudgetTelemetry>())
+    {
+        telemetry.sync_policy(&updated);
+    }
+}
+
 impl ModBudgetExt for World {
     fn set_mod_budget_policy(&mut self, policy: ModBudgetPolicy) -> &mut Self {
         ensure_budget_resources(self);
@@ -1056,15 +961,9 @@ impl ModBudgetExt for World {
     }
 
     fn set_mod_budget_override(&mut self, mod_id: ModId, limits: ModBudgetLimits) -> &mut Self {
-        ensure_budget_resources(self);
-        let updated = {
-            let mut policy = self.resource_mut::<ModBudgetPolicy>();
+        update_policy_override(self, |policy| {
             policy.set_mod_override(mod_id, limits);
-            policy.clone()
-        };
-        if let Some(telemetry) = self.get_resource::<ModBudgetTelemetry>() {
-            telemetry.sync_policy(&updated);
-        }
+        });
         self
     }
 
@@ -1073,15 +972,9 @@ impl ModBudgetExt for World {
         mod_name: impl Into<String>,
         limits: ModBudgetLimits,
     ) -> &mut Self {
-        ensure_budget_resources(self);
-        let updated = {
-            let mut policy = self.resource_mut::<ModBudgetPolicy>();
+        update_policy_override(self, |policy| {
             policy.set_mod_name_override(mod_name, limits);
-            policy.clone()
-        };
-        if let Some(telemetry) = self.get_resource::<ModBudgetTelemetry>() {
-            telemetry.sync_policy(&updated);
-        }
+        });
         self
     }
 
@@ -1123,92 +1016,5 @@ impl ModBudgetExt for App {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn latency_window_percentiles_and_resize_preserve_recent_samples() {
-        let mut w = LatencyWindow::new(4);
-        assert_eq!(w.compute_percentiles(), (0, 0));
-
-        assert_eq!(w.record_and_percentiles(100), (100, 100));
-        assert_eq!(w.record_and_percentiles(200), (100, 200));
-        assert_eq!(w.record_and_percentiles(300), (200, 300));
-        assert_eq!(w.record_and_percentiles(400), (200, 400));
-        // Overwrites oldest (100) -> chronological [200, 300, 400, 500]
-        assert_eq!(w.record_and_percentiles(500), (300, 500));
-
-        // Shrink window from 4 -> 2: retains two most recent samples [400, 500].
-        w.resize(2);
-        assert_eq!(w.compute_percentiles(), (400, 500));
-
-        // Grow window from 2 -> 5 and add 50 -> [400, 500, 50] sorted [50, 400, 500].
-        w.resize(5);
-        assert_eq!(w.record_and_percentiles(50), (400, 500));
-
-        // Zero-clamped window size still works cleanly.
-        w.resize(0);
-        assert_eq!(w.compute_percentiles(), (50, 50));
-    }
-
-    #[test]
-    fn policy_override_precedence_prefers_mod_id_then_name_then_defaults() {
-        let mut policy = ModBudgetPolicy::default()
-            .with_max_arena_bytes_per_system(Some(4096))
-            .with_max_spawns_per_frame(Some(100))
-            .with_max_p99_system_micros(Some(2000))
-            .with_window_size(16)
-            .with_max_consecutive_breaches(4)
-            .with_mod_name_override(
-                "alpha",
-                ModBudgetLimits::default().with_max_spawns_per_frame(Some(25)),
-            )
-            .with_mod_override(
-                ModId(7),
-                ModBudgetLimits::default().with_max_spawns_per_frame(Some(5)),
-            );
-
-        assert_eq!(
-            policy
-                .effective_limits(Some(ModId(7)), Some("alpha"))
-                .max_spawns_per_frame,
-            Some(5)
-        );
-        assert_eq!(
-            policy
-                .effective_limits(Some(ModId(8)), Some("alpha"))
-                .max_spawns_per_frame,
-            Some(25)
-        );
-        assert_eq!(
-            policy
-                .effective_limits(Some(ModId(8)), Some("beta"))
-                .max_spawns_per_frame,
-            Some(100)
-        );
-
-        assert!(policy.clear_mod_override(ModId(7)).is_some());
-        assert_eq!(
-            policy
-                .effective_limits(Some(ModId(7)), Some("alpha"))
-                .max_spawns_per_frame,
-            Some(25)
-        );
-        assert!(policy.clear_mod_name_override("alpha").is_some());
-        assert_eq!(
-            policy
-                .effective_limits(Some(ModId(7)), Some("alpha"))
-                .max_spawns_per_frame,
-            Some(100)
-        );
-    }
-
-    #[test]
-    fn budget_limits_zero_window_and_breaches_clamp_to_one() {
-        let lim = ModBudgetLimits::unlimited()
-            .with_window_size(0)
-            .with_max_consecutive_breaches(0);
-        assert_eq!(lim.effective_window_size(), 1);
-        assert_eq!(lim.effective_max_consecutive_breaches(), 1);
-    }
-}
+#[path = "../tests/unit/budgets_tests.rs"]
+mod tests;

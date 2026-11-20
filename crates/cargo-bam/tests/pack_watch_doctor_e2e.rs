@@ -419,6 +419,9 @@ fn e2e_new_build_sign_pack_verify_and_deterministic_packing() {
 #[test]
 fn e2e_pack_custom_assets_dir_and_rust_cdylib() {
     let tmp = TempDir::new().unwrap();
+    let guest_sdk = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("bevy_abi_mod_guest");
 
     cargo_bam::run_cli([
         "cargo-bam",
@@ -428,9 +431,16 @@ fn e2e_pack_custom_assets_dir_and_rust_cdylib() {
         "rust",
         "--dir",
         tmp.path().to_str().unwrap(),
+        "--guest-sdk-path",
+        guest_sdk.to_str().unwrap(),
     ])
     .unwrap();
     let proj = tmp.path().join("rust_pack_demo");
+
+    // Verify scaffolded template uses locked zero-boilerplate B3 API and compile it unmodified.
+    let scaffold_lib = fs::read_to_string(proj.join("src/lib.rs")).unwrap();
+    assert!(scaffold_lib.contains("GuestComponent"));
+    assert!(scaffold_lib.contains("query_typed"));
 
     let custom_assets = tmp.path().join("external_assets");
     fs::create_dir_all(custom_assets.join("shaders")).unwrap();
@@ -537,7 +547,7 @@ fn e2e_watch_programmatic_edit_rebuild_sign_and_atomic_stage() {
     // Modify `src/mod.c` with a different manifest version string so compiled binary bytes change
     let mod_c = proj.join("src/mod.c");
     let original_c = fs::read_to_string(&mod_c).unwrap();
-    let updated_c = original_c.replace("\"0.2.0\"", "\"0.2.1-hotreload\"");
+    let updated_c = original_c.replace("\"0.1.0\"", "\"0.1.1-hotreload\"");
     assert_ne!(original_c, updated_c);
     fs::write(&mod_c, updated_c).unwrap();
 

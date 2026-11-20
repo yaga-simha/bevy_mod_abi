@@ -1,101 +1,53 @@
 [package]
 name = "bevy_abi_mod"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-authors.workspace = true
-description = "Top-level Bevy host facade for zero-serialization, asymmetric C-ABI native modding (`ABI 0.3.0`)"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+authors = ["bevy_abi_mod authors"]
+description = "Deprecated compatibility shim re-exporting `bevy_mod_abi` (use `bevy_mod_abi` instead)"
 readme = "README.md"
-repository.workspace = true
-keywords.workspace = true
-categories.workspace = true
+repository = "https://github.com/yaga-simha/bevy_mod_abi"
+keywords = ["bevy", "ecs", "ffi", "modding", "plugin"]
+categories = ["game-development", "api-bindings"]
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+improper_ctypes_definitions = "deny"
+unreachable_pub = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+ptr_as_ptr = "warn"
+cast_ptr_alignment = "warn"
+transmute_ptr_to_ptr = "warn"
+needless_pass_by_ref_mut = "warn"
+redundant_clone = "warn"
+match_same_arms = "warn"
 
 [features]
-strict-ffi-checks = ["bevy_abi_mod_host/strict-ffi-checks"]
-diagnostics = ["bevy_abi_mod_host/diagnostics"]
-signature-verification = ["bevy_abi_mod_host/signature-verification"]
-bridge-std-types = [
-    "dep:bevy_abi_mod_bridges",
-    "bevy_abi_mod_bridges/bridge-std-types",
-]
-bridge-asset = [
-    "dep:bevy_abi_mod_bridges",
-    "bevy_abi_mod_bridges/bridge-asset",
-]
-bridge-state = [
-    "dep:bevy_abi_mod_bridges",
-    "bevy_abi_mod_bridges/bridge-state",
-]
-bridge-reflect = ["dep:bevy_abi_mod_reflect"]
-bridge-bsn = [
-    "dep:bevy_abi_mod_bridges",
-    "bevy_abi_mod_bridges/bridge-bsn",
-    "bridge-asset",
-]
-bridge-picking = [
-    "dep:bevy_abi_mod_bridges",
-    "bevy_abi_mod_bridges/bridge-picking",
-]
-bridge-audio = [
-    "dep:bevy_abi_mod_bridges",
-    "bevy_abi_mod_bridges/bridge-audio",
-    "bridge-asset",
-]
-bridge-light = [
-    "dep:bevy_abi_mod_bridges",
-    "bevy_abi_mod_bridges/bridge-light",
-]
-bridge-ui = [
-    "dep:bevy_abi_mod_bridges",
-    "bevy_abi_mod_bridges/bridge-ui",
-]
-bridge-feathers = [
-    "dep:bevy_abi_mod_bridges",
-    "bevy_abi_mod_bridges/bridge-feathers",
-    "bridge-ui",
-]
-bridge-camera-controller = [
-    "dep:bevy_abi_mod_bridges",
-    "bevy_abi_mod_bridges/bridge-camera-controller",
-]
-bridge-solari = [
-    "dep:bevy_abi_mod_bridges",
-    "bevy_abi_mod_bridges/bridge-solari",
-]
-sub-app-extract = [
-    "dep:bevy_abi_mod_render",
-    "bridge-asset",
-]
-hot-reload-watcher = ["dep:bevy_abi_mod_watcher"]
+strict-ffi-checks = ["bevy_mod_abi/strict-ffi-checks"]
+diagnostics = ["bevy_mod_abi/diagnostics"]
+signature-verification = ["bevy_mod_abi/signature-verification"]
+hot-reload-watcher = ["bevy_mod_abi/hot-reload-watcher"]
+bridge-std-types = ["bevy_mod_abi/bridge-std-types"]
+bridge-asset = ["bevy_mod_abi/bridge-asset"]
+bridge-state = ["bevy_mod_abi/bridge-state"]
+bridge-reflect = ["bevy_mod_abi/bridge-reflect"]
+bridge-bsn = ["bevy_mod_abi/bridge-bsn"]
+sub-app-extract = ["bevy_mod_abi/sub-app-extract"]
+bridge-picking = ["bevy_mod_abi/bridge-picking"]
+bridge-audio = ["bevy_mod_abi/bridge-audio"]
+bridge-camera-2d = ["bevy_mod_abi/bridge-camera-2d"]
+bridge-light = ["bevy_mod_abi/bridge-light"]
+bridge-ui = ["bevy_mod_abi/bridge-ui"]
+bridge-feathers = ["bevy_mod_abi/bridge-feathers"]
+bridge-camera-controller = ["bevy_mod_abi/bridge-camera-controller"]
+bridge-solari = ["bevy_mod_abi/bridge-solari"]
+preset-2d = ["bevy_mod_abi/preset-2d"]
+preset-3d = ["bevy_mod_abi/preset-3d"]
+preset-ui = ["bevy_mod_abi/preset-ui"]
+preset-full = ["bevy_mod_abi/preset-full"]
 
 [dependencies]
-bevy_abi_mod_sys = { workspace = true }
-bevy_abi_mod_host = { workspace = true }
-bevy_abi_mod_macros = { workspace = true }
-bevy_abi_mod_bridges = { workspace = true, optional = true }
-bevy_abi_mod_render = { workspace = true, optional = true }
-bevy_abi_mod_reflect = { workspace = true, optional = true }
-bevy_abi_mod_watcher = { workspace = true, optional = true }
-
-[dev-dependencies]
-bevy_app = { workspace = true }
-bevy_asset = { workspace = true }
-bevy_camera = { workspace = true }
-bevy_ecs = { workspace = true }
-bevy_input = { workspace = true }
-bevy_reflect = { workspace = true }
-bevy_remote = { workspace = true }
-bevy_scene = { workspace = true }
-bevy_state = { workspace = true }
-bevy_time = { workspace = true }
-bevy_transform = { workspace = true }
-serde_json = { workspace = true }
-
-[[test]]
-name = "bridges_integration"
-path = "tests/bridges_integration.rs"
-required-features = ["bridge-std-types", "bridge-asset", "bridge-state"]
+bevy_mod_abi = { version = "0.3.0", path = "../bevy_mod_abi", default-features = false }

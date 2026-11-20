@@ -1,10 +1,10 @@
 #![forbid(unsafe_code)]
 //! Shared `#[repr(C)]` `ModComponent` types and Zig build helper for Example 08 (Zig Guest Mod).
 
-use bevy_abi_mod::prelude::*;
 use bevy_abi_mod_sys::{FfiBool, FfiOption, ModComponent as ModComponentTrait};
 use bevy_ecs::component::Component;
 use bevy_ecs::resource::Resource;
+use bevy_mod_abi::prelude::*;
 use std::path::PathBuf;
 use std::process::Command;
 

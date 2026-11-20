@@ -19,7 +19,9 @@ use bevy_app::App;
 use bevy_ecs::component::Component;
 use bevy_ecs::entity::Entity;
 use bevy_ecs::name::Name;
+use bevy_ecs::reflect::ReflectComponent;
 use bevy_ecs::world::World;
+use bevy_reflect::prelude::ReflectDefault;
 use core::ffi::CStr;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::collections::HashMap;
@@ -815,4 +817,396 @@ fn witness_non_pod_component_migration_and_file_roundtrip() {
     assert_eq!(profile.loot_ids, vec![7, 14, 21]);
     assert_eq!(profile.guild_id, FfiOption::some(88));
     assert_eq!(profile.prestige_rank, 77);
+}
+
+#[derive(bevy_asset::Asset, bevy_reflect::Reflect, Clone, Debug, PartialEq)]
+struct ModTextureAsset {
+    label: String,
+}
+
+#[derive(bevy_asset::Asset, bevy_reflect::Reflect, Clone, Debug, PartialEq)]
+struct ModAudioAsset {
+    clip: String,
+}
+
+#[derive(Default, bevy_reflect::TypePath)]
+struct ModTextureLoader;
+
+impl bevy_asset::AssetLoader for ModTextureLoader {
+    type Asset = ModTextureAsset;
+    type Settings = ();
+    type Error = std::io::Error;
+
+    async fn load(
+        &self,
+        reader: &mut dyn bevy_asset::io::Reader,
+        _settings: &Self::Settings,
+        _load_context: &mut bevy_asset::LoadContext<'_>,
+    ) -> Result<Self::Asset, Self::Error> {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await?;
+        let label = String::from_utf8(bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(ModTextureAsset { label })
+    }
+
+    fn extensions(&self) -> &[&str] {
+        &["mtex"]
+    }
+}
+
+#[derive(Default, bevy_reflect::TypePath)]
+struct ModAudioLoader;
+
+impl bevy_asset::AssetLoader for ModAudioLoader {
+    type Asset = ModAudioAsset;
+    type Settings = ();
+    type Error = std::io::Error;
+
+    async fn load(
+        &self,
+        reader: &mut dyn bevy_asset::io::Reader,
+        _settings: &Self::Settings,
+        _load_context: &mut bevy_asset::LoadContext<'_>,
+    ) -> Result<Self::Asset, Self::Error> {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await?;
+        let clip = String::from_utf8(bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(ModAudioAsset { clip })
+    }
+
+    fn extensions(&self) -> &[&str] {
+        &["maud"]
+    }
+}
+
+#[derive(Component, bevy_reflect::Reflect, Clone, Debug, PartialEq)]
+#[reflect(Component, Default)]
+struct ModAssetBundle {
+    texture: bevy_asset::Handle<ModTextureAsset>,
+    audio: bevy_asset::Handle<ModAudioAsset>,
+    untyped_audio: bevy_asset::UntypedHandle,
+    constant_tex: bevy_asset::Handle<ModTextureAsset>,
+    tag: String,
+}
+
+impl Default for ModAssetBundle {
+    fn default() -> Self {
+        Self {
+            texture: bevy_asset::Handle::default(),
+            audio: bevy_asset::Handle::default(),
+            untyped_audio: bevy_asset::Handle::<ModAudioAsset>::default().untyped(),
+            constant_tex: bevy_asset::Handle::default(),
+            tag: String::new(),
+        }
+    }
+}
+
+impl bevy_abi_mod_sys::ModComponent for ModAssetBundle {
+    const CANONICAL_NAME: &'static str = "game::ModAssetBundle";
+    const COMPONENT_CSTR: &'static CStr = c"game::ModAssetBundle";
+    const UUID: ComponentUuid = ComponentUuid::from_namespaced(
+        "game::ModAssetBundle",
+        core::mem::size_of::<Self>(),
+        core::mem::align_of::<Self>(),
+        0,
+    );
+    type VTable = ();
+    fn vtable() -> &'static Self::VTable {
+        &()
+    }
+    fn symbols() -> &'static [bevy_abi_mod_sys::SymbolEntry] {
+        &[]
+    }
+}
+
+fn setup_mod_asset_save_app(dir: &bevy_asset::io::memory::Dir) -> App {
+    use bevy_abi_mod_reflect::reflect::{ModReflectAppExt, ModReflectPlugin};
+    use bevy_asset::io::AssetSourceBuilder;
+    use bevy_asset::io::memory::MemoryAssetReader;
+    use bevy_asset::{AssetApp, AssetMetaCheck, AssetPlugin};
+
+    let mut app = App::new();
+    let mod_dir = dir.clone();
+    app.register_asset_source(
+        "mod",
+        AssetSourceBuilder::new(move || {
+            Box::new(MemoryAssetReader {
+                root: mod_dir.clone(),
+            })
+        }),
+    );
+    app.add_plugins((
+        bevy_app::TaskPoolPlugin::default(),
+        AssetPlugin {
+            meta_check: AssetMetaCheck::Never,
+            ..Default::default()
+        },
+        AbiModPlugin,
+        ModReflectPlugin,
+        ModSaveGamePlugin::new(),
+    ));
+    app.init_asset::<ModTextureAsset>()
+        .init_asset::<ModAudioAsset>()
+        .register_asset_reflect::<ModTextureAsset>()
+        .register_asset_reflect::<ModAudioAsset>()
+        .init_asset_loader::<ModTextureLoader>()
+        .init_asset_loader::<ModAudioLoader>();
+    app.register_reflected_component::<ModAssetBundle>(ComponentOptions::new().with_default())
+        .unwrap();
+    app
+}
+
+fn pump_until_loaded(app: &mut App, check: impl Fn(&bevy_asset::AssetServer) -> bool) {
+    for _ in 0..200 {
+        app.update();
+        let server = app.world().resource::<bevy_asset::AssetServer>();
+        if check(server) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("timed out waiting for mod assets to finish loading");
+}
+
+#[test]
+fn reflected_asset_handles_roundtrip_across_save_and_load_with_mod_paths() {
+    use bevy_abi_mod_reflect::savegame::SavedComponentPayload;
+    use bevy_asset::{AssetPath, AssetServer, Assets, Handle, LoadedUntypedAsset};
+
+    let dir = bevy_asset::io::memory::Dir::default();
+    dir.insert_asset_text(
+        std::path::Path::new("hero_mod/textures/hero.mtex"),
+        "hero_albedo_v1",
+    );
+    dir.insert_asset_text(
+        std::path::Path::new("hero_mod/audio/swing.maud"),
+        "sword_whoosh_v1",
+    );
+    dir.insert_asset_text(
+        std::path::Path::new("hero_mod/audio/theme.maud"),
+        "paladin_theme_v1",
+    );
+
+    let const_uuid = bevy_asset::uuid::Uuid::from_u128(0xdead_beef_cafe_1234_5678_9abc_def0_0001);
+
+    // World 1: load `mod://...` handles + constant UUID handle, then save archive.
+    let mut save_app = setup_mod_asset_save_app(&dir);
+    let server_1 = save_app.world().resource::<AssetServer>().clone();
+    let tex_handle: Handle<ModTextureAsset> = server_1.load("mod://hero_mod/textures/hero.mtex");
+    let audio_handle: Handle<ModAudioAsset> = server_1.load("mod://hero_mod/audio/swing.maud");
+    let untyped_loader = server_1
+        .load_builder()
+        .load_untyped("mod://hero_mod/audio/theme.maud");
+    pump_until_loaded(&mut save_app, |s| {
+        s.is_loaded(&tex_handle) && s.is_loaded(&audio_handle) && s.is_loaded(&untyped_loader)
+    });
+    let untyped_audio = save_app
+        .world()
+        .resource::<Assets<LoadedUntypedAsset>>()
+        .get(&untyped_loader)
+        .unwrap()
+        .handle
+        .clone();
+
+    let src_entity = save_app
+        .world_mut()
+        .spawn((
+            Name::new("paladin"),
+            ModAssetBundle {
+                texture: tex_handle,
+                audio: audio_handle,
+                untyped_audio,
+                constant_tex: Handle::from(const_uuid),
+                tag: "paladin_kit".to_owned(),
+            },
+        ))
+        .id();
+
+    let archive = save_app.save_mod_archive().unwrap();
+    assert_eq!(archive.component_headers.len(), 1);
+    assert_eq!(
+        archive.component_headers[0].format,
+        SavedComponentFormat::ReflectedJson
+    );
+
+    // Verify saved ReflectedJson is unwrapped (TypedReflectSerializer, NOT outer-type-wrapped)
+    // and encodes stable `mod://` asset paths via `HandleSerializeProcessor`.
+    let saved_payload = &archive.entities[0].components[0].payload;
+    let SavedComponentPayload::JsonValue(json_val) = saved_payload else {
+        panic!("expected ReflectedJson payload, got {saved_payload:?}");
+    };
+    assert_eq!(json_val["tag"], "paladin_kit");
+    assert_eq!(
+        json_val["texture"]["Path"],
+        "mod://hero_mod/textures/hero.mtex"
+    );
+    assert_eq!(json_val["audio"]["Path"], "mod://hero_mod/audio/swing.maud");
+    assert_eq!(
+        json_val["untyped_audio"]["reference"]["Path"],
+        "mod://hero_mod/audio/theme.maud"
+    );
+
+    // Verify both JSON and binary archive wire round-trips preserve handle metadata verbatim.
+    let json_roundtrip = ModSaveArchive::from_json_str(&archive.to_json_string().unwrap()).unwrap();
+    let bin_roundtrip =
+        ModSaveArchive::from_binary_bytes(&archive.to_binary_bytes().unwrap()).unwrap();
+    assert_eq!(json_roundtrip, archive);
+    assert_eq!(bin_roundtrip, archive);
+
+    // World 2: brand-new App & AssetServer restores the archive and re-loads all `mod://` assets.
+    let mut load_app = setup_mod_asset_save_app(&dir);
+    let report = load_app
+        .load_mod_archive(&bin_roundtrip, ModSaveLoadPolicy::StrictRequireMods)
+        .unwrap();
+    assert_eq!(report.restored_entities, 1);
+    assert_eq!(report.restored_components, 1);
+    let restored_e = report.entity_map[&src_entity.to_bits()];
+    let restored = load_app
+        .world()
+        .get::<ModAssetBundle>(restored_e)
+        .unwrap()
+        .clone();
+
+    assert_eq!(restored.tag, "paladin_kit");
+    assert_eq!(restored.constant_tex, Handle::from(const_uuid));
+    assert_eq!(
+        restored.texture.path(),
+        Some(&AssetPath::parse("mod://hero_mod/textures/hero.mtex"))
+    );
+    assert_eq!(
+        restored.audio.path(),
+        Some(&AssetPath::parse("mod://hero_mod/audio/swing.maud"))
+    );
+    assert_eq!(
+        restored.untyped_audio.path(),
+        Some(&AssetPath::parse("mod://hero_mod/audio/theme.maud"))
+    );
+
+    pump_until_loaded(&mut load_app, |s| {
+        s.is_loaded(&restored.texture)
+            && s.is_loaded(&restored.audio)
+            && s.is_loaded(&restored.untyped_audio)
+    });
+    assert_eq!(
+        load_app
+            .world()
+            .resource::<Assets<ModTextureAsset>>()
+            .get(&restored.texture)
+            .unwrap()
+            .label,
+        "hero_albedo_v1"
+    );
+    assert_eq!(
+        load_app
+            .world()
+            .resource::<Assets<ModAudioAsset>>()
+            .get(&restored.audio)
+            .unwrap()
+            .clip,
+        "sword_whoosh_v1"
+    );
+    assert_eq!(
+        load_app
+            .world()
+            .resource::<Assets<ModAudioAsset>>()
+            .get(&restored.untyped_audio.try_typed::<ModAudioAsset>().unwrap())
+            .unwrap()
+            .clip,
+        "paladin_theme_v1"
+    );
+}
+
+#[test]
+fn ephemeral_handle_behavior_and_headless_asset_server_error_handling() {
+    use bevy_abi_mod_reflect::reflect::{ModReflectAppExt, ModReflectPlugin};
+    use bevy_abi_mod_reflect::savegame::EphemeralHandleBehavior;
+    use bevy_asset::{AssetApp, Assets, Handle};
+
+    let dir = bevy_asset::io::memory::Dir::default();
+    dir.insert_asset_text(
+        std::path::Path::new("hero_mod/textures/hero.mtex"),
+        "hero_albedo_v1",
+    );
+    let mut app = setup_mod_asset_save_app(&dir);
+
+    let ephemeral_tex = app
+        .world_mut()
+        .resource_mut::<Assets<ModTextureAsset>>()
+        .add(ModTextureAsset {
+            label: "runtime_procedural".to_owned(),
+        });
+    let const_uuid = bevy_asset::uuid::Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888);
+    let e = app
+        .world_mut()
+        .spawn(ModAssetBundle {
+            texture: ephemeral_tex,
+            audio: Handle::default(),
+            untyped_audio: Handle::<ModAudioAsset>::default().untyped(),
+            constant_tex: Handle::from(const_uuid),
+            tag: "ephemeral_case".to_owned(),
+        })
+        .id();
+
+    // 1. `EphemeralHandleBehavior::Error` fails cleanly with `ModSaveLoadError::Serialization`.
+    let strict_opts = ModSaveOptions {
+        ephemeral_handle_behavior: EphemeralHandleBehavior::Error,
+        ..ModSaveOptions::default()
+    };
+    let err = app.save_mod_archive_with(&strict_opts).unwrap_err();
+    assert!(matches!(err, ModSaveLoadError::Serialization(_)));
+
+    // 2. `EphemeralHandleBehavior::Silent` serializes ephemeral handles as default UUID and
+    //    restores cleanly even into a headless world with NO `AssetServer`.
+    let silent_opts = ModSaveOptions {
+        ephemeral_handle_behavior: EphemeralHandleBehavior::Silent,
+        ..ModSaveOptions::default()
+    };
+    let silent_archive = app.save_mod_archive_with(&silent_opts).unwrap();
+
+    let mut headless = App::new();
+    headless.add_plugins((AbiModPlugin, ModReflectPlugin, ModSaveGamePlugin::new()));
+    headless
+        .register_asset_reflect::<ModTextureAsset>()
+        .register_asset_reflect::<ModAudioAsset>();
+    headless
+        .register_reflected_component::<ModAssetBundle>(ComponentOptions::new().with_default())
+        .unwrap();
+
+    let report = headless
+        .load_mod_archive(&silent_archive, ModSaveLoadPolicy::StrictRequireMods)
+        .unwrap();
+    let restored = headless
+        .world()
+        .get::<ModAssetBundle>(report.entity_map[&e.to_bits()])
+        .unwrap();
+    assert_eq!(restored.texture, Handle::default());
+    assert_eq!(restored.constant_tex, Handle::from(const_uuid));
+    assert_eq!(restored.tag, "ephemeral_case");
+
+    // 3. Loading a path-backed `mod://` handle into a headless world WITHOUT `AssetServer`
+    //    returns a typed `ModSaveLoadError::Serialization` instead of panicking.
+    let path_tex: Handle<ModTextureAsset> = app
+        .world()
+        .resource::<bevy_asset::AssetServer>()
+        .load("mod://hero_mod/textures/hero.mtex");
+    app.world_mut()
+        .get_mut::<ModAssetBundle>(e)
+        .unwrap()
+        .texture = path_tex;
+    let path_archive = app.save_mod_archive_with(&silent_opts).unwrap();
+
+    let missing_server_err = headless
+        .load_mod_archive(&path_archive, ModSaveLoadPolicy::StrictRequireMods)
+        .unwrap_err();
+    match missing_server_err {
+        ModSaveLoadError::Serialization(msg) => {
+            assert!(
+                msg.contains("AssetServer"),
+                "expected AssetServer diagnostic, got: {msg}"
+            );
+        }
+        other => panic!("expected Serialization error without AssetServer, got {other:?}"),
+    }
 }

@@ -1045,3 +1045,64 @@ fn diagnostics_publishes_budget_breaches_p99_spawns_and_arena_peak() {
         Some(128.0)
     );
 }
+
+#[test]
+fn policy_override_precedence_prefers_mod_id_then_name_then_defaults() {
+    let mut policy = ModBudgetPolicy::default()
+        .with_max_arena_bytes_per_system(Some(4096))
+        .with_max_spawns_per_frame(Some(100))
+        .with_max_p99_system_micros(Some(2000))
+        .with_window_size(16)
+        .with_max_consecutive_breaches(4)
+        .with_mod_name_override(
+            "alpha",
+            ModBudgetLimits::default().with_max_spawns_per_frame(Some(25)),
+        )
+        .with_mod_override(
+            ModId(7),
+            ModBudgetLimits::default().with_max_spawns_per_frame(Some(5)),
+        );
+
+    assert_eq!(
+        policy
+            .effective_limits(Some(ModId(7)), Some("alpha"))
+            .max_spawns_per_frame,
+        Some(5)
+    );
+    assert_eq!(
+        policy
+            .effective_limits(Some(ModId(8)), Some("alpha"))
+            .max_spawns_per_frame,
+        Some(25)
+    );
+    assert_eq!(
+        policy
+            .effective_limits(Some(ModId(8)), Some("beta"))
+            .max_spawns_per_frame,
+        Some(100)
+    );
+
+    assert!(policy.clear_mod_override(ModId(7)).is_some());
+    assert_eq!(
+        policy
+            .effective_limits(Some(ModId(7)), Some("alpha"))
+            .max_spawns_per_frame,
+        Some(25)
+    );
+    assert!(policy.clear_mod_name_override("alpha").is_some());
+    assert_eq!(
+        policy
+            .effective_limits(Some(ModId(7)), Some("alpha"))
+            .max_spawns_per_frame,
+        Some(100)
+    );
+}
+
+#[test]
+fn budget_limits_zero_window_and_breaches_clamp_to_one() {
+    let lim = ModBudgetLimits::unlimited()
+        .with_window_size(0)
+        .with_max_consecutive_breaches(0);
+    assert_eq!(lim.effective_window_size(), 1);
+    assert_eq!(lim.effective_max_consecutive_breaches(), 1);
+}

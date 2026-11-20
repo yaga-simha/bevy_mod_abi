@@ -154,64 +154,79 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
     let canonical_name_expr = state.canonical_name.as_str_expr();
     let canonical_cstr_bytes_expr = state.canonical_name.as_nul_bytes_expr();
 
-    let uuid_expr = match state.custom_uuid.as_deref() {
-        Some(hex_str) => {
-            quote! { #sys_crate::ComponentUuid::parse_hex(#hex_str) }
-        }
-        None if state.decl_enum.is_some() => {
-            let enum_info = state.decl_enum.as_ref().expect("checked Some");
-            let tag_str = enum_info.int_repr.rust_ty_str();
-            let mut schema_expr = quote! {
-                #sys_crate::ComponentUuid::hash_field_schema(0u64, "__enum_tag", #tag_str, 0usize)
+    let pod_schema_hash_expr = if is_abi_pod {
+        let mut schema_expr = quote! { 0u64 };
+        for (field_name, field_tag, member_toks) in &state.schema_fields {
+            schema_expr = quote! {
+                #sys_crate::ComponentUuid::hash_field_schema(
+                    #schema_expr,
+                    #field_name,
+                    #field_tag,
+                    ::core::mem::offset_of!(#struct_ident, #member_toks),
+                )
             };
-            for var in &enum_info.variants {
-                let v_name = &var.name;
-                let v_tag = format!("variant:{}", var.discriminant);
-                schema_expr = quote! {
-                    #sys_crate::ComponentUuid::hash_field_schema(#schema_expr, #v_name, #v_tag, 0usize)
-                };
-                for (f_idx, (f_name, f_tag)) in var.schema_fields.iter().enumerate() {
-                    let f_key = format!("{v_name}::{f_name}");
-                    schema_expr = quote! {
-                        #sys_crate::ComponentUuid::hash_field_schema(#schema_expr, #f_key, #f_tag, #f_idx)
-                    };
-                }
-            }
-            quote! {
-                #sys_crate::ComponentUuid::from_parts(
-                    Self::CANONICAL_NAME,
-                    ::core::mem::size_of::<#struct_ident>(),
-                    ::core::mem::align_of::<#struct_ident>(),
-                    #schema_expr,
-                )
-            }
         }
-        None if is_abi_pod => {
-            let mut schema_expr = quote! { 0u64 };
-            for (field_name, field_tag, member_toks) in &state.schema_fields {
+        schema_expr
+    } else {
+        quote! { 0u64 }
+    };
+
+    let uuid_expr = if let Some(hex_str) = state.custom_uuid.as_deref() {
+        quote! { #sys_crate::ComponentUuid::parse_hex(#hex_str) }
+    } else if let Some(ref enum_info) = state.decl_enum {
+        let tag_str = enum_info.int_repr.rust_ty_str();
+        let mut schema_expr = quote! {
+            #sys_crate::ComponentUuid::hash_field_schema(0u64, "__enum_tag", #tag_str, 0usize)
+        };
+        for var in &enum_info.variants {
+            let v_name = &var.name;
+            let v_tag = format!("variant:{}", var.discriminant);
+            schema_expr = quote! {
+                #sys_crate::ComponentUuid::hash_field_schema(#schema_expr, #v_name, #v_tag, 0usize)
+            };
+            for (f_idx, (f_name, f_tag)) in var.schema_fields.iter().enumerate() {
+                let f_key = format!("{v_name}::{f_name}");
                 schema_expr = quote! {
-                    #sys_crate::ComponentUuid::hash_field_schema(
-                        #schema_expr,
-                        #field_name,
-                        #field_tag,
-                        ::core::mem::offset_of!(#struct_ident, #member_toks),
-                    )
+                    #sys_crate::ComponentUuid::hash_field_schema(#schema_expr, #f_key, #f_tag, #f_idx)
                 };
             }
-            quote! {
-                #sys_crate::ComponentUuid::from_parts(
-                    Self::CANONICAL_NAME,
-                    ::core::mem::size_of::<#struct_ident>(),
-                    ::core::mem::align_of::<#struct_ident>(),
-                    #schema_expr,
-                )
+        }
+        quote! {
+            #sys_crate::ComponentUuid::from_parts(
+                Self::CANONICAL_NAME,
+                ::core::mem::size_of::<#struct_ident>(),
+                ::core::mem::align_of::<#struct_ident>(),
+                #schema_expr,
+            )
+        }
+    } else if is_abi_pod {
+        quote! {
+            #sys_crate::ComponentUuid::from_parts(
+                Self::CANONICAL_NAME,
+                ::core::mem::size_of::<#struct_ident>(),
+                ::core::mem::align_of::<#struct_ident>(),
+                #pod_schema_hash_expr,
+            )
+        }
+    } else {
+        quote! {
+            #sys_crate::ComponentUuid::from_canonical_name(Self::CANONICAL_NAME)
+        }
+    };
+
+    let conditional_guest_component_impl = if let Some(ref guest_crate) = state.guest_crate {
+        quote! {
+            impl #guest_crate::GuestComponent for #struct_ident {
+                const NAME: &'static ::core::ffi::CStr =
+                    <#struct_ident as #sys_crate::ModComponent>::COMPONENT_CSTR;
+                const FIELD_SCHEMA_HASH: u64 = #pod_schema_hash_expr;
+                const FLAGS: u32 = <#struct_ident as #sys_crate::ModComponent>::COMPONENT_FLAGS;
+                const UUID: #sys_crate::ComponentUuid =
+                    <#struct_ident as #sys_crate::ModComponent>::UUID;
             }
         }
-        None => {
-            quote! {
-                #sys_crate::ComponentUuid::from_canonical_name(Self::CANONICAL_NAME)
-            }
-        }
+    } else {
+        quote! {}
     };
 
     let conditional_raw_insertable_impl = if is_raw_insertable {
@@ -783,6 +798,8 @@ pub(crate) fn emit_vtable_and_impls(state: &CodegenState, vtable_ident: &Ident) 
                     SYMBOLS
                 }
             }
+
+            #conditional_guest_component_impl
         };
     }
 }

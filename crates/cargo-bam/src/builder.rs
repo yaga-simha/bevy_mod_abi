@@ -1,10 +1,13 @@
 //! Mod build and staging (`cargo bam build`) for Rust, C99, C++17, and Zig guest mods.
 
-use crate::CliError;
-use crate::dag::ValidatedModManifest;
 use crate::scaffold::ModLanguage;
 use crate::signing::{self, DEFAULT_NAMESPACE};
-use serde::Deserialize;
+use crate::{
+    CliError, atomic_write_bytes, detect_rust_crate_stem, dylib_naming, read_file_bounded,
+    resolve_project_info, validated_stage_dir,
+};
+use bevy_abi_mod_manifest::MAX_MANIFEST_BYTES;
+use bevy_abi_mod_trust::{DEFAULT_MAX_MOD_BINARY_BYTES, PrivateKey, sign_mod_bytes_with_key};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -24,16 +27,6 @@ pub struct BuildOutput {
     pub staged_manifest_path: Option<PathBuf>,
     /// Detached `.sig` sidecar path if `--sign-key` was provided.
     pub signature_path: Option<PathBuf>,
-}
-
-fn dylib_naming() -> (&'static str, &'static str) {
-    if cfg!(target_os = "windows") {
-        ("", "dll")
-    } else if cfg!(target_os = "macos") {
-        ("lib", "dylib")
-    } else {
-        ("lib", "so")
-    }
 }
 
 pub(crate) fn is_msvc_style_driver(tool: &str) -> bool {
@@ -491,91 +484,6 @@ fn run_command(cmd: &mut Command, label: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-#[derive(Deserialize)]
-struct CargoTomlPartial {
-    package: Option<CargoPackagePartial>,
-    lib: Option<CargoLibPartial>,
-}
-
-#[derive(Deserialize)]
-struct CargoPackagePartial {
-    name: String,
-}
-
-#[derive(Deserialize)]
-struct CargoLibPartial {
-    name: Option<String>,
-}
-
-fn detect_rust_crate_stem(cargo_toml: &Path) -> Result<String, CliError> {
-    let content = fs::read_to_string(cargo_toml)?;
-    let parsed: CargoTomlPartial = toml::from_str(&content)
-        .map_err(|e| CliError::InvalidManifest(format!("{}: {e}", cargo_toml.display())))?;
-    let name = parsed
-        .lib
-        .and_then(|l| l.name)
-        .or_else(|| parsed.package.map(|p| p.name))
-        .ok_or_else(|| {
-            CliError::InvalidManifest(format!(
-                "{} is missing `[package].name`",
-                cargo_toml.display()
-            ))
-        })?;
-    Ok(name.replace('-', "_"))
-}
-
-fn parse_language_str(raw: &str) -> Option<ModLanguage> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "rust" | "rs" => Some(ModLanguage::Rust),
-        "c" | "c99" => Some(ModLanguage::C99),
-        "cpp" | "c++" | "cpp17" | "c++17" => Some(ModLanguage::Cpp17),
-        "zig" => Some(ModLanguage::Zig),
-        _ => None,
-    }
-}
-
-fn resolve_project(
-    manifest_path: Option<&Path>,
-    dir: Option<&Path>,
-) -> Result<(PathBuf, Option<PathBuf>, Option<ValidatedModManifest>), CliError> {
-    let (project_dir, mod_toml_path) = if let Some(mp) = manifest_path {
-        let file_name = mp.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if file_name == "mod.toml" {
-            let pdir = mp
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf();
-            (pdir, Some(mp.to_path_buf()))
-        } else if file_name == "Cargo.toml" {
-            let pdir = mp
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf();
-            let candidate = pdir.join("mod.toml");
-            (pdir, candidate.is_file().then_some(candidate))
-        } else {
-            return Err(CliError::InvalidArgument(format!(
-                "--manifest-path must point to `mod.toml` or `Cargo.toml`, got {}",
-                mp.display()
-            )));
-        }
-    } else {
-        let pdir = dir.unwrap_or_else(|| Path::new(".")).to_path_buf();
-        let candidate = pdir.join("mod.toml");
-        (pdir, candidate.is_file().then_some(candidate))
-    };
-
-    let parsed_mod_toml = if let Some(ref mp) = mod_toml_path {
-        Some(ValidatedModManifest::from_file(mp)?)
-    } else {
-        None
-    };
-
-    Ok((project_dir, mod_toml_path, parsed_mod_toml))
-}
-
 fn find_first_existing(project_dir: &Path, candidates: &[&str]) -> Option<PathBuf> {
     candidates
         .iter()
@@ -706,54 +614,19 @@ pub fn build_mod_with_signing(
     sign_key: Option<&Path>,
     sign_namespace: &str,
 ) -> Result<BuildOutput, CliError> {
-    let (project_dir, mod_toml_path, parsed_mod) = resolve_project(manifest_path, dir)?;
+    if sign_key.is_some() && sign_namespace.is_empty() {
+        return Err(CliError::InvalidArgument(
+            "`--sign-namespace` must not be empty".to_owned(),
+        ));
+    }
+
+    let project = resolve_project_info(manifest_path, dir)?;
+    let project_dir = project.project_dir;
+    let mod_toml_path = project.mod_toml_path;
+    let language = project.language;
+    let mod_id = project.mod_id;
+    let stem_from_mod = project.lib_stem;
     let cargo_toml = project_dir.join("Cargo.toml");
-
-    let explicit_lang = parsed_mod
-        .as_ref()
-        .and_then(|m| m.language.as_deref())
-        .and_then(parse_language_str);
-
-    let language = if let Some(lang) = explicit_lang {
-        lang
-    } else if cargo_toml.is_file() {
-        ModLanguage::Rust
-    } else if project_dir.join("build.zig").is_file() {
-        ModLanguage::Zig
-    } else if find_first_existing(&project_dir, &["src/mod.cpp", "mod.cpp"]).is_some() {
-        ModLanguage::Cpp17
-    } else if find_first_existing(&project_dir, &["src/mod.c", "mod.c"]).is_some() {
-        ModLanguage::C99
-    } else {
-        return Err(CliError::InvalidManifest(format!(
-            "could not determine mod language in {} (missing `mod.toml`, `Cargo.toml`, `build.zig`, `src/mod.c`, or `src/mod.cpp`)",
-            project_dir.display()
-        )));
-    };
-
-    let mod_id = parsed_mod
-        .as_ref()
-        .map(|m| m.id.clone())
-        .unwrap_or_else(|| {
-            project_dir
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("bam_mod")
-                .to_owned()
-        });
-    let stem_from_mod = parsed_mod
-        .as_ref()
-        .and_then(|m| m.entry.clone())
-        .map(|e| {
-            Path::new(&e)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(&mod_id)
-                .trim_start_matches("lib")
-                .to_owned()
-        })
-        .unwrap_or_else(|| mod_id.clone())
-        .replace('-', "_");
 
     let (prefix, ext) = dylib_naming();
     let built_artifact = match language {
@@ -874,26 +747,62 @@ pub fn build_mod_with_signing(
     };
 
     if let Some(stage_root) = out_dir {
-        let stage_dir = stage_root.join(&mod_id);
-        fs::create_dir_all(&stage_dir)?;
+        let stage_dir = validated_stage_dir(stage_root, &mod_id)?;
         let file_name = built_artifact
             .file_name()
             .ok_or_else(|| CliError::Command("built artifact has no filename".to_owned()))?;
-        let staged_lib = stage_dir.join(file_name);
-        fs::copy(&built_artifact, &staged_lib)?;
+        let lib_bytes = read_file_bounded(
+            &built_artifact,
+            DEFAULT_MAX_MOD_BINARY_BYTES,
+            "built shared library",
+        )?;
+        if lib_bytes.is_empty() {
+            return Err(CliError::Command(format!(
+                "built shared library {} is empty",
+                built_artifact.display()
+            )));
+        }
+
+        let sig_pem = if let Some(key_path) = sign_key {
+            let signing_key = PrivateKey::read_openssh_file(key_path).map_err(|e| {
+                CliError::Crypto(format!(
+                    "failed to read signing key {}: {e}",
+                    key_path.display()
+                ))
+            })?;
+            Some(
+                sign_mod_bytes_with_key(&signing_key, sign_namespace, &lib_bytes)
+                    .map_err(|e| CliError::Crypto(e.to_string()))?,
+            )
+        } else {
+            None
+        };
+
+        // 1. Stage `mod.toml` atomically first.
         let staged_manifest = if let Some(ref mp) = mod_toml_path {
+            let manifest_bytes = read_file_bounded(mp, MAX_MANIFEST_BYTES, "mod.toml")?;
             let dest_manifest = stage_dir.join("mod.toml");
-            fs::copy(mp, &dest_manifest)?;
+            atomic_write_bytes(&dest_manifest, &manifest_bytes)?;
             Some(dest_manifest)
         } else {
             None
         };
-        let signature_path = if let Some(key_path) = sign_key {
-            let signed = signing::sign_mod_file(key_path, &staged_lib, None, sign_namespace)?;
-            Some(signed.signature_path)
+
+        let staged_lib = stage_dir.join(file_name);
+
+        // 2. Stage `.sig` atomically BEFORE the shared library so watchers observe a matching
+        //    signature as soon as the new library appears.
+        let signature_path = if let Some(pem) = sig_pem {
+            let sig_dest = signing::default_sig_path(&staged_lib);
+            atomic_write_bytes(&sig_dest, pem.as_bytes())?;
+            Some(sig_dest)
         } else {
             None
         };
+
+        // 3. Stage the shared library atomically LAST.
+        atomic_write_bytes(&staged_lib, &lib_bytes)?;
+
         return Ok(BuildOutput {
             language,
             library_path: staged_lib,

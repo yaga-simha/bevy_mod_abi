@@ -16,6 +16,7 @@ use bevy_app::{App, Plugin, PostUpdate, PreUpdate};
 use bevy_camera::NormalizedRenderTarget;
 use bevy_ecs::component::Component;
 use bevy_ecs::entity::{ContainsEntity, Entity};
+use bevy_ecs::error::{ErrorContext, error as log_ecs_error};
 use bevy_ecs::event::EntityEvent;
 use bevy_ecs::lifecycle::RemovedComponents;
 use bevy_ecs::observer::On;
@@ -1125,8 +1126,14 @@ pub struct ModPickingBridgePlugin;
 
 impl Plugin for ModPickingBridgePlugin {
     fn build(&self, app: &mut App) {
-        register_picking_bridges(app.world_mut())
-            .expect("ModPickingBridgePlugin registration collided in ModRegistry");
+        if let Err(err) = register_picking_bridges(app.world_mut()) {
+            log_ecs_error(
+                err.into(),
+                ErrorContext::Command {
+                    name: "ModPickingBridgePlugin::build".into(),
+                },
+            );
+        }
 
         app.add_observer(forward_pointer_press)
             .add_observer(forward_pointer_release)

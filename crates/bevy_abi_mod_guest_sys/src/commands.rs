@@ -3,11 +3,8 @@
 use core::{ffi::c_void, marker::PhantomData};
 
 use bevy_abi_mod_sys::{
-    AbiPod, BamCmdCheckpointFn, BamCmdDespawnAllFn, BamCmdInsertFn, BamCmdInsertRelationFn,
-    BamCmdObserveFn, BamCmdRemoveRelationFn, BamCmdRollbackFn, BamCmdSpawnBatchFn, BamCmdSpawnFn,
-    BamCmdSpawnSceneFn, BamCmdTriggerExFn, BamCmdTriggerFn, BamCommands, BamComponent,
-    BamEventKind, BamHostApi, BamObserverDesc, BamTermDesc, BamTriggerDesc, FfiAssetHandle,
-    FfiEntity, FfiResult,
+    AbiPod, BamCommands, BamComponent, BamEventKind, BamObserverDesc, BamTermDesc, BamTriggerDesc,
+    FfiAssetHandle, FfiEntity, FfiResult,
 };
 
 use crate::{
@@ -23,12 +20,15 @@ const INLINE_SPAWN_CAP: usize = 16;
 
 /// Type-erased `(BamComponent, *const u8)` pair for batched single-archetype [`ValidatedCommands::spawn`].
 ///
-/// Constructed safely via [`SpawnEntry::new`] from any `T: AbiPod` reference without materializing
-/// `&[u8]` over struct padding bytes.
+/// Constructed safely via [`SpawnEntry::new`] / [`SpawnEntry::marker`] carrying exact byte layout
+/// metadata verified against `Host::component_layout_info` before submitting to `cmd_spawn`,
+/// without materializing `&[u8]` over struct padding bytes.
 #[derive(Clone, Copy, Debug)]
 pub struct SpawnEntry<'a> {
     component: BamComponent,
     data_ptr: *const u8,
+    size: Option<usize>,
+    align: Option<usize>,
     _marker: PhantomData<&'a ()>,
 }
 
@@ -39,6 +39,8 @@ impl<'a> SpawnEntry<'a> {
         Self {
             component,
             data_ptr: core::ptr::from_ref(value).cast::<u8>(),
+            size: Some(core::mem::size_of::<T>()),
+            align: Some(core::mem::align_of::<T>()),
             _marker: PhantomData,
         }
     }
@@ -50,6 +52,8 @@ impl<'a> SpawnEntry<'a> {
         Self {
             component,
             data_ptr: core::ptr::NonNull::<u8>::dangling().as_ptr(),
+            size: Some(0),
+            align: None,
             _marker: PhantomData,
         }
     }
@@ -64,6 +68,8 @@ impl<'a> SpawnEntry<'a> {
         Self {
             component,
             data_ptr,
+            size: None,
+            align: None,
             _marker: PhantomData,
         }
     }
@@ -79,6 +85,41 @@ impl<'a> SpawnEntry<'a> {
     pub const fn data_ptr(&self) -> *const u8 {
         self.data_ptr
     }
+
+    /// Returns the statically known byte size of this entry's payload (`None` for [`Self::from_raw`]).
+    #[inline]
+    pub const fn size(&self) -> Option<usize> {
+        self.size
+    }
+
+    /// Returns the statically known alignment of this entry's payload (`None` for markers / raw).
+    #[inline]
+    pub const fn align(&self) -> Option<usize> {
+        self.align
+    }
+}
+
+/// Validates a [`SpawnEntry`] against `host.component_layout_info(entry.component)` (failing
+/// closed on layout mismatch or `UNSUPPORTED` when safe layout metadata is present).
+pub(crate) fn validate_spawn_entry(host: &Host, entry: &SpawnEntry<'_>) -> Result<(), FfiResult> {
+    if !entry.component.is_valid() {
+        return Err(FfiResult::INVALID_COMPONENT);
+    }
+    if let Some(expected_size) = entry.size {
+        let info = host.component_layout_info(entry.component)?;
+        if info.size != expected_size {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        if let Some(expected_align) = entry.align
+            && info.align != expected_align
+        {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        if expected_size > 0 && entry.data_ptr.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+    }
+    Ok(())
 }
 
 /// Columnar slice descriptor `(BamComponent, *const u8, len)` for multi-entity
@@ -88,6 +129,8 @@ pub struct SpawnBatchColumn<'a> {
     component: BamComponent,
     column_ptr: *const u8,
     entity_count: usize,
+    elem_size: Option<usize>,
+    elem_align: Option<usize>,
     _marker: PhantomData<&'a ()>,
 }
 
@@ -104,6 +147,8 @@ impl<'a> SpawnBatchColumn<'a> {
             component,
             column_ptr: ptr,
             entity_count: values.len(),
+            elem_size: Some(core::mem::size_of::<T>()),
+            elem_align: Some(core::mem::align_of::<T>()),
             _marker: PhantomData,
         }
     }
@@ -115,6 +160,8 @@ impl<'a> SpawnBatchColumn<'a> {
             component,
             column_ptr: core::ptr::NonNull::<u8>::dangling().as_ptr().cast_const(),
             entity_count,
+            elem_size: Some(0),
+            elem_align: None,
             _marker: PhantomData,
         }
     }
@@ -134,6 +181,8 @@ impl<'a> SpawnBatchColumn<'a> {
             component,
             column_ptr,
             entity_count,
+            elem_size: None,
+            elem_align: None,
             _marker: PhantomData,
         }
     }
@@ -155,6 +204,57 @@ impl<'a> SpawnBatchColumn<'a> {
     pub const fn entity_count(&self) -> usize {
         self.entity_count
     }
+
+    /// Returns the statically known element byte size (`None` for [`Self::from_raw`]).
+    #[inline]
+    pub const fn elem_size(&self) -> Option<usize> {
+        self.elem_size
+    }
+
+    /// Returns the statically known element alignment (`None` for markers / raw).
+    #[inline]
+    pub const fn elem_align(&self) -> Option<usize> {
+        self.elem_align
+    }
+}
+
+fn validate_spawn_batch_column(
+    host: &Host,
+    col: &SpawnBatchColumn<'_>,
+    entity_count: usize,
+) -> FfiResult {
+    if !col.component.is_valid() {
+        return FfiResult::INVALID_COMPONENT;
+    }
+    if col.entity_count < entity_count {
+        return FfiResult::INVALID_ARGUMENT;
+    }
+    if let Some(expected_size) = col.elem_size {
+        let info = match host.component_layout_info(col.component) {
+            Ok(i) => i,
+            Err(err) => return err,
+        };
+        if info.size != expected_size {
+            return FfiResult::TYPE_MISMATCH;
+        }
+        if let Some(expected_align) = col.elem_align
+            && info.align != expected_align
+        {
+            return FfiResult::TYPE_MISMATCH;
+        }
+        if entity_count > 0 && expected_size > 0 {
+            if col.column_ptr.is_null() {
+                return FfiResult::NULL_POINTER;
+            }
+            if entity_count
+                .checked_mul(expected_size)
+                .is_none_or(|b| b > isize::MAX as usize)
+            {
+                return FfiResult::OUT_OF_RANGE;
+            }
+        }
+    }
+    FfiResult::OK
 }
 
 /// Validated deferred command buffer wrapper bound to an active system invocation.
@@ -220,38 +320,57 @@ impl<'a> ValidatedCommands<'a> {
         if status.is_ok() { Ok(out) } else { Err(status) }
     }
 
-    /// Reserves an entity and batch-inserts `entries` in a single archetype placement via
-    /// `BamHostApi::cmd_spawn`.
-    ///
-    /// Note: The caller must ensure each [`SpawnEntry`]'s `T` matches the exact byte size and layout
-    /// registered for its [`BamComponent`] handle.
-    pub fn spawn(&mut self, entries: &[SpawnEntry<'_>]) -> Result<FfiEntity, FfiResult> {
+    fn spawn_entries_impl(
+        &mut self,
+        entries: &[SpawnEntry<'_>],
+        persistent: bool,
+    ) -> Result<FfiEntity, FfiResult> {
+        if self.raw.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
         if entries.len() <= INLINE_SPAWN_CAP {
             let mut comps = [BamComponent::INVALID; INLINE_SPAWN_CAP];
             let mut ptrs = [core::ptr::null::<u8>(); INLINE_SPAWN_CAP];
             for (i, entry) in entries.iter().enumerate() {
-                if !entry.component.is_valid() {
-                    return Err(FfiResult::INVALID_COMPONENT);
-                }
+                validate_spawn_entry(self.host, entry)?;
                 comps[i] = entry.component;
                 ptrs[i] = entry.data_ptr;
             }
-            // SAFETY: Each `SpawnEntry` holds a valid `T: AbiPod` reference or caller-verified raw
-            // payload for the duration of `entries`, and slice lengths match `entries.len()`.
-            unsafe { self.spawn_raw(&comps[..entries.len()], &ptrs[..entries.len()]) }
+            let c = &comps[..entries.len()];
+            let p = &ptrs[..entries.len()];
+            // SAFETY: Each safe `SpawnEntry` passed `component_layout_info` validation and covers
+            // its registered layout for the duration of `entries`; raw entries satisfy `from_raw`.
+            unsafe {
+                if persistent {
+                    self.spawn_persistent_raw(c, p)
+                } else {
+                    self.spawn_raw(c, p)
+                }
+            }
         } else {
             let mut comps = Vec::with_capacity(entries.len());
             let mut ptrs = Vec::with_capacity(entries.len());
             for entry in entries {
-                if !entry.component.is_valid() {
-                    return Err(FfiResult::INVALID_COMPONENT);
-                }
+                validate_spawn_entry(self.host, entry)?;
                 comps.push(entry.component);
                 ptrs.push(entry.data_ptr);
             }
-            // SAFETY: `comps` and `ptrs` have identical length and point to live `SpawnEntry` payloads.
-            unsafe { self.spawn_raw(&comps, &ptrs) }
+            // SAFETY: `comps` and `ptrs` have identical length and validated live payloads.
+            unsafe {
+                if persistent {
+                    self.spawn_persistent_raw(&comps, &ptrs)
+                } else {
+                    self.spawn_raw(&comps, &ptrs)
+                }
+            }
         }
+    }
+
+    /// Reserves an entity and batch-inserts `entries` in a single archetype placement via
+    /// `BamHostApi::cmd_spawn`, validating each safe [`SpawnEntry`]'s layout against
+    /// `Host::component_layout_info`.
+    pub fn spawn(&mut self, entries: &[SpawnEntry<'_>]) -> Result<FfiEntity, FfiResult> {
+        self.spawn_entries_impl(entries, false)
     }
 
     /// Raw batched entity spawn forwarding parallel `components` and `data_ptrs` slices to
@@ -417,13 +536,7 @@ impl<'a> ValidatedCommands<'a> {
         if data_len > 0 && data_ptr.is_null() {
             return FfiResult::NULL_POINTER;
         }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, cmd_trigger),
-            core::mem::size_of::<Option<BamCmdTriggerFn>>(),
-        ) {
-            return FfiResult::UNSUPPORTED;
-        }
-        let Some(trigger_fn) = self.host.api().cmd_trigger else {
+        let Some(trigger_fn) = host_slot!(self.host.api(), cmd_trigger) else {
             return FfiResult::UNSUPPORTED;
         };
         // SAFETY: `self.raw` is active and caller guarantees `data_ptr` is readable for `data_len` bytes.
@@ -448,33 +561,10 @@ impl<'a> ValidatedCommands<'a> {
     }
 
     /// Reserves an entity that survives mod unload (`BamHostApi::cmd_spawn_persistent`) and
-    /// batch-inserts `entries`.
+    /// batch-inserts `entries`, validating each safe [`SpawnEntry`]'s layout against
+    /// `Host::component_layout_info`.
     pub fn spawn_persistent(&mut self, entries: &[SpawnEntry<'_>]) -> Result<FfiEntity, FfiResult> {
-        if entries.len() <= INLINE_SPAWN_CAP {
-            let mut comps = [BamComponent::INVALID; INLINE_SPAWN_CAP];
-            let mut ptrs = [core::ptr::null::<u8>(); INLINE_SPAWN_CAP];
-            for (i, entry) in entries.iter().enumerate() {
-                if !entry.component.is_valid() {
-                    return Err(FfiResult::INVALID_COMPONENT);
-                }
-                comps[i] = entry.component;
-                ptrs[i] = entry.data_ptr;
-            }
-            // SAFETY: Each `SpawnEntry` holds a valid payload for the duration of `entries`.
-            unsafe { self.spawn_persistent_raw(&comps[..entries.len()], &ptrs[..entries.len()]) }
-        } else {
-            let mut comps = Vec::with_capacity(entries.len());
-            let mut ptrs = Vec::with_capacity(entries.len());
-            for entry in entries {
-                if !entry.component.is_valid() {
-                    return Err(FfiResult::INVALID_COMPONENT);
-                }
-                comps.push(entry.component);
-                ptrs.push(entry.data_ptr);
-            }
-            // SAFETY: `comps` and `ptrs` have identical length and point to live `SpawnEntry` payloads.
-            unsafe { self.spawn_persistent_raw(&comps, &ptrs) }
-        }
+        self.spawn_entries_impl(entries, true)
     }
 
     /// Raw persistent batched entity spawn forwarding parallel `components` and `data_ptrs` slices
@@ -494,15 +584,8 @@ impl<'a> ValidatedCommands<'a> {
         if components.len() != data_ptrs.len() {
             return Err(FfiResult::INVALID_ARGUMENT);
         }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, cmd_spawn_persistent),
-            core::mem::size_of::<Option<BamCmdSpawnFn>>(),
-        ) {
-            return Err(FfiResult::UNSUPPORTED);
-        }
-        let Some(spawn_fn) = self.host.api().cmd_spawn_persistent else {
-            return Err(FfiResult::UNSUPPORTED);
-        };
+        let spawn_fn =
+            host_slot!(self.host.api(), cmd_spawn_persistent).ok_or(FfiResult::UNSUPPORTED)?;
         let count = components.len();
         let comps_ptr = if count == 0 {
             core::ptr::null()
@@ -522,24 +605,26 @@ impl<'a> ValidatedCommands<'a> {
     }
 
     /// Spawns `entity_count` entities in a single columnar batch via `BamHostApi::cmd_spawn_batch`,
-    /// optionally writing the reserved [`FfiEntity`] handles into `out_entities`.
+    /// validating each safe [`SpawnBatchColumn`]'s layout against `Host::component_layout_info`
+    /// and optionally writing the reserved [`FfiEntity`] handles into `out_entities`.
     pub fn spawn_batch_columns(
         &mut self,
         columns: &[SpawnBatchColumn<'_>],
         entity_count: usize,
         out_entities: Option<&mut [FfiEntity]>,
     ) -> FfiResult {
+        if self.raw.is_null() {
+            return FfiResult::NULL_POINTER;
+        }
         if let Some(ref out_slice) = out_entities
             && out_slice.len() < entity_count
         {
             return FfiResult::INVALID_ARGUMENT;
         }
         for col in columns {
-            if !col.component.is_valid() {
-                return FfiResult::INVALID_COMPONENT;
-            }
-            if col.entity_count < entity_count {
-                return FfiResult::INVALID_ARGUMENT;
+            let status = validate_spawn_batch_column(self.host, col, entity_count);
+            if !status.is_ok() {
+                return status;
             }
         }
         let out_ptr = match out_entities {
@@ -553,7 +638,8 @@ impl<'a> ValidatedCommands<'a> {
                 comps[i] = col.component;
                 ptrs[i] = col.column_ptr;
             }
-            // SAFETY: Each `SpawnBatchColumn` verified `col.entity_count >= entity_count` and valid pointers.
+            // SAFETY: Each `SpawnBatchColumn` verified `col.entity_count >= entity_count`, layout,
+            // and valid readable column bytes.
             unsafe {
                 self.spawn_batch_raw(
                     &comps[..columns.len()],
@@ -569,7 +655,7 @@ impl<'a> ValidatedCommands<'a> {
                 comps.push(col.component);
                 ptrs.push(col.column_ptr);
             }
-            // SAFETY: `comps` and `ptrs` match `columns` and cover `entity_count` rows.
+            // SAFETY: `comps` and `ptrs` match `columns` and cover `entity_count` validated rows.
             unsafe { self.spawn_batch_raw(&comps, &ptrs, entity_count, out_ptr) }
         }
     }
@@ -595,13 +681,7 @@ impl<'a> ValidatedCommands<'a> {
         if components.len() != column_ptrs.len() {
             return FfiResult::INVALID_ARGUMENT;
         }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, cmd_spawn_batch),
-            core::mem::size_of::<Option<BamCmdSpawnBatchFn>>(),
-        ) {
-            return FfiResult::UNSUPPORTED;
-        }
-        let Some(batch_fn) = self.host.api().cmd_spawn_batch else {
+        let Some(batch_fn) = host_slot!(self.host.api(), cmd_spawn_batch) else {
             return FfiResult::UNSUPPORTED;
         };
         let comp_count = components.len();
@@ -643,13 +723,7 @@ impl<'a> ValidatedCommands<'a> {
                 return status;
             }
         }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, cmd_despawn_all),
-            core::mem::size_of::<Option<BamCmdDespawnAllFn>>(),
-        ) {
-            return FfiResult::UNSUPPORTED;
-        }
-        let Some(despawn_all_fn) = self.host.api().cmd_despawn_all else {
+        let Some(despawn_all_fn) = host_slot!(self.host.api(), cmd_despawn_all) else {
             return FfiResult::UNSUPPORTED;
         };
         // SAFETY: `self.raw` is active and `terms` is a valid slice of validated `BamTermDesc`s.
@@ -695,13 +769,7 @@ impl<'a> ValidatedCommands<'a> {
         if data_len > 0 && data_ptr.is_null() {
             return FfiResult::NULL_POINTER;
         }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, cmd_insert_if_new),
-            core::mem::size_of::<Option<BamCmdInsertFn>>(),
-        ) {
-            return FfiResult::UNSUPPORTED;
-        }
-        let Some(insert_fn) = self.host.api().cmd_insert_if_new else {
+        let Some(insert_fn) = host_slot!(self.host.api(), cmd_insert_if_new) else {
             return FfiResult::UNSUPPORTED;
         };
         // SAFETY: `self.raw` is active and caller guarantees `data_ptr` covers `data_len` bytes.
@@ -721,13 +789,7 @@ impl<'a> ValidatedCommands<'a> {
         if !validation.is_ok() {
             return validation;
         }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, cmd_trigger_ex),
-            core::mem::size_of::<Option<BamCmdTriggerExFn>>(),
-        ) {
-            return FfiResult::UNSUPPORTED;
-        }
-        let Some(trigger_ex_fn) = self.host.api().cmd_trigger_ex else {
+        let Some(trigger_ex_fn) = host_slot!(self.host.api(), cmd_trigger_ex) else {
             return FfiResult::UNSUPPORTED;
         };
         // SAFETY: `self.raw` is active and `desc` passed validation per caller contract.
@@ -796,15 +858,7 @@ impl<'a> ValidatedCommands<'a> {
         if !validation.is_ok() {
             return Err(validation);
         }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, cmd_observe),
-            core::mem::size_of::<Option<BamCmdObserveFn>>(),
-        ) {
-            return Err(FfiResult::UNSUPPORTED);
-        }
-        let Some(observe_fn) = self.host.api().cmd_observe else {
-            return Err(FfiResult::UNSUPPORTED);
-        };
+        let observe_fn = host_slot!(self.host.api(), cmd_observe).ok_or(FfiResult::UNSUPPORTED)?;
         let mut out = FfiEntity::NULL;
         // SAFETY: `self.raw` is active, `desc` passed validation, and `out` is writable stack storage.
         let status = unsafe { observe_fn(self.raw, desc, &mut out) };
@@ -920,15 +974,8 @@ impl<'a> ValidatedCommands<'a> {
         if scene_handle.is_none() {
             return Err(FfiResult::INVALID_ARGUMENT);
         }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, cmd_spawn_scene),
-            core::mem::size_of::<Option<BamCmdSpawnSceneFn>>(),
-        ) {
-            return Err(FfiResult::UNSUPPORTED);
-        }
-        let Some(spawn_scene_fn) = self.host.api().cmd_spawn_scene else {
-            return Err(FfiResult::UNSUPPORTED);
-        };
+        let spawn_scene_fn =
+            host_slot!(self.host.api(), cmd_spawn_scene).ok_or(FfiResult::UNSUPPORTED)?;
         let mut out = FfiEntity::NULL;
         // SAFETY: `self.raw` is active and `scene_handle` / `&mut out` are aligned stack references.
         let status = unsafe { spawn_scene_fn(self.raw, scene_handle, parent, &mut out) };
@@ -953,15 +1000,7 @@ impl<'a> ValidatedCommands<'a> {
         if self.raw.is_null() {
             return Err(FfiResult::NULL_POINTER);
         }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, cmd_checkpoint),
-            core::mem::size_of::<Option<BamCmdCheckpointFn>>(),
-        ) {
-            return Err(FfiResult::UNSUPPORTED);
-        }
-        let Some(cp_fn) = self.host.api().cmd_checkpoint else {
-            return Err(FfiResult::UNSUPPORTED);
-        };
+        let cp_fn = host_slot!(self.host.api(), cmd_checkpoint).ok_or(FfiResult::UNSUPPORTED)?;
         let mut token = 0usize;
         // SAFETY: `self.raw` is an active `BamCommands` for `'a` and `&mut token` is writable stack storage.
         let status = unsafe { cp_fn(self.raw, &mut token) };
@@ -980,13 +1019,7 @@ impl<'a> ValidatedCommands<'a> {
         if self.raw.is_null() {
             return FfiResult::NULL_POINTER;
         }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, cmd_rollback),
-            core::mem::size_of::<Option<BamCmdRollbackFn>>(),
-        ) {
-            return FfiResult::UNSUPPORTED;
-        }
-        let Some(rb_fn) = self.host.api().cmd_rollback else {
+        let Some(rb_fn) = host_slot!(self.host.api(), cmd_rollback) else {
             return FfiResult::UNSUPPORTED;
         };
         // SAFETY: `self.raw` is an active `BamCommands` for `'a` under `&mut self`.
@@ -1019,13 +1052,7 @@ impl<'a> ValidatedCommands<'a> {
         if data_size > 0 && data.is_null() {
             return FfiResult::NULL_POINTER;
         }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, cmd_insert_relation),
-            core::mem::size_of::<Option<BamCmdInsertRelationFn>>(),
-        ) {
-            return FfiResult::UNSUPPORTED;
-        }
-        let Some(insert_rel_fn) = self.host.api().cmd_insert_relation else {
+        let Some(insert_rel_fn) = host_slot!(self.host.api(), cmd_insert_relation) else {
             return FfiResult::UNSUPPORTED;
         };
         // SAFETY: `self.raw` is active and caller guarantees `data` is readable for `data_size` bytes.
@@ -1083,13 +1110,7 @@ impl<'a> ValidatedCommands<'a> {
         if !relation.is_valid() {
             return FfiResult::INVALID_COMPONENT;
         }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, cmd_remove_relation),
-            core::mem::size_of::<Option<BamCmdRemoveRelationFn>>(),
-        ) {
-            return FfiResult::UNSUPPORTED;
-        }
-        let Some(remove_rel_fn) = self.host.api().cmd_remove_relation else {
+        let Some(remove_rel_fn) = host_slot!(self.host.api(), cmd_remove_relation) else {
             return FfiResult::UNSUPPORTED;
         };
         // SAFETY: `self.raw` is active and `entity`/`target`/`relation` were validated non-null/valid.

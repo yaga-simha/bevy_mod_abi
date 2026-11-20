@@ -1,7 +1,7 @@
 //! Host components for Example 3: Cross-Language Interoperability.
 
-use bevy_abi_mod::ModComponent;
 use bevy_ecs::component::Component;
+use bevy_mod_abi::ModComponent;
 
 /// Shared 3D position component (`"example::Position"`).
 #[repr(C)]

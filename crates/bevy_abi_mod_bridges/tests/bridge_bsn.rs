@@ -385,3 +385,55 @@ fn bsn_ready_name_constant_matches_type_name() {
         core::mem::size_of::<FfiEntity>()
     );
 }
+
+#[test]
+fn expose_mod_scene_bsn_preserves_pending_scene_across_transient_failure() {
+    // Start WITHOUT `AssetPlugin` / `AssetServer` so the first spawn attempt fails transiently
+    // with `FfiResult::INVALID_STATE`.
+    let mut app = App::new();
+    app.add_plugins((TaskPoolPlugin::default(), AbiModPlugin, ModBsnPlugin));
+
+    let scene_handle = app
+        .expose_mod_scene_bsn(
+            "bsn_test::retryable_prop",
+            bsn! {
+                #RetryRoot
+                Children [
+                    #RetryChild
+                ]
+            },
+        )
+        .expect("expose bsn scene");
+
+    let snap = app.world().resource::<ModRegistry>().snapshot_arc();
+    let backend = snap.scene_backend().expect("scene backend").clone();
+
+    // First attempt without AssetServer must fail with INVALID_STATE WITHOUT discarding `pending_scene`.
+    let root_fail = app.world_mut().spawn_empty().id();
+    let err = backend.spawn_scene(app.world_mut(), &snap, root_fail, None, &scene_handle);
+    assert_eq!(err, Err(FfiResult::INVALID_STATE));
+    assert!(app.world().get::<Name>(root_fail).is_none());
+
+    // Now install `AssetPlugin` (creating `AssetServer`) and retry spawning the exact same handle.
+    app.add_plugins(AssetPlugin::default());
+    app.finish();
+
+    let root_ok = app.world_mut().spawn_empty().id();
+    backend
+        .spawn_scene(app.world_mut(), &snap, root_ok, None, &scene_handle)
+        .expect("retry after AssetServer becomes available must succeed");
+
+    assert_eq!(
+        app.world().get::<Name>(root_ok).map(Name::as_str),
+        Some("RetryRoot")
+    );
+    let children = app
+        .world()
+        .get::<Children>(root_ok)
+        .expect("retried BSN scene has children");
+    assert_eq!(children.len(), 1);
+    assert_eq!(
+        app.world().get::<Name>(children[0]).map(Name::as_str),
+        Some("RetryChild")
+    );
+}

@@ -1,6 +1,6 @@
 //! Context-carrying `"bam.v0.*"` symbol and VTable resolution (`host_get_proc_address`).
 
-use crate::handle_header::{HOST_CTX_MAGIC, HostContext, validate_handle_ref};
+use crate::handle_header::validate_host_ctx;
 use bevy_abi_mod_sys::BamHostCtx;
 use core::ffi::{CStr, c_char, c_void};
 
@@ -11,16 +11,14 @@ use core::ffi::{CStr, c_char, c_void};
 /// `"bam.v0."` namespace prefix, or is unregistered/evicted in `ctx`.
 ///
 /// # Safety
-/// - `ctx` must point to an active [`HostContext`] cast to [`BamHostCtx`], or null.
+/// - `ctx` must point to an active [`crate::HostContext`] cast to [`BamHostCtx`], or null.
 /// - If non-null, `name` must point to a NUL-terminated C string.
 pub unsafe extern "C" fn host_get_proc_address(
     ctx: *const BamHostCtx,
     name: *const c_char,
 ) -> *const c_void {
-    // SAFETY: Validating `ctx` against `HOST_CTX_MAGIC` unconditionally (`always_check = true`).
-    let Ok(host_ctx) =
-        (unsafe { validate_handle_ref::<HostContext>(ctx.cast::<c_void>(), HOST_CTX_MAGIC, true) })
-    else {
+    // SAFETY: Validating `ctx` against `HOST_CTX_MAGIC` unconditionally.
+    let Ok(host_ctx) = (unsafe { validate_host_ctx(ctx) }) else {
         return core::ptr::null();
     };
 

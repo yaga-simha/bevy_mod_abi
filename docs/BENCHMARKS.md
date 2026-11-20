@@ -1,6 +1,6 @@
 # Benchmarks & Deterministic Regression Gates (`ABI 0.3.0`)
 
-This document records the **canonical benchmark scenarios**, **deterministic CI regression gates (`iai-callgrind` + counting allocator)**, **reference hardware baselines**, the **full 5-dimensional permutation matrix**, and **ABI `0.3.0` migration / hot-rewire / soak gates** for `bevy_abi_mod` (`v0.3.0`).
+This document records the **canonical benchmark scenarios**, **deterministic CI regression gates (`iai-callgrind` + counting allocator)**, **reference hardware baselines**, the **full 5-dimensional permutation matrix**, and **ABI `0.3.0` migration / hot-rewire / soak gates** for **`bevy_mod_abi`** (workspace `bevy_abi_mod`, `v0.3.0`).
 
 ```bash
 # 1. Run all 9 canonical host benchmark scenarios (stages Rust & C99 fixtures automatically)
@@ -133,7 +133,7 @@ Compares single-call Structure-of-Arrays `host_cmd_spawn_batch` (4 components) a
 | **`10,000`** | C-ABI `host_cmd_despawn` loop | `0.4244 ms` | `0.5316 ms` | `23.0M ent/s` | `42.44 ns` | `1.00x` |
 
 ### 2.8 Scenario 8: `BAM_COMPONENT_FLAG_SUMMARY_TICK` Multi-Table Skip (`10,000` Entities, `100` Tables)
-Compares `AccessMode::CHANGED` across `100` distinct tables (`100` entities/table = `10,000` total) for dynamic dense components registered without vs. with `BAM_COMPONENT_FLAG_SUMMARY_TICK` at `0%`, `1%` (`1/100` dirty tables = `100` entities), and `100%` dirty ratios:
+Compares `AccessMode::CHANGED` across `100` distinct tables (`100` entities/table = `10,000` total) for dynamic dense components registered without vs. with `BAM_COMPONENT_FLAG_SUMMARY_TICK` (host `ComponentOptions::with_summary_tick()`, guest `#[guest_component(summary_tick)]`) at `0%`, `1%` (`1/100` dirty tables = `100` entities), and `100%` dirty ratios:
 
 | Dirty Ratio | Variant | Median Frame | p95 Frame | Effective Scan Rate | `ns / entity` |
 |---|---|---:|---:|---:|---:|
@@ -195,7 +195,7 @@ Beyond single-query microbenchmarks, `permutation_bench` evaluates a **34-archet
 | **7. `NaiveChattyFfi` (~1M FFI calls)** | C-ABI C99 / Rust | `release` / `release` | `1.44–1.47 ms` | `29.3–29.9 ns` | `7.72x–7.88x` | `8.6%–8.8%` |
 
 ### Key Takeaways for Mod Authors
-1. **Hoist FFI Calls to the Chunk Level:** Crossing `extern "C"` once per archetype table (`ChunkOptimized` / `Chunk::component_mut`) runs within `0–15%` of statically linked Bevy—and even faster on simple dense loops thanks to contiguous slice auto-vectorization.
+1. **Hoist FFI Calls to the Chunk Level:** Crossing `extern "C"` once per archetype table (`ChunkOptimized`, typed `ctx.single_query::<&mut T>().for_each(...)`, or `Chunk::component_mut`) runs within `0–15%` of statically linked Bevy—and even faster on simple dense loops thanks to contiguous slice auto-vectorization.
 2. **Use Batched `cmd_spawn` for Multi-Component Entities:** Spawning `K` components via `cmd_spawn` writes directly into the final Bevy archetype in one transition instead of `K` table relocations.
 3. **Debug Mods Inside a Release Host:** Because the C-ABI decouples optimization profiles, modders can attach LLDB/GDB to an `-O0` guest `.cdylib`/`.dylib` inside a full-speed `--release` Bevy game at `< 7%` frame budget cost.
 

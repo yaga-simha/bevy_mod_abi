@@ -4,8 +4,12 @@
 use crate::builder;
 use crate::scaffold::ModLanguage;
 use crate::signing::{self, DEFAULT_NAMESPACE};
-use crate::{CliError, ResolvedProject, atomic_write_bytes, resolve_project_info};
-use bevy_abi_mod_trust::{PrivateKey, sign_mod_bytes_with_key};
+use crate::{
+    CliError, ResolvedProject, atomic_write_bytes, read_file_bounded, resolve_project_info,
+    validated_stage_dir,
+};
+use bevy_abi_mod_manifest::MAX_MANIFEST_BYTES;
+use bevy_abi_mod_trust::{DEFAULT_MAX_MOD_BINARY_BYTES, PrivateKey, sign_mod_bytes_with_key};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
@@ -363,7 +367,11 @@ impl WatchRunner {
             None,
         )?;
 
-        let lib_bytes = fs::read(&built.library_path)?;
+        let lib_bytes = read_file_bounded(
+            &built.library_path,
+            DEFAULT_MAX_MOD_BINARY_BYTES,
+            "built shared library",
+        )?;
         if lib_bytes.is_empty() {
             return Err(CliError::Command(format!(
                 "built shared library {} is empty",
@@ -388,17 +396,18 @@ impl WatchRunner {
 
         let (final_lib_path, staged_manifest_path, signature_path) =
             if let Some(stage_root) = &self.config.out_dir {
-                let stage_dir = stage_root.join(&self.project.mod_id);
-                fs::create_dir_all(&stage_dir)?;
+                let stage_dir = validated_stage_dir(stage_root, &self.project.mod_id)?;
 
                 // 1. Stage `mod.toml` atomically (only rewrite if missing or changed to avoid
                 //    redundant `ModHotReloadPlugin` triggers when only code changed).
                 let staged_manifest = if let Some(manifest_src) = &self.project.mod_toml_path {
-                    let manifest_bytes = fs::read(manifest_src)?;
+                    let manifest_bytes =
+                        read_file_bounded(manifest_src, MAX_MANIFEST_BYTES, "mod.toml")?;
                     let dest_manifest = stage_dir.join("mod.toml");
-                    let needs_write = fs::read(&dest_manifest)
-                        .map(|existing| existing != manifest_bytes)
-                        .unwrap_or(true);
+                    let needs_write =
+                        read_file_bounded(&dest_manifest, MAX_MANIFEST_BYTES, "staged mod.toml")
+                            .map(|existing| existing != manifest_bytes)
+                            .unwrap_or(true);
                     if needs_write {
                         atomic_write_bytes(&dest_manifest, &manifest_bytes)?;
                     }

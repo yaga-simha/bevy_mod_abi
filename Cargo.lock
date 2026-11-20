@@ -437,25 +437,7 @@ dependencies = [
 name = "bevy_abi_mod"
 version = "0.3.0"
 dependencies = [
- "bevy_abi_mod_bridges",
- "bevy_abi_mod_host",
- "bevy_abi_mod_macros",
- "bevy_abi_mod_reflect",
- "bevy_abi_mod_render",
- "bevy_abi_mod_sys",
- "bevy_abi_mod_watcher",
- "bevy_app",
- "bevy_asset",
- "bevy_camera",
- "bevy_ecs",
- "bevy_input",
- "bevy_reflect",
- "bevy_remote",
- "bevy_scene",
- "bevy_state",
- "bevy_time",
- "bevy_transform",
- "serde_json",
+ "bevy_mod_abi",
 ]
 
 [[package]]
@@ -588,6 +570,7 @@ dependencies = [
  "bevy_abi_mod_macros",
  "bevy_abi_mod_sys",
  "bevy_app",
+ "bevy_asset",
  "bevy_ecs",
  "bevy_platform",
  "bevy_reflect",
@@ -1409,9 +1392,25 @@ checksum = "bff34eb29ff4b8a8688bc7299f14fb6b597461ca80fec03ed7d22939ab33e48f"
 name = "bevy_mod_abi"
 version = "0.3.0"
 dependencies = [
- "bevy_abi_mod",
+ "bevy_abi_mod_bridges",
+ "bevy_abi_mod_host",
+ "bevy_abi_mod_macros",
+ "bevy_abi_mod_reflect",
+ "bevy_abi_mod_render",
+ "bevy_abi_mod_sys",
+ "bevy_abi_mod_watcher",
  "bevy_app",
+ "bevy_asset",
+ "bevy_camera",
  "bevy_ecs",
+ "bevy_input",
+ "bevy_reflect",
+ "bevy_remote",
+ "bevy_scene",
+ "bevy_state",
+ "bevy_time",
+ "bevy_transform",
+ "serde_json",
 ]
 
 [[package]]
@@ -3193,40 +3192,40 @@ dependencies = [
 name = "example_01_minimal_handshake"
 version = "0.3.0"
 dependencies = [
- "bevy_abi_mod",
  "bevy_abi_mod_sys",
  "bevy_app",
  "bevy_ecs",
+ "bevy_mod_abi",
 ]
 
 [[package]]
 name = "example_02_multi_system_pipeline"
 version = "0.3.0"
 dependencies = [
- "bevy_abi_mod",
  "bevy_abi_mod_sys",
  "bevy_app",
  "bevy_ecs",
+ "bevy_mod_abi",
 ]
 
 [[package]]
 name = "example_03_cross_language_interop"
 version = "0.3.0"
 dependencies = [
- "bevy_abi_mod",
  "bevy_abi_mod_sys",
  "bevy_app",
  "bevy_ecs",
+ "bevy_mod_abi",
 ]
 
 [[package]]
 name = "example_04_visual_game"
 version = "0.2.0"
 dependencies = [
- "bevy_abi_mod",
  "bevy_abi_mod_sys",
  "bevy_app",
  "bevy_ecs",
+ "bevy_mod_abi",
  "crossterm",
  "ratatui",
 ]
@@ -3236,11 +3235,11 @@ name = "example_05_cute_3d_winit"
 version = "0.2.0"
 dependencies = [
  "avian3d",
- "bevy_abi_mod",
  "bevy_abi_mod_sys",
  "bevy_app",
  "bevy_ecs",
  "bevy_math",
+ "bevy_mod_abi",
  "bevy_time",
  "bevy_transform",
  "bytemuck",
@@ -3254,41 +3253,41 @@ dependencies = [
 name = "example_06_cross_mod_components"
 version = "0.3.0"
 dependencies = [
- "bevy_abi_mod",
  "bevy_abi_mod_sys",
  "bevy_app",
  "bevy_ecs",
+ "bevy_mod_abi",
 ]
 
 [[package]]
 name = "example_07_cpp17_guest"
 version = "0.3.0"
 dependencies = [
- "bevy_abi_mod",
  "bevy_abi_mod_sys",
  "bevy_app",
  "bevy_ecs",
+ "bevy_mod_abi",
 ]
 
 [[package]]
 name = "example_08_zig_guest"
 version = "0.3.0"
 dependencies = [
- "bevy_abi_mod",
  "bevy_abi_mod_sys",
  "bevy_app",
  "bevy_ecs",
+ "bevy_mod_abi",
 ]
 
 [[package]]
 name = "example_09_bql_wire_parity"
 version = "0.3.0"
 dependencies = [
- "bevy_abi_mod",
  "bevy_abi_mod_host_sys",
  "bevy_abi_mod_sys",
  "bevy_app",
  "bevy_ecs",
+ "bevy_mod_abi",
  "bevy_reflect",
  "sha2",
  "tempfile",
@@ -3298,7 +3297,6 @@ dependencies = [
 name = "example_10_bevy20_full_companion"
 version = "0.3.0"
 dependencies = [
- "bevy_abi_mod",
  "bevy_abi_mod_sys",
  "bevy_app",
  "bevy_asset",
@@ -3313,6 +3311,7 @@ dependencies = [
  "bevy_light",
  "bevy_material",
  "bevy_math",
+ "bevy_mod_abi",
  "bevy_pbr",
  "bevy_picking",
  "bevy_remote",

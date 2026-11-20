@@ -466,3 +466,124 @@ fn bevy_settings_toml_roundtrip_synchronizes_settings_group_and_witness_resource
 
     let _ = fs::remove_file(&path);
 }
+
+#[derive(bevy_asset::Asset, Reflect, Clone, Debug, PartialEq)]
+struct BrpIconAsset {
+    name: String,
+}
+
+#[derive(Component, Reflect, Default, Clone, Debug, PartialEq)]
+#[reflect(Component, Default)]
+struct OpaqueLoadout {
+    label: String,
+    tier: u32,
+    icon: bevy_asset::Handle<BrpIconAsset>,
+}
+
+impl bevy_abi_mod_sys::ModComponent for OpaqueLoadout {
+    const CANONICAL_NAME: &'static str = "reflect_test::OpaqueLoadout";
+    const COMPONENT_CSTR: &'static core::ffi::CStr = c"reflect_test::OpaqueLoadout";
+    const UUID: bevy_abi_mod_sys::ComponentUuid = bevy_abi_mod_sys::ComponentUuid::from_namespaced(
+        "reflect_test::OpaqueLoadout",
+        core::mem::size_of::<Self>(),
+        core::mem::align_of::<Self>(),
+        0,
+    );
+    type VTable = ();
+    fn vtable() -> &'static Self::VTable {
+        &()
+    }
+    fn symbols() -> &'static [bevy_abi_mod_sys::SymbolEntry] {
+        &[]
+    }
+}
+
+#[test]
+fn brp_opaque_reflected_component_and_asset_handle_roundtrip() {
+    use bevy_asset::io::AssetSourceBuilder;
+    use bevy_asset::io::memory::{Dir, MemoryAssetReader};
+    use bevy_asset::{AssetApp, AssetMetaCheck, AssetPath, AssetPlugin, AssetServer, Handle};
+
+    let mod_dir = Dir::default();
+    let mut app = App::new();
+    app.register_asset_source(
+        "mod",
+        AssetSourceBuilder::new(move || {
+            Box::new(MemoryAssetReader {
+                root: mod_dir.clone(),
+            })
+        }),
+    );
+    app.add_plugins((
+        bevy_app::TaskPoolPlugin::default(),
+        AssetPlugin {
+            meta_check: AssetMetaCheck::Never,
+            ..Default::default()
+        },
+        AbiModPlugin,
+        RemotePlugin::default(),
+        ModReflectPlugin,
+    ));
+    app.init_asset::<BrpIconAsset>()
+        .register_asset_reflect::<BrpIconAsset>();
+    app.register_reflected_component::<OpaqueLoadout>(ComponentOptions::new().with_default())
+        .unwrap();
+
+    let knight_icon: Handle<BrpIconAsset> = app
+        .world()
+        .resource::<AssetServer>()
+        .load("mod://ui/knight.icon");
+    let entity = app
+        .world_mut()
+        .spawn(OpaqueLoadout {
+            label: "knight".to_owned(),
+            tier: 2,
+            icon: knight_icon,
+        })
+        .id();
+    app.finish();
+    app.cleanup();
+
+    // 1. `get_components` on an opaque reflected component must emit unwrapped JSON with
+    //    `HandleSerializeProcessor` path encoding (matching `TypedReflectDeserializer`).
+    let get_res = app
+        .world_mut()
+        .dispatch_mod_brp_request(BrpRequest {
+            method: BRP_METHOD_GET_COMPONENTS.to_owned(),
+            id: Some(serde_json::json!(10)),
+            params: Some(serde_json::json!({
+                "entity": entity.to_bits(),
+                "components": ["reflect_test::OpaqueLoadout"],
+            })),
+        })
+        .unwrap();
+    let mut loadout_json = get_res["components"]["reflect_test::OpaqueLoadout"].clone();
+    assert_eq!(loadout_json["label"], "knight");
+    assert_eq!(loadout_json["tier"], 2);
+    assert_eq!(loadout_json["icon"]["Path"], "mod://ui/knight.icon");
+
+    // 2. Mutate the returned JSON in-place and feed it straight back into `mutate_components`.
+    loadout_json["label"] = serde_json::json!("paladin");
+    loadout_json["tier"] = serde_json::json!(5);
+    loadout_json["icon"] = serde_json::json!({ "Path": "mod://ui/paladin.icon" });
+
+    app.world_mut()
+        .dispatch_mod_brp_request(BrpRequest {
+            method: BRP_METHOD_MUTATE_COMPONENTS.to_owned(),
+            id: Some(serde_json::json!(11)),
+            params: Some(serde_json::json!({
+                "entity": entity.to_bits(),
+                "component": "reflect_test::OpaqueLoadout",
+                "value": loadout_json,
+            })),
+        })
+        .unwrap();
+
+    let updated = app.world().get::<OpaqueLoadout>(entity).unwrap();
+    assert_eq!(updated.label, "paladin");
+    assert_eq!(updated.tier, 5);
+    assert_eq!(
+        updated.icon.path(),
+        Some(&AssetPath::parse("mod://ui/paladin.icon"))
+    );
+}

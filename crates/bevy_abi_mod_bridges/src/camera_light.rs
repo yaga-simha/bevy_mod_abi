@@ -4,7 +4,9 @@
 //! Exposes zero-padding `#[repr(C)]` `AbiPod` + `ModComponent` mirror components and
 //! bidirectional Bevy ECS sync systems under `#![forbid(unsafe_code)]`:
 //!
-//! - `feature = "bridge-light"`: `FfiCamera2d` (`Camera2d` + `Camera` + `Hdr`), `FfiCamera3d`
+//! - `feature = "bridge-camera-2d"`: `FfiCamera2d` (`Camera2d` + `Camera` + `Hdr`) without pulling
+//!   3D rendering/lighting crates (`bevy_pbr`, `bevy_light`, `bevy_render`).
+//! - `feature = "bridge-light"`: implies `bridge-camera-2d` and adds `FfiCamera3d`
 //!   (`Camera3d` + `Camera` + `Tonemapping` + `DebandDither` + `Exposure` + `Hdr` + optional
 //!   `ScreenSpaceTransmission`), `FfiPointLight` (`PointLight`), `FfiSpotLight` (`SpotLight`),
 //!   and `FfiDirectionalLight` (`DirectionalLight`).
@@ -24,16 +26,16 @@ use bevy_app::{App, Plugin, PostUpdate};
 use bevy_ecs::change_detection::{DetectChanges, DetectChangesMut};
 use bevy_ecs::component::Component;
 use bevy_ecs::entity::Entity;
+use bevy_ecs::error::{ErrorContext, error as log_ecs_error};
 use bevy_ecs::query::{Changed, Without};
 use bevy_ecs::schedule::{IntoScheduleConfigs, SystemSet};
 use bevy_ecs::system::{Commands, Query};
 use bevy_ecs::world::{Ref, World};
 
+#[cfg(feature = "bridge-camera-2d")]
+use bevy_camera::{Camera, Camera2d, ClearColorConfig, Hdr};
 #[cfg(feature = "bridge-light")]
-use bevy_camera::{
-    Camera, Camera2d, Camera3d, Camera3dDepthLoadOp, Camera3dDepthTextureUsage, ClearColorConfig,
-    Exposure, Hdr,
-};
+use bevy_camera::{Camera3d, Camera3dDepthLoadOp, Camera3dDepthTextureUsage, Exposure};
 #[cfg(feature = "bridge-camera-controller")]
 use bevy_camera_controller::pan_orbit_camera::controller::{
     component::{EnabledMotion, OrbitConstraint, PanOrbitCamera, Sensitivity},
@@ -42,9 +44,9 @@ use bevy_camera_controller::pan_orbit_camera::controller::{
     smoothing::Smoothing,
     zoom::ZoomLimits,
 };
-#[cfg(feature = "bridge-light")]
+#[cfg(feature = "bridge-camera-2d")]
 use bevy_color::{Color, LinearRgba};
-#[cfg(feature = "bridge-light")]
+#[cfg(feature = "bridge-camera-2d")]
 use bevy_ecs::query::{Has, With};
 #[cfg(feature = "bridge-light")]
 use bevy_light::{DirectionalLight, PointLight, SpotLight};
@@ -64,7 +66,7 @@ use core::time::Duration;
 // ---------------------------------------------------------------------------
 
 /// Canonical ABI name for [`FfiCamera2d`].
-#[cfg(feature = "bridge-light")]
+#[cfg(feature = "bridge-camera-2d")]
 pub const CANONICAL_CAMERA_2D_NAME: &str = "bevy_abi_mod::camera_light::FfiCamera2d";
 /// Canonical ABI name for [`FfiCamera3d`].
 #[cfg(feature = "bridge-light")]
@@ -87,13 +89,13 @@ pub const CANONICAL_PAN_ORBIT_CAMERA_NAME: &str = "bevy_abi_mod::camera_light::F
 pub const CANONICAL_SOLARI_LIGHTING_NAME: &str = "bevy_abi_mod::camera_light::FfiSolariLighting";
 
 /// Clear color mode: inherit the world's `ClearColor` resource (`ClearColorConfig::Default`).
-#[cfg(feature = "bridge-light")]
+#[cfg(feature = "bridge-camera-2d")]
 pub const CLEAR_COLOR_DEFAULT: u8 = 0;
 /// Clear color mode: clear with custom linear RGBA (`ClearColorConfig::Custom`).
-#[cfg(feature = "bridge-light")]
+#[cfg(feature = "bridge-camera-2d")]
 pub const CLEAR_COLOR_CUSTOM: u8 = 1;
 /// Clear color mode: do not clear before rendering (`ClearColorConfig::None`).
-#[cfg(feature = "bridge-light")]
+#[cfg(feature = "bridge-camera-2d")]
 pub const CLEAR_COLOR_NONE: u8 = 2;
 
 /// 3D camera depth load op: clear depth buffer (`Camera3dDepthLoadOp::Clear`).
@@ -176,12 +178,28 @@ pub struct ModCameraLightBridgePlugin;
 
 impl Plugin for ModCameraLightBridgePlugin {
     fn build(&self, app: &mut App) {
-        register_camera_light_bridges(app.world_mut())
-            .expect("ModCameraLightBridgePlugin registration collided in ModRegistry");
+        if let Err(err) = register_camera_light_bridges(app.world_mut()) {
+            log_ecs_error(
+                err.into(),
+                ErrorContext::Command {
+                    name: "ModCameraLightBridgePlugin::build".into(),
+                },
+            );
+        }
 
         app.configure_sets(
             PostUpdate,
             CameraLightBridgeSystems::Push.before(CameraLightBridgeSystems::Pull),
+        );
+
+        #[cfg(feature = "bridge-camera-2d")]
+        app.add_systems(
+            PostUpdate,
+            (
+                (spawn_camera_2d_from_ffi, push_camera_2d_to_bevy)
+                    .in_set(CameraLightBridgeSystems::Push),
+                pull_camera_2d_from_bevy.in_set(CameraLightBridgeSystems::Pull),
+            ),
         );
 
         #[cfg(feature = "bridge-light")]
@@ -189,8 +207,6 @@ impl Plugin for ModCameraLightBridgePlugin {
             PostUpdate,
             (
                 (
-                    spawn_camera_2d_from_ffi,
-                    push_camera_2d_to_bevy,
                     spawn_camera_3d_from_ffi,
                     push_camera_3d_to_bevy,
                     spawn_point_light_from_ffi,
@@ -202,7 +218,6 @@ impl Plugin for ModCameraLightBridgePlugin {
                 )
                     .in_set(CameraLightBridgeSystems::Push),
                 (
-                    pull_camera_2d_from_bevy,
                     pull_camera_3d_from_bevy,
                     pull_point_light_from_bevy,
                     pull_spot_light_from_bevy,
@@ -244,9 +259,13 @@ pub fn register_camera_light_bridges(world: &mut World) -> Result<(), ComponentC
         world.insert_resource(ModRegistry::new());
     }
 
-    #[cfg(feature = "bridge-light")]
+    #[cfg(feature = "bridge-camera-2d")]
     {
         register_mirror_if_missing::<FfiCamera2d>(world)?;
+    }
+
+    #[cfg(feature = "bridge-light")]
+    {
         register_mirror_if_missing::<FfiCamera3d>(world)?;
         register_mirror_if_missing::<FfiPointLight>(world)?;
         register_mirror_if_missing::<FfiSpotLight>(world)?;
@@ -283,17 +302,17 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Conversion helpers (`bridge-light`)
+// Conversion helpers (`bridge-camera-2d` & `bridge-light`)
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "bridge-light")]
+#[cfg(feature = "bridge-camera-2d")]
 #[inline]
 fn color_to_linear_rgba(color: Color) -> [f32; 4] {
     let linear = color.to_linear();
     [linear.red, linear.green, linear.blue, linear.alpha]
 }
 
-#[cfg(feature = "bridge-light")]
+#[cfg(feature = "bridge-camera-2d")]
 #[inline]
 fn linear_rgba_to_color(rgba: [f32; 4]) -> Option<Color> {
     if rgba.iter().all(|v| v.is_finite()) {
@@ -308,7 +327,7 @@ fn linear_rgba_to_color(rgba: [f32; 4]) -> Option<Color> {
     }
 }
 
-#[cfg(feature = "bridge-light")]
+#[cfg(feature = "bridge-camera-2d")]
 #[inline]
 fn clear_color_to_ffi(config: ClearColorConfig) -> (u8, [f32; 4]) {
     match config {
@@ -318,7 +337,7 @@ fn clear_color_to_ffi(config: ClearColorConfig) -> (u8, [f32; 4]) {
     }
 }
 
-#[cfg(feature = "bridge-light")]
+#[cfg(feature = "bridge-camera-2d")]
 #[inline]
 fn ffi_to_clear_color(mode: u8, rgba: [f32; 4]) -> ClearColorConfig {
     match mode {
@@ -330,7 +349,7 @@ fn ffi_to_clear_color(mode: u8, rgba: [f32; 4]) -> ClearColorConfig {
     }
 }
 
-#[cfg(feature = "bridge-light")]
+#[cfg(feature = "bridge-camera-2d")]
 #[inline]
 fn clear_color_eq(a: ClearColorConfig, b: ClearColorConfig) -> bool {
     match (a, b) {
@@ -404,14 +423,14 @@ fn tag_to_transmission_quality(tag: u8) -> ScreenSpaceTransmissionQuality {
 }
 
 // ---------------------------------------------------------------------------
-// FfiCamera2d (`bridge-light`)
+// FfiCamera2d (`bridge-camera-2d`)
 // ---------------------------------------------------------------------------
 
 /// Zero-padding `#[repr(C)]` `AbiPod` + `ModComponent` mirror of Bevy [`Camera2d`] and its
 /// paired [`Camera`] / [`Hdr`] configuration.
 ///
 /// Layout: `24` bytes, `4`-byte alignment, zero implicit compiler padding.
-#[cfg(feature = "bridge-light")]
+#[cfg(feature = "bridge-camera-2d")]
 #[repr(C)]
 #[derive(Component, Clone, Copy, Debug, PartialEq, ModComponent)]
 #[mod_component(name = "bevy_abi_mod::camera_light::FfiCamera2d")]
@@ -430,14 +449,14 @@ pub struct FfiCamera2d {
     pub hdr: FfiBool,
 }
 
-#[cfg(feature = "bridge-light")]
+#[cfg(feature = "bridge-camera-2d")]
 impl Default for FfiCamera2d {
     fn default() -> Self {
         Self::from_bevy(&Camera::default(), false)
     }
 }
 
-#[cfg(feature = "bridge-light")]
+#[cfg(feature = "bridge-camera-2d")]
 impl FfiCamera2d {
     /// Projects a Bevy [`Camera`] and [`Hdr`] presence into [`FfiCamera2d`].
     pub fn from_bevy(camera: &Camera, has_hdr: bool) -> Self {
@@ -481,7 +500,7 @@ impl FfiCamera2d {
     }
 }
 
-#[cfg(feature = "bridge-light")]
+#[cfg(feature = "bridge-camera-2d")]
 fn spawn_camera_2d_from_ffi(
     mut commands: Commands,
     query: Query<(Entity, &FfiCamera2d), Without<Camera2d>>,
@@ -495,7 +514,7 @@ fn spawn_camera_2d_from_ffi(
     }
 }
 
-#[cfg(feature = "bridge-light")]
+#[cfg(feature = "bridge-camera-2d")]
 type Camera2dPushQuery<'w, 's> = Query<
     'w,
     's,
@@ -503,7 +522,7 @@ type Camera2dPushQuery<'w, 's> = Query<
     (Changed<FfiCamera2d>, With<Camera2d>),
 >;
 
-#[cfg(feature = "bridge-light")]
+#[cfg(feature = "bridge-camera-2d")]
 fn push_camera_2d_to_bevy(mut commands: Commands, mut query: Camera2dPushQuery<'_, '_>) {
     for (entity, ffi, mut camera, has_hdr) in &mut query {
         if !ffi.matches_camera(&camera) {
@@ -517,7 +536,7 @@ fn push_camera_2d_to_bevy(mut commands: Commands, mut query: Camera2dPushQuery<'
     }
 }
 
-#[cfg(feature = "bridge-light")]
+#[cfg(feature = "bridge-camera-2d")]
 fn pull_camera_2d_from_bevy(
     mut query: Query<(&mut FfiCamera2d, Ref<Camera>, Has<Hdr>), With<Camera2d>>,
 ) {
@@ -1763,10 +1782,13 @@ fn pull_solari_lighting_from_bevy(
 // ---------------------------------------------------------------------------
 
 const _: () = {
-    #[cfg(feature = "bridge-light")]
+    #[cfg(feature = "bridge-camera-2d")]
     {
         assert!(core::mem::size_of::<FfiCamera2d>() == 24);
         assert!(core::mem::align_of::<FfiCamera2d>() == 4);
+    }
+    #[cfg(feature = "bridge-light")]
+    {
         assert!(core::mem::size_of::<FfiCamera3d>() == 48);
         assert!(core::mem::align_of::<FfiCamera3d>() == 4);
         assert!(core::mem::size_of::<FfiPointLight>() == 44);
@@ -1790,9 +1812,10 @@ const _: () = {
 
 #[allow(dead_code)]
 fn _assert_all_camera_light_wire_types_are_abi_pod() {
+    #[cfg(feature = "bridge-camera-2d")]
+    assert_abi_pod::<FfiCamera2d>();
     #[cfg(feature = "bridge-light")]
     {
-        assert_abi_pod::<FfiCamera2d>();
         assert_abi_pod::<FfiCamera3d>();
         assert_abi_pod::<FfiPointLight>();
         assert_abi_pod::<FfiSpotLight>();

@@ -15,7 +15,10 @@ use bevy_abi_mod_sys::{
 };
 
 use crate::{
-    app::context::{RunConditionContext, SystemContext},
+    app::{
+        context::{RunConditionContext, SystemContext},
+        observers::{RunIfPredicate, with_guest_commands},
+    },
     commands::GuestCommands,
     component::{
         GuestComponent, GuestComponentHooks, qualify_component_identity, resolve_guest_component,
@@ -426,14 +429,7 @@ impl<'a> GuestApp<'a> {
             event,
             target,
             move |tgt, ev, validated_cmds| {
-                let host = validated_cmds.host();
-                // SAFETY: Reborrow of `validated_cmds` is strictly scoped to `callback` invocation.
-                let mut cmds = GuestCommands::from_validated(
-                    bevy_abi_mod_guest_sys::ValidatedCommands::empty(host),
-                );
-                core::mem::swap(&mut cmds.inner, validated_cmds);
-                callback(tgt, ev, &mut cmds);
-                core::mem::swap(&mut cmds.inner, validated_cmds);
+                with_guest_commands(validated_cmds, |cmds| callback(tgt, ev, cmds));
                 FfiResult::OK
             },
         );
@@ -495,10 +491,36 @@ impl<'a> GuestApp<'a> {
             after_weak: Vec::new(),
             before_weak: Vec::new(),
             ambiguous_with: Vec::new(),
-            run_if: None,
+            run_if_preds: Vec::new(),
             first_error: None,
         }
     }
+}
+
+macro_rules! define_query_guest_terms {
+    ($( $(#[$meta:meta])* $method:ident <$ty:ident> => $mode:ident );* $(;)?) => {
+        $(
+            $(#[$meta])*
+            #[inline]
+            pub fn $method<$ty: GuestComponent>(mut self) -> Self {
+                self.push_guest_term::<$ty>(AccessMode::$mode);
+                self
+            }
+        )*
+    };
+}
+
+macro_rules! define_query_handle_terms {
+    ($( $(#[$meta:meta])* $method:ident => $mode:ident );* $(;)?) => {
+        $(
+            $(#[$meta])*
+            #[inline]
+            pub fn $method(mut self, component: BamComponent) -> Self {
+                self.push_term(component, AccessMode::$mode);
+                self
+            }
+        )*
+    };
 }
 
 /// Declarative query-clause builder passed to [`SystemBuilder::query`].
@@ -542,81 +564,37 @@ impl<'b> QueryBuilder<'b> {
         }
     }
 
-    /// Appends a shared read-only (`&T`) entity column term.
-    #[inline]
-    pub fn read<T: GuestComponent>(mut self) -> Self {
-        self.push_guest_term::<T>(AccessMode::READ);
-        self
-    }
-
-    /// Appends an exclusive mutable (`&mut T`) entity column term.
-    #[inline]
-    pub fn write<T: GuestComponent>(mut self) -> Self {
-        self.push_guest_term::<T>(AccessMode::WRITE);
-        self
-    }
-
-    /// Appends an archetype presence filter (`With<T>`) term.
-    #[inline]
-    pub fn with<T: GuestComponent>(mut self) -> Self {
-        self.push_guest_term::<T>(AccessMode::FILTER_ONLY);
-        self
-    }
-
-    /// Appends an archetype absence filter (`Without<T>`) term.
-    #[inline]
-    pub fn without<T: GuestComponent>(mut self) -> Self {
-        self.push_guest_term::<T>(AccessMode::WITHOUT);
-        self
-    }
-
-    /// Appends an optional shared read-only (`Option<&T>`) column term.
-    #[inline]
-    pub fn optional_read<T: GuestComponent>(mut self) -> Self {
-        self.push_guest_term::<T>(AccessMode::OPTIONAL_READ);
-        self
-    }
-
-    /// Appends an optional exclusive mutable (`Option<&mut T>`) column term.
-    #[inline]
-    pub fn optional_write<T: GuestComponent>(mut self) -> Self {
-        self.push_guest_term::<T>(AccessMode::OPTIONAL_WRITE);
-        self
-    }
-
-    /// Appends a row-level change-tick filter with read-only column access (`Changed<T> + &T`).
-    #[inline]
-    pub fn changed<T: GuestComponent>(mut self) -> Self {
-        self.push_guest_term::<T>(AccessMode::CHANGED);
-        self
-    }
-
-    /// Appends a row-level added-tick filter with read-only column access (`Added<T> + &T`).
-    #[inline]
-    pub fn added<T: GuestComponent>(mut self) -> Self {
-        self.push_guest_term::<T>(AccessMode::ADDED);
-        self
-    }
-
-    /// Appends an entity-disabling filter bypass (`Allow<T>`) term.
-    #[inline]
-    pub fn allow<T: GuestComponent>(mut self) -> Self {
-        self.push_guest_term::<T>(AccessMode::ALLOW);
-        self
-    }
-
-    /// Appends an archetypal presence indicator (`Has<T>`) term yielding an `FfiBool` column.
-    #[inline]
-    pub fn has<T: GuestComponent>(mut self) -> Self {
-        self.push_guest_term::<T>(AccessMode::HAS);
-        self
-    }
-
-    /// Appends a `RemovedComponents<T>` removal-stream reader (`AccessMode::REMOVED_READ`) term.
-    #[inline]
-    pub fn removed<T: GuestComponent>(mut self) -> Self {
-        self.push_guest_term::<T>(AccessMode::REMOVED_READ);
-        self
+    define_query_guest_terms! {
+        /// Appends a shared read-only (`&T`) entity column term.
+        read<T> => READ;
+        /// Appends an exclusive mutable (`&mut T`) entity column term.
+        write<T> => WRITE;
+        /// Appends an archetype presence filter (`With<T>`) term.
+        with<T> => FILTER_ONLY;
+        /// Appends an archetype absence filter (`Without<T>`) term.
+        without<T> => WITHOUT;
+        /// Appends an optional shared read-only (`Option<&T>`) column term.
+        optional_read<T> => OPTIONAL_READ;
+        /// Appends an optional exclusive mutable (`Option<&mut T>`) column term.
+        optional_write<T> => OPTIONAL_WRITE;
+        /// Appends a row-level change-tick filter with read-only column access (`Changed<T> + &T`).
+        changed<T> => CHANGED;
+        /// Appends a row-level added-tick filter with read-only column access (`Added<T> + &T`).
+        added<T> => ADDED;
+        /// Appends an entity-disabling filter bypass (`Allow<T>`) term.
+        allow<T> => ALLOW;
+        /// Appends an archetypal presence indicator (`Has<T>`) term yielding an `FfiBool` column.
+        has<T> => HAS;
+        /// Appends a `RemovedComponents<T>` removal-stream reader (`AccessMode::REMOVED_READ`) term.
+        removed<T> => REMOVED_READ;
+        /// Appends a shared singleton resource read (`Res<R>`) term to this query.
+        resource_read<R> => RESOURCE_READ;
+        /// Appends an exclusive singleton resource write (`ResMut<R>`) term to this query.
+        resource_write<R> => RESOURCE_WRITE;
+        /// Appends a buffered message stream reader (`MessageReader<M>`) term.
+        message_read<M> => MESSAGE_READ;
+        /// Appends a buffered message stream writer (`MessageWriter<M>`) term.
+        message_write<M> => MESSAGE_WRITE;
     }
 
     /// Appends a disjunctive `Or<(...)>` filter group (`group_id`, `1..=255`) whose terms are
@@ -648,34 +626,6 @@ impl<'b> QueryBuilder<'b> {
         self
     }
 
-    /// Appends a shared singleton resource read (`Res<R>`) term to this query.
-    #[inline]
-    pub fn resource_read<R: GuestComponent>(mut self) -> Self {
-        self.push_guest_term::<R>(AccessMode::RESOURCE_READ);
-        self
-    }
-
-    /// Appends an exclusive singleton resource write (`ResMut<R>`) term to this query.
-    #[inline]
-    pub fn resource_write<R: GuestComponent>(mut self) -> Self {
-        self.push_guest_term::<R>(AccessMode::RESOURCE_WRITE);
-        self
-    }
-
-    /// Appends a buffered message stream reader (`MessageReader<M>`) term.
-    #[inline]
-    pub fn message_read<M: GuestComponent>(mut self) -> Self {
-        self.push_guest_term::<M>(AccessMode::MESSAGE_READ);
-        self
-    }
-
-    /// Appends a buffered message stream writer (`MessageWriter<M>`) term.
-    #[inline]
-    pub fn message_write<M: GuestComponent>(mut self) -> Self {
-        self.push_guest_term::<M>(AccessMode::MESSAGE_WRITE);
-        self
-    }
-
     /// Appends a pre-resolved [`BamComponent`] handle with explicit [`AccessMode`].
     #[inline]
     pub fn term(mut self, component: BamComponent, mode: AccessMode) -> Self {
@@ -683,88 +633,31 @@ impl<'b> QueryBuilder<'b> {
         self
     }
 
-    /// Appends a pre-resolved shared read-only (`&T`) handle term.
-    #[inline]
-    pub fn read_handle(mut self, component: BamComponent) -> Self {
-        self.push_term(component, AccessMode::READ);
-        self
-    }
-
-    /// Appends a pre-resolved exclusive mutable (`&mut T`) handle term.
-    #[inline]
-    pub fn write_handle(mut self, component: BamComponent) -> Self {
-        self.push_term(component, AccessMode::WRITE);
-        self
-    }
-
-    /// Appends a pre-resolved `With<T>` filter handle term.
-    #[inline]
-    pub fn with_handle(mut self, component: BamComponent) -> Self {
-        self.push_term(component, AccessMode::FILTER_ONLY);
-        self
-    }
-
-    /// Appends a pre-resolved `Without<T>` filter handle term.
-    #[inline]
-    pub fn without_handle(mut self, component: BamComponent) -> Self {
-        self.push_term(component, AccessMode::WITHOUT);
-        self
-    }
-
-    /// Appends a pre-resolved `Option<&T>` handle term.
-    #[inline]
-    pub fn optional_read_handle(mut self, component: BamComponent) -> Self {
-        self.push_term(component, AccessMode::OPTIONAL_READ);
-        self
-    }
-
-    /// Appends a pre-resolved `Option<&mut T>` handle term.
-    #[inline]
-    pub fn optional_write_handle(mut self, component: BamComponent) -> Self {
-        self.push_term(component, AccessMode::OPTIONAL_WRITE);
-        self
-    }
-
-    /// Appends a pre-resolved `Changed<T>` handle term.
-    #[inline]
-    pub fn changed_handle(mut self, component: BamComponent) -> Self {
-        self.push_term(component, AccessMode::CHANGED);
-        self
-    }
-
-    /// Appends a pre-resolved `Added<T>` handle term.
-    #[inline]
-    pub fn added_handle(mut self, component: BamComponent) -> Self {
-        self.push_term(component, AccessMode::ADDED);
-        self
-    }
-
-    /// Appends a pre-resolved `Res<R>` handle term.
-    #[inline]
-    pub fn resource_read_handle(mut self, component: BamComponent) -> Self {
-        self.push_term(component, AccessMode::RESOURCE_READ);
-        self
-    }
-
-    /// Appends a pre-resolved `ResMut<R>` handle term.
-    #[inline]
-    pub fn resource_write_handle(mut self, component: BamComponent) -> Self {
-        self.push_term(component, AccessMode::RESOURCE_WRITE);
-        self
-    }
-
-    /// Appends a pre-resolved `MessageReader<M>` handle term.
-    #[inline]
-    pub fn message_read_handle(mut self, component: BamComponent) -> Self {
-        self.push_term(component, AccessMode::MESSAGE_READ);
-        self
-    }
-
-    /// Appends a pre-resolved `MessageWriter<M>` handle term.
-    #[inline]
-    pub fn message_write_handle(mut self, component: BamComponent) -> Self {
-        self.push_term(component, AccessMode::MESSAGE_WRITE);
-        self
+    define_query_handle_terms! {
+        /// Appends a pre-resolved shared read-only (`&T`) handle term.
+        read_handle => READ;
+        /// Appends a pre-resolved exclusive mutable (`&mut T`) handle term.
+        write_handle => WRITE;
+        /// Appends a pre-resolved `With<T>` filter handle term.
+        with_handle => FILTER_ONLY;
+        /// Appends a pre-resolved `Without<T>` filter handle term.
+        without_handle => WITHOUT;
+        /// Appends a pre-resolved `Option<&T>` handle term.
+        optional_read_handle => OPTIONAL_READ;
+        /// Appends a pre-resolved `Option<&mut T>` handle term.
+        optional_write_handle => OPTIONAL_WRITE;
+        /// Appends a pre-resolved `Changed<T>` handle term.
+        changed_handle => CHANGED;
+        /// Appends a pre-resolved `Added<T>` handle term.
+        added_handle => ADDED;
+        /// Appends a pre-resolved `Res<R>` handle term.
+        resource_read_handle => RESOURCE_READ;
+        /// Appends a pre-resolved `ResMut<R>` handle term.
+        resource_write_handle => RESOURCE_WRITE;
+        /// Appends a pre-resolved `MessageReader<M>` handle term.
+        message_read_handle => MESSAGE_READ;
+        /// Appends a pre-resolved `MessageWriter<M>` handle term.
+        message_write_handle => MESSAGE_WRITE;
     }
 
     /// Resolves `name` (with optional `uuid`) on the host and appends a term with `mode`.
@@ -798,7 +691,7 @@ pub struct SystemBuilder<'b, 'a> {
     after_weak: Vec<&'b CStr>,
     before_weak: Vec<&'b CStr>,
     ambiguous_with: Vec<&'b CStr>,
-    run_if: Option<PreparedRunIf>,
+    run_if_preds: Vec<RunIfPredicate>,
     first_error: Option<FfiResult>,
 }
 
@@ -1006,47 +899,69 @@ impl<'b, 'a> SystemBuilder<'b, 'a> {
         self
     }
 
-    /// Attaches an optional run-condition predicate `|ctx: &RunConditionContext<'_>| -> bool`.
+    /// Appends a run-condition predicate `|ctx: &RunConditionContext<'_>| -> bool`.
+    ///
+    /// Multiple `.run_if(...)` / `.run_if_fn(...)` calls compose with short-circuit logical AND
+    /// semantics in registration order (without overwriting or leaking earlier predicates).
     ///
     /// For zero-argument predicates or plain `fn() -> bool` functions, use [`Self::run_if_fn`]
     /// or `.run_if(|_| ...)`.
     #[inline]
-    pub fn run_if<F>(mut self, mut condition: F) -> Self
+    pub fn run_if<F>(mut self, condition: F) -> Self
     where
         F: FnMut(&RunConditionContext<'_>) -> bool + Send + 'static,
     {
         if self.first_error.is_none() {
-            let prepared = PreparedRunIf::new(self.app.instance, move |host| {
-                let ctx = RunConditionContext::new(host);
-                condition(&ctx)
-            });
-            self.run_if = Some(prepared);
+            self.run_if_preds.push(Box::new(condition));
         }
         self
     }
 
-    /// Attaches a zero-argument run-condition predicate `|| -> bool`.
+    /// Appends a zero-argument run-condition predicate `|| -> bool`.
+    ///
+    /// Composes with any preceding `.run_if(...)` / `.run_if_fn(...)` predicates using
+    /// short-circuit logical AND semantics.
     #[inline]
-    pub fn run_if_fn<F>(mut self, mut condition: F) -> Self
+    pub fn run_if_fn<F>(self, mut condition: F) -> Self
     where
         F: FnMut() -> bool + Send + 'static,
     {
-        if self.first_error.is_none() {
-            let prepared = PreparedRunIf::new(self.app.instance, move |_host| condition());
-            self.run_if = Some(prepared);
-        }
-        self
+        self.run_if(move |_ctx| condition())
     }
 
-    /// Finalizes and registers the system on the host `World`, returning [`FfiResult::OK`] on
-    /// success or the first registration/resolution error encountered.
-    pub fn build<F, R>(self, mut callback: F) -> FfiResult
-    where
-        F: FnMut(&mut SystemContext<'_>) -> R + Send + 'static,
-        R: IntoSystemResult,
-    {
+    fn prepare_run_if(
+        instance: &mut GuestInstance,
+        mut preds: Vec<RunIfPredicate>,
+    ) -> Option<PreparedRunIf> {
+        if preds.is_empty() {
+            None
+        } else if preds.len() == 1
+            && let Some(mut single) = preds.pop()
+        {
+            Some(PreparedRunIf::new(instance, move |host| {
+                let ctx = RunConditionContext::new(host);
+                single(&ctx)
+            }))
+        } else {
+            Some(PreparedRunIf::new(instance, move |host| {
+                let ctx = RunConditionContext::new(host);
+                preds.iter_mut().all(|pred| pred(&ctx))
+            }))
+        }
+    }
+
+    fn finalize<Out>(
+        self,
+        submit: impl FnOnce(
+            &mut ValidatedLoadCtx<'a>,
+            &mut GuestInstance,
+            &SystemRegistrationConfig<'_>,
+            Option<PreparedRunIf>,
+        ) -> Out,
+        on_err: impl FnOnce(FfiResult) -> Out,
+    ) -> Out {
         if let Some(err) = self.first_error {
-            return err;
+            return on_err(err);
         }
         let query_slices: Vec<&[BamTermDesc]> = self.queries.iter().map(Vec::as_slice).collect();
         let config = SystemRegistrationConfig {
@@ -1062,14 +977,30 @@ impl<'b, 'a> SystemBuilder<'b, 'a> {
             before_weak: &self.before_weak,
             ambiguous_with: &self.ambiguous_with,
         };
-        self.app.load_ctx.register_system(
-            self.app.instance,
-            &config,
-            self.run_if,
-            move |inv: &mut ValidatedSystemInvocation<'_>| {
-                let mut ctx = SystemContext::from_invocation(inv);
-                callback(&mut ctx).into_ffi_result()
+        let run_if = Self::prepare_run_if(self.app.instance, self.run_if_preds);
+        submit(&mut self.app.load_ctx, self.app.instance, &config, run_if)
+    }
+
+    /// Finalizes and registers the system on the host `World`, returning [`FfiResult::OK`] on
+    /// success or the first registration/resolution error encountered.
+    pub fn build<F, R>(self, mut callback: F) -> FfiResult
+    where
+        F: FnMut(&mut SystemContext<'_>) -> R + Send + 'static,
+        R: IntoSystemResult,
+    {
+        self.finalize(
+            |load_ctx, instance, config, run_if| {
+                load_ctx.register_system(
+                    instance,
+                    config,
+                    run_if,
+                    move |inv: &mut ValidatedSystemInvocation<'_>| {
+                        let mut ctx = SystemContext::from_invocation(inv);
+                        callback(&mut ctx).into_ffi_result()
+                    },
+                )
             },
+            |err| err,
         )
     }
 
@@ -1081,31 +1012,19 @@ impl<'b, 'a> SystemBuilder<'b, 'a> {
         F: FnMut(&mut SystemContext<'_>) -> R + Send + 'static,
         R: IntoSystemResult,
     {
-        if let Some(err) = self.first_error {
-            return Err(err);
-        }
-        let query_slices: Vec<&[BamTermDesc]> = self.queries.iter().map(Vec::as_slice).collect();
-        let config = SystemRegistrationConfig {
-            name: self.name,
-            user_queries: &query_slices,
-            system_resources: &self.system_resources,
-            schedule: self.schedule,
-            flags: self.flags,
-            after: &self.after,
-            before: &self.before,
-            in_sets: &self.in_sets,
-            after_weak: &self.after_weak,
-            before_weak: &self.before_weak,
-            ambiguous_with: &self.ambiguous_with,
-        };
-        self.app.load_ctx.register_system_handle(
-            self.app.instance,
-            &config,
-            self.run_if,
-            move |inv: &mut ValidatedSystemInvocation<'_>| {
-                let mut ctx = SystemContext::from_invocation(inv);
-                callback(&mut ctx).into_ffi_result()
+        self.finalize(
+            |load_ctx, instance, config, run_if| {
+                load_ctx.register_system_handle(
+                    instance,
+                    config,
+                    run_if,
+                    move |inv: &mut ValidatedSystemInvocation<'_>| {
+                        let mut ctx = SystemContext::from_invocation(inv);
+                        callback(&mut ctx).into_ffi_result()
+                    },
+                )
             },
+            Err,
         )
     }
 }

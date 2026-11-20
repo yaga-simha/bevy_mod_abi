@@ -18,10 +18,10 @@ use bevy_abi_mod_guest::raw::{
     ABI_VERSION, AccessMode, BAM_COMPONENT_FLAG_IMMUTABLE, BAM_COMPONENT_FLAG_SPARSE_SET,
     BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_MESSAGE, BAM_STORAGE_FLAG_RESOURCE,
     BAM_STORAGE_FLAG_SPARSE_SET, BamChunkTaskFn, BamColumnInfo, BamCommands, BamComponent,
-    BamHostApi, BamHostCtx, BamInstance, BamIter, BamLoadCtx, BamManifest, BamRunIfFn,
-    BamSystemCtx, BamSystemDesc, BamSystemFn, BamTermDesc, ComponentDesc, ComponentDropFn,
-    ComponentHookFn, ComponentUuid, FfiBool, FfiEntity, FfiResult, ScheduleId, init_guest_instance,
-    shutdown_guest_instance,
+    BamHostApi, BamHostCtx, BamInstance, BamIter, BamLayoutInfo, BamLoadCtx, BamManifest,
+    BamRunIfFn, BamSystemCtx, BamSystemDesc, BamSystemFn, BamTermDesc, ComponentDesc,
+    ComponentDropFn, ComponentHookFn, ComponentUuid, FfiBool, FfiEntity, FfiResult, ScheduleId,
+    init_guest_instance, shutdown_guest_instance,
 };
 use bevy_abi_mod_guest::{GuestApp, GuestPlugin, build_guest_fn, build_guest_plugin};
 
@@ -1369,6 +1369,39 @@ unsafe extern "C" fn host_msg_send(
     FfiResult::OK
 }
 
+unsafe extern "C" fn host_component_layout_info(
+    host_ctx: *const BamHostCtx,
+    component: BamComponent,
+    out_info: *mut BamLayoutInfo,
+) -> FfiResult {
+    if host_ctx.is_null() || out_info.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    let world = unsafe { &*host_ctx.cast::<MockHostWorld>() };
+    let Some(meta) = world.comp_meta(component) else {
+        return FfiResult::INVALID_COMPONENT;
+    };
+    let mut storage_flags = 0u32;
+    if (meta.flags & BAM_COMPONENT_FLAG_SPARSE_SET) != 0 {
+        storage_flags |= BAM_STORAGE_FLAG_SPARSE_SET;
+    }
+    if (meta.flags & BAM_COMPONENT_FLAG_IMMUTABLE) != 0 {
+        storage_flags |= BAM_STORAGE_FLAG_IMMUTABLE;
+    }
+    unsafe {
+        let info = &mut *out_info;
+        info.struct_size = core::mem::size_of::<BamLayoutInfo>() as u32;
+        info.flags = storage_flags;
+        info.uuid = meta.uuid;
+        info.schema_fingerprint = 0;
+        info.size = meta.size;
+        info.align = meta.align;
+        info.fields = core::ptr::null();
+        info.field_count = 0;
+    }
+    FfiResult::OK
+}
+
 pub fn make_mock_host_api() -> BamHostApi {
     BamHostApi {
         struct_size: core::mem::size_of::<BamHostApi>() as u32,
@@ -1426,7 +1459,7 @@ pub fn make_mock_host_api() -> BamHostApi {
         log_diagnostic: None,
         report_guest_fault: None,
         resolve_component_by_uuid: None,
-        component_layout_info: None,
+        component_layout_info: Some(host_component_layout_info),
         register_relation: None,
         intern_symbol: None,
         bind_named_object: None,

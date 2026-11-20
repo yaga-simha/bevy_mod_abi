@@ -4,13 +4,11 @@
 use core::ffi::{CStr, c_void};
 
 use bevy_abi_mod_sys::{
-    ABI_VERSION, AbiPod, BamAssetGetLoadStateFn, BamAssetLoadFn, BamAssetReleaseFn,
-    BamBindNamedObjectFn, BamComponent, BamComponentLayoutInfoFn, BamEventKind, BamHostApi,
-    BamHostCtx, BamInternSymbolFn, BamLayoutInfo, BamLoadCtx, BamLogDiagnosticFn, BamRelationDesc,
-    BamReportGuestFaultFn, BamResolveComponentByUuidFn, BamRowMigrateFn, BamScheduleSetDesc,
-    BamSymbol, BamSystem, BamSystemSet, ComponentDesc, ComponentUuid, FfiAssetHandle,
-    FfiAssetLoadState, FfiEntity, FfiResult, MappedStringVTable, MappedWireVTable, ModComponent,
-    ScheduleId, StrView, VTableHeader, read_descriptor,
+    ABI_VERSION, AbiPod, BamComponent, BamEventKind, BamHostApi, BamHostCtx, BamLayoutInfo,
+    BamLoadCtx, BamRelationDesc, BamRowMigrateFn, BamScheduleSetDesc, BamSymbol, BamSystem,
+    BamSystemSet, ComponentDesc, ComponentUuid, FfiAssetHandle, FfiAssetLoadState, FfiEntity,
+    FfiResult, MappedStringVTable, MappedWireVTable, ModComponent, ScheduleId, StrView,
+    VTableHeader, read_descriptor,
 };
 
 use crate::{
@@ -464,15 +462,7 @@ impl Host {
         if path.is_empty() {
             return Err(FfiResult::INVALID_ARGUMENT);
         }
-        if !self.api.covers_slot(
-            core::mem::offset_of!(BamHostApi, asset_load),
-            core::mem::size_of::<Option<BamAssetLoadFn>>(),
-        ) {
-            return Err(FfiResult::UNSUPPORTED);
-        }
-        let Some(load_fn) = self.api.asset_load else {
-            return Err(FfiResult::UNSUPPORTED);
-        };
+        let load_fn = host_slot!(&self.api, asset_load).ok_or(FfiResult::UNSUPPORTED)?;
         let mut out = FfiAssetHandle::NONE;
         // SAFETY: `self.host_ctx.0` is an active `BamHostCtx`, `StrView::from_str(path)` borrows
         // valid UTF-8 for this call, and `out` is aligned writable stack storage.
@@ -499,15 +489,7 @@ impl Host {
         if handle.is_none() {
             return Ok(FfiAssetLoadState::NOT_LOADED);
         }
-        if !self.api.covers_slot(
-            core::mem::offset_of!(BamHostApi, asset_get_load_state),
-            core::mem::size_of::<Option<BamAssetGetLoadStateFn>>(),
-        ) {
-            return Err(FfiResult::UNSUPPORTED);
-        }
-        let Some(state_fn) = self.api.asset_get_load_state else {
-            return Err(FfiResult::UNSUPPORTED);
-        };
+        let state_fn = host_slot!(&self.api, asset_get_load_state).ok_or(FfiResult::UNSUPPORTED)?;
         let mut out = FfiAssetLoadState::NOT_LOADED;
         // SAFETY: `self.host_ctx.0` is valid and `handle`/`&mut out` are aligned stack references.
         let status = unsafe { state_fn(self.host_ctx.0, handle, &mut out) };
@@ -524,13 +506,7 @@ impl Host {
         if handle.is_none() {
             return FfiResult::OK;
         }
-        if !self.api.covers_slot(
-            core::mem::offset_of!(BamHostApi, asset_release),
-            core::mem::size_of::<Option<BamAssetReleaseFn>>(),
-        ) {
-            return FfiResult::UNSUPPORTED;
-        }
-        let Some(release_fn) = self.api.asset_release else {
+        let Some(release_fn) = host_slot!(&self.api, asset_release) else {
             return FfiResult::UNSUPPORTED;
         };
         // SAFETY: `self.host_ctx.0` is valid and `handle` is an aligned shared reference.
@@ -543,13 +519,7 @@ impl Host {
     /// Returns [`FfiResult::UNSUPPORTED`] when connected to an ABI `0.2` host.
     #[inline]
     pub fn log_diagnostic(&self, level: u32, message: &str) -> FfiResult {
-        if !self.api.covers_slot(
-            core::mem::offset_of!(BamHostApi, log_diagnostic),
-            core::mem::size_of::<Option<BamLogDiagnosticFn>>(),
-        ) {
-            return FfiResult::UNSUPPORTED;
-        }
-        let Some(log_fn) = self.api.log_diagnostic else {
+        let Some(log_fn) = host_slot!(&self.api, log_diagnostic) else {
             return FfiResult::UNSUPPORTED;
         };
         // SAFETY: `self.host_ctx.0` is a valid active `BamHostCtx`, and `StrView::from_str(message)`
@@ -563,13 +533,7 @@ impl Host {
     /// Returns [`FfiResult::UNSUPPORTED`] when connected to an ABI `0.2` host.
     #[inline]
     pub fn report_guest_fault(&self, message: &str) -> FfiResult {
-        if !self.api.covers_slot(
-            core::mem::offset_of!(BamHostApi, report_guest_fault),
-            core::mem::size_of::<Option<BamReportGuestFaultFn>>(),
-        ) {
-            return FfiResult::UNSUPPORTED;
-        }
-        let Some(fault_fn) = self.api.report_guest_fault else {
+        let Some(fault_fn) = host_slot!(&self.api, report_guest_fault) else {
             return FfiResult::UNSUPPORTED;
         };
         // SAFETY: `self.host_ctx.0` is a valid active `BamHostCtx`, and `StrView::from_str(message)`
@@ -586,15 +550,8 @@ impl Host {
         &self,
         uuid: ComponentUuid,
     ) -> Result<BamComponent, FfiResult> {
-        if !self.api.covers_slot(
-            core::mem::offset_of!(BamHostApi, resolve_component_by_uuid),
-            core::mem::size_of::<Option<BamResolveComponentByUuidFn>>(),
-        ) {
-            return Err(FfiResult::UNSUPPORTED);
-        }
-        let Some(resolve_fn) = self.api.resolve_component_by_uuid else {
-            return Err(FfiResult::UNSUPPORTED);
-        };
+        let resolve_fn =
+            host_slot!(&self.api, resolve_component_by_uuid).ok_or(FfiResult::UNSUPPORTED)?;
         let mut out = BamComponent::INVALID;
         // SAFETY: `self.host_ctx.0` is an active `BamHostCtx`, `&uuid` is readable, and `&mut out`
         // is aligned writable stack storage.
@@ -621,15 +578,7 @@ impl Host {
         if !component.is_valid() {
             return Err(FfiResult::INVALID_COMPONENT);
         }
-        if !self.api.covers_slot(
-            core::mem::offset_of!(BamHostApi, component_layout_info),
-            core::mem::size_of::<Option<BamComponentLayoutInfoFn>>(),
-        ) {
-            return Err(FfiResult::UNSUPPORTED);
-        }
-        let Some(info_fn) = self.api.component_layout_info else {
-            return Err(FfiResult::UNSUPPORTED);
-        };
+        let info_fn = host_slot!(&self.api, component_layout_info).ok_or(FfiResult::UNSUPPORTED)?;
         let mut out = BamLayoutInfo::empty();
         // SAFETY: `self.host_ctx.0` is an active `BamHostCtx` and `&mut out` is aligned writable storage.
         let status = unsafe { info_fn(self.host_ctx.0, component, &mut out) };
@@ -645,15 +594,7 @@ impl Host {
         if symbol.is_empty() {
             return Err(FfiResult::INVALID_ARGUMENT);
         }
-        if !self.api.covers_slot(
-            core::mem::offset_of!(BamHostApi, intern_symbol),
-            core::mem::size_of::<Option<BamInternSymbolFn>>(),
-        ) {
-            return Err(FfiResult::UNSUPPORTED);
-        }
-        let Some(intern_fn) = self.api.intern_symbol else {
-            return Err(FfiResult::UNSUPPORTED);
-        };
+        let intern_fn = host_slot!(&self.api, intern_symbol).ok_or(FfiResult::UNSUPPORTED)?;
         let mut out = BamSymbol::INVALID;
         // SAFETY: `self.host_ctx.0` is an active `BamHostCtx`, `StrView::from_str(symbol)` borrows
         // valid UTF-8 bytes for this call, and `&mut out` is aligned writable stack storage.
@@ -679,13 +620,7 @@ impl Host {
         if entity.is_null() {
             return FfiResult::INVALID_ENTITY;
         }
-        if !self.api.covers_slot(
-            core::mem::offset_of!(BamHostApi, bind_named_object),
-            core::mem::size_of::<Option<BamBindNamedObjectFn>>(),
-        ) {
-            return FfiResult::UNSUPPORTED;
-        }
-        let Some(bind_fn) = self.api.bind_named_object else {
+        let Some(bind_fn) = host_slot!(&self.api, bind_named_object) else {
             return FfiResult::UNSUPPORTED;
         };
         // SAFETY: `self.host_ctx.0` is an active `BamHostCtx` and `StrView::from_str(name)` borrows

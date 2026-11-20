@@ -1,6 +1,6 @@
 # Overview & Threat Model (`ABI 0.3.0`)
 
-`bevy_abi_mod` (also published on crates.io under the matching umbrella alias **`bevy_mod_abi`**) is an **asymmetric, zero-serialization `extern "C"` modding framework** for **Bevy ECS (`v0.20+`)**. It lets a Bevy application load, execute, budget, quarantine, persist, and hot-unload native dynamic libraries (`.so`, `.dylib`, `.dll`) compiled with **different Rust compiler versions**, **different optimization flags (`-O0` vs. `--release`)**, or **non-Rust languages (ISO C99, C++17/20, Zig)** without sharing Rust ABI assumptions or serializing ECS tables.
+**`bevy_mod_abi`** (workspace `bevy_abi_mod`; legacy `bevy_abi_mod` is now a minimal `#[deprecated]` compatibility shim forwarding to `bevy_mod_abi`) is an **asymmetric, zero-serialization `extern "C"` modding framework** for **Bevy ECS (`v0.20+`)**. It lets a Bevy application load, execute, budget, quarantine, persist, and hot-unload native dynamic libraries (`.so`, `.dylib`, `.dll`) compiled with **different Rust compiler versions**, **different optimization flags (`-O0` vs. `--release`)**, or **non-Rust languages (ISO C99, C++17/20, Zig)** without sharing Rust ABI assumptions or serializing ECS tables.
 
 ---
 
@@ -26,20 +26,20 @@ The workspace comprises **16 workspace crates** (15 library/umbrella crates plus
 | Crate | `#![forbid(unsafe_code)]` | `bevy*` Allowed | Role |
 |---|---|---|---|
 | `bevy_abi_mod_sys` | No (`#![no_std]`) | **Never** | Zero-dependency `ABI 0.3.0` `#[repr(C)]` wire contract & `offsets` (`include/bevy_abi_mod.h` source of truth). |
-| `bevy_abi_mod_macros` | **Yes** | **Never** | `#[derive(ModComponent, AbiPod)]` zero-padding assertions, `SCHEMA_FINGERPRINT`, `BAM_FIELDS`, and VTable/C/Zig codegen. |
-| `bevy_abi_mod_trust` | **Yes** | **Never** | Pure-Rust Ed25519 OpenSSH `SSHSIG`, CA certificate, `SSHKRL`, `.bam_sig`, and `.bampack` verifier. |
-| `bevy_abi_mod_manifest` | **Yes** | **Never** | `mod.toml` manifest parser and Kahn SemVer DAG topological loader (`ModTomlManifest`, `ModDependencyGraph`). |
+| `bevy_abi_mod_macros` | **Yes** | **Never** | `#[derive(ModComponent, AbiPod, GuestComponent)]` zero-padding assertions, `SCHEMA_FINGERPRINT`, `BAM_FIELDS`, and VTable/C/Zig codegen. |
+| `bevy_abi_mod_trust` | **Yes** | **Never** | Pure-Rust Ed25519 OpenSSH `SSHSIG`, CA certificate, authority-scoped `SSHKRL`, `.bam_sig`, and hardened `.bampack` (`VerifiedBamPack::extract_to_dir`) verifier. |
+| `bevy_abi_mod_manifest` | **Yes** | **Never** | `mod.toml` manifest parser, path/symlink validator, and Kahn SemVer DAG topological loader (`ModTomlManifest`, `ModDependencyGraph`). |
 | `bevy_abi_mod_sdk_gen` | **Yes** | **Never** | Single-source C99 (`include/bevy_abi_mod.h`), C++17, Zig, and component header generator (`BAM_EXPORT`, `BAM_RESTRICT`, `BAM_HOST_API_OFFSET_*`). |
-| `bevy_abi_mod_host_sys` | No (isolates host `unsafe`) | Yes (core ECS) | 68/68 `HOST_API`, sealed `ffi/mod.rs` + `ffi/validation.rs`, `HostIter`, `CascadeHierarchyCache`, `ModRelationGraph`, `ModScheduleSetRegistry`, `CommandArena`, `GuestSystem`, `DROP_PAGES`, zero-copy reload & `migrate_component_column`. |
-| `bevy_abi_mod_host` | **Yes** | Yes (**headless only**) | Slim headless Bevy `AbiModPlugin`, `ModBudgetPolicy`, `ModUnloadHooks`, `ModWorldExt`, `ModAppExt`, `ModCommandsExt`, `LoadOptions`, `ComponentOptions`. |
-| `bevy_abi_mod_bridges` | **Yes** | Yes (opt-in features) | Opt-in Bevy `0.20` bridges: `std_types` + `Disabled`, dynamic `state` slabs (`SubStates`/`ComputedStates`), `asset` + `AssetOverlayPolicy`, `bsn`, `picking` + `input_ext`, `camera_light` (`PanOrbitCamera`, `SolariLighting`), `audio`, `ui` + `feathers`. |
-| `bevy_abi_mod_render` | **Yes** | Yes (render) | `ModSubAppPlugin<L>`, `ModWeslMaterialPlugin`, `ModSpriteMaterialPlugin`, and opt-in `ModMeshShaderPlugin`. |
-| `bevy_abi_mod_reflect` | **Yes** | Yes (reflect/remote) | `ModReflectPlugin` (witness + declarative `BamFieldDesc` `ReflectFromPtr` + BRP + TOML), `ModSaveGamePlugin`, and `ModTelemetryPlugin` (`bam/*` BRP + 64B Unix/loopback stream). |
+| `bevy_abi_mod_host_sys` | No (isolates host `unsafe`) | Yes (core ECS) | 68/68 `HOST_API`, sealed `ffi/mod.rs` + `ffi/validation.rs`, `HostIter`, `CascadeHierarchyCache`, `ModRelationGraph`, `ModScheduleSetRegistry`, `CommandArena`, `GuestSystem`, observer `FallbackErrorHandler`/`ErrorContext::Observer`, `DROP_PAGES`, zero-copy reload & `migrate_component_column`. |
+| `bevy_abi_mod_host` | **Yes** | Yes (**headless only**) | Slim headless Bevy `AbiModPlugin`, `ModBudgetPolicy`, `ModUnloadHooks`, `ModWorldExt` (`despawn_all_where` incl. `Allow<Disabled>`), `ModAppExt`, `ModCommandsExt`, `LoadOptions`, `ComponentOptions::with_summary_tick()`. |
+| `bevy_abi_mod_bridges` | **Yes** | Yes (opt-in features) | Opt-in Bevy `0.20` bridges (`std_types`+`Disabled`, `state`, `asset`+`AssetOverlayPolicy`, `bsn`, `picking`, `bridge-camera-2d`, `camera_light`, `audio`, `ui`+real `feathers` BSN) + presets `preset-2d`/`3d`/`ui`/`full` (`ModPreset*Plugin`). |
+| `bevy_abi_mod_render` | **Yes** | Yes (render) | `ModSubAppPlugin<L>`, `ModWeslMaterialPlugin`, `ModSpriteMaterialPlugin`, opt-in `ModMeshShaderPlugin`, and `ModRenderRecoveryPlugin` (`DeviceLost` recovery). |
+| `bevy_abi_mod_reflect` | **Yes** | Yes (reflect/remote) | `ModReflectPlugin` (witness + declarative `BamFieldDesc` `ReflectFromPtr` + BRP + TOML), `ModSaveGamePlugin` (`HandleSerializeProcessor`/`HandleDeserializeProcessor`), and `ModTelemetryPlugin` (`bam/*` BRP + 64B Unix/loopback stream). |
 | `bevy_abi_mod_watcher` | **Yes** | Yes (`notify`) | Debounced filesystem watcher (`ModHotReloadPlugin`) with cascading DAG hot-reloads. |
-| `bevy_abi_mod` | **Yes** | Yes (via features) | Top-level host facade crate re-exporting `bevy_abi_mod_host`, macros, companion crates (17 features), and unified `prelude`. |
-| `bevy_mod_abi` | **Yes** | Yes (via facade) | `crates.io` umbrella alias matching `github.com/yaga-simha/bevy_mod_abi` (`cargo add bevy_mod_abi`). |
+| `bevy_mod_abi` | **Yes** | Yes (via features) | **Canonical top-level host facade** re-exporting `bevy_abi_mod_host`, macros, companion crates (18 granular features + 4 presets), and unified `prelude` (`cargo add bevy_mod_abi`). |
+| `bevy_abi_mod` | **Yes** | Yes (via `bevy_mod_abi`) | Minimal (`< 80` LoC) `#[deprecated]` compatibility shim forwarding `bevy_mod_abi::*`, `prelude`, and all feature flags 1:1. |
 | `bevy_abi_mod_guest_sys` | No (isolates guest `unsafe`) | **Never** | Per-World `GuestInstance`, all 68 `Host` slot wrappers, `catch_guest_*` panic guards, lock-free closure trampolines, slice/migration validators. |
-| `bevy_abi_mod_guest` | **Yes** | **Never** | Safe Rust guest SDK covering all 18 ABI `0.3.0` slots (`GuestPlugin`, `GuestApp`, `GuestTransaction`, 16-term `QueryTuple`, `Or<(T0..T7)>`, `export_mod!`). |
+| `bevy_abi_mod_guest` | **Yes** | **Never** | Safe Rust guest SDK (`GuestPlugin`, `GuestApp`, `#[derive(AbiPod, GuestComponent)]`, typed `query_typed`/`single_query`, `ObserverBuilder::run_if`, `GuestTransaction`, 16-term `QueryTuple`, `Or<(T0..T7)>`, `export_mod!`). |
 | `cargo-bam` | **Yes** | **Never** | Standalone CLI (`new`, `export-sdk`/`header`, `build`, `pack`, `watch`, `check-mods`, `doctor`, `keygen`, `sign`, `verify`). |
 
 See [`spec.md`](../../../spec.md), [`docs/ARCHITECTURE.md`](../../ARCHITECTURE.md), and the [`bevy_bql` Lowering Contract](./bql-lowering-contract.md) for the complete module breakdown, wire contract, and memory reclamation diagrams.

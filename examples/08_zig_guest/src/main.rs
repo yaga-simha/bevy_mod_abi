@@ -5,10 +5,10 @@
 //! error-union mapping (`error.InvalidArgument -> FfiResult::INVALID_ARGUMENT`), and gracefully
 //! skips runtime execution when `zig` is not installed locally.
 
-use bevy_abi_mod::prelude::*;
 use bevy_abi_mod_sys::{FfiBool, FfiResult};
 use bevy_app::App;
 use bevy_ecs::message::Messages;
+use bevy_mod_abi::prelude::*;
 use example_08_zig_guest::{Position, Velocity, ZigSimConfig, try_resolve_or_build_zig_mod};
 
 fn main() {

@@ -5,14 +5,13 @@ use core::{ffi::c_void, marker::PhantomData, mem::MaybeUninit, ops::Index};
 use std::ffi::CString;
 
 use bevy_abi_mod_sys::{
-    AbiPod, AccessMode, BamChangeTicks, BamColumnInfo, BamComponent, BamHostApi, BamIter,
-    BamIterCountFn, BamIterReadRemovedFn, BamIterUpCascadeFn, BamMsgReadBatchFn, BamMsgSendFn,
-    BamMsgWriteBatchFn, BamParForEachChunkFn, BamResTicksFn, ComponentUuid, FfiBool, FfiEntity,
-    FfiResult, FfiSlice, MAX_TERMS_PER_QUERY, ModComponent, StrView,
+    AbiPod, AccessMode, BamChangeTicks, BamColumnInfo, BamComponent, BamIter, ComponentUuid,
+    FfiBool, FfiEntity, FfiResult, FfiSlice, MAX_TERMS_PER_QUERY, ModComponent, StrView,
 };
 
 use crate::{
     host::{Host, ValidatedStringVTable, ValidatedWireVTable},
+    instance::qualify_mod_component_identity,
     panic::catch_guest_result,
 };
 
@@ -243,7 +242,63 @@ unsafe fn raw_dense_slice_mut<'a, T: AbiPod>(ptr: *mut u8, len: usize) -> Option
     Some(unsafe { core::slice::from_raw_parts_mut(ptr.cast::<T>(), len) })
 }
 
-/// Validated read-only dense column view carrying optional [`BamColumnInfo`] layout/UUID metadata.
+#[inline]
+fn validate_slice_meta<T: AbiPod>(
+    valid: bool,
+    expected_size: Option<usize>,
+    expected_align: Option<usize>,
+    uuid: Option<ComponentUuid>,
+    expected_uuid: Option<UuidFilter>,
+) -> bool {
+    if !valid {
+        return false;
+    }
+    if let Some(filter) = expected_uuid {
+        let Some(actual_uuid) = uuid else {
+            return false;
+        };
+        if !filter.matches(actual_uuid) {
+            return false;
+        }
+    }
+    let Some(sz) = expected_size else {
+        return false;
+    };
+    if sz != core::mem::size_of::<T>() {
+        return false;
+    }
+    if let Some(al) = expected_align
+        && al != core::mem::align_of::<T>()
+    {
+        return false;
+    }
+    true
+}
+
+#[inline]
+fn checked_slice_elem_offset(
+    valid: bool,
+    len: usize,
+    expected_size: Option<usize>,
+    index: usize,
+    elem_stride: usize,
+) -> Option<usize> {
+    if !valid || index >= len {
+        return None;
+    }
+    let expected = expected_size?;
+    if expected != elem_stride {
+        return None;
+    }
+    let byte_offset = index.checked_mul(elem_stride)?;
+    let total = len.checked_mul(elem_stride)?;
+    if total > isize::MAX as usize {
+        return None;
+    }
+    Some(byte_offset)
+}
+
+/// Validated read-only dense column view carrying [`BamColumnInfo`] or explicit stride metadata.
 pub struct ValidatedSlice<'a> {
     ptr: *const u8,
     len: usize,
@@ -256,8 +311,7 @@ pub struct ValidatedSlice<'a> {
 }
 
 impl<'a> ValidatedSlice<'a> {
-    /// Constructs an empty/invalid slice whose typed conversions return `None` (or `&[]` if valid
-    /// zero-length with matching layout).
+    /// Constructs an empty/invalid slice whose typed conversions return `None`.
     #[inline]
     pub const fn invalid() -> Self {
         Self {
@@ -272,17 +326,18 @@ impl<'a> ValidatedSlice<'a> {
         }
     }
 
-    /// Constructs a [`ValidatedSlice`] from raw parts with an optional byte `stride` (`0` = unspecified).
+    /// Constructs a [`ValidatedSlice`] from raw parts with exact element byte `stride` (`0` means
+    /// zero-sized elements only; non-ZST typed casts are rejected when `stride == 0`).
     ///
     /// # Safety
-    /// If `ptr` is non-null and `len > 0`, `ptr` must remain valid for shared reads of `len`
-    /// contiguous elements of `stride` bytes for lifetime `'a`.
+    /// If `ptr` is non-null and `len > 0` and `stride > 0`, `ptr` must remain valid for shared
+    /// reads of `len` contiguous elements of `stride` bytes for lifetime `'a`.
     #[inline]
     pub const unsafe fn from_raw_parts(ptr: *const u8, len: usize, stride: usize) -> Self {
         Self {
             ptr,
             len,
-            expected_size: if stride > 0 { Some(stride) } else { None },
+            expected_size: Some(stride),
             expected_align: None,
             uuid: None,
             manifest_name: "",
@@ -348,7 +403,7 @@ impl<'a> ValidatedSlice<'a> {
         self.ptr
     }
 
-    /// Returns the known element byte stride (`0` if unknown or ZST).
+    /// Returns the known element byte stride (`0` if invalid or ZST).
     #[inline]
     pub const fn stride(&self) -> usize {
         match self.expected_size {
@@ -366,19 +421,16 @@ impl<'a> ValidatedSlice<'a> {
     /// Computes a bounds-checked element pointer at `index` using `elem_stride` bytes per element.
     #[inline]
     pub fn get_ptr(&self, index: usize, elem_stride: usize) -> Option<*const u8> {
-        if !self.valid || self.ptr.is_null() || index >= self.len {
+        if self.ptr.is_null() {
             return None;
         }
-        if let Some(expected) = self.expected_size
-            && expected != elem_stride
-        {
-            return None;
-        }
-        let byte_offset = index.checked_mul(elem_stride)?;
-        let total = self.len.checked_mul(elem_stride)?;
-        if total > isize::MAX as usize {
-            return None;
-        }
+        let byte_offset = checked_slice_elem_offset(
+            self.valid,
+            self.len,
+            self.expected_size,
+            index,
+            elem_stride,
+        )?;
         // SAFETY: `index < self.len`, `total <= isize::MAX`, and `self.ptr` covers `total` bytes.
         Some(unsafe { self.ptr.add(byte_offset) })
     }
@@ -389,32 +441,16 @@ impl<'a> ValidatedSlice<'a> {
         &self,
         expected_uuid: Option<UuidFilter>,
     ) -> Option<&'a [T]> {
-        if !self.valid {
+        if !validate_slice_meta::<T>(
+            self.valid,
+            self.expected_size,
+            self.expected_align,
+            self.uuid,
+            expected_uuid,
+        ) {
             return None;
         }
-        if let Some(filter) = expected_uuid {
-            let actual_uuid = self.uuid?;
-            if !filter.matches(actual_uuid) {
-                return None;
-            }
-        }
-        if let Some(sz) = self.expected_size
-            && sz != core::mem::size_of::<T>()
-        {
-            return None;
-        }
-        if let Some(al) = self.expected_align
-            && al != core::mem::align_of::<T>()
-        {
-            return None;
-        }
-        if self.len == 0 && !self.ptr.is_null() {
-            return Some(&[]);
-        }
-        if self.len == 0 && core::mem::size_of::<T>() == 0 {
-            return Some(&[]);
-        }
-        if self.len == 0 && self.expected_size.is_none() {
+        if self.len == 0 && (!self.ptr.is_null() || core::mem::size_of::<T>() == 0) {
             return Some(&[]);
         }
         // SAFETY: Layout/UUID checks succeeded and `self.ptr` covers `self.len` elements for `'a`.
@@ -428,7 +464,7 @@ impl<'a> ValidatedSlice<'a> {
     }
 }
 
-/// Validated mutable dense column view carrying optional [`BamColumnInfo`] layout/UUID metadata.
+/// Validated mutable dense column view carrying [`BamColumnInfo`] or explicit stride metadata.
 pub struct ValidatedSliceMut<'a> {
     ptr: *mut u8,
     len: usize,
@@ -456,17 +492,18 @@ impl<'a> ValidatedSliceMut<'a> {
         }
     }
 
-    /// Constructs a [`ValidatedSliceMut`] from raw parts with an optional byte `stride` (`0` = unspecified).
+    /// Constructs a [`ValidatedSliceMut`] from raw parts with exact element byte `stride` (`0`
+    /// means zero-sized elements only; non-ZST typed casts are rejected when `stride == 0`).
     ///
     /// # Safety
-    /// If `ptr` is non-null and `len > 0`, `ptr` must remain valid for exclusive mutable reads and
-    /// writes of `len` contiguous elements of `stride` bytes for lifetime `'a`.
+    /// If `ptr` is non-null and `len > 0` and `stride > 0`, `ptr` must remain valid for exclusive
+    /// mutable reads and writes of `len` contiguous elements of `stride` bytes for lifetime `'a`.
     #[inline]
     pub const unsafe fn from_raw_parts(ptr: *mut u8, len: usize, stride: usize) -> Self {
         Self {
             ptr,
             len,
-            expected_size: if stride > 0 { Some(stride) } else { None },
+            expected_size: Some(stride),
             expected_align: None,
             uuid: None,
             manifest_name: "",
@@ -541,7 +578,7 @@ impl<'a> ValidatedSliceMut<'a> {
         self.ptr
     }
 
-    /// Returns the known element byte stride (`0` if unknown or ZST).
+    /// Returns the known element byte stride (`0` if invalid or ZST).
     #[inline]
     pub const fn stride(&self) -> usize {
         match self.expected_size {
@@ -559,19 +596,16 @@ impl<'a> ValidatedSliceMut<'a> {
     /// Computes a bounds-checked read-only element pointer at `index`.
     #[inline]
     pub fn get_ptr(&self, index: usize, elem_stride: usize) -> Option<*const u8> {
-        if !self.valid || self.ptr.is_null() || index >= self.len {
+        if self.ptr.is_null() {
             return None;
         }
-        if let Some(expected) = self.expected_size
-            && expected != elem_stride
-        {
-            return None;
-        }
-        let byte_offset = index.checked_mul(elem_stride)?;
-        let total = self.len.checked_mul(elem_stride)?;
-        if total > isize::MAX as usize {
-            return None;
-        }
+        let byte_offset = checked_slice_elem_offset(
+            self.valid,
+            self.len,
+            self.expected_size,
+            index,
+            elem_stride,
+        )?;
         // SAFETY: `index < self.len`, `total <= isize::MAX`, and `self.ptr` covers `total` bytes.
         Some(unsafe { self.ptr.add(byte_offset).cast_const() })
     }
@@ -579,19 +613,16 @@ impl<'a> ValidatedSliceMut<'a> {
     /// Computes a bounds-checked mutable element pointer at `index`.
     #[inline]
     pub fn get_mut_ptr(&mut self, index: usize, elem_stride: usize) -> Option<*mut u8> {
-        if !self.valid || self.ptr.is_null() || index >= self.len {
+        if self.ptr.is_null() {
             return None;
         }
-        if let Some(expected) = self.expected_size
-            && expected != elem_stride
-        {
-            return None;
-        }
-        let byte_offset = index.checked_mul(elem_stride)?;
-        let total = self.len.checked_mul(elem_stride)?;
-        if total > isize::MAX as usize {
-            return None;
-        }
+        let byte_offset = checked_slice_elem_offset(
+            self.valid,
+            self.len,
+            self.expected_size,
+            index,
+            elem_stride,
+        )?;
         // SAFETY: `index < self.len`, `total <= isize::MAX`, and `self.ptr` covers `total` bytes.
         Some(unsafe { self.ptr.add(byte_offset) })
     }
@@ -603,30 +634,16 @@ impl<'a> ValidatedSliceMut<'a> {
         &self,
         expected_uuid: Option<UuidFilter>,
     ) -> Option<&[T]> {
-        if !self.valid {
+        if !validate_slice_meta::<T>(
+            self.valid,
+            self.expected_size,
+            self.expected_align,
+            self.uuid,
+            expected_uuid,
+        ) {
             return None;
         }
-        if let Some(filter) = expected_uuid {
-            let actual_uuid = self.uuid?;
-            if !filter.matches(actual_uuid) {
-                return None;
-            }
-        }
-        if let Some(sz) = self.expected_size
-            && sz != core::mem::size_of::<T>()
-        {
-            return None;
-        }
-        if let Some(al) = self.expected_align
-            && al != core::mem::align_of::<T>()
-        {
-            return None;
-        }
-        if self.len == 0
-            && (!self.ptr.is_null()
-                || core::mem::size_of::<T>() == 0
-                || self.expected_size.is_none())
-        {
+        if self.len == 0 && (!self.ptr.is_null() || core::mem::size_of::<T>() == 0) {
             return Some(&[]);
         }
         // SAFETY: Layout/UUID checks succeeded and `&self` borrows `self.ptr` immutably.
@@ -646,30 +663,16 @@ impl<'a> ValidatedSliceMut<'a> {
         &mut self,
         expected_uuid: Option<UuidFilter>,
     ) -> Option<&mut [T]> {
-        if !self.valid {
+        if !validate_slice_meta::<T>(
+            self.valid,
+            self.expected_size,
+            self.expected_align,
+            self.uuid,
+            expected_uuid,
+        ) {
             return None;
         }
-        if let Some(filter) = expected_uuid {
-            let actual_uuid = self.uuid?;
-            if !filter.matches(actual_uuid) {
-                return None;
-            }
-        }
-        if let Some(sz) = self.expected_size
-            && sz != core::mem::size_of::<T>()
-        {
-            return None;
-        }
-        if let Some(al) = self.expected_align
-            && al != core::mem::align_of::<T>()
-        {
-            return None;
-        }
-        if self.len == 0
-            && (!self.ptr.is_null()
-                || core::mem::size_of::<T>() == 0
-                || self.expected_size.is_none())
-        {
+        if self.len == 0 && (!self.ptr.is_null() || core::mem::size_of::<T>() == 0) {
             return Some(&mut []);
         }
         // SAFETY: Layout/UUID checks succeeded and `&mut self` guarantees exclusive access.
@@ -688,30 +691,16 @@ impl<'a> ValidatedSliceMut<'a> {
         self,
         expected_uuid: Option<UuidFilter>,
     ) -> Option<&'a mut [T]> {
-        if !self.valid {
+        if !validate_slice_meta::<T>(
+            self.valid,
+            self.expected_size,
+            self.expected_align,
+            self.uuid,
+            expected_uuid,
+        ) {
             return None;
         }
-        if let Some(filter) = expected_uuid {
-            let actual_uuid = self.uuid?;
-            if !filter.matches(actual_uuid) {
-                return None;
-            }
-        }
-        if let Some(sz) = self.expected_size
-            && sz != core::mem::size_of::<T>()
-        {
-            return None;
-        }
-        if let Some(al) = self.expected_align
-            && al != core::mem::align_of::<T>()
-        {
-            return None;
-        }
-        if self.len == 0
-            && (!self.ptr.is_null()
-                || core::mem::size_of::<T>() == 0
-                || self.expected_size.is_none())
-        {
+        if self.len == 0 && (!self.ptr.is_null() || core::mem::size_of::<T>() == 0) {
             return Some(&mut []);
         }
         // SAFETY: Consumes `self`, transferring exclusive `'a` access to the returned slice.
@@ -754,7 +743,12 @@ impl<'a, T: AbiPod> SparseRows<'a, T> {
                 _marker: PhantomData,
             });
         }
-        if ptrs.is_null() || !(ptrs as usize).is_multiple_of(core::mem::align_of::<*const u8>()) {
+        if ptrs.is_null()
+            || !(ptrs as usize).is_multiple_of(core::mem::align_of::<*const u8>())
+            || len
+                .checked_mul(core::mem::size_of::<*const u8>())
+                .is_none_or(|bytes| bytes > isize::MAX as usize)
+        {
             return None;
         }
         let align = core::mem::align_of::<T>();
@@ -903,7 +897,12 @@ impl<'a, T: AbiPod> SparseRowsMut<'a, T> {
                 _marker: PhantomData,
             });
         }
-        if ptrs.is_null() || !(ptrs as usize).is_multiple_of(core::mem::align_of::<*mut u8>()) {
+        if ptrs.is_null()
+            || !(ptrs as usize).is_multiple_of(core::mem::align_of::<*mut u8>())
+            || len
+                .checked_mul(core::mem::size_of::<*mut u8>())
+                .is_none_or(|bytes| bytes > isize::MAX as usize)
+        {
             return None;
         }
         let align = core::mem::align_of::<T>();
@@ -1718,15 +1717,7 @@ impl<'a> ValidatedIter<'a> {
         if self.raw.is_null() {
             return Err(FfiResult::NULL_POINTER);
         }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, res_ticks),
-            core::mem::size_of::<Option<BamResTicksFn>>(),
-        ) {
-            return Err(FfiResult::UNSUPPORTED);
-        }
-        let Some(ticks_fn) = self.host.api().res_ticks else {
-            return Err(FfiResult::UNSUPPORTED);
-        };
+        let ticks_fn = host_slot!(self.host.api(), res_ticks).ok_or(FfiResult::UNSUPPORTED)?;
         let mut out = BamChangeTicks::default();
         // SAFETY: `self.raw` is active and `&mut out` is aligned writable `BamChangeTicks` storage.
         let status = unsafe { ticks_fn(self.raw.cast_const(), term_index, &mut out) };
@@ -1766,13 +1757,7 @@ impl<'a> ValidatedIter<'a> {
         if self.raw.is_null() {
             return FfiResult::OK;
         }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, par_for_each_chunk),
-            core::mem::size_of::<Option<BamParForEachChunkFn>>(),
-        ) {
-            return FfiResult::UNSUPPORTED;
-        }
-        let Some(par_fn) = self.host.api().par_for_each_chunk else {
+        let Some(par_fn) = host_slot!(self.host.api(), par_for_each_chunk) else {
             return FfiResult::UNSUPPORTED;
         };
         self.current_len = 0;
@@ -1804,13 +1789,7 @@ impl<'a> ValidatedIter<'a> {
         if self.raw.is_null() {
             return FfiResult::OK;
         }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, par_for_each_chunk_readonly),
-            core::mem::size_of::<Option<BamParForEachChunkFn>>(),
-        ) {
-            return FfiResult::UNSUPPORTED;
-        }
-        let Some(par_fn) = self.host.api().par_for_each_chunk_readonly else {
+        let Some(par_fn) = host_slot!(self.host.api(), par_for_each_chunk_readonly) else {
             return FfiResult::UNSUPPORTED;
         };
         self.current_len = 0;
@@ -1839,15 +1818,7 @@ impl<'a> ValidatedIter<'a> {
         if self.raw.is_null() {
             return Err(FfiResult::NULL_POINTER);
         }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, iter_count),
-            core::mem::size_of::<Option<BamIterCountFn>>(),
-        ) {
-            return Err(FfiResult::UNSUPPORTED);
-        }
-        let Some(count_fn) = self.host.api().iter_count else {
-            return Err(FfiResult::UNSUPPORTED);
-        };
+        let count_fn = host_slot!(self.host.api(), iter_count).ok_or(FfiResult::UNSUPPORTED)?;
         let mut out = 0usize;
         // SAFETY: `self.raw` is an active `BamIter` for `'a` and `&mut out` is aligned writable storage.
         let status = unsafe { count_fn(self.raw, &mut out) };
@@ -1876,15 +1847,8 @@ impl<'a> ValidatedIter<'a> {
         if entity.is_null() {
             return Err(FfiResult::INVALID_ENTITY);
         }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, iter_up_cascade),
-            core::mem::size_of::<Option<BamIterUpCascadeFn>>(),
-        ) {
-            return Err(FfiResult::UNSUPPORTED);
-        }
-        let Some(cascade_fn) = self.host.api().iter_up_cascade else {
-            return Err(FfiResult::UNSUPPORTED);
-        };
+        let cascade_fn =
+            host_slot!(self.host.api(), iter_up_cascade).ok_or(FfiResult::UNSUPPORTED)?;
         let info = self.column_info(term_index)?;
         if info.mode.is_mutable() {
             return Err(FfiResult::PERMISSION_DENIED);
@@ -1944,15 +1908,7 @@ impl<'a> ValidatedIter<'a> {
         if self.raw.is_null() {
             return Err(FfiResult::NULL_POINTER);
         }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, msg_read_batch),
-            core::mem::size_of::<Option<BamMsgReadBatchFn>>(),
-        ) {
-            return Err(FfiResult::UNSUPPORTED);
-        }
-        let Some(read_fn) = self.host.api().msg_read_batch else {
-            return Err(FfiResult::UNSUPPORTED);
-        };
+        let read_fn = host_slot!(self.host.api(), msg_read_batch).ok_or(FfiResult::UNSUPPORTED)?;
         let info = self.column_info(term_index)?;
         if !validate_message_read_info::<M>(&info, expected_uuid) {
             return Err(FfiResult::TYPE_MISMATCH);
@@ -2017,13 +1973,7 @@ impl<'a> ValidatedIter<'a> {
         if self.raw.is_null() {
             return FfiResult::NULL_POINTER;
         }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, msg_send),
-            core::mem::size_of::<Option<BamMsgSendFn>>(),
-        ) {
-            return FfiResult::UNSUPPORTED;
-        }
-        let Some(send_fn) = self.host.api().msg_send else {
+        let Some(send_fn) = host_slot!(self.host.api(), msg_send) else {
             return FfiResult::UNSUPPORTED;
         };
         let info = match self.column_info(term_index) {
@@ -2054,13 +2004,7 @@ impl<'a> ValidatedIter<'a> {
         if self.raw.is_null() {
             return FfiResult::NULL_POINTER;
         }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, msg_write_batch),
-            core::mem::size_of::<Option<BamMsgWriteBatchFn>>(),
-        ) {
-            return FfiResult::UNSUPPORTED;
-        }
-        let Some(write_fn) = self.host.api().msg_write_batch else {
+        let Some(write_fn) = host_slot!(self.host.api(), msg_write_batch) else {
             return FfiResult::UNSUPPORTED;
         };
         let info = match self.column_info(term_index) {
@@ -2100,15 +2044,7 @@ impl<'a> ValidatedIter<'a> {
         if self.raw.is_null() {
             return Err(FfiResult::NULL_POINTER);
         }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, msg_read_batch),
-            core::mem::size_of::<Option<BamMsgReadBatchFn>>(),
-        ) {
-            return Err(FfiResult::UNSUPPORTED);
-        }
-        let Some(read_fn) = self.host.api().msg_read_batch else {
-            return Err(FfiResult::UNSUPPORTED);
-        };
+        let read_fn = host_slot!(self.host.api(), msg_read_batch).ok_or(FfiResult::UNSUPPORTED)?;
         let info = self.column_info(term_index)?;
         if !validate_non_pod_message_info(&info, expected_uuid, false) {
             return Err(FfiResult::TYPE_MISMATCH);
@@ -2156,7 +2092,13 @@ impl<'a> ValidatedIter<'a> {
         max_count: usize,
     ) -> Result<Vec<M>, FfiResult> {
         let info = self.column_info(term_index)?;
-        if !validate_non_pod_message_info(&info, expected_uuid, false) {
+        let effective_uuid = expected_uuid.unwrap_or_else(|| UuidFilter::exact(M::UUID));
+        if !validate_non_pod_message_info_for::<M>(
+            &info,
+            self.host.manifest_name(),
+            Some(effective_uuid),
+            false,
+        ) {
             return Err(FfiResult::TYPE_MISMATCH);
         }
         self.verify_non_pod_message_marker::<M>()?;
@@ -2166,7 +2108,7 @@ impl<'a> ValidatedIter<'a> {
 
         let mut ptrs = vec![core::ptr::null::<c_void>(); max_count];
         let actual =
-            self.read_non_pod_message_ptrs_checked(term_index, expected_uuid, &mut ptrs)?;
+            self.read_non_pod_message_ptrs_checked(term_index, Some(effective_uuid), &mut ptrs)?;
         if actual == 0 {
             return Ok(Vec::new());
         }
@@ -2220,11 +2162,19 @@ impl<'a> ValidatedIter<'a> {
             type_tag: StrView,
             payload: FfiSlice<u8>,
         ) -> FfiResult {
-            // SAFETY: `ctx` points to a stack-pinned `ImportSinkCtx` for the duration of `host_export_fn`.
-            let sink_ctx = unsafe { &*ctx.cast::<ImportSinkCtx>() };
-            // SAFETY: `sink_ctx.dst_ptr` points to a valid initialized `M`, and `field_name`,
-            // `type_tag`, `payload` are valid slices for this synchronous callback.
-            unsafe { (sink_ctx.import_fn)(sink_ctx.dst_ptr, field_name, type_tag, payload) }
+            catch_guest_result(|| {
+                if ctx.is_null()
+                    || !(ctx as usize).is_multiple_of(core::mem::align_of::<ImportSinkCtx>())
+                {
+                    return FfiResult::INVALID_ARGUMENT;
+                }
+                // SAFETY: `ctx` is non-null, aligned, and points to a stack-pinned `ImportSinkCtx`
+                // for the duration of `host_export_fn`.
+                let sink_ctx = unsafe { &*ctx.cast::<ImportSinkCtx>() };
+                // SAFETY: `sink_ctx.dst_ptr` points to a valid initialized `M`, and `field_name`,
+                // `type_tag`, `payload` are valid slices for this synchronous callback.
+                unsafe { (sink_ctx.import_fn)(sink_ctx.dst_ptr, field_name, type_tag, payload) }
+            })
         }
 
         let mut out = Vec::with_capacity(actual);
@@ -2287,20 +2237,20 @@ impl<'a> ValidatedIter<'a> {
         if self.raw.is_null() {
             return FfiResult::NULL_POINTER;
         }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, msg_send),
-            core::mem::size_of::<Option<BamMsgSendFn>>(),
-        ) {
-            return FfiResult::UNSUPPORTED;
-        }
-        let Some(send_fn) = self.host.api().msg_send else {
+        let Some(send_fn) = host_slot!(self.host.api(), msg_send) else {
             return FfiResult::UNSUPPORTED;
         };
         let info = match self.column_info(term_index) {
             Ok(i) => i,
             Err(err) => return err,
         };
-        if !validate_non_pod_message_info(&info, expected_uuid, true) {
+        let effective_uuid = expected_uuid.unwrap_or_else(|| UuidFilter::exact(M::UUID));
+        if !validate_non_pod_message_info_for::<M>(
+            &info,
+            self.host.manifest_name(),
+            Some(effective_uuid),
+            true,
+        ) {
             return FfiResult::TYPE_MISMATCH;
         }
         if let Err(err) = self.verify_non_pod_message_marker::<M>() {
@@ -2341,41 +2291,49 @@ impl<'a> ValidatedIter<'a> {
             type_tag: StrView,
             payload: FfiSlice<u8>,
         ) -> FfiResult {
-            // SAFETY: `ctx` points to an active `PacketBuilder` on the stack for this call.
-            let builder = unsafe { &mut *ctx.cast::<PacketBuilder>() };
-            // SAFETY: `field_name`, `type_tag`, and `payload` come directly from `export_fields`
-            // and borrow live slices for this synchronous callback.
-            let Ok(name_bytes) = (unsafe { field_name.try_as_slice() }) else {
-                return FfiResult::NULL_POINTER;
-            };
-            // SAFETY: Same as above for `type_tag`.
-            let Ok(tag_bytes) = (unsafe { type_tag.try_as_slice() }) else {
-                return FfiResult::NULL_POINTER;
-            };
-            // SAFETY: Same as above for `payload`.
-            let Ok(val_bytes) = (unsafe { payload.try_as_slice() }) else {
-                return FfiResult::NULL_POINTER;
-            };
-            let Ok(name_len) = u32::try_from(name_bytes.len()) else {
-                return FfiResult::CAPACITY_EXCEEDED;
-            };
-            let Ok(tag_len) = u32::try_from(tag_bytes.len()) else {
-                return FfiResult::CAPACITY_EXCEEDED;
-            };
-            let Ok(val_len) = u32::try_from(val_bytes.len()) else {
-                return FfiResult::CAPACITY_EXCEEDED;
-            };
-            let Some(next_count) = builder.field_count.checked_add(1) else {
-                return FfiResult::CAPACITY_EXCEEDED;
-            };
-            builder.field_count = next_count;
-            builder.buf.extend_from_slice(&name_len.to_le_bytes());
-            builder.buf.extend_from_slice(name_bytes);
-            builder.buf.extend_from_slice(&tag_len.to_le_bytes());
-            builder.buf.extend_from_slice(tag_bytes);
-            builder.buf.extend_from_slice(&val_len.to_le_bytes());
-            builder.buf.extend_from_slice(val_bytes);
-            FfiResult::OK
+            catch_guest_result(|| {
+                if ctx.is_null()
+                    || !(ctx as usize).is_multiple_of(core::mem::align_of::<PacketBuilder>())
+                {
+                    return FfiResult::INVALID_ARGUMENT;
+                }
+                // SAFETY: `ctx` is non-null, aligned, and points to an active `PacketBuilder` on
+                // the stack for this call.
+                let builder = unsafe { &mut *ctx.cast::<PacketBuilder>() };
+                // SAFETY: `field_name`, `type_tag`, and `payload` come directly from `export_fields`
+                // and borrow live slices for this synchronous callback.
+                let Ok(name_bytes) = (unsafe { field_name.try_as_slice() }) else {
+                    return FfiResult::NULL_POINTER;
+                };
+                // SAFETY: Same as above for `type_tag`.
+                let Ok(tag_bytes) = (unsafe { type_tag.try_as_slice() }) else {
+                    return FfiResult::NULL_POINTER;
+                };
+                // SAFETY: Same as above for `payload`.
+                let Ok(val_bytes) = (unsafe { payload.try_as_slice() }) else {
+                    return FfiResult::NULL_POINTER;
+                };
+                let Ok(name_len) = u32::try_from(name_bytes.len()) else {
+                    return FfiResult::CAPACITY_EXCEEDED;
+                };
+                let Ok(tag_len) = u32::try_from(tag_bytes.len()) else {
+                    return FfiResult::CAPACITY_EXCEEDED;
+                };
+                let Ok(val_len) = u32::try_from(val_bytes.len()) else {
+                    return FfiResult::CAPACITY_EXCEEDED;
+                };
+                let Some(next_count) = builder.field_count.checked_add(1) else {
+                    return FfiResult::CAPACITY_EXCEEDED;
+                };
+                builder.field_count = next_count;
+                builder.buf.extend_from_slice(&name_len.to_le_bytes());
+                builder.buf.extend_from_slice(name_bytes);
+                builder.buf.extend_from_slice(&tag_len.to_le_bytes());
+                builder.buf.extend_from_slice(tag_bytes);
+                builder.buf.extend_from_slice(&val_len.to_le_bytes());
+                builder.buf.extend_from_slice(val_bytes);
+                FfiResult::OK
+            })
         }
 
         let mut builder = PacketBuilder {
@@ -2437,15 +2395,8 @@ impl<'a> ValidatedIter<'a> {
         if self.raw.is_null() {
             return Err(FfiResult::NULL_POINTER);
         }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, iter_read_removed),
-            core::mem::size_of::<Option<BamIterReadRemovedFn>>(),
-        ) {
-            return Err(FfiResult::UNSUPPORTED);
-        }
-        let Some(read_fn) = self.host.api().iter_read_removed else {
-            return Err(FfiResult::UNSUPPORTED);
-        };
+        let read_fn =
+            host_slot!(self.host.api(), iter_read_removed).ok_or(FfiResult::UNSUPPORTED)?;
         let info = self.column_info(term_index)?;
         if info.mode != AccessMode::REMOVED_READ || info.is_resource() || info.is_message() {
             return Err(FfiResult::TYPE_MISMATCH);
@@ -2488,6 +2439,33 @@ impl<'a> ValidatedIter<'a> {
     }
 
     #[inline]
+    fn validate_bridged_row_info(
+        &self,
+        term_index: usize,
+        row: usize,
+        expected_uuid: ComponentUuid,
+        host_size: usize,
+        host_align: usize,
+        require_mutable: bool,
+    ) -> Result<BamColumnInfo, FfiResult> {
+        if row >= self.current_len {
+            return Err(FfiResult::OUT_OF_RANGE);
+        }
+        let info = self.column_info(term_index)?;
+        if !info.mode.has_entity_column_data()
+            || info.is_resource()
+            || info.is_message()
+            || (require_mutable && (!info.mode.is_mutable() || info.is_immutable()))
+            || info.uuid != expected_uuid
+            || info.size != host_size
+            || info.align != host_align
+        {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        Ok(info)
+    }
+
+    #[inline]
     fn raw_bridged_row_ptr_ro(
         &mut self,
         term_index: usize,
@@ -2496,19 +2474,14 @@ impl<'a> ValidatedIter<'a> {
         host_size: usize,
         host_align: usize,
     ) -> Result<Option<*const c_void>, FfiResult> {
-        if row >= self.current_len {
-            return Err(FfiResult::OUT_OF_RANGE);
-        }
-        let info = self.column_info(term_index)?;
-        if !info.mode.has_entity_column_data()
-            || info.is_resource()
-            || info.is_message()
-            || info.uuid != expected_uuid
-            || info.size != host_size
-            || info.align != host_align
-        {
-            return Err(FfiResult::TYPE_MISMATCH);
-        }
+        let info = self.validate_bridged_row_info(
+            term_index,
+            row,
+            expected_uuid,
+            host_size,
+            host_align,
+            false,
+        )?;
         if info.is_sparse_set() {
             let rows_fn = self
                 .host
@@ -2518,18 +2491,31 @@ impl<'a> ValidatedIter<'a> {
             // SAFETY: `self.raw` is active at `self.current_len` rows.
             let ptrs = unsafe { rows_fn(self.raw, term_index) };
             if ptrs.is_null() {
-                if info.mode.is_optional() {
-                    return Ok(None);
-                }
-                return Err(FfiResult::NULL_POINTER);
+                return if info.mode.is_optional() {
+                    Ok(None)
+                } else {
+                    Err(FfiResult::NULL_POINTER)
+                };
             }
-            // SAFETY: `row < self.current_len` and `ptrs` covers `self.current_len` pointers.
+            if !ptrs.is_aligned() {
+                return Err(FfiResult::TYPE_MISMATCH);
+            }
+            if self
+                .current_len
+                .checked_mul(core::mem::size_of::<*const u8>())
+                .is_none_or(|b| b > isize::MAX as usize)
+            {
+                return Err(FfiResult::OUT_OF_RANGE);
+            }
+            // SAFETY: `ptrs` is non-null, aligned, `current_len * size_of::<*const u8>() <= isize::MAX`,
+            // and `row < self.current_len`.
             let row_ptr = unsafe { *ptrs.add(row) };
             if row_ptr.is_null() {
-                if info.mode.is_optional() {
-                    return Ok(None);
-                }
-                return Err(FfiResult::NULL_POINTER);
+                return if info.mode.is_optional() {
+                    Ok(None)
+                } else {
+                    Err(FfiResult::NULL_POINTER)
+                };
             }
             if host_size > 0 && !(row_ptr as usize).is_multiple_of(host_align) {
                 return Err(FfiResult::TYPE_MISMATCH);
@@ -2538,10 +2524,11 @@ impl<'a> ValidatedIter<'a> {
         } else {
             let base = self.column_readonly_ptr(term_index);
             if base.is_null() {
-                if info.mode.is_optional() {
-                    return Ok(None);
-                }
-                return Err(FfiResult::NULL_POINTER);
+                return if info.mode.is_optional() {
+                    Ok(None)
+                } else {
+                    Err(FfiResult::NULL_POINTER)
+                };
             }
             if host_size == 0 {
                 return Ok(Some(base.cast::<c_void>()));
@@ -2550,7 +2537,10 @@ impl<'a> ValidatedIter<'a> {
                 return Err(FfiResult::TYPE_MISMATCH);
             }
             let offset = row.checked_mul(host_size).ok_or(FfiResult::OUT_OF_RANGE)?;
-            // SAFETY: `row < self.current_len` and `base` covers `self.current_len * host_size` bytes.
+            if offset > isize::MAX as usize {
+                return Err(FfiResult::OUT_OF_RANGE);
+            }
+            // SAFETY: `row < self.current_len`, `offset <= isize::MAX`, and `base` covers the column.
             Ok(Some(unsafe { base.add(offset) }.cast::<c_void>()))
         }
     }
@@ -2564,21 +2554,14 @@ impl<'a> ValidatedIter<'a> {
         host_size: usize,
         host_align: usize,
     ) -> Result<Option<*mut c_void>, FfiResult> {
-        if row >= self.current_len {
-            return Err(FfiResult::OUT_OF_RANGE);
-        }
-        let info = self.column_info(term_index)?;
-        if !info.mode.is_mutable()
-            || !info.mode.has_entity_column_data()
-            || info.is_immutable()
-            || info.is_resource()
-            || info.is_message()
-            || info.uuid != expected_uuid
-            || info.size != host_size
-            || info.align != host_align
-        {
-            return Err(FfiResult::TYPE_MISMATCH);
-        }
+        let info = self.validate_bridged_row_info(
+            term_index,
+            row,
+            expected_uuid,
+            host_size,
+            host_align,
+            true,
+        )?;
         if info.is_sparse_set() {
             let rows_fn = self
                 .host
@@ -2588,18 +2571,31 @@ impl<'a> ValidatedIter<'a> {
             // SAFETY: `self.raw` is active at `self.current_len` rows under `&mut self`.
             let ptrs = unsafe { rows_fn(self.raw, term_index) };
             if ptrs.is_null() {
-                if info.mode.is_optional() {
-                    return Ok(None);
-                }
-                return Err(FfiResult::NULL_POINTER);
+                return if info.mode.is_optional() {
+                    Ok(None)
+                } else {
+                    Err(FfiResult::NULL_POINTER)
+                };
             }
-            // SAFETY: `row < self.current_len` and `ptrs` covers `self.current_len` writable pointers.
+            if !ptrs.is_aligned() {
+                return Err(FfiResult::TYPE_MISMATCH);
+            }
+            if self
+                .current_len
+                .checked_mul(core::mem::size_of::<*mut u8>())
+                .is_none_or(|b| b > isize::MAX as usize)
+            {
+                return Err(FfiResult::OUT_OF_RANGE);
+            }
+            // SAFETY: `ptrs` is non-null, aligned, `current_len * size_of::<*mut u8>() <= isize::MAX`,
+            // and `row < self.current_len`.
             let row_ptr = unsafe { *ptrs.add(row) };
             if row_ptr.is_null() {
-                if info.mode.is_optional() {
-                    return Ok(None);
-                }
-                return Err(FfiResult::NULL_POINTER);
+                return if info.mode.is_optional() {
+                    Ok(None)
+                } else {
+                    Err(FfiResult::NULL_POINTER)
+                };
             }
             if host_size > 0 && !(row_ptr as usize).is_multiple_of(host_align) {
                 return Err(FfiResult::TYPE_MISMATCH);
@@ -2608,10 +2604,11 @@ impl<'a> ValidatedIter<'a> {
         } else {
             let base = self.column_mutable_ptr(term_index);
             if base.is_null() {
-                if info.mode.is_optional() {
-                    return Ok(None);
-                }
-                return Err(FfiResult::NULL_POINTER);
+                return if info.mode.is_optional() {
+                    Ok(None)
+                } else {
+                    Err(FfiResult::NULL_POINTER)
+                };
             }
             if host_size == 0 {
                 return Ok(Some(base.cast::<c_void>()));
@@ -2620,7 +2617,10 @@ impl<'a> ValidatedIter<'a> {
                 return Err(FfiResult::TYPE_MISMATCH);
             }
             let offset = row.checked_mul(host_size).ok_or(FfiResult::OUT_OF_RANGE)?;
-            // SAFETY: `row < self.current_len` and `base` covers `self.current_len * host_size` bytes.
+            if offset > isize::MAX as usize {
+                return Err(FfiResult::OUT_OF_RANGE);
+            }
+            // SAFETY: `row < self.current_len`, `offset <= isize::MAX`, and `base` covers the column.
             Ok(Some(unsafe { base.add(offset) }.cast::<c_void>()))
         }
     }
@@ -2924,6 +2924,24 @@ fn validate_non_pod_message_info(
     true
 }
 
+#[inline]
+fn validate_non_pod_message_info_for<M: ModComponent>(
+    info: &BamColumnInfo,
+    manifest_name: &str,
+    expected_uuid: Option<UuidFilter>,
+    writable: bool,
+) -> bool {
+    let filter = expected_uuid.unwrap_or_else(|| UuidFilter::exact(M::UUID));
+    if !validate_non_pod_message_info(info, Some(filter), writable) {
+        return false;
+    }
+    if info.uuid == M::UUID {
+        return true;
+    }
+    qualify_mod_component_identity::<M>(manifest_name)
+        .is_ok_and(|(_, qualified_uuid)| info.uuid == qualified_uuid)
+}
+
 #[derive(Clone, Copy)]
 struct DispensedBorrow {
     component: BamComponent,
@@ -3042,7 +3060,10 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
         let byte_len = len
             .checked_mul(core::mem::size_of::<FfiEntity>())
             .ok_or(FfiResult::OUT_OF_RANGE)?;
-        let start = ptr as usize;
+        if byte_len > isize::MAX as usize {
+            return Err(FfiResult::OUT_OF_RANGE);
+        }
+        let start = ptr.addr();
         let end = start.checked_add(byte_len).ok_or(FfiResult::OUT_OF_RANGE)?;
         for prev in &self.borrowed[..self.borrowed_count] {
             if prev.is_mut && prev.end > prev.start && start < prev.end && prev.start < end {
@@ -3050,9 +3071,57 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
             }
         }
         self.entities_range = Some((start, end));
-        // SAFETY: `ptr` is non-null, aligned, disjoint from all mutable column borrows, and valid
-        // for `len` `FfiEntity` elements throughout `'chunk`.
+        // SAFETY: `ptr` is non-null, aligned, `byte_len <= isize::MAX`, disjoint from all mutable
+        // column borrows, and valid for `len` `FfiEntity` elements throughout `'chunk`.
         Ok(unsafe { core::slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    unsafe fn dispense_dense_read<T: AbiPod>(
+        &mut self,
+        component: BamComponent,
+        ptr: *const u8,
+        len: usize,
+    ) -> Result<&'chunk [T], FfiResult> {
+        let elem_size = core::mem::size_of::<T>();
+        if len == 0 || elem_size == 0 {
+            self.check_and_record_borrow(component, 0, 0, false)?;
+            // SAFETY: `len == 0` or ZST `T: AbiPod`; `raw_dense_slice` uses `NonNull::dangling()`.
+            return unsafe { raw_dense_slice::<T>(ptr, len) }.ok_or(FfiResult::TYPE_MISMATCH);
+        }
+        let byte_len = len.checked_mul(elem_size).ok_or(FfiResult::OUT_OF_RANGE)?;
+        if byte_len > isize::MAX as usize {
+            return Err(FfiResult::OUT_OF_RANGE);
+        }
+        // SAFETY: Validated `ptr`, `len`, alignment, and `byte_len <= isize::MAX` before recording borrow.
+        let slice = unsafe { raw_dense_slice::<T>(ptr, len) }.ok_or(FfiResult::TYPE_MISMATCH)?;
+        self.check_and_record_borrow(component, ptr.addr(), byte_len, false)?;
+        Ok(slice)
+    }
+
+    #[inline]
+    unsafe fn dispense_dense_write<T: AbiPod>(
+        &mut self,
+        component: BamComponent,
+        ptr: *mut u8,
+        len: usize,
+    ) -> Result<&'chunk mut [T], FfiResult> {
+        let elem_size = core::mem::size_of::<T>();
+        if len == 0 || elem_size == 0 {
+            self.check_and_record_borrow(component, 0, 0, true)?;
+            // SAFETY: `len == 0` or ZST `T: AbiPod`; `check_and_record_borrow` verified unique component.
+            return unsafe { raw_dense_slice_mut::<T>(ptr, len) }.ok_or(FfiResult::TYPE_MISMATCH);
+        }
+        let byte_len = len.checked_mul(elem_size).ok_or(FfiResult::OUT_OF_RANGE)?;
+        if byte_len > isize::MAX as usize {
+            return Err(FfiResult::OUT_OF_RANGE);
+        }
+        if ptr.is_null() || !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        self.check_and_record_borrow(component, ptr.addr(), byte_len, true)?;
+        // SAFETY: Verified non-null, aligned, `byte_len <= isize::MAX`, and strict disjointness for `'chunk`.
+        unsafe { raw_dense_slice_mut::<T>(ptr, len) }.ok_or(FfiResult::TYPE_MISMATCH)
     }
 
     /// Dispenses the next dense read-only `&'chunk [T]` column (`READ`, `CHANGED`, or `ADDED`).
@@ -3068,31 +3137,20 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
             return Err(FfiResult::TYPE_MISMATCH);
         }
         let len = self.iter.current_len();
-        if len == 0 || core::mem::size_of::<T>() == 0 {
-            self.check_and_record_borrow(info.component, 0, 0, false)?;
-            // SAFETY: Zero-length or ZST slice uses `NonNull::dangling()` without dereferencing.
-            return Ok(unsafe {
-                core::slice::from_raw_parts(core::ptr::NonNull::<T>::dangling().as_ptr(), len)
-            });
-        }
-        let col_fn = self
-            .iter
-            .host
-            .api()
-            .iter_column_readonly
-            .ok_or(FfiResult::NULL_POINTER)?;
-        // SAFETY: `self.iter.raw` is active at a chunk of `len` rows for `'chunk`.
-        let ptr = unsafe { col_fn(self.iter.raw.cast_const(), term_index) };
-        if ptr.is_null() || !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
-            return Err(FfiResult::TYPE_MISMATCH);
-        }
-        let byte_len = len
-            .checked_mul(core::mem::size_of::<T>())
-            .ok_or(FfiResult::OUT_OF_RANGE)?;
-        self.check_and_record_borrow(info.component, ptr as usize, byte_len, false)?;
-        // SAFETY: `validate_dense_read_info` confirmed `T`'s layout and UUID; `check_and_record_borrow`
-        // confirmed no mutable borrow aliases this component or byte range for `'chunk`.
-        Ok(unsafe { core::slice::from_raw_parts(ptr.cast::<T>(), len) })
+        let ptr = if len == 0 || core::mem::size_of::<T>() == 0 {
+            core::ptr::NonNull::<u8>::dangling().as_ptr().cast_const()
+        } else {
+            let col_fn = self
+                .iter
+                .host
+                .api()
+                .iter_column_readonly
+                .ok_or(FfiResult::NULL_POINTER)?;
+            // SAFETY: `self.iter.raw` is active at a chunk of `len` rows for `'chunk`.
+            unsafe { col_fn(self.iter.raw.cast_const(), term_index) }
+        };
+        // SAFETY: `validate_dense_read_info` verified `T`'s layout and UUID for `'chunk`.
+        unsafe { self.dispense_dense_read::<T>(info.component, ptr, len) }
     }
 
     /// Dispenses the next dense mutable `&'chunk mut [T]` column (`WRITE`).
@@ -3107,8 +3165,7 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
             return Err(FfiResult::TYPE_MISMATCH);
         }
         let len = self.iter.current_len();
-        if len == 0 || core::mem::size_of::<T>() == 0 {
-            self.check_and_record_borrow(info.component, 0, 0, true)?;
+        let ptr = if len == 0 || core::mem::size_of::<T>() == 0 {
             if len > 0
                 && let Some(col_fn) = self.iter.host.api().iter_column_mutable
             {
@@ -3116,29 +3173,19 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
                 // SAFETY: `self.iter.raw` is active at a valid chunk.
                 let _ = unsafe { col_fn(self.iter.raw, term_index) };
             }
-            // SAFETY: Zero-length or ZST mutable slice over `NonNull::dangling()` with unique component check.
-            return Ok(unsafe {
-                core::slice::from_raw_parts_mut(core::ptr::NonNull::<T>::dangling().as_ptr(), len)
-            });
-        }
-        let col_fn = self
-            .iter
-            .host
-            .api()
-            .iter_column_mutable
-            .ok_or(FfiResult::NULL_POINTER)?;
-        // SAFETY: `self.iter.raw` is active at a chunk of `len` rows for `'chunk`.
-        let ptr = unsafe { col_fn(self.iter.raw, term_index) };
-        if ptr.is_null() || !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
-            return Err(FfiResult::TYPE_MISMATCH);
-        }
-        let byte_len = len
-            .checked_mul(core::mem::size_of::<T>())
-            .ok_or(FfiResult::OUT_OF_RANGE)?;
-        self.check_and_record_borrow(info.component, ptr as usize, byte_len, true)?;
-        // SAFETY: `validate_dense_write_info` verified `WRITE`, non-immutable, layout, and UUID;
-        // `check_and_record_borrow` verified strict disjointness from all other borrows in `'chunk`.
-        Ok(unsafe { core::slice::from_raw_parts_mut(ptr.cast::<T>(), len) })
+            core::ptr::NonNull::<u8>::dangling().as_ptr()
+        } else {
+            let col_fn = self
+                .iter
+                .host
+                .api()
+                .iter_column_mutable
+                .ok_or(FfiResult::NULL_POINTER)?;
+            // SAFETY: `self.iter.raw` is active at a chunk of `len` rows for `'chunk`.
+            unsafe { col_fn(self.iter.raw, term_index) }
+        };
+        // SAFETY: `validate_dense_write_info` verified `WRITE`, non-immutable, layout, and UUID.
+        unsafe { self.dispense_dense_write::<T>(info.component, ptr, len) }
     }
 
     /// Dispenses the next optional dense read-only `Option<&'chunk [T]>` column (`OPTIONAL_READ`).
@@ -3166,24 +3213,8 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
         if ptr.is_null() {
             return Ok(None);
         }
-        if core::mem::size_of::<T>() == 0 {
-            self.check_and_record_borrow(info.component, 0, 0, false)?;
-            // SAFETY: Non-null optional ZST column is present for all `len` entities in the chunk.
-            return Ok(Some(unsafe {
-                core::slice::from_raw_parts(core::ptr::NonNull::<T>::dangling().as_ptr(), len)
-            }));
-        }
-        if !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
-            return Err(FfiResult::TYPE_MISMATCH);
-        }
-        let byte_len = len
-            .checked_mul(core::mem::size_of::<T>())
-            .ok_or(FfiResult::OUT_OF_RANGE)?;
-        self.check_and_record_borrow(info.component, ptr as usize, byte_len, false)?;
         // SAFETY: Present optional dense column verified for layout, UUID, alignment, and non-aliasing.
-        Ok(Some(unsafe {
-            core::slice::from_raw_parts(ptr.cast::<T>(), len)
-        }))
+        unsafe { self.dispense_dense_read::<T>(info.component, ptr, len) }.map(Some)
     }
 
     /// Dispenses the next optional dense mutable `Option<&'chunk mut [T]>` column (`OPTIONAL_WRITE`).
@@ -3211,24 +3242,8 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
         if ptr.is_null() {
             return Ok(None);
         }
-        if core::mem::size_of::<T>() == 0 {
-            self.check_and_record_borrow(info.component, 0, 0, true)?;
-            // SAFETY: Present optional ZST mutable column verified disjoint by component handle.
-            return Ok(Some(unsafe {
-                core::slice::from_raw_parts_mut(core::ptr::NonNull::<T>::dangling().as_ptr(), len)
-            }));
-        }
-        if !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
-            return Err(FfiResult::TYPE_MISMATCH);
-        }
-        let byte_len = len
-            .checked_mul(core::mem::size_of::<T>())
-            .ok_or(FfiResult::OUT_OF_RANGE)?;
-        self.check_and_record_borrow(info.component, ptr as usize, byte_len, true)?;
         // SAFETY: Present optional dense mutable column verified for layout, UUID, alignment, and disjointness.
-        Ok(Some(unsafe {
-            core::slice::from_raw_parts_mut(ptr.cast::<T>(), len)
-        }))
+        unsafe { self.dispense_dense_write::<T>(info.component, ptr, len) }.map(Some)
     }
 
     /// Validates and advances past a pure filter term (`FILTER_ONLY` / `WITHOUT` / `ALLOW`).
@@ -3318,467 +3333,5 @@ impl<'chunk, 'ctx> ChunkColumnDispenser<'chunk, 'ctx> {
         self.iter
             .has_column(term_index)
             .ok_or(FfiResult::NULL_POINTER)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bevy_abi_mod_sys::{ABI_VERSION, BAM_STORAGE_FLAG_MESSAGE, BamHostCtx, SymbolEntry};
-    use core::ffi::CStr;
-
-    #[derive(Default, Debug, Clone, PartialEq, Eq)]
-    struct MockNonPodMsg {
-        label: String,
-        nums: Vec<u32>,
-    }
-
-    unsafe extern "C" fn mock_export_fields(
-        src_ptr: *const c_void,
-        sink: Option<
-            unsafe extern "C" fn(
-                sink_ctx: *mut c_void,
-                field_name: StrView,
-                type_tag: StrView,
-                payload: FfiSlice<u8>,
-            ) -> FfiResult,
-        >,
-        sink_ctx: *mut c_void,
-    ) -> FfiResult {
-        // SAFETY: `src_ptr` points to a live `MockNonPodMsg`.
-        let msg = unsafe { &*src_ptr.cast::<MockNonPodMsg>() };
-        let Some(sink_fn) = sink else {
-            return FfiResult::NULL_POINTER;
-        };
-        // SAFETY: Forwarding live UTF-8 field slice into `sink_fn`.
-        let rc = unsafe {
-            sink_fn(
-                sink_ctx,
-                StrView::from_str("label"),
-                StrView::from_str("String"),
-                FfiSlice::from_slice(msg.label.as_bytes()),
-            )
-        };
-        if !rc.is_ok() {
-            return rc;
-        }
-        let mut raw_nums = Vec::with_capacity(4 + msg.nums.len() * 4);
-        raw_nums.extend_from_slice(&(msg.nums.len() as u32).to_le_bytes());
-        for &n in &msg.nums {
-            raw_nums.extend_from_slice(&n.to_le_bytes());
-        }
-        // SAFETY: Forwarding encoded `Vec<u32>` slice into `sink_fn`.
-        unsafe {
-            sink_fn(
-                sink_ctx,
-                StrView::from_str("nums"),
-                StrView::from_str("Vec<u32>"),
-                FfiSlice::from_slice(&raw_nums),
-            )
-        }
-    }
-
-    unsafe extern "C" fn mock_import_field(
-        dst_ptr: *mut c_void,
-        field_name: StrView,
-        _type_tag: StrView,
-        payload: FfiSlice<u8>,
-    ) -> FfiResult {
-        // SAFETY: `dst_ptr` points to a valid `MockNonPodMsg`.
-        let dst = unsafe { &mut *dst_ptr.cast::<MockNonPodMsg>() };
-        // SAFETY: `field_name` and `payload` borrow live slices for this synchronous callback.
-        let Ok(name) = (unsafe { field_name.try_as_str() }) else {
-            return FfiResult::INVALID_UTF8;
-        };
-        // SAFETY: Same as above for `payload`.
-        let Ok(bytes) = (unsafe { payload.try_as_slice() }) else {
-            return FfiResult::NULL_POINTER;
-        };
-        match name {
-            "label" => {
-                let Ok(s) = core::str::from_utf8(bytes) else {
-                    return FfiResult::INVALID_UTF8;
-                };
-                dst.label = s.to_owned();
-            }
-            "nums" => {
-                if bytes.len() < 4 {
-                    return FfiResult::INVALID_ARGUMENT;
-                }
-                let cnt = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-                if bytes.len() != 4 + cnt * 4 {
-                    return FfiResult::INVALID_ARGUMENT;
-                }
-                dst.nums.clear();
-                for i in 0..cnt {
-                    let off = 4 + i * 4;
-                    dst.nums.push(u32::from_le_bytes([
-                        bytes[off],
-                        bytes[off + 1],
-                        bytes[off + 2],
-                        bytes[off + 3],
-                    ]));
-                }
-            }
-            _ => return FfiResult::INVALID_ARGUMENT,
-        }
-        FfiResult::OK
-    }
-
-    static MOCK_SYMS: [SymbolEntry; 2] = [
-        SymbolEntry {
-            name: "bam.v0.mock::NonPodChat.export_fields",
-            ptr: mock_export_fields as *const c_void,
-        },
-        SymbolEntry {
-            name: "bam.v0.mock::NonPodChat.import_field",
-            ptr: mock_import_field as *const c_void,
-        },
-    ];
-
-    impl ModComponent for MockNonPodMsg {
-        const CANONICAL_NAME: &'static str = "mock::NonPodChat";
-        const COMPONENT_CSTR: &'static CStr = c"mock::NonPodChat";
-        const UUID: ComponentUuid = ComponentUuid::from_parts("mock::NonPodChat", 48, 8, 1);
-        type VTable = ();
-
-        fn vtable() -> &'static Self::VTable {
-            &()
-        }
-
-        fn symbols() -> &'static [SymbolEntry] {
-            &MOCK_SYMS
-        }
-    }
-
-    struct MockMsgWorld {
-        stored: Vec<MockNonPodMsg>,
-        sent_packets: Vec<Vec<u8>>,
-    }
-
-    unsafe extern "C" fn mock_get_proc(
-        _ctx: *const BamHostCtx,
-        sym: *const core::ffi::c_char,
-    ) -> *const c_void {
-        // SAFETY: Caller passes valid NUL-terminated CStr.
-        let name = unsafe { CStr::from_ptr(sym) };
-        match name.to_bytes() {
-            b"bam.v0.mock::NonPodChat.export_fields" => mock_export_fields as *const c_void,
-            b"bam.v0.mock::NonPodChat.non_pod_message" => mock_msg_read_batch as *const c_void,
-            _ => core::ptr::null(),
-        }
-    }
-
-    unsafe extern "C" fn mock_col_info(
-        _iter: *const BamIter,
-        term_index: usize,
-        out_info: *mut BamColumnInfo,
-    ) -> FfiResult {
-        if term_index > 1 {
-            return FfiResult::OUT_OF_RANGE;
-        }
-        let uuid = if term_index == 0 {
-            MockNonPodMsg::UUID
-        } else {
-            MockPodWithoutMarker::UUID
-        };
-        // SAFETY: `out_info` is writable.
-        unsafe {
-            *out_info = BamColumnInfo {
-                component: BamComponent::from_raw((term_index + 1) as u32),
-                uuid,
-                size: core::mem::size_of::<*const c_void>(),
-                align: core::mem::align_of::<*const c_void>(),
-                mode: AccessMode::MESSAGE_WRITE,
-                storage_flags: BAM_STORAGE_FLAG_MESSAGE,
-                reserved0: 0,
-            };
-        }
-        FfiResult::OK
-    }
-
-    #[derive(Default, Debug, PartialEq, Eq)]
-    struct MockPodWithoutMarker;
-
-    impl ModComponent for MockPodWithoutMarker {
-        const CANONICAL_NAME: &'static str = "mock::PodWithoutMarker";
-        const COMPONENT_CSTR: &'static CStr = c"mock::PodWithoutMarker";
-        const UUID: ComponentUuid = ComponentUuid::from_parts("mock::PodWithoutMarker", 8, 8, 2);
-        type VTable = ();
-
-        fn vtable() -> &'static Self::VTable {
-            &()
-        }
-
-        fn symbols() -> &'static [SymbolEntry] {
-            &[]
-        }
-    }
-
-    unsafe extern "C" fn mock_msg_read_batch(
-        iter: *mut BamIter,
-        _term_index: usize,
-        out_buf: *mut u8,
-        max_count: usize,
-        out_count: *mut usize,
-    ) -> FfiResult {
-        // SAFETY: `iter` points to `MockMsgWorld`.
-        let world = unsafe { &*iter.cast::<MockMsgWorld>() };
-        let take = world.stored.len().min(max_count);
-        for (i, stored_msg) in world.stored.iter().enumerate().take(take) {
-            let msg_ptr = core::ptr::from_ref(stored_msg).cast::<c_void>();
-            // SAFETY: `out_buf` is writable for `take * size_of::<*const c_void>()` bytes;
-            // `write_unaligned` preserves full pointer provenance.
-            #[allow(clippy::cast_ptr_alignment)]
-            unsafe {
-                core::ptr::write_unaligned(
-                    out_buf
-                        .add(i * core::mem::size_of::<*const c_void>())
-                        .cast::<*const c_void>(),
-                    msg_ptr,
-                );
-            }
-        }
-        // SAFETY: `out_count` is writable.
-        unsafe {
-            *out_count = take;
-        }
-        FfiResult::OK
-    }
-
-    unsafe extern "C" fn mock_msg_send(
-        iter: *mut BamIter,
-        _term_index: usize,
-        data_ptr: *const u8,
-        data_len: usize,
-    ) -> FfiResult {
-        // SAFETY: `iter` points to `MockMsgWorld`, `data_ptr` is readable for `data_len`.
-        let world = unsafe { &mut *iter.cast::<MockMsgWorld>() };
-        // SAFETY: `data_ptr` covers `data_len` bytes.
-        let pkt = unsafe { core::slice::from_raw_parts(data_ptr, data_len) }.to_vec();
-        world.sent_packets.push(pkt);
-        FfiResult::OK
-    }
-
-    #[test]
-    fn validated_iter_non_pod_message_read_and_send_encode_witness_packets() {
-        use bevy_abi_mod_sys::{
-            BamCommands, BamLoadCtx, BamQueryDesc, BamSystemCtx, BamSystemDesc, ComponentDesc,
-            FfiBool, FfiEntity,
-        };
-        unsafe extern "C" fn stub_last_error(
-            _: *const BamHostCtx,
-            _: *mut core::ffi::c_char,
-            _: usize,
-        ) -> usize {
-            0
-        }
-        unsafe extern "C" fn stub_load_host_ctx(_: *const BamLoadCtx) -> *const BamHostCtx {
-            core::ptr::null()
-        }
-        unsafe extern "C" fn stub_reg_comp(
-            _: *mut BamLoadCtx,
-            _: *const ComponentDesc,
-            _: *mut BamComponent,
-        ) -> FfiResult {
-            FfiResult::OK
-        }
-        unsafe extern "C" fn stub_resolve_comp(
-            _: *const BamHostCtx,
-            _: *const core::ffi::c_char,
-            _: *const ComponentUuid,
-            _: *mut BamComponent,
-        ) -> FfiResult {
-            FfiResult::OK
-        }
-        unsafe extern "C" fn stub_reg_sys(
-            _: *mut BamLoadCtx,
-            _: *const BamSystemDesc,
-        ) -> FfiResult {
-            FfiResult::OK
-        }
-        unsafe extern "C" fn stub_sys_host_ctx(_: *const BamSystemCtx) -> *const BamHostCtx {
-            core::ptr::null()
-        }
-        unsafe extern "C" fn stub_sys_query(
-            _: *mut BamSystemCtx,
-            _: usize,
-            _: *mut *mut BamIter,
-        ) -> FfiResult {
-            FfiResult::OK
-        }
-        unsafe extern "C" fn stub_sys_cmds(
-            _: *mut BamSystemCtx,
-            _: *mut *mut BamCommands,
-        ) -> FfiResult {
-            FfiResult::OK
-        }
-        unsafe extern "C" fn stub_iter_next(_: *mut BamIter, _: *mut usize) -> FfiBool {
-            FfiBool::FALSE
-        }
-        unsafe extern "C" fn stub_iter_reset(_: *mut BamIter) -> FfiResult {
-            FfiResult::OK
-        }
-        unsafe extern "C" fn stub_iter_ents(_: *const BamIter) -> *const FfiEntity {
-            core::ptr::null()
-        }
-        unsafe extern "C" fn stub_col_ro(_: *const BamIter, _: usize) -> *const u8 {
-            core::ptr::null()
-        }
-        unsafe extern "C" fn stub_col_mut(_: *mut BamIter, _: usize) -> *mut u8 {
-            core::ptr::null_mut()
-        }
-        unsafe extern "C" fn stub_mark_changed(
-            _: *mut BamIter,
-            _: usize,
-            _: usize,
-            _: usize,
-        ) -> FfiResult {
-            FfiResult::OK
-        }
-        unsafe extern "C" fn stub_rows_ro(_: *mut BamIter, _: usize) -> *const *const u8 {
-            core::ptr::null()
-        }
-        unsafe extern "C" fn stub_rows_mut(_: *mut BamIter, _: usize) -> *const *mut u8 {
-            core::ptr::null()
-        }
-        unsafe extern "C" fn stub_res_ptr(_: *const BamIter, _: usize) -> *const u8 {
-            core::ptr::null()
-        }
-        unsafe extern "C" fn stub_res_mut(_: *mut BamIter, _: usize) -> *mut u8 {
-            core::ptr::null_mut()
-        }
-        unsafe extern "C" fn stub_spawn_empty(_: *mut BamCommands, _: *mut FfiEntity) -> FfiResult {
-            FfiResult::OK
-        }
-        unsafe extern "C" fn stub_spawn(
-            _: *mut BamCommands,
-            _: *const BamComponent,
-            _: *const *const u8,
-            _: usize,
-            _: *mut FfiEntity,
-        ) -> FfiResult {
-            FfiResult::OK
-        }
-        unsafe extern "C" fn stub_despawn(_: *mut BamCommands, _: FfiEntity) -> FfiResult {
-            FfiResult::OK
-        }
-        unsafe extern "C" fn stub_insert(
-            _: *mut BamCommands,
-            _: FfiEntity,
-            _: BamComponent,
-            _: *const u8,
-            _: usize,
-        ) -> FfiResult {
-            FfiResult::OK
-        }
-        unsafe extern "C" fn stub_insert_def(
-            _: *mut BamCommands,
-            _: FfiEntity,
-            _: BamComponent,
-        ) -> FfiResult {
-            FfiResult::OK
-        }
-        unsafe extern "C" fn stub_remove(
-            _: *mut BamCommands,
-            _: FfiEntity,
-            _: BamComponent,
-        ) -> FfiResult {
-            FfiResult::OK
-        }
-        let _ = core::mem::size_of::<BamQueryDesc>();
-
-        // SAFETY: Zeroed `BamHostApi` initialized with required baseline ABI callbacks + msg slots.
-        let mut api: BamHostApi = unsafe { MaybeUninit::zeroed().assume_init() };
-        api.struct_size = core::mem::size_of::<BamHostApi>() as u32;
-        api.abi_version = ABI_VERSION;
-        api.get_proc_address = Some(mock_get_proc);
-        api.last_error = Some(stub_last_error);
-        api.load_host_ctx = Some(stub_load_host_ctx);
-        api.register_component = Some(stub_reg_comp);
-        api.resolve_component = Some(stub_resolve_comp);
-        api.register_system = Some(stub_reg_sys);
-        api.sys_host_ctx = Some(stub_sys_host_ctx);
-        api.sys_query = Some(stub_sys_query);
-        api.sys_commands = Some(stub_sys_cmds);
-        api.iter_next_chunk = Some(stub_iter_next);
-        api.iter_reset = Some(stub_iter_reset);
-        api.iter_entities = Some(stub_iter_ents);
-        api.iter_column_readonly = Some(stub_col_ro);
-        api.iter_column_mutable = Some(stub_col_mut);
-        api.iter_column_mutable_untracked = Some(stub_col_mut);
-        api.iter_mark_changed_range = Some(stub_mark_changed);
-        api.iter_column_rows_readonly = Some(stub_rows_ro);
-        api.iter_column_rows_mutable = Some(stub_rows_mut);
-        api.iter_column_info = Some(mock_col_info);
-        api.res_ptr = Some(stub_res_ptr);
-        api.res_mut_ptr = Some(stub_res_mut);
-        api.cmd_spawn_empty = Some(stub_spawn_empty);
-        api.cmd_spawn = Some(stub_spawn);
-        api.cmd_despawn = Some(stub_despawn);
-        api.cmd_insert = Some(stub_insert);
-        api.cmd_insert_default = Some(stub_insert_def);
-        api.cmd_remove = Some(stub_remove);
-        api.msg_read_batch = Some(mock_msg_read_batch);
-        api.msg_send = Some(mock_msg_send);
-
-        let mut world = MockMsgWorld {
-            stored: vec![MockNonPodMsg {
-                label: "hello".to_owned(),
-                nums: vec![10, 20, 30],
-            }],
-            sent_packets: Vec::new(),
-        };
-        let host_ctx = (&raw mut world).cast::<BamHostCtx>();
-        // SAFETY: `api` and `host_ctx` live for the test duration.
-        let host = unsafe { Host::from_raw(&api, host_ctx) }.unwrap();
-        // SAFETY: `raw_iter` points to `MockMsgWorld` used by mock callbacks.
-        let mut iter =
-            unsafe { ValidatedIter::from_raw((&raw mut world).cast::<BamIter>(), &host) };
-
-        let got = iter
-            .read_non_pod_messages_checked::<MockNonPodMsg>(
-                0,
-                Some(UuidFilter::exact(MockNonPodMsg::UUID)),
-                8,
-            )
-            .unwrap();
-        assert_eq!(got, world.stored);
-
-        let outgoing = MockNonPodMsg {
-            label: "reply".to_owned(),
-            nums: vec![7, 8],
-        };
-        assert_eq!(
-            iter.send_non_pod_message_checked::<MockNonPodMsg>(
-                0,
-                Some(UuidFilter::exact(MockNonPodMsg::UUID)),
-                &outgoing,
-            ),
-            FfiResult::OK
-        );
-        assert_eq!(world.sent_packets.len(), 1);
-        assert_eq!(
-            u32::from_le_bytes(world.sent_packets[0][0..4].try_into().unwrap()),
-            2
-        );
-
-        // 8-byte POD message without `non_pod_message` marker must be rejected with TYPE_MISMATCH.
-        assert_eq!(
-            iter.read_non_pod_messages_checked::<MockPodWithoutMarker>(
-                1,
-                Some(UuidFilter::exact(MockPodWithoutMarker::UUID)),
-                4,
-            ),
-            Err(FfiResult::TYPE_MISMATCH)
-        );
-        assert_eq!(
-            iter.send_non_pod_message_checked::<MockPodWithoutMarker>(
-                1,
-                Some(UuidFilter::exact(MockPodWithoutMarker::UUID)),
-                &MockPodWithoutMarker,
-            ),
-            FfiResult::TYPE_MISMATCH
-        );
     }
 }

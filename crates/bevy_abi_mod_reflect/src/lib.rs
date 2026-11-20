@@ -11,6 +11,7 @@
 //! persistent TOML settings files, persistent (`!ModScoped`) entity save archives with recovery
 //! and schema migration policies, and non-blocking 64-byte binary telemetry streaming.
 
+pub(crate) mod codec;
 pub mod reflect;
 pub mod savegame;
 pub mod telemetry;
@@ -27,12 +28,12 @@ pub use reflect::{
     WitnessReflectSchema, handle_mod_brp_request, install_mod_brp_methods,
 };
 pub use savegame::{
-    ComponentMigrationContext, MOD_SAVE_ARCHIVE_VERSION, MOD_SAVE_BINARY_MAGIC,
-    MigratedComponentPayload, ModComponentMigrator, ModSaveAppExt, ModSaveArchive,
-    ModSaveFormatPreference, ModSaveGamePlugin, ModSaveLoadError, ModSaveLoadPolicy,
-    ModSaveLoadReport, ModSaveOptions, ModSaveRegistry, ModSaveWorldExt, SavedComponentEntry,
-    SavedComponentFormat, SavedComponentHeader, SavedComponentPayload, SavedEntityRecord,
-    SavedFieldHeader, SavedModMetadata,
+    ComponentMigrationContext, EphemeralHandleBehavior, MOD_SAVE_ARCHIVE_VERSION,
+    MOD_SAVE_BINARY_MAGIC, MigratedComponentPayload, ModComponentMigrator, ModSaveAppExt,
+    ModSaveArchive, ModSaveFormatPreference, ModSaveGamePlugin, ModSaveLoadError,
+    ModSaveLoadPolicy, ModSaveLoadReport, ModSaveOptions, ModSaveRegistry, ModSaveWorldExt,
+    SavedComponentEntry, SavedComponentFormat, SavedComponentHeader, SavedComponentPayload,
+    SavedEntityRecord, SavedFieldHeader, SavedModMetadata,
 };
 pub use telemetry::{
     BRP_METHOD_BAM_COMPONENT_SCHEMAS, BRP_METHOD_BAM_HOT_RELOAD, BRP_METHOD_BAM_LIST_MODS,
@@ -55,10 +56,10 @@ pub mod prelude {
         ModReflectRemoteExt, ModReflectWorldExt, ModSettingsError, ModSettingsRegistry,
     };
     pub use crate::savegame::{
-        ComponentMigrationContext, MigratedComponentPayload, ModSaveAppExt, ModSaveArchive,
-        ModSaveFormatPreference, ModSaveGamePlugin, ModSaveLoadError, ModSaveLoadPolicy,
-        ModSaveLoadReport, ModSaveOptions, ModSaveRegistry, ModSaveWorldExt, SavedComponentFormat,
-        SavedComponentHeader, SavedComponentPayload,
+        ComponentMigrationContext, EphemeralHandleBehavior, MigratedComponentPayload,
+        ModSaveAppExt, ModSaveArchive, ModSaveFormatPreference, ModSaveGamePlugin,
+        ModSaveLoadError, ModSaveLoadPolicy, ModSaveLoadReport, ModSaveOptions, ModSaveRegistry,
+        ModSaveWorldExt, SavedComponentFormat, SavedComponentHeader, SavedComponentPayload,
     };
     pub use crate::telemetry::{
         HotReloadOutcome, HotReloadRequest, ModHotReloadQueue, ModTelemetryEndpoint,

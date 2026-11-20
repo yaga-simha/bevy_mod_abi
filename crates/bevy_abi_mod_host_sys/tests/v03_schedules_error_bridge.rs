@@ -4,9 +4,9 @@
 //! the Bevy `0.20` `FallbackErrorHandler` / `host_report_guest_fault` error bridge.
 
 use bevy_abi_mod_host_sys::schedule::{
-    ModScheduleSetRegistry, ScheduleSetMode, apply_mod_schedule_sets_to_schedule,
-    configure_guest_system_for_schedule, install_mod_schedule_set_pass, mount_mod_systems_in_world,
-    rewire_mod_schedule_sets_in_world,
+    ModScheduleSetRegistry, ScheduleSetConfig, ScheduleSetMode,
+    apply_mod_schedule_sets_to_schedule, configure_guest_system_for_schedule,
+    install_mod_schedule_set_pass, mount_mod_systems_in_world, rewire_mod_schedule_sets_in_world,
 };
 use bevy_abi_mod_host_sys::system::dispatch_mod_fault_to_fallback_handler;
 use bevy_abi_mod_host_sys::{
@@ -514,18 +514,18 @@ fn sequence_vs_sequence_weak_edges_and_concurrent_unrelated_siblings() {
 
         let mut set_reg = ModScheduleSetRegistry::new();
         let seq_h = set_reg
-            .configure_set(
-                None,
-                Arc::from("native"),
-                Arc::from("StrictSeq"),
-                0,
-                ScheduleId::UPDATE,
-                ScheduleSetMode::Sequence,
-                vec![],
-                vec![],
-                false,
-                false,
-            )
+            .configure_set(ScheduleSetConfig {
+                mod_id: None,
+                mod_name: Arc::from("native"),
+                set_name: Arc::from("StrictSeq"),
+                generation: 0,
+                schedule: ScheduleId::UPDATE,
+                mode: ScheduleSetMode::Sequence,
+                before_sets: vec![],
+                after_sets: vec![],
+                before_weak: false,
+                after_weak: false,
+            })
             .unwrap();
         let s1 = ModNamedSystemSet::new("native", "r1");
         let s2 = ModNamedSystemSet::new("native", "r2");
@@ -537,18 +537,18 @@ fn sequence_vs_sequence_weak_edges_and_concurrent_unrelated_siblings() {
             .unwrap();
 
         let weak_h = set_reg
-            .configure_set(
-                None,
-                Arc::from("native"),
-                Arc::from("WeakSeq"),
-                0,
-                ScheduleId::UPDATE,
-                ScheduleSetMode::SequenceWeak,
-                vec![],
-                vec![],
-                false,
-                false,
-            )
+            .configure_set(ScheduleSetConfig {
+                mod_id: None,
+                mod_name: Arc::from("native"),
+                set_name: Arc::from("WeakSeq"),
+                generation: 0,
+                schedule: ScheduleId::UPDATE,
+                mode: ScheduleSetMode::SequenceWeak,
+                before_sets: vec![],
+                after_sets: vec![],
+                before_weak: false,
+                after_weak: false,
+            })
             .unwrap();
         let w1 = ModNamedSystemSet::new("native", "w1");
         let w_mid = ModNamedSystemSet::new("native", "w_mid");
@@ -564,18 +564,18 @@ fn sequence_vs_sequence_weak_edges_and_concurrent_unrelated_siblings() {
             .unwrap();
 
         let weak_nc_h = set_reg
-            .configure_set(
-                None,
-                Arc::from("native"),
-                Arc::from("WeakNoConflict"),
-                0,
-                ScheduleId::UPDATE,
-                ScheduleSetMode::SequenceWeak,
-                vec![],
-                vec![],
-                false,
-                false,
-            )
+            .configure_set(ScheduleSetConfig {
+                mod_id: None,
+                mod_name: Arc::from("native"),
+                set_name: Arc::from("WeakNoConflict"),
+                generation: 0,
+                schedule: ScheduleId::UPDATE,
+                mode: ScheduleSetMode::SequenceWeak,
+                before_sets: vec![],
+                after_sets: vec![],
+                before_weak: false,
+                after_weak: false,
+            })
             .unwrap();
         let nc1 = ModNamedSystemSet::new("native", "nc1");
         let nc2 = ModNamedSystemSet::new("native", "nc2");
@@ -678,18 +678,18 @@ fn sequence_vs_sequence_weak_edges_and_concurrent_unrelated_siblings() {
         world.insert_resource(NativeResB);
         let mut set_reg = ModScheduleSetRegistry::new();
         let h = set_reg
-            .configure_set(
-                None,
-                Arc::from("probe"),
-                Arc::from("Pair"),
-                0,
-                ScheduleId::UPDATE,
+            .configure_set(ScheduleSetConfig {
+                mod_id: None,
+                mod_name: Arc::from("probe"),
+                set_name: Arc::from("Pair"),
+                generation: 0,
+                schedule: ScheduleId::UPDATE,
                 mode,
-                vec![],
-                vec![],
-                false,
-                false,
-            )
+                before_sets: vec![],
+                after_sets: vec![],
+                before_weak: false,
+                after_weak: false,
+            })
             .unwrap();
         let s1 = ModNamedSystemSet::new("probe", "a");
         let s2 = ModNamedSystemSet::new("probe", "b");

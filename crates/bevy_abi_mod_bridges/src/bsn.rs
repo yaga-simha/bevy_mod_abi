@@ -9,10 +9,12 @@ use bevy_app::{App, Plugin};
 use bevy_asset::{AssetServer, Assets, Handle};
 use bevy_ecs::bundle::BundleScratch;
 use bevy_ecs::entity::Entity;
+use bevy_ecs::error::{ErrorContext, error as log_ecs_error};
 use bevy_ecs::prelude::Resource;
 use bevy_ecs::world::World;
 use bevy_platform::collections::HashMap;
-use bevy_scene::{Ready, ResolvedSceneRoot, Scene, ScenePatch, ScenePlugin};
+use bevy_scene::{Ready, ResolvedSceneRoot, Scene, SceneDependencies, ScenePatch, ScenePlugin};
+use core::any::TypeId;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::asset::ModAssetWorldExt;
@@ -234,14 +236,28 @@ fn ensure_bsn_world_setup(world: &mut World) {
         .get_by_name(SCENE_PATCH_ALIAS)
         .map(|e| e.handle);
     let scene_type_handle = match existing_type_handle {
-        Some(h) => h,
-        None => world
-            .register_mod_asset_with_alias::<ScenePatch>(Some(SCENE_PATCH_ALIAS))
-            .expect("register ScenePatch asset type"),
+        Some(h) => Some(h),
+        None => match world.register_mod_asset_with_alias::<ScenePatch>(Some(SCENE_PATCH_ALIAS)) {
+            Ok(h) => Some(h),
+            Err(err) => {
+                log_ecs_error(
+                    err.into(),
+                    ErrorContext::Command {
+                        name: "ModBsnPlugin::register_scene_patch".into(),
+                    },
+                );
+                world
+                    .resource::<ModRegistry>()
+                    .get_by_name(core::any::type_name::<ScenePatch>())
+                    .map(|e| e.handle)
+            }
+        },
     };
 
     let scene_reg = world.resource::<HostSceneRegistry>().clone();
-    scene_reg.set_scene_type_handle(scene_type_handle);
+    if let Some(handle) = scene_type_handle {
+        scene_reg.set_scene_type_handle(handle);
+    }
 
     let backend: Arc<dyn HostSceneBackend> = Arc::new(BevyHostSceneBackend {
         inner: scene_reg.inner,
@@ -256,15 +272,21 @@ fn ensure_bsn_world_setup(world: &mut World) {
         .is_none()
     {
         world.resource_scope(|world, mut reg: bevy_ecs::prelude::Mut<'_, ModRegistry>| {
-            reg.register_bridged_entity_event_with::<Ready>(
+            if let Err(err) = reg.register_bridged_entity_event_with::<Ready>(
                 world,
                 CANONICAL_READY_NAME,
                 Some("Ready"),
                 |w, entity| {
                     w.trigger(Ready { entity });
                 },
-            )
-            .expect("register bevy_scene::Ready entity event");
+            ) {
+                log_ecs_error(
+                    err.into(),
+                    ErrorContext::Command {
+                        name: "ModBsnPlugin::register_ready_event".into(),
+                    },
+                );
+            }
         });
     }
 }
@@ -334,20 +356,50 @@ impl ModBsnWorldExt for World {
                 if let Some(existing) = cache_guard.as_ref() {
                     Arc::clone(existing)
                 } else {
-                    let boxed_scene = pending_scene
+                    let mut pending_guard = pending_scene
                         .lock()
-                        .map_err(|_| FfiResult::INTERNAL_ERROR)?
-                        .take()
-                        .ok_or(FfiResult::INVALID_STATE)?;
-                    let root = world.resource_scope(
-                        |world, patches: bevy_ecs::prelude::Mut<'_, Assets<ScenePatch>>| {
-                            let server = world
-                                .get_resource::<AssetServer>()
-                                .ok_or(FfiResult::INVALID_STATE)?;
-                            ResolvedSceneRoot::resolve(boxed_scene, server, &patches)
-                                .map_err(|_| FfiResult::INVALID_STATE)
-                        },
-                    )?;
+                        .map_err(|_| FfiResult::INTERNAL_ERROR)?;
+                    let Some(scene_ref) = pending_guard.as_ref() else {
+                        return Err(FfiResult::INVALID_STATE);
+                    };
+                    let Some(server) = world.get_resource::<AssetServer>().cloned() else {
+                        return Err(FfiResult::INVALID_STATE);
+                    };
+                    let Some(patches) = world.get_resource::<Assets<ScenePatch>>() else {
+                        return Err(FfiResult::INVALID_STATE);
+                    };
+
+                    // Pre-validate every registered asset dependency before taking
+                    // `pending_scene` so transient missing-AssetServer or unloaded-asset errors
+                    // never permanently consume the scene template.
+                    let mut deps = SceneDependencies::default();
+                    scene_ref.register_dependencies_box(&mut deps);
+                    for dep in deps.iter() {
+                        let matching_id = server
+                            .get_path_ids(&dep.path)
+                            .into_iter()
+                            .find(|id| id.type_id() == dep.type_id);
+                        let ready = match matching_id {
+                            Some(id) if dep.type_id == TypeId::of::<ScenePatch>() => id
+                                .try_typed::<ScenePatch>()
+                                .ok()
+                                .and_then(|typed_id| patches.get(typed_id))
+                                .and_then(|patch| patch.resolved.as_ref())
+                                .is_some(),
+                            Some(id) => server.is_loaded_with_dependencies(id),
+                            None => {
+                                let _ = server.load_builder().load_erased(dep.type_id, &dep.path);
+                                false
+                            }
+                        };
+                        if !ready {
+                            return Err(FfiResult::INVALID_STATE);
+                        }
+                    }
+
+                    let boxed_scene = pending_guard.take().ok_or(FfiResult::INVALID_STATE)?;
+                    let root = ResolvedSceneRoot::resolve(boxed_scene, &server, patches)
+                        .map_err(|_| FfiResult::INVALID_STATE)?;
                     let arc = Arc::new(root);
                     *cache_guard = Some(Arc::clone(&arc));
                     arc

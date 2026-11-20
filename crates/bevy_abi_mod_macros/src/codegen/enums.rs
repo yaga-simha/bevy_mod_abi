@@ -85,6 +85,13 @@ pub(crate) fn expand_enum_mod_component(
     mut state: CodegenState,
     vtable_ident: &Ident,
 ) -> syn::Result<TokenStream> {
+    if state.guest_crate.is_some() {
+        return Err(syn::Error::new_spanned(
+            &input.ident,
+            "`#[mod_component(guest)]` cannot be applied to enums because `GuestComponent` requires `AbiPod`",
+        ));
+    }
+
     if let Some(ref bad_int) = repr_flags.unsupported_int_repr {
         return Err(syn::Error::new_spanned(
             &input.ident,

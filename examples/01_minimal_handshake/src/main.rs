@@ -5,10 +5,10 @@
 //! [`LoadOptions`], observing [`ModLoaded`] / [`ModUnloaded`] messages, executing guest ticks,
 //! and deterministically unloading the mod.
 
-use bevy_abi_mod::prelude::*;
 use bevy_app::{App, Update};
 use bevy_ecs::component::Component;
 use bevy_ecs::message::{MessageReader, Messages};
+use bevy_mod_abi::prelude::*;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

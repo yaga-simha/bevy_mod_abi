@@ -4,9 +4,9 @@ use core::ffi::{CStr, c_void};
 use std::ffi::CString;
 
 use bevy_abi_mod_sys::{
-    AbiPod, BamComponent, BamHostApi, BamLoadCtx, BamMigrateComponentColumnFn,
-    BamRegisterRelationFn, BamRelationDesc, BamRowMigrateFn, ComponentCloneFn, ComponentDesc,
-    ComponentDropFn, ComponentHookFn, ComponentUuid, FfiEntity, FfiResult, ModComponent,
+    AbiPod, BamComponent, BamLoadCtx, BamRelationDesc, BamRowMigrateFn, ComponentCloneFn,
+    ComponentDesc, ComponentDropFn, ComponentHookFn, ComponentUuid, FfiEntity, FfiResult,
+    ModComponent,
 };
 
 use crate::{
@@ -135,84 +135,31 @@ fn dispatch_pod_hook<T: AbiPod>(
     let _ = cell.try_with_mut(|cb| cb(entity, val_ref));
 }
 
-unsafe extern "C" fn pod_on_add_trampoline<T: AbiPod>(
-    entity: FfiEntity,
-    component_ptr: *const c_void,
-    user_data: *mut c_void,
-) {
-    if user_data.is_null() {
-        return;
-    }
-    catch_guest_unit(|| {
-        // SAFETY: `user_data` was allocated via `GuestInstance::track_allocation` for
-        // `HookTrampolineState<T>`, and the host clears `DynamicComponentHookMap` and disarms
-        // `is_active` prior to `bevy_abi_mod_shutdown`.
-        let state = unsafe { &*user_data.cast::<HookTrampolineState<T>>() };
-        dispatch_pod_hook::<T>(entity, component_ptr, &state.on_add);
-    });
+macro_rules! define_pod_hook_trampoline {
+    ($fn_name:ident, $field:ident) => {
+        unsafe extern "C" fn $fn_name<T: AbiPod>(
+            entity: FfiEntity,
+            component_ptr: *const c_void,
+            user_data: *mut c_void,
+        ) {
+            if user_data.is_null() {
+                return;
+            }
+            catch_guest_unit(|| {
+                // SAFETY: `user_data` was allocated via `GuestInstance::track_allocation` for
+                // `HookTrampolineState<T>`, and the host disarms hooks prior to shutdown.
+                let state = unsafe { &*user_data.cast::<HookTrampolineState<T>>() };
+                dispatch_pod_hook::<T>(entity, component_ptr, &state.$field);
+            });
+        }
+    };
 }
 
-unsafe extern "C" fn pod_on_insert_trampoline<T: AbiPod>(
-    entity: FfiEntity,
-    component_ptr: *const c_void,
-    user_data: *mut c_void,
-) {
-    if user_data.is_null() {
-        return;
-    }
-    catch_guest_unit(|| {
-        // SAFETY: `user_data` points to `HookTrampolineState<T>` owned by `GuestInstance`.
-        let state = unsafe { &*user_data.cast::<HookTrampolineState<T>>() };
-        dispatch_pod_hook::<T>(entity, component_ptr, &state.on_insert);
-    });
-}
-
-unsafe extern "C" fn pod_on_discard_trampoline<T: AbiPod>(
-    entity: FfiEntity,
-    component_ptr: *const c_void,
-    user_data: *mut c_void,
-) {
-    if user_data.is_null() {
-        return;
-    }
-    catch_guest_unit(|| {
-        // SAFETY: `user_data` points to `HookTrampolineState<T>` owned by `GuestInstance`.
-        let state = unsafe { &*user_data.cast::<HookTrampolineState<T>>() };
-        dispatch_pod_hook::<T>(entity, component_ptr, &state.on_discard);
-    });
-}
-
-unsafe extern "C" fn pod_on_remove_trampoline<T: AbiPod>(
-    entity: FfiEntity,
-    component_ptr: *const c_void,
-    user_data: *mut c_void,
-) {
-    if user_data.is_null() {
-        return;
-    }
-    catch_guest_unit(|| {
-        // SAFETY: `user_data` was allocated via `GuestInstance::track_allocation` for
-        // `HookTrampolineState<T>`, and the host clears `DynamicComponentHookMap` and disarms
-        // `is_active` prior to `bevy_abi_mod_shutdown`.
-        let state = unsafe { &*user_data.cast::<HookTrampolineState<T>>() };
-        dispatch_pod_hook::<T>(entity, component_ptr, &state.on_remove);
-    });
-}
-
-unsafe extern "C" fn pod_on_despawn_trampoline<T: AbiPod>(
-    entity: FfiEntity,
-    component_ptr: *const c_void,
-    user_data: *mut c_void,
-) {
-    if user_data.is_null() {
-        return;
-    }
-    catch_guest_unit(|| {
-        // SAFETY: `user_data` points to `HookTrampolineState<T>` owned by `GuestInstance`.
-        let state = unsafe { &*user_data.cast::<HookTrampolineState<T>>() };
-        dispatch_pod_hook::<T>(entity, component_ptr, &state.on_despawn);
-    });
-}
+define_pod_hook_trampoline!(pod_on_add_trampoline, on_add);
+define_pod_hook_trampoline!(pod_on_insert_trampoline, on_insert);
+define_pod_hook_trampoline!(pod_on_discard_trampoline, on_discard);
+define_pod_hook_trampoline!(pod_on_remove_trampoline, on_remove);
+define_pod_hook_trampoline!(pod_on_despawn_trampoline, on_despawn);
 
 /// Panic-safe `extern "C"` bitwise [`ComponentCloneFn`] trampoline for `T: AbiPod`.
 ///
@@ -313,28 +260,18 @@ pub unsafe fn register_pod_component<T: AbiPod>(
     flags: u32,
     vtable_ptr: *const c_void,
 ) -> Result<BamComponent, FfiResult> {
-    if name.to_bytes().is_empty() {
-        return Err(FfiResult::INVALID_ARGUMENT);
+    // SAFETY: Caller upholds the identical `load_ctx` and `vtable_ptr` invariants.
+    unsafe {
+        register_pod_component_with_hooks::<T>(
+            instance,
+            load_ctx,
+            name,
+            uuid,
+            flags,
+            vtable_ptr,
+            PodComponentHooks::default(),
+        )
     }
-    if name.to_str().is_err() {
-        return Err(FfiResult::INVALID_UTF8);
-    }
-    let owned_name = CString::from(name);
-    let raw_name = instance.track_allocation(Box::new(owned_name));
-    // SAFETY: `raw_name` was just allocated by `instance.track_allocation` and stays valid for the
-    // lifetime of `instance`.
-    let name_ptr = unsafe { (*raw_name).as_ptr() };
-    let desc = ComponentDesc::new(
-        name_ptr,
-        uuid,
-        core::mem::size_of::<T>(),
-        core::mem::align_of::<T>(),
-    )
-    .with_flags(flags)
-    .with_vtable(vtable_ptr);
-    let host = *instance.host();
-    // SAFETY: `load_ctx` and `vtable_ptr` are valid per caller contract; `name_ptr` is owned by `instance`.
-    unsafe { register_component_raw(load_ctx, &host, &desc) }
 }
 
 /// Registers a cross-language `T: AbiPod` dynamic component with optional `on_add` and `on_remove`
@@ -553,8 +490,8 @@ pub fn resolve_component(
 /// Registers a caller-constructed [`BamRelationDesc`] on `load_ctx` via
 /// `BamHostApi::register_relation` and returns its 1-based [`BamComponent`] handle.
 ///
-/// Returns [`FfiResult::UNSUPPORTED`] if the host's [`BamHostApi`] table does not cover or
-/// populate slot 54 (`register_relation`).
+/// Returns [`FfiResult::UNSUPPORTED`] if the host's [`BamHostApi`](bevy_abi_mod_sys::BamHostApi)
+/// table does not cover or populate slot 54 (`register_relation`).
 ///
 /// # Safety
 /// - `load_ctx` must be a non-null, active [`BamLoadCtx`] during `bevy_abi_mod_init`.
@@ -572,15 +509,7 @@ pub unsafe fn register_relation_raw(
     if !validation.is_ok() {
         return Err(validation);
     }
-    if !host.api().covers_slot(
-        core::mem::offset_of!(BamHostApi, register_relation),
-        core::mem::size_of::<Option<BamRegisterRelationFn>>(),
-    ) {
-        return Err(FfiResult::UNSUPPORTED);
-    }
-    let Some(register_fn) = host.api().register_relation else {
-        return Err(FfiResult::UNSUPPORTED);
-    };
+    let register_fn = host_slot!(host.api(), register_relation).ok_or(FfiResult::UNSUPPORTED)?;
     let mut out = BamComponent::INVALID;
     // SAFETY: `load_ctx` is non-null and active per caller contract, `desc` passed validation, and
     // `out` is aligned writable stack storage.
@@ -622,11 +551,7 @@ pub unsafe fn register_relation(
         return Err(FfiResult::INVALID_UTF8);
     }
     let host = *instance.host();
-    if !host.api().covers_slot(
-        core::mem::offset_of!(BamHostApi, register_relation),
-        core::mem::size_of::<Option<BamRegisterRelationFn>>(),
-    ) || host.api().register_relation.is_none()
-    {
+    if host_slot!(host.api(), register_relation).is_none() {
         return Err(FfiResult::UNSUPPORTED);
     }
     let mut probe_desc = BamRelationDesc::new(name.as_ptr(), uuid)
@@ -739,13 +664,7 @@ pub unsafe fn migrate_component_column_raw(
     if !validation.is_ok() {
         return validation;
     }
-    if !host.api().covers_slot(
-        core::mem::offset_of!(BamHostApi, migrate_component_column),
-        core::mem::size_of::<Option<BamMigrateComponentColumnFn>>(),
-    ) {
-        return FfiResult::UNSUPPORTED;
-    }
-    let Some(mig_fn) = host.api().migrate_component_column else {
+    let Some(mig_fn) = host_slot!(host.api(), migrate_component_column) else {
         return FfiResult::UNSUPPORTED;
     };
     // SAFETY: `load_ctx` is active per caller contract, `new_desc` passed validation, and
@@ -801,11 +720,7 @@ where
     if !validation.is_ok() {
         return validation;
     }
-    if !host.api().covers_slot(
-        core::mem::offset_of!(BamHostApi, migrate_component_column),
-        core::mem::size_of::<Option<BamMigrateComponentColumnFn>>(),
-    ) || host.api().migrate_component_column.is_none()
-    {
+    if host_slot!(host.api(), migrate_component_column).is_none() {
         return FfiResult::UNSUPPORTED;
     }
     match host.component_layout_info(component) {
@@ -863,11 +778,7 @@ where
         return FfiResult::INVALID_COMPONENT;
     }
     let host = *instance.host();
-    if !host.api().covers_slot(
-        core::mem::offset_of!(BamHostApi, migrate_component_column),
-        core::mem::size_of::<Option<BamMigrateComponentColumnFn>>(),
-    ) || host.api().migrate_component_column.is_none()
-    {
+    if host_slot!(host.api(), migrate_component_column).is_none() {
         return FfiResult::UNSUPPORTED;
     }
     let (qualified_name, uuid) =
@@ -950,11 +861,7 @@ where
         return FfiResult::INVALID_UTF8;
     }
     let host = *instance.host();
-    if !host.api().covers_slot(
-        core::mem::offset_of!(BamHostApi, migrate_component_column),
-        core::mem::size_of::<Option<BamMigrateComponentColumnFn>>(),
-    ) || host.api().migrate_component_column.is_none()
-    {
+    if host_slot!(host.api(), migrate_component_column).is_none() {
         return FfiResult::UNSUPPORTED;
     }
     let owned_name = CString::from(new_name);

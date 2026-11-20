@@ -38,13 +38,22 @@ use bevy_abi_mod_sys::{
     BamComponent, BamObserverDesc, BamSystemCtx, ComponentUuid, FfiAssetHandle, FfiBool, FfiEntity,
     FfiResult, assert_abi_pod,
 };
+#[cfg(feature = "bridge-feathers")]
+use bevy_app::TaskPoolPlugin;
 use bevy_app::{App, Update};
+#[cfg(feature = "bridge-feathers")]
+use bevy_asset::AssetPlugin;
 use bevy_asset::Assets;
 use bevy_color::Color;
 use bevy_ecs::entity::Entity;
 use bevy_ecs::entity_disabling::Disabled;
 use bevy_ecs::hierarchy::ChildOf;
+#[cfg(feature = "bridge-feathers")]
+use bevy_ecs::hierarchy::Children;
 use bevy_ecs::observer::On;
+use bevy_ecs::prelude::{Changed, Component, Query, ResMut, Resource};
+#[cfg(feature = "bridge-feathers")]
+use bevy_ecs::world::World;
 use bevy_image::{Image, TRANSPARENT_IMAGE_HANDLE};
 use bevy_input_focus::tab_navigation::TabIndex;
 use bevy_input_focus::{FocusCause, InputFocus};
@@ -53,6 +62,8 @@ use bevy_text::{
     EditableText, FontSize, FontSmoothing, FontStyle, FontWeight, InlineBox, InlineBoxKind,
     Justify, LineBreak, RemSize, TextColor, TextFont, TextLayout, TextReadWriteMode,
 };
+#[cfg(feature = "bridge-feathers")]
+use bevy_ui::Overflow;
 use bevy_ui::widget::{InlineImage, Text};
 use bevy_ui::{
     AlignItems, BorderRadius, CornerRadius, Display, FixedNode, FlexDirection, FlexWrap,
@@ -69,8 +80,10 @@ use bevy_abi_mod_bridges::ui::{
 };
 #[cfg(feature = "bridge-feathers")]
 use bevy_feathers::controls::{
-    ColorInputMode, ColorInputSettings, ColorInputValue, FeathersColorInput, FeathersListRow,
-    FeathersListView, FeathersNumberInput, FeathersSelect, HardLimit, NumberInputPrecision,
+    ColorInputMode, ColorInputSettings, ColorInputValue, ColorSwatchFg, FeathersColorInput,
+    FeathersColorSwatch, FeathersLazyMenu, FeathersListRow, FeathersListView, FeathersMenu,
+    FeathersMenuButton, FeathersMenuPopup, FeathersNumberInput, FeathersScrollbar, FeathersSelect,
+    FeathersTextInput, FeathersTextInputContainer, HardLimit, NumberInputPrecision,
     NumberInputRange, NumberInputStep, NumberInputValue, NumberInputWrap, OptionIndex,
     ScrollbarGutter, SoftLimit,
 };
@@ -83,12 +96,41 @@ use bevy_feathers::theme::{
 #[cfg(feature = "bridge-feathers")]
 use bevy_platform::collections::HashMap;
 #[cfg(feature = "bridge-feathers")]
-use bevy_ui_widgets::{ListBox, ListItem, ScrollArea};
+use bevy_ui_widgets::{ListBox, ListItem, ScrollArea, Scrollbar};
 
 fn setup_ui_app() -> App {
     let mut app = App::new();
     app.add_plugins((AbiModPlugin, ModUiBridgePlugin));
     app
+}
+
+#[cfg(feature = "bridge-feathers")]
+fn setup_feathers_app() -> App {
+    let mut app = App::new();
+    app.add_plugins((
+        TaskPoolPlugin::default(),
+        AssetPlugin::default(),
+        AbiModPlugin,
+        ModUiBridgePlugin,
+    ));
+    app
+}
+
+#[cfg(feature = "bridge-feathers")]
+fn find_descendant<C: Component>(world: &World, root: Entity) -> Option<Entity> {
+    let mut queue = std::collections::VecDeque::new();
+    if let Some(children) = world.get::<Children>(root) {
+        queue.extend(children.iter().copied());
+    }
+    while let Some(cur) = queue.pop_front() {
+        if world.get::<C>(cur).is_some() {
+            return Some(cur);
+        }
+        if let Some(children) = world.get::<Children>(cur) {
+            queue.extend(children.iter().copied());
+        }
+    }
+    None
 }
 
 fn workspace_root() -> PathBuf {
@@ -877,7 +919,7 @@ fn headless_tablist_selection_and_value_change_guest_observer_dispatch() {
 #[cfg(feature = "bridge-feathers")]
 #[test]
 fn feathers_widget_descriptors_and_theme_context_levels_sync() {
-    let mut app = setup_ui_app();
+    let mut app = setup_feathers_app();
 
     // Configure contextual `UiTheme` overrides for `Base`, `Higher`, `Highest`, `Floating`.
     let surface_token = ThemeToken::new_static("panel.surface");
@@ -1013,34 +1055,109 @@ fn feathers_widget_descriptors_and_theme_context_levels_sync() {
         assert!((resolved.red - expected_v).abs() < 1e-5);
     }
 
-    // Verify `FeathersColorInput`, `ColorInputValue`, and `ColorInputSettings`.
+    // Verify `FeathersColorInput` BSN hierarchy, `opaque_color_percentage`, `ColorInputValue`,
+    // and `ColorInputSettings`.
     assert!(app.world().get::<FeathersColorInput>(color_ent).is_some());
+    assert!(
+        app.world().get::<FeathersLazyMenu>(color_ent).is_some(),
+        "FeathersColorInput must hydrate real FeathersLazyMenu BSN scene"
+    );
+    let swatch_ent = find_descendant::<FeathersColorSwatch>(app.world(), color_ent)
+        .expect("FeathersColorInput BSN scene spawns FeathersColorSwatch descendant");
+    let swatch_children = app
+        .world()
+        .get::<Children>(swatch_ent)
+        .expect("FeathersColorSwatch children");
+    assert_eq!(
+        swatch_children.len(),
+        2,
+        "opaque_color_percentage=50.0 must spawn second opaque preview ColorSwatchFg child"
+    );
+    assert!(
+        app.world()
+            .get::<ColorSwatchFg>(swatch_children[1])
+            .is_some()
+    );
+    assert_eq!(
+        app.world().get::<Node>(swatch_children[1]).unwrap().left,
+        Val::Percent(50.0)
+    );
     assert_eq!(
         app.world().get::<ColorInputValue>(color_ent).unwrap().0,
         Color::srgba(0.8, 0.25, 0.5, 0.9)
     );
     assert!(app.world().resource::<ColorInputSettings>().mode == ColorInputMode::HSPlane);
 
-    // Verify `FeathersSelect` dropdown + `OptionIndex`.
+    // Verify `FeathersSelect` BSN hierarchy (`FeathersMenu`, `FeathersMenuButton` with
+    // `rounded_corners = CORNERS_TOP`, `FeathersMenuPopup`, `FeathersListView` with
+    // `max_visible = 6`) + `OptionIndex`.
     assert!(app.world().get::<FeathersSelect>(dropdown_ent).is_some());
+    assert!(
+        app.world().get::<FeathersMenu>(dropdown_ent).is_some(),
+        "FeathersSelect must hydrate real FeathersMenu BSN scene"
+    );
+    let select_btn = find_descendant::<FeathersMenuButton>(app.world(), dropdown_ent)
+        .expect("FeathersSelect BSN scene spawns FeathersMenuButton");
+    assert_eq!(
+        app.world().get::<Node>(select_btn).unwrap().border_radius,
+        RoundedCorners::Top.to_border_radius(4.0)
+    );
+    assert!(find_descendant::<FeathersMenuPopup>(app.world(), dropdown_ent).is_some());
+    let select_list = find_descendant::<FeathersListView>(app.world(), dropdown_ent)
+        .expect("FeathersSelect BSN scene spawns popup FeathersListView");
+    assert_eq!(
+        app.world().get::<Node>(select_list).unwrap().max_height,
+        Val::Px(6.0 * 28.0)
+    );
     assert_eq!(app.world().get::<OptionIndex>(dropdown_ent).unwrap().0, 2);
 
-    // Verify `FeathersListView`, `ScrollbarGutter`, `ListBox`, `ScrollArea`, & `FeathersListRow`.
+    // Verify `FeathersListView` BSN hierarchy (`ListBox`, `ScrollbarGutter`, inner `ScrollArea`
+    // with `Overflow::scroll_y()`, `FeathersScrollbar` with `ControlOrientation::Vertical`, and
+    // reparented `row_ent`) & `FeathersListRow`.
     assert!(app.world().get::<FeathersListView>(list_ent).is_some());
     assert_eq!(
         app.world().get::<ScrollbarGutter>(list_ent).unwrap().0,
         Val::Rem(1.0)
     );
     assert!(app.world().get::<ListBox>(list_ent).is_some());
-    assert!(app.world().get::<ScrollArea>(list_ent).is_some());
+    let inner_scroll = find_descendant::<ScrollArea>(app.world(), list_ent)
+        .expect("FeathersListView BSN scene spawns inner ScrollArea child");
+    let inner_node = app.world().get::<Node>(inner_scroll).unwrap();
+    assert_eq!(inner_node.flex_direction, FlexDirection::Column);
+    assert_eq!(inner_node.overflow, Overflow::scroll_y());
+    let sb_ent = find_descendant::<FeathersScrollbar>(app.world(), list_ent)
+        .expect("FeathersListView BSN scene spawns FeathersScrollbar child");
+    assert_eq!(
+        app.world().get::<Scrollbar>(sb_ent).unwrap().orientation,
+        ControlOrientation::Vertical
+    );
+    assert_eq!(
+        app.world().get::<ChildOf>(row_ent),
+        Some(&ChildOf(inner_scroll)),
+        "pre-existing row child must be reparented into FeathersListView's inner ScrollArea"
+    );
 
     assert!(app.world().get::<FeathersListRow>(row_ent).is_some());
     assert!(app.world().get::<ListItem>(row_ent).is_some());
+    assert!(
+        app.world().get::<Node>(row_ent).is_some(),
+        "FeathersListRow BSN scene populates layout Node"
+    );
     assert_eq!(app.world().get::<OptionIndex>(row_ent).unwrap().0, 3);
     assert!(app.world().get::<Selected>(row_ent).is_some());
 
-    // Verify scrubbable `FeathersNumberInput` + limits + precision + step + wrap.
+    // Verify scrubbable `FeathersNumberInput` BSN hierarchy (`FeathersTextInputContainer` +
+    // descendant `FeathersTextInput` + `EditableText`) + limits + precision + step + wrap.
     assert!(app.world().get::<FeathersNumberInput>(number_ent).is_some());
+    assert!(
+        app.world()
+            .get::<FeathersTextInputContainer>(number_ent)
+            .is_some(),
+        "FeathersNumberInput must hydrate real FeathersTextInputContainer BSN scene"
+    );
+    let num_text_ent = find_descendant::<FeathersTextInput>(app.world(), number_ent)
+        .expect("FeathersNumberInput BSN scene spawns FeathersTextInput child");
+    assert!(app.world().get::<EditableText>(num_text_ent).is_some());
     assert_eq!(
         *app.world().get::<NumberInputValue>(number_ent).unwrap(),
         NumberInputValue::F32(12.5)
@@ -1067,6 +1184,69 @@ fn feathers_widget_descriptors_and_theme_context_levels_sync() {
     assert_eq!(
         *app.world().get::<NumberInputWrap>(number_ent).unwrap(),
         NumberInputWrap::Wrap
+    );
+
+    // Dynamically update all 4 previously-discarded FFI fields (`opaque_color_percentage`,
+    // `max_visible`, `rounded_corners`, `orientation`) and confirm in-place updates WITHOUT
+    // duplicating child hierarchies!
+    let dropdown_child_count_before = app.world().get::<Children>(dropdown_ent).unwrap().len();
+    let list_child_count_before = app.world().get::<Children>(list_ent).unwrap().len();
+
+    app.world_mut()
+        .get_mut::<FfiFeathersColorInput>(color_ent)
+        .unwrap()
+        .opaque_color_percentage = 25.0;
+    {
+        let mut dd = app
+            .world_mut()
+            .get_mut::<FfiFeathersDropdown>(dropdown_ent)
+            .unwrap();
+        dd.max_visible = 4;
+        dd.rounded_corners = FfiFeathersDropdown::CORNERS_LEFT;
+    }
+    app.world_mut()
+        .get_mut::<FfiFeathersScrollableList>(list_ent)
+        .unwrap()
+        .orientation = FfiFeathersScrollableList::ORIENTATION_HORIZONTAL;
+
+    app.update();
+
+    assert_eq!(
+        app.world().get::<Children>(dropdown_ent).unwrap().len(),
+        dropdown_child_count_before,
+        "re-syncing dropdown must not duplicate children"
+    );
+    assert_eq!(
+        app.world().get::<Children>(list_ent).unwrap().len(),
+        list_child_count_before,
+        "re-syncing list view must not duplicate children"
+    );
+    let updated_swatch_children = app.world().get::<Children>(swatch_ent).unwrap();
+    assert_eq!(
+        app.world()
+            .get::<Node>(updated_swatch_children[1])
+            .unwrap()
+            .left,
+        Val::Percent(75.0)
+    );
+    assert_eq!(
+        app.world().get::<Node>(select_btn).unwrap().border_radius,
+        RoundedCorners::Left.to_border_radius(4.0)
+    );
+    assert_eq!(
+        app.world().get::<Node>(select_list).unwrap().max_height,
+        Val::Px(4.0 * 28.0)
+    );
+    let inner_node_horiz = app.world().get::<Node>(inner_scroll).unwrap();
+    assert_eq!(inner_node_horiz.flex_direction, FlexDirection::Row);
+    assert_eq!(inner_node_horiz.overflow, Overflow::scroll_x());
+    assert_eq!(
+        app.world().get::<Scrollbar>(sb_ent).unwrap().orientation,
+        ControlOrientation::Horizontal
+    );
+    assert_eq!(
+        app.world().get::<Node>(list_ent).unwrap().padding.bottom,
+        Val::Rem(1.0)
     );
 
     // Verify host-side updates mirror back into `FfiThemeContext`, `FfiFeathersColorInput`,
@@ -1388,4 +1568,163 @@ fn disabled_tabs_and_interaction_disabled_sync() {
     app.update();
     assert!(app.world().get::<InteractionDisabled>(list).is_none());
     assert!(app.world().get::<InteractionDisabled>(tab).is_none());
+}
+
+#[test]
+fn mirror_systems_bypass_change_detection_without_feedback_loops() {
+    #[derive(Resource, Default)]
+    struct ChangeCounters {
+        selected_tab: u32,
+        #[cfg(feature = "bridge-feathers")]
+        theme_context: u32,
+        #[cfg(feature = "bridge-feathers")]
+        color_input: u32,
+        #[cfg(feature = "bridge-feathers")]
+        number_input: u32,
+    }
+
+    fn count_selected_tab_changes(
+        q: Query<(), Changed<FfiSelectedTab>>,
+        mut counters: ResMut<ChangeCounters>,
+    ) {
+        counters.selected_tab += q.iter().count() as u32;
+    }
+
+    #[cfg(feature = "bridge-feathers")]
+    fn count_feathers_changes(
+        q_theme: Query<(), Changed<FfiThemeContext>>,
+        q_color: Query<(), Changed<FfiFeathersColorInput>>,
+        q_num: Query<(), Changed<FfiFeathersNumberInput>>,
+        mut counters: ResMut<ChangeCounters>,
+    ) {
+        counters.theme_context += q_theme.iter().count() as u32;
+        counters.color_input += q_color.iter().count() as u32;
+        counters.number_input += q_num.iter().count() as u32;
+    }
+
+    #[cfg(feature = "bridge-feathers")]
+    let mut app = setup_feathers_app();
+    #[cfg(not(feature = "bridge-feathers"))]
+    let mut app = setup_ui_app();
+
+    app.init_resource::<ChangeCounters>();
+    app.add_systems(Update, count_selected_tab_changes);
+    #[cfg(feature = "bridge-feathers")]
+    app.add_systems(Update, count_feathers_changes);
+
+    let tab_a = app.world_mut().spawn(FfiTab::default()).id();
+    let tab_b = app.world_mut().spawn(FfiTab::default()).id();
+    let tablist = app
+        .world_mut()
+        .spawn((
+            FfiTabList::default(),
+            FfiSelectedTab::from_option(Some(tab_a)),
+        ))
+        .id();
+
+    #[cfg(feature = "bridge-feathers")]
+    let (theme_ent, color_ent, num_ent) = (
+        app.world_mut().spawn(FfiThemeContext::BASE).id(),
+        app.world_mut().spawn(FfiFeathersColorInput::default()).id(),
+        app.world_mut().spawn(FfiFeathersNumberInput::f32(1.0)).id(),
+    );
+
+    // Frame 1: initial spawn & hydration marks `Ffi*` changed once.
+    app.update();
+    // Reset counters after initial spawn/hydration tick.
+    *app.world_mut().resource_mut::<ChangeCounters>() = ChangeCounters::default();
+
+    // Mutate Bevy host components -> mirror systems copy into `Ffi*` via `bypass_change_detection()`.
+    app.world_mut()
+        .entity_mut(tablist)
+        .insert(SelectedTab(Some(tab_b)));
+    #[cfg(feature = "bridge-feathers")]
+    {
+        app.world_mut()
+            .entity_mut(theme_ent)
+            .insert(ThemeContext(SurfaceLevel::Highest));
+        app.world_mut()
+            .entity_mut(color_ent)
+            .insert(ColorInputValue(Color::srgba(0.2, 0.4, 0.6, 1.0)));
+        app.world_mut()
+            .entity_mut(num_ent)
+            .insert(NumberInputValue::I32(123));
+    }
+
+    // Frame 2: Mirror systems run in `PostUpdate`.
+    app.update();
+    // Frame 3: `Update` checks whether any `Ffi*` was spuriously marked `Changed`.
+    app.update();
+
+    assert_eq!(
+        *app.world().get::<FfiSelectedTab>(tablist).unwrap(),
+        FfiSelectedTab::from_option(Some(tab_b))
+    );
+    let counters = app.world().resource::<ChangeCounters>();
+    assert_eq!(
+        counters.selected_tab, 0,
+        "mirror_selected_tabs_to_ffi must bypass change detection"
+    );
+    #[cfg(feature = "bridge-feathers")]
+    {
+        assert_eq!(
+            *app.world().get::<FfiThemeContext>(theme_ent).unwrap(),
+            FfiThemeContext::HIGHEST
+        );
+        assert_eq!(
+            app.world()
+                .get::<FfiFeathersColorInput>(color_ent)
+                .unwrap()
+                .color,
+            FfiRgba::new(0.2, 0.4, 0.6, 1.0)
+        );
+        assert_eq!(
+            app.world()
+                .get::<FfiFeathersNumberInput>(num_ent)
+                .unwrap()
+                .value_i64,
+            123
+        );
+        assert_eq!(
+            counters.theme_context, 0,
+            "mirror_theme_context_to_ffi must bypass change detection"
+        );
+        assert_eq!(
+            counters.color_input, 0,
+            "mirror_color_input_value_to_ffi must bypass change detection"
+        );
+        assert_eq!(
+            counters.number_input, 0,
+            "mirror_number_input_value_to_ffi must bypass change detection"
+        );
+    }
+}
+
+#[cfg(feature = "preset-full")]
+#[test]
+fn curated_preset_plugins_install_and_update_cleanly() {
+    use bevy_abi_mod_bridges::{
+        ModPreset2dPlugin, ModPreset3dPlugin, ModPresetFullPlugin, ModPresetUiPlugin,
+    };
+
+    for add_preset in [
+        (|app: &mut App| {
+            app.add_plugins(ModPreset2dPlugin);
+        }) as fn(&mut App),
+        |app: &mut App| {
+            app.add_plugins(ModPreset3dPlugin);
+        },
+        |app: &mut App| {
+            app.add_plugins(ModPresetUiPlugin);
+        },
+        |app: &mut App| {
+            app.add_plugins(ModPresetFullPlugin);
+        },
+    ] {
+        let mut app = App::new();
+        app.add_plugins((TaskPoolPlugin::default(), AbiModPlugin));
+        add_preset(&mut app);
+        app.add_plugins(AssetPlugin::default());
+        app.update();
+    }
 }

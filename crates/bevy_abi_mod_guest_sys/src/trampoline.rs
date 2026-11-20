@@ -10,18 +10,15 @@ use core::{
 use std::ffi::CString;
 
 use bevy_abi_mod_sys::{
-    AbiPod, BAM_SYSTEM_KNOWN_FLAGS, BamChangeTicks, BamCommands, BamComponent,
-    BamConfigureScheduleSetFn, BamEventKind, BamHostApi, BamIter, BamLoadCtx,
-    BamMountSystemInScheduleFn, BamObserverDesc, BamObserverFn, BamObserverMutFn, BamQueryDesc,
-    BamRegisterObserverFn, BamRegisterSystemHandleFn, BamRunIfFn, BamScheduleSetDesc,
-    BamSysEntityChildrenFn, BamSysEntityGetFn, BamSysEntityGetMutFn, BamSysHostCtxFn,
-    BamSysResMutPtrFn, BamSysResPtrFn, BamSystem, BamSystemCtx, BamSystemDesc, BamSystemFn,
-    BamSystemSet, BamTermDesc, ComponentUuid, FfiBool, FfiEntity, FfiResult,
-    MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent, ScheduleId,
+    AbiPod, BAM_STORAGE_FLAG_IMMUTABLE, BAM_SYSTEM_KNOWN_FLAGS, BamChangeTicks, BamCommands,
+    BamComponent, BamEventKind, BamIter, BamLoadCtx, BamObserverDesc, BamObserverFn,
+    BamObserverMutFn, BamQueryDesc, BamRunIfFn, BamScheduleSetDesc, BamSystem, BamSystemCtx,
+    BamSystemDesc, BamSystemFn, BamSystemSet, BamTermDesc, ComponentUuid, FfiBool, FfiEntity,
+    FfiResult, MAX_QUERIES_PER_SYSTEM, MAX_TERMS_PER_QUERY, ModComponent, ScheduleId,
 };
 
 use crate::{
-    commands::{SpawnEntry, ValidatedCommands},
+    commands::{SpawnEntry, ValidatedCommands, validate_spawn_entry},
     host::{Host, ValidatedWireVTable},
     instance::{GuestInstance, qualify_mod_component_identity},
     iter::{UuidFilter, ValidatedIter},
@@ -104,9 +101,13 @@ pub struct ValidatedSystemInvocation<'a> {
     total_query_count: usize,
     user_query_count: usize,
     resource_query_index: Option<usize>,
+    sys_ref: Option<ValidatedSystemRef<'a>>,
     queries: [Option<ValidatedIter<'a>>; MAX_QUERIES_PER_SYSTEM],
+    query_taken: [bool; MAX_QUERIES_PER_SYSTEM],
     empty_iter: ValidatedIter<'a>,
     commands: Option<ValidatedCommands<'a>>,
+    commands_taken: bool,
+    empty_commands: ValidatedCommands<'a>,
 }
 
 impl<'a> ValidatedSystemInvocation<'a> {
@@ -130,9 +131,13 @@ impl<'a> ValidatedSystemInvocation<'a> {
             total_query_count: clamped_total,
             user_query_count: clamped_user,
             resource_query_index: resource_query_index.filter(|&idx| idx < clamped_total),
+            sys_ref: Some(ValidatedSystemRef { sys_ctx, host }),
             queries: [const { None }; MAX_QUERIES_PER_SYSTEM],
+            query_taken: [false; MAX_QUERIES_PER_SYSTEM],
             empty_iter: ValidatedIter::empty(host),
             commands: None,
+            commands_taken: false,
+            empty_commands: ValidatedCommands::empty(host),
         }
     }
 
@@ -142,13 +147,24 @@ impl<'a> ValidatedSystemInvocation<'a> {
         self.sys_ctx
     }
 
-    /// Returns a validated [`ValidatedSystemRef`] token bound to this active system invocation.
+    /// Borrows the unique [`ValidatedSystemRef`] token immutably (`None` if already extracted via
+    /// [`Self::take_system_ref`]).
     #[inline]
-    pub const fn system_ref(&self) -> ValidatedSystemRef<'a> {
-        ValidatedSystemRef {
-            sys_ctx: self.sys_ctx,
-            host: self.host,
-        }
+    pub const fn system_ref(&self) -> Option<&ValidatedSystemRef<'a>> {
+        self.sys_ref.as_ref()
+    }
+
+    /// Borrows the unique [`ValidatedSystemRef`] token mutably (`None` if already extracted via
+    /// [`Self::take_system_ref`]).
+    #[inline]
+    pub fn system_ref_mut(&mut self) -> Option<&mut ValidatedSystemRef<'a>> {
+        self.sys_ref.as_mut()
+    }
+
+    /// Extracts the unique non-`Copy` [`ValidatedSystemRef`] token by value (succeeds at most once).
+    #[inline]
+    pub fn take_system_ref(&mut self) -> Option<ValidatedSystemRef<'a>> {
+        self.sys_ref.take()
     }
 
     /// Returns the cached [`Host`] table for this mod instance.
@@ -169,20 +185,27 @@ impl<'a> ValidatedSystemInvocation<'a> {
         self.resource_query_index
     }
 
-    /// Extracts validated query slot `index` (`0..total_query_count`) by value.
+    /// Extracts validated query slot `index` (`0..total_query_count`) by value (succeeds at most once
+    /// per slot).
     #[inline]
     pub fn take_raw_query_slot(&mut self, index: usize) -> Option<ValidatedIter<'a>> {
-        if index >= self.total_query_count {
+        if index >= self.total_query_count || self.query_taken[index] {
             return None;
         }
         self.ensure_query_slot(index);
+        self.query_taken[index] = true;
         self.queries[index].take()
     }
 
-    /// Fetches a [`ValidatedCommands`] buffer for this system invocation by value.
+    /// Fetches a [`ValidatedCommands`] buffer for this system invocation by value (returns an empty
+    /// disabled buffer if already extracted).
     #[inline]
     pub fn take_commands(&mut self) -> ValidatedCommands<'a> {
+        if self.commands_taken {
+            return ValidatedCommands::empty(self.host);
+        }
         self.ensure_commands_slot();
+        self.commands_taken = true;
         self.commands
             .take()
             .unwrap_or_else(|| ValidatedCommands::empty(self.host))
@@ -190,7 +213,10 @@ impl<'a> ValidatedSystemInvocation<'a> {
 
     #[inline]
     fn ensure_query_slot(&mut self, index: usize) {
-        if index >= self.total_query_count || self.queries[index].is_some() {
+        if index >= self.total_query_count
+            || self.query_taken[index]
+            || self.queries[index].is_some()
+        {
             return;
         }
         let iter = if self.sys_ctx.is_null() {
@@ -213,26 +239,29 @@ impl<'a> ValidatedSystemInvocation<'a> {
     }
 
     #[inline]
-    fn ensure_commands_slot(&mut self) {
-        if self.commands.is_some() {
-            return;
+    fn fetch_commands_slot(&self) -> ValidatedCommands<'a> {
+        if self.sys_ctx.is_null() {
+            return ValidatedCommands::empty(self.host);
         }
-        let cmds = if self.sys_ctx.is_null() {
-            ValidatedCommands::empty(self.host)
-        } else if let Some(sys_cmds_fn) = self.host.api().sys_commands {
-            let mut raw_cmds: *mut BamCommands = core::ptr::null_mut();
-            // SAFETY: `self.sys_ctx` is active for `'a` and `raw_cmds` is writable stack storage.
-            let status = unsafe { sys_cmds_fn(self.sys_ctx, &mut raw_cmds) };
-            if status.is_ok() && !raw_cmds.is_null() {
-                // SAFETY: `raw_cmds` was returned by `sys_commands` for `self.sys_ctx`.
-                unsafe { ValidatedCommands::from_raw(raw_cmds, self.host) }
-            } else {
-                ValidatedCommands::empty(self.host)
-            }
+        let Some(sys_cmds_fn) = self.host.api().sys_commands else {
+            return ValidatedCommands::empty(self.host);
+        };
+        let mut raw_cmds: *mut BamCommands = core::ptr::null_mut();
+        // SAFETY: `self.sys_ctx` is active for `'a` and `raw_cmds` is writable stack storage.
+        let status = unsafe { sys_cmds_fn(self.sys_ctx, &mut raw_cmds) };
+        if status.is_ok() && !raw_cmds.is_null() {
+            // SAFETY: `raw_cmds` was returned by `sys_commands` for `self.sys_ctx`.
+            unsafe { ValidatedCommands::from_raw(raw_cmds, self.host) }
         } else {
             ValidatedCommands::empty(self.host)
-        };
-        self.commands = Some(cmds);
+        }
+    }
+
+    #[inline]
+    fn ensure_commands_slot(&mut self) {
+        if !self.commands_taken && self.commands.is_none() {
+            self.commands = Some(self.fetch_commands_slot());
+        }
     }
 
     /// Borrows primary query `0` mutably (yielding an empty exhausted iterator if no entity query
@@ -280,10 +309,19 @@ impl<'a> ValidatedSystemInvocation<'a> {
     /// Borrows the per-system [`ValidatedCommands`] buffer mutably.
     #[inline]
     pub fn commands_mut(&mut self) -> &mut ValidatedCommands<'a> {
-        self.ensure_commands_slot();
-        self.commands
-            .as_mut()
-            .expect("commands slot initialized by ensure_commands_slot")
+        if self.commands_taken {
+            return &mut self.empty_commands;
+        }
+        let fetched = if self.commands.is_none() {
+            Some(self.fetch_commands_slot())
+        } else {
+            None
+        };
+        if let Some(cmds) = fetched {
+            self.commands.insert(cmds)
+        } else {
+            self.commands.as_mut().unwrap_or(&mut self.empty_commands)
+        }
     }
 
     /// Simultaneously borrows primary query `0` and the deferred [`ValidatedCommands`] buffer.
@@ -295,10 +333,11 @@ impl<'a> ValidatedSystemInvocation<'a> {
             self.ensure_query_slot(0);
         }
         self.ensure_commands_slot();
-        let cmds = self
-            .commands
-            .as_mut()
-            .expect("commands slot initialized by ensure_commands_slot");
+        let cmds = if self.commands_taken {
+            &mut self.empty_commands
+        } else {
+            self.commands.as_mut().unwrap_or(&mut self.empty_commands)
+        };
         let iter = if self.user_query_count == 0 {
             &mut self.empty_iter
         } else {
@@ -370,15 +409,28 @@ impl<'a> ValidatedSystemInvocation<'a> {
     }
 }
 
-/// Validated per-tick `*mut BamSystemCtx` token supporting borrow-checked random per-entity
-/// component lookups.
-#[derive(Clone, Copy)]
+/// Unique (non-`Copy`, non-`Clone`) validated per-tick `*mut BamSystemCtx` token supporting
+/// borrow-checked random per-entity component lookups and handle-based singleton resource access.
+///
+/// Uniqueness guarantees that `&mut self` methods such as [`Self::res_mut_ptr_by_handle_checked`]
+/// and [`Self::write_mapped_wire_resource_by_handle`] cannot produce aliasing `&mut` references to
+/// the same host resource.
 pub struct ValidatedSystemRef<'a> {
     sys_ctx: *mut BamSystemCtx,
     host: &'a Host,
 }
 
 impl<'a> ValidatedSystemRef<'a> {
+    /// Constructs a disabled [`ValidatedSystemRef`] (`sys_ctx = null`) whose lookups return
+    /// `None` / `Err(FfiResult::NULL_POINTER)` / `Err(FfiResult::INVALID_COMPONENT)`.
+    #[inline]
+    pub const fn empty(host: &'a Host) -> Self {
+        Self {
+            sys_ctx: core::ptr::null_mut(),
+            host,
+        }
+    }
+
     /// Returns the raw `*mut BamSystemCtx` pointer.
     #[inline]
     pub const fn as_raw_sys_ctx(&self) -> *mut BamSystemCtx {
@@ -391,6 +443,92 @@ impl<'a> ValidatedSystemRef<'a> {
         self.host
     }
 
+    #[inline]
+    fn raw_entity_ptr_ro(
+        &self,
+        iter: &ValidatedIter<'a>,
+        query_index: usize,
+        term_index: usize,
+        entity: FfiEntity,
+        check_info: impl FnOnce(&bevy_abi_mod_sys::BamColumnInfo) -> bool,
+    ) -> Option<*const u8> {
+        if self.sys_ctx.is_null() {
+            return None;
+        }
+        let get_fn = host_slot!(self.host.api(), sys_entity_get)?;
+        let info = iter.column_info(term_index).ok()?;
+        if !info.mode.has_entity_column_data() || info.is_resource() || info.is_message() {
+            return None;
+        }
+        if !check_info(&info) {
+            return None;
+        }
+        // SAFETY: `self.sys_ctx` is an active `BamSystemCtx` for `'a`, and `&self` + `&iter`
+        // prevent concurrent mutable access through this system context.
+        let ptr = unsafe { get_fn(self.sys_ctx.cast_const(), query_index, entity, term_index) };
+        (!ptr.is_null()).then_some(ptr)
+    }
+
+    #[inline]
+    // `&mut ValidatedIter` is an intentional borrow-guard preventing aliasing chunk borrows while
+    // `sys_entity_get_mut` holds a mutable pointer into `iter`'s query storage.
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    fn raw_entity_ptr_mut(
+        &mut self,
+        iter: &mut ValidatedIter<'a>,
+        query_index: usize,
+        term_index: usize,
+        entity: FfiEntity,
+        check_info: impl FnOnce(&bevy_abi_mod_sys::BamColumnInfo) -> bool,
+    ) -> Option<*mut u8> {
+        if self.sys_ctx.is_null() {
+            return None;
+        }
+        let get_mut_fn = host_slot!(self.host.api(), sys_entity_get_mut)?;
+        let info = iter.column_info(term_index).ok()?;
+        if !info.mode.is_mutable()
+            || !info.mode.has_entity_column_data()
+            || info.is_immutable()
+            || info.is_resource()
+            || info.is_message()
+        {
+            return None;
+        }
+        if !check_info(&info) {
+            return None;
+        }
+        // SAFETY: `self.sys_ctx` is an active `BamSystemCtx` for `'a`, and `&mut self` +
+        // `&mut iter` prevent any aliasing borrow on this system context.
+        let ptr = unsafe { get_mut_fn(self.sys_ctx, query_index, entity, term_index) };
+        (!ptr.is_null()).then_some(ptr)
+    }
+
+    #[inline]
+    unsafe fn cast_entity_ref<'b, T>(ptr: *const u8) -> Option<&'b T> {
+        if core::mem::size_of::<T>() == 0 {
+            // SAFETY: Zero-sized `T` may be referenced via `NonNull::dangling()`.
+            return Some(unsafe { core::ptr::NonNull::<T>::dangling().as_ref() });
+        }
+        if !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+            return None;
+        }
+        // SAFETY: Caller verified non-null `ptr`, layout/UUID/VTable, and shared borrow lifetime `'b`.
+        Some(unsafe { &*ptr.cast::<T>() })
+    }
+
+    #[inline]
+    unsafe fn cast_entity_mut<'b, T>(ptr: *mut u8) -> Option<&'b mut T> {
+        if core::mem::size_of::<T>() == 0 {
+            // SAFETY: Zero-sized `T` may be mutably referenced via `NonNull::dangling()`.
+            return Some(unsafe { core::ptr::NonNull::<T>::dangling().as_mut() });
+        }
+        if !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+            return None;
+        }
+        // SAFETY: Caller verified non-null `ptr`, layout/UUID/VTable, and exclusive borrow `'b`.
+        Some(unsafe { &mut *ptr.cast::<T>() })
+    }
+
     /// Looks up a shared `&'b T` component reference for `entity` using declared access on
     /// `(query_index, term_index)`.
     pub fn entity_get_checked<'b, T: AbiPod>(
@@ -401,44 +539,14 @@ impl<'a> ValidatedSystemRef<'a> {
         entity: FfiEntity,
         expected_uuid: Option<UuidFilter>,
     ) -> Option<&'b T> {
-        if self.sys_ctx.is_null() {
-            return None;
-        }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, sys_entity_get),
-            core::mem::size_of::<Option<BamSysEntityGetFn>>(),
-        ) {
-            return None;
-        }
-        let get_fn = self.host.api().sys_entity_get?;
-        let info = iter.column_info(term_index).ok()?;
-        if !info.mode.has_entity_column_data() || info.is_resource() || info.is_message() {
-            return None;
-        }
-        if info.size != core::mem::size_of::<T>() || info.align != core::mem::align_of::<T>() {
-            return None;
-        }
-        if let Some(filter) = expected_uuid
-            && !filter.matches(info.uuid)
-        {
-            return None;
-        }
-        // SAFETY: `self.sys_ctx` is an active `BamSystemCtx` for `'a`, and `&'b self` + `&'b iter`
-        // prevent concurrent mutable access through this system context for `'b`.
-        let ptr = unsafe { get_fn(self.sys_ctx.cast_const(), query_index, entity, term_index) };
-        if ptr.is_null() {
-            return None;
-        }
-        if core::mem::size_of::<T>() == 0 {
-            // SAFETY: Zero-sized `T: AbiPod` may be referenced via `NonNull::dangling()`.
-            return Some(unsafe { core::ptr::NonNull::<T>::dangling().as_ref() });
-        }
-        if !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
-            return None;
-        }
+        let ptr = self.raw_entity_ptr_ro(iter, query_index, term_index, entity, |info| {
+            info.size == core::mem::size_of::<T>()
+                && info.align == core::mem::align_of::<T>()
+                && expected_uuid.is_none_or(|f| f.matches(info.uuid))
+        })?;
         // SAFETY: Host verified query membership and declared read/write access; `info` confirmed
-        // `T`'s layout and optional UUID, and `ptr` is non-null and aligned for `'b`.
-        Some(unsafe { &*ptr.cast::<T>() })
+        // `T`'s layout and optional UUID, and `&'b self` + `&'b iter` hold a shared borrow for `'b`.
+        unsafe { Self::cast_entity_ref::<T>(ptr) }
     }
 
     /// Looks up an exclusive `&'b mut T` component reference for `entity` using declared writable
@@ -451,26 +559,29 @@ impl<'a> ValidatedSystemRef<'a> {
         entity: FfiEntity,
         expected_uuid: Option<UuidFilter>,
     ) -> Option<&'b mut T> {
-        if self.sys_ctx.is_null() {
+        let ptr = self.raw_entity_ptr_mut(iter, query_index, term_index, entity, |info| {
+            info.size == core::mem::size_of::<T>()
+                && info.align == core::mem::align_of::<T>()
+                && expected_uuid.is_none_or(|f| f.matches(info.uuid))
+        })?;
+        // SAFETY: Host verified query membership, writable `FilteredAccessSet` declaration, and
+        // marked change ticks; `&'b mut self` + `&'b mut iter` guarantee exclusive access for `'b`.
+        unsafe { Self::cast_entity_mut::<T>(ptr) }
+    }
+
+    /// Looks up a shared singleton resource `&R` by its pre-resolved `BamComponent` handle,
+    /// validating `(size, align)` and optional `expected_uuid` via `Host::component_layout_info`
+    /// (failing closed on mismatch or `UNSUPPORTED`).
+    pub fn res_ptr_by_handle_with_uuid_checked<R: AbiPod>(
+        &self,
+        component: BamComponent,
+        expected_uuid: Option<UuidFilter>,
+    ) -> Option<(&R, BamChangeTicks)> {
+        if self.sys_ctx.is_null() || !component.is_valid() {
             return None;
         }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, sys_entity_get_mut),
-            core::mem::size_of::<Option<BamSysEntityGetMutFn>>(),
-        ) {
-            return None;
-        }
-        let get_mut_fn = self.host.api().sys_entity_get_mut?;
-        let info = iter.column_info(term_index).ok()?;
-        if !info.mode.is_mutable()
-            || !info.mode.has_entity_column_data()
-            || info.is_immutable()
-            || info.is_resource()
-            || info.is_message()
-        {
-            return None;
-        }
-        if info.size != core::mem::size_of::<T>() || info.align != core::mem::align_of::<T>() {
+        let info = self.host.component_layout_info(component).ok()?;
+        if info.size != core::mem::size_of::<R>() || info.align != core::mem::align_of::<R>() {
             return None;
         }
         if let Some(filter) = expected_uuid
@@ -478,94 +589,75 @@ impl<'a> ValidatedSystemRef<'a> {
         {
             return None;
         }
-        // SAFETY: `self.sys_ctx` is an active `BamSystemCtx` for `'a`, and `&'b mut self` +
-        // `&'b mut iter` prevent any aliasing borrow on this system context for `'b`.
-        let ptr = unsafe { get_mut_fn(self.sys_ctx, query_index, entity, term_index) };
-        if ptr.is_null() {
-            return None;
-        }
-        if core::mem::size_of::<T>() == 0 {
-            // SAFETY: Zero-sized `T: AbiPod` may be mutably referenced via `NonNull::dangling()`.
-            return Some(unsafe { core::ptr::NonNull::<T>::dangling().as_mut() });
-        }
-        if !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
-            return None;
-        }
-        // SAFETY: Host verified query membership, writable `FilteredAccessSet` declaration, and
-        // marked change ticks; `&'b mut self` guarantees exclusive access for `'b`.
-        Some(unsafe { &mut *ptr.cast::<T>() })
-    }
-
-    /// Looks up a shared singleton resource `&'b R` by its pre-resolved `BamComponent` handle,
-    /// returning `(ref, BamChangeTicks)` if declared with `ResourceRead` or `ResourceWrite`.
-    pub fn res_ptr_by_handle_checked<R: AbiPod>(
-        &self,
-        component: BamComponent,
-    ) -> Option<(&R, BamChangeTicks)> {
-        if self.sys_ctx.is_null() || !component.is_valid() {
-            return None;
-        }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, sys_res_ptr),
-            core::mem::size_of::<Option<BamSysResPtrFn>>(),
-        ) {
-            return None;
-        }
-        let get_fn = self.host.api().sys_res_ptr?;
+        let get_fn = host_slot!(self.host.api(), sys_res_ptr)?;
         let mut ticks = BamChangeTicks::default();
         // SAFETY: `self.sys_ctx` is an active `BamSystemCtx` and `&mut ticks` is aligned writable storage.
         let ptr = unsafe { get_fn(self.sys_ctx.cast_const(), component, &mut ticks) };
         if ptr.is_null() {
             return None;
         }
-        if core::mem::size_of::<R>() == 0 {
-            // SAFETY: Zero-sized `R: AbiPod` may be referenced via `NonNull::dangling()`.
-            return Some((
-                unsafe { core::ptr::NonNull::<R>::dangling().as_ref() },
-                ticks,
-            ));
-        }
-        if !(ptr as usize).is_multiple_of(core::mem::align_of::<R>()) {
-            return None;
-        }
-        // SAFETY: Host verified resource borrow permissions in `FilteredAccessSet` and alignment holds.
-        Some((unsafe { &*ptr.cast::<R>() }, ticks))
+        // SAFETY: `component_layout_info` verified `R`'s exact size, alignment, and optional UUID;
+        // host verified resource borrow permissions in `FilteredAccessSet`.
+        let val = unsafe { Self::cast_entity_ref::<R>(ptr) }?;
+        Some((val, ticks))
     }
 
-    /// Looks up an exclusive mutable singleton resource `&'b mut R` by its pre-resolved
-    /// `BamComponent` handle, returning `(mut_ref, BamChangeTicks)` if declared with `ResourceWrite`.
-    pub fn res_mut_ptr_by_handle_checked<R: AbiPod>(
+    /// Looks up a shared singleton resource `&R` by its pre-resolved `BamComponent` handle,
+    /// validating `(size, align)` via `Host::component_layout_info` (failing closed on mismatch or
+    /// `UNSUPPORTED`).
+    #[inline]
+    pub fn res_ptr_by_handle_checked<R: AbiPod>(
+        &self,
+        component: BamComponent,
+    ) -> Option<(&R, BamChangeTicks)> {
+        self.res_ptr_by_handle_with_uuid_checked::<R>(component, None)
+    }
+
+    /// Looks up an exclusive mutable singleton resource `&mut R` by its pre-resolved
+    /// `BamComponent` handle, validating `(size, align, !immutable)` and optional `expected_uuid`
+    /// via `Host::component_layout_info` (failing closed on mismatch or `UNSUPPORTED`).
+    pub fn res_mut_ptr_by_handle_with_uuid_checked<R: AbiPod>(
         &mut self,
         component: BamComponent,
+        expected_uuid: Option<UuidFilter>,
     ) -> Option<(&mut R, BamChangeTicks)> {
         if self.sys_ctx.is_null() || !component.is_valid() {
             return None;
         }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, sys_res_mut_ptr),
-            core::mem::size_of::<Option<BamSysResMutPtrFn>>(),
-        ) {
+        let info = self.host.component_layout_info(component).ok()?;
+        if (info.flags & BAM_STORAGE_FLAG_IMMUTABLE) != 0
+            || info.size != core::mem::size_of::<R>()
+            || info.align != core::mem::align_of::<R>()
+        {
             return None;
         }
-        let get_mut_fn = self.host.api().sys_res_mut_ptr?;
+        if let Some(filter) = expected_uuid
+            && !filter.matches(info.uuid)
+        {
+            return None;
+        }
+        let get_mut_fn = host_slot!(self.host.api(), sys_res_mut_ptr)?;
         let mut ticks = BamChangeTicks::default();
-        // SAFETY: `self.sys_ctx` is active, `&'b mut self` prevents aliasing, and `&mut ticks` is aligned.
+        // SAFETY: `self.sys_ctx` is active, unique `&mut self` prevents aliasing, and `&mut ticks` is aligned.
         let ptr = unsafe { get_mut_fn(self.sys_ctx, component, &mut ticks) };
         if ptr.is_null() {
             return None;
         }
-        if core::mem::size_of::<R>() == 0 {
-            // SAFETY: Zero-sized `R: AbiPod` may be mutably referenced via `NonNull::dangling()`.
-            return Some((
-                unsafe { core::ptr::NonNull::<R>::dangling().as_mut() },
-                ticks,
-            ));
-        }
-        if !(ptr as usize).is_multiple_of(core::mem::align_of::<R>()) {
-            return None;
-        }
-        // SAFETY: Host verified exclusive `ResourceWrite` permission and stamped change ticks.
-        Some((unsafe { &mut *ptr.cast::<R>() }, ticks))
+        // SAFETY: `component_layout_info` verified `R`'s exact size, alignment, mutability, and
+        // optional UUID; host verified exclusive `ResourceWrite` permission and stamped change ticks.
+        let val = unsafe { Self::cast_entity_mut::<R>(ptr) }?;
+        Some((val, ticks))
+    }
+
+    /// Looks up an exclusive mutable singleton resource `&mut R` by its pre-resolved
+    /// `BamComponent` handle, validating `(size, align, !immutable)` via
+    /// `Host::component_layout_info` (failing closed on mismatch or `UNSUPPORTED`).
+    #[inline]
+    pub fn res_mut_ptr_by_handle_checked<R: AbiPod>(
+        &mut self,
+        component: BamComponent,
+    ) -> Option<(&mut R, BamChangeTicks)> {
+        self.res_mut_ptr_by_handle_with_uuid_checked::<R>(component, None)
     }
 
     /// Borrows the contiguous zero-copy `&[FfiEntity]` slice of child/target entities for `entity`
@@ -582,15 +674,8 @@ impl<'a> ValidatedSystemRef<'a> {
         if entity.is_null() {
             return Err(FfiResult::INVALID_ENTITY);
         }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, sys_entity_children),
-            core::mem::size_of::<Option<BamSysEntityChildrenFn>>(),
-        ) {
-            return Err(FfiResult::UNSUPPORTED);
-        }
-        let Some(children_fn) = self.host.api().sys_entity_children else {
-            return Err(FfiResult::UNSUPPORTED);
-        };
+        let children_fn =
+            host_slot!(self.host.api(), sys_entity_children).ok_or(FfiResult::UNSUPPORTED)?;
         let mut ptr: *const FfiEntity = core::ptr::null();
         let mut len: usize = 0;
         // SAFETY: `self.sys_ctx` is an active `BamSystemCtx` and `ptr`/`len` are aligned stack slots.
@@ -623,8 +708,28 @@ impl<'a> ValidatedSystemRef<'a> {
         Ok(unsafe { core::slice::from_raw_parts(ptr, len) })
     }
 
+    fn validate_wire_resource_layout<W: AbiPod>(
+        &self,
+        component: BamComponent,
+        vtable: &ValidatedWireVTable<W>,
+        require_mutable: bool,
+    ) -> Result<(), FfiResult> {
+        let info = self.host.component_layout_info(component)?;
+        if info.size != vtable.host_size() || info.align != vtable.host_align() {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        if !vtable.uuid().is_zero() && info.uuid != vtable.uuid() {
+            return Err(FfiResult::TYPE_MISMATCH);
+        }
+        if require_mutable && (info.flags & BAM_STORAGE_FLAG_IMMUTABLE) != 0 {
+            return Err(FfiResult::PERMISSION_DENIED);
+        }
+        Ok(())
+    }
+
     /// Reads an opaque host-bridged singleton resource by `component` handle using `vtable`
-    /// (`BamHostApi::sys_res_ptr`).
+    /// (`BamHostApi::sys_res_ptr`), validating `component` against `vtable.uuid()`,
+    /// `vtable.host_size()`, and `vtable.host_align()` via `Host::component_layout_info`.
     pub fn read_mapped_wire_resource_by_handle<W: AbiPod>(
         &self,
         component: BamComponent,
@@ -633,15 +738,8 @@ impl<'a> ValidatedSystemRef<'a> {
         if self.sys_ctx.is_null() || !component.is_valid() {
             return Err(FfiResult::INVALID_COMPONENT);
         }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, sys_res_ptr),
-            core::mem::size_of::<Option<BamSysResPtrFn>>(),
-        ) {
-            return Err(FfiResult::UNSUPPORTED);
-        }
-        let Some(get_ptr_fn) = self.host.api().sys_res_ptr else {
-            return Err(FfiResult::UNSUPPORTED);
-        };
+        self.validate_wire_resource_layout(component, vtable, false)?;
+        let get_ptr_fn = host_slot!(self.host.api(), sys_res_ptr).ok_or(FfiResult::UNSUPPORTED)?;
         let Some(vt_get) = vtable.raw.get else {
             return Err(FfiResult::UNSUPPORTED);
         };
@@ -655,7 +753,8 @@ impl<'a> ValidatedSystemRef<'a> {
             return Err(FfiResult::TYPE_MISMATCH);
         }
         let mut out = core::mem::MaybeUninit::<W>::zeroed();
-        // SAFETY: Host verified resource read access on `component`; `vt_get` initializes `out`.
+        // SAFETY: Host verified resource read access on `component`, `validate_wire_resource_layout`
+        // confirmed `vtable`'s exact UUID and host layout, and `vt_get` initializes `out`.
         let status = unsafe { vt_get(ptr.cast::<c_void>(), out.as_mut_ptr()) };
         if status.is_ok() {
             // SAFETY: `vt_get` reported `OK`, confirming `out` is initialized `W`.
@@ -666,7 +765,9 @@ impl<'a> ValidatedSystemRef<'a> {
     }
 
     /// Writes `value` (`W: AbiPod`) into an opaque host-bridged singleton resource by `component`
-    /// handle using `vtable` (`BamHostApi::sys_res_mut_ptr`).
+    /// handle using `vtable` (`BamHostApi::sys_res_mut_ptr`), validating `component` against
+    /// `vtable.uuid()`, `vtable.host_size()`, and `vtable.host_align()` via
+    /// `Host::component_layout_info`.
     pub fn write_mapped_wire_resource_by_handle<W: AbiPod>(
         &mut self,
         component: BamComponent,
@@ -676,20 +777,14 @@ impl<'a> ValidatedSystemRef<'a> {
         if self.sys_ctx.is_null() || !component.is_valid() {
             return Err(FfiResult::INVALID_COMPONENT);
         }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, sys_res_mut_ptr),
-            core::mem::size_of::<Option<BamSysResMutPtrFn>>(),
-        ) {
-            return Err(FfiResult::UNSUPPORTED);
-        }
-        let Some(get_mut_fn) = self.host.api().sys_res_mut_ptr else {
-            return Err(FfiResult::UNSUPPORTED);
-        };
+        self.validate_wire_resource_layout(component, vtable, true)?;
+        let get_mut_fn =
+            host_slot!(self.host.api(), sys_res_mut_ptr).ok_or(FfiResult::UNSUPPORTED)?;
         let Some(vt_set) = vtable.raw.set else {
             return Err(FfiResult::PERMISSION_DENIED);
         };
         let mut ticks = BamChangeTicks::default();
-        // SAFETY: `self.sys_ctx` is active under `&mut self` and `&mut ticks` is writable storage.
+        // SAFETY: `self.sys_ctx` is active under unique `&mut self` and `&mut ticks` is writable storage.
         let ptr = unsafe { get_mut_fn(self.sys_ctx, component, &mut ticks) };
         if ptr.is_null() {
             return Err(FfiResult::NOT_FOUND);
@@ -697,7 +792,8 @@ impl<'a> ValidatedSystemRef<'a> {
         if vtable.host_size() > 0 && !(ptr as usize).is_multiple_of(vtable.host_align()) {
             return Err(FfiResult::TYPE_MISMATCH);
         }
-        // SAFETY: Host verified exclusive `ResourceWrite` permission; `value` is aligned readable `&W`.
+        // SAFETY: Host verified exclusive `ResourceWrite` permission, `validate_wire_resource_layout`
+        // confirmed `vtable`'s exact UUID and host layout, and `value` is aligned readable `&W`.
         let status = unsafe { vt_set(ptr.cast::<c_void>(), value) };
         if status.is_ok() {
             Ok(ticks)
@@ -734,11 +830,7 @@ where
         // SAFETY: `user_data` was allocated via `GuestInstance::track_allocation` for
         // `SystemClosureState<F>` and remains valid until `bevy_abi_mod_shutdown`.
         let state = unsafe { &*user_data.cast::<SystemClosureState<F>>() };
-        let inv_host = if state.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, sys_host_ctx),
-            core::mem::size_of::<Option<BamSysHostCtxFn>>(),
-        ) && let Some(sys_host_ctx_fn) = state.host.api().sys_host_ctx
-        {
+        let inv_host = if let Some(sys_host_ctx_fn) = host_slot!(state.host.api(), sys_host_ctx) {
             // SAFETY: `sys_ctx` is non-null and active for the duration of this `BamSystemFn` call.
             let raw_ctx = unsafe { sys_host_ctx_fn(sys_ctx.cast_const()) };
             if raw_ctx.is_null() {
@@ -890,27 +982,92 @@ pub struct SystemRegistrationConfig<'a> {
     pub ambiguous_with: &'a [&'a CStr],
 }
 
+struct OwnedRawCString(*mut c_char);
+
+// SAFETY: Uniquely owns an immutable heap NUL-terminated string created via `CString::into_raw`
+// (avoiding `Box` `Unique` retagging on move) and freed once in `Drop`.
+unsafe impl Send for OwnedRawCString {}
+
+impl OwnedRawCString {
+    fn from_cstr(s: &CStr) -> Self {
+        Self(CString::from(s).into_raw())
+    }
+
+    #[inline]
+    const fn as_ptr(&self) -> *const c_char {
+        self.0.cast_const()
+    }
+}
+
+impl Drop for OwnedRawCString {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` was created via `CString::into_raw` in `from_cstr` and is freed once.
+        drop(unsafe { CString::from_raw(self.0) });
+    }
+}
+
+struct OwnedRawTermSlice {
+    ptr: *mut BamTermDesc,
+    len: usize,
+}
+
+// SAFETY: Uniquely owns an immutable heap `[BamTermDesc]` slice created via `Box::into_raw`
+// (avoiding `Box` `Unique` retagging on move) and freed once in `Drop` when `len > 0`.
+unsafe impl Send for OwnedRawTermSlice {}
+
+impl OwnedRawTermSlice {
+    fn from_slice(terms: &[BamTermDesc]) -> Self {
+        let len = terms.len();
+        if len == 0 {
+            Self {
+                ptr: core::ptr::NonNull::<BamTermDesc>::dangling().as_ptr(),
+                len: 0,
+            }
+        } else {
+            let boxed: Box<[BamTermDesc]> = terms.into();
+            Self {
+                ptr: Box::into_raw(boxed).cast::<BamTermDesc>(),
+                len,
+            }
+        }
+    }
+
+    #[inline]
+    const fn as_ptr(&self) -> *const BamTermDesc {
+        self.ptr.cast_const()
+    }
+}
+
+impl Drop for OwnedRawTermSlice {
+    fn drop(&mut self) {
+        if self.len > 0 {
+            // SAFETY: `self.ptr` came from `Box::into_raw` of a `Box<[BamTermDesc]>` of length `self.len`.
+            drop(unsafe { Box::from_raw(core::ptr::slice_from_raw_parts_mut(self.ptr, self.len)) });
+        }
+    }
+}
+
 struct OwnedDescriptorStorage {
-    name: CString,
-    _term_vecs: Vec<Box<[BamTermDesc]>>,
+    name: OwnedRawCString,
+    _term_vecs: Vec<OwnedRawTermSlice>,
     queries: Box<[BamQueryDesc]>,
-    _after_names: Vec<CString>,
+    _after_names: Vec<OwnedRawCString>,
     after_ptrs: Box<[*const c_char]>,
-    _before_names: Vec<CString>,
+    _before_names: Vec<OwnedRawCString>,
     before_ptrs: Box<[*const c_char]>,
-    _in_set_names: Vec<CString>,
+    _in_set_names: Vec<OwnedRawCString>,
     in_set_ptrs: Box<[*const c_char]>,
-    _after_weak_names: Vec<CString>,
+    _after_weak_names: Vec<OwnedRawCString>,
     after_weak_ptrs: Box<[*const c_char]>,
-    _before_weak_names: Vec<CString>,
+    _before_weak_names: Vec<OwnedRawCString>,
     before_weak_ptrs: Box<[*const c_char]>,
-    _ambiguous_with_names: Vec<CString>,
+    _ambiguous_with_names: Vec<OwnedRawCString>,
     ambiguous_with_ptrs: Box<[*const c_char]>,
 }
 
-// SAFETY: Every raw pointer inside `queries`, `after_ptrs`, and `before_ptrs` points exclusively
-// into heap-allocated `Box<[BamTermDesc]>` and `CString` buffers owned by the same struct and
-// never mutated after construction.
+// SAFETY: Every raw pointer inside `queries` and `*_ptrs` points exclusively into heap-allocated
+// `OwnedRawTermSlice` and `OwnedRawCString` buffers owned by the same struct and never mutated
+// after construction (nor retagged on move).
 unsafe impl Send for OwnedDescriptorStorage {}
 
 fn prepare_system_desc<F>(
@@ -978,37 +1135,37 @@ where
         }
     }
 
-    let mut term_vecs: Vec<Box<[BamTermDesc]>> = Vec::with_capacity(total_query_count);
+    let mut term_vecs: Vec<OwnedRawTermSlice> = Vec::with_capacity(total_query_count);
     let mut query_descs: Vec<BamQueryDesc> = Vec::with_capacity(total_query_count);
     for terms in config.user_queries {
         if terms.is_empty() {
             query_descs.push(BamQueryDesc::empty());
         } else {
-            let boxed_terms: Box<[BamTermDesc]> = (*terms).into();
-            let ptr = boxed_terms.as_ptr();
-            let len = boxed_terms.len();
-            term_vecs.push(boxed_terms);
+            let raw_terms = OwnedRawTermSlice::from_slice(terms);
+            let ptr = raw_terms.as_ptr();
+            let len = raw_terms.len;
+            term_vecs.push(raw_terms);
             query_descs.push(BamQueryDesc::new(ptr, len));
         }
     }
 
     let resource_query_index = if has_sys_resources {
         let idx = query_descs.len();
-        let boxed_res: Box<[BamTermDesc]> = config.system_resources.into();
-        let ptr = boxed_res.as_ptr();
-        let len = boxed_res.len();
-        term_vecs.push(boxed_res);
+        let raw_res = OwnedRawTermSlice::from_slice(config.system_resources);
+        let ptr = raw_res.as_ptr();
+        let len = raw_res.len;
+        term_vecs.push(raw_res);
         query_descs.push(BamQueryDesc::new(ptr, len));
         Some(idx)
     } else {
         None
     };
 
-    fn collect_cstrings(names: &[&CStr]) -> (Vec<CString>, Box<[*const c_char]>) {
-        let mut owned: Vec<CString> = Vec::with_capacity(names.len());
+    fn collect_cstrings(names: &[&CStr]) -> (Vec<OwnedRawCString>, Box<[*const c_char]>) {
+        let mut owned: Vec<OwnedRawCString> = Vec::with_capacity(names.len());
         let mut ptrs: Vec<*const c_char> = Vec::with_capacity(names.len());
         for set_name in names {
-            let cstr = CString::from(*set_name);
+            let cstr = OwnedRawCString::from_cstr(set_name);
             ptrs.push(cstr.as_ptr());
             owned.push(cstr);
         }
@@ -1023,7 +1180,7 @@ where
     let (ambiguous_with_names, ambiguous_with_ptrs) = collect_cstrings(config.ambiguous_with);
 
     let storage = OwnedDescriptorStorage {
-        name: CString::from(config.name),
+        name: OwnedRawCString::from_cstr(config.name),
         _term_vecs: term_vecs,
         queries: query_descs.into_boxed_slice(),
         _after_names: after_names,
@@ -1150,15 +1307,8 @@ where
     if load_ctx.is_null() {
         return Err(FfiResult::NULL_POINTER);
     }
-    if !instance.host().api().covers_slot(
-        core::mem::offset_of!(BamHostApi, register_system_handle),
-        core::mem::size_of::<Option<BamRegisterSystemHandleFn>>(),
-    ) {
-        return Err(FfiResult::UNSUPPORTED);
-    }
-    let Some(register_handle_fn) = instance.host().api().register_system_handle else {
-        return Err(FfiResult::UNSUPPORTED);
-    };
+    let register_handle_fn =
+        host_slot!(instance.host().api(), register_system_handle).ok_or(FfiResult::UNSUPPORTED)?;
     let desc = prepare_system_desc(instance, config, run_if, closure)?;
     let mut out = BamSystem::INVALID;
     // SAFETY: `load_ctx` is active per caller contract, `desc` passed validation with all pointed-to
@@ -1192,15 +1342,8 @@ pub unsafe fn configure_schedule_set_raw(
     if !validation.is_ok() {
         return Err(validation);
     }
-    if !host.api().covers_slot(
-        core::mem::offset_of!(BamHostApi, configure_schedule_set),
-        core::mem::size_of::<Option<BamConfigureScheduleSetFn>>(),
-    ) {
-        return Err(FfiResult::UNSUPPORTED);
-    }
-    let Some(configure_fn) = host.api().configure_schedule_set else {
-        return Err(FfiResult::UNSUPPORTED);
-    };
+    let configure_fn =
+        host_slot!(host.api(), configure_schedule_set).ok_or(FfiResult::UNSUPPORTED)?;
     let mut out = BamSystemSet::INVALID;
     // SAFETY: `load_ctx` is active per caller contract, `desc` passed validation, and `&mut out`
     // is aligned writable stack storage.
@@ -1245,11 +1388,7 @@ pub unsafe fn configure_schedule_set(
         u32::try_from(before_sets.len()).map_err(|_| FfiResult::CAPACITY_EXCEEDED)?;
     let after_count = u32::try_from(after_sets.len()).map_err(|_| FfiResult::CAPACITY_EXCEEDED)?;
     let host = *instance.host();
-    if !host.api().covers_slot(
-        core::mem::offset_of!(BamHostApi, configure_schedule_set),
-        core::mem::size_of::<Option<BamConfigureScheduleSetFn>>(),
-    ) || host.api().configure_schedule_set.is_none()
-    {
+    if host_slot!(host.api(), configure_schedule_set).is_none() {
         return Err(FfiResult::UNSUPPORTED);
     }
     let before_ptr = if before_sets.is_empty() {
@@ -1307,13 +1446,7 @@ pub unsafe fn mount_system_in_schedule(
     if !system.is_valid() || !schedule.is_valid() {
         return FfiResult::INVALID_ARGUMENT;
     }
-    if !host.api().covers_slot(
-        core::mem::offset_of!(BamHostApi, mount_system_in_schedule),
-        core::mem::size_of::<Option<BamMountSystemInScheduleFn>>(),
-    ) {
-        return FfiResult::UNSUPPORTED;
-    }
-    let Some(mount_fn) = host.api().mount_system_in_schedule else {
+    let Some(mount_fn) = host_slot!(host.api(), mount_system_in_schedule) else {
         return FfiResult::UNSUPPORTED;
     };
     // SAFETY: `load_ctx` is active per caller contract and `system`/`schedule` passed validation.
@@ -1362,6 +1495,155 @@ where
     })
 }
 
+enum ObserverAllocTarget<'a> {
+    Init(&'a mut GuestInstance),
+    Runtime(&'a Host),
+}
+
+impl ObserverAllocTarget<'_> {
+    fn host(&self) -> Host {
+        match self {
+            Self::Init(inst) => *inst.host(),
+            Self::Runtime(host) => **host,
+        }
+    }
+
+    fn track<T: Send + 'static>(&mut self, boxed: Box<T>) -> Result<*mut T, FfiResult> {
+        match self {
+            Self::Init(inst) => Ok(inst.track_allocation(boxed)),
+            Self::Runtime(host) => host
+                .track_runtime_allocation(boxed)
+                .ok_or(FfiResult::INVALID_STATE),
+        }
+    }
+}
+
+enum ObserverKind {
+    CustomRead(BamComponent, BamObserverFn),
+    CustomMut(BamComponent, BamObserverMutFn),
+    Lifecycle(BamEventKind, BamObserverFn),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_observer_desc<F: Send + 'static>(
+    mut alloc: ObserverAllocTarget<'_>,
+    name: Option<&str>,
+    kind: ObserverKind,
+    watched_components: &[BamComponent],
+    target: FfiEntity,
+    flags: u32,
+    propagate_relationship: BamComponent,
+    callback: F,
+) -> Result<BamObserverDesc, FfiResult> {
+    match kind {
+        ObserverKind::CustomRead(ev, _) | ObserverKind::CustomMut(ev, _) => {
+            if !ev.is_valid() {
+                return Err(FfiResult::INVALID_ARGUMENT);
+            }
+        }
+        ObserverKind::Lifecycle(event_kind, _) => {
+            if event_kind == BamEventKind::CUSTOM || !event_kind.is_valid() {
+                return Err(FfiResult::INVALID_ARGUMENT);
+            }
+        }
+    }
+
+    let name_ptr = match name {
+        Some(s) => {
+            if s.is_empty() {
+                return Err(FfiResult::INVALID_ARGUMENT);
+            }
+            let cstr = CString::new(s).map_err(|_| FfiResult::INVALID_ARGUMENT)?;
+            let raw_name = alloc.track(Box::new(cstr))?;
+            // SAFETY: `raw_name` stays pinned inside `GuestInstance` until shutdown.
+            unsafe { (*raw_name).as_ptr() }
+        }
+        None => core::ptr::null(),
+    };
+
+    let (watched_ptr, watched_len) = if watched_components.is_empty() {
+        (core::ptr::null(), 0)
+    } else {
+        let boxed: Box<[BamComponent]> = watched_components.into();
+        let len = boxed.len();
+        let raw_watched = alloc.track(Box::new(boxed))?;
+        // SAFETY: `raw_watched` stays pinned inside `GuestInstance` until shutdown.
+        (unsafe { (*raw_watched).as_ptr() }, len)
+    };
+
+    let host = alloc.host();
+    let raw_state = alloc.track(Box::new(ObserverTrampolineState {
+        host,
+        callback: ReentrantCell::new(callback),
+    }))?;
+
+    let mut desc = match kind {
+        ObserverKind::CustomRead(event, cb) => {
+            BamObserverDesc::new(event, cb, raw_state.cast::<c_void>())
+        }
+        ObserverKind::CustomMut(event, cb) => {
+            BamObserverDesc::new_mut(event, cb, raw_state.cast::<c_void>())
+        }
+        ObserverKind::Lifecycle(event_kind, cb) => BamObserverDesc::new_lifecycle(
+            event_kind,
+            watched_ptr,
+            watched_len,
+            cb,
+            raw_state.cast::<c_void>(),
+        ),
+    }
+    .with_entity(target)
+    .with_flags(flags);
+
+    if !name_ptr.is_null() {
+        desc = desc.with_name(name_ptr);
+    }
+    if propagate_relationship.is_valid() {
+        desc = desc.with_propagate(propagate_relationship);
+    }
+    let validation = desc.validate();
+    if !validation.is_ok() {
+        return Err(validation);
+    }
+    Ok(desc)
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn submit_init_observer<F: Send + 'static>(
+    instance: &mut GuestInstance,
+    load_ctx: *mut BamLoadCtx,
+    name: &str,
+    kind: ObserverKind,
+    watched_components: &[BamComponent],
+    target: FfiEntity,
+    flags: u32,
+    propagate_relationship: BamComponent,
+    callback: F,
+) -> FfiResult {
+    if load_ctx.is_null() {
+        return FfiResult::NULL_POINTER;
+    }
+    let Some(register_fn) = host_slot!(instance.host().api(), register_observer) else {
+        return FfiResult::UNSUPPORTED;
+    };
+    let desc = match build_observer_desc(
+        ObserverAllocTarget::Init(instance),
+        Some(name),
+        kind,
+        watched_components,
+        target,
+        flags,
+        propagate_relationship,
+        callback,
+    ) {
+        Ok(d) => d,
+        Err(err) => return err,
+    };
+    // SAFETY: `load_ctx` is active per caller contract and `desc` passed validation with all
+    // pointed-to strings, watched component lists, and closure state owned by `instance`.
+    unsafe { register_fn(load_ctx, &desc) }
+}
+
 /// Validates and registers a dynamic [`BamObserverDesc`] closure on `load_ctx`, tracking its
 /// heap-owned name and state inside `instance`.
 ///
@@ -1380,46 +1662,19 @@ where
     E: AbiPod,
     F: FnMut(FfiEntity, &E, &mut ValidatedCommands<'_>) -> FfiResult + Send + 'static,
 {
-    if load_ctx.is_null() {
-        return FfiResult::NULL_POINTER;
+    // SAFETY: Forwarding identical `load_ctx` invariant to `register_observer_closure_with_options`.
+    unsafe {
+        register_observer_closure_with_options::<E, F>(
+            instance,
+            load_ctx,
+            name,
+            event,
+            target,
+            0,
+            BamComponent::INVALID,
+            callback,
+        )
     }
-    if name.is_empty() || !event.is_valid() {
-        return FfiResult::INVALID_ARGUMENT;
-    }
-    let Ok(owned_name) = CString::new(name) else {
-        return FfiResult::INVALID_ARGUMENT;
-    };
-    if !instance.host().api().covers_slot(
-        core::mem::offset_of!(BamHostApi, register_observer),
-        core::mem::size_of::<Option<BamRegisterObserverFn>>(),
-    ) {
-        return FfiResult::UNSUPPORTED;
-    }
-    let Some(register_fn) = instance.host().api().register_observer else {
-        return FfiResult::UNSUPPORTED;
-    };
-
-    let raw_name = instance.track_allocation(Box::new(owned_name));
-    // SAFETY: `raw_name` stays pinned inside `instance` until `shutdown_guest_instance`.
-    let name_ptr = unsafe { (*raw_name).as_ptr() };
-
-    let host = *instance.host();
-    let raw_state = instance.track_allocation(Box::new(ObserverTrampolineState {
-        host,
-        callback: ReentrantCell::new(callback),
-    }));
-
-    let obs_cb: BamObserverFn = observer_closure_trampoline::<E, F>;
-    let desc = BamObserverDesc::new(event, obs_cb, raw_state.cast::<c_void>())
-        .with_name(name_ptr)
-        .with_entity(target);
-    let validation = desc.validate();
-    if !validation.is_ok() {
-        return validation;
-    }
-    // SAFETY: `load_ctx` is active per caller contract and `desc` passed validation with `name_ptr`
-    // and `raw_state` owned by `instance`.
-    unsafe { register_fn(load_ctx, &desc) }
 }
 
 unsafe extern "C" fn observer_mut_closure_trampoline<E, F>(
@@ -1521,46 +1776,20 @@ where
     E: AbiPod,
     F: FnMut(FfiEntity, &E, &mut ValidatedCommands<'_>) -> FfiResult + Send + 'static,
 {
-    if load_ctx.is_null() {
-        return FfiResult::NULL_POINTER;
+    // SAFETY: Caller guarantees `load_ctx` is an active `BamLoadCtx` belonging to `instance`.
+    unsafe {
+        submit_init_observer(
+            instance,
+            load_ctx,
+            name,
+            ObserverKind::CustomRead(event, observer_closure_trampoline::<E, F>),
+            &[],
+            target,
+            flags,
+            propagate_relationship,
+            callback,
+        )
     }
-    if name.is_empty() || !event.is_valid() {
-        return FfiResult::INVALID_ARGUMENT;
-    }
-    let Ok(owned_name) = CString::new(name) else {
-        return FfiResult::INVALID_ARGUMENT;
-    };
-    if !instance.host().api().covers_slot(
-        core::mem::offset_of!(BamHostApi, register_observer),
-        core::mem::size_of::<Option<BamRegisterObserverFn>>(),
-    ) {
-        return FfiResult::UNSUPPORTED;
-    }
-    let Some(register_fn) = instance.host().api().register_observer else {
-        return FfiResult::UNSUPPORTED;
-    };
-    let raw_name = instance.track_allocation(Box::new(owned_name));
-    // SAFETY: `raw_name` stays pinned inside `instance` until `shutdown_guest_instance`.
-    let name_ptr = unsafe { (*raw_name).as_ptr() };
-    let host = *instance.host();
-    let raw_state = instance.track_allocation(Box::new(ObserverTrampolineState {
-        host,
-        callback: ReentrantCell::new(callback),
-    }));
-    let obs_cb: BamObserverFn = observer_closure_trampoline::<E, F>;
-    let mut desc = BamObserverDesc::new(event, obs_cb, raw_state.cast::<c_void>())
-        .with_name(name_ptr)
-        .with_entity(target)
-        .with_flags(flags);
-    if propagate_relationship.is_valid() {
-        desc = desc.with_propagate(propagate_relationship);
-    }
-    let validation = desc.validate();
-    if !validation.is_ok() {
-        return validation;
-    }
-    // SAFETY: `load_ctx` is active and `desc` passed validation with buffers owned by `instance`.
-    unsafe { register_fn(load_ctx, &desc) }
 }
 
 /// Validates and registers a mutable [`BamObserverDesc`] closure (`&mut E` + `&mut bool` propagate)
@@ -1586,46 +1815,20 @@ where
         + Send
         + 'static,
 {
-    if load_ctx.is_null() {
-        return FfiResult::NULL_POINTER;
+    // SAFETY: Caller guarantees `load_ctx` is an active `BamLoadCtx` belonging to `instance`.
+    unsafe {
+        submit_init_observer(
+            instance,
+            load_ctx,
+            name,
+            ObserverKind::CustomMut(event, observer_mut_closure_trampoline::<E, F>),
+            &[],
+            target,
+            flags,
+            propagate_relationship,
+            callback,
+        )
     }
-    if name.is_empty() || !event.is_valid() {
-        return FfiResult::INVALID_ARGUMENT;
-    }
-    let Ok(owned_name) = CString::new(name) else {
-        return FfiResult::INVALID_ARGUMENT;
-    };
-    if !instance.host().api().covers_slot(
-        core::mem::offset_of!(BamHostApi, register_observer),
-        core::mem::size_of::<Option<BamRegisterObserverFn>>(),
-    ) {
-        return FfiResult::UNSUPPORTED;
-    }
-    let Some(register_fn) = instance.host().api().register_observer else {
-        return FfiResult::UNSUPPORTED;
-    };
-    let raw_name = instance.track_allocation(Box::new(owned_name));
-    // SAFETY: `raw_name` stays pinned inside `instance` until `shutdown_guest_instance`.
-    let name_ptr = unsafe { (*raw_name).as_ptr() };
-    let host = *instance.host();
-    let raw_state = instance.track_allocation(Box::new(ObserverTrampolineState {
-        host,
-        callback: ReentrantCell::new(callback),
-    }));
-    let obs_cb: BamObserverMutFn = observer_mut_closure_trampoline::<E, F>;
-    let mut desc = BamObserverDesc::new_mut(event, obs_cb, raw_state.cast::<c_void>())
-        .with_name(name_ptr)
-        .with_entity(target)
-        .with_flags(flags);
-    if propagate_relationship.is_valid() {
-        desc = desc.with_propagate(propagate_relationship);
-    }
-    let validation = desc.validate();
-    if !validation.is_ok() {
-        return validation;
-    }
-    // SAFETY: `load_ctx` is active and `desc` passed validation with buffers owned by `instance`.
-    unsafe { register_fn(load_ctx, &desc) }
 }
 
 /// Validates and registers a component lifecycle or `Ready` [`BamObserverDesc`] closure on
@@ -1649,61 +1852,20 @@ pub unsafe fn register_lifecycle_observer_closure<F>(
 where
     F: FnMut(FfiEntity, &mut ValidatedCommands<'_>) -> FfiResult + Send + 'static,
 {
-    if load_ctx.is_null() {
-        return FfiResult::NULL_POINTER;
+    // SAFETY: Caller guarantees `load_ctx` is an active `BamLoadCtx` belonging to `instance`.
+    unsafe {
+        submit_init_observer(
+            instance,
+            load_ctx,
+            name,
+            ObserverKind::Lifecycle(event_kind, lifecycle_observer_closure_trampoline::<F>),
+            watched_components,
+            target,
+            flags,
+            propagate_relationship,
+            callback,
+        )
     }
-    if name.is_empty() || event_kind == BamEventKind::CUSTOM || !event_kind.is_valid() {
-        return FfiResult::INVALID_ARGUMENT;
-    }
-    let Ok(owned_name) = CString::new(name) else {
-        return FfiResult::INVALID_ARGUMENT;
-    };
-    if !instance.host().api().covers_slot(
-        core::mem::offset_of!(BamHostApi, register_observer),
-        core::mem::size_of::<Option<BamRegisterObserverFn>>(),
-    ) {
-        return FfiResult::UNSUPPORTED;
-    }
-    let Some(register_fn) = instance.host().api().register_observer else {
-        return FfiResult::UNSUPPORTED;
-    };
-    let raw_name = instance.track_allocation(Box::new(owned_name));
-    // SAFETY: `raw_name` stays pinned inside `instance` until `shutdown_guest_instance`.
-    let name_ptr = unsafe { (*raw_name).as_ptr() };
-    let (watched_ptr, watched_len) = if watched_components.is_empty() {
-        (core::ptr::null(), 0)
-    } else {
-        let boxed: Box<[BamComponent]> = watched_components.into();
-        let len = boxed.len();
-        let raw_watched = instance.track_allocation(Box::new(boxed));
-        // SAFETY: `raw_watched` stays pinned inside `instance`.
-        (unsafe { (*raw_watched).as_ptr() }, len)
-    };
-    let host = *instance.host();
-    let raw_state = instance.track_allocation(Box::new(ObserverTrampolineState {
-        host,
-        callback: ReentrantCell::new(callback),
-    }));
-    let obs_cb: BamObserverFn = lifecycle_observer_closure_trampoline::<F>;
-    let mut desc = BamObserverDesc::new_lifecycle(
-        event_kind,
-        watched_ptr,
-        watched_len,
-        obs_cb,
-        raw_state.cast::<c_void>(),
-    )
-    .with_name(name_ptr)
-    .with_entity(target)
-    .with_flags(flags);
-    if propagate_relationship.is_valid() {
-        desc = desc.with_propagate(propagate_relationship);
-    }
-    let validation = desc.validate();
-    if !validation.is_ok() {
-        return validation;
-    }
-    // SAFETY: `load_ctx` is active and `desc` passed validation with buffers owned by `instance`.
-    unsafe { register_fn(load_ctx, &desc) }
 }
 
 pub(crate) fn allocate_runtime_observer_desc<E, F>(
@@ -1719,44 +1881,16 @@ where
     E: AbiPod,
     F: FnMut(FfiEntity, &E, &mut ValidatedCommands<'_>) -> FfiResult + Send + 'static,
 {
-    if !event.is_valid() {
-        return Err(FfiResult::INVALID_ARGUMENT);
-    }
-    let name_ptr = match name {
-        Some(s) => {
-            if s.is_empty() {
-                return Err(FfiResult::INVALID_ARGUMENT);
-            }
-            let cstr = CString::new(s).map_err(|_| FfiResult::INVALID_ARGUMENT)?;
-            let raw_name = host
-                .track_runtime_allocation(Box::new(cstr))
-                .ok_or(FfiResult::INVALID_STATE)?;
-            // SAFETY: `raw_name` is pinned inside `GuestInstance`'s `RuntimeAllocTracker`.
-            unsafe { (*raw_name).as_ptr() }
-        }
-        None => core::ptr::null(),
-    };
-    let raw_state = host
-        .track_runtime_allocation(Box::new(ObserverTrampolineState {
-            host: *host,
-            callback: ReentrantCell::new(callback),
-        }))
-        .ok_or(FfiResult::INVALID_STATE)?;
-    let obs_cb: BamObserverFn = observer_closure_trampoline::<E, F>;
-    let mut desc = BamObserverDesc::new(event, obs_cb, raw_state.cast::<c_void>())
-        .with_entity(target)
-        .with_flags(flags);
-    if !name_ptr.is_null() {
-        desc = desc.with_name(name_ptr);
-    }
-    if propagate_relationship.is_valid() {
-        desc = desc.with_propagate(propagate_relationship);
-    }
-    let validation = desc.validate();
-    if !validation.is_ok() {
-        return Err(validation);
-    }
-    Ok(desc)
+    build_observer_desc(
+        ObserverAllocTarget::Runtime(host),
+        name,
+        ObserverKind::CustomRead(event, observer_closure_trampoline::<E, F>),
+        &[],
+        target,
+        flags,
+        propagate_relationship,
+        callback,
+    )
 }
 
 pub(crate) fn allocate_runtime_observer_mut_desc<E, F>(
@@ -1774,44 +1908,16 @@ where
         + Send
         + 'static,
 {
-    if !event.is_valid() {
-        return Err(FfiResult::INVALID_ARGUMENT);
-    }
-    let name_ptr = match name {
-        Some(s) => {
-            if s.is_empty() {
-                return Err(FfiResult::INVALID_ARGUMENT);
-            }
-            let cstr = CString::new(s).map_err(|_| FfiResult::INVALID_ARGUMENT)?;
-            let raw_name = host
-                .track_runtime_allocation(Box::new(cstr))
-                .ok_or(FfiResult::INVALID_STATE)?;
-            // SAFETY: `raw_name` is pinned inside `GuestInstance`'s `RuntimeAllocTracker`.
-            unsafe { (*raw_name).as_ptr() }
-        }
-        None => core::ptr::null(),
-    };
-    let raw_state = host
-        .track_runtime_allocation(Box::new(ObserverTrampolineState {
-            host: *host,
-            callback: ReentrantCell::new(callback),
-        }))
-        .ok_or(FfiResult::INVALID_STATE)?;
-    let obs_cb: BamObserverMutFn = observer_mut_closure_trampoline::<E, F>;
-    let mut desc = BamObserverDesc::new_mut(event, obs_cb, raw_state.cast::<c_void>())
-        .with_entity(target)
-        .with_flags(flags);
-    if !name_ptr.is_null() {
-        desc = desc.with_name(name_ptr);
-    }
-    if propagate_relationship.is_valid() {
-        desc = desc.with_propagate(propagate_relationship);
-    }
-    let validation = desc.validate();
-    if !validation.is_ok() {
-        return Err(validation);
-    }
-    Ok(desc)
+    build_observer_desc(
+        ObserverAllocTarget::Runtime(host),
+        name,
+        ObserverKind::CustomMut(event, observer_mut_closure_trampoline::<E, F>),
+        &[],
+        target,
+        flags,
+        propagate_relationship,
+        callback,
+    )
 }
 
 pub(crate) fn allocate_runtime_lifecycle_observer_desc<F>(
@@ -1827,61 +1933,16 @@ pub(crate) fn allocate_runtime_lifecycle_observer_desc<F>(
 where
     F: FnMut(FfiEntity, &mut ValidatedCommands<'_>) -> FfiResult + Send + 'static,
 {
-    if event_kind == BamEventKind::CUSTOM || !event_kind.is_valid() {
-        return Err(FfiResult::INVALID_ARGUMENT);
-    }
-    let name_ptr = match name {
-        Some(s) => {
-            if s.is_empty() {
-                return Err(FfiResult::INVALID_ARGUMENT);
-            }
-            let cstr = CString::new(s).map_err(|_| FfiResult::INVALID_ARGUMENT)?;
-            let raw_name = host
-                .track_runtime_allocation(Box::new(cstr))
-                .ok_or(FfiResult::INVALID_STATE)?;
-            // SAFETY: `raw_name` is pinned inside `GuestInstance`'s `RuntimeAllocTracker`.
-            unsafe { (*raw_name).as_ptr() }
-        }
-        None => core::ptr::null(),
-    };
-    let (watched_ptr, watched_len) = if watched_components.is_empty() {
-        (core::ptr::null(), 0)
-    } else {
-        let boxed: Box<[BamComponent]> = watched_components.into();
-        let len = boxed.len();
-        let raw_watched = host
-            .track_runtime_allocation(Box::new(boxed))
-            .ok_or(FfiResult::INVALID_STATE)?;
-        // SAFETY: `raw_watched` is pinned inside `GuestInstance`'s `RuntimeAllocTracker`.
-        (unsafe { (*raw_watched).as_ptr() }, len)
-    };
-    let raw_state = host
-        .track_runtime_allocation(Box::new(ObserverTrampolineState {
-            host: *host,
-            callback: ReentrantCell::new(callback),
-        }))
-        .ok_or(FfiResult::INVALID_STATE)?;
-    let obs_cb: BamObserverFn = lifecycle_observer_closure_trampoline::<F>;
-    let mut desc = BamObserverDesc::new_lifecycle(
-        event_kind,
-        watched_ptr,
-        watched_len,
-        obs_cb,
-        raw_state.cast::<c_void>(),
+    build_observer_desc(
+        ObserverAllocTarget::Runtime(host),
+        name,
+        ObserverKind::Lifecycle(event_kind, lifecycle_observer_closure_trampoline::<F>),
+        watched_components,
+        target,
+        flags,
+        propagate_relationship,
+        callback,
     )
-    .with_entity(target)
-    .with_flags(flags);
-    if !name_ptr.is_null() {
-        desc = desc.with_name(name_ptr);
-    }
-    if propagate_relationship.is_valid() {
-        desc = desc.with_propagate(propagate_relationship);
-    }
-    let validation = desc.validate();
-    if !validation.is_ok() {
-        return Err(validation);
-    }
-    Ok(desc)
 }
 
 /// Generates a panic-safe [`BamSystemFn`] `extern "C"` wrapper around a Rust system function
@@ -1997,28 +2058,27 @@ pub fn verify_same_mod_dynamic_component<T: ModComponent>(
     false
 }
 
-/// Borrows dense column `col` as `&[T]` for a same-mod dynamic [`ModComponent`] (`T`), verifying
-/// layout, [`ComponentUuid`], and active same-binary VTable provenance.
-pub fn iter_dynamic_slice<'b, 'a, T: ModComponent>(
-    iter: &'b ValidatedIter<'a>,
+fn validate_dynamic_dense_col<T: ModComponent>(
+    iter: &ValidatedIter<'_>,
     col: usize,
-) -> Option<&'b [T]> {
+    require_mutable: bool,
+) -> Option<(usize, bool)> {
     let info = iter.column_info(col).ok()?;
     if !info.mode.has_entity_column_data() || info.is_resource() || info.is_sparse_set() {
+        return None;
+    }
+    if require_mutable && (!info.mode.is_mutable() || info.is_immutable()) {
         return None;
     }
     if !verify_same_mod_dynamic_component::<T>(iter.host(), info.uuid, info.size, info.align) {
         return None;
     }
-    let len = iter.entities().len();
-    if len == 0 {
-        if info.mode.is_optional() {
-            return None;
-        }
-        return Some(&[]);
-    }
+    Some((iter.entities().len(), info.mode.is_optional()))
+}
+
+#[inline]
+unsafe fn cast_dynamic_slice<'b, T>(ptr: *const u8, len: usize) -> Option<&'b [T]> {
     let elem_size = core::mem::size_of::<T>();
-    let ptr = iter.column_readonly_ptr(col);
     if elem_size == 0 {
         if ptr.is_null() {
             return None;
@@ -2036,42 +2096,13 @@ pub fn iter_dynamic_slice<'b, 'a, T: ModComponent>(
     if byte_len > isize::MAX as usize {
         return None;
     }
-    // SAFETY: Verified same-mod `T` UUID + active VTable + layout, `ptr` non-null/aligned, and
-    // host guarantees `ptr` points to `len` initialized `T` elements for `'b`.
+    // SAFETY: Caller verified same-mod `T` UUID + active VTable + layout and shared borrow `'b`.
     Some(unsafe { core::slice::from_raw_parts(ptr.cast::<T>(), len) })
 }
 
-/// Mutably borrows dense column `col` as `&mut [T]` for a same-mod dynamic [`ModComponent`] (`T`).
-pub fn iter_dynamic_slice_mut<'b, 'a, T: ModComponent>(
-    iter: &'b mut ValidatedIter<'a>,
-    col: usize,
-    mark_changed: bool,
-) -> Option<&'b mut [T]> {
-    let info = iter.column_info(col).ok()?;
-    if !info.mode.is_mutable()
-        || !info.mode.has_entity_column_data()
-        || info.is_immutable()
-        || info.is_resource()
-        || info.is_sparse_set()
-    {
-        return None;
-    }
-    if !verify_same_mod_dynamic_component::<T>(iter.host(), info.uuid, info.size, info.align) {
-        return None;
-    }
-    let len = iter.entities().len();
-    if len == 0 {
-        if info.mode.is_optional() {
-            return None;
-        }
-        return Some(&mut []);
-    }
+#[inline]
+unsafe fn cast_dynamic_slice_mut<'b, T>(ptr: *mut u8, len: usize) -> Option<&'b mut [T]> {
     let elem_size = core::mem::size_of::<T>();
-    let ptr = if mark_changed {
-        iter.column_mutable_ptr(col)
-    } else {
-        iter.column_mutable_untracked_ptr(col)
-    };
     if elem_size == 0 {
         if ptr.is_null() {
             return None;
@@ -2088,59 +2119,76 @@ pub fn iter_dynamic_slice_mut<'b, 'a, T: ModComponent>(
     if byte_len > isize::MAX as usize {
         return None;
     }
-    // SAFETY: Verified writable dense column, same-mod `T` UUID + VTable + layout, and `&mut iter`
-    // enforces exclusive mutable access for `'b`.
+    // SAFETY: Caller verified writable dense column, same-mod `T` layout/VTable, and exclusive `'b`.
     Some(unsafe { core::slice::from_raw_parts_mut(ptr.cast::<T>(), len) })
 }
 
+/// Borrows dense column `col` as `&[T]` for a same-mod dynamic [`ModComponent`] (`T`), verifying
+/// layout, [`ComponentUuid`], and active same-binary VTable provenance.
+pub fn iter_dynamic_slice<'b, 'a, T: ModComponent>(
+    iter: &'b ValidatedIter<'a>,
+    col: usize,
+) -> Option<&'b [T]> {
+    let (len, is_optional) = validate_dynamic_dense_col::<T>(iter, col, false)?;
+    if len == 0 {
+        return (!is_optional).then_some(&[][..]);
+    }
+    let ptr = iter.column_readonly_ptr(col);
+    // SAFETY: `validate_dynamic_dense_col` verified same-mod `T` identity and `&'b iter` holds shared access.
+    unsafe { cast_dynamic_slice::<T>(ptr, len) }
+}
+
+/// Mutably borrows dense column `col` as `&mut [T]` for a same-mod dynamic [`ModComponent`] (`T`).
+pub fn iter_dynamic_slice_mut<'b, 'a, T: ModComponent>(
+    iter: &'b mut ValidatedIter<'a>,
+    col: usize,
+    mark_changed: bool,
+) -> Option<&'b mut [T]> {
+    let (len, is_optional) = validate_dynamic_dense_col::<T>(iter, col, true)?;
+    if len == 0 {
+        return (!is_optional).then_some(&mut [][..]);
+    }
+    let ptr = if mark_changed {
+        iter.column_mutable_ptr(col)
+    } else {
+        iter.column_mutable_untracked_ptr(col)
+    };
+    // SAFETY: `validate_dynamic_dense_col` verified writable same-mod `T` and `&'b mut iter` holds exclusive access.
+    unsafe { cast_dynamic_slice_mut::<T>(ptr, len) }
+}
+
 /// Simultaneously borrows `[FfiEntity; len]` and writable dense dynamic component slice `&mut [T]`
-/// (`T: ModComponent`) for the current chunk.
+/// (`T: ModComponent`) for the current chunk, verifying byte-range disjointness.
 pub fn iter_entities_and_dynamic_slice_mut<'b, 'a, T: ModComponent>(
     iter: &'b mut ValidatedIter<'a>,
     write_col: usize,
 ) -> Option<(&'b [FfiEntity], &'b mut [T])> {
-    let info = iter.column_info(write_col).ok()?;
-    if !info.mode.is_mutable()
-        || !info.mode.has_entity_column_data()
-        || info.is_immutable()
-        || info.is_resource()
-        || info.is_sparse_set()
-    {
-        return None;
-    }
-    if !verify_same_mod_dynamic_component::<T>(iter.host(), info.uuid, info.size, info.align) {
-        return None;
-    }
-    let len = iter.entities().len();
+    let (len, is_optional) = validate_dynamic_dense_col::<T>(iter, write_col, true)?;
     if len == 0 {
-        if info.mode.is_optional() {
-            return None;
-        }
-        return Some((&[], &mut []));
+        return (!is_optional).then_some((&[][..], &mut [][..]));
     }
     let elem_size = core::mem::size_of::<T>();
     let ptr = iter.column_mutable_ptr(write_col);
     let entities = iter.entities();
-    if elem_size == 0 {
+    if elem_size > 0 {
         if ptr.is_null() {
             return None;
         }
-        // SAFETY: `T` is zero-sized and disjoint from `entities`.
-        let slice_mut = unsafe {
-            core::slice::from_raw_parts_mut(core::ptr::NonNull::<T>::dangling().as_ptr(), len)
-        };
-        return Some((entities, slice_mut));
+        let e_bytes = len.checked_mul(core::mem::size_of::<FfiEntity>())?;
+        let w_bytes = len.checked_mul(elem_size)?;
+        if e_bytes > isize::MAX as usize || w_bytes > isize::MAX as usize {
+            return None;
+        }
+        let e_start = entities.as_ptr().addr();
+        let w_start = ptr.addr();
+        let e_end = e_start.checked_add(e_bytes)?;
+        let w_end = w_start.checked_add(w_bytes)?;
+        if e_start < w_end && w_start < e_end {
+            return None;
+        }
     }
-    if ptr.is_null() || !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
-        return None;
-    }
-    let byte_len = len.checked_mul(elem_size)?;
-    if byte_len > isize::MAX as usize {
-        return None;
-    }
-    // SAFETY: `entities` and component column `ptr` occupy disjoint Bevy archetype storage and
-    // `&mut iter` prevents aliasing borrows for `'b`.
-    let slice_mut = unsafe { core::slice::from_raw_parts_mut(ptr.cast::<T>(), len) };
+    // SAFETY: Verified non-overlapping with `entities`, writable same-mod `T`, and exclusive `&'b mut iter`.
+    let slice_mut = unsafe { cast_dynamic_slice_mut::<T>(ptr, len) }?;
     Some((entities, slice_mut))
 }
 
@@ -2154,39 +2202,13 @@ impl<'a> ValidatedSystemRef<'a> {
         term_index: usize,
         entity: FfiEntity,
     ) -> Option<&'b T> {
-        if self.sys_ctx.is_null() {
-            return None;
-        }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, sys_entity_get),
-            core::mem::size_of::<Option<BamSysEntityGetFn>>(),
-        ) {
-            return None;
-        }
-        let get_fn = self.host.api().sys_entity_get?;
-        let info = iter.column_info(term_index).ok()?;
-        if !info.mode.has_entity_column_data() || info.is_resource() || info.is_message() {
-            return None;
-        }
-        if !verify_same_mod_dynamic_component::<T>(self.host, info.uuid, info.size, info.align) {
-            return None;
-        }
-        // SAFETY: `self.sys_ctx` is active for `'a` and `&'b self` + `&'b iter` prevent mutable
-        // aliasing for `'b`.
-        let ptr = unsafe { get_fn(self.sys_ctx.cast_const(), query_index, entity, term_index) };
-        if ptr.is_null() {
-            return None;
-        }
-        if core::mem::size_of::<T>() == 0 {
-            // SAFETY: Zero-sized `T` may be referenced via `NonNull::dangling()`.
-            return Some(unsafe { core::ptr::NonNull::<T>::dangling().as_ref() });
-        }
-        if !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
-            return None;
-        }
+        let host = self.host;
+        let ptr = self.raw_entity_ptr_ro(iter, query_index, term_index, entity, |info| {
+            verify_same_mod_dynamic_component::<T>(host, info.uuid, info.size, info.align)
+        })?;
         // SAFETY: Host verified query membership & declared access; `verify_same_mod_dynamic_component`
         // confirmed `T`'s layout, UUID, and active same-binary VTable.
-        Some(unsafe { &*ptr.cast::<T>() })
+        unsafe { Self::cast_entity_ref::<T>(ptr) }
     }
 
     /// Looks up an exclusive `&'b mut T` reference for a same-mod dynamic [`ModComponent`] on
@@ -2198,51 +2220,34 @@ impl<'a> ValidatedSystemRef<'a> {
         term_index: usize,
         entity: FfiEntity,
     ) -> Option<&'b mut T> {
-        if self.sys_ctx.is_null() {
-            return None;
-        }
-        if !self.host.api().covers_slot(
-            core::mem::offset_of!(BamHostApi, sys_entity_get_mut),
-            core::mem::size_of::<Option<BamSysEntityGetMutFn>>(),
-        ) {
-            return None;
-        }
-        let get_mut_fn = self.host.api().sys_entity_get_mut?;
-        let info = iter.column_info(term_index).ok()?;
-        if !info.mode.is_mutable()
-            || !info.mode.has_entity_column_data()
-            || info.is_immutable()
-            || info.is_resource()
-            || info.is_message()
-        {
-            return None;
-        }
-        if !verify_same_mod_dynamic_component::<T>(self.host, info.uuid, info.size, info.align) {
-            return None;
-        }
-        // SAFETY: `self.sys_ctx` is active for `'a` and `&'b mut self` + `&'b mut iter` prevent
-        // aliasing borrows for `'b`.
-        let ptr = unsafe { get_mut_fn(self.sys_ctx, query_index, entity, term_index) };
-        if ptr.is_null() {
-            return None;
-        }
-        if core::mem::size_of::<T>() == 0 {
-            // SAFETY: Zero-sized `T` may be mutably referenced via `NonNull::dangling()`.
-            return Some(unsafe { core::ptr::NonNull::<T>::dangling().as_mut() });
-        }
-        if !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
-            return None;
-        }
+        let host = self.host;
+        let ptr = self.raw_entity_ptr_mut(iter, query_index, term_index, entity, |info| {
+            verify_same_mod_dynamic_component::<T>(host, info.uuid, info.size, info.align)
+        })?;
         // SAFETY: Host verified writable access & stamped change ticks; `T`'s layout, UUID, and
         // active same-binary VTable were verified.
-        Some(unsafe { &mut *ptr.cast::<T>() })
+        unsafe { Self::cast_entity_mut::<T>(ptr) }
     }
+}
+
+fn verify_moved_component_handle<T: ModComponent>(
+    host: &Host,
+    component: BamComponent,
+) -> Result<(), FfiResult> {
+    if !component.is_valid() {
+        return Err(FfiResult::INVALID_COMPONENT);
+    }
+    let info = host.component_layout_info(component)?;
+    if !verify_same_mod_dynamic_component::<T>(host, info.uuid, info.size, info.align) {
+        return Err(FfiResult::TYPE_MISMATCH);
+    }
+    Ok(())
 }
 
 impl<'a> ValidatedCommands<'a> {
     /// Moves an owned non-POD (or POD) [`ModComponent`] `value` into `BamHostApi::cmd_insert` via
-    /// [`ManuallyDrop`], dropping `value` on the guest heap if queueing fails before ownership
-    /// transfers to the host `CommandArena`.
+    /// [`ManuallyDrop`], verifying `component` matches same-mod `T` via `Host::component_layout_info`
+    /// and dropping `value` on the guest heap if validation or queueing fails.
     pub fn insert_moved<T: ModComponent>(
         &mut self,
         entity: FfiEntity,
@@ -2250,14 +2255,25 @@ impl<'a> ValidatedCommands<'a> {
         value: T,
     ) -> FfiResult {
         let mut slot = ManuallyDrop::new(value);
+        if !self.is_valid() {
+            // SAFETY: Command buffer is null; ownership never transferred to the host.
+            unsafe { ManuallyDrop::drop(&mut slot) };
+            return FfiResult::NULL_POINTER;
+        }
+        if let Err(err) = verify_moved_component_handle::<T>(self.host(), component) {
+            // SAFETY: Handle validation failed before transferring ownership to the host.
+            unsafe { ManuallyDrop::drop(&mut slot) };
+            return err;
+        }
         let data_ptr = if core::mem::size_of::<T>() == 0 {
             core::ptr::NonNull::<u8>::dangling().as_ptr().cast_const()
         } else {
             (&raw const *slot).cast::<u8>()
         };
-        // SAFETY: `slot` remains alive on the stack during `insert_raw`. On `FfiResult::OK`, the
-        // host `CommandArena` copied `size_of::<T>()` bytes with ownership and `drop_fn`; on error,
-        // `slot` was not taken and is dropped cleanly below on the guest heap.
+        // SAFETY: `verify_moved_component_handle` confirmed `component` is registered as same-mod
+        // `T` with matching layout, UUID, and active guest VTable/drop_fn. On `FfiResult::OK`, the
+        // host `CommandArena` copied `size_of::<T>()` bytes with ownership; on error, `slot` is
+        // dropped cleanly below on the guest heap.
         let status =
             unsafe { self.insert_raw(entity, component, data_ptr, core::mem::size_of::<T>()) };
         if !status.is_ok() {
@@ -2270,8 +2286,9 @@ impl<'a> ValidatedCommands<'a> {
     }
 
     /// Spawns a fresh entity (mod-scoped or persistent) with an owned non-POD (or POD)
-    /// [`ModComponent`] `value` plus optional `extra` [`SpawnEntry`] items, dropping `value` on
-    /// the guest heap if spawning fails.
+    /// [`ModComponent`] `value` plus optional `extra` [`SpawnEntry`] items, validating `component`
+    /// and every `extra` entry against `Host::component_layout_info` and dropping `value` on the
+    /// guest heap if validation or spawning fails.
     pub fn spawn_moved<T: ModComponent>(
         &mut self,
         component: BamComponent,
@@ -2280,12 +2297,22 @@ impl<'a> ValidatedCommands<'a> {
         persistent: bool,
     ) -> Result<FfiEntity, FfiResult> {
         let mut slot = ManuallyDrop::new(value);
-        if !component.is_valid() || extra.iter().any(|e| !e.component().is_valid()) {
-            // SAFETY: Ownership never transferred to the host.
-            unsafe {
-                ManuallyDrop::drop(&mut slot);
+        if !self.is_valid() {
+            // SAFETY: Command buffer is null; ownership never transferred to the host.
+            unsafe { ManuallyDrop::drop(&mut slot) };
+            return Err(FfiResult::NULL_POINTER);
+        }
+        if let Err(err) = verify_moved_component_handle::<T>(self.host(), component) {
+            // SAFETY: Handle validation failed before transferring ownership to the host.
+            unsafe { ManuallyDrop::drop(&mut slot) };
+            return Err(err);
+        }
+        for entry in extra {
+            if let Err(err) = validate_spawn_entry(self.host(), entry) {
+                // SAFETY: Extra entry validation failed before transferring ownership to the host.
+                unsafe { ManuallyDrop::drop(&mut slot) };
+                return Err(err);
             }
-            return Err(FfiResult::INVALID_COMPONENT);
         }
         let val_ptr = if core::mem::size_of::<T>() == 0 {
             core::ptr::NonNull::<u8>::dangling().as_ptr().cast_const()
@@ -2300,8 +2327,8 @@ impl<'a> ValidatedCommands<'a> {
             comps.push(entry.component());
             ptrs.push(entry.data_ptr());
         }
-        // SAFETY: `comps` and `ptrs` have matching length, `slot` remains live across the call,
-        // and each `extra` entry carries a valid `T: AbiPod` reference for `'a`.
+        // SAFETY: `comps` and `ptrs` have matching length, `component` was verified as same-mod `T`,
+        // `slot` remains live across the call, and every `extra` entry passed layout validation.
         let res = unsafe {
             if persistent {
                 self.spawn_persistent_raw(&comps, &ptrs)

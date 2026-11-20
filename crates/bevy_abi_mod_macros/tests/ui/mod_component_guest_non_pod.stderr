@@ -1,0 +1,5 @@
+error: `#[mod_component(guest)]` requires an `AbiPod` struct (`#[repr(C)]` or `#[repr(transparent)]`, no `no_pod`/`opaque`, no skipped fields, and all fields `AbiPod`) because `GuestComponent: AbiPod`
+ --> tests/ui/mod_component_guest_non_pod.rs:6:12
+  |
+6 | pub struct NonPodGuest {
+  |            ^^^^^^^^^^^

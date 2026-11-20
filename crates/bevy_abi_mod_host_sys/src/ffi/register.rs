@@ -6,14 +6,15 @@ use crate::drop_trampoline::{
     on_insert_hook_for_slot, prune_drop_trampolines_for_guard,
 };
 use crate::handle_header::{
-    HOST_CTX_MAGIC, HandleHeader, HostContext, LOAD_CTX_MAGIC, validate_handle_mut,
-    validate_handle_ref,
+    AlignedBuf, HandleHeader, HostContext, LOAD_CTX_MAGIC, decode_optional_entity, ffi_try,
+    lock_unpoison, validate_host_ctx, validate_load_ctx_mut, validate_load_ctx_ref,
+    validate_non_empty_cstr,
 };
 use crate::loader::ModId;
 use crate::loader::symbols::ensure_symbol_tables_in_world;
 use crate::registry::{
-    ExtractEventTargetFn, ModRegistry, RegistrySnapshot, component_flags_to_storage_flags,
-    extract_owned_dynamic_fields,
+    DynamicComponentReg, ExtractEventTargetFn, ModRegistry, RegistrySnapshot,
+    component_flags_to_storage_flags, extract_owned_dynamic_fields,
 };
 use crate::schedule::ModNamedSystemSet;
 use crate::sync_ptr::{GuestFnPtr, GuestUserData};
@@ -124,12 +125,18 @@ struct CloneBindingEntry {
     is_active: Arc<AtomicBool>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DynamicRelBinding {
+    target_cid: ComponentId,
+    allow_self_referential: bool,
+}
+
 #[derive(Resource, Default)]
 pub(crate) struct DynamicComponentHookMap {
     by_id: HashMap<ComponentId, Vec<DynamicHookBinding>>,
     drop_slot_by_id: HashMap<ComponentId, usize>,
     clone_by_id: HashMap<ComponentId, Vec<CloneBindingEntry>>,
-    rel_to_target: HashMap<ComponentId, ComponentId>,
+    rel_to_target: HashMap<ComponentId, DynamicRelBinding>,
     target_to_rel: HashMap<ComponentId, ComponentId>,
     rel_targets: HashMap<(ComponentId, Entity), Vec<FfiEntity>>,
 }
@@ -138,9 +145,7 @@ pub(crate) struct DynamicComponentHookMap {
 /// registering dynamic components never lazily allocates an `IsResource` entity mid-session.
 #[inline]
 pub fn ensure_dynamic_hook_map_in_world(world: &mut World) {
-    if !world.contains_resource::<DynamicComponentHookMap>() {
-        world.insert_resource(DynamicComponentHookMap::default());
-    }
+    world.init_resource::<DynamicComponentHookMap>();
 }
 
 impl DynamicComponentHookMap {
@@ -207,8 +212,19 @@ impl DynamicComponentHookMap {
         }
     }
 
-    fn bind_relationship_pair(&mut self, rel_cid: ComponentId, tgt_cid: ComponentId) {
-        self.rel_to_target.insert(rel_cid, tgt_cid);
+    fn bind_relationship_pair(
+        &mut self,
+        rel_cid: ComponentId,
+        tgt_cid: ComponentId,
+        allow_self_referential: bool,
+    ) {
+        self.rel_to_target.insert(
+            rel_cid,
+            DynamicRelBinding {
+                target_cid: tgt_cid,
+                allow_self_referential,
+            },
+        );
         self.target_to_rel.insert(tgt_cid, rel_cid);
     }
 
@@ -240,51 +256,18 @@ impl DynamicComponentHookMap {
     }
 }
 
-struct OwnedZeroedBuffer {
-    ptr: *mut u8,
-    layout: Layout,
-}
-
-impl OwnedZeroedBuffer {
-    fn new(layout: Layout) -> Self {
-        if layout.size() == 0 {
-            return Self {
-                ptr: core::ptr::NonNull::<u8>::dangling().as_ptr(),
-                layout,
-            };
-        }
-        // SAFETY: `layout.size() > 0` and `layout.align()` is a valid power of two.
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-        if ptr.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
-        Self { ptr, layout }
-    }
-}
-
-impl Drop for OwnedZeroedBuffer {
-    fn drop(&mut self) {
-        if self.layout.size() > 0 {
-            // SAFETY: `self.ptr` was allocated with `std::alloc::alloc_zeroed(self.layout)`.
-            unsafe {
-                std::alloc::dealloc(self.ptr, self.layout);
-            }
-        }
-    }
-}
-
 fn insert_required_raw_buffer(
     world: &mut World,
     entity: Entity,
     req_meta: &crate::registry::RegisteredComponent,
-    buf: &OwnedZeroedBuffer,
+    buf: &AlignedBuf,
 ) -> bool {
     if !req_meta.is_dynamic {
         if let Some(insert_raw) = req_meta.insert_raw_fn {
-            // SAFETY: `buf.ptr` holds `req_meta.size` initialized bytes aligned to `req_meta.align`
+            // SAFETY: `buf` holds `req_meta.size` initialized bytes aligned to `req_meta.align`
             // matching `req_meta`'s raw-insertable host layout.
             unsafe {
-                insert_raw(world, entity, buf.ptr.cast_const());
+                insert_raw(world, entity, buf.as_ptr());
             }
             return true;
         }
@@ -292,15 +275,9 @@ fn insert_required_raw_buffer(
     }
 
     if let Ok(mut e_mut) = world.get_entity_mut(entity) {
-        let nn = if buf.layout.size() == 0 {
-            core::ptr::NonNull::<u8>::dangling()
-        } else {
-            // SAFETY: `OwnedZeroedBuffer::new` aborts on null when `size > 0`.
-            unsafe { core::ptr::NonNull::new_unchecked(buf.ptr) }
-        };
-        // SAFETY: `nn` points to `req_meta.size` initialized bytes matching `req_meta.component_id`'s
-        // layout; `insert_by_id` copies out without freeing `buf`.
-        let owning = unsafe { OwningPtr::new(nn) };
+        // SAFETY: `buf.non_null()` points to `req_meta.size` initialized bytes matching
+        // `req_meta.component_id`'s layout; `insert_by_id` copies out without freeing `buf`.
+        let owning = unsafe { OwningPtr::new(buf.non_null()) };
         // SAFETY: `req_meta.component_id` was registered in `world` with `(size, align)`.
         unsafe {
             e_mut.insert_by_id(req_meta.component_id, owning);
@@ -375,11 +352,9 @@ fn insert_required_components_recursive(
                     && req_meta.drop_fn.is_none()
                     && req_meta.drop_slot.is_none()
                 {
-                    let Ok(layout) = Layout::from_size_align(req_meta.size, req_meta.align.max(1))
-                    else {
+                    let Ok(zeroed) = AlignedBuf::new_zeroed(req_meta.size, req_meta.align) else {
                         continue;
                     };
-                    let zeroed = OwnedZeroedBuffer::new(layout);
                     let _ = insert_required_raw_buffer(world, entity, req_meta, &zeroed);
                 }
             }
@@ -391,16 +366,18 @@ fn insert_required_components_recursive(
                 {
                     continue;
                 }
-                let Ok(layout) = Layout::from_size_align(req_meta.size, req_meta.align.max(1))
-                else {
+                let Ok(buf) = AlignedBuf::new_zeroed(req_meta.size, req_meta.align) else {
                     continue;
                 };
-                let buf = OwnedZeroedBuffer::new(layout);
                 if !bytes.is_empty() {
-                    // SAFETY: `buf.ptr` is allocated for `req_meta.size == bytes.len()` writable
+                    // SAFETY: `buf` is allocated for `req_meta.size == bytes.len()` writable
                     // bytes and does not overlap `bytes`.
                     unsafe {
-                        core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.ptr, bytes.len());
+                        core::ptr::copy_nonoverlapping(
+                            bytes.as_ptr(),
+                            buf.as_mut_ptr(),
+                            bytes.len(),
+                        );
                     }
                 }
                 let _ = insert_required_raw_buffer(world, entity, req_meta, &buf);
@@ -413,18 +390,10 @@ fn insert_required_components_recursive(
                 if !is_active.load(Ordering::Acquire) {
                     continue;
                 }
-                let Ok(layout) = Layout::from_size_align(req_meta.size, req_meta.align.max(1))
-                else {
+                let Ok(buf) = AlignedBuf::new_zeroed(req_meta.size, req_meta.align) else {
                     continue;
                 };
-                let buf = OwnedZeroedBuffer::new(layout);
-                let dst_ptr = if layout.size() == 0 {
-                    core::ptr::NonNull::<u8>::dangling()
-                        .as_ptr()
-                        .cast::<c_void>()
-                } else {
-                    buf.ptr.cast::<c_void>()
-                };
+                let dst_ptr = buf.as_mut_c_void();
                 // SAFETY: `is_active` was verified true (`Ordering::Acquire`), `dst_ptr` points to
                 // `req_meta.size` writable `req_meta.align`-aligned bytes, and `init_fn` upholds
                 // `BamRequiredInitFn`'s nounwind contract.
@@ -503,12 +472,13 @@ fn dynamic_on_add_hook(mut world: DeferredWorld<'_>, ctx: HookContext) {
 }
 
 fn dynamic_rel_on_insert(world: &mut DeferredWorld<'_>, ctx: HookContext) {
-    let Some(tgt_cid) = world
+    let Some(rel_binding) = world
         .get_resource::<DynamicComponentHookMap>()
         .and_then(|map| map.rel_to_target.get(&ctx.component_id).copied())
     else {
         return;
     };
+    let tgt_cid = rel_binding.target_cid;
     let target_ffi = {
         let Ok(ptr) = world.entity(ctx.entity).get_by_id(ctx.component_id) else {
             return;
@@ -521,7 +491,11 @@ fn dynamic_rel_on_insert(world: &mut DeferredWorld<'_>, ctx: HookContext) {
     let valid_target = (!target_ffi.is_null())
         .then(|| Entity::try_from_bits(target_ffi.to_bits()))
         .flatten()
-        .filter(|&t| t != Entity::PLACEHOLDER && t != ctx.entity && world.entities().contains(t));
+        .filter(|&t| {
+            t != Entity::PLACEHOLDER
+                && (rel_binding.allow_self_referential || t != ctx.entity)
+                && world.entities().contains(t)
+        });
     let Some(target_entity) = valid_target else {
         let source_entity = ctx.entity;
         let rel_cid = ctx.component_id;
@@ -569,7 +543,11 @@ fn dynamic_rel_on_insert(world: &mut DeferredWorld<'_>, ctx: HookContext) {
 fn dynamic_rel_on_discard(world: &mut DeferredWorld<'_>, ctx: HookContext) {
     let Some(tgt_cid) = world
         .get_resource::<DynamicComponentHookMap>()
-        .and_then(|map| map.rel_to_target.get(&ctx.component_id).copied())
+        .and_then(|map| {
+            map.rel_to_target
+                .get(&ctx.component_id)
+                .map(|b| b.target_cid)
+        })
     else {
         return;
     };
@@ -638,13 +616,14 @@ fn dynamic_rel_target_on_despawn(world: &mut DeferredWorld<'_>, ctx: HookContext
     if sources.is_empty() {
         return;
     }
-    let expected_bits = ctx.entity.to_bits();
+    let despawning_entity = ctx.entity;
+    let expected_bits = despawning_entity.to_bits();
     world.commands().queue(move |w: &mut World| {
         for src_ffi in sources {
             let Some(src_ent) = (!src_ffi.is_null())
                 .then(|| Entity::try_from_bits(src_ffi.to_bits()))
                 .flatten()
-                .filter(|&e| e != Entity::PLACEHOLDER)
+                .filter(|&e| e != Entity::PLACEHOLDER && e != despawning_entity)
             else {
                 continue;
             };
@@ -758,7 +737,7 @@ fn dynamic_clone_runner(_source: &SourceComponent, ctx: &mut ComponentCloneCtx) 
             return;
         }
 
-        let temp = OwnedZeroedBuffer::new(expected_layout);
+        let temp = AlignedBuf::from_layout_zeroed(expected_layout);
         let status = {
             let Ok(source_ent) = world.get_entity(source_entity) else {
                 return;
@@ -766,12 +745,12 @@ fn dynamic_clone_runner(_source: &SourceComponent, ctx: &mut ComponentCloneCtx) 
             let Ok(src_ptr) = source_ent.get_by_id(comp_id) else {
                 return;
             };
-            // SAFETY: `src_ptr` points to `size` initialized source bytes; `temp.ptr` points to
+            // SAFETY: `src_ptr` points to `size` initialized source bytes; `temp` points to
             // `size` writable `expected_layout.align()`-aligned bytes; `is_active` is true.
             unsafe {
                 clone_fn(
                     src_ptr.as_ptr().cast::<c_void>(),
-                    temp.ptr.cast::<c_void>(),
+                    temp.as_mut_c_void(),
                     user_data.as_ptr(),
                 )
             }
@@ -780,11 +759,9 @@ fn dynamic_clone_runner(_source: &SourceComponent, ctx: &mut ComponentCloneCtx) 
         if status.is_ok()
             && let Ok(mut target_ent) = world.get_entity_mut(target_entity)
         {
-            // SAFETY: `OwnedZeroedBuffer::new` aborts on null when `size > 0`.
-            let nn = unsafe { core::ptr::NonNull::new_unchecked(temp.ptr) };
-            // SAFETY: `nn` points to `size` initialized bytes written by `clone_fn`;
+            // SAFETY: `temp.non_null()` points to `size` initialized bytes written by `clone_fn`;
             // `insert_by_id` moves out of `owning` without freeing `temp`'s scratch buffer.
-            let owning = unsafe { OwningPtr::new(nn) };
+            let owning = unsafe { OwningPtr::new(temp.non_null()) };
             // SAFETY: `comp_id` was registered in `world` with `expected_layout`.
             unsafe {
                 target_ent.insert_by_id(comp_id, owning);
@@ -936,13 +913,7 @@ impl LoadContext {
     /// restoring the initial `RegistrySnapshot`.
     pub fn rollback(&mut self) {
         self.finish_init();
-        let bindings = {
-            let mut guard = self
-                .staged_drop_bindings
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            core::mem::take(&mut *guard)
-        };
+        let bindings = core::mem::take(&mut *lock_unpoison(&self.staged_drop_bindings));
         let fresh_comp_ids = core::mem::take(&mut self.fresh_dynamic_comp_ids);
         let fresh_rels = core::mem::take(&mut self.fresh_rel_bindings);
         let active_guard = Arc::clone(&self.is_active);
@@ -1003,9 +974,7 @@ pub(crate) unsafe fn validate_active_load_ctx<'a>(
     load_ctx: *mut BamLoadCtx,
 ) -> Result<&'a mut LoadContext, FfiResult> {
     // SAFETY: Unconditionally validates non-null, alignment, and `LOAD_CTX_MAGIC` + non-zero generation.
-    let ctx = unsafe {
-        validate_handle_mut::<LoadContext>(load_ctx.cast::<c_void>(), LOAD_CTX_MAGIC, true)?
-    };
+    let ctx = unsafe { validate_load_ctx_mut(load_ctx)? };
     if !ctx.in_init {
         return Err(FfiResult::INVALID_STATE);
     }
@@ -1018,9 +987,7 @@ pub(crate) unsafe fn validate_active_load_ctx<'a>(
 /// `load_ctx` must point to an active [`LoadContext`] cast to [`BamLoadCtx`], or null.
 pub unsafe extern "C" fn host_load_host_ctx(load_ctx: *const BamLoadCtx) -> *const BamHostCtx {
     // SAFETY: Unconditionally validates `load_ctx` against `LOAD_CTX_MAGIC`.
-    let Ok(ctx) = (unsafe {
-        validate_handle_ref::<LoadContext>(load_ctx.cast::<c_void>(), LOAD_CTX_MAGIC, true)
-    }) else {
+    let Ok(ctx) = (unsafe { validate_load_ctx_ref(load_ctx) }) else {
         return core::ptr::null();
     };
     if !ctx.in_init {
@@ -1046,29 +1013,17 @@ pub unsafe extern "C" fn host_resolve_component(
         return FfiResult::NULL_POINTER;
     }
     // SAFETY: Unconditionally validates `ctx` against `HOST_CTX_MAGIC`.
-    let host_ctx = match unsafe {
-        validate_handle_ref::<HostContext>(ctx.cast::<c_void>(), HOST_CTX_MAGIC, true)
-    } {
-        Ok(c) => c,
-        Err(err) => return err,
-    };
-
-    if name.is_null() && uuid.is_null() {
-        host_ctx.set_last_error("resolve_component requires at least one of `name` or `uuid`");
-        return FfiResult::INVALID_ARGUMENT;
-    }
+    let host_ctx = ffi_try!(unsafe { validate_host_ctx(ctx) });
 
     let parsed_name = if !name.is_null() {
         // SAFETY: Caller guarantees `name` points to a NUL-terminated C string.
-        let Ok(s) = (unsafe { CStr::from_ptr(name) }).to_str() else {
-            host_ctx.set_last_error("resolve_component `name` is not valid UTF-8");
-            return FfiResult::INVALID_UTF8;
-        };
-        if s.is_empty() {
-            host_ctx.set_last_error("resolve_component `name` must not be empty");
-            return FfiResult::INVALID_ARGUMENT;
+        match unsafe { validate_non_empty_cstr(name) } {
+            Ok(s) => Some(s),
+            Err(err) => {
+                host_ctx.set_last_error("resolve_component `name` is empty or invalid UTF-8");
+                return err;
+            }
         }
-        Some(s)
     } else {
         None
     };
@@ -1132,7 +1087,10 @@ pub unsafe extern "C" fn host_resolve_component(
             };
             by_uuid
         }
-        (None, None) => unreachable!(),
+        (None, None) => {
+            host_ctx.set_last_error("resolve_component requires at least one of `name` or `uuid`");
+            return FfiResult::INVALID_ARGUMENT;
+        }
     };
 
     // SAFETY: `out_component` was checked non-null above and caller guarantees writable `BamComponent`.
@@ -1143,15 +1101,18 @@ pub unsafe extern "C" fn host_resolve_component(
 }
 
 const BAM_REL_BIND_PREFIX: &str = "__bam_rel_bind::";
+const BAM_REL_BIND_SELF_PREFIX: &str = "__bam_rel_bind_self::";
 
 /// Binds a dynamic `(Relationship, RelationshipTarget)` pair when guest code registers the
-/// synthetic `"__bam_rel_bind::<rel_handle>::<target_handle>"` marker descriptor.
+/// synthetic `"__bam_rel_bind::<rel_handle>::<target_handle>[::self]"` or
+/// `"__bam_rel_bind_self::<rel_handle>::<target_handle>"` marker descriptor.
 ///
 /// # Safety
 /// `out_component` must be a non-null, aligned, writable `*mut BamComponent`.
 unsafe fn bind_dynamic_relationship_descriptor(
     ctx: &mut LoadContext,
     pair_spec: &str,
+    default_allow_self: bool,
     desc: &ComponentDesc,
     out_component: *mut BamComponent,
 ) -> FfiResult {
@@ -1166,7 +1127,13 @@ unsafe fn bind_dynamic_relationship_descriptor(
             .set_last_error("__bam_rel_bind marker must be a zero-sized hookless descriptor");
         return FfiResult::INVALID_ARGUMENT;
     }
-    let Some((rel_str, tgt_str)) = pair_spec.split_once("::") else {
+    let (pair_body, allow_self_referential) =
+        if let Some(stripped) = pair_spec.strip_suffix("::self") {
+            (stripped, true)
+        } else {
+            (pair_spec, default_allow_self)
+        };
+    let Some((rel_str, tgt_str)) = pair_body.split_once("::") else {
         ctx.host_ctx
             .set_last_error("malformed __bam_rel_bind relationship descriptor");
         return FfiResult::INVALID_ARGUMENT;
@@ -1239,8 +1206,10 @@ unsafe fn bind_dynamic_relationship_descriptor(
     ensure_dynamic_hook_map_in_world(world);
     {
         let map = world.resource::<DynamicComponentHookMap>();
-        if let Some(&existing_tgt) = map.rel_to_target.get(&rel_cid) {
-            if existing_tgt == tgt_cid {
+        if let Some(&existing) = map.rel_to_target.get(&rel_cid) {
+            if existing.target_cid == tgt_cid
+                && existing.allow_self_referential == allow_self_referential
+            {
                 // SAFETY: Caller guarantees `out_component` is non-null, aligned, and writable.
                 unsafe {
                     *out_component = tgt_handle;
@@ -1248,7 +1217,7 @@ unsafe fn bind_dynamic_relationship_descriptor(
                 return FfiResult::OK;
             }
             ctx.host_ctx.set_last_error(format!(
-                "relationship source '{}' is already bound to a different target component",
+                "relationship source '{}' is already bound with incompatible target/self-referential policy",
                 rel_meta.name
             ));
             return FfiResult::TYPE_MISMATCH;
@@ -1287,7 +1256,7 @@ unsafe fn bind_dynamic_relationship_descriptor(
 
     world
         .resource_mut::<DynamicComponentHookMap>()
-        .bind_relationship_pair(rel_cid, tgt_cid);
+        .bind_relationship_pair(rel_cid, tgt_cid, allow_self_referential);
     ctx.fresh_rel_bindings.push((rel_cid, tgt_cid));
 
     // SAFETY: Caller guarantees `out_component` is non-null, aligned, and writable.
@@ -1367,10 +1336,16 @@ pub unsafe extern "C" fn host_register_component(
         };
     let name_ref = canonical_name.as_ref();
 
+    if let Some(pair_spec) = name_ref.strip_prefix(BAM_REL_BIND_SELF_PREFIX) {
+        // SAFETY: `out_component` was verified non-null above and caller guarantees writable `BamComponent`.
+        return unsafe {
+            bind_dynamic_relationship_descriptor(ctx, pair_spec, true, &desc, out_component)
+        };
+    }
     if let Some(pair_spec) = name_ref.strip_prefix(BAM_REL_BIND_PREFIX) {
         // SAFETY: `out_component` was verified non-null above and caller guarantees writable `BamComponent`.
         return unsafe {
-            bind_dynamic_relationship_descriptor(ctx, pair_spec, &desc, out_component)
+            bind_dynamic_relationship_descriptor(ctx, pair_spec, false, &desc, out_component)
         };
     }
 
@@ -1585,7 +1560,12 @@ pub unsafe extern "C" fn host_register_component(
                     ));
                     return FfiResult::PERMISSION_DENIED;
                 }
-                let cb = req_init.init_fn.expect("checked Some above");
+                let Some(cb) = req_init.init_fn else {
+                    ctx.host_ctx.set_last_error(format!(
+                        "BamRequiredComponent[{idx}] `init_fn` is null with INIT_FN flag set"
+                    ));
+                    return FfiResult::NULL_POINTER;
+                };
                 RequiredInitStrategy::InitFn {
                     init_fn: GuestFnPtr(cb),
                     user_data: GuestUserData::new(req_init.user_data),
@@ -1683,9 +1663,7 @@ pub unsafe extern "C" fn host_register_component(
 
     let (comp_id, drop_slot, was_fresh_id): (ComponentId, Option<usize>, bool) = {
         let world = ctx.world_mut();
-        if !world.contains_resource::<WorldDropGuard>() {
-            world.insert_resource(WorldDropGuard::new());
-        }
+        world.init_resource::<WorldDropGuard>();
 
         let (slot_opt, trampoline_opt) = if let Some(drop_fn) = desc.drop_fn {
             let bound = world
@@ -1697,10 +1675,7 @@ pub unsafe extern "C" fn host_register_component(
                 ));
                 return FfiResult::CAPACITY_EXCEEDED;
             };
-            staged_log
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(staged_binding);
+            lock_unpoison(&staged_log).push(staged_binding);
             (Some(slot), Some(tramp))
         } else {
             (None, None)
@@ -1775,17 +1750,19 @@ pub unsafe extern "C" fn host_register_component(
         ctx.fresh_dynamic_comp_ids.push(comp_id);
     }
 
-    let handle = match ctx.registry.register_dynamic_component_owned_with_schema(
-        comp_id,
-        &desc_for_registry,
-        name_ref,
-        owner,
-        drop_slot,
-        required_boxed,
-        schema_fingerprint,
-        extracted_fields,
-        owned_field_strings,
-    ) {
+    let handle = match ctx
+        .registry
+        .register_dynamic_component(DynamicComponentReg {
+            comp_id,
+            desc: &desc_for_registry,
+            name: name_ref,
+            owner,
+            drop_slot,
+            required_components: required_boxed,
+            schema_fingerprint,
+            fields: extracted_fields,
+            owned_field_strings,
+        }) {
         Ok(h) => h,
         Err(err) => {
             ctx.host_ctx.set_last_error(err.to_string());
@@ -2128,24 +2105,12 @@ pub(crate) unsafe fn build_observer_binding_from_desc(
         ));
     }
 
-    let raw_target = desc.entity();
-    let target_entity = if raw_target.is_null() {
-        None
-    } else {
-        let Some(entity) = Entity::try_from_bits(raw_target.to_bits()) else {
-            return Err((
-                FfiResult::INVALID_ENTITY,
-                "BamObserverDesc target entity is invalid".to_string(),
-            ));
-        };
-        if entity == Entity::PLACEHOLDER {
-            return Err((
-                FfiResult::INVALID_ENTITY,
-                "BamObserverDesc target entity is Entity::PLACEHOLDER".to_string(),
-            ));
-        }
-        Some(entity)
-    };
+    let target_entity = decode_optional_entity(desc.entity()).map_err(|status| {
+        (
+            status,
+            "BamObserverDesc target entity is invalid or Entity::PLACEHOLDER".to_string(),
+        )
+    })?;
 
     let propagate_relationship = if desc.propagate_relationship.is_valid() {
         let Some(rel_meta) = snapshot.get_by_handle(desc.propagate_relationship) else {
@@ -2262,7 +2227,12 @@ pub(crate) unsafe fn build_observer_binding_from_desc(
                 BamEventKind::DISCARD => bevy_ecs::lifecycle::DISCARD,
                 BamEventKind::REMOVE => bevy_ecs::lifecycle::REMOVE,
                 BamEventKind::DESPAWN => bevy_ecs::lifecycle::DESPAWN,
-                _ => unreachable!(),
+                other => {
+                    return Err((
+                        FfiResult::INVALID_ARGUMENT,
+                        format!("unsupported lifecycle BamEventKind({})", other.0),
+                    ));
+                }
             };
             (None, key, core::mem::size_of::<FfiEntity>(), true, None)
         } else if desc.event_kind.is_ready() {
@@ -2342,18 +2312,8 @@ pub unsafe extern "C" fn host_register_observer(
     load_ctx: *mut BamLoadCtx,
     desc: *const BamObserverDesc,
 ) -> FfiResult {
-    // SAFETY: Validating `load_ctx` against `LOAD_CTX_MAGIC` under `STRICT_FFI_CHECKS`.
-    let ctx = match unsafe {
-        validate_handle_mut::<LoadContext>(load_ctx.cast::<c_void>(), LOAD_CTX_MAGIC, false)
-    } {
-        Ok(c) => c,
-        Err(err) => return err,
-    };
-    if !ctx.in_init {
-        ctx.host_ctx
-            .set_last_error("host_register_observer called outside bevy_abi_mod_init");
-        return FfiResult::INVALID_STATE;
-    }
+    // SAFETY: Validates active `LoadContext` header and `in_init` state.
+    let ctx = ffi_try!(unsafe { validate_active_load_ctx(load_ctx) });
     ctx.host_ctx.clear_last_error();
 
     if desc.is_null() {
@@ -2401,1129 +2361,5 @@ pub unsafe extern "C" fn host_register_observer(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use bevy_abi_mod_sys::{
-        BAM_COMPONENT_FLAG_SPARSE_SET, BAM_COMPONENT_FLAG_SUMMARY_TICK, ModComponent,
-    };
-    use bevy_ecs::prelude::Component;
-    use core::sync::atomic::AtomicUsize;
-    use std::ffi::CString;
-
-    struct HookLog {
-        events: Mutex<Vec<(&'static str, FfiEntity, u32)>>,
-    }
-
-    unsafe extern "C" fn test_hook_add(
-        entity: FfiEntity,
-        data: *const c_void,
-        user_data: *mut c_void,
-    ) {
-        // SAFETY: `data` points to `u32` and `user_data` points to `HookLog`.
-        let val = unsafe { *data.cast::<u32>() };
-        // SAFETY: `user_data` points to `HookLog`.
-        let log = unsafe { &*user_data.cast::<HookLog>() };
-        log.events.lock().unwrap().push(("add", entity, val));
-    }
-
-    unsafe extern "C" fn test_hook_insert(
-        entity: FfiEntity,
-        data: *const c_void,
-        user_data: *mut c_void,
-    ) {
-        // SAFETY: `data` points to `u32` and `user_data` points to `HookLog`.
-        let val = unsafe { *data.cast::<u32>() };
-        // SAFETY: `user_data` points to `HookLog`.
-        let log = unsafe { &*user_data.cast::<HookLog>() };
-        log.events.lock().unwrap().push(("insert", entity, val));
-    }
-
-    unsafe extern "C" fn test_hook_discard(
-        entity: FfiEntity,
-        data: *const c_void,
-        user_data: *mut c_void,
-    ) {
-        // SAFETY: `data` points to `u32` and `user_data` points to `HookLog`.
-        let val = unsafe { *data.cast::<u32>() };
-        // SAFETY: `user_data` points to `HookLog`.
-        let log = unsafe { &*user_data.cast::<HookLog>() };
-        log.events.lock().unwrap().push(("discard", entity, val));
-    }
-
-    unsafe extern "C" fn test_hook_remove(
-        entity: FfiEntity,
-        data: *const c_void,
-        user_data: *mut c_void,
-    ) {
-        // SAFETY: `data` points to `u32` and `user_data` points to `HookLog`.
-        let val = unsafe { *data.cast::<u32>() };
-        // SAFETY: `user_data` points to `HookLog`.
-        let log = unsafe { &*user_data.cast::<HookLog>() };
-        log.events.lock().unwrap().push(("remove", entity, val));
-    }
-
-    unsafe extern "C" fn test_hook_despawn(
-        entity: FfiEntity,
-        data: *const c_void,
-        user_data: *mut c_void,
-    ) {
-        // SAFETY: `data` points to `u32` and `user_data` points to `HookLog`.
-        let val = unsafe { *data.cast::<u32>() };
-        // SAFETY: `user_data` points to `HookLog`.
-        let log = unsafe { &*user_data.cast::<HookLog>() };
-        log.events.lock().unwrap().push(("despawn", entity, val));
-    }
-
-    unsafe extern "C" fn test_clone_u32_doubled(
-        src: *const c_void,
-        dst: *mut c_void,
-        user_data: *mut c_void,
-    ) -> FfiResult {
-        // SAFETY: `src` is readable `u32`, `dst` is writable `u32`.
-        let val = unsafe { *src.cast::<u32>() };
-        // SAFETY: `dst` is writable `u32`.
-        unsafe { *dst.cast::<u32>() = val.saturating_mul(2) };
-        if !user_data.is_null() {
-            // SAFETY: `user_data` points to `AtomicUsize`.
-            unsafe { (*user_data.cast::<AtomicUsize>()).fetch_add(1, Ordering::Relaxed) };
-        }
-        FfiResult::OK
-    }
-
-    unsafe extern "C" fn test_clone_zst(
-        _src: *const c_void,
-        _dst: *mut c_void,
-        user_data: *mut c_void,
-    ) -> FfiResult {
-        if !user_data.is_null() {
-            // SAFETY: `user_data` points to `AtomicUsize`.
-            unsafe { (*user_data.cast::<AtomicUsize>()).fetch_add(1, Ordering::Relaxed) };
-        }
-        FfiResult::OK
-    }
-
-    #[derive(Component)]
-    struct OpaqueHostComp(#[allow(dead_code)] String);
-
-    // Opaque host component metadata only; raw insert disabled.
-    impl ModComponent for OpaqueHostComp {
-        const CANONICAL_NAME: &'static str = "reg_test::OpaqueHostComp";
-        const COMPONENT_CSTR: &'static CStr = c"reg_test::OpaqueHostComp";
-        const UUID: ComponentUuid = ComponentUuid::from_canonical_name("reg_test::OpaqueHostComp");
-        const IS_RAW_INSERTABLE: bool = false;
-        const IS_ABI_POD: bool = false;
-        type VTable = ();
-
-        fn vtable() -> &'static Self::VTable {
-            &()
-        }
-
-        fn symbols() -> &'static [bevy_abi_mod_sys::SymbolEntry] {
-            &[]
-        }
-    }
-
-    #[test]
-    fn summary_tick_flag_sets_component_info_and_rejects_sparse_set() {
-        let mut world = World::new();
-        let reg = ModRegistry::new();
-        let active = Arc::new(AtomicBool::new(true));
-        let mut h_summary = BamComponent::INVALID;
-        let mut h_plain = BamComponent::INVALID;
-        let mut h_bad = BamComponent::INVALID;
-
-        let mut ctx = LoadContext::with_world_and_mod_id(
-            reg,
-            active,
-            &mut world as *mut World,
-            Some(ModId(10)),
-        );
-
-        let desc_summary = ComponentDesc::new(
-            c"reg_test::WithSummary".as_ptr(),
-            ComponentUuid::from_parts("reg_test::WithSummary", 4, 4, 0),
-            4,
-            4,
-        )
-        .with_flags(BAM_COMPONENT_FLAG_SUMMARY_TICK);
-        let desc_plain = ComponentDesc::new(
-            c"reg_test::PlainTable".as_ptr(),
-            ComponentUuid::from_parts("reg_test::PlainTable", 4, 4, 0),
-            4,
-            4,
-        );
-        let desc_bad = ComponentDesc::new(
-            c"reg_test::BadSparseSummary".as_ptr(),
-            ComponentUuid::from_parts("reg_test::BadSparseSummary", 4, 4, 0),
-            4,
-            4,
-        )
-        .with_flags(BAM_COMPONENT_FLAG_SPARSE_SET | BAM_COMPONENT_FLAG_SUMMARY_TICK);
-
-        // SAFETY: Valid `LoadContext` and `ComponentDesc`s.
-        unsafe {
-            assert_eq!(
-                host_register_component(ctx.as_ffi_ptr(), &desc_summary, &mut h_summary),
-                FfiResult::OK
-            );
-            assert_eq!(
-                host_register_component(ctx.as_ffi_ptr(), &desc_plain, &mut h_plain),
-                FfiResult::OK
-            );
-            assert_eq!(
-                host_register_component(ctx.as_ffi_ptr(), &desc_bad, &mut h_bad),
-                FfiResult::INVALID_ARGUMENT
-            );
-        }
-
-        let reg_after = ctx.registry.clone();
-        ctx.finish_init();
-
-        let m_sum = reg_after.get_by_handle(h_summary).unwrap();
-        let m_plain = reg_after.get_by_handle(h_plain).unwrap();
-        assert!(m_sum.is_summary_tick());
-        assert!(!m_plain.is_summary_tick());
-        assert!(
-            world
-                .components()
-                .get_info(m_sum.component_id)
-                .unwrap()
-                .summary_tick()
-        );
-        assert!(
-            !world
-                .components()
-                .get_info(m_plain.component_id)
-                .unwrap()
-                .summary_tick()
-        );
-    }
-
-    #[test]
-    fn all_five_lifecycle_hooks_post_unload_disarm_and_beyond_1024_cap() {
-        let mut world = World::new();
-        let reg = ModRegistry::new();
-        let active = Arc::new(AtomicBool::new(true));
-        let log = Box::new(HookLog {
-            events: Mutex::new(Vec::new()),
-        });
-        let log_ptr = (&*log as *const HookLog).cast_mut().cast::<c_void>();
-
-        let mut h_hooked = BamComponent::INVALID;
-        let reg_after = {
-            let mut ctx = LoadContext::with_world_and_mod_id(
-                reg,
-                Arc::clone(&active),
-                &mut world as *mut World,
-                Some(ModId(11)),
-            );
-            let desc = ComponentDesc::new(
-                c"reg_test::FullHooks".as_ptr(),
-                ComponentUuid::from_parts("reg_test::FullHooks", 4, 4, 0),
-                4,
-                4,
-            )
-            .with_hooks(Some(test_hook_add), Some(test_hook_remove), log_ptr)
-            .with_on_insert(test_hook_insert)
-            .with_on_discard(test_hook_discard)
-            .with_on_despawn(test_hook_despawn);
-            // SAFETY: Valid `LoadContext` and `ComponentDesc`.
-            let r_main = unsafe { host_register_component(ctx.as_ffi_ptr(), &desc, &mut h_hooked) };
-            assert_eq!(r_main, FfiResult::OK);
-
-            // Register 1,100 additional hooked components in the same World to prove zero 1,024-slot cap.
-            let extra_count = if cfg!(miri) { 8 } else { 1100 };
-            for idx in 0..extra_count {
-                let name = format!("reg_test::ManyHooked_{idx}");
-                let cname = CString::new(name.as_str()).unwrap();
-                let mut h = BamComponent::INVALID;
-                let extra = ComponentDesc::new(
-                    cname.as_ptr(),
-                    ComponentUuid::from_parts(&name, 4, 4, 0),
-                    4,
-                    4,
-                )
-                .with_on_insert(test_hook_insert)
-                .with_hook_user_data(log_ptr);
-                // SAFETY: Valid `LoadContext` and `ComponentDesc`.
-                let r_extra = unsafe { host_register_component(ctx.as_ffi_ptr(), &extra, &mut h) };
-                assert_eq!(r_extra, FfiResult::OK);
-            }
-
-            let r = ctx.registry.clone();
-            ctx.finish_init();
-            r
-        };
-
-        let cid = reg_after.get_by_handle(h_hooked).unwrap().component_id;
-        let e1 = world.spawn_empty().id();
-        let e1_ffi = FfiEntity::from_bits(e1.to_bits());
-
-        let mut v1: u32 = 10;
-        // SAFETY: `cid` matches 4-byte `u32` layout.
-        unsafe {
-            world.entity_mut(e1).insert_by_id(
-                cid,
-                OwningPtr::new(core::ptr::NonNull::from(&mut v1).cast()),
-            );
-        }
-        let mut v2: u32 = 20;
-        // SAFETY: `cid` matches 4-byte `u32` layout.
-        unsafe {
-            world.entity_mut(e1).insert_by_id(
-                cid,
-                OwningPtr::new(core::ptr::NonNull::from(&mut v2).cast()),
-            );
-        }
-        world.entity_mut(e1).remove_by_id(cid);
-
-        let mut v3: u32 = 30;
-        // SAFETY: `cid` matches 4-byte `u32` layout.
-        unsafe {
-            world.entity_mut(e1).insert_by_id(
-                cid,
-                OwningPtr::new(core::ptr::NonNull::from(&mut v3).cast()),
-            );
-        }
-        world.entity_mut(e1).despawn();
-
-        let recorded = log.events.lock().unwrap().clone();
-        assert_eq!(
-            recorded,
-            vec![
-                ("add", e1_ffi, 10),
-                ("insert", e1_ffi, 10),
-                ("discard", e1_ffi, 10),
-                ("insert", e1_ffi, 20),
-                ("discard", e1_ffi, 20),
-                ("remove", e1_ffi, 20),
-                ("add", e1_ffi, 30),
-                ("insert", e1_ffi, 30),
-                ("despawn", e1_ffi, 30),
-                ("discard", e1_ffi, 30),
-                ("remove", e1_ffi, 30),
-            ]
-        );
-        // Disarm `is_active` and verify zero foreign hooks run afterwards.
-        active.store(false, Ordering::Release);
-        let e2 = world.spawn_empty().id();
-        let mut v4: u32 = 40;
-        // SAFETY: `cid` matches 4-byte `u32` layout.
-        unsafe {
-            world.entity_mut(e2).insert_by_id(
-                cid,
-                OwningPtr::new(core::ptr::NonNull::from(&mut v4).cast()),
-            );
-        }
-        world.entity_mut(e2).despawn();
-        assert_eq!(log.events.lock().unwrap().len(), 11);
-    }
-
-    #[test]
-    fn entity_cloner_custom_clone_fn_non_zst_zst_and_post_unload_disarm() {
-        let mut world = World::new();
-        let reg = ModRegistry::new();
-        let active = Arc::new(AtomicBool::new(true));
-        let clone_count = Box::new(AtomicUsize::new(0));
-        let count_ptr = (&*clone_count as *const AtomicUsize)
-            .cast_mut()
-            .cast::<c_void>();
-
-        let mut h_val = BamComponent::INVALID;
-        let mut h_zst = BamComponent::INVALID;
-        let reg_after = {
-            let mut ctx = LoadContext::with_world_and_mod_id(
-                reg,
-                Arc::clone(&active),
-                &mut world as *mut World,
-                Some(ModId(12)),
-            );
-            let desc_val = ComponentDesc::new(
-                c"reg_test::CloneVal".as_ptr(),
-                ComponentUuid::from_parts("reg_test::CloneVal", 4, 4, 0),
-                4,
-                4,
-            )
-            .with_clone_fn(test_clone_u32_doubled)
-            .with_hook_user_data(count_ptr);
-            let desc_zst = ComponentDesc::new(
-                c"reg_test::CloneZst".as_ptr(),
-                ComponentUuid::from_parts("reg_test::CloneZst", 0, 1, 0),
-                0,
-                1,
-            )
-            .with_clone_fn(test_clone_zst)
-            .with_hook_user_data(count_ptr);
-            // SAFETY: Valid `LoadContext` and `ComponentDesc`s.
-            unsafe {
-                assert_eq!(
-                    host_register_component(ctx.as_ffi_ptr(), &desc_val, &mut h_val),
-                    FfiResult::OK
-                );
-                assert_eq!(
-                    host_register_component(ctx.as_ffi_ptr(), &desc_zst, &mut h_zst),
-                    FfiResult::OK
-                );
-            }
-            let r = ctx.registry.clone();
-            ctx.finish_init();
-            r
-        };
-
-        let cid_val = reg_after.get_by_handle(h_val).unwrap().component_id;
-        let cid_zst = reg_after.get_by_handle(h_zst).unwrap().component_id;
-        let e = world.spawn_empty().id();
-        let mut raw_val: u32 = 21;
-        // SAFETY: `cid_val` has 4-byte `u32` layout and `cid_zst` is ZST.
-        unsafe {
-            world.entity_mut(e).insert_by_id(
-                cid_val,
-                OwningPtr::new(core::ptr::NonNull::from(&mut raw_val).cast()),
-            );
-            world.entity_mut(e).insert_by_id(
-                cid_zst,
-                OwningPtr::new(core::ptr::NonNull::<u8>::dangling()),
-            );
-        }
-
-        let cloned = world.entity_mut(e).clone_and_spawn();
-        let cloned_ref = world.entity(cloned);
-        assert!(cloned_ref.contains_id(cid_zst));
-        let cloned_ptr = cloned_ref.get_by_id(cid_val).unwrap();
-        // SAFETY: `cloned_ptr` points to 4-byte `u32` initialized by `test_clone_u32_doubled`.
-        let cloned_val = unsafe { core::ptr::read_unaligned(cloned_ptr.as_ptr().cast::<u32>()) };
-        assert_eq!(cloned_val, 42);
-        assert_eq!(clone_count.load(Ordering::Relaxed), 2);
-
-        // Disarm `is_active` and clone again: `clone_fn` must NOT execute!
-        active.store(false, Ordering::Release);
-        let cloned2 = world.entity_mut(e).clone_and_spawn();
-        assert!(!world.entity(cloned2).contains_id(cid_val));
-        assert!(!world.entity(cloned2).contains_id(cid_zst));
-        assert_eq!(clone_count.load(Ordering::Relaxed), 2);
-    }
-
-    #[test]
-    fn transitive_required_components_preserves_existing_and_validates_ctors() {
-        let mut world = World::new();
-        let mut reg = ModRegistry::new();
-        let opaque_cid = world.register_component::<OpaqueHostComp>();
-        reg.register_component::<OpaqueHostComp>(opaque_cid, Default::default())
-            .unwrap();
-        let h_opaque = reg.get_by_id(opaque_cid).unwrap().handle;
-
-        let active = Arc::new(AtomicBool::new(true));
-        let mut h_c = BamComponent::INVALID;
-        let mut h_b = BamComponent::INVALID;
-        let mut h_a = BamComponent::INVALID;
-        let mut h_fail = BamComponent::INVALID;
-
-        let reg_after = {
-            let mut ctx = LoadContext::with_world_and_mod_id(
-                reg,
-                active,
-                &mut world as *mut World,
-                Some(ModId(13)),
-            );
-            let desc_c = ComponentDesc::new(
-                c"req_test::CompC".as_ptr(),
-                ComponentUuid::from_parts("req_test::CompC", 4, 4, 0),
-                4,
-                4,
-            );
-            // SAFETY: Valid `LoadContext` and `ComponentDesc`.
-            let rc = unsafe { host_register_component(ctx.as_ffi_ptr(), &desc_c, &mut h_c) };
-            assert_eq!(rc, FfiResult::OK);
-
-            let reqs_b = [h_c];
-            let desc_b = ComponentDesc::new(
-                c"req_test::CompB".as_ptr(),
-                ComponentUuid::from_parts("req_test::CompB", 4, 4, 0),
-                4,
-                4,
-            )
-            .with_required_components(reqs_b.as_ptr(), reqs_b.len());
-            // SAFETY: Valid `LoadContext` and `ComponentDesc`.
-            let rb = unsafe { host_register_component(ctx.as_ffi_ptr(), &desc_b, &mut h_b) };
-            assert_eq!(rb, FfiResult::OK);
-
-            let reqs_a = [h_b];
-            let desc_a = ComponentDesc::new(
-                c"req_test::CompA".as_ptr(),
-                ComponentUuid::from_parts("req_test::CompA", 4, 4, 0),
-                4,
-                4,
-            )
-            .with_required_components(reqs_a.as_ptr(), reqs_a.len());
-            // SAFETY: Valid `LoadContext` and `ComponentDesc`.
-            let ra = unsafe { host_register_component(ctx.as_ffi_ptr(), &desc_a, &mut h_a) };
-            assert_eq!(ra, FfiResult::OK);
-
-            // Requiring an opaque host component without a default constructor must fail with PERMISSION_DENIED.
-            let bad_reqs = [h_opaque];
-            let desc_bad = ComponentDesc::new(
-                c"req_test::BadReq".as_ptr(),
-                ComponentUuid::from_parts("req_test::BadReq", 4, 4, 0),
-                4,
-                4,
-            )
-            .with_required_components(bad_reqs.as_ptr(), bad_reqs.len());
-            // SAFETY: Valid `LoadContext` and `ComponentDesc`.
-            let rbad = unsafe { host_register_component(ctx.as_ffi_ptr(), &desc_bad, &mut h_fail) };
-            assert_eq!(rbad, FfiResult::PERMISSION_DENIED);
-
-            let r = ctx.registry.clone();
-            ctx.finish_init();
-            r
-        };
-
-        assert_eq!(reg_after.required_components(h_a), &[h_b]);
-        assert_eq!(reg_after.required_components(h_b), &[h_c]);
-
-        let cid_a = reg_after.get_by_handle(h_a).unwrap().component_id;
-        let cid_b = reg_after.get_by_handle(h_b).unwrap().component_id;
-        let cid_c = reg_after.get_by_handle(h_c).unwrap().component_id;
-
-        // 1. Inserting A automatically inserts transitive requirements B and C.
-        let e1 = world.spawn_empty().id();
-        let mut val_a: u32 = 7;
-        // SAFETY: `cid_a` has 4-byte `u32` layout.
-        unsafe {
-            world.entity_mut(e1).insert_by_id(
-                cid_a,
-                OwningPtr::new(core::ptr::NonNull::from(&mut val_a).cast()),
-            );
-        }
-        assert!(world.entity(e1).contains_id(cid_a));
-        assert!(world.entity(e1).contains_id(cid_b));
-        assert!(world.entity(e1).contains_id(cid_c));
-        let b_ptr = world.entity(e1).get_by_id(cid_b).unwrap().as_ptr();
-        let c_ptr = world.entity(e1).get_by_id(cid_c).unwrap().as_ptr();
-        // SAFETY: `cid_b` and `cid_c` are zero-initialized `u32`s.
-        unsafe {
-            assert_eq!(core::ptr::read_unaligned(b_ptr.cast::<u32>()), 0);
-            assert_eq!(core::ptr::read_unaligned(c_ptr.cast::<u32>()), 0);
-        }
-
-        // 2. Pre-existing B(99) is preserved when A is inserted, while missing C is still inserted.
-        let e2 = world.spawn_empty().id();
-        let mut val_b: u32 = 99;
-        // SAFETY: `cid_b` has 4-byte `u32` layout.
-        unsafe {
-            world.entity_mut(e2).insert_by_id(
-                cid_b,
-                OwningPtr::new(core::ptr::NonNull::from(&mut val_b).cast()),
-            );
-            world.entity_mut(e2).insert_by_id(
-                cid_a,
-                OwningPtr::new(core::ptr::NonNull::from(&mut val_a).cast()),
-            );
-        }
-        assert!(world.entity(e2).contains_id(cid_c));
-        let e2_b_ptr = world.entity(e2).get_by_id(cid_b).unwrap().as_ptr();
-        // SAFETY: `cid_b` holds 99.
-        unsafe {
-            assert_eq!(core::ptr::read_unaligned(e2_b_ptr.cast::<u32>()), 99);
-        }
-    }
-
-    unsafe extern "C" fn test_drop_atomic_ptr(ptr: *mut c_void) {
-        // SAFETY: `ptr` stores an aligned `*const AtomicUsize` pointing to a live counter.
-        let counter_ptr = unsafe { core::ptr::read_unaligned(ptr.cast::<*const AtomicUsize>()) };
-        if !counter_ptr.is_null() {
-            // SAFETY: Test keeps the `Box<AtomicUsize>` alive for the test duration.
-            unsafe { (*counter_ptr).fetch_add(1, Ordering::Relaxed) };
-        }
-    }
-
-    unsafe extern "C" fn test_on_insert_atomic(
-        _entity: FfiEntity,
-        _data: *const c_void,
-        user_data: *mut c_void,
-    ) {
-        if !user_data.is_null() {
-            // SAFETY: `user_data` points to a live `AtomicUsize`.
-            unsafe { (*user_data.cast::<AtomicUsize>()).fetch_add(1, Ordering::Relaxed) };
-        }
-    }
-
-    #[test]
-    fn drop_fn_plus_on_insert_active_and_disarmed_never_underflows_live_values() {
-        let _serial = crate::drop_trampoline::TEST_DROP_SLAB_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let drop_count = Box::new(AtomicUsize::new(0));
-        let insert_count = Box::new(AtomicUsize::new(0));
-        let drop_ptr = &*drop_count as *const AtomicUsize;
-        let insert_ptr = (&*insert_count as *const AtomicUsize)
-            .cast_mut()
-            .cast::<c_void>();
-
-        let mut world = World::new();
-        let reg = ModRegistry::new();
-        let active = Arc::new(AtomicBool::new(true));
-        let mut handle = BamComponent::INVALID;
-
-        let reg_after = {
-            let mut ctx = LoadContext::with_world_and_mod_id(
-                reg,
-                Arc::clone(&active),
-                &mut world as *mut World,
-                Some(ModId(21)),
-            );
-            let desc = ComponentDesc::new(
-                c"reg_test::DropPlusInsert".as_ptr(),
-                ComponentUuid::from_parts(
-                    "reg_test::DropPlusInsert",
-                    core::mem::size_of::<*const AtomicUsize>(),
-                    core::mem::align_of::<*const AtomicUsize>(),
-                    0,
-                ),
-                core::mem::size_of::<*const AtomicUsize>(),
-                core::mem::align_of::<*const AtomicUsize>(),
-            )
-            .with_drop(test_drop_atomic_ptr)
-            .with_on_insert(test_on_insert_atomic)
-            .with_hook_user_data(insert_ptr);
-            // SAFETY: Valid `LoadContext`, `ComponentDesc`, and output pointer.
-            let rc = unsafe { host_register_component(ctx.as_ffi_ptr(), &desc, &mut handle) };
-            assert_eq!(rc, FfiResult::OK);
-            let r = ctx.registry.clone();
-            ctx.finish_init();
-            r
-        };
-
-        let meta = reg_after.get_by_handle(handle).unwrap();
-        let cid = meta.component_id;
-        let slot = meta.drop_slot.expect("drop_fn allocates a drop slot");
-        assert_eq!(
-            world
-                .get_resource::<DynamicComponentHookMap>()
-                .and_then(|m| m.drop_slot_by_id.get(&cid).copied()),
-            Some(slot)
-        );
-
-        // 1. Active insert + despawn runs both `on_insert` and `drop_fn`.
-        let e1 = world.spawn_empty().id();
-        let mut payload1 = drop_ptr;
-        // SAFETY: `cid` matches `*const AtomicUsize` layout.
-        unsafe {
-            world.entity_mut(e1).insert_by_id(
-                cid,
-                OwningPtr::new(core::ptr::NonNull::from(&mut payload1).cast()),
-            );
-        }
-        assert_eq!(insert_count.load(Ordering::Relaxed), 1);
-        assert!(world.despawn(e1));
-        assert_eq!(drop_count.load(Ordering::Relaxed), 1);
-
-        // 2. Disarm `is_active` and insert/despawn again: callbacks do NOT run, and `live_values`
-        // must still increment on insert so `drop_trampoline` does not underflow on despawn.
-        active.store(false, Ordering::Release);
-        let e2 = world.spawn_empty().id();
-        let mut payload2 = drop_ptr;
-        // SAFETY: `cid` matches `*const AtomicUsize` layout.
-        unsafe {
-            world.entity_mut(e2).insert_by_id(
-                cid,
-                OwningPtr::new(core::ptr::NonNull::from(&mut payload2).cast()),
-            );
-        }
-        assert_eq!(insert_count.load(Ordering::Relaxed), 1);
-        assert!(world.despawn(e2));
-        assert_eq!(drop_count.load(Ordering::Relaxed), 1);
-        drop(world);
-    }
-
-    #[test]
-    fn clone_fn_supports_over_1024_components_and_failed_inits_in_one_world() {
-        let mut world = World::new();
-        let reg = ModRegistry::new();
-
-        // 1. 60 failed/rolled-back inits with `clone_fn` + 1,100 live registrations in one World.
-        let (rollback_iters, live_iters) = if cfg!(miri) { (4, 8) } else { (60, 1100) };
-        for idx in 0..rollback_iters {
-            let mut ctx = LoadContext::with_world_and_mod_id(
-                reg.clone(),
-                Arc::new(AtomicBool::new(true)),
-                &mut world as *mut World,
-                Some(ModId(300 + idx)),
-            );
-            let name = format!("clone_cap_test::RolledBack_{idx}");
-            let cname = CString::new(name.as_str()).unwrap();
-            let mut h = BamComponent::INVALID;
-            let desc = ComponentDesc::new(
-                cname.as_ptr(),
-                ComponentUuid::from_parts(&name, 4, 4, 0),
-                4,
-                4,
-            )
-            .with_clone_fn(test_clone_u32_doubled);
-            // SAFETY: Valid `LoadContext`, `ComponentDesc`, and output pointer.
-            let rc = unsafe { host_register_component(ctx.as_ffi_ptr(), &desc, &mut h) };
-            assert_eq!(rc, FfiResult::OK);
-            ctx.rollback();
-        }
-
-        let active = Arc::new(AtomicBool::new(true));
-        let mut last_handle = BamComponent::INVALID;
-        let reg_after = {
-            let mut ctx = LoadContext::with_world_and_mod_id(
-                reg,
-                active,
-                &mut world as *mut World,
-                Some(ModId(400)),
-            );
-            for idx in 0..live_iters {
-                let name = format!("clone_cap_test::Live_{idx}");
-                let cname = CString::new(name.as_str()).unwrap();
-                let mut h = BamComponent::INVALID;
-                let desc = ComponentDesc::new(
-                    cname.as_ptr(),
-                    ComponentUuid::from_parts(&name, 4, 4, 0),
-                    4,
-                    4,
-                )
-                .with_clone_fn(test_clone_u32_doubled);
-                // SAFETY: Valid `LoadContext`, `ComponentDesc`, and output pointer.
-                let rc = unsafe { host_register_component(ctx.as_ffi_ptr(), &desc, &mut h) };
-                assert_eq!(rc, FfiResult::OK);
-                last_handle = h;
-            }
-            let r = ctx.registry.clone();
-            ctx.finish_init();
-            r
-        };
-
-        let cid_last = reg_after.get_by_handle(last_handle).unwrap().component_id;
-        let e = world.spawn_empty().id();
-        let mut val: u32 = 21;
-        // SAFETY: `cid_last` has 4-byte `u32` layout.
-        unsafe {
-            world.entity_mut(e).insert_by_id(
-                cid_last,
-                OwningPtr::new(core::ptr::NonNull::from(&mut val).cast()),
-            );
-        }
-        let cloned = world.entity_mut(e).clone_and_spawn();
-        let cloned_ptr = world.entity(cloned).get_by_id(cid_last).unwrap();
-        // SAFETY: `cloned_ptr` holds `u32` produced by `test_clone_u32_doubled`.
-        let cloned_val = unsafe { core::ptr::read_unaligned(cloned_ptr.as_ptr().cast::<u32>()) };
-        assert_eq!(cloned_val, 42);
-    }
-
-    #[test]
-    fn recycled_drop_slot_reregistration_allocates_fresh_component_id() {
-        let _serial = crate::drop_trampoline::TEST_DROP_SLAB_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let drop_a_count = Box::new(AtomicUsize::new(0));
-        let drop_b_count = Box::new(AtomicUsize::new(0));
-        let drop_a_ptr = &*drop_a_count as *const AtomicUsize;
-        let drop_b_ptr = &*drop_b_count as *const AtomicUsize;
-
-        let mut world = World::new();
-        let reg = ModRegistry::new();
-        let active_a1 = Arc::new(AtomicBool::new(true));
-        let mut h_a1 = BamComponent::INVALID;
-
-        let reg_after_a1 = {
-            let mut ctx = LoadContext::with_world_and_mod_id(
-                reg,
-                Arc::clone(&active_a1),
-                &mut world as *mut World,
-                Some(ModId(501)),
-            );
-            let desc_a = ComponentDesc::new(
-                c"recycle_test::CompA".as_ptr(),
-                ComponentUuid::from_parts(
-                    "recycle_test::CompA",
-                    core::mem::size_of::<*const AtomicUsize>(),
-                    core::mem::align_of::<*const AtomicUsize>(),
-                    0,
-                ),
-                core::mem::size_of::<*const AtomicUsize>(),
-                core::mem::align_of::<*const AtomicUsize>(),
-            )
-            .with_drop(test_drop_atomic_ptr);
-            // SAFETY: Valid `LoadContext`, `ComponentDesc`, and output pointer.
-            let rc = unsafe { host_register_component(ctx.as_ffi_ptr(), &desc_a, &mut h_a1) };
-            assert_eq!(rc, FfiResult::OK);
-            let r = ctx.registry.clone();
-            ctx.finish_init();
-            r
-        };
-
-        let meta_a1 = reg_after_a1.get_by_handle(h_a1).unwrap();
-        let cid_a1 = meta_a1.component_id;
-        let slot_a1 = meta_a1.drop_slot.unwrap();
-
-        // Simulate Mod A unloading with 0 live values and its drop slot being recycled cleanly.
-        active_a1.store(false, Ordering::Release);
-        prune_drop_trampolines_for_guard(&active_a1);
-        drop(world.remove_resource::<WorldDropGuard>());
-        world.insert_resource(WorldDropGuard::new());
-
-        // Mod B claims the recycled slot (`slot_a1`).
-        let active_b = Arc::new(AtomicBool::new(true));
-        let mut h_b = BamComponent::INVALID;
-        let reg_after_b = {
-            let mut ctx = LoadContext::with_world_and_mod_id(
-                reg_after_a1,
-                active_b,
-                &mut world as *mut World,
-                Some(ModId(502)),
-            );
-            let desc_b = ComponentDesc::new(
-                c"recycle_test::CompB".as_ptr(),
-                ComponentUuid::from_parts(
-                    "recycle_test::CompB",
-                    core::mem::size_of::<*const AtomicUsize>(),
-                    core::mem::align_of::<*const AtomicUsize>(),
-                    0,
-                ),
-                core::mem::size_of::<*const AtomicUsize>(),
-                core::mem::align_of::<*const AtomicUsize>(),
-            )
-            .with_drop(test_drop_atomic_ptr);
-            // SAFETY: Valid `LoadContext`, `ComponentDesc`, and output pointer.
-            let rc = unsafe { host_register_component(ctx.as_ffi_ptr(), &desc_b, &mut h_b) };
-            assert_eq!(rc, FfiResult::OK);
-            let r = ctx.registry.clone();
-            ctx.finish_init();
-            r
-        };
-        let _slot_b = reg_after_b.get_by_handle(h_b).unwrap().drop_slot.unwrap();
-
-        // Mod A reloads and gets a DIFFERENT drop slot than `slot_a1` (when Mod B took `slot_a1`).
-        let active_a2 = Arc::new(AtomicBool::new(true));
-        let mut h_a2 = BamComponent::INVALID;
-        let reg_after_a2 = {
-            let mut ctx = LoadContext::with_world_and_mod_id(
-                reg_after_b,
-                active_a2,
-                &mut world as *mut World,
-                Some(ModId(503)),
-            );
-            let desc_a2 = ComponentDesc::new(
-                c"recycle_test::CompA".as_ptr(),
-                ComponentUuid::from_parts(
-                    "recycle_test::CompA",
-                    core::mem::size_of::<*const AtomicUsize>(),
-                    core::mem::align_of::<*const AtomicUsize>(),
-                    0,
-                ),
-                core::mem::size_of::<*const AtomicUsize>(),
-                core::mem::align_of::<*const AtomicUsize>(),
-            )
-            .with_drop(test_drop_atomic_ptr);
-            // SAFETY: Valid `LoadContext`, `ComponentDesc`, and output pointer.
-            let rc = unsafe { host_register_component(ctx.as_ffi_ptr(), &desc_a2, &mut h_a2) };
-            assert_eq!(rc, FfiResult::OK);
-            let r = ctx.registry.clone();
-            ctx.finish_init();
-            r
-        };
-
-        assert_eq!(h_a2, h_a1);
-        let meta_a2 = reg_after_a2.get_by_handle(h_a2).unwrap();
-        let slot_a2 = meta_a2.drop_slot.unwrap();
-        assert_ne!(slot_a2, slot_a1);
-        assert_ne!(
-            meta_a2.component_id, cid_a1,
-            "re-registering onto a different drop slot must allocate a fresh ComponentId"
-        );
-        assert_eq!(
-            reg_after_a2.get_by_id(meta_a2.component_id).unwrap().handle,
-            h_a2
-        );
-        assert!(reg_after_a2.get_by_id(cid_a1).is_none());
-
-        let ea = world.spawn_empty().id();
-        let mut pa = drop_a_ptr;
-        let eb = world.spawn_empty().id();
-        let mut pb = drop_b_ptr;
-        let cid_b = reg_after_a2.get_by_handle(h_b).unwrap().component_id;
-        // SAFETY: Layouts match `*const AtomicUsize`.
-        unsafe {
-            world.entity_mut(ea).insert_by_id(
-                meta_a2.component_id,
-                OwningPtr::new(core::ptr::NonNull::from(&mut pa).cast()),
-            );
-            world.entity_mut(eb).insert_by_id(
-                cid_b,
-                OwningPtr::new(core::ptr::NonNull::from(&mut pb).cast()),
-            );
-        }
-        assert!(world.despawn(ea));
-        assert!(world.despawn(eb));
-        assert_eq!(drop_a_count.load(Ordering::Relaxed), 1);
-        assert_eq!(drop_b_count.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn required_init_descs_custom_bytes_init_fn_uuid_and_disarm_under_miri() {
-        use bevy_abi_mod_sys::{
-            BAM_REQUIRED_FLAG_CUSTOM_BYTES, BAM_REQUIRED_FLAG_INIT_FN,
-            BAM_REQUIRED_FLAG_RESOLVE_BY_UUID, BamRequiredComponent,
-        };
-
-        #[repr(C)]
-        #[derive(Clone, Copy, Debug, PartialEq)]
-        struct Stats {
-            hp: i32,
-            armor: i32,
-        }
-
-        #[repr(C)]
-        #[derive(Clone, Copy, Debug, PartialEq)]
-        struct Shield {
-            cap: u32,
-            regen: u32,
-        }
-
-        #[repr(C)]
-        #[derive(Clone, Copy, Debug, PartialEq)]
-        struct BaseBadge {
-            rank: u64,
-        }
-
-        const STATS_UUID: ComponentUuid = ComponentUuid::from_parts("req::Stats", 8, 4, 0);
-        const SHIELD_UUID: ComponentUuid = ComponentUuid::from_parts("req::Shield", 8, 4, 0);
-        const BADGE_UUID: ComponentUuid = ComponentUuid::from_parts("req::BaseBadge", 8, 8, 0);
-        const UNIT_UUID: ComponentUuid = ComponentUuid::from_parts("req::Unit", 0, 1, 0);
-
-        struct InitCtx {
-            calls: AtomicUsize,
-            rank_value: u64,
-        }
-
-        unsafe extern "C" fn init_badge_fn(dst: *mut c_void, user_data: *mut c_void) -> FfiResult {
-            // SAFETY: `user_data` points to `InitCtx` pinned on the test stack while `active` is true.
-            let ctx = unsafe { &*user_data.cast::<InitCtx>() };
-            ctx.calls.fetch_add(1, Ordering::SeqCst);
-            // SAFETY: `dst` is valid 8-byte aligned storage for `BaseBadge`.
-            unsafe {
-                core::ptr::write(
-                    dst.cast::<BaseBadge>(),
-                    BaseBadge {
-                        rank: ctx.rank_value,
-                    },
-                );
-            }
-            FfiResult::OK
-        }
-
-        let mut world = World::new();
-        world.insert_resource(WorldDropGuard::new());
-        let reg = ModRegistry::new();
-        let active = Arc::new(AtomicBool::new(true));
-        let init_ctx = InitCtx {
-            calls: AtomicUsize::new(0),
-            rank_value: 0xABCD_1234_5678_90EF,
-        };
-
-        let mut h_stats = BamComponent::INVALID;
-        let mut h_shield = BamComponent::INVALID;
-        let mut h_badge = BamComponent::INVALID;
-        let mut h_unit = BamComponent::INVALID;
-
-        let stats_custom = Stats { hp: 250, armor: 42 };
-        let stats_bytes: [u8; 8] = {
-            let mut b = [0u8; 8];
-            b[0..4].copy_from_slice(&stats_custom.hp.to_ne_bytes());
-            b[4..8].copy_from_slice(&stats_custom.armor.to_ne_bytes());
-            b
-        };
-        let shield_custom = Shield {
-            cap: 120,
-            regen: 15,
-        };
-        let shield_bytes: [u8; 8] = {
-            let mut b = [0u8; 8];
-            b[0..4].copy_from_slice(&shield_custom.cap.to_ne_bytes());
-            b[4..8].copy_from_slice(&shield_custom.regen.to_ne_bytes());
-            b
-        };
-
-        let reg = {
-            let mut ctx = LoadContext::with_world_and_mod_id(
-                reg,
-                Arc::clone(&active),
-                &mut world as *mut World,
-                Some(ModId(601)),
-            );
-
-            let badge_desc = ComponentDesc::new(
-                c"req::BaseBadge".as_ptr(),
-                BADGE_UUID,
-                core::mem::size_of::<BaseBadge>(),
-                core::mem::align_of::<BaseBadge>(),
-            );
-            assert_eq!(
-                // SAFETY: Valid `LoadContext`, `ComponentDesc`, and output pointer.
-                unsafe { host_register_component(ctx.as_ffi_ptr(), &badge_desc, &mut h_badge) },
-                FfiResult::OK
-            );
-
-            // `Shield` transitively requires `BaseBadge` via `INIT_FN` + `RESOLVE_BY_UUID`.
-            let badge_req = BamRequiredComponent::by_uuid(BADGE_UUID).with_init_fn(
-                init_badge_fn,
-                core::mem::size_of::<BaseBadge>(),
-                (&raw const init_ctx).cast_mut().cast::<c_void>(),
-            );
-            assert_eq!(
-                badge_req.flags,
-                BAM_REQUIRED_FLAG_RESOLVE_BY_UUID | BAM_REQUIRED_FLAG_INIT_FN
-            );
-            let shield_desc = ComponentDesc::new(
-                c"req::Shield".as_ptr(),
-                SHIELD_UUID,
-                core::mem::size_of::<Shield>(),
-                core::mem::align_of::<Shield>(),
-            )
-            .with_required_init_descs(&badge_req, 1);
-            assert_eq!(
-                // SAFETY: Valid `LoadContext`, `ComponentDesc`, and output pointer.
-                unsafe { host_register_component(ctx.as_ffi_ptr(), &shield_desc, &mut h_shield) },
-                FfiResult::OK
-            );
-
-            let stats_desc = ComponentDesc::new(
-                c"req::Stats".as_ptr(),
-                STATS_UUID,
-                core::mem::size_of::<Stats>(),
-                core::mem::align_of::<Stats>(),
-            );
-            assert_eq!(
-                // SAFETY: Valid `LoadContext`, `ComponentDesc`, and output pointer.
-                unsafe { host_register_component(ctx.as_ffi_ptr(), &stats_desc, &mut h_stats) },
-                FfiResult::OK
-            );
-
-            // Mismatched `init_size` (4 != 8) must fail with `TYPE_MISMATCH`.
-            let bad_bytes = [0u8; 4];
-            let mut bad_req = BamRequiredComponent::by_handle(h_stats);
-            bad_req.flags = BAM_REQUIRED_FLAG_CUSTOM_BYTES;
-            bad_req.init_bytes = bad_bytes.as_ptr();
-            bad_req.init_size = bad_bytes.len();
-            let bad_unit_desc = ComponentDesc::new(c"req::BadUnit".as_ptr(), UNIT_UUID, 0, 1)
-                .with_required_init_descs(&bad_req, 1);
-            let mut h_bad = BamComponent::INVALID;
-            assert_eq!(
-                // SAFETY: Valid `LoadContext`, `ComponentDesc`, and output pointer.
-                unsafe { host_register_component(ctx.as_ffi_ptr(), &bad_unit_desc, &mut h_bad) },
-                FfiResult::TYPE_MISMATCH
-            );
-
-            // `Unit` requires `Stats` (by handle + CUSTOM_BYTES) and `Shield` (by UUID + CUSTOM_BYTES).
-            let mut req_stats = BamRequiredComponent::by_handle(h_stats);
-            req_stats.flags = BAM_REQUIRED_FLAG_CUSTOM_BYTES;
-            req_stats.init_bytes = stats_bytes.as_ptr();
-            req_stats.init_size = stats_bytes.len();
-
-            let mut req_shield = BamRequiredComponent::by_uuid(SHIELD_UUID);
-            req_shield.flags |= BAM_REQUIRED_FLAG_CUSTOM_BYTES;
-            req_shield.init_bytes = shield_bytes.as_ptr();
-            req_shield.init_size = shield_bytes.len();
-
-            let unit_reqs = [req_stats, req_shield];
-            let unit_desc = ComponentDesc::new(c"req::Unit".as_ptr(), UNIT_UUID, 0, 1)
-                .with_required_init_descs(unit_reqs.as_ptr(), unit_reqs.len());
-            assert_eq!(
-                // SAFETY: Valid `LoadContext`, `ComponentDesc`, and output pointer.
-                unsafe { host_register_component(ctx.as_ffi_ptr(), &unit_desc, &mut h_unit) },
-                FfiResult::OK
-            );
-
-            let r = ctx.registry.clone();
-            ctx.finish_init();
-            r
-        };
-
-        let cid_stats = reg.get_by_handle(h_stats).unwrap().component_id;
-        let cid_shield = reg.get_by_handle(h_shield).unwrap().component_id;
-        let cid_badge = reg.get_by_handle(h_badge).unwrap().component_id;
-        let cid_unit = reg.get_by_handle(h_unit).unwrap().component_id;
-
-        // Spawn entity and insert `Unit`: must materialize `Stats`, `Shield`, and transitively `BaseBadge`!
-        let e1 = world.spawn_empty().id();
-        // SAFETY: `cid_unit` is a ZST component registered in `world`.
-        unsafe {
-            world
-                .entity_mut(e1)
-                .insert_by_id(cid_unit, OwningPtr::new(core::ptr::NonNull::dangling()));
-        }
-        assert_eq!(init_ctx.calls.load(Ordering::SeqCst), 1);
-        // SAFETY: Components hold initialized POD values matching their registered layouts.
-        unsafe {
-            assert_eq!(
-                *world
-                    .entity(e1)
-                    .get_by_id(cid_stats)
-                    .unwrap()
-                    .deref::<Stats>(),
-                stats_custom
-            );
-            assert_eq!(
-                *world
-                    .entity(e1)
-                    .get_by_id(cid_shield)
-                    .unwrap()
-                    .deref::<Shield>(),
-                shield_custom
-            );
-            assert_eq!(
-                *world
-                    .entity(e1)
-                    .get_by_id(cid_badge)
-                    .unwrap()
-                    .deref::<BaseBadge>(),
-                BaseBadge {
-                    rank: 0xABCD_1234_5678_90EF
-                }
-            );
-        }
-
-        // Existing `Stats` must NOT be overwritten when `Unit` is added!
-        let e2 = world.spawn_empty().id();
-        let existing_stats = Stats { hp: 999, armor: 7 };
-        // SAFETY: `cid_stats` and `cid_unit` match registered layouts.
-        unsafe {
-            OwningPtr::make(existing_stats, |p| {
-                world.entity_mut(e2).insert_by_id(cid_stats, p);
-            });
-            world
-                .entity_mut(e2)
-                .insert_by_id(cid_unit, OwningPtr::new(core::ptr::NonNull::dangling()));
-        }
-        assert_eq!(init_ctx.calls.load(Ordering::SeqCst), 2);
-        // SAFETY: `cid_stats` holds `Stats`.
-        unsafe {
-            assert_eq!(
-                *world
-                    .entity(e2)
-                    .get_by_id(cid_stats)
-                    .unwrap()
-                    .deref::<Stats>(),
-                existing_stats
-            );
-        }
-
-        // Disarm the mod (`is_active = false`): inserting `Shield` must NOT call `init_badge_fn`!
-        active.store(false, Ordering::SeqCst);
-        let e3 = world.spawn_empty().id();
-        // SAFETY: `cid_shield` matches `Shield` layout.
-        unsafe {
-            OwningPtr::make(shield_custom, |p| {
-                world.entity_mut(e3).insert_by_id(cid_shield, p);
-            });
-        }
-        assert_eq!(
-            init_ctx.calls.load(Ordering::SeqCst),
-            2,
-            "disarmed mod tombstone must suppress `init_fn` after unload"
-        );
-        assert!(world.entity(e3).get_by_id(cid_badge).is_err());
-    }
-}
+#[path = "../../tests/unit/register_tests.rs"]
+mod tests;

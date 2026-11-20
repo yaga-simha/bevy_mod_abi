@@ -3,10 +3,17 @@
 
 use crate::builder;
 use crate::scaffold::ModLanguage;
-use crate::{CliError, ResolvedProject, atomic_write_bytes, dylib_naming, resolve_project_info};
+use crate::signing::build_cli_trust_policy;
+use crate::{
+    CliError, ResolvedProject, atomic_write_bytes, dylib_naming, read_file_bounded,
+    resolve_project_info,
+};
+use bevy_abi_mod_manifest::{MAX_MANIFEST_BYTES, validate_mod_id};
 use bevy_abi_mod_trust::{
-    BAMPACK_MAGIC, BAMPACK_VERSION, BamPackBuilder, BamPackEntry, HashAlg, MAX_BAMPACK_ENTRIES,
-    MAX_SIGNATURE_SIDECAR_BYTES, ModTrustPolicy, PrivateKey, VerifiedBamPack,
+    BAMPACK_MAGIC, BAMPACK_VERSION, BamPackBuilder, BamPackEntry, Certificate,
+    CertificateValidityPolicy, DEFAULT_MAX_MOD_BINARY_BYTES, HashAlg, MAX_BAMPACK_ENTRIES,
+    MAX_BAMPACK_PATH_DEPTH, MAX_SIGNATURE_SIDECAR_BYTES, ModTrustPolicy, PrivateKey, PublicKey,
+    VerifiedBamPack, parse_bampack_entries_unverified, validate_bampack_entry_path,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -83,63 +90,33 @@ pub struct PackOutput {
 }
 
 fn validate_posix_rel_path(path: &str) -> Result<(), CliError> {
-    if path.is_empty() {
-        return Err(CliError::InvalidArgument(
-            "archive entry path must not be empty".to_owned(),
-        ));
-    }
-    if path.as_bytes().contains(&0) {
-        return Err(CliError::InvalidArgument(
-            "archive entry path must not contain NUL bytes".to_owned(),
-        ));
-    }
-    if path.starts_with('/') || path.contains('\\') {
-        return Err(CliError::InvalidArgument(format!(
-            "archive entry path '{path}' must be relative with POSIX '/' separators"
-        )));
-    }
-    let bytes = path.as_bytes();
-    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        return Err(CliError::InvalidArgument(format!(
-            "archive entry path '{path}' must not contain a drive prefix"
-        )));
-    }
-    for segment in path.split('/') {
-        if segment.is_empty() || segment == "." || segment == ".." {
-            return Err(CliError::InvalidArgument(format!(
-                "archive entry path '{path}' contains invalid path segment '{segment}'"
-            )));
-        }
-    }
-    Ok(())
+    validate_bampack_entry_path(path).map_err(CliError::InvalidArgument)
 }
 
 fn validate_path_segment(segment: &str) -> Result<(), CliError> {
-    if segment.is_empty()
-        || segment == "."
-        || segment == ".."
-        || segment.contains('/')
-        || segment.contains('\\')
-        || segment.as_bytes().contains(&0)
-    {
+    if segment.contains('/') {
         return Err(CliError::InvalidArgument(format!(
             "unsafe asset path segment '{segment}'"
         )));
     }
-    let bytes = segment.as_bytes();
-    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        return Err(CliError::InvalidArgument(format!(
-            "unsafe drive-prefixed asset path segment '{segment}'"
-        )));
-    }
-    Ok(())
+    validate_bampack_entry_path(segment).map_err(CliError::InvalidArgument)
 }
 
 fn collect_assets_recursive(
     current_dir: &Path,
     rel_prefix: &str,
+    depth: usize,
     entries: &mut BTreeMap<String, Vec<u8>>,
+    seen_lower: &mut BTreeSet<String>,
+    total_bytes: &mut u64,
 ) -> Result<(), CliError> {
+    if depth >= MAX_BAMPACK_PATH_DEPTH {
+        return Err(CliError::InvalidArgument(format!(
+            "assets directory exceeds maximum nesting depth ({MAX_BAMPACK_PATH_DEPTH}): {}",
+            current_dir.display()
+        )));
+    }
+
     let mut children: Vec<(String, PathBuf)> = Vec::new();
     for entry_res in fs::read_dir(current_dir)? {
         let entry = entry_res?;
@@ -167,19 +144,43 @@ fn collect_assets_recursive(
         validate_posix_rel_path(&rel_posix)?;
 
         if meta.is_dir() {
-            collect_assets_recursive(&path, &rel_posix, entries)?;
+            let lower_dir = rel_posix.to_lowercase();
+            if seen_lower.contains(&lower_dir) {
+                return Err(CliError::InvalidArgument(format!(
+                    "asset directory '{rel_posix}' collides case-insensitively with an existing file entry"
+                )));
+            }
+            collect_assets_recursive(
+                &path,
+                &rel_posix,
+                depth + 1,
+                entries,
+                seen_lower,
+                total_bytes,
+            )?;
         } else if meta.is_file() {
             if entries.len() >= MAX_BAMPACK_ENTRIES {
                 return Err(CliError::InvalidArgument(format!(
                     "archive exceeds MAX_BAMPACK_ENTRIES ({MAX_BAMPACK_ENTRIES})"
                 )));
             }
-            let data = fs::read(&path)?;
-            if entries.insert(rel_posix.clone(), data).is_some() {
+            let remaining = DEFAULT_MAX_MOD_BINARY_BYTES.saturating_sub(*total_bytes);
+            let data = read_file_bounded(&path, remaining, "asset file")?;
+            let next_total = total_bytes.checked_add(data.len() as u64).ok_or_else(|| {
+                CliError::InvalidArgument("archive total size overflows u64".to_owned())
+            })?;
+            if next_total > DEFAULT_MAX_MOD_BINARY_BYTES {
                 return Err(CliError::InvalidArgument(format!(
-                    "duplicate archive entry path '{rel_posix}'"
+                    "archive total size ({next_total} bytes) exceeds limit ({DEFAULT_MAX_MOD_BINARY_BYTES} bytes)"
                 )));
             }
+            if !seen_lower.insert(rel_posix.to_lowercase()) {
+                return Err(CliError::InvalidArgument(format!(
+                    "duplicate or case-colliding archive entry path '{rel_posix}'"
+                )));
+            }
+            *total_bytes = next_total;
+            entries.insert(rel_posix, data);
         } else {
             return Err(CliError::InvalidArgument(format!(
                 "unsupported non-regular file in assets: {}",
@@ -195,6 +196,8 @@ fn collect_optional_assets(
     project_dir: &Path,
     explicit_assets_dir: Option<&Path>,
     entries: &mut BTreeMap<String, Vec<u8>>,
+    seen_lower: &mut BTreeSet<String>,
+    total_bytes: &mut u64,
 ) -> Result<(), CliError> {
     let assets_root = match explicit_assets_dir {
         Some(dir) => {
@@ -243,7 +246,7 @@ fn collect_optional_assets(
     };
 
     if let Some(root) = assets_root {
-        collect_assets_recursive(&root, "assets", entries)?;
+        collect_assets_recursive(&root, "assets", 1, entries, seen_lower, total_bytes)?;
     }
     Ok(())
 }
@@ -323,6 +326,11 @@ fn locate_prebuilt_library(project: &ResolvedProject, release: bool) -> Result<P
 }
 
 fn encode_unsigned_bampack(entries: &BTreeMap<String, Vec<u8>>) -> Result<Vec<u8>, CliError> {
+    if entries.is_empty() {
+        return Err(CliError::InvalidArgument(
+            "cannot encode empty .bampack archive (0 entries)".to_owned(),
+        ));
+    }
     if entries.len() > MAX_BAMPACK_ENTRIES {
         return Err(CliError::InvalidArgument(format!(
             "archive exceeds MAX_BAMPACK_ENTRIES ({MAX_BAMPACK_ENTRIES})"
@@ -387,6 +395,9 @@ pub fn pack_mod(options: &PackOptions) -> Result<PackOutput, CliError> {
     let manifest = project.manifest.as_ref().ok_or_else(|| {
         CliError::InvalidManifest(format!("failed to parse {}", mod_toml_path.display()))
     })?;
+    validate_mod_id(&manifest.id).map_err(|reason| {
+        CliError::InvalidManifest(format!("invalid [mod].id '{}': {reason}", manifest.id))
+    })?;
 
     let manifest_meta = fs::symlink_metadata(mod_toml_path)?;
     if manifest_meta.file_type().is_symlink() {
@@ -416,18 +427,23 @@ pub fn pack_mod(options: &PackOptions) -> Result<PackOutput, CliError> {
         )));
     }
 
-    let lib_bytes = fs::read(&library_path)?;
+    let lib_bytes = read_file_bounded(
+        &library_path,
+        DEFAULT_MAX_MOD_BINARY_BYTES,
+        "shared library",
+    )?;
     if lib_bytes.is_empty() {
         return Err(CliError::InvalidArgument(format!(
             "shared library {} is empty",
             library_path.display()
         )));
     }
-    let manifest_bytes = fs::read(mod_toml_path)?;
+    let manifest_bytes = read_file_bounded(mod_toml_path, MAX_MANIFEST_BYTES, "mod.toml")?;
 
     let library_entry = if let Some(entry) = &manifest.entry {
         validate_posix_rel_path(entry)?;
-        if entry == "mod.toml" || entry.starts_with("assets/") {
+        let lower = entry.to_lowercase();
+        if lower == "mod.toml" || lower == "assets" || lower.starts_with("assets/") {
             return Err(CliError::InvalidManifest(format!(
                 "`[mod].entry` ('{entry}') collides with reserved archive paths"
             )));
@@ -449,16 +465,31 @@ pub fn pack_mod(options: &PackOptions) -> Result<PackOutput, CliError> {
 
     // Deterministic sorted relative POSIX path map across manifest, library, and optional assets.
     let mut entries: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    entries.insert("mod.toml".to_owned(), manifest_bytes);
-    if entries.insert(library_entry.clone(), lib_bytes).is_some() {
-        return Err(CliError::InvalidManifest(format!(
-            "duplicate archive entry path '{library_entry}'"
+    let mut seen_lower: BTreeSet<String> = BTreeSet::new();
+    let mut total_bytes: u64 = (manifest_bytes.len() as u64)
+        .checked_add(lib_bytes.len() as u64)
+        .ok_or_else(|| CliError::InvalidArgument("archive total size overflows u64".to_owned()))?;
+    if total_bytes > DEFAULT_MAX_MOD_BINARY_BYTES {
+        return Err(CliError::InvalidArgument(format!(
+            "archive total size ({total_bytes} bytes) exceeds limit ({DEFAULT_MAX_MOD_BINARY_BYTES} bytes)"
         )));
     }
+
+    seen_lower.insert("mod.toml".to_owned());
+    entries.insert("mod.toml".to_owned(), manifest_bytes);
+    if !seen_lower.insert(library_entry.to_lowercase()) {
+        return Err(CliError::InvalidManifest(format!(
+            "duplicate or case-colliding archive entry path '{library_entry}'"
+        )));
+    }
+    entries.insert(library_entry.clone(), lib_bytes);
+
     collect_optional_assets(
         &project.project_dir,
         options.assets_dir.as_deref(),
         &mut entries,
+        &mut seen_lower,
+        &mut total_bytes,
     )?;
 
     let entry_paths: Vec<String> = entries.keys().cloned().collect();
@@ -478,14 +509,41 @@ pub fn pack_mod(options: &PackOptions) -> Result<PackOutput, CliError> {
         }
 
         let bytes = if let Some(cert_path) = &options.cert {
-            let cert_text = fs::read_to_string(cert_path)?;
-            builder
+            let cert_raw =
+                read_file_bounded(cert_path, MAX_SIGNATURE_SIDECAR_BYTES, "certificate")?;
+            let cert_text = String::from_utf8(cert_raw).map_err(|_| {
+                CliError::Crypto(format!(
+                    "certificate {} is not valid UTF-8",
+                    cert_path.display()
+                ))
+            })?;
+            let trimmed_cert = cert_text.trim();
+            let bytes = builder
                 .build_signed_with_openssh_certificate(
                     &signing_key,
-                    cert_text.trim(),
+                    trimmed_cert,
                     &options.namespace,
                 )
-                .map_err(|e| CliError::Crypto(e.to_string()))?
+                .map_err(|e| CliError::Crypto(e.to_string()))?;
+
+            // Self-verify freshly produced certificate-signed archive via `bevy_abi_mod_trust`.
+            if let Ok(parsed_cert) = Certificate::from_openssh(trimmed_cert) {
+                let ca_openssh = PublicKey::from(parsed_cert.signature_key().clone())
+                    .to_openssh()
+                    .map_err(|e| CliError::Crypto(e.to_string()))?;
+                let policy = ModTrustPolicy::from_ca_openssh(&ca_openssh)
+                    .map_err(|e| CliError::Crypto(e.to_string()))?
+                    .with_namespace(&options.namespace)
+                    .map_err(|e| CliError::Crypto(e.to_string()))?
+                    .with_validity_policy(CertificateValidityPolicy::IgnoreTimestamps);
+                policy
+                    .verify_bampack_bytes(&bytes)
+                    .map_err(|e| CliError::Crypto(format!("self-verification failed: {e}")))?;
+            } else {
+                parse_bampack_entries_unverified(&bytes, DEFAULT_MAX_MOD_BINARY_BYTES)
+                    .map_err(|e| CliError::Crypto(format!("self-verification failed: {e}")))?;
+            }
+            bytes
         } else {
             let bytes = builder
                 .build_signed_with_key(&signing_key, &options.namespace)
@@ -519,11 +577,13 @@ pub fn pack_mod(options: &PackOptions) -> Result<PackOutput, CliError> {
         Some(path) => path.clone(),
         None => {
             let profile_dir = if options.release { "release" } else { "debug" };
+            let file_name = format!("{}-{}.bampack", manifest.id, manifest.version);
+            validate_path_segment(&file_name)?;
             project
                 .project_dir
                 .join("target")
                 .join(profile_dir)
-                .join(format!("{}-{}.bampack", manifest.id, manifest.version))
+                .join(file_name)
         }
     };
     atomic_write_bytes(&output_path, &archive_bytes)?;
@@ -568,68 +628,36 @@ pub fn verify_bampack_file(
     required_principal: Option<&str>,
     namespace: &str,
 ) -> Result<VerifiedBamPack, CliError> {
-    if pubkey_paths.is_empty() && ca_key_paths.is_empty() {
-        return Err(CliError::InvalidArgument(
-            "at least one `--pubkey <key.pub>` or `--ca <ca.pub>` is required".to_owned(),
-        ));
-    }
-    if namespace.is_empty() {
-        return Err(CliError::InvalidArgument(
-            "`--namespace` must not be empty".to_owned(),
-        ));
-    }
+    verify_bampack_file_with_krl(
+        archive_path,
+        pubkey_paths,
+        ca_key_paths,
+        &[],
+        required_principal,
+        namespace,
+    )
+}
 
-    let mut policy = ModTrustPolicy::strict()
-        .with_namespace(namespace)
-        .map_err(|e| CliError::Crypto(e.to_string()))?;
-    for pubkey in pubkey_paths {
-        policy = policy
-            .add_public_key_file(pubkey)
-            .map_err(|e| CliError::Crypto(e.to_string()))?;
-    }
-    for ca_key in ca_key_paths {
-        policy = policy
-            .add_ca_file(ca_key)
-            .map_err(|e| CliError::Crypto(e.to_string()))?;
-    }
-    if let Some(principal) = required_principal {
-        policy = policy.with_required_principal(principal);
-    }
-
+/// Verifies a signed `.bampack` archive file against pinned Ed25519 `.pub` keys, CA `.pub` keys,
+/// and optional binary `SSHKRL` revocation lists using [`bevy_abi_mod_trust::ModTrustPolicy`].
+pub fn verify_bampack_file_with_krl(
+    archive_path: &Path,
+    pubkey_paths: &[PathBuf],
+    ca_key_paths: &[PathBuf],
+    krl_paths: &[PathBuf],
+    required_principal: Option<&str>,
+    namespace: &str,
+) -> Result<VerifiedBamPack, CliError> {
+    let policy = build_cli_trust_policy(
+        pubkey_paths,
+        ca_key_paths,
+        krl_paths,
+        required_principal,
+        namespace,
+    )?;
     policy
         .verify_bampack_file(archive_path)
         .map_err(|e| CliError::Crypto(e.to_string()))
-}
-
-fn read_exact_slice<'a>(
-    buf: &'a [u8],
-    cursor: &mut usize,
-    len: usize,
-) -> Result<&'a [u8], CliError> {
-    let end = cursor
-        .checked_add(len)
-        .filter(|&e| e <= buf.len())
-        .ok_or_else(|| CliError::Crypto("truncated .bampack archive".to_owned()))?;
-    let slice = &buf[*cursor..end];
-    *cursor = end;
-    Ok(slice)
-}
-
-fn read_u16_le(buf: &[u8], cursor: &mut usize) -> Result<u16, CliError> {
-    let s = read_exact_slice(buf, cursor, 2)?;
-    Ok(u16::from_le_bytes([s[0], s[1]]))
-}
-
-fn read_u32_le(buf: &[u8], cursor: &mut usize) -> Result<u32, CliError> {
-    let s = read_exact_slice(buf, cursor, 4)?;
-    Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
-}
-
-fn read_u64_le(buf: &[u8], cursor: &mut usize) -> Result<u64, CliError> {
-    let s = read_exact_slice(buf, cursor, 8)?;
-    Ok(u64::from_le_bytes([
-        s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
-    ]))
 }
 
 /// Parses and integrity-checks a `.bampack` archive's framing and per-entry SHA-256 digests,
@@ -640,89 +668,8 @@ fn read_u64_le(buf: &[u8], cursor: &mut usize) -> Result<u64, CliError> {
 pub fn inspect_bampack_entries(
     archive_bytes: &[u8],
 ) -> Result<(Vec<BamPackEntry>, bool), CliError> {
-    let mut cursor = 0usize;
-    let magic = read_exact_slice(archive_bytes, &mut cursor, BAMPACK_MAGIC.len())?;
-    if magic != BAMPACK_MAGIC {
-        return Err(CliError::Crypto("invalid .bampack magic header".to_owned()));
-    }
-    let version = read_u32_le(archive_bytes, &mut cursor)?;
-    if version != BAMPACK_VERSION {
-        return Err(CliError::Crypto(format!(
-            "unsupported .bampack version {version}"
-        )));
-    }
-    let flags = read_u32_le(archive_bytes, &mut cursor)?;
-    if flags != 0 {
-        return Err(CliError::Crypto(format!(
-            "unsupported non-zero .bampack flags {flags}"
-        )));
-    }
-    let entry_count = read_u32_le(archive_bytes, &mut cursor)? as usize;
-    if entry_count > MAX_BAMPACK_ENTRIES {
-        return Err(CliError::Crypto(format!(
-            ".bampack entry count {entry_count} exceeds limit ({MAX_BAMPACK_ENTRIES})"
-        )));
-    }
-    let reserved = read_u32_le(archive_bytes, &mut cursor)?;
-    if reserved != 0 {
-        return Err(CliError::Crypto(format!(
-            "non-zero .bampack reserved header {reserved}"
-        )));
-    }
-
-    let mut entries = Vec::with_capacity(entry_count.min(64));
-    let mut seen_paths = BTreeSet::new();
-    for _ in 0..entry_count {
-        let path_len = usize::from(read_u16_le(archive_bytes, &mut cursor)?);
-        let path_bytes = read_exact_slice(archive_bytes, &mut cursor, path_len)?;
-        let path = std::str::from_utf8(path_bytes)
-            .map_err(|_| CliError::Crypto("non-UTF-8 .bampack entry path".to_owned()))?
-            .to_owned();
-        validate_posix_rel_path(&path)?;
-        if !seen_paths.insert(path.clone()) {
-            return Err(CliError::Crypto(format!(
-                "duplicate .bampack entry path '{path}'"
-            )));
-        }
-
-        let content_len_u64 = read_u64_le(archive_bytes, &mut cursor)?;
-        let content_len = usize::try_from(content_len_u64).map_err(|_| {
-            CliError::Crypto(".bampack entry content_len overflows usize".to_owned())
-        })?;
-        let expected_sha_slice = read_exact_slice(archive_bytes, &mut cursor, 32)?;
-        let mut expected_sha = [0u8; 32];
-        expected_sha.copy_from_slice(expected_sha_slice);
-
-        let data_slice = read_exact_slice(archive_bytes, &mut cursor, content_len)?;
-        let actual_sha: [u8; 32] = Sha256::digest(data_slice).into();
-        if actual_sha != expected_sha {
-            return Err(CliError::Crypto(format!(
-                "SHA-256 mismatch on .bampack entry '{path}'"
-            )));
-        }
-
-        entries.push(BamPackEntry {
-            path,
-            sha256: actual_sha,
-            data: data_slice.to_vec(),
-        });
-    }
-
-    let sig_len = read_u32_le(archive_bytes, &mut cursor)?;
-    if u64::from(sig_len) > MAX_SIGNATURE_SIDECAR_BYTES {
-        return Err(CliError::Crypto(format!(
-            ".bampack signature trailer ({sig_len} B) exceeds limit ({MAX_SIGNATURE_SIDECAR_BYTES} B)"
-        )));
-    }
-    let _sig_bytes = read_exact_slice(archive_bytes, &mut cursor, sig_len as usize)?;
-    if cursor != archive_bytes.len() {
-        return Err(CliError::Crypto(format!(
-            "trailing bytes ({}) after .bampack signature trailer",
-            archive_bytes.len() - cursor
-        )));
-    }
-
-    Ok((entries, sig_len > 0))
+    parse_bampack_entries_unverified(archive_bytes, DEFAULT_MAX_MOD_BINARY_BYTES)
+        .map_err(|e| CliError::Crypto(e.to_string()))
 }
 
 #[cfg(test)]
@@ -774,6 +721,8 @@ mod tests {
         assert!(validate_posix_rel_path("/abs/path").is_err());
         assert!(validate_posix_rel_path("assets\\win").is_err());
         assert!(validate_posix_rel_path("C:evil").is_err());
+        assert!(validate_posix_rel_path("assets/foo:ads:$DATA").is_err());
+        assert!(validate_posix_rel_path("assets/CON.txt").is_err());
         assert!(validate_posix_rel_path("assets/ok/file.png").is_ok());
     }
 
@@ -790,7 +739,16 @@ mod tests {
         symlink(&secret, assets.join("link.txt")).unwrap();
 
         let mut entries = BTreeMap::new();
-        let err = collect_optional_assets(tmp.path(), None, &mut entries).unwrap_err();
+        let mut seen_lower = BTreeSet::new();
+        let mut total_bytes = 0u64;
+        let err = collect_optional_assets(
+            tmp.path(),
+            None,
+            &mut entries,
+            &mut seen_lower,
+            &mut total_bytes,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("symlink"),
             "expected symlink rejection error, got: {err}"
@@ -798,12 +756,28 @@ mod tests {
     }
 
     #[test]
-    fn cert_without_key_is_rejected() {
-        let opts = PackOptions {
-            cert: Some(PathBuf::from("signer-cert.pub")),
-            ..PackOptions::default()
-        };
-        let err = pack_mod(&opts).unwrap_err();
-        assert!(matches!(err, CliError::InvalidArgument(_)));
+    fn rejects_case_insensitive_asset_duplicates() {
+        let mut entries = BTreeMap::new();
+        let mut seen_lower = BTreeSet::new();
+        let mut total_bytes = 0u64;
+        seen_lower.insert("assets/hero.png".to_owned());
+
+        let tmp = TempDir::new().unwrap();
+        let assets = tmp.path().join("assets");
+        fs::create_dir_all(&assets).unwrap();
+        fs::write(assets.join("HERO.PNG"), b"dup").unwrap();
+
+        let err = collect_optional_assets(
+            tmp.path(),
+            None,
+            &mut entries,
+            &mut seen_lower,
+            &mut total_bytes,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("case-colliding") || err.to_string().contains("duplicate"),
+            "unexpected error: {err}"
+        );
     }
 }

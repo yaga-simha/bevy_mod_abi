@@ -2,8 +2,8 @@
 
 //! Deterministic headless smoke and lifecycle integration tests for `10_bevy20_full_companion`.
 
-use bevy_abi_mod::prelude::*;
 use bevy_asset::Assets;
+use bevy_mod_abi::prelude::*;
 use bevy_render::storage::ShaderBuffer;
 use bevy_shader::Shader;
 use bevy_state::state::{NextState, State, States};

@@ -12,7 +12,7 @@ pub use bevy_abi_mod_host_sys::{
 use bevy_abi_mod_sys::ScheduleId;
 use bevy_ecs::schedule::{
     InternedScheduleLabel, InternedSystemSet, IntoScheduleConfigs, Schedule, ScheduleConfigs,
-    Schedules,
+    Schedules, SystemSet,
 };
 use bevy_ecs::system::ScheduleSystem;
 use bevy_ecs::world::World;
@@ -83,6 +83,8 @@ pub(crate) fn prevalidate_mod_schedules_and_ordering(
 
     let mut batch_sets: HashSet<(InternedScheduleLabel, ModNamedSystemSet)> = HashSet::default();
     let mut late_startup_names: HashSet<&str> = HashSet::default();
+    let mut resolved_systems: Vec<(&GuestSystem, InternedScheduleLabel)> =
+        Vec::with_capacity(if strict { systems.len() } else { 0 });
 
     for sys in systems {
         let Some(interned) = resolve_schedule_in_world(world, sys.schedule()) else {
@@ -100,11 +102,18 @@ pub(crate) fn prevalidate_mod_schedules_and_ordering(
                 ModNamedSystemSet::with_generation(mod_name, sys.system_name(), own_gen),
             ));
         }
+        if strict {
+            resolved_systems.push((sys, interned));
+        }
     }
 
     if strict {
-        for sys in systems {
-            let interned = resolve_schedule_in_world(world, sys.schedule()).expect("checked above");
+        let unresolved = |sys: &GuestSystem, target: &str| ModLoadError::UnresolvedOrderingTarget {
+            path: path.to_path_buf(),
+            system_name: sys.system_name().to_string(),
+            target: target.to_string(),
+        };
+        for (sys, interned) in resolved_systems {
             let is_late_startup = startup_already_ran && sys.schedule() == ScheduleId::STARTUP;
             for dep in sys
                 .after_systems()
@@ -113,20 +122,12 @@ pub(crate) fn prevalidate_mod_schedules_and_ordering(
             {
                 if dep.starts_with("host::") {
                     if resolve_host_visible_set(world, dep).is_none() {
-                        return Err(ModLoadError::UnresolvedOrderingTarget {
-                            path: path.to_path_buf(),
-                            system_name: sys.system_name().to_string(),
-                            target: dep.clone(),
-                        });
+                        return Err(unresolved(sys, dep));
                     }
                     continue;
                 }
                 let Some(parsed) = ModNamedSystemSet::parse_target(dep, mod_name) else {
-                    return Err(ModLoadError::UnresolvedOrderingTarget {
-                        path: path.to_path_buf(),
-                        system_name: sys.system_name().to_string(),
-                        target: dep.clone(),
-                    });
+                    return Err(unresolved(sys, dep));
                 };
                 let target_gen = if parsed.mod_name.as_ref() == mod_name {
                     own_gen
@@ -134,38 +135,23 @@ pub(crate) fn prevalidate_mod_schedules_and_ordering(
                     resolve_mod_generation_in_world(world, &parsed.mod_name)
                 };
                 let target = parsed.at_generation(target_gen);
-                let resolved = if is_late_startup {
-                    if target.mod_name.as_ref() == mod_name {
-                        late_startup_names.contains(target.system_name.as_ref())
-                    } else {
-                        target_exists_in_batch_or_world(world, interned, &batch_sets, &target)
-                    }
+                let resolved = if is_late_startup && target.mod_name.as_ref() == mod_name {
+                    late_startup_names.contains(target.system_name.as_ref())
                 } else {
                     target_exists_in_batch_or_world(world, interned, &batch_sets, &target)
                 };
                 if !resolved {
-                    return Err(ModLoadError::UnresolvedOrderingTarget {
-                        path: path.to_path_buf(),
-                        system_name: sys.system_name().to_string(),
-                        target: dep.clone(),
-                    });
+                    return Err(unresolved(sys, dep));
                 }
             }
             for target_set in sys.in_sets() {
-                if target_set.starts_with("host::") {
-                    if resolve_host_visible_set(world, target_set).is_none() {
-                        return Err(ModLoadError::UnresolvedOrderingTarget {
-                            path: path.to_path_buf(),
-                            system_name: sys.system_name().to_string(),
-                            target: target_set.clone(),
-                        });
-                    }
-                } else if ModNamedSystemSet::parse_target(target_set, mod_name).is_none() {
-                    return Err(ModLoadError::UnresolvedOrderingTarget {
-                        path: path.to_path_buf(),
-                        system_name: sys.system_name().to_string(),
-                        target: target_set.clone(),
-                    });
+                let valid = if target_set.starts_with("host::") {
+                    resolve_host_visible_set(world, target_set).is_some()
+                } else {
+                    ModNamedSystemSet::parse_target(target_set, mod_name).is_some()
+                };
+                if !valid {
+                    return Err(unresolved(sys, target_set));
                 }
             }
             // Weak ordering (`after_weak`/`before_weak`) and `ambiguous_with` only require valid
@@ -176,20 +162,13 @@ pub(crate) fn prevalidate_mod_schedules_and_ordering(
                 .chain(sys.before_weak_systems().iter())
                 .chain(sys.ambiguous_with_systems().iter())
             {
-                if let Some(host_part) = weak_or_ambig.strip_prefix("host::") {
-                    if host_part.is_empty() || host_part.contains("::") {
-                        return Err(ModLoadError::UnresolvedOrderingTarget {
-                            path: path.to_path_buf(),
-                            system_name: sys.system_name().to_string(),
-                            target: weak_or_ambig.clone(),
-                        });
-                    }
-                } else if ModNamedSystemSet::parse_target(weak_or_ambig, mod_name).is_none() {
-                    return Err(ModLoadError::UnresolvedOrderingTarget {
-                        path: path.to_path_buf(),
-                        system_name: sys.system_name().to_string(),
-                        target: weak_or_ambig.clone(),
-                    });
+                let valid = if let Some(host_part) = weak_or_ambig.strip_prefix("host::") {
+                    !host_part.is_empty() && !host_part.contains("::")
+                } else {
+                    ModNamedSystemSet::parse_target(weak_or_ambig, mod_name).is_some()
+                };
+                if !valid {
+                    return Err(unresolved(sys, weak_or_ambig));
                 }
             }
         }
@@ -230,178 +209,155 @@ impl OrderingEdgeKind {
             Self::AfterWeak | Self::BeforeWeak | Self::AmbiguousWith
         )
     }
+
+    fn apply<S: SystemSet>(
+        self,
+        cfg: ScheduleConfigs<ScheduleSystem>,
+        set: S,
+    ) -> ScheduleConfigs<ScheduleSystem> {
+        match self {
+            Self::InSet => IntoScheduleConfigs::in_set(cfg, set),
+            Self::After => IntoScheduleConfigs::after(cfg, set),
+            Self::Before => IntoScheduleConfigs::before(cfg, set),
+            Self::AfterWeak => IntoScheduleConfigs::after_weak(cfg, set),
+            Self::BeforeWeak => IntoScheduleConfigs::before_weak(cfg, set),
+            Self::AmbiguousWith => IntoScheduleConfigs::ambiguous_with(cfg, set),
+        }
+    }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn apply_ordering_edge(
-    world: &World,
-    mod_name: &str,
+struct OrderingCtx<'a> {
+    world: &'a World,
+    mod_name: &'a str,
     own_gen: u64,
-    sys_name: &str,
-    kind: OrderingEdgeKind,
-    raw_target: &str,
     check_batch: Option<(
         InternedScheduleLabel,
-        &HashSet<(InternedScheduleLabel, ModNamedSystemSet)>,
+        &'a HashSet<(InternedScheduleLabel, ModNamedSystemSet)>,
     )>,
-    batch_names: Option<&HashSet<String>>,
-    mut cfg: ScheduleConfigs<ScheduleSystem>,
-    mut recorded_sets: Option<(
+    batch_names: Option<&'a HashSet<String>>,
+    recorded_sets: Option<(
         InternedScheduleLabel,
-        &mut Vec<(InternedScheduleLabel, ModNamedSystemSet)>,
+        &'a mut Vec<(InternedScheduleLabel, ModNamedSystemSet)>,
     )>,
-) -> ScheduleConfigs<ScheduleSystem> {
-    if raw_target.starts_with("host::") {
-        if let Some(host_set) = resolve_host_visible_set(world, raw_target) {
-            // Do not add `host::*` sets to `recorded_sets` so mod unload never excises
-            // host-owned system sets or native host systems.
-            cfg = match kind {
-                OrderingEdgeKind::InSet => IntoScheduleConfigs::in_set(cfg, host_set),
-                OrderingEdgeKind::After => IntoScheduleConfigs::after(cfg, host_set),
-                OrderingEdgeKind::Before => IntoScheduleConfigs::before(cfg, host_set),
-                OrderingEdgeKind::AfterWeak => IntoScheduleConfigs::after_weak(cfg, host_set),
-                OrderingEdgeKind::BeforeWeak => IntoScheduleConfigs::before_weak(cfg, host_set),
-                OrderingEdgeKind::AmbiguousWith => {
-                    IntoScheduleConfigs::ambiguous_with(cfg, host_set)
-                }
-            };
-        } else if !kind.is_optional_target() {
-            tracing::warn!(
-                system = %sys_name,
-                mod_name = %mod_name,
-                edge = kind.label(),
-                target = %raw_target,
-                "guest system targets unregistered `host::` set"
-            );
-        }
-        return cfg;
-    }
+}
 
-    let Some(parsed) = ModNamedSystemSet::parse_target(raw_target, mod_name) else {
-        tracing::warn!(
-            system = %sys_name,
-            mod_name = %mod_name,
-            edge = kind.label(),
-            target = %raw_target,
-            "guest system has invalid ordering target syntax"
-        );
-        return cfg;
-    };
-
-    let target_gen = if parsed.mod_name.as_ref() == mod_name {
-        own_gen
-    } else {
-        resolve_mod_generation_in_world(world, &parsed.mod_name)
-    };
-    let target = parsed.at_generation(target_gen);
-
-    if kind.is_strong_ordering() {
-        if let Some((label, batch_sets)) = check_batch {
-            if !target_exists_in_batch_or_world(world, label, batch_sets, &target) {
+impl OrderingCtx<'_> {
+    fn apply_edge(
+        &mut self,
+        sys_name: &str,
+        kind: OrderingEdgeKind,
+        raw_target: &str,
+        cfg: ScheduleConfigs<ScheduleSystem>,
+    ) -> ScheduleConfigs<ScheduleSystem> {
+        if raw_target.starts_with("host::") {
+            if let Some(host_set) = resolve_host_visible_set(self.world, raw_target) {
+                // Do not add `host::*` sets to `recorded_sets` so mod unload never excises
+                // host-owned system sets or native host systems.
+                return kind.apply(cfg, host_set);
+            }
+            if !kind.is_optional_target() {
                 tracing::warn!(
                     system = %sys_name,
-                    mod_name = %mod_name,
+                    mod_name = %self.mod_name,
                     edge = kind.label(),
                     target = %raw_target,
-                    "guest system declares ordering on unresolved target"
+                    "guest system targets unregistered `host::` set"
                 );
             }
-        } else if let Some(names) = batch_names
-            && target.mod_name.as_ref() == mod_name
-            && !names.contains(target.system_name.as_ref())
-        {
+            return cfg;
+        }
+
+        let Some(parsed) = ModNamedSystemSet::parse_target(raw_target, self.mod_name) else {
             tracing::warn!(
                 system = %sys_name,
-                mod_name = %mod_name,
+                mod_name = %self.mod_name,
                 edge = kind.label(),
                 target = %raw_target,
-                "startup system declares ordering on unresolved startup target"
+                "guest system has invalid ordering target syntax"
             );
+            return cfg;
+        };
+
+        let target_gen = if parsed.mod_name.as_ref() == self.mod_name {
+            self.own_gen
+        } else {
+            resolve_mod_generation_in_world(self.world, &parsed.mod_name)
+        };
+        let target = parsed.at_generation(target_gen);
+
+        if kind.is_strong_ordering() {
+            if let Some((label, batch_sets)) = self.check_batch {
+                if !target_exists_in_batch_or_world(self.world, label, batch_sets, &target) {
+                    tracing::warn!(
+                        system = %sys_name,
+                        mod_name = %self.mod_name,
+                        edge = kind.label(),
+                        target = %raw_target,
+                        "guest system declares ordering on unresolved target"
+                    );
+                }
+            } else if let Some(names) = self.batch_names
+                && target.mod_name.as_ref() == self.mod_name
+                && !names.contains(target.system_name.as_ref())
+            {
+                tracing::warn!(
+                    system = %sys_name,
+                    mod_name = %self.mod_name,
+                    edge = kind.label(),
+                    target = %raw_target,
+                    "startup system declares ordering on unresolved startup target"
+                );
+            }
         }
-    }
 
-    if target.mod_name.as_ref() == mod_name
-        && let Some((label, ref mut sets_out)) = recorded_sets
-    {
-        sets_out.push((label, target.clone()));
-    }
-
-    match kind {
-        OrderingEdgeKind::InSet => IntoScheduleConfigs::in_set(cfg, target),
-        OrderingEdgeKind::After => IntoScheduleConfigs::after(cfg, target),
-        OrderingEdgeKind::Before => IntoScheduleConfigs::before(cfg, target),
-        OrderingEdgeKind::AfterWeak => IntoScheduleConfigs::after_weak(cfg, target),
-        OrderingEdgeKind::BeforeWeak => IntoScheduleConfigs::before_weak(cfg, target),
-        OrderingEdgeKind::AmbiguousWith => IntoScheduleConfigs::ambiguous_with(cfg, target),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_configured_guest_system(
-    world: &World,
-    mod_name: &str,
-    own_gen: u64,
-    sys: GuestSystem,
-    check_batch: Option<(
-        InternedScheduleLabel,
-        &HashSet<(InternedScheduleLabel, ModNamedSystemSet)>,
-    )>,
-    batch_names: Option<&HashSet<String>>,
-    mut recorded_sets: Option<(
-        InternedScheduleLabel,
-        &mut Vec<(InternedScheduleLabel, ModNamedSystemSet)>,
-    )>,
-) -> ScheduleConfigs<ScheduleSystem> {
-    let sys_name = sys.system_name().to_string();
-    let own_set = ModNamedSystemSet::with_generation(mod_name, sys_name.as_str(), own_gen);
-    if let Some((label, ref mut sets_out)) = recorded_sets {
-        sets_out.push((label, own_set.clone()));
-    }
-
-    let in_sets = sys.in_sets().to_vec();
-    let after = sys.after_systems().to_vec();
-    let before = sys.before_systems().to_vec();
-    let after_weak = sys.after_weak_systems().to_vec();
-    let before_weak = sys.before_weak_systems().to_vec();
-    let ambiguous_with = sys.ambiguous_with_systems().to_vec();
-    let ambiguous_with_all = sys.is_ambiguous_with_all();
-
-    let mut cfg = sys.in_set(own_set);
-
-    let edge_lists: [(OrderingEdgeKind, Vec<String>); 6] = [
-        (OrderingEdgeKind::InSet, in_sets),
-        (OrderingEdgeKind::After, after),
-        (OrderingEdgeKind::Before, before),
-        (OrderingEdgeKind::AfterWeak, after_weak),
-        (OrderingEdgeKind::BeforeWeak, before_weak),
-        (OrderingEdgeKind::AmbiguousWith, ambiguous_with),
-    ];
-
-    for (kind, targets) in edge_lists {
-        for raw_target in targets {
-            let rec_reborrow = recorded_sets
-                .as_mut()
-                .map(|(lbl, vec_ref)| (*lbl, &mut **vec_ref));
-            cfg = apply_ordering_edge(
-                world,
-                mod_name,
-                own_gen,
-                &sys_name,
-                kind,
-                &raw_target,
-                check_batch,
-                batch_names,
-                cfg,
-                rec_reborrow,
-            );
+        if target.mod_name.as_ref() == self.mod_name
+            && let Some((label, ref mut sets_out)) = self.recorded_sets
+        {
+            sets_out.push((label, target.clone()));
         }
+
+        kind.apply(cfg, target)
     }
 
-    if ambiguous_with_all {
-        cfg = IntoScheduleConfigs::ambiguous_with_all(cfg);
-    }
+    fn build_configured_system(&mut self, sys: GuestSystem) -> ScheduleConfigs<ScheduleSystem> {
+        let sys_name = sys.system_name().to_string();
+        let own_set =
+            ModNamedSystemSet::with_generation(self.mod_name, sys_name.as_str(), self.own_gen);
+        if let Some((label, ref mut sets_out)) = self.recorded_sets {
+            sets_out.push((label, own_set.clone()));
+        }
 
-    cfg
+        let edge_lists: [(OrderingEdgeKind, Vec<String>); 6] = [
+            (OrderingEdgeKind::InSet, sys.in_sets().to_vec()),
+            (OrderingEdgeKind::After, sys.after_systems().to_vec()),
+            (OrderingEdgeKind::Before, sys.before_systems().to_vec()),
+            (
+                OrderingEdgeKind::AfterWeak,
+                sys.after_weak_systems().to_vec(),
+            ),
+            (
+                OrderingEdgeKind::BeforeWeak,
+                sys.before_weak_systems().to_vec(),
+            ),
+            (
+                OrderingEdgeKind::AmbiguousWith,
+                sys.ambiguous_with_systems().to_vec(),
+            ),
+        ];
+        let ambiguous_with_all = sys.is_ambiguous_with_all();
+
+        let mut cfg = sys.in_set(own_set);
+        for (kind, targets) in edge_lists {
+            for raw_target in targets {
+                cfg = self.apply_edge(&sys_name, kind, &raw_target, cfg);
+            }
+        }
+
+        if ambiguous_with_all {
+            cfg = IntoScheduleConfigs::ambiguous_with_all(cfg);
+        }
+        cfg
+    }
 }
 
 /// Configures a standalone [`GuestSystem`] with all declared [`ModNamedSystemSet`]s, strong/weak
@@ -412,7 +368,15 @@ pub fn configure_guest_system_in_world(
     own_gen: u64,
     sys: GuestSystem,
 ) -> ScheduleConfigs<ScheduleSystem> {
-    build_configured_guest_system(world, mod_name, own_gen, sys, None, None, None)
+    OrderingCtx {
+        world,
+        mod_name,
+        own_gen,
+        check_batch: None,
+        batch_names: None,
+        recorded_sets: None,
+    }
+    .build_configured_system(sys)
 }
 
 /// Applies Bevy's `.chain_weak()` ordering across an ordered sequence of [`ModNamedSystemSet`]s
@@ -425,9 +389,7 @@ pub fn configure_weak_set_chain(
     if sets.len() < 2 {
         return;
     }
-    if !world.contains_resource::<Schedules>() {
-        world.insert_resource(Schedules::new());
-    }
+    world.init_resource::<Schedules>();
     if let Some(mut schedules) = world.get_resource_mut::<Schedules>() {
         for pair in sets.windows(2) {
             schedules.configure_sets(schedule, (pair[0].clone(), pair[1].clone()).chain_weak());
@@ -444,9 +406,7 @@ pub(crate) fn schedule_mod_systems_in_world(
     mod_name: &str,
     systems: Vec<GuestSystem>,
 ) -> Vec<GuestSystem> {
-    if !world.contains_resource::<ModQuarantine>() {
-        world.insert_resource(ModQuarantine::new());
-    }
+    world.init_resource::<ModQuarantine>();
     if let Some(mut quarantine) = world.get_resource_mut::<ModQuarantine>() {
         for sys in &systems {
             quarantine.register_system(mod_id, sys.system_name_arc(), sys.enabled_flag());
@@ -481,22 +441,20 @@ pub(crate) fn schedule_mod_systems_in_world(
         })
         .collect();
 
-    if !world.contains_resource::<Schedules>() {
-        world.insert_resource(Schedules::new());
-    }
+    world.init_resource::<Schedules>();
 
     let has_schedule_sets = world.contains_resource::<ModScheduleSetRegistry>();
     let mut recorded_sets = Vec::with_capacity(to_schedule.len());
     for (sched_id, interned, sys) in to_schedule {
-        let cfg = build_configured_guest_system(
+        let cfg = OrderingCtx {
             world,
             mod_name,
             own_gen,
-            sys,
-            Some((interned, &batch_sets)),
-            None,
-            Some((interned, &mut recorded_sets)),
-        );
+            check_batch: Some((interned, &batch_sets)),
+            batch_names: None,
+            recorded_sets: Some((interned, &mut recorded_sets)),
+        }
+        .build_configured_system(sys);
 
         if let Some(mut schedules) = world.get_resource_mut::<Schedules>() {
             if has_schedule_sets {
@@ -529,17 +487,16 @@ pub(crate) fn run_late_startup_systems_in_world(
         .collect();
 
     let mut temp_schedule = Schedule::default();
+    let mut ctx = OrderingCtx {
+        world,
+        mod_name,
+        own_gen,
+        check_batch: None,
+        batch_names: Some(&batch_names),
+        recorded_sets: None,
+    };
     for sys in startup_systems {
-        let cfg = build_configured_guest_system(
-            world,
-            mod_name,
-            own_gen,
-            sys,
-            None,
-            Some(&batch_names),
-            None,
-        );
-        temp_schedule.add_systems(cfg);
+        temp_schedule.add_systems(ctx.build_configured_system(sys));
     }
 
     temp_schedule.run(world);

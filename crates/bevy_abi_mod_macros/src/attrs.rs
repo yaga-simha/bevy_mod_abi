@@ -24,6 +24,10 @@ pub(crate) struct ComponentAttrs {
     pub(crate) custom_prefix: Option<String>,
     /// Optional explicit path override to the `bevy_abi_mod_sys` contract module/crate.
     pub(crate) crate_override: Option<Path>,
+    /// Optional explicit path override to the `bevy_abi_mod_guest` crate (used with `guest`).
+    pub(crate) guest_crate_override: Option<Path>,
+    /// Whether to also emit `impl GuestComponent for #Ident` delegating to `ModComponent` (`#[mod_component(guest)]`).
+    pub(crate) emit_guest: bool,
     /// Whether to emit `#[unsafe(export_name = "bam_<ns>_<Struct>_...")]` on generated accessors.
     pub(crate) export_symbols: bool,
     /// Explicit opt-out of `AbiPod` auto-implementation on `#[repr(C)]` structs (`#[mod_component(no_pod)]`).
@@ -245,6 +249,44 @@ fn validate_non_empty_no_nul(lit: &LitStr, label: &str) -> syn::Result<String> {
     Ok(val)
 }
 
+fn validate_namespaced_ident(lit: &LitStr, label: &str) -> syn::Result<String> {
+    let val = validate_non_empty_no_nul(lit, label)?;
+    if val.starts_with("::") || val.ends_with("::") || val.contains("::::") {
+        return Err(syn::Error::new_spanned(
+            lit,
+            format!("{label} has malformed `::` separator"),
+        ));
+    }
+    Ok(val)
+}
+
+fn validate_uuid_lit(lit: &LitStr, attr_name: &str) -> syn::Result<String> {
+    let val = lit.value();
+    if !is_valid_uuid_hex(&val) {
+        return Err(syn::Error::new_spanned(
+            lit,
+            format!(
+                "invalid `#[{attr_name}(uuid = \"...\")]` hex string; expected 36-char `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` or 32 hex digits"
+            ),
+        ));
+    }
+    Ok(val)
+}
+
+/// Parsed container-level `#[guest_component(...)]` (or fallback `#[mod_component(...)]`)
+/// attributes for `#[derive(GuestComponent)]`.
+pub(crate) struct GuestComponentAttrs {
+    pub(crate) custom_name: Option<String>,
+    pub(crate) custom_namespace: Option<String>,
+    pub(crate) custom_uuid: Option<String>,
+    pub(crate) no_schema_hash: bool,
+    pub(crate) sparse_set: bool,
+    pub(crate) immutable: bool,
+    pub(crate) summary_tick: bool,
+    pub(crate) crate_override: Option<Path>,
+    pub(crate) guest_crate_override: Option<Path>,
+}
+
 /// Parses container-level `#[mod_component(...)]` attributes for `ModComponent`.
 pub(crate) fn parse_component_attrs(input: &DeriveInput) -> syn::Result<ComponentAttrs> {
     let mut attrs = ComponentAttrs {
@@ -253,6 +295,8 @@ pub(crate) fn parse_component_attrs(input: &DeriveInput) -> syn::Result<Componen
         custom_uuid: None,
         custom_prefix: None,
         crate_override: None,
+        guest_crate_override: None,
+        emit_guest: false,
         export_symbols: false,
         no_pod: false,
         opaque: false,
@@ -270,38 +314,18 @@ pub(crate) fn parse_component_attrs(input: &DeriveInput) -> syn::Result<Componen
             if meta.path.is_ident("name") {
                 let value = meta.value()?;
                 let lit: LitStr = value.parse()?;
-                let val = validate_non_empty_no_nul(&lit, "component name")?;
-                if val.starts_with("::") || val.ends_with("::") || val.contains("::::") {
-                    return Err(syn::Error::new_spanned(
-                        &lit,
-                        "component name has malformed `::` namespace separator",
-                    ));
-                }
-                attrs.custom_name = Some(val);
+                attrs.custom_name = Some(validate_namespaced_ident(&lit, "component name")?);
                 Ok(())
             } else if meta.path.is_ident("namespace") {
                 let value = meta.value()?;
                 let lit: LitStr = value.parse()?;
-                let val = validate_non_empty_no_nul(&lit, "component namespace")?;
-                if val.starts_with("::") || val.ends_with("::") || val.contains("::::") {
-                    return Err(syn::Error::new_spanned(
-                        &lit,
-                        "component namespace has malformed `::` separator",
-                    ));
-                }
-                attrs.custom_namespace = Some(val);
+                attrs.custom_namespace =
+                    Some(validate_namespaced_ident(&lit, "component namespace")?);
                 Ok(())
             } else if meta.path.is_ident("uuid") {
                 let value = meta.value()?;
                 let lit: LitStr = value.parse()?;
-                let val = lit.value();
-                if !is_valid_uuid_hex(&val) {
-                    return Err(syn::Error::new_spanned(
-                        &lit,
-                        "invalid `#[mod_component(uuid = \"...\")]` hex string; expected 36-char `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` or 32 hex digits",
-                    ));
-                }
-                attrs.custom_uuid = Some(val);
+                attrs.custom_uuid = Some(validate_uuid_lit(&lit, "mod_component")?);
                 Ok(())
             } else if meta.path.is_ident("prefix") {
                 let value = meta.value()?;
@@ -310,6 +334,12 @@ pub(crate) fn parse_component_attrs(input: &DeriveInput) -> syn::Result<Componen
                 Ok(())
             } else if meta.path.is_ident("crate") {
                 attrs.crate_override = Some(parse_crate_path_value(&meta)?);
+                Ok(())
+            } else if meta.path.is_ident("guest_crate") {
+                attrs.guest_crate_override = Some(parse_crate_path_value(&meta)?);
+                Ok(())
+            } else if meta.path.is_ident("guest") {
+                attrs.emit_guest = true;
                 Ok(())
             } else if meta.path.is_ident("export_symbols") {
                 attrs.export_symbols = true;
@@ -363,7 +393,7 @@ pub(crate) fn parse_component_attrs(input: &DeriveInput) -> syn::Result<Componen
                 Ok(())
             } else {
                 Err(meta.error(
-                    "unsupported `#[mod_component(...)]` attribute; expected `name = \"...\"`, `namespace = \"...\"`, `uuid = \"...\"`, `prefix = \"...\"`, `crate = ...`, `export_symbols`, `no_pod`, `opaque`, `sparse_set`, `immutable`, `summary_tick`, or `require(...)`",
+                    "unsupported `#[mod_component(...)]` attribute; expected `name = \"...\"`, `namespace = \"...\"`, `uuid = \"...\"`, `prefix = \"...\"`, `crate = ...`, `guest`, `guest_crate = ...`, `export_symbols`, `no_pod`, `opaque`, `sparse_set`, `immutable`, `summary_tick`, or `require(...)`",
                 ))
             }
         })?;
@@ -389,23 +419,159 @@ pub(crate) fn parse_component_attrs(input: &DeriveInput) -> syn::Result<Componen
     Ok(attrs)
 }
 
-/// Parses optional `#[mod_component(crate = ...)]` override for `#[derive(AbiPod)]`.
-pub(crate) fn parse_abi_pod_crate_override(input: &DeriveInput) -> syn::Result<Option<Path>> {
-    let mut crate_override = None;
+/// Parses container-level `#[guest_component(...)]` attributes for `#[derive(GuestComponent)]`,
+/// falling back to `#[mod_component(...)]` keys when absent so
+/// `#[derive(ModComponent, GuestComponent)] #[mod_component(name = "...")]` works seamlessly.
+pub(crate) fn parse_guest_component_attrs(input: &DeriveInput) -> syn::Result<GuestComponentAttrs> {
+    let mut attrs = GuestComponentAttrs {
+        custom_name: None,
+        custom_namespace: None,
+        custom_uuid: None,
+        no_schema_hash: false,
+        sparse_set: false,
+        immutable: false,
+        summary_tick: false,
+        crate_override: None,
+        guest_crate_override: None,
+    };
+
+    let mut has_guest_attr = false;
     for attr in &input.attrs {
-        if !attr.path().is_ident("mod_component") {
+        if !attr.path().is_ident("guest_component") {
             continue;
         }
+        has_guest_attr = true;
         attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("crate") {
-                crate_override = Some(parse_crate_path_value(&meta)?);
+            if meta.path.is_ident("name") {
+                let value = meta.value()?;
+                let lit: LitStr = value.parse()?;
+                attrs.custom_name = Some(validate_namespaced_ident(&lit, "component name")?);
+                Ok(())
+            } else if meta.path.is_ident("namespace") {
+                let value = meta.value()?;
+                let lit: LitStr = value.parse()?;
+                attrs.custom_namespace =
+                    Some(validate_namespaced_ident(&lit, "component namespace")?);
+                Ok(())
+            } else if meta.path.is_ident("uuid") {
+                let value = meta.value()?;
+                let lit: LitStr = value.parse()?;
+                attrs.custom_uuid = Some(validate_uuid_lit(&lit, "guest_component")?);
+                Ok(())
+            } else if meta.path.is_ident("no_schema_hash") {
+                attrs.no_schema_hash = true;
+                Ok(())
+            } else if meta.path.is_ident("sparse_set") {
+                attrs.sparse_set = true;
+                Ok(())
+            } else if meta.path.is_ident("immutable") {
+                attrs.immutable = true;
+                Ok(())
+            } else if meta.path.is_ident("summary_tick") {
+                attrs.summary_tick = true;
+                Ok(())
+            } else if meta.path.is_ident("crate") {
+                attrs.crate_override = Some(parse_crate_path_value(&meta)?);
+                Ok(())
+            } else if meta.path.is_ident("guest_crate") {
+                attrs.guest_crate_override = Some(parse_crate_path_value(&meta)?);
                 Ok(())
             } else {
                 Err(meta.error(
-                    "unsupported `#[mod_component(...)]` attribute for `#[derive(AbiPod)]`; only `crate = ...` is supported",
+                    "unsupported `#[guest_component(...)]` attribute; expected `name = \"...\"`, `namespace = \"...\"`, `uuid = \"...\"`, `no_schema_hash`, `sparse_set`, `immutable`, `summary_tick`, `crate = ...`, or `guest_crate = ...`",
                 ))
             }
         })?;
+    }
+
+    let has_mod_attr = input
+        .attrs
+        .iter()
+        .any(|a| a.path().is_ident("mod_component"));
+    if has_mod_attr {
+        let mod_attrs = parse_component_attrs(input)?;
+        if !has_guest_attr {
+            attrs.custom_name = mod_attrs.custom_name;
+            attrs.custom_namespace = mod_attrs.custom_namespace;
+            attrs.custom_uuid = mod_attrs.custom_uuid;
+            attrs.sparse_set = mod_attrs.sparse_set;
+            attrs.immutable = mod_attrs.immutable;
+            attrs.summary_tick = mod_attrs.summary_tick;
+            attrs.crate_override = mod_attrs.crate_override;
+            attrs.guest_crate_override = mod_attrs.guest_crate_override;
+        } else {
+            if attrs.custom_name.is_none() && attrs.custom_namespace.is_none() {
+                attrs.custom_name = mod_attrs.custom_name;
+                attrs.custom_namespace = mod_attrs.custom_namespace;
+            }
+            if attrs.custom_uuid.is_none() {
+                attrs.custom_uuid = mod_attrs.custom_uuid;
+            }
+            if attrs.crate_override.is_none() {
+                attrs.crate_override = mod_attrs.crate_override;
+            }
+            if attrs.guest_crate_override.is_none() {
+                attrs.guest_crate_override = mod_attrs.guest_crate_override;
+            }
+            attrs.sparse_set |= mod_attrs.sparse_set;
+            attrs.immutable |= mod_attrs.immutable;
+            attrs.summary_tick |= mod_attrs.summary_tick;
+        }
+    }
+
+    if attrs.sparse_set && attrs.summary_tick {
+        return Err(syn::Error::new_spanned(
+            &input.ident,
+            "cannot combine `#[guest_component(sparse_set)]` with `#[guest_component(summary_tick)]` (`summary_tick` requires `Table` storage)",
+        ));
+    }
+
+    if attrs.custom_namespace.is_some()
+        && let Some(ref name) = attrs.custom_name
+        && name.contains("::")
+    {
+        return Err(syn::Error::new_spanned(
+            &input.ident,
+            "cannot combine `#[guest_component(namespace = \"...\")]` with an already-namespaced `name = \"ns::Name\"`",
+        ));
+    }
+
+    Ok(attrs)
+}
+
+/// Parses optional `crate = ...` override for `#[derive(AbiPod)]` from `#[mod_component(...)]`
+/// or a companion `#[guest_component(...)]` attribute.
+pub(crate) fn parse_abi_pod_crate_override(input: &DeriveInput) -> syn::Result<Option<Path>> {
+    let mut crate_override = None;
+    for attr in &input.attrs {
+        if attr.path().is_ident("mod_component") {
+            attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("crate") {
+                    crate_override = Some(parse_crate_path_value(&meta)?);
+                    Ok(())
+                } else {
+                    Err(meta.error(
+                        "unsupported `#[mod_component(...)]` attribute for `#[derive(AbiPod)]`; only `crate = ...` is supported",
+                    ))
+                }
+            })?;
+        } else if attr.path().is_ident("guest_component") {
+            // Best-effort extraction of `crate = ...` when paired with `#[derive(AbiPod, GuestComponent)]`;
+            // full validation of `#[guest_component(...)]` is owned by `#[derive(GuestComponent)]`.
+            let _ = attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("crate") {
+                    crate_override = Some(parse_crate_path_value(&meta)?);
+                } else if meta.input.peek(syn::Token![=]) {
+                    let value = meta.value()?;
+                    if value.peek(LitStr) {
+                        let _: LitStr = value.parse()?;
+                    } else {
+                        let _: Path = value.parse()?;
+                    }
+                }
+                Ok(())
+            });
+        }
     }
     Ok(crate_override)
 }
@@ -478,6 +644,44 @@ where
     }
 
     quote! { ::bevy_abi_mod_sys }
+}
+
+/// Resolves the token path to `bevy_abi_mod_guest`, respecting an explicit `guest_crate = ...`
+/// override or probing Cargo dependencies via `proc_macro_crate` (zero Cargo dependency on
+/// `bevy_abi_mod_guest` in `bevy_abi_mod_macros`).
+pub(crate) fn resolve_guest_crate_path(guest_crate_override: Option<&Path>) -> TokenStream {
+    let current_crate = std::env::var("CARGO_CRATE_NAME").ok();
+    resolve_guest_crate_with(guest_crate_override, current_crate.as_deref(), |pkg| {
+        proc_macro_crate::crate_name(pkg).ok()
+    })
+}
+
+pub(crate) fn resolve_guest_crate_with<F>(
+    guest_crate_override: Option<&Path>,
+    current_crate_name: Option<&str>,
+    mut lookup: F,
+) -> TokenStream
+where
+    F: FnMut(&str) -> Option<FoundCrate>,
+{
+    if let Some(path) = guest_crate_override {
+        return quote! { #path };
+    }
+
+    if let Some(found) = lookup("bevy_abi_mod_guest") {
+        return match found {
+            FoundCrate::Itself if current_crate_name == Some("bevy_abi_mod_guest") => {
+                quote! { crate }
+            }
+            FoundCrate::Itself => quote! { ::bevy_abi_mod_guest },
+            FoundCrate::Name(name) => {
+                let ident = Ident::new(&name, Span::call_site());
+                quote! { ::#ident }
+            }
+        };
+    }
+
+    quote! { ::bevy_abi_mod_guest }
 }
 
 /// Field-level classification override specified via `#[mod_field(...)]`.

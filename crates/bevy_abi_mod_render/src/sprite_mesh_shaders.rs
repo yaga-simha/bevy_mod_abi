@@ -37,7 +37,7 @@ use bevy_app::{App, AppLabel, Plugin};
 use bevy_asset::{AssetId, AssetServer, Assets, Handle, RenderAssetUsages};
 use bevy_color::Color;
 use bevy_ecs::entity::Entity;
-use bevy_ecs::prelude::Resource;
+use bevy_ecs::prelude::{ResMut, Resource};
 use bevy_ecs::schedule::Schedule;
 use bevy_ecs::world::World;
 use bevy_extract::{ExtractSchedule, MainWorld};
@@ -49,7 +49,6 @@ use bevy_material::descriptor::{
 use bevy_material::specialize::SpecializedMeshPipelineError;
 use bevy_platform::collections::{HashMap, HashSet};
 use bevy_reflect::Reflect;
-use bevy_render::RenderApp;
 use bevy_render::camera::DirtySpecializations;
 use bevy_render::mesh::{Indices, Mesh, Mesh2d, MeshVertexBufferLayoutRef, PrimitiveTopology};
 use bevy_render::render_resource::{
@@ -59,6 +58,7 @@ use bevy_render::render_resource::{
 use bevy_render::renderer::RenderDevice;
 use bevy_render::storage::ShaderBuffer;
 use bevy_render::sync_world::SyncToRenderWorld;
+use bevy_render::{RenderApp, RenderStartup};
 use bevy_shader::{Shader, ShaderDefVal};
 use bevy_sprite::{Anchor, Sprite, SpriteAlphaMode, SpriteImageMode};
 use bevy_sprite_render::{
@@ -817,10 +817,12 @@ impl Plugin for ModSpriteMaterialPlugin {
             ensure_asset_store_in_app::<ModWeslSpriteExtension2d>(app);
             ensure_asset_store_in_app::<ModExtendedSpriteMaterial2d>(app);
         }
+        crate::recovery::install_sprite_material_recovery_in_sub_app::<RenderApp>(app);
     }
 
     fn finish(&self, app: &mut App) {
         ensure_headless_render_app_sprite_resources(app);
+        crate::recovery::install_sprite_material_recovery_in_sub_app::<RenderApp>(app);
     }
 }
 
@@ -2210,12 +2212,16 @@ pub struct ExtractedModMeshPipeline {
 }
 
 /// Resource living inside [`RenderApp`] (or a custom [`SubApp`](bevy_app::SubApp)) mirroring
-/// active mod [`MeshPipelineDescriptor`]s and tracking pipelines/shaders evicted on `unload_mod`.
+/// active mod [`MeshPipelineDescriptor`]s and tracking pipelines/shaders evicted on `unload_mod`
+/// as well as [`RenderStartup`] device-loss recovery resets.
 #[derive(Resource, Default, Debug)]
 pub struct ExtractedModMeshPipelines {
     active: HashMap<ModMeshPipelineId, ExtractedModMeshPipeline>,
     evicted_pipeline_ids: Vec<ModMeshPipelineId>,
     evicted_shader_ids: Vec<AssetId<Shader>>,
+    recovery_epoch: u64,
+    last_reset_cleared_count: usize,
+    pending_invalidated_count: usize,
 }
 
 impl ExtractedModMeshPipelines {
@@ -2268,36 +2274,121 @@ impl ExtractedModMeshPipelines {
     pub fn evicted_shader_ids(&self) -> &[AssetId<Shader>] {
         &self.evicted_shader_ids
     }
+
+    /// Monotonic counter incremented each time [`reset_mod_mesh_pipelines_on_render_startup`]
+    /// resets cached pipeline entries during [`RenderStartup`].
+    pub fn recovery_epoch(&self) -> u64 {
+        self.recovery_epoch
+    }
+
+    /// Number of active cached pipeline entries invalidated during the most recent
+    /// [`RenderStartup`] reset (including entries preemptively cleared by
+    /// [`invalidate_mod_render_caches_in_render_world`](crate::invalidate_mod_render_caches_in_render_world)
+    /// right before that [`RenderStartup`]).
+    pub fn last_reset_cleared_count(&self) -> usize {
+        self.last_reset_cleared_count
+    }
+
+    /// Clears all active extracted mod mesh pipelines for [`RenderStartup`] re-initialization and
+    /// increments [`Self::recovery_epoch`].
+    ///
+    /// Unlike mod unload eviction, this does **not** append to [`Self::evicted_pipeline_ids`] or
+    /// [`Self::evicted_shader_ids`], preserving unload eviction telemetry while forcing the next
+    /// [`ExtractSchedule`] to re-check [`RenderDevice`] features and re-queue fresh
+    /// [`CachedRenderPipelineId`]s on the new [`PipelineCache`].
+    pub fn clear_for_render_startup(&mut self) -> usize {
+        let active_cleared = self.active.len();
+        self.active.clear();
+        let total_cleared =
+            active_cleared.saturating_add(core::mem::take(&mut self.pending_invalidated_count));
+        self.recovery_epoch = self.recovery_epoch.saturating_add(1);
+        self.last_reset_cleared_count = total_cleared;
+        total_cleared
+    }
+
+    /// Immediately clears active cached pipeline entries during GPU device-loss error handling
+    /// without bumping [`Self::recovery_epoch`] (which advances once when Bevy runs
+    /// [`RenderStartup`] after recreating `RenderDevice` + `PipelineCache`).
+    pub(crate) fn invalidate_for_device_loss(&mut self) -> usize {
+        let cleared = self.active.len();
+        self.active.clear();
+        self.pending_invalidated_count = self.pending_invalidated_count.saturating_add(cleared);
+        cleared
+    }
+}
+
+/// [`RenderStartup`] system clearing [`ExtractedModMeshPipelines`] so GPU device-loss recovery
+/// or shader reloads never retain dangling [`CachedRenderPipelineId`]s from a destroyed
+/// [`PipelineCache`].
+///
+/// The subsequent [`ExtractSchedule`] re-checks [`RenderDevice::features`] against
+/// [`ModMeshShaderConfig::required_wgpu_features`] and re-queues every live
+/// [`ModMeshPipelineEntry`] onto the fresh [`PipelineCache`].
+pub fn reset_mod_mesh_pipelines_on_render_startup(
+    extracted: Option<ResMut<ExtractedModMeshPipelines>>,
+) {
+    let Some(mut extracted) = extracted else {
+        return;
+    };
+    let cleared = extracted.clear_for_render_startup();
+    if cleared > 0 {
+        tracing::info!(
+            cleared,
+            recovery_epoch = extracted.recovery_epoch(),
+            "cleared cached mod mesh pipelines on RenderStartup for re-queueing"
+        );
+    }
 }
 
 #[derive(Resource, Default)]
 struct ModMeshPipelineExtractInstalled;
 
-fn install_mesh_pipeline_extraction_in_sub_app<L: AppLabel + Default + Copy + Eq>(app: &mut App) {
+#[derive(Resource, Default)]
+struct ModMeshPipelineResetInstalled;
+
+pub(crate) fn install_mesh_pipeline_reset_in_sub_app<L: AppLabel + Default + Copy + Eq>(
+    app: &mut App,
+) {
     let Some(sub_app) = app.get_sub_app_mut(L::default()) else {
         return;
     };
     if sub_app
         .world()
-        .contains_resource::<ModMeshPipelineExtractInstalled>()
+        .contains_resource::<ModMeshPipelineResetInstalled>()
     {
         return;
     }
-    sub_app
-        .init_resource::<ExtractedModMeshPipelines>()
-        .init_resource::<ModMeshPipelineExtractInstalled>();
+    sub_app.init_resource::<ModMeshPipelineResetInstalled>();
+    sub_app.add_systems(RenderStartup, reset_mod_mesh_pipelines_on_render_startup);
+}
 
-    if sub_app
-        .world()
-        .get_resource::<bevy_ecs::schedule::Schedules>()
-        .is_none_or(|s| !s.contains(ExtractSchedule))
+fn install_mesh_pipeline_extraction_in_sub_app<L: AppLabel + Default + Copy + Eq>(app: &mut App) {
     {
-        let mut extract_schedule = Schedule::new(ExtractSchedule);
-        extract_schedule.set_apply_final_deferred(false);
-        sub_app.add_schedule(extract_schedule);
-    }
+        let Some(sub_app) = app.get_sub_app_mut(L::default()) else {
+            return;
+        };
+        if !sub_app
+            .world()
+            .contains_resource::<ModMeshPipelineExtractInstalled>()
+        {
+            sub_app
+                .init_resource::<ExtractedModMeshPipelines>()
+                .init_resource::<ModMeshPipelineExtractInstalled>();
 
-    sub_app.add_systems(ExtractSchedule, extract_mod_mesh_pipelines);
+            if sub_app
+                .world()
+                .get_resource::<bevy_ecs::schedule::Schedules>()
+                .is_none_or(|s| !s.contains(ExtractSchedule))
+            {
+                let mut extract_schedule = Schedule::new(ExtractSchedule);
+                extract_schedule.set_apply_final_deferred(false);
+                sub_app.add_schedule(extract_schedule);
+            }
+
+            sub_app.add_systems(ExtractSchedule, extract_mod_mesh_pipelines);
+        }
+    }
+    install_mesh_pipeline_reset_in_sub_app::<L>(app);
 }
 
 fn extract_mod_mesh_pipelines(sub_world: &mut World) {

@@ -20,7 +20,7 @@ pub use bevy_abi_mod_sys::{
 };
 
 #[cfg(feature = "derive")]
-pub use bevy_abi_mod_macros::{AbiPod, ModComponent};
+pub use bevy_abi_mod_macros::{AbiPod, GuestComponent, ModComponent};
 
 #[cfg(feature = "derive")]
 pub use crate::bridges::{

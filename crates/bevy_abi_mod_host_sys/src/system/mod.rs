@@ -8,7 +8,7 @@ pub mod query_group;
 pub use error_policy::{
     BudgetWatchdogAction, GuestSystemRunMetrics, ModBudgetHook, ModBudgetRuntime, ModErrorPolicy,
     ModErrorPolicyConfig, ModQuarantine, ModSystemError, ModSystemFaulted, SystemInitError,
-    dispatch_mod_fault_to_fallback_handler,
+    dispatch_mod_fault_to_fallback_handler, dispatch_mod_observer_fault_to_fallback_handler,
 };
 pub use guest_system::{
     GuestSystem, HostSystemCtx, host_sys_commands, host_sys_entity_get, host_sys_entity_get_mut,

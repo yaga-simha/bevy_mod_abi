@@ -1,7 +1,7 @@
 //! Host components for Example 6: Cross-Mod Dynamic Components.
 
-use bevy_abi_mod::ModComponent;
 use bevy_ecs::component::Component;
+use bevy_mod_abi::ModComponent;
 
 /// Host-native component representing the spatial sector of the fleet (`"example::FleetSector"`).
 #[repr(C)]

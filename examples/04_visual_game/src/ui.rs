@@ -3,8 +3,8 @@
 //! Provides the Braille Canvas widget, telemetry HUD, keyboard command polling,
 //! and RAII terminal restoration guard.
 
-use bevy_abi_mod::ModId;
 use bevy_ecs::prelude::Resource;
+use bevy_mod_abi::ModId;
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEventKind},

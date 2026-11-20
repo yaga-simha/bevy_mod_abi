@@ -98,148 +98,46 @@ macro_rules! guest_log {
 #[macro_export]
 macro_rules! export_mod {
     (plugin: $plugin_ty:ty) => {
-        static __BAM_EXPORTED_MANIFEST: $crate::BamManifest =
-            <$plugin_ty as $crate::GuestPlugin>::MANIFEST;
-
-        /// Returns a pointer to the static [`BamManifest`]($crate::BamManifest) for this guest mod.
-        ///
-        /// # Safety
-        /// Side-effect free; returns a pointer valid until library unload.
-        #[unsafe(no_mangle)]
-        pub unsafe extern "C" fn bevy_abi_mod_manifest() -> *const $crate::BamManifest {
-            &raw const __BAM_EXPORTED_MANIFEST
-        }
-
-        /// Initializes a per-World [`BamInstance`]($crate::raw::BamInstance) for this guest mod.
-        ///
-        /// # Safety
-        /// Caller (host loader) must supply valid ABI `0.3.0` `api`, `load_ctx`, and `instance_out` pointers.
-        #[unsafe(no_mangle)]
-        pub unsafe extern "C" fn bevy_abi_mod_init(
-            api: *const $crate::raw::BamHostApi,
-            load_ctx: *mut $crate::raw::BamLoadCtx,
-            instance_out: *mut *mut $crate::raw::BamInstance,
-        ) -> $crate::FfiResult {
-            // SAFETY: Entry point invoked by the host loader with valid ABI v0.3 handshake pointers.
-            unsafe {
-                $crate::raw::init_guest_instance(
-                    api,
-                    load_ctx,
-                    instance_out,
-                    &__BAM_EXPORTED_MANIFEST,
-                    $crate::build_guest_plugin::<$plugin_ty>,
-                )
-            }
-        }
-
-        /// Tears down and frees a per-World [`BamInstance`]($crate::raw::BamInstance).
-        ///
-        /// # Safety
-        /// `instance` must be either null or a pointer returned by `bevy_abi_mod_init` not yet freed.
-        #[unsafe(no_mangle)]
-        pub unsafe extern "C" fn bevy_abi_mod_shutdown(instance: *mut $crate::raw::BamInstance) {
-            // SAFETY: Invoked once by the host with the `BamInstance*` returned by `bevy_abi_mod_init`.
-            unsafe {
-                $crate::raw::shutdown_guest_instance(instance);
-            }
-        }
-
-        /// Resolves a `"bam.v0.*"` dynamic symbol registered on `instance`.
-        ///
-        /// # Safety
-        /// - `instance` must be null or a live `BamInstance*` produced by `bevy_abi_mod_init`
-        ///   prior to `bevy_abi_mod_shutdown`.
-        /// - `name` must be null or a NUL-terminated C string.
-        #[unsafe(no_mangle)]
-        pub unsafe extern "C" fn bevy_abi_mod_resolve_symbol(
-            instance: *const $crate::raw::BamInstance,
-            name: *const ::core::ffi::c_char,
-        ) -> *const ::core::ffi::c_void {
-            // SAFETY: Forwarding raw `BamInstance*` and NUL-terminated symbol name to guest-sys resolver.
-            unsafe { $crate::commands_lifecycle::resolve_guest_instance_symbol(instance, name) }
-        }
+        $crate::export_mod!(
+            @emit_managed
+            <$plugin_ty as $crate::GuestPlugin>::MANIFEST,
+            $crate::build_guest_plugin::<$plugin_ty>
+        );
     };
     (name: $name:expr, version: $version:expr, $build_fn:path $(,)?) => {
-        static __BAM_EXPORTED_MANIFEST: $crate::BamManifest = $crate::BamManifest::new(
-            ::core::ffi::CStr::as_ptr($name),
-            ::core::ffi::CStr::as_ptr($version),
-        )
-        .with_state_callbacks(
-            $crate::raw::guest_save_state_trampoline,
-            $crate::raw::guest_restore_state_trampoline,
+        $crate::export_mod!(
+            @emit_managed
+            $crate::BamManifest::new(
+                ::core::ffi::CStr::as_ptr($name),
+                ::core::ffi::CStr::as_ptr($version),
+            )
+            .with_state_callbacks(
+                $crate::raw::guest_save_state_trampoline,
+                $crate::raw::guest_restore_state_trampoline,
+            ),
+            |inst, load| $crate::build_guest_fn(inst, load, $build_fn)
         );
-
-        /// Returns a pointer to the static [`BamManifest`]($crate::BamManifest) for this guest mod.
-        ///
-        /// # Safety
-        /// Side-effect free; returns a pointer valid until library unload.
-        #[unsafe(no_mangle)]
-        pub unsafe extern "C" fn bevy_abi_mod_manifest() -> *const $crate::BamManifest {
-            &raw const __BAM_EXPORTED_MANIFEST
-        }
-
-        /// Initializes a per-World [`BamInstance`]($crate::raw::BamInstance) for this guest mod.
-        ///
-        /// # Safety
-        /// Caller (host loader) must supply valid ABI `0.3.0` `api`, `load_ctx`, and `instance_out` pointers.
-        #[unsafe(no_mangle)]
-        pub unsafe extern "C" fn bevy_abi_mod_init(
-            api: *const $crate::raw::BamHostApi,
-            load_ctx: *mut $crate::raw::BamLoadCtx,
-            instance_out: *mut *mut $crate::raw::BamInstance,
-        ) -> $crate::FfiResult {
-            // SAFETY: Entry point invoked by the host loader with valid ABI v0.3 handshake pointers.
-            unsafe {
-                $crate::raw::init_guest_instance(
-                    api,
-                    load_ctx,
-                    instance_out,
-                    &__BAM_EXPORTED_MANIFEST,
-                    |inst, load| $crate::build_guest_fn(inst, load, $build_fn),
-                )
-            }
-        }
-
-        /// Tears down and frees a per-World [`BamInstance`]($crate::raw::BamInstance).
-        ///
-        /// # Safety
-        /// `instance` must be either null or a pointer returned by `bevy_abi_mod_init` not yet freed.
-        #[unsafe(no_mangle)]
-        pub unsafe extern "C" fn bevy_abi_mod_shutdown(instance: *mut $crate::raw::BamInstance) {
-            // SAFETY: Invoked once by the host with the `BamInstance*` returned by `bevy_abi_mod_init`.
-            unsafe {
-                $crate::raw::shutdown_guest_instance(instance);
-            }
-        }
-
-        /// Resolves a `"bam.v0.*"` dynamic symbol registered on `instance`.
-        ///
-        /// # Safety
-        /// - `instance` must be null or a live `BamInstance*` produced by `bevy_abi_mod_init`
-        ///   prior to `bevy_abi_mod_shutdown`.
-        /// - `name` must be null or a NUL-terminated C string.
-        #[unsafe(no_mangle)]
-        pub unsafe extern "C" fn bevy_abi_mod_resolve_symbol(
-            instance: *const $crate::raw::BamInstance,
-            name: *const ::core::ffi::c_char,
-        ) -> *const ::core::ffi::c_void {
-            // SAFETY: Forwarding raw `BamInstance*` and NUL-terminated symbol name to guest-sys resolver.
-            unsafe { $crate::commands_lifecycle::resolve_guest_instance_symbol(instance, name) }
-        }
     };
     ($build_fn:path) => {
-        static __BAM_EXPORTED_MANIFEST: $crate::BamManifest = $crate::BamManifest::new(
-            concat!(env!("CARGO_PKG_NAME"), "\0")
-                .as_ptr()
-                .cast::<::core::ffi::c_char>(),
-            concat!(env!("CARGO_PKG_VERSION"), "\0")
-                .as_ptr()
-                .cast::<::core::ffi::c_char>(),
-        )
-        .with_state_callbacks(
-            $crate::raw::guest_save_state_trampoline,
-            $crate::raw::guest_restore_state_trampoline,
+        $crate::export_mod!(
+            @emit_managed
+            $crate::BamManifest::new(
+                concat!(env!("CARGO_PKG_NAME"), "\0")
+                    .as_ptr()
+                    .cast::<::core::ffi::c_char>(),
+                concat!(env!("CARGO_PKG_VERSION"), "\0")
+                    .as_ptr()
+                    .cast::<::core::ffi::c_char>(),
+            )
+            .with_state_callbacks(
+                $crate::raw::guest_save_state_trampoline,
+                $crate::raw::guest_restore_state_trampoline,
+            ),
+            |inst, load| $crate::build_guest_fn(inst, load, $build_fn)
         );
+    };
+    (@emit_managed $manifest_expr:expr, $builder:expr) => {
+        static __BAM_EXPORTED_MANIFEST: $crate::BamManifest = $manifest_expr;
 
         /// Returns a pointer to the static [`BamManifest`]($crate::BamManifest) for this guest mod.
         ///
@@ -267,7 +165,7 @@ macro_rules! export_mod {
                     load_ctx,
                     instance_out,
                     &__BAM_EXPORTED_MANIFEST,
-                    |inst, load| $crate::build_guest_fn(inst, load, $build_fn),
+                    $builder,
                 )
             }
         }

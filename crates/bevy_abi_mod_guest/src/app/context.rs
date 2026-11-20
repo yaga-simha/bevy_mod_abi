@@ -181,7 +181,9 @@ impl<R> core::ops::DerefMut for GuestResMut<'_, R> {
 impl<'a> SystemContext<'a> {
     pub(crate) fn from_invocation(inv: &mut ValidatedSystemInvocation<'a>) -> Self {
         let host = inv.host();
-        let sys_ref = inv.system_ref();
+        let sys_ref = inv
+            .take_system_ref()
+            .unwrap_or_else(|| ValidatedSystemRef::empty(host));
         let user_query_count = inv.query_count();
         let mut queries: [Option<ChunkIter<'a>>; MAX_QUERIES_PER_SYSTEM] =
             [const { None }; MAX_QUERIES_PER_SYSTEM];
@@ -319,6 +321,20 @@ impl<'a> SystemContext<'a> {
         }
     }
 
+    #[inline]
+    fn resource_iter(&self) -> Option<&ChunkIter<'a>> {
+        self.resource_query
+            .as_ref()
+            .or_else(|| self.queries.first().and_then(Option::as_ref))
+    }
+
+    #[inline]
+    fn resource_iter_mut(&mut self) -> Option<&mut ChunkIter<'a>> {
+        self.resource_query
+            .as_mut()
+            .or_else(|| self.queries.first_mut().and_then(Option::as_mut))
+    }
+
     /// Borrows singleton resource `R` (`R: AbiPod`) by declaration index `decl_index`.
     ///
     /// Routes to the system-level resource bundle when `.resource_read` / `.resource_write` was
@@ -326,39 +342,21 @@ impl<'a> SystemContext<'a> {
     /// declared inside `.query(|q| ...)`.
     #[inline]
     pub fn resource<R: AbiPod>(&self, decl_index: usize) -> Option<&R> {
-        if let Some(ref res_q) = self.resource_query {
-            res_q.resource::<R>(decl_index)
-        } else {
-            self.queries.first()?.as_ref()?.resource::<R>(decl_index)
-        }
+        self.resource_iter()?.resource::<R>(decl_index)
     }
 
     /// Borrows singleton resource `R` (`R: GuestComponent`) by declaration index `decl_index`,
     /// validating `R::UUID`.
     #[inline]
     pub fn component_resource<R: GuestComponent>(&self, decl_index: usize) -> Option<&R> {
-        if let Some(ref res_q) = self.resource_query {
-            res_q.component_resource::<R>(decl_index)
-        } else {
-            self.queries
-                .first()?
-                .as_ref()?
-                .component_resource::<R>(decl_index)
-        }
+        self.resource_iter()?.component_resource::<R>(decl_index)
     }
 
     /// Mutably borrows singleton resource `R` (`R: AbiPod`) declared with `RESOURCE_WRITE` at
     /// `decl_index`.
     #[inline]
     pub fn resource_mut<R: AbiPod>(&mut self, decl_index: usize) -> Option<&mut R> {
-        if let Some(ref mut res_q) = self.resource_query {
-            res_q.resource_mut::<R>(decl_index)
-        } else {
-            self.queries
-                .first_mut()?
-                .as_mut()?
-                .resource_mut::<R>(decl_index)
-        }
+        self.resource_iter_mut()?.resource_mut::<R>(decl_index)
     }
 
     /// Mutably borrows singleton resource `R` (`R: GuestComponent`) at `decl_index`, validating
@@ -368,14 +366,8 @@ impl<'a> SystemContext<'a> {
         &mut self,
         decl_index: usize,
     ) -> Option<&mut R> {
-        if let Some(ref mut res_q) = self.resource_query {
-            res_q.component_resource_mut::<R>(decl_index)
-        } else {
-            self.queries
-                .first_mut()?
-                .as_mut()?
-                .component_resource_mut::<R>(decl_index)
-        }
+        self.resource_iter_mut()?
+            .component_resource_mut::<R>(decl_index)
     }
 
     /// Looks up a shared singleton resource `R` wrapped in [`GuestRes`] by pre-resolved
@@ -403,15 +395,9 @@ impl<'a> SystemContext<'a> {
     /// Reads Bevy change-detection ticks for the singleton resource declared at `decl_index`.
     #[inline]
     pub fn resource_ticks(&self, decl_index: usize) -> Result<BamChangeTicks, FfiResult> {
-        if let Some(ref res_q) = self.resource_query {
-            res_q.resource_ticks(decl_index)
-        } else {
-            self.queries
-                .first()
-                .and_then(Option::as_ref)
-                .ok_or(FfiResult::OUT_OF_RANGE)?
-                .resource_ticks(decl_index)
-        }
+        self.resource_iter()
+            .ok_or(FfiResult::OUT_OF_RANGE)?
+            .resource_ticks(decl_index)
     }
 
     /// Borrows singleton resource `R` (`R: GuestComponent`) with [`BamChangeTicks`] at
@@ -421,15 +407,9 @@ impl<'a> SystemContext<'a> {
         &self,
         decl_index: usize,
     ) -> Result<GuestRes<'_, R>, FfiResult> {
-        if let Some(ref res_q) = self.resource_query {
-            res_q.component_resource_with_ticks::<R>(decl_index)
-        } else {
-            self.queries
-                .first()
-                .and_then(Option::as_ref)
-                .ok_or(FfiResult::OUT_OF_RANGE)?
-                .component_resource_with_ticks::<R>(decl_index)
-        }
+        self.resource_iter()
+            .ok_or(FfiResult::OUT_OF_RANGE)?
+            .component_resource_with_ticks::<R>(decl_index)
     }
 
     /// Mutably borrows singleton resource `R` (`R: GuestComponent`) with prior [`BamChangeTicks`]
@@ -439,15 +419,9 @@ impl<'a> SystemContext<'a> {
         &mut self,
         decl_index: usize,
     ) -> Result<GuestResMut<'_, R>, FfiResult> {
-        if let Some(ref mut res_q) = self.resource_query {
-            res_q.component_resource_mut_with_ticks::<R>(decl_index)
-        } else {
-            self.queries
-                .first_mut()
-                .and_then(Option::as_mut)
-                .ok_or(FfiResult::OUT_OF_RANGE)?
-                .component_resource_mut_with_ticks::<R>(decl_index)
-        }
+        self.resource_iter_mut()
+            .ok_or(FfiResult::OUT_OF_RANGE)?
+            .component_resource_mut_with_ticks::<R>(decl_index)
     }
 
     /// Processes primary query `0` chunks in parallel across the host `ComputeTaskPool`.
@@ -596,42 +570,26 @@ impl<'a> SystemContext<'a> {
         &mut self,
         decl_index: usize,
     ) -> Result<Vec<M>, FfiResult> {
-        if let Some(ref mut res_q) = self.resource_query {
-            res_q.read_messages::<M>(decl_index)
-        } else {
-            self.queries
-                .first_mut()
-                .and_then(Option::as_mut)
-                .ok_or(FfiResult::OUT_OF_RANGE)?
-                .read_messages::<M>(decl_index)
-        }
+        self.resource_iter_mut()
+            .ok_or(FfiResult::OUT_OF_RANGE)?
+            .read_messages::<M>(decl_index)
     }
 
     /// Drains unread POD messages (`M: AbiPod`) declared at `decl_index`.
     #[inline]
     pub fn read_pod_messages<M: AbiPod>(&mut self, decl_index: usize) -> Result<Vec<M>, FfiResult> {
-        if let Some(ref mut res_q) = self.resource_query {
-            res_q.read_pod_messages::<M>(decl_index)
-        } else {
-            self.queries
-                .first_mut()
-                .and_then(Option::as_mut)
-                .ok_or(FfiResult::OUT_OF_RANGE)?
-                .read_pod_messages::<M>(decl_index)
-        }
+        self.resource_iter_mut()
+            .ok_or(FfiResult::OUT_OF_RANGE)?
+            .read_pod_messages::<M>(decl_index)
     }
 
     /// Appends a message (`M: GuestComponent`) to the stream declared with `MESSAGE_WRITE` at
     /// `decl_index`, validating `M`'s UUID.
     #[inline]
     pub fn send_message<M: GuestComponent>(&mut self, decl_index: usize, msg: &M) -> FfiResult {
-        if let Some(ref mut res_q) = self.resource_query {
-            res_q.send_message::<M>(decl_index, msg)
-        } else {
-            match self.queries.first_mut().and_then(Option::as_mut) {
-                Some(q) => q.send_message::<M>(decl_index, msg),
-                None => FfiResult::OUT_OF_RANGE,
-            }
+        match self.resource_iter_mut() {
+            Some(q) => q.send_message::<M>(decl_index, msg),
+            None => FfiResult::OUT_OF_RANGE,
         }
     }
 
@@ -639,13 +597,9 @@ impl<'a> SystemContext<'a> {
     /// `decl_index`.
     #[inline]
     pub fn send_pod_message<M: AbiPod>(&mut self, decl_index: usize, msg: &M) -> FfiResult {
-        if let Some(ref mut res_q) = self.resource_query {
-            res_q.send_pod_message::<M>(decl_index, msg)
-        } else {
-            match self.queries.first_mut().and_then(Option::as_mut) {
-                Some(q) => q.send_pod_message::<M>(decl_index, msg),
-                None => FfiResult::OUT_OF_RANGE,
-            }
+        match self.resource_iter_mut() {
+            Some(q) => q.send_pod_message::<M>(decl_index, msg),
+            None => FfiResult::OUT_OF_RANGE,
         }
     }
 
@@ -657,14 +611,8 @@ impl<'a> SystemContext<'a> {
         decl_index: usize,
         messages: &[M],
     ) -> Result<(), FfiResult> {
-        if let Some(ref mut res_q) = self.resource_query {
-            res_q.send_messages::<M>(decl_index, messages)
-        } else {
-            self.queries
-                .first_mut()
-                .and_then(Option::as_mut)
-                .ok_or(FfiResult::OUT_OF_RANGE)?
-                .send_messages::<M>(decl_index, messages)
-        }
+        self.resource_iter_mut()
+            .ok_or(FfiResult::OUT_OF_RANGE)?
+            .send_messages::<M>(decl_index, messages)
     }
 }

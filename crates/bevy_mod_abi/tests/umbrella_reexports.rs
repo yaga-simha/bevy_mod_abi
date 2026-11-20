@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
 
-//! Verifies that the top-level `bevy_mod_abi` umbrella crate re-exports `bevy_abi_mod::*`,
-//! `bevy_mod_abi::prelude::*`, `#[derive(ModComponent, AbiPod)]`, and every optional feature flag
-//! under both default features and `--all-features`.
+//! Verifies that the canonical top-level `bevy_mod_abi` facade crate exports all core host APIs,
+//! module paths (`bridges::*`, `recovery`, `sprite_mesh_shaders`, `sub_app_materials`, `savegame`,
+//! `telemetry`, `watcher`), `prelude::*`, procedural derives (`#[derive(ModComponent, AbiPod)]`),
+//! curated bridge presets (`preset-2d`, `preset-3d`, `preset-ui`, `preset-full`), and every
+//! optional feature flag under both default features and `--all-features`.
 
 use bevy_app::App;
 use bevy_ecs::component::Component;
@@ -33,7 +35,7 @@ fn umbrella_core_exports_and_derives_work() {
     app.register_mod_component::<UmbrellaHealth>(
         ComponentOptions::new().with_raw_insert().with_default(),
     )
-    .expect("register UmbrellaHealth through umbrella crate");
+    .expect("register UmbrellaHealth through canonical facade crate");
 
     assert!(app.world().contains_resource::<ModHost>());
     assert!(app.world().contains_resource::<ModRegistry>());
@@ -42,10 +44,10 @@ fn umbrella_core_exports_and_derives_work() {
     assert!(app.world().contains_resource::<ModBudgetTelemetry>());
 
     let _ = core::any::type_name::<bevy_mod_abi::budgets::ModBudgetLimits>();
-    let _ = core::any::type_name::<bevy_mod_abi::bevy_abi_mod::AbiModPlugin>();
     let _ = core::any::type_name::<bevy_mod_abi::bevy_abi_mod_host::ModHost>();
-    let _pod = UmbrellaPod { x: 1.0, y: 2.0 };
-    assert_eq!(_pod.x, 1.0);
+    let pod = UmbrellaPod { x: 1.0, y: 2.0 };
+    assert_eq!(pod.x, 1.0);
+    assert_eq!(pod.y, 2.0);
 }
 
 #[cfg(feature = "strict-ffi-checks")]
@@ -131,22 +133,47 @@ fn umbrella_reflect_savegame_telemetry_reexports_work() {
     assert!(app.world().contains_resource::<ModReflectRegistry>());
     let _ = core::any::type_name::<bevy_mod_abi::ModSaveGamePlugin>();
     let _ = core::any::type_name::<bevy_mod_abi::savegame::ModSaveArchive>();
+    let _ = core::any::type_name::<bevy_mod_abi::EphemeralHandleBehavior>();
+    let _ = core::any::type_name::<bevy_mod_abi::bridges::EphemeralHandleBehavior>();
+    let _ = core::any::type_name::<bevy_mod_abi::savegame::EphemeralHandleBehavior>();
+    let _behavior: EphemeralHandleBehavior = EphemeralHandleBehavior::Warn;
     let _ = core::any::type_name::<bevy_mod_abi::ModTelemetryPlugin>();
     let _ = core::any::type_name::<bevy_mod_abi::telemetry::SystemTelemetryDigest64>();
 }
 
 #[cfg(feature = "sub-app-extract")]
 #[test]
-fn umbrella_render_reexports_work() {
+fn umbrella_render_and_recovery_reexports_work() {
     let mut app = App::new();
-    app.add_plugins((AbiModPlugin, ModWeslMaterialPlugin));
+    app.add_plugins((
+        AbiModPlugin,
+        ModWeslMaterialPlugin,
+        ModRenderRecoveryPlugin::default(),
+    ));
     assert!(app.world().contains_resource::<ModWeslMaterialRegistry>());
+    assert!(app.world().contains_resource::<ModRenderRecoveryPolicy>());
+    assert!(
+        app.world()
+            .contains_resource::<ModRenderRecoveryTelemetry>()
+    );
+    assert!(app.world().contains_resource::<ModRenderRecoveryHooks>());
+    assert!(app.mod_render_recovery_telemetry().is_some());
+    assert!(app.world().mod_render_recovery_telemetry().is_some());
+    app.register_mod_render_recovery_hook("facade_smoke", |_main_world, _render_world| {});
+    assert!(app.unregister_mod_render_recovery_hook("facade_smoke"));
+
     let _spec = bevy_mod_abi::sub_app_materials::ModSpriteMaterialSpec::new("umbrella_smoke");
     let _params = ModMaterialParams::default();
     let _ext = ModSpriteExtension2d::default();
     let _ = core::any::type_name::<bevy_mod_abi::ModSpriteMaterialPlugin>();
     let _ = core::any::type_name::<bevy_mod_abi::ModMeshShaderPlugin>();
     let _ = core::any::type_name::<bevy_mod_abi::sprite_mesh_shaders::ModUnifiedSpriteSpec>();
+    let _ = core::any::type_name::<bevy_mod_abi::ModRenderRecoveryPlugin>();
+    let _ = core::any::type_name::<bevy_mod_abi::ModRenderRecoveryPolicy>();
+    let _ = core::any::type_name::<bevy_mod_abi::ModRenderRecoveryTelemetry>();
+    let _ = core::any::type_name::<bevy_mod_abi::ModRenderRecoveryOutcome>();
+    let _ = core::any::type_name::<bevy_mod_abi::ModRenderRecoveryHooks>();
+    let _ = core::any::type_name::<bevy_mod_abi::recovery::ModRenderCacheInvalidationReport>();
     assert_eq!(app.cleanup_mod_materials(ModId(999_999)), 0);
 }
 
@@ -173,10 +200,24 @@ fn umbrella_audio_reexports_work() {
     let _ = core::any::type_name::<bevy_mod_abi::FfiAudioPlaybackSettings>();
 }
 
+#[cfg(feature = "bridge-camera-2d")]
+#[test]
+fn umbrella_camera_2d_reexports_work() {
+    let _ = core::any::type_name::<bevy_mod_abi::FfiCamera2d>();
+    let _ = core::any::type_name::<bevy_mod_abi::bridges::FfiCamera2d>();
+    let _ = core::any::type_name::<bevy_mod_abi::bridges::camera_light::FfiCamera2d>();
+    let _ = core::any::type_name::<bevy_mod_abi::ModCameraLightBridgePlugin>();
+    let _ = core::any::type_name::<bevy_mod_abi::CameraLightBridgeSystems>();
+    let mut app = App::new();
+    app.add_plugins((AbiModPlugin, ModCameraLightBridgePlugin));
+    app.update();
+}
+
 #[cfg(feature = "bridge-light")]
 #[test]
 fn umbrella_camera_light_reexports_work() {
     let _ = core::any::type_name::<bevy_mod_abi::ModCameraLightBridgePlugin>();
+    let _ = core::any::type_name::<bevy_mod_abi::FfiCamera2d>();
     let _ = core::any::type_name::<bevy_mod_abi::bridges::camera_light::FfiCamera3d>();
     let _ = core::any::type_name::<bevy_mod_abi::FfiPointLight>();
 }
@@ -206,4 +247,64 @@ fn umbrella_camera_controller_reexports_work() {
 #[test]
 fn umbrella_solari_reexports_work() {
     let _ = core::any::type_name::<bevy_mod_abi::FfiSolariLighting>();
+}
+
+#[cfg(feature = "preset-2d")]
+#[test]
+fn umbrella_preset_2d_plugin_works() {
+    let _ = core::any::type_name::<bevy_mod_abi::ModPreset2dPlugin>();
+    let _ = core::any::type_name::<bevy_mod_abi::bridges::ModPreset2dPlugin>();
+    let mut app = App::new();
+    app.add_plugins((
+        bevy_app::TaskPoolPlugin::default(),
+        AbiModPlugin,
+        ModPreset2dPlugin,
+        bevy_asset::AssetPlugin::default(),
+    ));
+    app.update();
+}
+
+#[cfg(feature = "preset-3d")]
+#[test]
+fn umbrella_preset_3d_plugin_works() {
+    let _ = core::any::type_name::<bevy_mod_abi::ModPreset3dPlugin>();
+    let _ = core::any::type_name::<bevy_mod_abi::bridges::ModPreset3dPlugin>();
+    let mut app = App::new();
+    app.add_plugins((
+        bevy_app::TaskPoolPlugin::default(),
+        AbiModPlugin,
+        ModPreset3dPlugin,
+        bevy_asset::AssetPlugin::default(),
+    ));
+    app.update();
+}
+
+#[cfg(feature = "preset-ui")]
+#[test]
+fn umbrella_preset_ui_plugin_works() {
+    let _ = core::any::type_name::<bevy_mod_abi::ModPresetUiPlugin>();
+    let _ = core::any::type_name::<bevy_mod_abi::bridges::ModPresetUiPlugin>();
+    let mut app = App::new();
+    app.add_plugins((
+        bevy_app::TaskPoolPlugin::default(),
+        AbiModPlugin,
+        ModPresetUiPlugin,
+        bevy_asset::AssetPlugin::default(),
+    ));
+    app.update();
+}
+
+#[cfg(feature = "preset-full")]
+#[test]
+fn umbrella_preset_full_plugin_works() {
+    let _ = core::any::type_name::<bevy_mod_abi::ModPresetFullPlugin>();
+    let _ = core::any::type_name::<bevy_mod_abi::bridges::ModPresetFullPlugin>();
+    let mut app = App::new();
+    app.add_plugins((
+        bevy_app::TaskPoolPlugin::default(),
+        AbiModPlugin,
+        ModPresetFullPlugin,
+        bevy_asset::AssetPlugin::default(),
+    ));
+    app.update();
 }

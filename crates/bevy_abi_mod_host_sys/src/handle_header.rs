@@ -8,12 +8,34 @@
 //!   handles in debug builds and under `--features strict-ffi-checks` (and unconditionally on
 //!   cold registration/lookup paths).
 
+use crate::ffi::commands::HostCommands;
+use crate::ffi::iter::HostIter;
+use crate::ffi::register::LoadContext;
 use crate::registry::RegistrySnapshot;
-use bevy_abi_mod_sys::{BamHostCtx, FfiResult};
+use crate::system::HostSystemCtx;
+use bevy_abi_mod_sys::{
+    BamCommands, BamHostCtx, BamIter, BamLoadCtx, BamSystemCtx, FfiEntity, FfiResult,
+};
+use bevy_ecs::entity::Entity;
+use bevy_ecs::ptr::PtrMut;
+use core::alloc::Layout;
 use core::cell::{RefCell, UnsafeCell};
-use core::ffi::{c_char, c_void};
+use core::ffi::{CStr, c_char, c_void};
+use core::num::NonZeroUsize;
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+/// Early-return helper for FFI functions returning [`FfiResult`].
+macro_rules! ffi_try {
+    ($expr:expr) => {
+        match $expr {
+            Ok(val) => val,
+            Err(err) => return err,
+        }
+    };
+}
+pub(crate) use ffi_try;
 
 /// Magic constant stamped at offset `0` of [`HostContext`] (`BamHostCtx`, `"BAMH"`).
 pub const HOST_CTX_MAGIC: u32 = 0x4241_4D48;
@@ -165,6 +187,312 @@ pub(crate) unsafe fn validate_handle_mut<'a, T>(
     Ok(unsafe { &mut *ptr.cast::<T>() })
 }
 
+/// Validates an opaque `*const BamHostCtx` (unconditionally checking magic/generation).
+///
+/// # Safety
+/// When non-null and header-valid, `ptr` must point to a live [`HostContext`] for `'a`.
+#[inline]
+pub(crate) unsafe fn validate_host_ctx<'a>(
+    ptr: *const BamHostCtx,
+) -> Result<&'a HostContext, FfiResult> {
+    // SAFETY: Caller upholds `validate_handle_ref` contract for `HostContext`.
+    unsafe { validate_handle_ref(ptr.cast::<c_void>(), HOST_CTX_MAGIC, true) }
+}
+
+/// Validates an opaque `*const BamLoadCtx` (unconditionally checking magic/generation).
+///
+/// # Safety
+/// When non-null and header-valid, `ptr` must point to a live [`LoadContext`] for `'a`.
+#[inline]
+pub(crate) unsafe fn validate_load_ctx_ref<'a>(
+    ptr: *const BamLoadCtx,
+) -> Result<&'a LoadContext, FfiResult> {
+    // SAFETY: Caller upholds `validate_handle_ref` contract for `LoadContext`.
+    unsafe { validate_handle_ref(ptr.cast::<c_void>(), LOAD_CTX_MAGIC, true) }
+}
+
+/// Validates an opaque `*mut BamLoadCtx` (unconditionally checking magic/generation).
+///
+/// # Safety
+/// When non-null and header-valid, `ptr` must point to an exclusively borrowed [`LoadContext`] for `'a`.
+#[inline]
+pub(crate) unsafe fn validate_load_ctx_mut<'a>(
+    ptr: *mut BamLoadCtx,
+) -> Result<&'a mut LoadContext, FfiResult> {
+    // SAFETY: Caller upholds `validate_handle_mut` contract for `LoadContext`.
+    unsafe { validate_handle_mut(ptr.cast::<c_void>(), LOAD_CTX_MAGIC, true) }
+}
+
+/// Validates an opaque `*mut BamCommands` under `STRICT_FFI_CHECKS`.
+///
+/// # Safety
+/// When non-null and header-valid, `ptr` must point to an exclusively borrowed [`HostCommands`] for `'a`.
+#[inline]
+pub(crate) unsafe fn validate_commands_mut<'a, 'w>(
+    ptr: *mut BamCommands,
+) -> Result<&'a mut HostCommands<'w>, FfiResult> {
+    // SAFETY: Caller upholds `validate_handle_mut` contract for `HostCommands`.
+    unsafe { validate_handle_mut(ptr.cast::<c_void>(), COMMANDS_MAGIC, false) }
+}
+
+/// Validates an opaque `*const BamIter` under `STRICT_FFI_CHECKS`.
+///
+/// # Safety
+/// When non-null and header-valid, `ptr` must point to a live [`HostIter`] for `'a`.
+#[inline]
+pub(crate) unsafe fn validate_iter_ref<'a, 'w>(
+    ptr: *const BamIter,
+) -> Result<&'a HostIter<'w>, FfiResult> {
+    // SAFETY: Caller upholds `validate_handle_ref` contract for `HostIter`.
+    unsafe { validate_handle_ref(ptr.cast::<c_void>(), ITER_MAGIC, false) }
+}
+
+/// Validates an opaque `*mut BamIter` under `STRICT_FFI_CHECKS`.
+///
+/// # Safety
+/// When non-null and header-valid, `ptr` must point to an exclusively borrowed [`HostIter`] for `'a`.
+#[inline]
+pub(crate) unsafe fn validate_iter_mut<'a, 'w>(
+    ptr: *mut BamIter,
+) -> Result<&'a mut HostIter<'w>, FfiResult> {
+    // SAFETY: Caller upholds `validate_handle_mut` contract for `HostIter`.
+    unsafe { validate_handle_mut(ptr.cast::<c_void>(), ITER_MAGIC, false) }
+}
+
+/// Validates an opaque `*const BamSystemCtx` under `STRICT_FFI_CHECKS`.
+///
+/// # Safety
+/// When non-null and header-valid, `ptr` must point to a live [`HostSystemCtx`] for `'a`.
+#[inline]
+pub(crate) unsafe fn validate_sys_ctx_ref<'a, 'w>(
+    ptr: *const BamSystemCtx,
+) -> Result<&'a HostSystemCtx<'w>, FfiResult> {
+    // SAFETY: Caller upholds `validate_handle_ref` contract for `HostSystemCtx`.
+    unsafe { validate_handle_ref(ptr.cast::<c_void>(), SYS_CTX_MAGIC, false) }
+}
+
+/// Validates an opaque `*mut BamSystemCtx` under `STRICT_FFI_CHECKS`.
+///
+/// # Safety
+/// When non-null and header-valid, `ptr` must point to an exclusively borrowed [`HostSystemCtx`] for `'a`.
+#[inline]
+pub(crate) unsafe fn validate_sys_ctx_mut<'a, 'w>(
+    ptr: *mut BamSystemCtx,
+) -> Result<&'a mut HostSystemCtx<'w>, FfiResult> {
+    // SAFETY: Caller upholds `validate_handle_mut` contract for `HostSystemCtx`.
+    unsafe { validate_handle_mut(ptr.cast::<c_void>(), SYS_CTX_MAGIC, false) }
+}
+
+/// Decodes a required non-null, non-placeholder [`FfiEntity`] into a Bevy [`Entity`].
+#[inline]
+pub(crate) fn decode_live_entity(entity: FfiEntity) -> Result<Entity, FfiResult> {
+    if entity.is_null() {
+        return Err(FfiResult::INVALID_ENTITY);
+    }
+    let Some(decoded) = Entity::try_from_bits(entity.to_bits()) else {
+        return Err(FfiResult::INVALID_ENTITY);
+    };
+    if decoded == Entity::PLACEHOLDER {
+        return Err(FfiResult::INVALID_ENTITY);
+    }
+    Ok(decoded)
+}
+
+/// Decodes an optional [`FfiEntity`] (`FfiEntity::NULL` -> `Ok(None)`), rejecting invalid/placeholder bits.
+#[inline]
+pub(crate) fn decode_optional_entity(entity: FfiEntity) -> Result<Option<Entity>, FfiResult> {
+    if entity.is_null() {
+        Ok(None)
+    } else {
+        decode_live_entity(entity).map(Some)
+    }
+}
+
+/// Validates a NUL-terminated non-empty UTF-8 C string pointer.
+///
+/// # Safety
+/// When non-null, `ptr` must point to a valid NUL-terminated C string readable for `'a`.
+#[inline]
+pub(crate) unsafe fn validate_non_empty_cstr<'a>(ptr: *const c_char) -> Result<&'a str, FfiResult> {
+    if ptr.is_null() {
+        return Err(FfiResult::NULL_POINTER);
+    }
+    // SAFETY: Caller guarantees `ptr` points to a valid NUL-terminated C string for `'a`.
+    let Ok(s) = (unsafe { CStr::from_ptr(ptr) }).to_str() else {
+        return Err(FfiResult::INVALID_UTF8);
+    };
+    if s.is_empty() {
+        return Err(FfiResult::INVALID_ARGUMENT);
+    }
+    Ok(s)
+}
+
+/// Validates a required aligned writable output pointer and initializes it to `default`.
+///
+/// # Safety
+/// When non-null and aligned, `ptr` must point to valid writable `T` storage.
+#[inline]
+pub(crate) unsafe fn init_out_ptr<'a, T>(ptr: *mut T, default: T) -> Result<&'a mut T, FfiResult> {
+    if ptr.is_null() {
+        return Err(FfiResult::NULL_POINTER);
+    }
+    if !ptr.is_aligned() {
+        return Err(FfiResult::INVALID_ARGUMENT);
+    }
+    // SAFETY: `ptr` is non-null, aligned, and caller guarantees writable `T` storage.
+    unsafe {
+        *ptr = default;
+        Ok(&mut *ptr)
+    }
+}
+
+/// Validates an optional aligned writable output pointer and initializes it to `default` if non-null.
+///
+/// # Safety
+/// When non-null and aligned, `ptr` must point to valid writable `T` storage.
+#[inline]
+pub(crate) unsafe fn init_opt_out_ptr<'a, T>(
+    ptr: *mut T,
+    default: T,
+) -> Result<Option<&'a mut T>, FfiResult> {
+    if ptr.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: Non-null check performed above; caller upholds writable storage contract.
+    unsafe { init_out_ptr(ptr, default) }.map(Some)
+}
+
+/// Acquires a [`Mutex`] guard, recovering cleanly from mutex poisoning.
+#[inline]
+pub(crate) fn lock_unpoison<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Acquires an [`RwLock`] read guard, recovering cleanly from lock poisoning.
+#[inline]
+pub(crate) fn read_unpoison<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Acquires an [`RwLock`] write guard, recovering cleanly from lock poisoning.
+#[inline]
+pub(crate) fn write_unpoison<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// RAII aligned heap byte buffer for dynamic component/event scratch storage and FFI transfers.
+pub(crate) struct AlignedBuf {
+    ptr: NonNull<u8>,
+    layout: Layout,
+}
+
+impl AlignedBuf {
+    #[inline]
+    fn dangling_for(layout: Layout) -> NonNull<u8> {
+        let align = NonZeroUsize::new(layout.align()).unwrap_or(NonZeroUsize::MIN);
+        NonNull::without_provenance(align)
+    }
+
+    /// Allocates a zero-initialized buffer matching `layout` (no heap allocation for ZSTs).
+    pub(crate) fn from_layout_zeroed(layout: Layout) -> Self {
+        if layout.size() == 0 {
+            return Self {
+                ptr: Self::dangling_for(layout),
+                layout,
+            };
+        }
+        // SAFETY: `layout.size() > 0` and `layout.align()` is a valid power of two.
+        let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+        let Some(ptr) = NonNull::new(raw) else {
+            std::alloc::handle_alloc_error(layout);
+        };
+        Self { ptr, layout }
+    }
+
+    /// Allocates a zero-initialized buffer for `(size, align)` (clamping `align` to `>= 1`).
+    pub(crate) fn new_zeroed(size: usize, align: usize) -> Result<Self, FfiResult> {
+        let layout =
+            Layout::from_size_align(size, align.max(1)).map_err(|_| FfiResult::INVALID_ARGUMENT)?;
+        Ok(Self::from_layout_zeroed(layout))
+    }
+
+    /// Allocates an aligned buffer and copies `size` bytes from `src`.
+    ///
+    /// # Safety
+    /// If `size > 0`, `src` must be non-null and readable for `size` bytes.
+    pub(crate) unsafe fn copy_from(
+        src: *const u8,
+        size: usize,
+        align: usize,
+    ) -> Result<Self, FfiResult> {
+        let layout =
+            Layout::from_size_align(size, align.max(1)).map_err(|_| FfiResult::INVALID_ARGUMENT)?;
+        if size == 0 {
+            return Ok(Self {
+                ptr: Self::dangling_for(layout),
+                layout,
+            });
+        }
+        if src.is_null() {
+            return Err(FfiResult::NULL_POINTER);
+        }
+        // SAFETY: `size > 0` and `layout.align()` is a valid power of two.
+        let raw = unsafe { std::alloc::alloc(layout) };
+        let Some(ptr) = NonNull::new(raw) else {
+            std::alloc::handle_alloc_error(layout);
+        };
+        // SAFETY: Caller guarantees `src` is readable for `size` bytes; `ptr` is freshly
+        // allocated for `size` writable bytes and does not overlap `src`.
+        unsafe {
+            core::ptr::copy_nonoverlapping(src, ptr.as_ptr(), size);
+        }
+        Ok(Self { ptr, layout })
+    }
+
+    #[inline]
+    pub(crate) fn as_ptr(&self) -> *const u8 {
+        self.ptr.as_ptr().cast_const()
+    }
+
+    #[inline]
+    pub(crate) fn as_mut_ptr(&self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+
+    #[inline]
+    pub(crate) fn as_mut_c_void(&self) -> *mut c_void {
+        self.ptr.as_ptr().cast::<c_void>()
+    }
+
+    #[inline]
+    pub(crate) fn non_null(&self) -> NonNull<u8> {
+        self.ptr
+    }
+
+    #[inline]
+    pub(crate) fn as_ptr_mut(&mut self) -> PtrMut<'_> {
+        // SAFETY: `self.ptr` is aligned to `self.layout.align()` and points to `self.layout.size()`
+        // initialized bytes owned exclusively by `&mut self`.
+        unsafe { PtrMut::new(self.ptr) }
+    }
+}
+
+impl Drop for AlignedBuf {
+    fn drop(&mut self) {
+        if self.layout.size() > 0 {
+            // SAFETY: `self.ptr` was allocated with `std::alloc::alloc`/`alloc_zeroed(self.layout)`.
+            unsafe {
+                std::alloc::dealloc(self.ptr.as_ptr(), self.layout);
+            }
+        }
+    }
+}
+
+// SAFETY: `AlignedBuf` uniquely owns its heap buffer of raw bytes.
+unsafe impl Send for AlignedBuf {}
+// SAFETY: Shared references expose no interior mutability on the owned byte buffer.
+unsafe impl Sync for AlignedBuf {}
+
 /// Concrete world-scoped registry and diagnostic context backing opaque [`BamHostCtx`].
 ///
 /// Embedded inside `LoadContext` during `bevy_abi_mod_init` and inside `HostSystemCtx` during
@@ -296,10 +624,8 @@ pub unsafe extern "C" fn host_last_error(
     buf: *mut c_char,
     cap: usize,
 ) -> usize {
-    // SAFETY: Validating `ctx` against `HOST_CTX_MAGIC` unconditionally (`always_check = true`).
-    let Ok(host_ctx) =
-        (unsafe { validate_handle_ref::<HostContext>(ctx.cast::<c_void>(), HOST_CTX_MAGIC, true) })
-    else {
+    // SAFETY: Unconditionally validates `ctx` against `HOST_CTX_MAGIC`.
+    let Ok(host_ctx) = (unsafe { validate_host_ctx(ctx) }) else {
         return 0;
     };
 

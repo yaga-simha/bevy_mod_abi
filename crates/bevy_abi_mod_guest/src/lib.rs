@@ -130,7 +130,7 @@ pub use bevy_abi_mod_sys::{
 };
 
 #[cfg(feature = "derive")]
-pub use bevy_abi_mod_macros::{AbiPod, ModComponent};
+pub use bevy_abi_mod_macros::{AbiPod, GuestComponent, ModComponent};
 
 pub use app::{
     GuestApp, GuestComponentOptions, GuestRes, GuestResMut, IntoSystemResult, ObserverBuilder,
@@ -179,14 +179,19 @@ mod tests {
         use crate::prelude::*;
 
         #[repr(C)]
-        #[derive(Clone, Copy, Debug, PartialEq, AbiPod)]
+        #[derive(Clone, Copy, Debug, PartialEq, AbiPod, GuestComponent)]
+        #[guest_component(name = "demo::DerivedVec2", no_schema_hash)]
         struct DerivedVec2 {
             x: f32,
             y: f32,
         }
 
-        impl GuestComponent for DerivedVec2 {
-            const NAME: &'static core::ffi::CStr = c"demo::DerivedVec2";
+        #[repr(C)]
+        #[derive(Clone, Copy, Debug, PartialEq, ModComponent)]
+        #[mod_component(name = "demo::ShorthandVec2", summary_tick, guest)]
+        struct ShorthandVec2 {
+            x: f32,
+            y: f32,
         }
 
         #[test]
@@ -197,7 +202,15 @@ mod tests {
                 core::mem::align_of::<DerivedVec2>(),
                 0,
             );
-            assert_eq!(DerivedVec2::UUID, expected);
+            assert_eq!(<DerivedVec2 as GuestComponent>::UUID, expected);
+            assert_eq!(
+                <ShorthandVec2 as GuestComponent>::UUID,
+                <ShorthandVec2 as ModComponent>::UUID
+            );
+            assert_eq!(
+                <ShorthandVec2 as GuestComponent>::FLAGS,
+                BAM_COMPONENT_FLAG_SUMMARY_TICK
+            );
         }
     }
 

@@ -8,29 +8,39 @@ use bevy_abi_mod_host_sys::LoadOptions;
 use bevy_abi_mod_render::prelude::*;
 use bevy_abi_mod_render::{
     build_quad_mesh_2d, register_mod_extended_sprite_material_in_world,
-    resolve_wesl_sprite_specialization,
+    reset_mod_sprite_materials_on_render_startup, resolve_wesl_sprite_specialization,
 };
 use bevy_app::{App, AppLabel, TaskPoolPlugin};
-use bevy_asset::{AssetPlugin, Assets, Handle};
+use bevy_asset::{AssetPlugin, AssetServer, Assets, Handle};
 use bevy_ecs::entity::Entity;
+use bevy_ecs::schedule::IntoScheduleConfigs;
+use bevy_extract::ExtractSchedule;
 use bevy_extract::sync_world::MainEntity;
 use bevy_material::descriptor::{
-    BindGroupLayoutDescriptor, MeshPipelineDescriptor, MeshState, RenderPipelineDescriptor,
+    BindGroupLayoutDescriptor, CachedRenderPipelineId, MeshPipelineDescriptor, MeshState,
+    RenderPipelineDescriptor,
 };
-use bevy_render::RenderApp;
-use bevy_render::camera::DirtySpecializations;
+use bevy_pbr::ViewKeyCache as PbrViewKeyCache;
+use bevy_render::camera::{
+    DirtySpecializationSystems, DirtySpecializations, clear_dirty_specializations,
+};
+use bevy_render::material_bind_groups::MaterialBindGroupAllocators;
 use bevy_render::mesh::{BaseMeshPipelineKey, Mesh, Mesh2d, MeshVertexBufferLayouts};
 use bevy_render::render_resource::{
-    AsBindGroup, ColorTargetState, ColorWrites, PrimitiveState, SpecializedMeshPipeline,
-    TextureFormat, WgpuFeatures,
+    AsBindGroup, ColorTargetState, ColorWrites, PipelineCache, PrimitiveState,
+    SpecializedMeshPipeline, SpecializedMeshPipelines, TextureFormat, WgpuFeatures,
 };
+use bevy_render::settings::{Backends, RenderResources, WgpuSettings};
 use bevy_render::storage::{ShaderBuffer, ShaderBufferData};
+use bevy_render::view::RetainedViewEntity;
+use bevy_render::{RenderApp, RenderStartup};
 use bevy_shader::{Shader, ShaderDefVal, Source, ValidateShader};
 use bevy_sprite::{Anchor, Sprite, SpriteAlphaMode};
 use bevy_sprite_render::{
     AlphaMode2d, EntitiesNeedingSpecialization, Material2d, Material2dKey, Material2dPipeline,
-    MaterialExtension2d, Mesh2dPipeline, Mesh2dPipelineKey, MeshMaterial2d, SpriteMaterial,
-    SpriteMeshMaterial,
+    Material2dPipelineSpecializer, MaterialExtension2d, Mesh2dPipeline, Mesh2dPipelineKey,
+    MeshMaterial2d, SpecializedMaterial2dPipelineCache, SpriteMaterial, SpriteMeshMaterial,
+    ViewKeyCache as SpriteViewKeyCache,
 };
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::borrow::Cow;
@@ -50,6 +60,11 @@ fn fixture_dylib(stem: &str) -> PathBuf {
     let dir = std::env::var_os("BAM_FIXTURE_DIR")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("CARGO_TARGET_DIR")
+                .filter(|v| !v.is_empty())
+                .map(|d| PathBuf::from(d).join("fixtures"))
+        })
         .unwrap_or_else(|| workspace_root().join("target").join("fixtures"));
     let (prefix, ext) = if cfg!(target_os = "windows") {
         ("", "dll")
@@ -1465,4 +1480,488 @@ fn independent_worlds_with_colliding_shader_asset_indices_do_not_evict_each_othe
     )
     .expect("specialize surviving app_a extension");
     assert_eq!(desc.fragment.as_ref().unwrap().shader, shader_a);
+}
+
+#[test]
+fn render_startup_clears_stale_mesh_pipelines_and_reextracts_cleanly() {
+    let dylib = TempDylibCopy::new(&fixture_dylib("ordered_sets_mod"), "mesh_render_startup");
+
+    let mut app = App::new();
+    app.add_plugins((
+        AbiModPlugin,
+        ModSubAppPlugin::<RenderApp>::default(),
+        ModSubAppPlugin::<CustomMeshRenderApp>::default(),
+        ModWeslMaterialPlugin,
+        ModMeshShaderPlugin::default(),
+        ModMeshShaderSubAppPlugin::<CustomMeshRenderApp>::default(),
+    ));
+
+    let mod_id = app
+        .load_mod_with(dylib.path(), LoadOptions::new().with_shadow_copy(true))
+        .expect("load mod");
+    let mesh_1 = app
+        .register_mod_wesl_shader(
+            mod_id,
+            WeslShaderAssetSpec::from_wesl("mesh_1", "mods/rs/mesh1.wesl", "@mesh fn m1() {}"),
+        )
+        .expect("register mesh_1");
+    let mesh_2 = app
+        .register_mod_wesl_shader(
+            mod_id,
+            WeslShaderAssetSpec::from_wesl("mesh_2", "mods/rs/mesh2.wesl", "@mesh fn m2() {}"),
+        )
+        .expect("register mesh_2");
+
+    let pipe_1 = app
+        .register_mod_mesh_pipeline(mod_id, ModMeshPipelineSpec::new("rs_pipe_1", mesh_1))
+        .expect("register pipe_1");
+    let pipe_2 = app
+        .register_mod_mesh_pipeline(mod_id, ModMeshPipelineSpec::new("rs_pipe_2", mesh_2))
+        .expect("register pipe_2");
+
+    // Frame 1: Extract pipelines into both RenderApp and CustomMeshRenderApp.
+    app.update();
+    for extracted in [
+        app.get_sub_app(RenderApp)
+            .unwrap()
+            .world()
+            .resource::<ExtractedModMeshPipelines>(),
+        app.get_sub_app(CustomMeshRenderApp)
+            .unwrap()
+            .world()
+            .resource::<ExtractedModMeshPipelines>(),
+    ] {
+        assert_eq!(extracted.len(), 2);
+        assert_eq!(extracted.recovery_epoch(), 0);
+        assert_eq!(extracted.last_reset_cleared_count(), 0);
+        assert!(extracted.contains(pipe_1));
+        assert!(extracted.contains(pipe_2));
+    }
+
+    // Simulate `RenderStartup` firing on both sub-apps (device-loss recovery / shader reload).
+    app.get_sub_app_mut(RenderApp)
+        .unwrap()
+        .world_mut()
+        .run_schedule(RenderStartup);
+    app.get_sub_app_mut(CustomMeshRenderApp)
+        .unwrap()
+        .world_mut()
+        .run_schedule(RenderStartup);
+
+    for extracted in [
+        app.get_sub_app(RenderApp)
+            .unwrap()
+            .world()
+            .resource::<ExtractedModMeshPipelines>(),
+        app.get_sub_app(CustomMeshRenderApp)
+            .unwrap()
+            .world()
+            .resource::<ExtractedModMeshPipelines>(),
+    ] {
+        assert!(
+            extracted.is_empty(),
+            "RenderStartup must clear active cached mesh pipelines"
+        );
+        assert_eq!(extracted.recovery_epoch(), 1);
+        assert_eq!(extracted.last_reset_cleared_count(), 2);
+        assert!(
+            extracted.evicted_pipeline_ids().is_empty(),
+            "RenderStartup reset must not pollute unload eviction telemetry"
+        );
+        assert!(extracted.evicted_shader_ids().is_empty());
+    }
+
+    // Next ExtractSchedule re-extracts all live mod mesh pipelines cleanly.
+    app.update();
+    for extracted in [
+        app.get_sub_app(RenderApp)
+            .unwrap()
+            .world()
+            .resource::<ExtractedModMeshPipelines>(),
+        app.get_sub_app(CustomMeshRenderApp)
+            .unwrap()
+            .world()
+            .resource::<ExtractedModMeshPipelines>(),
+    ] {
+        assert_eq!(extracted.len(), 2);
+        assert_eq!(extracted.recovery_epoch(), 1);
+        assert!(extracted.contains(pipe_1));
+        assert!(extracted.contains(pipe_2));
+    }
+
+    // A second RenderStartup cycle advances recovery_epoch to 2 and re-extracts cleanly again.
+    app.get_sub_app_mut(RenderApp)
+        .unwrap()
+        .world_mut()
+        .run_schedule(RenderStartup);
+    app.update();
+    {
+        let extracted = app
+            .get_sub_app(RenderApp)
+            .unwrap()
+            .world()
+            .resource::<ExtractedModMeshPipelines>();
+        assert_eq!(extracted.len(), 2);
+        assert_eq!(extracted.recovery_epoch(), 2);
+        assert_eq!(extracted.last_reset_cleared_count(), 2);
+    }
+
+    // Mod unload still evicts and records eviction telemetry accurately afterwards.
+    app.unload_mod(mod_id).expect("unload mod");
+    app.update();
+    {
+        let extracted = app
+            .get_sub_app(RenderApp)
+            .unwrap()
+            .world()
+            .resource::<ExtractedModMeshPipelines>();
+        assert!(extracted.is_empty());
+        assert_eq!(extracted.evicted_pipeline_ids().len(), 2);
+        assert!(extracted.evicted_pipeline_ids().contains(&pipe_1));
+        assert!(extracted.evicted_pipeline_ids().contains(&pipe_2));
+    }
+}
+
+#[test]
+fn pipeline_cache_swap_on_render_startup_requeues_fresh_cached_pipeline_ids() {
+    let Ok(RenderResources(device, ..)) = std::panic::catch_unwind(|| {
+        bevy_platform::future::block_on(bevy_render::renderer::initialize_renderer(
+            Backends::all(),
+            None,
+            &WgpuSettings::default(),
+        ))
+    }) else {
+        // Skip only in GPU-less environments lacking even a software wgpu adapter;
+        // `render_startup_clears_stale_mesh_pipelines_and_reextracts_cleanly` still exercises
+        // RenderStartup clearing headlessly everywhere.
+        return;
+    };
+
+    let dylib = TempDylibCopy::new(&fixture_dylib("ordered_sets_mod"), "pipeline_cache_swap");
+
+    let mut app = App::new();
+    app.add_plugins((
+        TaskPoolPlugin::default(),
+        AssetPlugin::default(),
+        AbiModPlugin,
+        ModSubAppPlugin::<RenderApp>::default(),
+        ModWeslMaterialPlugin,
+        ModSpriteMaterialPlugin::default(),
+        ModMeshShaderPlugin::new(
+            ModMeshShaderConfig::enabled().with_required_wgpu_features(WgpuFeatures::empty()),
+        ),
+        ModRenderRecoveryPlugin::default(),
+    ));
+
+    let mod_id = app
+        .load_mod_with(dylib.path(), LoadOptions::new().with_shadow_copy(true))
+        .expect("load mod");
+    let mesh_1 = app
+        .register_mod_wesl_shader(
+            mod_id,
+            WeslShaderAssetSpec::from_wesl("swap_m1", "mods/swap/m1.wesl", "@mesh fn m1() {}"),
+        )
+        .expect("register mesh_1");
+    let mesh_2 = app
+        .register_mod_wesl_shader(
+            mod_id,
+            WeslShaderAssetSpec::from_wesl("swap_m2", "mods/swap/m2.wesl", "@mesh fn m2() {}"),
+        )
+        .expect("register mesh_2");
+
+    let pipe_1 = app
+        .register_mod_mesh_pipeline(mod_id, ModMeshPipelineSpec::new("recovery_mesh_1", mesh_1))
+        .expect("register pipe_1");
+    let pipe_2 = app
+        .register_mod_mesh_pipeline(mod_id, ModMeshPipelineSpec::new("recovery_mesh_2", mesh_2))
+        .expect("register pipe_2");
+
+    // Seed RenderApp with a live RenderDevice, AssetServer, MaterialBindGroupAllocators, and
+    // PipelineCache #1 pre-populated with 3 dummy pipelines so our mod mesh pipelines receive
+    // IDs >= 3 (out of range for a fresh cache!).
+    {
+        let asset_server = app.world().resource::<AssetServer>().clone();
+        let cache_v1 = PipelineCache::new(device.clone(), false);
+        for _ in 0..3 {
+            let _ = cache_v1.queue_render_pipeline(RenderPipelineDescriptor::default());
+        }
+        let render_world = app.get_sub_app_mut(RenderApp).unwrap().world_mut();
+        render_world.insert_resource(asset_server);
+        render_world.init_resource::<MaterialBindGroupAllocators>();
+        render_world.insert_resource(device.clone());
+        render_world.insert_resource(cache_v1);
+    }
+
+    // Frame 1: Extract queues both mod mesh pipelines on PipelineCache #1.
+    app.update();
+    let (old_id_1, old_id_2) = {
+        let render_world = app.get_sub_app(RenderApp).unwrap().world();
+        let extracted = render_world.resource::<ExtractedModMeshPipelines>();
+        assert_eq!(extracted.len(), 2);
+        assert_eq!(extracted.recovery_epoch(), 0);
+        let id1 = extracted
+            .get(pipe_1)
+            .and_then(|e| e.cached_pipeline_id)
+            .expect("pipe_1 queued on PipelineCache #1");
+        let id2 = extracted
+            .get(pipe_2)
+            .and_then(|e| e.cached_pipeline_id)
+            .expect("pipe_2 queued on PipelineCache #1");
+        assert!(id1.id() >= 3 && id2.id() >= 3);
+        (id1, id2)
+    };
+
+    // Simulate GPU device loss recovery: unpack brand-new PipelineCache #2 and run RenderStartup.
+    {
+        let render_world = app.get_sub_app_mut(RenderApp).unwrap().world_mut();
+        render_world.insert_resource(PipelineCache::new(device, false));
+        render_world.run_schedule(RenderStartup);
+
+        let extracted = render_world.resource::<ExtractedModMeshPipelines>();
+        assert!(extracted.is_empty());
+        assert_eq!(extracted.recovery_epoch(), 1);
+        assert_eq!(extracted.last_reset_cleared_count(), 2);
+        assert!(extracted.evicted_pipeline_ids().is_empty());
+        assert_eq!(
+            render_world
+                .resource::<ModRenderRecoveryRenderState>()
+                .render_startup_generations(),
+            1,
+            "RenderStartup must also run sprite/material recovery reset once"
+        );
+    }
+
+    // Frame 2: ExtractSchedule re-queues both live pipelines onto PipelineCache #2 with fresh IDs.
+    app.update();
+    {
+        let render_world = app.get_sub_app_mut(RenderApp).unwrap().world_mut();
+        let (new_id_1, new_id_2) = {
+            let extracted = render_world.resource::<ExtractedModMeshPipelines>();
+            assert_eq!(extracted.len(), 2);
+            assert_eq!(extracted.recovery_epoch(), 1);
+            let id1 = extracted
+                .get(pipe_1)
+                .and_then(|e| e.cached_pipeline_id)
+                .expect("pipe_1 re-queued on PipelineCache #2");
+            let id2 = extracted
+                .get(pipe_2)
+                .and_then(|e| e.cached_pipeline_id)
+                .expect("pipe_2 re-queued on PipelineCache #2");
+            assert_ne!(id1, old_id_1);
+            assert_ne!(id2, old_id_2);
+            assert!(id1.id() < 2 && id2.id() < 2);
+            (id1, id2)
+        };
+
+        let mut cache_v2 = render_world.resource_mut::<PipelineCache>();
+        cache_v2.process_queue();
+        assert_eq!(
+            cache_v2
+                .get_mesh_pipeline_descriptor(new_id_1)
+                .label
+                .as_deref(),
+            Some("recovery_mesh_1")
+        );
+        assert_eq!(
+            cache_v2
+                .get_mesh_pipeline_descriptor(new_id_2)
+                .label
+                .as_deref(),
+            Some("recovery_mesh_2")
+        );
+    }
+
+    // Verify recovery also re-checks queueing eligibility (e.g. if auto_queue / device features change).
+    app.world_mut()
+        .resource_mut::<ModMeshShaderConfig>()
+        .auto_queue_in_render_app = false;
+    app.get_sub_app_mut(RenderApp)
+        .unwrap()
+        .world_mut()
+        .run_schedule(RenderStartup);
+    app.update();
+    {
+        let extracted = app
+            .get_sub_app(RenderApp)
+            .unwrap()
+            .world()
+            .resource::<ExtractedModMeshPipelines>();
+        assert_eq!(extracted.recovery_epoch(), 2);
+        assert_eq!(extracted.get(pipe_1).unwrap().cached_pipeline_id, None);
+        assert_eq!(extracted.get(pipe_2).unwrap().cached_pipeline_id, None);
+    }
+
+    app.unload_mod(mod_id).expect("unload mod");
+}
+
+#[test]
+fn render_startup_clears_2d_view_keys_and_redirties_mod_sprite_materials() {
+    let dylib = TempDylibCopy::new(&fixture_dylib("ordered_sets_mod"), "sprite_render_startup");
+
+    let mut app = App::new();
+    app.add_plugins((
+        TaskPoolPlugin::default(),
+        AssetPlugin::default(),
+        AbiModPlugin,
+        ModSubAppPlugin::<RenderApp>::default(),
+        ModWeslMaterialPlugin,
+        ModSpriteMaterialPlugin::default(),
+    ));
+
+    // Mirror CameraPlugin's DirtySpecializationSystems::Clear -> CheckForChanges ordering.
+    {
+        let render_app = app.get_sub_app_mut(RenderApp).expect("RenderApp present");
+        render_app.configure_sets(
+            ExtractSchedule,
+            DirtySpecializationSystems::Clear.before(DirtySpecializationSystems::CheckForChanges),
+        );
+        render_app.add_systems(
+            ExtractSchedule,
+            clear_dirty_specializations.in_set(DirtySpecializationSystems::Clear),
+        );
+    }
+
+    let mod_id = app
+        .load_mod_with(dylib.path(), LoadOptions::new().with_shadow_copy(true))
+        .expect("load mod");
+    let frag = app
+        .register_mod_wesl_shader(
+            mod_id,
+            WeslShaderAssetSpec::from_wesl(
+                "sprite_rs_fs",
+                "mods/sprite_rs/fs.wesl",
+                "@fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }",
+            ),
+        )
+        .expect("register fragment shader");
+    let sprite_ext = app
+        .register_mod_wesl_sprite_extension(
+            mod_id,
+            ModWeslSpriteExtensionSpec::new("sprite_rs_ext").with_fragment_shader(frag.clone()),
+        )
+        .expect("register sprite extension");
+    let ext2d = app
+        .register_mod_wesl_extended_sprite_material(
+            mod_id,
+            ModExtendedSpriteMaterialSpec::new("ext2d_rs").with_fragment_shader(frag),
+        )
+        .expect("register extended 2d material");
+
+    let sprite_entity = app
+        .spawn_mod_sprite_with_material(
+            mod_id,
+            ModUnifiedSpriteSpec::new().with_sync_to_render_world(true),
+            sprite_ext,
+        )
+        .expect("spawn unified sprite");
+    let ext2d_entity = app
+        .spawn_mod_extended_mesh_sprite(
+            mod_id,
+            ModUnifiedSpriteSpec::new().with_sync_to_render_world(true),
+            ext2d,
+        )
+        .expect("spawn extended 2d mesh sprite");
+
+    // Warm up until initial spawn + `SpriteMaterialPlugin` deferred `MeshMaterial2d` insertion +
+    // `AssetChanged` propagation have settled into a clean steady-state frame.
+    for _ in 0..4 {
+        app.update();
+    }
+
+    {
+        let render_world = app.get_sub_app_mut(RenderApp).unwrap().world_mut();
+        let dirty_before = render_world
+            .resource::<DirtySpecializations>()
+            .changed_renderables
+            .clone();
+        assert!(
+            dirty_before.is_empty(),
+            "steady-state frame should have empty DirtySpecializations, got {dirty_before:?}"
+        );
+
+        // Populate synthetic cached GPU handles across 2D & 3D caches as if rendered before loss.
+        let mut sprite_view_keys = SpriteViewKeyCache::default();
+        sprite_view_keys.insert(
+            MainEntity::from(Entity::PLACEHOLDER),
+            Mesh2dPipelineKey::NONE,
+        );
+        render_world.insert_resource(sprite_view_keys);
+
+        let mut spec_cache = SpecializedMaterial2dPipelineCache::default();
+        let view_entity = RetainedViewEntity::new(MainEntity::from(Entity::PLACEHOLDER), None, 0);
+        spec_cache.entry(view_entity).or_default().insert(
+            MainEntity::from(ext2d_entity),
+            CachedRenderPipelineId::new(42),
+        );
+        render_world.insert_resource(spec_cache);
+
+        render_world.init_resource::<SpecializedMeshPipelines<Material2dPipelineSpecializer>>();
+        render_world.init_resource::<SpecializedMeshPipelines<Mesh2dPipeline>>();
+
+        let mut pbr_view_keys = PbrViewKeyCache::default();
+        pbr_view_keys.insert(view_entity, bevy_pbr::MeshPipelineKey::empty());
+        render_world.insert_resource(pbr_view_keys);
+    }
+
+    // Run our RenderStartup cache invalidation system (in a full RenderPlugin app this runs
+    // automatically inside the `RenderStartup` schedule alongside Bevy's GPU startup systems;
+    // headless RenderApp lacks `RenderDevice` required by Bevy's `Material2dPlugin` startup hook).
+    {
+        let render_world = app.get_sub_app_mut(RenderApp).unwrap().world_mut();
+        reset_mod_sprite_materials_on_render_startup(render_world);
+
+        assert!(render_world.resource::<SpriteViewKeyCache>().is_empty());
+        assert!(
+            render_world
+                .resource::<SpecializedMaterial2dPipelineCache>()
+                .is_empty()
+        );
+        assert!(render_world.resource::<PbrViewKeyCache>().is_empty());
+
+        let state = render_world.resource::<ModRenderRecoveryRenderState>();
+        assert_eq!(state.render_startup_generations(), 1);
+        assert!(state.pending_force_dirty_2d_materials());
+        assert_eq!(state.last_invalidation().sprite_view_keys_cleared, 1);
+        assert_eq!(state.last_invalidation().sprite_material_caches_cleared, 1);
+        assert!(state.last_invalidation().material2d_specializer_reset);
+        assert!(state.last_invalidation().mesh2d_specializer_reset);
+        assert_eq!(state.last_invalidation().pbr_view_keys_cleared, 1);
+    }
+
+    // Frame 3 (with ZERO main-world mutations): ExtractSchedule must force-dirty both unchanged
+    // mod 2D material entities AFTER DirtySpecializationSystems::Clear runs!
+    app.update();
+    {
+        let render_world = app.get_sub_app(RenderApp).unwrap().world();
+        let dirty = render_world.resource::<DirtySpecializations>();
+        assert!(
+            dirty
+                .changed_renderables
+                .contains(&MainEntity::from(sprite_entity)),
+            "unchanged SpriteMaterial entity must be re-dirtied after RenderStartup"
+        );
+        assert!(
+            dirty
+                .changed_renderables
+                .contains(&MainEntity::from(ext2d_entity)),
+            "unchanged ModExtendedSpriteMaterial2d entity must be re-dirtied after RenderStartup"
+        );
+        let state = render_world.resource::<ModRenderRecoveryRenderState>();
+        assert!(!state.pending_force_dirty_2d_materials());
+        assert!(state.last_requeued_2d_entities() >= 2);
+    }
+
+    // Frame 4: One-shot flag is consumed; steady-state frame stays clean with zero churn.
+    app.update();
+    {
+        let render_world = app.get_sub_app(RenderApp).unwrap().world();
+        assert!(
+            render_world
+                .resource::<DirtySpecializations>()
+                .changed_renderables
+                .is_empty()
+        );
+    }
+
+    app.unload_mod(mod_id).expect("unload mod");
 }

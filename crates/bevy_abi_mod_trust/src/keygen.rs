@@ -1,6 +1,7 @@
 //! Ed25519 OpenSSH keypair generation and cross-platform certificate issuance (`keygen` feature).
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use signature::Signer;
@@ -36,8 +37,20 @@ pub struct IssuedCertificate {
     pub ca_fingerprint: String,
 }
 
+fn contains_ascii_control(s: &str) -> bool {
+    s.bytes().any(|b| b < 0x20 || b == 0x7F)
+}
+
 /// Generates a fresh Ed25519 OpenSSH [`PrivateKey`] in memory.
 pub fn generate_ed25519_keypair(comment: Option<&str>) -> Result<PrivateKey, ModSigningError> {
+    if let Some(c) = comment
+        && contains_ascii_control(c)
+    {
+        return Err(ModSigningError::Encoding {
+            detail: "OpenSSH key comment must not contain NUL or ASCII control characters"
+                .to_owned(),
+        });
+    }
     let mut key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).map_err(|e| {
         ModSigningError::Signing {
             detail: format!("failed to generate Ed25519 keypair: {e}"),
@@ -49,11 +62,31 @@ pub fn generate_ed25519_keypair(comment: Option<&str>) -> Result<PrivateKey, Mod
     Ok(key)
 }
 
-/// Generates an OpenSSH Ed25519 keypair and writes `<out_prefix>` and `<out_prefix>.pub`.
+/// Generates an OpenSSH Ed25519 keypair and writes `<out_prefix>` and `<out_prefix>.pub`,
+/// refusing to overwrite existing key files.
 pub fn write_openssh_keypair(
     out_prefix: &Path,
     comment: Option<&str>,
 ) -> Result<GeneratedKeypair, ModTrustConfigError> {
+    let mut pub_os = out_prefix.as_os_str().to_os_string();
+    pub_os.push(".pub");
+    let pub_path = PathBuf::from(pub_os);
+
+    for existing in [out_prefix, pub_path.as_path()] {
+        if fs::symlink_metadata(existing).is_ok() {
+            return Err(ModTrustConfigError::Io {
+                path: existing.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "refusing to overwrite existing key file '{}'",
+                        existing.display()
+                    ),
+                ),
+            });
+        }
+    }
+
     if let Some(parent) = out_prefix.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -75,9 +108,6 @@ pub fn write_openssh_keypair(
             source: std::io::Error::other(e.to_string()),
         })?;
 
-    let mut pub_os = out_prefix.as_os_str().to_os_string();
-    pub_os.push(".pub");
-    let pub_path = PathBuf::from(pub_os);
     let mut pub_text =
         key.public_key()
             .to_openssh()
@@ -85,10 +115,19 @@ pub fn write_openssh_keypair(
                 detail: e.to_string(),
             })?;
     pub_text.push('\n');
-    fs::write(&pub_path, pub_text.as_bytes()).map_err(|source| ModTrustConfigError::Io {
-        path: pub_path.clone(),
-        source,
-    })?;
+
+    let write_pub_res = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&pub_path)
+        .and_then(|mut f| f.write_all(pub_text.as_bytes()));
+    if let Err(source) = write_pub_res {
+        let _ = fs::remove_file(out_prefix);
+        return Err(ModTrustConfigError::Io {
+            path: pub_path,
+            source,
+        });
+    }
 
     let fingerprint = key.public_key().fingerprint(HashAlg::Sha256).to_string();
     Ok(GeneratedKeypair {
@@ -119,6 +158,20 @@ pub fn issue_ed25519_certificate_openssh(
         return Err(ModSigningError::UnsupportedAlgorithm {
             detail: format!("subject key uses '{}'", subject_pubkey.algorithm()),
         });
+    }
+    if contains_ascii_control(key_id) {
+        return Err(ModSigningError::Encoding {
+            detail: "certificate key_id must not contain NUL or ASCII control characters"
+                .to_owned(),
+        });
+    }
+    for p in principals {
+        if contains_ascii_control(p) {
+            return Err(ModSigningError::Encoding {
+                detail: "certificate principal must not contain NUL or ASCII control characters"
+                    .to_owned(),
+            });
+        }
     }
     if valid_after >= valid_before {
         return Err(ModSigningError::Encoding {
@@ -200,11 +253,9 @@ pub fn issue_ed25519_certificate_openssh(
             Base64Writer::new(&mut b64_buf).map_err(|e| ModSigningError::Encoding {
                 detail: e.to_string(),
             })?;
-        writer
-            .write(&cert_blob)
-            .map_err(|e| ModSigningError::Encoding {
-                detail: e.to_string(),
-            })?;
+        Writer::write(&mut writer, &cert_blob).map_err(|e| ModSigningError::Encoding {
+            detail: e.to_string(),
+        })?;
         writer.finish().map_err(|e| ModSigningError::Encoding {
             detail: e.to_string(),
         })?

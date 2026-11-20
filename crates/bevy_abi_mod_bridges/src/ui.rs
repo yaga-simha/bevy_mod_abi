@@ -36,12 +36,19 @@ use bevy_abi_mod_sys::{FfiAssetHandle, FfiBool, FfiEntity, FfiResult};
 use bevy_app::{App, Plugin, PostUpdate};
 use bevy_asset::uuid::Uuid;
 use bevy_asset::{Asset, AssetId, AssetIndex, AssetServer, Assets, Handle};
+#[cfg(feature = "bridge-feathers")]
+use bevy_asset::{AssetApp, AssetEvent, AssetLoadFailedEvent};
+#[cfg(feature = "bridge-feathers")]
+use bevy_color::Alpha;
 use bevy_color::Color;
 use bevy_ecs::change_detection::DetectChangesMut;
 use bevy_ecs::entity::Entity;
 use bevy_ecs::entity_disabling::Disabled;
+use bevy_ecs::error::{ErrorContext, error as log_ecs_error};
 use bevy_ecs::event::{EntityEvent, EntityTrigger, Event};
 use bevy_ecs::hierarchy::Children;
+#[cfg(feature = "bridge-feathers")]
+use bevy_ecs::message::Messages;
 use bevy_ecs::observer::On;
 use bevy_ecs::prelude::{
     Added, Changed, Commands, Component, Has, Or, Query, Res, ResMut, Resource,
@@ -58,32 +65,49 @@ use bevy_text::{
     InlineBox, InlineBoxKind, Justify, LineBreak, RemSize, TextColor, TextFont, TextLayout,
     TextReadWriteMode, TextSpan,
 };
-#[cfg(feature = "bridge-feathers")]
-use bevy_ui::Selected;
 use bevy_ui::widget::{InlineImage, Text};
 use bevy_ui::{
     AlignItems, BackgroundColor, BorderColor, BorderRadius, CornerRadius, Display, FixedNode,
     FlexDirection, FlexWrap, InteractionDisabled, JustifyContent, Node, PositionType, UiRect,
     UiSystems, Val,
 };
+#[cfg(feature = "bridge-feathers")]
+use bevy_ui::{Overflow, Selected, ZIndex};
 use bevy_ui_widgets::{
     Activate, ControlOrientation, MenuFocusSystem, SelectedTab, Tab, TabActivation, TabList,
     TabPlugin, TextInput, ValueChange,
 };
 
 #[cfg(feature = "bridge-feathers")]
+use bevy_ecs::bundle::BundleScratch;
+#[cfg(feature = "bridge-feathers")]
+use bevy_ecs::change_detection::DetectChanges;
+#[cfg(feature = "bridge-feathers")]
+use bevy_ecs::hierarchy::ChildOf;
+#[cfg(feature = "bridge-feathers")]
+use bevy_ecs::name::Name;
+#[cfg(feature = "bridge-feathers")]
+use bevy_ecs::query::Without;
+#[cfg(feature = "bridge-feathers")]
+use bevy_ecs::world::Ref;
+#[cfg(feature = "bridge-feathers")]
 use bevy_feathers::controls::{
-    ColorInputMode, ColorInputSettings, ColorInputValue, FeathersColorInput, FeathersListRow,
-    FeathersListView, FeathersNumberInput, FeathersSelect, HardLimit, NumberInputPrecision,
-    NumberInputRange, NumberInputStep, NumberInputValue, NumberInputWrap, OptionIndex,
-    ScrollbarGutter, SoftLimit,
+    AngleDegrees, ColorInputMode, ColorInputSettings, ColorInputValue, ColorSwatchFg,
+    Dimensionless, FeathersColorInput, FeathersColorInputProps, FeathersColorSwatch,
+    FeathersListRow, FeathersListView, FeathersListViewProps, FeathersMenuButton,
+    FeathersNumberInput, FeathersNumberInputProps, FeathersScrollbar, FeathersSelect,
+    FeathersSelectProps, HardLimit, LengthMeters, NumberInputPrecision, NumberInputRange,
+    NumberInputStep, NumberInputValue, NumberInputWrap, OptionIndex, ScrollbarGutter, SoftLimit,
+    TimeSeconds, UnitsRegistry,
 };
 #[cfg(feature = "bridge-feathers")]
 use bevy_feathers::rounded_corners::RoundedCorners;
 #[cfg(feature = "bridge-feathers")]
 use bevy_feathers::theme::{SurfaceLevel, ThemeContext, UiTheme};
 #[cfg(feature = "bridge-feathers")]
-use bevy_ui_widgets::{ListBox, ListItem, ScrollArea, SetSelected};
+use bevy_scene::{ResolvedSceneRoot, Scene, ScenePatch, bsn, bsn_list};
+#[cfg(feature = "bridge-feathers")]
+use bevy_ui_widgets::{ListBox, ScrollArea, Scrollbar, SetSelected};
 
 /// Canonical ABI name for bridged `bevy_ui::widget::Text`.
 pub const CANONICAL_UI_TEXT_NAME: &str = "bevy_ui::widget::text::Text";
@@ -2118,7 +2142,8 @@ impl Default for FfiFeathersScrollableList {
 }
 
 /// Fixed-layout `#[repr(C)]` `AbiPod` + `ModComponent` descriptor synchronized with Bevy `0.20`'s
-/// [`FeathersListRow`], [`ListItem`], optional [`OptionIndex`], and [`Selected`] state.
+/// [`FeathersListRow`], `bevy_ui_widgets::ListItem`, optional [`OptionIndex`], and [`Selected`]
+/// state.
 ///
 /// Layout: `8` bytes, `4`-byte alignment, zero implicit padding.
 #[cfg(feature = "bridge-feathers")]
@@ -2678,12 +2703,7 @@ pub fn register_ui_bridges(world: &mut World) -> Result<(), ComponentCollisionEr
     }
     #[cfg(feature = "bridge-feathers")]
     {
-        if !world.contains_resource::<UiTheme>() {
-            world.insert_resource(UiTheme::default());
-        }
-        if !world.contains_resource::<ColorInputSettings>() {
-            world.insert_resource(ColorInputSettings::default());
-        }
+        ensure_feathers_runtime_resources(world);
     }
 
     register_mod_unload_hook_in_world(world, UI_UNLOAD_HOOK_KEY, cleanup_mod_ui_hook);
@@ -2822,8 +2842,14 @@ pub struct ModUiBridgePlugin;
 
 impl Plugin for ModUiBridgePlugin {
     fn build(&self, app: &mut App) {
-        register_ui_bridges(app.world_mut())
-            .expect("ModUiBridgePlugin registration collided in ModRegistry");
+        if let Err(err) = register_ui_bridges(app.world_mut()) {
+            log_ecs_error(
+                err.into(),
+                ErrorContext::Command {
+                    name: "ModUiBridgePlugin::build".into(),
+                },
+            );
+        }
 
         if !app.is_plugin_added::<TabPlugin>() {
             app.add_plugins(TabPlugin);
@@ -2837,7 +2863,9 @@ impl Plugin for ModUiBridgePlugin {
                 ModUiBridgeSet::Sync
                     .before(UiSystems::Prepare)
                     .before(MenuFocusSystem),
-                ModUiBridgeSet::Mirror.after(InputFocusSystems::FocusChangeEvents),
+                ModUiBridgeSet::Mirror
+                    .after(ModUiBridgeSet::Sync)
+                    .after(InputFocusSystems::FocusChangeEvents),
                 ModUiBridgeSet::Track.after(ModUiBridgeSet::Sync),
             ),
         );
@@ -2899,6 +2927,23 @@ impl Plugin for ModUiBridgePlugin {
             .add_observer(bridge_value_change_i64)
             .add_observer(bridge_value_change_color);
         }
+    }
+
+    fn finish(&self, app: &mut App) {
+        #[cfg(feature = "bridge-feathers")]
+        if app.world().contains_resource::<AssetServer>() {
+            if !app.world().contains_resource::<Assets<Font>>() {
+                app.init_asset::<Font>();
+            }
+            if !app.world().contains_resource::<Assets<Image>>() {
+                app.init_asset::<Image>();
+            }
+            if !app.world().contains_resource::<Assets<ScenePatch>>() {
+                app.init_asset::<ScenePatch>();
+            }
+        }
+        #[cfg(not(feature = "bridge-feathers"))]
+        let _ = app;
     }
 }
 
@@ -3297,7 +3342,9 @@ fn mirror_selected_tabs_to_ffi(
 ) {
     for (sel, mut ffi) in &mut q {
         let desired = FfiSelectedTab::from_option(sel.0);
-        ffi.set_if_neq(desired);
+        if *ffi != desired {
+            *ffi.bypass_change_detection() = desired;
+        }
     }
 }
 
@@ -3412,6 +3459,390 @@ fn bridge_value_change_bool(change: On<ValueChange<bool>>, mut commands: Command
 // ============================================================================
 
 #[cfg(feature = "bridge-feathers")]
+const FEATHERS_SELECT_ROW_PX: f32 = 28.0;
+
+/// Internal marker recording that a Feathers `SceneComponent` BSN hierarchy has already been
+/// hydrated onto an FFI widget entity so subsequent descriptor edits update state/props in place
+/// without duplicating child hierarchies.
+#[cfg(feature = "bridge-feathers")]
+#[derive(Component, Debug, Default, Clone, Copy)]
+struct FeathersSceneHydrated;
+
+#[cfg(feature = "bridge-feathers")]
+fn ensure_registered_asset<A: Asset>(world: &mut World, server: &AssetServer) {
+    if !world.contains_resource::<Assets<A>>() {
+        let assets = Assets::<A>::default();
+        server.register_asset(&assets);
+        world.insert_resource(assets);
+    }
+    world.init_resource::<Messages<AssetEvent<A>>>();
+    world.init_resource::<Messages<AssetLoadFailedEvent<A>>>();
+}
+
+#[cfg(feature = "bridge-feathers")]
+fn ensure_feathers_runtime_resources(world: &mut World) {
+    if !world.contains_resource::<UiTheme>() {
+        world.insert_resource(UiTheme::default());
+    }
+    if !world.contains_resource::<ColorInputSettings>() {
+        world.insert_resource(ColorInputSettings::default());
+    }
+    if !world.contains_resource::<InputFocus>() {
+        world.insert_resource(InputFocus::default());
+    }
+    if let Some(server) = world.get_resource::<AssetServer>().cloned() {
+        ensure_registered_asset::<Font>(world, &server);
+        ensure_registered_asset::<Image>(world, &server);
+        ensure_registered_asset::<ScenePatch>(world, &server);
+    } else if !world.contains_resource::<Assets<ScenePatch>>() {
+        world.insert_resource(Assets::<ScenePatch>::default());
+    }
+    if !world.contains_resource::<UnitsRegistry>() {
+        let mut units = UnitsRegistry::default();
+        units.insert(&Dimensionless);
+        units.insert(&LengthMeters);
+        units.insert(&TimeSeconds);
+        units.insert(&AngleDegrees);
+        world.insert_resource(units);
+    }
+}
+
+#[cfg(feature = "bridge-feathers")]
+fn find_descendant_with<C: Component>(world: &World, root: Entity) -> Option<Entity> {
+    let mut queue = std::collections::VecDeque::new();
+    if let Some(children) = world.get::<Children>(root) {
+        for &child in children.iter() {
+            queue.push_back(child);
+        }
+    }
+    while let Some(current) = queue.pop_front() {
+        if world.get::<C>(current).is_some() {
+            return Some(current);
+        }
+        if let Some(children) = world.get::<Children>(current) {
+            for &child in children.iter() {
+                queue.push_back(child);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(feature = "bridge-feathers")]
+fn hydrate_feathers_scene<S: Scene>(
+    world: &mut World,
+    entity: Entity,
+    scene: S,
+    reparent_preexisting_into_scroll_area: bool,
+) -> bool {
+    if world.get_entity(entity).is_err() {
+        return false;
+    }
+    if world.get::<FeathersSceneHydrated>(entity).is_some() {
+        return true;
+    }
+    ensure_feathers_runtime_resources(world);
+    let Some(server) = world.get_resource::<AssetServer>().cloned() else {
+        return false;
+    };
+
+    // Capture any pre-existing children (such as mod-spawned `FfiFeathersListRow` entities
+    // attached via `ChildOf`) before `ResolvedSceneRoot::apply` replaces `Children`.
+    let preexisting_children: Vec<Entity> = if reparent_preexisting_into_scroll_area {
+        world
+            .get::<Children>(entity)
+            .map(|children| children.iter().copied().collect())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let resolved = {
+        let Some(patches) = world.get_resource::<Assets<ScenePatch>>() else {
+            return false;
+        };
+        match ResolvedSceneRoot::resolve(Box::new(scene), &server, patches) {
+            Ok(root) => root,
+            Err(err) => {
+                log_ecs_error(
+                    err.into(),
+                    ErrorContext::Command {
+                        name: "ModUiBridgePlugin::hydrate_feathers_scene".into(),
+                    },
+                );
+                return false;
+            }
+        }
+    };
+
+    let mut scratch = BundleScratch::default();
+    let apply_result = {
+        let Ok(mut ent_mut) = world.get_entity_mut(entity) else {
+            return false;
+        };
+        resolved.apply(&mut ent_mut, &mut scratch)
+    };
+    if let Err(err) = apply_result {
+        log_ecs_error(
+            err.into(),
+            ErrorContext::Command {
+                name: "ModUiBridgePlugin::hydrate_feathers_scene".into(),
+            },
+        );
+        return false;
+    }
+
+    if let Ok(mut ent_mut) = world.get_entity_mut(entity) {
+        ent_mut.insert(FeathersSceneHydrated);
+    }
+
+    if !preexisting_children.is_empty() {
+        let target_parent = find_descendant_with::<ScrollArea>(world, entity).unwrap_or(entity);
+        for child in preexisting_children {
+            if world.get_entity(child).is_ok()
+                && child != target_parent
+                && let Ok(mut child_mut) = world.get_entity_mut(child)
+            {
+                child_mut.insert(ChildOf(target_parent));
+            }
+        }
+    }
+
+    true
+}
+
+#[cfg(feature = "bridge-feathers")]
+fn apply_color_input_opaque_percentage(
+    world: &mut World,
+    root: Entity,
+    opaque_color_percentage: f32,
+    color: Color,
+) {
+    let Some(swatch_ent) = find_descendant_with::<FeathersColorSwatch>(world, root) else {
+        return;
+    };
+    let children: Vec<Entity> = world
+        .get::<Children>(swatch_ent)
+        .map(|c| c.iter().copied().collect())
+        .unwrap_or_default();
+    let clamped = opaque_color_percentage.clamp(0.0, 100.0);
+    if clamped > 0.0 {
+        let target_left = Val::Percent(100.0 - clamped);
+        let opaque_color = Color::from(color.to_srgba().with_alpha(1.0));
+        if let Some(&opaque_child) = children.get(1) {
+            if let Some(mut node) = world.get_mut::<Node>(opaque_child)
+                && node.left != target_left
+            {
+                node.left = target_left;
+            }
+            if let Some(mut bg) = world.get_mut::<BackgroundColor>(opaque_child)
+                && bg.0 != opaque_color
+            {
+                bg.0 = opaque_color;
+            }
+        } else {
+            world.spawn((
+                ChildOf(swatch_ent),
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: target_left,
+                    top: Val::Px(0.0),
+                    bottom: Val::Px(0.0),
+                    right: Val::Px(0.0),
+                    border_radius: RoundedCorners::Right.to_border_radius(5.0),
+                    ..Default::default()
+                },
+                ColorSwatchFg,
+                BackgroundColor(opaque_color),
+                ZIndex(1),
+            ));
+        }
+    } else if let Some(&opaque_child) = children.get(1) {
+        let _ = world.despawn(opaque_child);
+    }
+}
+
+#[cfg(feature = "bridge-feathers")]
+fn apply_dropdown_visual_props(
+    world: &mut World,
+    root: Entity,
+    corners: RoundedCorners,
+    max_visible: usize,
+) {
+    if let Some(button_ent) = find_descendant_with::<FeathersMenuButton>(world, root)
+        && let Some(mut node) = world.get_mut::<Node>(button_ent)
+    {
+        let desired_radius = corners.to_border_radius(4.0);
+        if node.border_radius != desired_radius {
+            node.border_radius = desired_radius;
+        }
+    }
+    if let Some(list_ent) = find_descendant_with::<FeathersListView>(world, root)
+        && let Some(mut node) = world.get_mut::<Node>(list_ent)
+    {
+        let desired_max_height = Val::Px(max_visible.max(1) as f32 * FEATHERS_SELECT_ROW_PX);
+        if node.max_height != desired_max_height {
+            node.max_height = desired_max_height;
+        }
+    }
+}
+
+#[cfg(feature = "bridge-feathers")]
+fn apply_listview_layout_props(
+    world: &mut World,
+    root: Entity,
+    orientation: ControlOrientation,
+    gutter_val: Val,
+    selectable: bool,
+    scrollable: bool,
+    disabled: bool,
+) {
+    if world.get_entity(root).is_err() {
+        return;
+    }
+
+    if let Some(mut gutter) = world.get_mut::<ScrollbarGutter>(root) {
+        if gutter.0 != gutter_val {
+            gutter.0 = gutter_val;
+        }
+    } else if let Ok(mut ent_mut) = world.get_entity_mut(root) {
+        ent_mut.insert(ScrollbarGutter(gutter_val));
+    }
+
+    if let Some(mut outer_node) = world.get_mut::<Node>(root) {
+        let desired_padding = if scrollable {
+            match orientation {
+                ControlOrientation::Vertical => UiRect {
+                    right: gutter_val,
+                    ..Default::default()
+                },
+                ControlOrientation::Horizontal => UiRect {
+                    bottom: gutter_val,
+                    ..Default::default()
+                },
+            }
+        } else {
+            UiRect::ZERO
+        };
+        if outer_node.padding != desired_padding {
+            outer_node.padding = desired_padding;
+        }
+    }
+
+    let has_listbox = world.get::<ListBox>(root).is_some();
+    if selectable && !has_listbox {
+        if let Ok(mut ent_mut) = world.get_entity_mut(root) {
+            ent_mut.insert(ListBox);
+        }
+    } else if !selectable
+        && has_listbox
+        && let Ok(mut ent_mut) = world.get_entity_mut(root)
+    {
+        ent_mut.remove::<ListBox>();
+    }
+
+    let has_disabled = world.get::<InteractionDisabled>(root).is_some();
+    if disabled && !has_disabled {
+        if let Ok(mut ent_mut) = world.get_entity_mut(root) {
+            ent_mut.insert(InteractionDisabled);
+        }
+    } else if !disabled
+        && has_disabled
+        && let Ok(mut ent_mut) = world.get_entity_mut(root)
+    {
+        ent_mut.remove::<InteractionDisabled>();
+    }
+
+    let direct_children: Vec<Entity> = world
+        .get::<Children>(root)
+        .map(|c| c.iter().copied().collect())
+        .unwrap_or_default();
+
+    let inner_ent = direct_children
+        .iter()
+        .copied()
+        .find(|&c| world.get::<Name>(c).is_some_and(|n| n.as_str() == "inner"))
+        .or_else(|| {
+            direct_children
+                .iter()
+                .copied()
+                .find(|&c| world.get::<FeathersScrollbar>(c).is_none())
+        });
+
+    if let Some(inner) = inner_ent {
+        if let Some(mut inner_node) = world.get_mut::<Node>(inner) {
+            let desired_dir = match orientation {
+                ControlOrientation::Horizontal => FlexDirection::Row,
+                ControlOrientation::Vertical => FlexDirection::Column,
+            };
+            let desired_overflow = if scrollable {
+                match orientation {
+                    ControlOrientation::Horizontal => Overflow::scroll_x(),
+                    ControlOrientation::Vertical => Overflow::scroll_y(),
+                }
+            } else {
+                Overflow::clip()
+            };
+            if inner_node.flex_direction != desired_dir {
+                inner_node.flex_direction = desired_dir;
+            }
+            if inner_node.overflow != desired_overflow {
+                inner_node.overflow = desired_overflow;
+            }
+        }
+        let has_scroll_area = world.get::<ScrollArea>(inner).is_some();
+        if scrollable && !has_scroll_area {
+            if let Ok(mut ent_mut) = world.get_entity_mut(inner) {
+                ent_mut.insert(ScrollArea);
+            }
+        } else if !scrollable
+            && has_scroll_area
+            && let Ok(mut ent_mut) = world.get_entity_mut(inner)
+        {
+            ent_mut.remove::<ScrollArea>();
+        }
+    }
+
+    let scrollbar_ent = direct_children
+        .into_iter()
+        .find(|&c| world.get::<FeathersScrollbar>(c).is_some());
+
+    if let Some(sb_ent) = scrollbar_ent {
+        if let Some(mut sb) = world.get_mut::<Scrollbar>(sb_ent)
+            && sb.orientation != orientation
+        {
+            sb.orientation = orientation;
+        }
+        if let Some(mut sb_node) = world.get_mut::<Node>(sb_ent) {
+            sb_node.display = if scrollable {
+                Display::Flex
+            } else {
+                Display::None
+            };
+            sb_node.position_type = PositionType::Absolute;
+            match orientation {
+                ControlOrientation::Vertical => {
+                    sb_node.left = Val::Auto;
+                    sb_node.right = Val::Px(4.0);
+                    sb_node.top = Val::Px(0.0);
+                    sb_node.bottom = Val::Px(0.0);
+                    sb_node.width = Val::Px(6.0);
+                    sb_node.height = Val::Auto;
+                }
+                ControlOrientation::Horizontal => {
+                    sb_node.left = Val::Px(0.0);
+                    sb_node.right = Val::Px(0.0);
+                    sb_node.top = Val::Auto;
+                    sb_node.bottom = Val::Px(4.0);
+                    sb_node.width = Val::Auto;
+                    sb_node.height = Val::Px(6.0);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "bridge-feathers")]
 fn sync_ffi_theme_context(
     mut q: Query<(Entity, &FfiThemeContext, Option<&mut ThemeContext>), Changed<FfiThemeContext>>,
     mut commands: Commands,
@@ -3437,40 +3868,80 @@ fn mirror_theme_context_to_ffi(
 ) {
     for (ctx, mut ffi) in &mut q {
         let desired = FfiThemeContext::from_bevy(ctx);
-        ffi.set_if_neq(desired);
+        if *ffi != desired {
+            *ffi.bypass_change_detection() = desired;
+        }
     }
 }
 
 #[cfg(feature = "bridge-feathers")]
 type FeathersColorInputSyncItem<'a> = (
     Entity,
-    &'a FfiFeathersColorInput,
-    Has<FeathersColorInput>,
+    Ref<'a, FfiFeathersColorInput>,
+    Has<FeathersSceneHydrated>,
     Option<&'a ColorInputValue>,
     Has<InteractionDisabled>,
 );
 
 #[cfg(feature = "bridge-feathers")]
 fn sync_ffi_feathers_color_input(
-    q: Query<FeathersColorInputSyncItem<'_>, Changed<FfiFeathersColorInput>>,
+    q: Query<
+        FeathersColorInputSyncItem<'_>,
+        Or<(
+            Changed<FfiFeathersColorInput>,
+            Without<FeathersSceneHydrated>,
+        )>,
+    >,
+    asset_server: Option<Res<AssetServer>>,
     mut settings: Option<ResMut<ColorInputSettings>>,
     mut commands: Commands,
 ) {
-    for (entity, desc, has_widget, current_val, has_disabled) in &q {
+    let has_asset_server = asset_server.is_some();
+    for (entity, desc, is_hydrated, current_val, has_disabled) in &q {
+        if !is_hydrated && !has_asset_server && !desc.is_changed() {
+            continue;
+        }
         if desc.reserved0 != 0 || !desc.opaque_color_percentage.is_finite() {
             continue;
         }
         let (Ok(color), Ok(mode)) = (desc.color.try_to_bevy(), desc.try_mode()) else {
             continue;
         };
+        let opaque_color_percentage = desc.opaque_color_percentage;
+        let disabled = desc.disabled.get();
 
-        if !has_widget {
-            commands
-                .entity(entity)
-                .insert((FeathersColorInput, ColorInputValue(color)));
-        } else if current_val.is_none_or(|v| v.0 != color) {
-            // `ColorInputValue` is `#[component(immutable)]`, so replace via `insert`.
-            commands.entity(entity).insert(ColorInputValue(color));
+        if !is_hydrated {
+            if has_asset_server {
+                commands.queue(move |world: &mut World| {
+                    let props = FeathersColorInputProps {
+                        opaque_color_percentage,
+                    };
+                    let scene = bsn! {
+                        @FeathersColorInput {
+                            @opaque_color_percentage: {props.opaque_color_percentage},
+                        }
+                    };
+                    if hydrate_feathers_scene(world, entity, scene, false)
+                        && let Ok(mut ent_mut) = world.get_entity_mut(entity)
+                    {
+                        ent_mut.insert(ColorInputValue(color));
+                        if disabled {
+                            ent_mut.insert(InteractionDisabled);
+                        } else {
+                            ent_mut.remove::<InteractionDisabled>();
+                        }
+                    }
+                });
+            }
+        } else {
+            if current_val.is_none_or(|v| v.0 != color) {
+                // `ColorInputValue` is `#[component(immutable)]`, so replace via `insert`.
+                commands.entity(entity).insert(ColorInputValue(color));
+            }
+            commands.queue(move |world: &mut World| {
+                apply_color_input_opaque_percentage(world, entity, opaque_color_percentage, color);
+            });
+            sync_disabled_marker(&mut commands, entity, disabled, has_disabled);
         }
 
         if desc.apply_mode_to_settings.get()
@@ -3479,8 +3950,6 @@ fn sync_ffi_feathers_color_input(
         {
             settings.mode = mode;
         }
-
-        sync_disabled_marker(&mut commands, entity, desc.disabled.get(), has_disabled);
     }
 }
 
@@ -3491,7 +3960,7 @@ fn mirror_color_input_value_to_ffi(
     for (val, mut ffi) in &mut q {
         let desired = FfiRgba::from_bevy(val.0);
         if ffi.color != desired {
-            ffi.color = desired;
+            ffi.bypass_change_detection().color = desired;
         }
     }
 }
@@ -3499,97 +3968,181 @@ fn mirror_color_input_value_to_ffi(
 #[cfg(feature = "bridge-feathers")]
 type FeathersDropdownSyncItem<'a> = (
     Entity,
-    &'a FfiFeathersDropdown,
-    Has<FeathersSelect>,
+    Ref<'a, FfiFeathersDropdown>,
+    Has<FeathersSceneHydrated>,
     Option<&'a OptionIndex>,
     Has<InteractionDisabled>,
 );
 
 #[cfg(feature = "bridge-feathers")]
 fn sync_ffi_feathers_dropdown(
-    q: Query<FeathersDropdownSyncItem<'_>, Changed<FfiFeathersDropdown>>,
+    q: Query<
+        FeathersDropdownSyncItem<'_>,
+        Or<(Changed<FfiFeathersDropdown>, Without<FeathersSceneHydrated>)>,
+    >,
+    asset_server: Option<Res<AssetServer>>,
     mut commands: Commands,
 ) {
-    for (entity, desc, has_select, current_idx, has_disabled) in &q {
-        if desc.reserved0 != [0; 5] || desc.try_rounded_corners().is_err() {
+    let has_asset_server = asset_server.is_some();
+    for (entity, desc, is_hydrated, current_idx, has_disabled) in &q {
+        if !is_hydrated && !has_asset_server && !desc.is_changed() {
             continue;
         }
-        if !has_select {
-            commands.entity(entity).insert(FeathersSelect);
+        if desc.reserved0 != [0; 5] {
+            continue;
         }
-        if desc.has_selected_index.get() {
-            let desired_idx = desc.selected_index as usize;
-            if current_idx.is_none_or(|i| i.0 != desired_idx) {
-                commands.entity(entity).insert(OptionIndex(desired_idx));
+        let Ok(corners) = desc.try_rounded_corners() else {
+            continue;
+        };
+        let max_visible = (desc.max_visible as usize).max(1);
+        let selected_index = desc
+            .has_selected_index
+            .get()
+            .then_some(desc.selected_index as usize);
+        let selected_row = ffi_entity_to_option(desc.selected_row);
+        let disabled = desc.disabled.get();
+
+        if !is_hydrated {
+            if has_asset_server {
+                commands.queue(move |world: &mut World| {
+                    let props = FeathersSelectProps {
+                        options: Box::new(bsn_list! {}),
+                        corners,
+                        max_visible,
+                    };
+                    let scene = bsn! {
+                        @FeathersSelect {
+                            @options: {props.options},
+                            @corners: {props.corners},
+                            @max_visible: {props.max_visible},
+                        }
+                    };
+                    if hydrate_feathers_scene(world, entity, scene, true) {
+                        if let Ok(mut ent_mut) = world.get_entity_mut(entity) {
+                            match selected_index {
+                                Some(idx) => {
+                                    ent_mut.insert(OptionIndex(idx));
+                                }
+                                None => {
+                                    ent_mut.remove::<OptionIndex>();
+                                }
+                            }
+                            if disabled {
+                                ent_mut.insert(InteractionDisabled);
+                            } else {
+                                ent_mut.remove::<InteractionDisabled>();
+                            }
+                        }
+                        if let Some(row) = selected_row {
+                            world.trigger(SetSelected { entity, row });
+                        }
+                    }
+                });
             }
-        } else if current_idx.is_some() {
-            commands.entity(entity).remove::<OptionIndex>();
+        } else {
+            commands.queue(move |world: &mut World| {
+                apply_dropdown_visual_props(world, entity, corners, max_visible);
+            });
+            match selected_index {
+                Some(desired_idx) => {
+                    if current_idx.is_none_or(|i| i.0 != desired_idx) {
+                        commands.entity(entity).insert(OptionIndex(desired_idx));
+                    }
+                }
+                None if current_idx.is_some() => {
+                    commands.entity(entity).remove::<OptionIndex>();
+                }
+                None => {}
+            }
+            if let Some(row) = selected_row {
+                commands.trigger(SetSelected { entity, row });
+            }
+            sync_disabled_marker(&mut commands, entity, disabled, has_disabled);
         }
-        if let Some(row) = ffi_entity_to_option(desc.selected_row) {
-            commands.trigger(SetSelected { entity, row });
-        }
-        sync_disabled_marker(&mut commands, entity, desc.disabled.get(), has_disabled);
     }
 }
 
 #[cfg(feature = "bridge-feathers")]
 type FeathersScrollableListSyncItem<'a> = (
     Entity,
-    &'a FfiFeathersScrollableList,
-    Has<FeathersListView>,
-    Option<&'a mut ScrollbarGutter>,
-    Has<ListBox>,
-    Has<ScrollArea>,
-    Has<InteractionDisabled>,
+    Ref<'a, FfiFeathersScrollableList>,
+    Has<FeathersSceneHydrated>,
 );
 
 #[cfg(feature = "bridge-feathers")]
 fn sync_ffi_feathers_scrollable_list(
-    mut q: Query<FeathersScrollableListSyncItem<'_>, Changed<FfiFeathersScrollableList>>,
+    q: Query<
+        FeathersScrollableListSyncItem<'_>,
+        Or<(
+            Changed<FfiFeathersScrollableList>,
+            Without<FeathersSceneHydrated>,
+        )>,
+    >,
+    asset_server: Option<Res<AssetServer>>,
     mut commands: Commands,
 ) {
-    for (entity, desc, has_view, gutter_opt, has_listbox, has_scroll_area, has_disabled) in &mut q {
-        if desc.orientation > FfiFeathersScrollableList::ORIENTATION_VERTICAL {
+    let has_asset_server = asset_server.is_some();
+    for (entity, desc, is_hydrated) in &q {
+        if !is_hydrated && !has_asset_server && !desc.is_changed() {
             continue;
         }
+        let orientation = match desc.orientation {
+            FfiFeathersScrollableList::ORIENTATION_HORIZONTAL => ControlOrientation::Horizontal,
+            FfiFeathersScrollableList::ORIENTATION_VERTICAL => ControlOrientation::Vertical,
+            _ => continue,
+        };
         let Ok(gutter_val) = desc.scrollbar_gutter.try_to_bevy() else {
             continue;
         };
-        if !has_view {
-            commands.entity(entity).insert(FeathersListView);
-        }
-        match gutter_opt {
-            Some(mut gutter) => {
-                if gutter.0 != gutter_val {
-                    gutter.0 = gutter_val;
-                }
+        let selectable = desc.selectable.get();
+        let scrollable = desc.scrollable.get();
+        let disabled = desc.disabled.get();
+
+        if !is_hydrated {
+            if has_asset_server {
+                commands.queue(move |world: &mut World| {
+                    let props = FeathersListViewProps {
+                        rows: Box::new(bsn_list! {}),
+                    };
+                    let scene = bsn! {
+                        @FeathersListView {
+                            @rows: {props.rows},
+                        }
+                    };
+                    if hydrate_feathers_scene(world, entity, scene, true) {
+                        apply_listview_layout_props(
+                            world,
+                            entity,
+                            orientation,
+                            gutter_val,
+                            selectable,
+                            scrollable,
+                            disabled,
+                        );
+                    }
+                });
             }
-            None => {
-                commands.entity(entity).insert(ScrollbarGutter(gutter_val));
-            }
+        } else {
+            commands.queue(move |world: &mut World| {
+                apply_listview_layout_props(
+                    world,
+                    entity,
+                    orientation,
+                    gutter_val,
+                    selectable,
+                    scrollable,
+                    disabled,
+                );
+            });
         }
-        let want_listbox = desc.selectable.get();
-        if want_listbox && !has_listbox {
-            commands.entity(entity).insert(ListBox);
-        } else if !want_listbox && has_listbox {
-            commands.entity(entity).remove::<ListBox>();
-        }
-        let want_scroll = desc.scrollable.get();
-        if want_scroll && !has_scroll_area {
-            commands.entity(entity).insert(ScrollArea);
-        } else if !want_scroll && has_scroll_area {
-            commands.entity(entity).remove::<ScrollArea>();
-        }
-        sync_disabled_marker(&mut commands, entity, desc.disabled.get(), has_disabled);
     }
 }
 
 #[cfg(feature = "bridge-feathers")]
 type FeathersListRowSyncItem<'a> = (
     Entity,
-    &'a FfiFeathersListRow,
-    Has<FeathersListRow>,
-    Has<ListItem>,
+    Ref<'a, FfiFeathersListRow>,
+    Has<FeathersSceneHydrated>,
     Option<&'a OptionIndex>,
     Has<Selected>,
     Has<InteractionDisabled>,
@@ -3597,42 +4150,83 @@ type FeathersListRowSyncItem<'a> = (
 
 #[cfg(feature = "bridge-feathers")]
 fn sync_ffi_feathers_list_row(
-    q: Query<FeathersListRowSyncItem<'_>, Changed<FfiFeathersListRow>>,
+    q: Query<
+        FeathersListRowSyncItem<'_>,
+        Or<(Changed<FfiFeathersListRow>, Without<FeathersSceneHydrated>)>,
+    >,
+    asset_server: Option<Res<AssetServer>>,
     mut commands: Commands,
 ) {
-    for (entity, desc, has_row, has_item, current_idx, has_selected, has_disabled) in &q {
+    let has_asset_server = asset_server.is_some();
+    for (entity, desc, is_hydrated, current_idx, has_selected, has_disabled) in &q {
+        if !is_hydrated && !has_asset_server && !desc.is_changed() {
+            continue;
+        }
         if desc.reserved0 != 0 {
             continue;
         }
-        if !has_row {
-            commands.entity(entity).insert(FeathersListRow);
-        }
-        if !has_item {
-            commands.entity(entity).insert(ListItem);
-        }
-        if desc.has_option_index.get() {
-            let desired_idx = desc.option_index as usize;
-            if current_idx.is_none_or(|i| i.0 != desired_idx) {
-                commands.entity(entity).insert(OptionIndex(desired_idx));
-            }
-        } else if current_idx.is_some() {
-            commands.entity(entity).remove::<OptionIndex>();
-        }
+        let option_index = desc
+            .has_option_index
+            .get()
+            .then_some(desc.option_index as usize);
         let want_selected = desc.selected.get();
-        if want_selected && !has_selected {
-            commands.entity(entity).insert(Selected);
-        } else if !want_selected && has_selected {
-            commands.entity(entity).remove::<Selected>();
+        let disabled = desc.disabled.get();
+
+        if !is_hydrated {
+            if has_asset_server {
+                commands.queue(move |world: &mut World| {
+                    let scene = bsn! { @FeathersListRow };
+                    if hydrate_feathers_scene(world, entity, scene, false)
+                        && let Ok(mut ent_mut) = world.get_entity_mut(entity)
+                    {
+                        match option_index {
+                            Some(idx) => {
+                                ent_mut.insert(OptionIndex(idx));
+                            }
+                            None => {
+                                ent_mut.remove::<OptionIndex>();
+                            }
+                        }
+                        if want_selected {
+                            ent_mut.insert(Selected);
+                        } else {
+                            ent_mut.remove::<Selected>();
+                        }
+                        if disabled {
+                            ent_mut.insert(InteractionDisabled);
+                        } else {
+                            ent_mut.remove::<InteractionDisabled>();
+                        }
+                    }
+                });
+            }
+        } else {
+            match option_index {
+                Some(desired_idx) => {
+                    if current_idx.is_none_or(|i| i.0 != desired_idx) {
+                        commands.entity(entity).insert(OptionIndex(desired_idx));
+                    }
+                }
+                None if current_idx.is_some() => {
+                    commands.entity(entity).remove::<OptionIndex>();
+                }
+                None => {}
+            }
+            if want_selected && !has_selected {
+                commands.entity(entity).insert(Selected);
+            } else if !want_selected && has_selected {
+                commands.entity(entity).remove::<Selected>();
+            }
+            sync_disabled_marker(&mut commands, entity, disabled, has_disabled);
         }
-        sync_disabled_marker(&mut commands, entity, desc.disabled.get(), has_disabled);
     }
 }
 
 #[cfg(feature = "bridge-feathers")]
 type FeathersNumberInputSyncItem<'a> = (
     Entity,
-    &'a FfiFeathersNumberInput,
-    Has<FeathersNumberInput>,
+    Ref<'a, FfiFeathersNumberInput>,
+    Has<FeathersSceneHydrated>,
     Option<&'a NumberInputValue>,
     Has<SoftLimit>,
     Has<HardLimit>,
@@ -3641,10 +4235,21 @@ type FeathersNumberInputSyncItem<'a> = (
 
 #[cfg(feature = "bridge-feathers")]
 fn sync_ffi_feathers_number_input(
-    q: Query<FeathersNumberInputSyncItem<'_>, Changed<FfiFeathersNumberInput>>,
+    q: Query<
+        FeathersNumberInputSyncItem<'_>,
+        Or<(
+            Changed<FfiFeathersNumberInput>,
+            Without<FeathersSceneHydrated>,
+        )>,
+    >,
+    asset_server: Option<Res<AssetServer>>,
     mut commands: Commands,
 ) {
-    for (entity, desc, has_widget, current_val, has_soft, has_hard, has_disabled) in &q {
+    let has_asset_server = asset_server.is_some();
+    for (entity, desc, is_hydrated, current_val, has_soft, has_hard, has_disabled) in &q {
+        if !is_hydrated && !has_asset_server && !desc.is_changed() {
+            continue;
+        }
         let Ok(value) = desc.try_value() else {
             continue;
         };
@@ -3672,40 +4277,78 @@ fn sync_ffi_feathers_number_input(
         };
         let precision = NumberInputPrecision(desc.precision);
         let step = NumberInputStep(desc.step);
+        let disabled = desc.disabled.get();
 
-        if !has_widget {
-            commands
-                .entity(entity)
-                .insert((FeathersNumberInput, value, precision, step, wrap));
+        if !is_hydrated {
+            if has_asset_server {
+                commands.queue(move |world: &mut World| {
+                    let props = FeathersNumberInputProps::default();
+                    let scene = bsn! {
+                        @FeathersNumberInput {
+                            @sigil_color: {props.sigil_color},
+                            @label_text: {props.label_text},
+                        }
+                    };
+                    if hydrate_feathers_scene(world, entity, scene, false)
+                        && let Ok(mut ent_mut) = world.get_entity_mut(entity)
+                    {
+                        ent_mut.insert((precision, step, wrap));
+                        match soft_limit {
+                            Some(limit) => {
+                                ent_mut.insert(limit);
+                            }
+                            None => {
+                                ent_mut.remove::<SoftLimit>();
+                            }
+                        }
+                        match hard_limit {
+                            Some(limit) => {
+                                ent_mut.insert(limit);
+                            }
+                            None => {
+                                ent_mut.remove::<HardLimit>();
+                            }
+                        }
+                        // Insert `NumberInputValue` after limits so `number_input_on_insert_value`
+                        // formats and positions the slidebar using the active limits.
+                        ent_mut.insert(value);
+                        if disabled {
+                            ent_mut.insert(InteractionDisabled);
+                        } else {
+                            ent_mut.remove::<InteractionDisabled>();
+                        }
+                    }
+                });
+            }
         } else {
             commands.entity(entity).insert((precision, step, wrap));
+            match soft_limit {
+                Some(limit) => {
+                    commands.entity(entity).insert(limit);
+                }
+                None if has_soft => {
+                    commands.entity(entity).remove::<SoftLimit>();
+                }
+                None => {}
+            }
+
+            match hard_limit {
+                Some(limit) => {
+                    commands.entity(entity).insert(limit);
+                }
+                None if has_hard => {
+                    commands.entity(entity).remove::<HardLimit>();
+                }
+                None => {}
+            }
+
             if current_val.is_none_or(|v| *v != value) {
                 // `NumberInputValue` is `#[component(immutable)]`.
                 commands.entity(entity).insert(value);
             }
-        }
 
-        match soft_limit {
-            Some(limit) => {
-                commands.entity(entity).insert(limit);
-            }
-            None if has_soft => {
-                commands.entity(entity).remove::<SoftLimit>();
-            }
-            None => {}
+            sync_disabled_marker(&mut commands, entity, disabled, has_disabled);
         }
-
-        match hard_limit {
-            Some(limit) => {
-                commands.entity(entity).insert(limit);
-            }
-            None if has_hard => {
-                commands.entity(entity).remove::<HardLimit>();
-            }
-            None => {}
-        }
-
-        sync_disabled_marker(&mut commands, entity, desc.disabled.get(), has_disabled);
     }
 }
 
@@ -3720,28 +4363,32 @@ fn mirror_number_input_value_to_ffi(
                 if ffi.format != FfiFeathersNumberInput::FORMAT_F32
                     || (ffi.value_f64 as f32).to_bits() != v.to_bits()
                 {
-                    ffi.format = FfiFeathersNumberInput::FORMAT_F32;
-                    ffi.value_f64 = target;
+                    let raw = ffi.bypass_change_detection();
+                    raw.format = FfiFeathersNumberInput::FORMAT_F32;
+                    raw.value_f64 = target;
                 }
             }
             NumberInputValue::F64(v) => {
                 if ffi.format != FfiFeathersNumberInput::FORMAT_F64
                     || ffi.value_f64.to_bits() != v.to_bits()
                 {
-                    ffi.format = FfiFeathersNumberInput::FORMAT_F64;
-                    ffi.value_f64 = v;
+                    let raw = ffi.bypass_change_detection();
+                    raw.format = FfiFeathersNumberInput::FORMAT_F64;
+                    raw.value_f64 = v;
                 }
             }
             NumberInputValue::I32(v) => {
                 if ffi.format != FfiFeathersNumberInput::FORMAT_I32 || ffi.value_i64 != v as i64 {
-                    ffi.format = FfiFeathersNumberInput::FORMAT_I32;
-                    ffi.value_i64 = v as i64;
+                    let raw = ffi.bypass_change_detection();
+                    raw.format = FfiFeathersNumberInput::FORMAT_I32;
+                    raw.value_i64 = v as i64;
                 }
             }
             NumberInputValue::I64(v) => {
                 if ffi.format != FfiFeathersNumberInput::FORMAT_I64 || ffi.value_i64 != v {
-                    ffi.format = FfiFeathersNumberInput::FORMAT_I64;
-                    ffi.value_i64 = v;
+                    let raw = ffi.bypass_change_detection();
+                    raw.format = FfiFeathersNumberInput::FORMAT_I64;
+                    raw.value_i64 = v;
                 }
             }
         }

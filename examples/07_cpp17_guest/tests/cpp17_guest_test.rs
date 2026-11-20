@@ -1,10 +1,10 @@
 #![forbid(unsafe_code)]
 //! End-to-end integration tests for Example 07 (`cpp_mod/mod.cpp`, ISO C++17).
 
-use bevy_abi_mod::prelude::*;
 use bevy_abi_mod_sys::{FfiBool, FfiOption, FfiResult};
 use bevy_app::App;
 use bevy_ecs::message::Messages;
+use bevy_mod_abi::prelude::*;
 use example_07_cpp17_guest::{
     ActorStats, BehaviorMode, CppTelemetry, Position, SimConfig, Velocity,
     render_example_components_header, resolve_or_build_cpp17_mod,

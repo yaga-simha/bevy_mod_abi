@@ -1,6 +1,10 @@
 //! Safe (`#![forbid(unsafe_code)]`) dynamic `bevy_reflect`, Bevy Remote Protocol (`bevy_remote`),
 //! and `bevy_settings` bridges for `bevy_abi_mod` (`feature = "bridge-reflect"`).
 
+use crate::codec::{
+    deserialize_reflect_from_json, encode_json_to_pod_field_bytes, encode_json_to_witness_record,
+    json_map_to_bam_field_patches, json_map_to_witness_records, serialize_reflect_to_json,
+};
 use bevy_abi_mod_host_sys::loader::ExportedFieldRecord;
 use bevy_abi_mod_host_sys::{
     BamFieldBytePatch, BamFieldDescriptor, BamFieldPodKind, ComponentCollisionError,
@@ -15,6 +19,7 @@ use bevy_abi_mod_host_sys::{
 };
 use bevy_abi_mod_sys::{BamComponent, BamFieldKind, FfiResult, ModComponent};
 use bevy_app::{App, Plugin};
+use bevy_asset::{AssetServer, EphemeralHandleBehavior};
 use bevy_ecs::change_detection::Mut;
 use bevy_ecs::component::Component;
 use bevy_ecs::entity::Entity;
@@ -22,7 +27,7 @@ use bevy_ecs::prelude::{In, Resource};
 use bevy_ecs::reflect::{AppTypeRegistry, ReflectComponent, ReflectResource};
 use bevy_ecs::world::World;
 use bevy_platform::collections::HashMap;
-use bevy_reflect::serde::{ReflectSerializer, TypedReflectDeserializer, TypedReflectSerializer};
+use bevy_reflect::serde::{TypedReflectDeserializer, TypedReflectSerializer};
 use bevy_reflect::structs::{DynamicStruct, Struct};
 use bevy_reflect::{
     FromReflect, GetTypeRegistration, PartialReflect, Reflect, ReflectCloneError, ReflectFromPtr,
@@ -2337,339 +2342,6 @@ fn dynamic_struct_to_bam_field_patches(
     Ok(patches)
 }
 
-fn json_number_as_u64(field_name: &str, val: &Value) -> Result<u64, String> {
-    val.as_u64()
-        .ok_or_else(|| format!("field '{field_name}' expected unsigned integer"))
-}
-
-fn json_number_as_i64(field_name: &str, val: &Value) -> Result<i64, String> {
-    val.as_i64()
-        .ok_or_else(|| format!("field '{field_name}' expected signed integer"))
-}
-
-fn json_number_as_f64(field_name: &str, val: &Value) -> Result<f64, String> {
-    val.as_f64()
-        .ok_or_else(|| format!("field '{field_name}' expected finite number"))
-}
-
-fn json_to_bam_field_bytes(
-    field_name: &str,
-    kind: BamFieldPodKind,
-    val: &Value,
-) -> Result<Vec<u8>, String> {
-    match kind {
-        BamFieldPodKind::Bool => val
-            .as_bool()
-            .map(|b| vec![u8::from(b)])
-            .ok_or_else(|| format!("field '{field_name}' expected bool")),
-        BamFieldPodKind::U8 => {
-            let u = json_number_as_u64(field_name, val)?;
-            u8::try_from(u)
-                .map(|x| x.to_ne_bytes().to_vec())
-                .map_err(|_| format!("field '{field_name}' out of u8 range"))
-        }
-        BamFieldPodKind::I8 => {
-            let i = json_number_as_i64(field_name, val)?;
-            i8::try_from(i)
-                .map(|x| x.to_ne_bytes().to_vec())
-                .map_err(|_| format!("field '{field_name}' out of i8 range"))
-        }
-        BamFieldPodKind::U16 => {
-            let u = json_number_as_u64(field_name, val)?;
-            u16::try_from(u)
-                .map(|x| x.to_ne_bytes().to_vec())
-                .map_err(|_| format!("field '{field_name}' out of u16 range"))
-        }
-        BamFieldPodKind::I16 => {
-            let i = json_number_as_i64(field_name, val)?;
-            i16::try_from(i)
-                .map(|x| x.to_ne_bytes().to_vec())
-                .map_err(|_| format!("field '{field_name}' out of i16 range"))
-        }
-        BamFieldPodKind::U32 | BamFieldPodKind::Component => {
-            let u = json_number_as_u64(field_name, val)?;
-            u32::try_from(u)
-                .map(|x| x.to_ne_bytes().to_vec())
-                .map_err(|_| format!("field '{field_name}' out of u32 range"))
-        }
-        BamFieldPodKind::I32 => {
-            let i = json_number_as_i64(field_name, val)?;
-            i32::try_from(i)
-                .map(|x| x.to_ne_bytes().to_vec())
-                .map_err(|_| format!("field '{field_name}' out of i32 range"))
-        }
-        BamFieldPodKind::U64 | BamFieldPodKind::Entity => {
-            let u = json_number_as_u64(field_name, val)?;
-            Ok(u.to_ne_bytes().to_vec())
-        }
-        BamFieldPodKind::I64 => {
-            let i = json_number_as_i64(field_name, val)?;
-            Ok(i.to_ne_bytes().to_vec())
-        }
-        BamFieldPodKind::Usize => {
-            let u = json_number_as_u64(field_name, val)?;
-            usize::try_from(u)
-                .map(|x| x.to_ne_bytes().to_vec())
-                .map_err(|_| format!("field '{field_name}' out of usize range"))
-        }
-        BamFieldPodKind::Isize => {
-            let i = json_number_as_i64(field_name, val)?;
-            isize::try_from(i)
-                .map(|x| x.to_ne_bytes().to_vec())
-                .map_err(|_| format!("field '{field_name}' out of isize range"))
-        }
-        BamFieldPodKind::F32 => {
-            let f = json_number_as_f64(field_name, val)?;
-            Ok((f as f32).to_ne_bytes().to_vec())
-        }
-        BamFieldPodKind::F64 => {
-            let f = json_number_as_f64(field_name, val)?;
-            Ok(f.to_ne_bytes().to_vec())
-        }
-        BamFieldPodKind::Vec2 | BamFieldPodKind::Vec3 | BamFieldPodKind::Vec4 => {
-            let len = kind.byte_size() / 4;
-            let arr = val
-                .as_array()
-                .ok_or_else(|| format!("field '{field_name}' expected [f32; {len}]"))?;
-            if arr.len() != len {
-                return Err(format!("field '{field_name}' expected {len} elements"));
-            }
-            let mut out = Vec::with_capacity(kind.byte_size());
-            for item in arr {
-                let f = json_number_as_f64(field_name, item)?;
-                out.extend_from_slice(&(f as f32).to_ne_bytes());
-            }
-            Ok(out)
-        }
-        BamFieldPodKind::DVec2 | BamFieldPodKind::DVec3 | BamFieldPodKind::DVec4 => {
-            let len = kind.byte_size() / 8;
-            let arr = val
-                .as_array()
-                .ok_or_else(|| format!("field '{field_name}' expected [f64; {len}]"))?;
-            if arr.len() != len {
-                return Err(format!("field '{field_name}' expected {len} elements"));
-            }
-            let mut out = Vec::with_capacity(kind.byte_size());
-            for item in arr {
-                let f = json_number_as_f64(field_name, item)?;
-                out.extend_from_slice(&f.to_ne_bytes());
-            }
-            Ok(out)
-        }
-        BamFieldPodKind::UVec2 | BamFieldPodKind::UVec3 | BamFieldPodKind::UVec4 => {
-            let len = kind.byte_size() / 4;
-            let arr = val
-                .as_array()
-                .ok_or_else(|| format!("field '{field_name}' expected [u32; {len}]"))?;
-            if arr.len() != len {
-                return Err(format!("field '{field_name}' expected {len} elements"));
-            }
-            let mut out = Vec::with_capacity(kind.byte_size());
-            for item in arr {
-                let u = json_number_as_u64(field_name, item)?;
-                let v = u32::try_from(u)
-                    .map_err(|_| format!("field '{field_name}' element out of u32 range"))?;
-                out.extend_from_slice(&v.to_ne_bytes());
-            }
-            Ok(out)
-        }
-        BamFieldPodKind::IVec2 | BamFieldPodKind::IVec3 | BamFieldPodKind::IVec4 => {
-            let len = kind.byte_size() / 4;
-            let arr = val
-                .as_array()
-                .ok_or_else(|| format!("field '{field_name}' expected [i32; {len}]"))?;
-            if arr.len() != len {
-                return Err(format!("field '{field_name}' expected {len} elements"));
-            }
-            let mut out = Vec::with_capacity(kind.byte_size());
-            for item in arr {
-                let i = json_number_as_i64(field_name, item)?;
-                let v = i32::try_from(i)
-                    .map_err(|_| format!("field '{field_name}' element out of i32 range"))?;
-                out.extend_from_slice(&v.to_ne_bytes());
-            }
-            Ok(out)
-        }
-        BamFieldPodKind::Bytes2
-        | BamFieldPodKind::Bytes3
-        | BamFieldPodKind::Bytes4
-        | BamFieldPodKind::Bytes8
-        | BamFieldPodKind::Bytes16 => {
-            let len = kind.byte_size();
-            let arr = val
-                .as_array()
-                .ok_or_else(|| format!("field '{field_name}' expected [u8; {len}]"))?;
-            if arr.len() != len {
-                return Err(format!("field '{field_name}' expected {len} byte elements"));
-            }
-            let mut out = Vec::with_capacity(len);
-            for item in arr {
-                let u = json_number_as_u64(field_name, item)?;
-                let b = u8::try_from(u)
-                    .map_err(|_| format!("field '{field_name}' element out of u8 range"))?;
-                out.push(b);
-            }
-            Ok(out)
-        }
-    }
-}
-
-fn json_map_to_bam_field_patches(
-    obj: &Map<String, Value>,
-    fields: &[BamFieldDescriptor],
-) -> Result<Vec<BamFieldBytePatch>, String> {
-    let mut patches = Vec::with_capacity(obj.len());
-    for (k, v) in obj {
-        let desc = fields
-            .iter()
-            .find(|f| f.name == *k)
-            .ok_or_else(|| format!("unknown field '{k}'"))?;
-        let pod_kind = desc
-            .pod_kind
-            .ok_or_else(|| format!("field '{k}' is opaque/non-POD and cannot be mutated"))?;
-        let bytes = json_to_bam_field_bytes(k, pod_kind, v)?;
-        patches.push(BamFieldBytePatch {
-            offset: desc.offset,
-            bytes,
-        });
-    }
-    Ok(patches)
-}
-
-fn json_to_record(
-    field_name: &str,
-    type_tag: &str,
-    val: &Value,
-) -> Result<ExportedFieldRecord, String> {
-    let bytes = match (type_tag, val) {
-        ("f32", Value::Number(n)) => {
-            let f = n
-                .as_f64()
-                .ok_or_else(|| format!("field '{field_name}' expected finite f32"))?;
-            (f as f32).to_le_bytes().to_vec()
-        }
-        ("f64", Value::Number(n)) => {
-            let f = n
-                .as_f64()
-                .ok_or_else(|| format!("field '{field_name}' expected finite f64"))?;
-            f.to_le_bytes().to_vec()
-        }
-        ("i8" | "i16" | "i32" | "i64" | "i128", Value::Number(n)) => {
-            let i = n
-                .as_i64()
-                .ok_or_else(|| format!("field '{field_name}' expected signed integer"))?;
-            encode_signed_i128(type_tag, i128::from(i))
-                .map_err(|e| format!("field '{field_name}' range/type error: {e:?}"))?
-        }
-        ("u8" | "u16" | "u32" | "u64" | "u128", Value::Number(n)) => {
-            let u = n
-                .as_u64()
-                .ok_or_else(|| format!("field '{field_name}' expected unsigned integer"))?;
-            encode_unsigned_u128(type_tag, u128::from(u))
-                .map_err(|e| format!("field '{field_name}' range/type error: {e:?}"))?
-        }
-        ("bool", Value::Bool(b)) => vec![u8::from(*b)],
-        ("String" | "__variant", Value::String(s)) => s.as_bytes().to_vec(),
-        ("Vec<u8>", Value::Array(arr)) => {
-            let mut out = Vec::with_capacity(arr.len());
-            for item in arr {
-                let b = item
-                    .as_u64()
-                    .and_then(|u| u8::try_from(u).ok())
-                    .ok_or_else(|| format!("field '{field_name}' expected u8 array"))?;
-                out.push(b);
-            }
-            out
-        }
-        ("Vec<u32>", Value::Array(arr)) => {
-            let mut out = Vec::with_capacity(arr.len() * 4);
-            for item in arr {
-                let u = item
-                    .as_u64()
-                    .and_then(|n| u32::try_from(n).ok())
-                    .ok_or_else(|| format!("field '{field_name}' expected u32 array"))?;
-                out.extend_from_slice(&u.to_le_bytes());
-            }
-            out
-        }
-        ("Vec<i32>", Value::Array(arr)) => {
-            let mut out = Vec::with_capacity(arr.len() * 4);
-            for item in arr {
-                let i = item
-                    .as_i64()
-                    .and_then(|n| i32::try_from(n).ok())
-                    .ok_or_else(|| format!("field '{field_name}' expected i32 array"))?;
-                out.extend_from_slice(&i.to_le_bytes());
-            }
-            out
-        }
-        ("Vec<f32>", Value::Array(arr)) => {
-            let mut out = Vec::with_capacity(arr.len() * 4);
-            for item in arr {
-                let f = item
-                    .as_f64()
-                    .ok_or_else(|| format!("field '{field_name}' expected f32 array"))?;
-                out.extend_from_slice(&(f as f32).to_le_bytes());
-            }
-            out
-        }
-        ("FfiOption<u32>", Value::Null)
-        | ("FfiOption<i32>", Value::Null)
-        | ("FfiOption<f32>", Value::Null) => vec![0u8],
-        ("FfiOption<u32>", Value::Number(n)) => {
-            let u = n
-                .as_u64()
-                .and_then(|x| u32::try_from(x).ok())
-                .ok_or_else(|| format!("field '{field_name}' expected Option<u32>"))?;
-            let mut b = vec![1u8];
-            b.extend_from_slice(&u.to_le_bytes());
-            b
-        }
-        ("FfiOption<i32>", Value::Number(n)) => {
-            let i = n
-                .as_i64()
-                .and_then(|x| i32::try_from(x).ok())
-                .ok_or_else(|| format!("field '{field_name}' expected Option<i32>"))?;
-            let mut b = vec![1u8];
-            b.extend_from_slice(&i.to_le_bytes());
-            b
-        }
-        ("FfiOption<f32>", Value::Number(n)) => {
-            let f = n
-                .as_f64()
-                .ok_or_else(|| format!("field '{field_name}' expected Option<f32>"))?;
-            let mut b = vec![1u8];
-            b.extend_from_slice(&(f as f32).to_le_bytes());
-            b
-        }
-        _ => {
-            return Err(format!(
-                "incompatible JSON value for field '{field_name}' (type_tag '{type_tag}')"
-            ));
-        }
-    };
-    Ok(ExportedFieldRecord {
-        field_name: field_name.to_owned(),
-        type_tag: type_tag.to_owned(),
-        bytes,
-    })
-}
-
-fn json_map_to_records(
-    obj: &Map<String, Value>,
-    fields: &[WitnessFieldDescriptor],
-) -> Result<Vec<ExportedFieldRecord>, String> {
-    let mut out = Vec::with_capacity(obj.len());
-    for (k, v) in obj {
-        let desc = fields
-            .iter()
-            .find(|f| f.name == *k)
-            .ok_or_else(|| format!("unknown field '{k}'"))?;
-        out.push(json_to_record(k, &desc.type_tag, v)?);
-    }
-    Ok(out)
-}
-
 // ============================================================================
 // Bevy Remote Protocol (`bevy_remote`) Mod Inspection & Mutation Handlers
 // ============================================================================
@@ -2715,11 +2387,14 @@ fn serialize_typed_reflect_to_json(
     component: BamComponent,
 ) -> Option<Value> {
     let reflect = world.reflect_mod_component(entity, component).ok()?;
-    let dyn_val = reflect.to_dynamic().ok()?;
     let app_types = world.get_resource::<AppTypeRegistry>()?;
     let types = app_types.read();
-    let ser = ReflectSerializer::new(dyn_val.as_partial_reflect(), &types);
-    serde_json::to_value(&ser).ok()
+    serialize_reflect_to_json(
+        reflect.as_partial_reflect(),
+        &types,
+        EphemeralHandleBehavior::Warn,
+    )
+    .ok()
 }
 
 /// Dispatches a Bevy Remote Protocol [`BrpRequest`] against `world` for `bevy_abi_mod/*` methods.
@@ -2912,6 +2587,7 @@ fn apply_typed_reflect_json(
         .get_resource::<AppTypeRegistry>()
         .ok_or_else(|| brp_err(error_codes::INTERNAL_ERROR, "AppTypeRegistry missing"))?
         .clone();
+    let mut asset_server = world.get_resource::<AssetServer>().cloned();
     let deserialized = {
         let types = app_types.read();
         let reg = types.get(type_id).ok_or_else(|| {
@@ -2920,13 +2596,8 @@ fn apply_typed_reflect_json(
                 format!("type '{canonical}' not registered in AppTypeRegistry"),
             )
         })?;
-        let de = TypedReflectDeserializer::new(reg, &types);
-        de.deserialize(value_json.clone()).map_err(|e| {
-            brp_err(
-                error_codes::INVALID_PARAMS,
-                format!("deserialize failed: {e}"),
-            )
-        })?
+        deserialize_reflect_from_json(reg, &types, value_json, asset_server.as_mut(), &canonical)
+            .map_err(|e| brp_err(error_codes::INVALID_PARAMS, e))?
     };
     with_reflect_mod_component_mut(world, entity, component, |mut target| {
         target.apply(deserialized.as_partial_reflect());
@@ -2950,7 +2621,7 @@ fn mutate_one_brp_component(
                 "component value must be object",
             )
         })?;
-        let records = json_map_to_records(map, &fields_schema)
+        let records = json_map_to_witness_records(map, &fields_schema)
             .map_err(|m| brp_err(error_codes::INVALID_PARAMS, m))?;
         apply_entity_component_fields(world, entity, handle, &records).map_err(|e| {
             brp_err(
@@ -3044,7 +2715,7 @@ fn brp_insert_components_impl(world: &mut World, params: Option<&Value>) -> BrpR
                     "component value must be object",
                 )
             })?;
-            let records = json_map_to_records(map, &fields_schema)
+            let records = json_map_to_witness_records(map, &fields_schema)
                 .map_err(|m| brp_err(error_codes::INVALID_PARAMS, m))?;
             insert_or_apply_entity_component_fields(world, entity, handle, &records).map_err(
                 |e| {
@@ -3147,7 +2818,7 @@ fn brp_mutate_resources_impl(world: &mut World, params: Option<&Value>) -> BrpRe
         .get_resource::<ModReflectRegistry>()
         .and_then(|r| r.witness_schema(handle).map(|s| s.fields.clone()))
     {
-        let records = json_map_to_records(value_map, &fields_schema)
+        let records = json_map_to_witness_records(value_map, &fields_schema)
             .map_err(|m| brp_err(error_codes::INVALID_PARAMS, m))?;
         apply_resource_fields(world, handle, &records).map_err(|e| {
             brp_err(
@@ -3342,8 +3013,11 @@ fn import_mod_settings_toml_into_world(
                     let mut records = Vec::new();
                     for (k, v) in group_tbl {
                         if let Some(desc) = fields_schema.iter().find(|f| f.name == *k)
-                            && let Ok(rec) =
-                                json_to_record(k, &desc.type_tag, &toml_to_json_value(v))
+                            && let Ok(rec) = encode_json_to_witness_record(
+                                k,
+                                &desc.type_tag,
+                                &toml_to_json_value(v),
+                            )
                         {
                             records.push(rec);
                         }
@@ -3361,7 +3035,7 @@ fn import_mod_settings_toml_into_world(
                         if let Some(desc) = bam_fields.iter().find(|f| f.name == *k)
                             && let Some(pod_kind) = desc.pod_kind
                             && let Ok(bytes) =
-                                json_to_bam_field_bytes(k, pod_kind, &toml_to_json_value(v))
+                                encode_json_to_pod_field_bytes(k, pod_kind, &toml_to_json_value(v))
                         {
                             patches.push(BamFieldBytePatch {
                                 offset: desc.offset,

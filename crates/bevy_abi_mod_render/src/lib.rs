@@ -3,16 +3,34 @@
 
 //! Safe (`#![forbid(unsafe_code)]`) multi-world `SubApp` extraction, WESL shaders,
 //! [`AlignedVec`](bevy_platform::collections::AlignedVec)-backed [`ShaderBuffer`] storage assets,
-//! and Bevy `0.20` 2D/3D material modding for `bevy_abi_mod` (`ABI 0.3.0`).
+//! Bevy `0.20` system-driven `RenderGraph` / `Core2d` / `Core3d` 2D/3D material modding, and
+//! bounded GPU device-loss recovery ([`ModRenderRecoveryPlugin`]) for `bevy_abi_mod` (`ABI 0.3.0`).
 //!
 //! Installing [`ModWeslMaterialPlugin`] (or calling any registration helper on [`ModMaterialAppExt`]
 //! / [`ModMaterialWorldExt`]) automatically registers a mod-unload cleanup hook with
 //! `bevy_abi_mod_host` so shaders, storage buffers, and material assets owned by an unloaded or
 //! hot-reloaded mod are purged deterministically from `Assets<T>`.
+//!
+//! Installing [`ModRenderRecoveryPlugin`] registers a bounded Bevy `0.20`
+//! [`RenderErrorHandler`](bevy_render::error_handler::RenderErrorHandler) that recovers from
+//! [`ErrorType::DeviceLost`](bevy_render::error_handler::ErrorType::DeviceLost) via
+//! [`RenderErrorPolicy::Recover`](bevy_render::error_handler::RenderErrorPolicy::Recover), clears
+//! cached mesh-shader pipelines and 2D/3D material specialization state on `RenderStartup`, and
+//! stops rendering safely on non-device-loss errors or exhausted retry budgets.
 
+pub mod recovery;
 pub mod sprite_mesh_shaders;
 pub mod sub_app_materials;
 
+pub use recovery::{
+    DEFAULT_MAX_CONSECUTIVE_RECOVERIES, DEFAULT_RECOVERY_WINDOW, ModRenderCacheInvalidationReport,
+    ModRenderRecoveryAppExt, ModRenderRecoveryHookFn, ModRenderRecoveryHooks,
+    ModRenderRecoveryOutcome, ModRenderRecoveryPlugin, ModRenderRecoveryPolicy,
+    ModRenderRecoveryRenderState, ModRenderRecoveryTelemetry, ModRenderRecoveryWorldExt,
+    handle_mod_render_error_at, invalidate_mod_render_caches_in_render_world,
+    mod_render_error_handler, register_mod_render_recovery_hook_in_world,
+    requeue_mod_2d_materials_after_render_startup, reset_mod_sprite_materials_on_render_startup,
+};
 pub use sprite_mesh_shaders::{
     ExtractedModMeshPipeline, ExtractedModMeshPipelines, ModExtendedSpriteMaterial2d,
     ModExtendedSpriteMaterialSpec, ModMeshPipelineEntry, ModMeshPipelineId, ModMeshPipelineSpec,
@@ -27,9 +45,10 @@ pub use sprite_mesh_shaders::{
     cleanup_mod_sprite_mesh_bindings_in_world, detach_mod_extended_material_2d_in_world,
     detach_mod_sprite_material_in_world, register_mod_mesh_pipeline_in_world,
     register_mod_quad_mesh_in_world, register_mod_wesl_extended_sprite_material_in_world,
-    register_mod_wesl_sprite_extension_in_world, resolve_wesl_sprite_specialization,
-    spawn_mod_extended_mesh_sprite_in_world, spawn_mod_sprite_with_material_in_world,
-    unregister_mod_mesh_pipeline_in_world, update_mod_extended_sprite_material_buffer_in_world,
+    register_mod_wesl_sprite_extension_in_world, reset_mod_mesh_pipelines_on_render_startup,
+    resolve_wesl_sprite_specialization, spawn_mod_extended_mesh_sprite_in_world,
+    spawn_mod_sprite_with_material_in_world, unregister_mod_mesh_pipeline_in_world,
+    update_mod_extended_sprite_material_buffer_in_world,
     update_mod_extended_sprite_material_params_in_world,
     update_mod_extended_sprite_material_shaders_in_world,
     update_mod_sprite_extension_params_in_world, update_mod_wesl_sprite_extension_buffer_in_world,
@@ -253,9 +272,15 @@ impl ModMaterialAppExt for App {
     }
 }
 
-/// Convenient prelude re-exporting `SubApp` extraction, WESL/material, 2D sprite shader, and
-/// opt-in mesh-shader plugins, traits, and specs.
+/// Convenient prelude re-exporting `SubApp` extraction, WESL/material, 2D sprite shader,
+/// opt-in mesh-shader, and bounded GPU device-loss recovery plugins, traits, and specs.
 pub mod prelude {
+    pub use crate::recovery::{
+        ModRenderCacheInvalidationReport, ModRenderRecoveryAppExt, ModRenderRecoveryHookFn,
+        ModRenderRecoveryHooks, ModRenderRecoveryOutcome, ModRenderRecoveryPlugin,
+        ModRenderRecoveryPolicy, ModRenderRecoveryRenderState, ModRenderRecoveryTelemetry,
+        ModRenderRecoveryWorldExt, mod_render_error_handler,
+    };
     pub use crate::sprite_mesh_shaders::{
         ExtractedModMeshPipeline, ExtractedModMeshPipelines, ModExtendedSpriteMaterial2d,
         ModExtendedSpriteMaterialSpec, ModMeshPipelineEntry, ModMeshPipelineId,

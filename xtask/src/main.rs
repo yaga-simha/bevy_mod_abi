@@ -1496,7 +1496,7 @@ fn run_sig_verification_clippy(root: &Path) -> Result<(), String> {
         "-p",
         "bevy_abi_mod_host",
         "-p",
-        "bevy_abi_mod",
+        "bevy_mod_abi",
         "--features",
         "signature-verification",
         "--all-targets",
@@ -1615,7 +1615,7 @@ fn cmd_ci(args: &[String]) -> Result<(), String> {
             "-p",
             "bevy_abi_mod_host",
             "-p",
-            "bevy_abi_mod",
+            "bevy_mod_abi",
             "--features",
             "signature-verification",
         ]);
@@ -1820,8 +1820,8 @@ fn verify_forbid_unsafe(root: &Path) -> Result<(), String> {
         "==> Verifying #![forbid(unsafe_code)] in safe host, bridge, render, reflect, watcher, guest, macro, CLI, and xtask crates"
     );
     let safe_crates = [
-        "crates/bevy_abi_mod/src/lib.rs",
         "crates/bevy_mod_abi/src/lib.rs",
+        "crates/bevy_abi_mod/src/lib.rs",
         "crates/bevy_abi_mod_host/src/lib.rs",
         "crates/bevy_abi_mod_bridges/src/lib.rs",
         "crates/bevy_abi_mod_render/src/lib.rs",

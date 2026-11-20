@@ -2,8 +2,8 @@
 //!
 //! Exposes `Position`, `Velocity`, and `ColorRgba` to guest mods via `#[derive(ModComponent)]`.
 
-use bevy_abi_mod::ModComponent;
 use bevy_ecs::component::Component;
+use bevy_mod_abi::ModComponent;
 
 /// 3D world-space particle position (`example::Position`).
 #[repr(C)]

@@ -86,6 +86,8 @@ pub enum ModStateError {
     InvalidVariantName(String),
     /// Deterministic `ScheduleId` arithmetic overflowed `u32::MAX`.
     ScheduleIdOverflow,
+    /// Dynamic [`ModStateSlab`] slot allocation exceeded `u32::MAX` slots.
+    SlabCapacityExceeded,
     /// Component or resource registration collided in [`ModRegistry`].
     ComponentCollision(ComponentCollisionError),
 }
@@ -105,6 +107,7 @@ impl fmt::Display for ModStateError {
                 write!(f, "invalid or duplicate variant name '{name}'")
             }
             Self::ScheduleIdOverflow => write!(f, "state ScheduleId range overflowed u32::MAX"),
+            Self::SlabCapacityExceeded => write!(f, "ModStateSlab exceeded u32::MAX slots"),
             Self::ComponentCollision(err) => write!(f, "{err}"),
         }
     }
@@ -513,24 +516,25 @@ impl ModStateSlab {
         slot.entry.as_mut()
     }
 
-    fn allocate_slot_for<S: 'static>(&mut self) -> ModStateHandle {
+    fn allocate_slot_for<S: 'static>(&mut self) -> Result<ModStateHandle, ModStateError> {
         if let Some(&existing) = self.by_type.get(&TypeId::of::<S>()) {
-            return existing;
+            return Ok(existing);
         }
         if let Some(idx) = self.free_list.pop() {
             let gen_val = self.slots[idx].generation;
             let handle = ModStateHandle::new(idx as u32, gen_val);
             self.by_type.insert(TypeId::of::<S>(), handle);
-            handle
+            Ok(handle)
         } else {
-            let idx = u32::try_from(self.slots.len()).expect("ModStateSlab exceeded u32::MAX");
+            let idx =
+                u32::try_from(self.slots.len()).map_err(|_| ModStateError::SlabCapacityExceeded)?;
             self.slots.push(SlabSlot {
                 generation: 1,
                 entry: None,
             });
             let handle = ModStateHandle::new(idx, 1);
             self.by_type.insert(TypeId::of::<S>(), handle);
-            handle
+            Ok(handle)
         }
     }
 
@@ -1854,7 +1858,7 @@ impl ModStateExt for App {
         let handle = self
             .world_mut()
             .resource_mut::<ModStateSlab>()
-            .allocate_slot_for::<S>();
+            .allocate_slot_for::<S>()?;
 
         store_state_variants(owned_variants.clone());
 
@@ -1918,7 +1922,7 @@ impl ModStateExt for App {
         let handle = self
             .world_mut()
             .resource_mut::<ModStateSlab>()
-            .allocate_slot_for::<S>();
+            .allocate_slot_for::<S>()?;
 
         store_state_variants(owned_variants.clone());
 
@@ -1981,7 +1985,7 @@ impl ModStateExt for App {
         let handle = self
             .world_mut()
             .resource_mut::<ModStateSlab>()
-            .allocate_slot_for::<S>();
+            .allocate_slot_for::<S>()?;
 
         store_state_variants(owned_variants.clone());
 

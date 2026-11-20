@@ -68,6 +68,13 @@ pub trait ModCommandsExt {
     fn reload_mod_with(&mut self, id: ModId, options: LoadOptions);
 }
 
+fn queue_mod_lifecycle<F>(commands: &mut Commands<'_, '_>, op: F)
+where
+    F: FnOnce(&mut World) + Send + Sync + 'static,
+{
+    commands.queue(move |world: &mut World| run_or_defer_lifecycle_op(world, op));
+}
+
 impl ModCommandsExt for Commands<'_, '_> {
     fn load_mod<P: AsRef<Path>>(&mut self, path: P) {
         self.load_mod_with(path, LoadOptions::default());
@@ -75,30 +82,18 @@ impl ModCommandsExt for Commands<'_, '_> {
 
     fn load_mod_with<P: AsRef<Path>>(&mut self, path: P, options: LoadOptions) {
         let path_buf = path.as_ref().to_path_buf();
-        self.queue(move |world: &mut World| {
-            run_or_defer_lifecycle_op(world, move |w| {
-                if let Err(err) = w.load_mod_with(&path_buf, options) {
-                    tracing::error!(
-                        path = %path_buf.display(),
-                        error = %err,
-                        "deferred Commands::load_mod_with failed"
-                    );
-                }
-            });
+        queue_mod_lifecycle(self, move |w| {
+            if let Err(err) = w.load_mod_with(&path_buf, options) {
+                tracing::error!(path = %path_buf.display(), error = %err, "deferred Commands::load_mod_with failed");
+            }
         });
     }
 
     fn unload_mod(&mut self, id: ModId) {
-        self.queue(move |world: &mut World| {
-            run_or_defer_lifecycle_op(world, move |w| {
-                if let Err(err) = w.unload_mod(id) {
-                    tracing::error!(
-                        mod_id = ?id,
-                        error = %err,
-                        "deferred Commands::unload_mod failed"
-                    );
-                }
-            });
+        queue_mod_lifecycle(self, move |w| {
+            if let Err(err) = w.unload_mod(id) {
+                tracing::error!(mod_id = ?id, error = %err, "deferred Commands::unload_mod failed");
+            }
         });
     }
 
@@ -107,16 +102,10 @@ impl ModCommandsExt for Commands<'_, '_> {
     }
 
     fn reload_mod_with(&mut self, id: ModId, options: LoadOptions) {
-        self.queue(move |world: &mut World| {
-            run_or_defer_lifecycle_op(world, move |w| {
-                if let Err(err) = w.reload_mod_with(id, options) {
-                    tracing::error!(
-                        mod_id = ?id,
-                        error = %err,
-                        "deferred Commands::reload_mod_with failed"
-                    );
-                }
-            });
+        queue_mod_lifecycle(self, move |w| {
+            if let Err(err) = w.reload_mod_with(id, options) {
+                tracing::error!(mod_id = ?id, error = %err, "deferred Commands::reload_mod_with failed");
+            }
         });
     }
 }

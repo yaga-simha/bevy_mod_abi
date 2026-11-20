@@ -1,8 +1,8 @@
 //! Host ECS components and UI mod-slot state for Example 05: Cute 3D Slime Meadow (`winit` + `wgpu`).
 
-use bevy_abi_mod::{ModComponent, ModId};
 use bevy_ecs::component::Component;
 use bevy_ecs::prelude::Resource;
+use bevy_mod_abi::{ModComponent, ModId};
 
 /// 3D world-space position of a slime spirit (`cute3d::Position`).
 #[repr(C)]

@@ -63,6 +63,11 @@ fn fixture_dylib(stem: &str) -> PathBuf {
     let dir = std::env::var_os("BAM_FIXTURE_DIR")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("CARGO_TARGET_DIR")
+                .filter(|v| !v.is_empty())
+                .map(|d| PathBuf::from(d).join("fixtures"))
+        })
         .unwrap_or_else(|| workspace_root().join("target").join("fixtures"));
     let (prefix, ext) = if cfg!(target_os = "windows") {
         ("", "dll")

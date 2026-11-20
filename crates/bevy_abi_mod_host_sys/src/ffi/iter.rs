@@ -20,7 +20,9 @@
 //!    `this_run`, while [`TickFilterTerm`] evaluates `Added<T>` / `Changed<T>` predicates
 //!    against `last_run` and `this_run`.
 
-use crate::handle_header::{HandleHeader, ITER_MAGIC, validate_handle_mut, validate_handle_ref};
+use crate::handle_header::{
+    HandleHeader, ITER_MAGIC, ffi_try, init_out_ptr, validate_iter_mut, validate_iter_ref,
+};
 use crate::registry::{MsgReadBatchFn, MsgSendFn, MsgWriteBatchFn};
 use crate::sync_ptr::{GuestFnPtr, GuestUserData};
 use bevy_abi_mod_sys::{
@@ -259,7 +261,6 @@ pub struct SparseRowScratch {
     entities: Vec<FfiEntity>,
     row_ptrs: Vec<Vec<*mut u8>>,
     tick_ptrs: Vec<Vec<*const UnsafeCell<Tick>>>,
-    summary_ptrs: Vec<Option<*const AtomicTick>>,
 }
 
 // SAFETY: `SparseRowScratch` holds temporary pointers only during an active single-threaded
@@ -275,9 +276,14 @@ impl SparseRowScratch {
         if self.row_ptrs.len() < term_count {
             self.row_ptrs.resize_with(term_count, Vec::new);
             self.tick_ptrs.resize_with(term_count, Vec::new);
-            self.summary_ptrs.resize(term_count, None);
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct RunTicks {
+    last_run: Tick,
+    this_run: Tick,
 }
 
 #[derive(Clone, Copy)]
@@ -362,6 +368,40 @@ pub struct HostIter<'w> {
 const _: () = assert!(core::mem::offset_of!(HostIter<'_>, header) == 0);
 
 impl<'w> HostIter<'w> {
+    #[inline]
+    fn from_backing(
+        tables: &'w Tables,
+        backing: IterBacking<'w>,
+        plan: &'w QueryPlan,
+        ticks: RunTicks,
+        world: Option<UnsafeWorldCell<'w>>,
+        sparse_scratch: Option<&'w mut SparseRowScratch>,
+        in_par_iter: bool,
+    ) -> Self {
+        Self {
+            header: HandleHeader::new(ITER_MAGIC),
+            tables: Some(tables),
+            backing,
+            plan,
+            last_run: ticks.last_run,
+            this_run: ticks.this_run,
+            world,
+            sparse_scratch,
+            msg_cursors: None,
+            in_par_iter,
+            chunks_yielded: 0,
+            entities_yielded: 0,
+            current_entities_ptr: core::ptr::null(),
+            current_entity_count: 0,
+            marked_changed_mask: 0,
+            materialized_sparse_mask: 0,
+            present_sparse_mask: 0,
+            active_columns: [None; MAX_TERMS_PER_QUERY],
+            has_true_buf: Vec::new(),
+            has_false_buf: Vec::new(),
+        }
+    }
+
     /// Constructs a dense `Table` chunk iterator.
     pub fn new_dense(
         tables: &'w Tables,
@@ -380,32 +420,18 @@ impl<'w> HostIter<'w> {
         } else {
             IterBacking::ResourceOnly
         };
-        Self {
-            header: HandleHeader::new(ITER_MAGIC),
-            tables: Some(tables),
+        Self::from_backing(
+            tables,
             backing,
             plan,
-            last_run,
-            this_run,
-            world: None,
-            sparse_scratch: None,
-            msg_cursors: None,
-            in_par_iter: false,
-            chunks_yielded: 0,
-            entities_yielded: 0,
-            current_entities_ptr: core::ptr::null(),
-            current_entity_count: 0,
-            marked_changed_mask: 0,
-            materialized_sparse_mask: 0,
-            present_sparse_mask: 0,
-            active_columns: [None; MAX_TERMS_PER_QUERY],
-            has_true_buf: Vec::new(),
-            has_false_buf: Vec::new(),
-        }
+            RunTicks { last_run, this_run },
+            None,
+            None,
+            false,
+        )
     }
 
     /// Constructs an archetype-aware iterator supporting indirect `SparseSet` row batching.
-    #[allow(clippy::too_many_arguments)]
     pub fn new_archetypal(
         tables: &'w Tables,
         archetypes: &'w Archetypes,
@@ -429,28 +455,15 @@ impl<'w> HostIter<'w> {
         } else {
             IterBacking::ResourceOnly
         };
-        Self {
-            header: HandleHeader::new(ITER_MAGIC),
-            tables: Some(tables),
+        Self::from_backing(
+            tables,
             backing,
             plan,
-            last_run,
-            this_run,
-            world: None,
-            sparse_scratch: Some(sparse_scratch),
-            msg_cursors: None,
-            in_par_iter: false,
-            chunks_yielded: 0,
-            entities_yielded: 0,
-            current_entities_ptr: core::ptr::null(),
-            current_entity_count: 0,
-            marked_changed_mask: 0,
-            materialized_sparse_mask: 0,
-            present_sparse_mask: 0,
-            active_columns: [None; MAX_TERMS_PER_QUERY],
-            has_true_buf: Vec::new(),
-            has_false_buf: Vec::new(),
-        }
+            RunTicks { last_run, this_run },
+            None,
+            Some(sparse_scratch),
+            false,
+        )
     }
 
     /// Overrides the handle generation (for zero-atomic per-frame initialization when `generation != 0`).
@@ -535,24 +548,22 @@ impl<'w> HostIter<'w> {
     }
 
     #[inline]
-    #[allow(clippy::too_many_arguments)]
     fn entity_matches_archetypal_filters(
-        dense_slices: &[(usize, &[UnsafeCell<Tick>])],
+        af: &ArchetypeFilters<'_>,
         sparse_sets: &'w SparseSets,
         tick_filters: &[TickFilterTerm],
         entity: Entity,
         table_row_idx: usize,
         table_len: usize,
-        last_run: Tick,
-        this_run: Tick,
+        ticks: RunTicks,
     ) -> bool {
         if table_row_idx >= table_len {
             return false;
         }
-        for &(_, ticks) in dense_slices {
-            // SAFETY: `table_row_idx < table_len == ticks.len()`.
-            let tick = unsafe { *ticks.get_unchecked(table_row_idx).get() };
-            if !tick.is_newer_than(last_run, this_run) {
+        for &(_, col_ticks) in &af.dense_filter_slices[..af.dense_filter_len] {
+            // SAFETY: `table_row_idx < table_len == col_ticks.len()`.
+            let tick = unsafe { *col_ticks.get_unchecked(table_row_idx).get() };
+            if !tick.is_newer_than(ticks.last_run, ticks.this_run) {
                 return false;
             }
         }
@@ -573,7 +584,7 @@ impl<'w> HostIter<'w> {
             };
             // SAFETY: Shared sparse component tick access was declared in `FilteredAccess`.
             let tick = unsafe { *cell.get() };
-            if !tick.is_newer_than(last_run, this_run) {
+            if !tick.is_newer_than(ticks.last_run, ticks.this_run) {
                 return false;
             }
         }
@@ -581,33 +592,31 @@ impl<'w> HostIter<'w> {
     }
 
     #[inline]
-    #[allow(clippy::too_many_arguments)]
     fn entity_matches_archetypal_or_groups(
-        or_dense_slices: &[&[UnsafeCell<Tick>]],
-        or_sparse_clauses: &[(ComponentId, bool)],
-        or_ranges: &[(usize, usize, usize, usize)],
+        af: &ArchetypeFilters<'_>,
         sparse_sets: &'w SparseSets,
         entity: Entity,
         table_row_idx: usize,
         table_len: usize,
-        last_run: Tick,
-        this_run: Tick,
+        ticks: RunTicks,
     ) -> bool {
         if table_row_idx >= table_len {
             return false;
         }
-        for &(d_start, d_end, s_start, s_end) in or_ranges {
+        let or_dense = &af.or_dense_slices[..af.or_dense_len];
+        let or_sparse = &af.or_sparse_clauses[..af.or_sparse_len];
+        for &(d_start, d_end, s_start, s_end) in &af.or_ranges[..af.or_group_len] {
             let mut any_match = false;
-            for ticks in &or_dense_slices[d_start..d_end] {
-                // SAFETY: `table_row_idx < table_len == ticks.len()`.
-                let tick = unsafe { *ticks.get_unchecked(table_row_idx).get() };
-                if tick.is_newer_than(last_run, this_run) {
+            for col_ticks in &or_dense[d_start..d_end] {
+                // SAFETY: `table_row_idx < table_len == col_ticks.len()`.
+                let tick = unsafe { *col_ticks.get_unchecked(table_row_idx).get() };
+                if tick.is_newer_than(ticks.last_run, ticks.this_run) {
                     any_match = true;
                     break;
                 }
             }
             if !any_match {
-                for &(cid, is_added) in &or_sparse_clauses[s_start..s_end] {
+                for &(cid, is_added) in &or_sparse[s_start..s_end] {
                     let Some(ss) = sparse_sets.get(cid) else {
                         continue;
                     };
@@ -621,7 +630,7 @@ impl<'w> HostIter<'w> {
                     };
                     // SAFETY: Shared sparse component tick access was declared in `FilteredAccess`.
                     let tick = unsafe { *cell.get() };
-                    if tick.is_newer_than(last_run, this_run) {
+                    if tick.is_newer_than(ticks.last_run, ticks.this_run) {
                         any_match = true;
                         break;
                     }
@@ -988,34 +997,27 @@ impl<'w> HostIter<'w> {
                     if af.skip {
                         continue;
                     }
-                    let active_dense = &af.dense_filter_slices[..af.dense_filter_len];
-                    let active_or_dense = &af.or_dense_slices[..af.or_dense_len];
-                    let active_or_sparse = &af.or_sparse_clauses[..af.or_sparse_len];
-                    let active_or_ranges = &af.or_ranges[..af.or_group_len];
+                    let ticks = RunTicks { last_run, this_run };
                     for cand in &arch_entities[start..limit_entities] {
                         let row_idx = cand.table_row().index();
                         let ok_top = !has_tick_filters
                             || Self::entity_matches_archetypal_filters(
-                                active_dense,
+                                &af,
                                 sparse_sets,
                                 tick_filters,
                                 cand.id(),
                                 row_idx,
                                 table_len,
-                                last_run,
-                                this_run,
+                                ticks,
                             );
-                        let ok_or = active_or_ranges.is_empty()
+                        let ok_or = af.or_group_len == 0
                             || Self::entity_matches_archetypal_or_groups(
-                                active_or_dense,
-                                active_or_sparse,
-                                active_or_ranges,
+                                &af,
                                 sparse_sets,
                                 cand.id(),
                                 row_idx,
                                 table_len,
-                                last_run,
-                                this_run,
+                                ticks,
                             );
                         if ok_top && ok_or {
                             total += 1;
@@ -1083,9 +1085,8 @@ impl<'w> HostIter<'w> {
                         let run_len = limit_len - start;
                         *table_cursor += 1;
                         *row_cursor = 0;
-                        // SAFETY: `start + run_len == limit_len <= full_table_len == table.entities().len()`.
                         self.current_entities_ptr =
-                            unsafe { table.entities().as_ptr().add(start).cast::<FfiEntity>() };
+                            table.entities()[start..].as_ptr().cast::<FfiEntity>();
                         self.current_entity_count = run_len;
                         self.populate_dense_columns(table, full_table_len, start, run_len);
                         self.populate_has_columns(run_len, |cid| table.has_column(cid));
@@ -1158,14 +1159,9 @@ impl<'w> HostIter<'w> {
                         *row_cursor = 0;
                     }
 
-                    // SAFETY: `start_row_idx + run_len <= limit_len <= full_table_len == table.entities().len()`.
-                    self.current_entities_ptr = unsafe {
-                        table
-                            .entities()
-                            .as_ptr()
-                            .add(start_row_idx)
-                            .cast::<FfiEntity>()
-                    };
+                    self.current_entities_ptr = table.entities()[start_row_idx..]
+                        .as_ptr()
+                        .cast::<FfiEntity>();
                     self.current_entity_count = run_len;
                     self.populate_dense_columns(table, full_table_len, start_row_idx, run_len);
                     self.populate_has_columns(run_len, |cid| table.has_column(cid));
@@ -1226,11 +1222,8 @@ impl<'w> HostIter<'w> {
                         continue;
                     }
 
-                    let active_dense_filters = &af.dense_filter_slices[..af.dense_filter_len];
-                    let active_or_dense = &af.or_dense_slices[..af.or_dense_len];
-                    let active_or_sparse = &af.or_sparse_clauses[..af.or_sparse_len];
-                    let active_or_ranges = &af.or_ranges[..af.or_group_len];
-                    let evaluate_row_filters = has_tick_filters || !active_or_ranges.is_empty();
+                    let ticks = RunTicks { last_run, this_run };
+                    let evaluate_row_filters = has_tick_filters || af.or_group_len != 0;
 
                     if evaluate_row_filters {
                         while *entity_cursor < limit_entities {
@@ -1238,26 +1231,22 @@ impl<'w> HostIter<'w> {
                             let row_idx = cand.table_row().index();
                             let ok_top = !has_tick_filters
                                 || Self::entity_matches_archetypal_filters(
-                                    active_dense_filters,
+                                    &af,
                                     sparse_sets,
                                     tick_filters,
                                     cand.id(),
                                     row_idx,
                                     table_len,
-                                    last_run,
-                                    this_run,
+                                    ticks,
                                 );
-                            let ok_or = active_or_ranges.is_empty()
+                            let ok_or = af.or_group_len == 0
                                 || Self::entity_matches_archetypal_or_groups(
-                                    active_or_dense,
-                                    active_or_sparse,
-                                    active_or_ranges,
+                                    &af,
                                     sparse_sets,
                                     cand.id(),
                                     row_idx,
                                     table_len,
-                                    last_run,
-                                    this_run,
+                                    ticks,
                                 );
                             if ok_top && ok_or {
                                 break;
@@ -1290,26 +1279,22 @@ impl<'w> HostIter<'w> {
                         if evaluate_row_filters {
                             let ok_top = !has_tick_filters
                                 || Self::entity_matches_archetypal_filters(
-                                    active_dense_filters,
+                                    &af,
                                     sparse_sets,
                                     tick_filters,
                                     next_ent.id(),
                                     next_row_idx,
                                     table_len,
-                                    last_run,
-                                    this_run,
+                                    ticks,
                                 );
-                            let ok_or = active_or_ranges.is_empty()
+                            let ok_or = af.or_group_len == 0
                                 || Self::entity_matches_archetypal_or_groups(
-                                    active_or_dense,
-                                    active_or_sparse,
-                                    active_or_ranges,
+                                    &af,
                                     sparse_sets,
                                     next_ent.id(),
                                     next_row_idx,
                                     table_len,
-                                    last_run,
-                                    this_run,
+                                    ticks,
                                 );
                             if !(ok_top && ok_or) {
                                 break;
@@ -1330,14 +1315,9 @@ impl<'w> HostIter<'w> {
                     self.entities_yielded += run_len;
 
                     if contiguous_table_rows && start_row_idx + run_len <= table_len {
-                        // SAFETY: `start_row_idx + run_len <= table_len == table.entities().len()`.
-                        self.current_entities_ptr = unsafe {
-                            table
-                                .entities()
-                                .as_ptr()
-                                .add(start_row_idx)
-                                .cast::<FfiEntity>()
-                        };
+                        self.current_entities_ptr = table.entities()[start_row_idx..]
+                            .as_ptr()
+                            .cast::<FfiEntity>();
                     } else if let Some(ref mut scratch) = self.sparse_scratch {
                         scratch.entities.clear();
                         scratch.entities.reserve(run_len);
@@ -1377,7 +1357,6 @@ impl<'w> HostIter<'w> {
                             ticks_vec.clear();
                             rows_vec.reserve(run_len);
                             ticks_vec.reserve(run_len);
-                            let mut summary_ptr: Option<*const AtomicTick> = None;
                             let mut all_present = true;
 
                             for arch_ent in
@@ -1386,11 +1365,6 @@ impl<'w> HostIter<'w> {
                                 if let Some((ptr, tick_cells)) = ss.get_with_ticks(arch_ent.id()) {
                                     rows_vec.push(ptr.as_ptr().cast_mut());
                                     ticks_vec.push(tick_cells.changed as *const UnsafeCell<Tick>);
-                                    if summary_ptr.is_none()
-                                        && let Some(s) = tick_cells.summary_tick
-                                    {
-                                        summary_ptr = Some(s as *const AtomicTick);
-                                    }
                                 } else {
                                     all_present = false;
                                     break;
@@ -1398,7 +1372,6 @@ impl<'w> HostIter<'w> {
                             }
 
                             if all_present {
-                                scratch.summary_ptrs[idx] = summary_ptr;
                                 self.present_sparse_mask |= 1u32 << idx;
                                 self.materialized_sparse_mask |= 1u32 << idx;
                             }
@@ -1589,9 +1562,7 @@ pub unsafe extern "C" fn host_iter_next_chunk(iter: *mut BamIter, out_len: *mut 
         return FfiBool::FALSE;
     }
     // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
-    let Ok(host_iter) =
-        (unsafe { validate_handle_mut::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false) })
-    else {
+    let Ok(host_iter) = (unsafe { validate_iter_mut(iter) }) else {
         return FfiBool::FALSE;
     };
 
@@ -1609,12 +1580,7 @@ pub unsafe extern "C" fn host_iter_next_chunk(iter: *mut BamIter, out_len: *mut 
 /// `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
 pub unsafe extern "C" fn host_iter_reset(iter: *mut BamIter) -> FfiResult {
     // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
-    let host_iter = match unsafe {
-        validate_handle_mut::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false)
-    } {
-        Ok(it) => it,
-        Err(err) => return err,
-    };
+    let host_iter = ffi_try!(unsafe { validate_iter_mut(iter) });
     if host_iter.in_par_iter {
         return FfiResult::ACCESS_CONFLICT;
     }
@@ -1628,9 +1594,7 @@ pub unsafe extern "C" fn host_iter_reset(iter: *mut BamIter) -> FfiResult {
 /// `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
 pub unsafe extern "C" fn host_iter_entities(iter: *const BamIter) -> *const FfiEntity {
     // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
-    let Ok(host_iter) =
-        (unsafe { validate_handle_ref::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false) })
-    else {
+    let Ok(host_iter) = (unsafe { validate_iter_ref(iter) }) else {
         return core::ptr::null();
     };
     if host_iter.current_entity_count == 0 {
@@ -1649,34 +1613,23 @@ pub unsafe extern "C" fn host_iter_column_readonly(
     term_index: usize,
 ) -> *const u8 {
     // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
-    let Ok(host_iter) =
-        (unsafe { validate_handle_ref::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false) })
-    else {
+    let Ok(host_iter) = (unsafe { validate_iter_ref(iter) }) else {
         return core::ptr::null();
     };
     if host_iter.current_entity_count == 0 || term_index >= host_iter.plan.terms.len() {
         return core::ptr::null();
     }
     let term = &host_iter.plan.terms[term_index];
-    if term.is_resource() || term.is_message() {
+    if term.is_resource()
+        || term.is_message()
+        || (host_iter.plan.or_term_mask & (1u32 << term_index)) != 0
+    {
         return core::ptr::null();
     }
-    if (host_iter.plan.or_term_mask & (1u32 << term_index)) != 0 {
+    if !term.mode.is_has() && (!term.mode.has_entity_column_data() || term.is_sparse_set()) {
         return core::ptr::null();
     }
-    if term.mode.is_has() {
-        return match &host_iter.active_columns[term_index] {
-            Some(col) => col.data_ptr.cast_const(),
-            None => core::ptr::null(),
-        };
-    }
-    if !term.mode.has_entity_column_data() || term.is_sparse_set() {
-        return core::ptr::null();
-    }
-    match &host_iter.active_columns[term_index] {
-        Some(col) => col.data_ptr.cast_const(),
-        None => core::ptr::null(),
-    }
+    host_iter.active_columns[term_index].map_or(core::ptr::null(), |col| col.data_ptr.cast_const())
 }
 
 /// Returns a mutable byte pointer to dense `Table` column `term_index`, marking chunk change ticks
@@ -1689,9 +1642,7 @@ pub unsafe extern "C" fn host_iter_column_mutable(
     term_index: usize,
 ) -> *mut u8 {
     // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
-    let Ok(host_iter) =
-        (unsafe { validate_handle_mut::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false) })
-    else {
+    let Ok(host_iter) = (unsafe { validate_iter_mut(iter) }) else {
         return core::ptr::null_mut();
     };
     if host_iter.current_entity_count == 0 || term_index >= host_iter.plan.terms.len() {
@@ -1736,9 +1687,7 @@ pub unsafe extern "C" fn host_iter_column_mutable_untracked(
     term_index: usize,
 ) -> *mut u8 {
     // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
-    let Ok(host_iter) =
-        (unsafe { validate_handle_mut::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false) })
-    else {
+    let Ok(host_iter) = (unsafe { validate_iter_mut(iter) }) else {
         return core::ptr::null_mut();
     };
     if host_iter.current_entity_count == 0 || term_index >= host_iter.plan.terms.len() {
@@ -1751,10 +1700,7 @@ pub unsafe extern "C" fn host_iter_column_mutable_untracked(
     {
         return core::ptr::null_mut();
     }
-    match host_iter.active_columns[term_index] {
-        Some(col) => col.data_ptr,
-        None => core::ptr::null_mut(),
-    }
+    host_iter.active_columns[term_index].map_or(core::ptr::null_mut(), |col| col.data_ptr)
 }
 
 /// Marks rows `start_row..start_row + row_count` in writable column `term_index` as changed.
@@ -1768,12 +1714,7 @@ pub unsafe extern "C" fn host_iter_mark_changed_range(
     row_count: usize,
 ) -> FfiResult {
     // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
-    let host_iter = match unsafe {
-        validate_handle_mut::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false)
-    } {
-        Ok(it) => it,
-        Err(err) => return err,
-    };
+    let host_iter = ffi_try!(unsafe { validate_iter_mut(iter) });
 
     if term_index >= host_iter.plan.terms.len() {
         return FfiResult::OUT_OF_RANGE;
@@ -1812,12 +1753,6 @@ pub unsafe extern "C" fn host_iter_mark_changed_range(
                     *(*tick_cell_ptr).get() = this_run;
                 }
             }
-            if let Some(summary_ptr) = scratch.summary_ptrs[term_index] {
-                // SAFETY: `summary_ptr` points to the live sparse set summary `AtomicTick`.
-                unsafe {
-                    (*summary_ptr).set(this_run);
-                }
-            }
             return FfiResult::OK;
         }
         return FfiResult::INTERNAL_ERROR;
@@ -1851,9 +1786,7 @@ pub unsafe extern "C" fn host_iter_column_rows_readonly(
     term_index: usize,
 ) -> *const *const u8 {
     // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
-    let Ok(host_iter) =
-        (unsafe { validate_handle_mut::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false) })
-    else {
+    let Ok(host_iter) = (unsafe { validate_iter_mut(iter) }) else {
         return core::ptr::null();
     };
     if host_iter.current_entity_count == 0 || term_index >= host_iter.plan.terms.len() {
@@ -1863,8 +1796,7 @@ pub unsafe extern "C" fn host_iter_column_rows_readonly(
     if !term.is_sparse_set() || !term.mode.has_entity_column_data() {
         return core::ptr::null();
     }
-    let bit = 1u32 << term_index;
-    if (host_iter.present_sparse_mask & bit) == 0 {
+    if (host_iter.present_sparse_mask & (1u32 << term_index)) == 0 {
         return core::ptr::null();
     }
     let Some(ref scratch) = host_iter.sparse_scratch else {
@@ -1883,9 +1815,7 @@ pub unsafe extern "C" fn host_iter_column_rows_mutable(
     term_index: usize,
 ) -> *const *mut u8 {
     // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
-    let Ok(host_iter) =
-        (unsafe { validate_handle_mut::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false) })
-    else {
+    let Ok(host_iter) = (unsafe { validate_iter_mut(iter) }) else {
         return core::ptr::null();
     };
     if host_iter.current_entity_count == 0 || term_index >= host_iter.plan.terms.len() {
@@ -1916,12 +1846,6 @@ pub unsafe extern "C" fn host_iter_column_rows_mutable(
                 *(*tick_cell_ptr).get() = this_run;
             }
         }
-        if let Some(summary_ptr) = scratch.summary_ptrs[term_index] {
-            // SAFETY: `summary_ptr` points to the live sparse set summary `AtomicTick`.
-            unsafe {
-                (*summary_ptr).set(this_run);
-            }
-        }
     }
 
     let out_ptr = scratch.row_ptrs[term_index].as_ptr();
@@ -1945,12 +1869,7 @@ pub unsafe extern "C" fn host_iter_column_info(
         return FfiResult::NULL_POINTER;
     }
     // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
-    let host_iter = match unsafe {
-        validate_handle_ref::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false)
-    } {
-        Ok(it) => it,
-        Err(err) => return err,
-    };
+    let host_iter = ffi_try!(unsafe { validate_iter_ref(iter) });
 
     if term_index >= host_iter.plan.terms.len() {
         return FfiResult::OUT_OF_RANGE;
@@ -1979,9 +1898,7 @@ pub unsafe extern "C" fn host_iter_column_info(
 /// `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
 pub unsafe extern "C" fn host_res_ptr(iter: *const BamIter, term_index: usize) -> *const u8 {
     // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
-    let Ok(host_iter) =
-        (unsafe { validate_handle_ref::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false) })
-    else {
+    let Ok(host_iter) = (unsafe { validate_iter_ref(iter) }) else {
         return core::ptr::null();
     };
     if term_index >= host_iter.plan.terms.len() {
@@ -2009,9 +1926,7 @@ pub unsafe extern "C" fn host_res_ptr(iter: *const BamIter, term_index: usize) -
 /// `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
 pub unsafe extern "C" fn host_res_mut_ptr(iter: *mut BamIter, term_index: usize) -> *mut u8 {
     // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
-    let Ok(host_iter) =
-        (unsafe { validate_handle_mut::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false) })
-    else {
+    let Ok(host_iter) = (unsafe { validate_iter_mut(iter) }) else {
         return core::ptr::null_mut();
     };
     if host_iter.in_par_iter || term_index >= host_iter.plan.terms.len() {
@@ -2059,12 +1974,7 @@ pub unsafe extern "C" fn host_msg_read_batch(
         return FfiResult::NULL_POINTER;
     }
     // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
-    let host_iter = match unsafe {
-        validate_handle_mut::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false)
-    } {
-        Ok(it) => it,
-        Err(err) => return err,
-    };
+    let host_iter = ffi_try!(unsafe { validate_iter_mut(iter) });
     if host_iter.in_par_iter {
         return FfiResult::ACCESS_CONFLICT;
     }
@@ -2113,12 +2023,7 @@ pub unsafe extern "C" fn host_msg_send(
     data_len: usize,
 ) -> FfiResult {
     // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
-    let host_iter = match unsafe {
-        validate_handle_mut::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false)
-    } {
-        Ok(it) => it,
-        Err(err) => return err,
-    };
+    let host_iter = ffi_try!(unsafe { validate_iter_mut(iter) });
     if host_iter.in_par_iter {
         return FfiResult::ACCESS_CONFLICT;
     }
@@ -2161,12 +2066,7 @@ pub unsafe extern "C" fn host_msg_write_batch(
     count: usize,
 ) -> FfiResult {
     // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
-    let host_iter = match unsafe {
-        validate_handle_mut::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false)
-    } {
-        Ok(it) => it,
-        Err(err) => return err,
-    };
+    let host_iter = ffi_try!(unsafe { validate_iter_mut(iter) });
     if host_iter.in_par_iter {
         return FfiResult::ACCESS_CONFLICT;
     }
@@ -2183,9 +2083,9 @@ pub unsafe extern "C" fn host_msg_write_batch(
     if term.size > 0 && in_buf.is_null() {
         return FfiResult::NULL_POINTER;
     }
-    let Some(_) = count.checked_mul(term.size) else {
+    if count.checked_mul(term.size).is_none() {
         return FfiResult::INVALID_ARGUMENT;
-    };
+    }
     let Some(write_fn) = term.msg_write_batch_fn else {
         return FfiResult::INVALID_COMPONENT;
     };
@@ -2216,19 +2116,20 @@ pub unsafe extern "C" fn host_res_ticks(
     term_index: usize,
     out_ticks: *mut BamChangeTicks,
 ) -> FfiResult {
-    if out_ticks.is_null() {
-        return FfiResult::NULL_POINTER;
-    }
-    if !out_ticks.is_aligned() {
-        return FfiResult::INVALID_ARGUMENT;
-    }
+    // SAFETY: Validates null/alignment and initializes `*out_ticks` on entry.
+    let out_slot = ffi_try!(unsafe {
+        init_out_ptr(
+            out_ticks,
+            BamChangeTicks {
+                added: 0,
+                changed: 0,
+                last_run: 0,
+                this_run: 0,
+            },
+        )
+    });
     // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
-    let host_iter = match unsafe {
-        validate_handle_ref::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false)
-    } {
-        Ok(it) => it,
-        Err(err) => return err,
-    };
+    let host_iter = ffi_try!(unsafe { validate_iter_ref(iter) });
     if term_index >= host_iter.plan.terms.len() {
         return FfiResult::OUT_OF_RANGE;
     }
@@ -2250,51 +2151,32 @@ pub unsafe extern "C" fn host_res_ticks(
     let Some(ticks) = (unsafe { entity_cell.get_change_ticks_by_id(term.component_id) }) else {
         return FfiResult::NOT_FOUND;
     };
-    // SAFETY: `out_ticks` is non-null, aligned, and exclusively writable here.
-    unsafe {
-        *out_ticks = BamChangeTicks {
-            added: ticks.added.get(),
-            changed: ticks.changed.get(),
-            last_run: host_iter.last_run.get(),
-            this_run: host_iter.this_run.get(),
-        };
-    }
+    *out_slot = BamChangeTicks {
+        added: ticks.added.get(),
+        changed: ticks.changed.get(),
+        last_run: host_iter.last_run.get(),
+        this_run: host_iter.this_run.get(),
+    };
     FfiResult::OK
 }
 
 #[derive(Clone, Copy)]
-struct UnsafeWorldCellSend<'w>(Option<UnsafeWorldCell<'w>>);
+struct ParWorldRefs<'w> {
+    tables: &'w Tables,
+    archetypes: Option<&'w Archetypes>,
+    sparse_sets: Option<&'w SparseSets>,
+    world: Option<UnsafeWorldCell<'w>>,
+}
 
-// SAFETY: Used strictly within `host_par_for_each_chunk` scoped worker tasks where:
-// 1. Each task operates on a disjoint `(TableId, start_row, end_row)` or `(ArchetypeId, start_idx, end_idx)` range.
-// 2. Mutable singleton/message operations (`res_mut_ptr`, `msg_read_batch`, `msg_send`) are rejected
-//    while `in_par_iter == true`, leaving only shared read-only `res_ptr` (`&R: Sync`) on `world`.
-unsafe impl Send for UnsafeWorldCellSend<'_> {}
-// SAFETY: Same scoped read-only resource and disjoint component-row invariants as `Send`.
-unsafe impl Sync for UnsafeWorldCellSend<'_> {}
-
-#[derive(Clone, Copy)]
-struct TablesSend<'w>(&'w Tables);
-// SAFETY: Shared read-only table metadata lookup across disjoint `(TableId, start_row, end_row)` slices
-// inside `ComputeTaskPool::scope`; column/tick writes occur strictly on disjoint entity rows.
-unsafe impl Send for TablesSend<'_> {}
-// SAFETY: Same scoped disjoint-row invariants as `Send`.
-unsafe impl Sync for TablesSend<'_> {}
-
-#[derive(Clone, Copy)]
-struct ArchetypesSend<'w>(&'w Archetypes);
-// SAFETY: Archetype metadata is immutable during `GuestSystem::run_unsafe` (`Deferred` commands only).
-unsafe impl Send for ArchetypesSend<'_> {}
-// SAFETY: Archetype metadata is immutable during `GuestSystem::run_unsafe`.
-unsafe impl Sync for ArchetypesSend<'_> {}
-
-#[derive(Clone, Copy)]
-struct SparseSetsSend<'w>(&'w SparseSets);
-// SAFETY: SparseSet index maps are immutable during `GuestSystem::run_unsafe`, and each worker task
-// accesses disjoint `ArchetypeEntity` indices `[start_entity..end_entity]` with task-local `SparseRowScratch`.
-unsafe impl Send for SparseSetsSend<'_> {}
-// SAFETY: Same scoped disjoint-entity invariants as `Send`.
-unsafe impl Sync for SparseSetsSend<'_> {}
+// SAFETY: Used strictly within `par_for_each_chunk_impl` scoped worker tasks where:
+// 1. Table, archetype, and sparse-set index metadata is immutable during `GuestSystem::run_unsafe`.
+// 2. Each task operates on a disjoint `(TableId, start_row..end_row)` or
+//    `(ArchetypeId, start_entity..end_entity)` sub-range with task-local `SparseRowScratch`.
+// 3. Mutable singleton/message ops (`res_mut_ptr`, `msg_read_batch`, `msg_send`, `msg_write_batch`)
+//    are rejected while `in_par_iter == true`, leaving only shared read-only `res_ptr` (`&R: Sync`).
+unsafe impl Send for ParWorldRefs<'_> {}
+// SAFETY: Same scoped read-only metadata and disjoint-row/entity invariants as `Send`.
+unsafe impl Sync for ParWorldRefs<'_> {}
 
 #[derive(Clone, Copy)]
 struct DenseParPartition {
@@ -2308,6 +2190,55 @@ struct ArchetypeParPartition {
     arch_id: ArchetypeId,
     start_entity: usize,
     end_entity: usize,
+}
+
+fn dispatch_partitions<P: Send>(
+    pool_opt: Option<&ComputeTaskPool>,
+    partitions: Vec<P>,
+    run: impl Fn(P) + Sync,
+) {
+    if let Some(pool) = pool_opt
+        && partitions.len() > 1
+    {
+        let run_ref = &run;
+        pool.scope(|s| {
+            for part in partitions {
+                s.spawn(async move {
+                    run_ref(part);
+                });
+            }
+        });
+    } else {
+        for part in partitions {
+            run(part);
+        }
+    }
+}
+
+/// Runs one worker partition callback against `sub_iter` and folds its result and counters into
+/// the shared atomics.
+///
+/// # Safety
+/// `sub_iter` must own a disjoint entity sub-range, and `(cb_ptr, ud_ptr)` must uphold the
+/// thread-safe, nounwind `BamChunkTaskFn` contract.
+unsafe fn run_par_sub_iter(
+    sub_iter: &mut HostIter<'_>,
+    cb_ptr: GuestFnPtr<BamChunkTaskFn>,
+    ud_ptr: GuestUserData,
+    first_err: &AtomicU32,
+    total_chunks: &AtomicUsize,
+    total_entities: &AtomicUsize,
+) {
+    let GuestFnPtr(cb) = cb_ptr;
+    // SAFETY: Caller guarantees disjoint `sub_iter` slice and thread-safe nounwind `cb`.
+    let rc = unsafe { cb(sub_iter.as_ffi_ptr(), ud_ptr.as_ptr()) };
+    if rc != FfiResult::OK {
+        let _ =
+            first_err.compare_exchange(FfiResult::OK.0, rc.0, Ordering::AcqRel, Ordering::Acquire);
+    }
+    let (c, e) = sub_iter.stats();
+    total_chunks.fetch_add(c, Ordering::Relaxed);
+    total_entities.fetch_add(e, Ordering::Relaxed);
 }
 
 /// Executes `chunk_fn(task_iter, user_data)` in parallel across Bevy's [`ComputeTaskPool`] over
@@ -2330,12 +2261,7 @@ pub(crate) unsafe fn par_for_each_chunk_impl(
         return FfiResult::NULL_POINTER;
     };
     // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
-    let host_iter = match unsafe {
-        validate_handle_mut::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false)
-    } {
-        Ok(it) => it,
-        Err(err) => return err,
-    };
+    let host_iter = ffi_try!(unsafe { validate_iter_mut(iter) });
     if host_iter.in_par_iter {
         return FfiResult::ACCESS_CONFLICT;
     }
@@ -2347,9 +2273,10 @@ pub(crate) unsafe fn par_for_each_chunk_impl(
         return FfiResult::OK;
     };
     let plan = host_iter.plan;
-    let last_run = host_iter.last_run;
-    let this_run = host_iter.this_run;
-    let send_world = UnsafeWorldCellSend(host_iter.world);
+    let ticks = RunTicks {
+        last_run: host_iter.last_run,
+        this_run: host_iter.this_run,
+    };
     let cb_ptr = GuestFnPtr(task_cb);
     let ud_ptr = GuestUserData::new(user_data);
 
@@ -2377,9 +2304,9 @@ pub(crate) unsafe fn par_for_each_chunk_impl(
             ref mut row_cursor,
             single_table_end_row,
         } => {
-            let mut total_rows = 0usize;
             let start_tc = *table_cursor;
             let start_rc = *row_cursor;
+            let mut total_rows = 0usize;
             for (rel_idx, &tid) in matched_tables[start_tc..].iter().enumerate() {
                 if let Some(t) = tables.get(tid) {
                     let end = single_table_end_row
@@ -2418,77 +2345,44 @@ pub(crate) unsafe fn par_for_each_chunk_impl(
                 }
             }
 
-            let send_tables = TablesSend(tables);
-            let run_partition = |part: DenseParPartition| {
+            let refs = ParWorldRefs {
+                tables,
+                archetypes: None,
+                sparse_sets: None,
+                world: host_iter.world,
+            };
+            dispatch_partitions(pool_opt, partitions, |part| {
                 if first_err.load(Ordering::Acquire) != FfiResult::OK.0 {
                     return;
                 }
-                let st = send_tables;
-                let sw = send_world;
-                let tables_ref = st.0;
+                let r = refs;
                 let table_slice = core::slice::from_ref(&part.table_id);
-                // Zero-arena stack-scoped sub-iterator: no `HostCommands`, no `CommandArena`,
-                // and no per-worker heap allocations.
-                let mut sub_iter = HostIter {
-                    header: HandleHeader::new(ITER_MAGIC),
-                    tables: Some(tables_ref),
-                    backing: IterBacking::DenseTables {
+                let mut sub_iter = HostIter::from_backing(
+                    r.tables,
+                    IterBacking::DenseTables {
                         matched_tables: table_slice,
                         table_cursor: 0,
                         row_cursor: part.start_row,
                         single_table_end_row: Some(part.end_row),
                     },
                     plan,
-                    last_run,
-                    this_run,
-                    world: sw.0,
-                    sparse_scratch: None,
-                    msg_cursors: None,
-                    in_par_iter: true,
-                    chunks_yielded: 0,
-                    entities_yielded: 0,
-                    current_entities_ptr: core::ptr::null(),
-                    current_entity_count: 0,
-                    marked_changed_mask: 0,
-                    materialized_sparse_mask: 0,
-                    present_sparse_mask: 0,
-                    active_columns: [None; MAX_TERMS_PER_QUERY],
-                    has_true_buf: Vec::new(),
-                    has_false_buf: Vec::new(),
-                };
-                let GuestFnPtr(cb) = cb_ptr;
-                // SAFETY: `sub_iter` owns a disjoint `[part.start_row..part.end_row]` slice of
-                // `part.table_id` whose `iter_next_chunk` yields only its assigned sub-range and
-                // poisons its `HandleHeader` on drop.
-                let rc = unsafe { cb(sub_iter.as_ffi_ptr(), ud_ptr.as_ptr()) };
-                if rc != FfiResult::OK {
-                    let _ = first_err.compare_exchange(
-                        FfiResult::OK.0,
-                        rc.0,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
+                    ticks,
+                    r.world,
+                    None,
+                    true,
+                );
+                // SAFETY: Disjoint `[part.start_row..part.end_row]` slice of `part.table_id`.
+                unsafe {
+                    run_par_sub_iter(
+                        &mut sub_iter,
+                        cb_ptr,
+                        ud_ptr,
+                        &first_err,
+                        &total_chunks,
+                        &total_entities,
                     );
                 }
-                let (c, e) = sub_iter.stats();
-                total_chunks.fetch_add(c, Ordering::Relaxed);
-                total_entities.fetch_add(e, Ordering::Relaxed);
-            };
-
-            if let Some(pool) = pool_opt
-                && partitions.len() > 1
-            {
-                pool.scope(|s| {
-                    for part in partitions {
-                        s.spawn(async move {
-                            run_partition(part);
-                        });
-                    }
-                });
-            } else {
-                for part in partitions {
-                    run_partition(part);
-                }
-            }
+            });
         }
         IterBacking::Archetypes {
             archetypes,
@@ -2539,30 +2433,30 @@ pub(crate) unsafe fn par_for_each_chunk_impl(
                 }
             }
 
-            let send_tables = TablesSend(tables);
-            let send_archetypes = ArchetypesSend(archetypes);
-            let send_sparse_sets = SparseSetsSend(sparse_sets);
+            let refs = ParWorldRefs {
+                tables,
+                archetypes: Some(archetypes),
+                sparse_sets: Some(sparse_sets),
+                world: host_iter.world,
+            };
             let needs_sparse_scratch_terms = plan.sparse_data_mask != 0;
-            let run_arch_partition = |part: ArchetypeParPartition| {
+            dispatch_partitions(pool_opt, partitions, |part| {
                 if first_err.load(Ordering::Acquire) != FfiResult::OK.0 {
                     return;
                 }
-                let st = send_tables;
-                let sa = send_archetypes;
-                let ss = send_sparse_sets;
-                let sw = send_world;
-                let tables_ref = st.0;
-                let archetypes_ref = sa.0;
-                let sparse_sets_ref = ss.0;
+                let r = refs;
+                let (Some(archetypes_ref), Some(sparse_sets_ref)) = (r.archetypes, r.sparse_sets)
+                else {
+                    return;
+                };
                 let mut local_scratch = SparseRowScratch::default();
                 if needs_sparse_scratch_terms {
                     local_scratch.ensure_terms(plan.terms.len());
                 }
                 let arch_slice = core::slice::from_ref(&part.arch_id);
-                let mut sub_iter = HostIter {
-                    header: HandleHeader::new(ITER_MAGIC),
-                    tables: Some(tables_ref),
-                    backing: IterBacking::Archetypes {
+                let mut sub_iter = HostIter::from_backing(
+                    r.tables,
+                    IterBacking::Archetypes {
                         archetypes: archetypes_ref,
                         sparse_sets: sparse_sets_ref,
                         matched_archetypes: arch_slice,
@@ -2571,56 +2465,23 @@ pub(crate) unsafe fn par_for_each_chunk_impl(
                         single_arch_end_entity: Some(part.end_entity),
                     },
                     plan,
-                    last_run,
-                    this_run,
-                    world: sw.0,
-                    sparse_scratch: Some(&mut local_scratch),
-                    msg_cursors: None,
-                    in_par_iter: true,
-                    chunks_yielded: 0,
-                    entities_yielded: 0,
-                    current_entities_ptr: core::ptr::null(),
-                    current_entity_count: 0,
-                    marked_changed_mask: 0,
-                    materialized_sparse_mask: 0,
-                    present_sparse_mask: 0,
-                    active_columns: [None; MAX_TERMS_PER_QUERY],
-                    has_true_buf: Vec::new(),
-                    has_false_buf: Vec::new(),
-                };
-                let GuestFnPtr(cb) = cb_ptr;
-                // SAFETY: `sub_iter` owns a disjoint `[part.start_entity..part.end_entity]`
-                // slice of `part.arch_id` with task-local `SparseRowScratch`, yielding only its
-                // assigned sub-range via `iter_next_chunk`.
-                let rc = unsafe { cb(sub_iter.as_ffi_ptr(), ud_ptr.as_ptr()) };
-                if rc != FfiResult::OK {
-                    let _ = first_err.compare_exchange(
-                        FfiResult::OK.0,
-                        rc.0,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
+                    ticks,
+                    r.world,
+                    Some(&mut local_scratch),
+                    true,
+                );
+                // SAFETY: Disjoint `[part.start_entity..part.end_entity]` slice with task-local scratch.
+                unsafe {
+                    run_par_sub_iter(
+                        &mut sub_iter,
+                        cb_ptr,
+                        ud_ptr,
+                        &first_err,
+                        &total_chunks,
+                        &total_entities,
                     );
                 }
-                let (c, e) = sub_iter.stats();
-                total_chunks.fetch_add(c, Ordering::Relaxed);
-                total_entities.fetch_add(e, Ordering::Relaxed);
-            };
-
-            if let Some(pool) = pool_opt
-                && partitions.len() > 1
-            {
-                pool.scope(|s| {
-                    for part in partitions {
-                        s.spawn(async move {
-                            run_arch_partition(part);
-                        });
-                    }
-                });
-            } else {
-                for part in partitions {
-                    run_arch_partition(part);
-                }
-            }
+            });
         }
     }
 
