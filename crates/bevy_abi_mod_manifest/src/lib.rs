@@ -8,7 +8,150 @@ use bevy_abi_mod_sys::{ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PATCH};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+/// Maximum `mod.toml` file size (`1 MiB`) accepted by [`ModTomlManifest::from_file`].
+pub const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+/// Maximum byte length accepted for a canonical `[mod].id` identifier.
+pub const MAX_MOD_ID_LEN: usize = 128;
+
+/// Maximum byte length accepted for a relative POSIX `[mod].entry` / `[mod].library` path.
+pub const MAX_ENTRY_PATH_LEN: usize = 1024;
+
+/// Maximum directory nesting depth accepted for a relative POSIX `[mod].entry` path.
+pub const MAX_ENTRY_PATH_DEPTH: usize = 32;
+
+/// Returns `true` if `segment` (or its stem before the first `.`) is a Windows reserved DOS device
+/// name (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, ASCII case-insensitive).
+#[must_use]
+fn is_windows_reserved_device_name(segment: &str) -> bool {
+    let stem = segment.split('.').next().unwrap_or(segment);
+    let bytes = stem.as_bytes();
+    match bytes.len() {
+        3 => {
+            stem.eq_ignore_ascii_case("CON")
+                || stem.eq_ignore_ascii_case("PRN")
+                || stem.eq_ignore_ascii_case("AUX")
+                || stem.eq_ignore_ascii_case("NUL")
+        }
+        4 => {
+            let prefix = &stem[..3];
+            let digit = bytes[3];
+            (prefix.eq_ignore_ascii_case("COM") || prefix.eq_ignore_ascii_case("LPT"))
+                && matches!(digit, b'1'..=b'9')
+        }
+        _ => false,
+    }
+}
+
+/// Validates a canonical `[mod].id` identifier against path traversal, separators, control bytes,
+/// NTFS alternate data streams, and Windows reserved device names.
+///
+/// Valid IDs are 1..=[`MAX_MOD_ID_LEN`] ASCII bytes matching `[A-Za-z0-9_][A-Za-z0-9_-]*` and must
+/// not be a Windows reserved device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`).
+pub fn validate_mod_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("mod identifier must not be empty".to_owned());
+    }
+    if id.len() > MAX_MOD_ID_LEN {
+        return Err(format!(
+            "mod identifier length ({}) exceeds maximum ({MAX_MOD_ID_LEN})",
+            id.len()
+        ));
+    }
+    if id.bytes().any(|b| b < 0x20 || b == 0x7F) {
+        return Err("mod identifier must not contain NUL or ASCII control characters".to_owned());
+    }
+    if id.starts_with('-') {
+        return Err("mod identifier must not start with '-'".to_owned());
+    }
+    if !id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err("mod identifier may only contain ASCII letters, digits, '_' or '-'".to_owned());
+    }
+    if is_windows_reserved_device_name(id) {
+        return Err(format!(
+            "mod identifier '{id}' is a Windows reserved device name"
+        ));
+    }
+    Ok(())
+}
+
+/// Validates a `[mod].entry` / `[mod].library` relative POSIX path against traversal (`..`, `.`),
+/// absolute paths, Windows drive/UNC prefixes, NUL/control bytes, NTFS ADS (`:`), trailing dots or
+/// spaces, excessive length/depth, and Windows reserved device names.
+pub fn validate_manifest_entry_path(entry: &str) -> Result<(), String> {
+    if entry.is_empty() {
+        return Err("entry path must not be empty".to_owned());
+    }
+    if entry.len() > MAX_ENTRY_PATH_LEN {
+        return Err(format!(
+            "entry path length ({}) exceeds maximum ({MAX_ENTRY_PATH_LEN})",
+            entry.len()
+        ));
+    }
+    if entry.bytes().any(|b| b < 0x20 || b == 0x7F) {
+        return Err("entry path must not contain NUL or ASCII control characters".to_owned());
+    }
+    if entry.starts_with('/') || entry.ends_with('/') {
+        return Err(
+            "entry path must be a relative file path without leading or trailing '/'".to_owned(),
+        );
+    }
+    if entry.contains('\\') {
+        return Err(
+            "entry path must use POSIX '/' separators and must not contain '\\'".to_owned(),
+        );
+    }
+    if entry.contains(':') {
+        return Err(
+            "entry path must not contain ':' (drive prefixes and NTFS alternate data streams are forbidden)"
+                .to_owned(),
+        );
+    }
+
+    let mut depth = 0usize;
+    for seg in entry.split('/') {
+        depth += 1;
+        if depth > MAX_ENTRY_PATH_DEPTH {
+            return Err(format!(
+                "entry path exceeds maximum directory depth ({MAX_ENTRY_PATH_DEPTH})"
+            ));
+        }
+        if seg.is_empty() || seg == "." || seg == ".." {
+            return Err(format!("entry path contains invalid segment '{seg}'"));
+        }
+        if seg.ends_with('.') || seg.ends_with(' ') {
+            return Err(format!(
+                "entry path segment '{seg}' must not end with '.' or space"
+            ));
+        }
+        if is_windows_reserved_device_name(seg) {
+            return Err(format!(
+                "entry path segment '{seg}' uses a Windows reserved device name"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn invalid_manifest_input(path: PathBuf, detail: impl Into<String>) -> ManifestError {
+    ManifestError::Io {
+        path,
+        source: std::io::Error::new(std::io::ErrorKind::InvalidInput, detail.into()),
+    }
+}
+
+fn permission_denied(path: PathBuf, detail: impl Into<String>) -> ManifestError {
+    ManifestError::Io {
+        path,
+        source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, detail.into()),
+    }
+}
 
 /// Host ABI SemVer version derived from [`bevy_abi_mod_sys::ABI_VERSION`].
 #[inline]
@@ -91,26 +234,45 @@ impl ModTomlManifest {
                 source: Box::new(source),
             })?;
 
-        let raw_id = raw
-            .mod_section
-            .id
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        let raw_name = raw
-            .mod_section
-            .name
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        let normalize_raw_field =
+            |opt: Option<String>, label: &str| -> Result<Option<String>, ManifestError> {
+                match opt {
+                    None => Ok(None),
+                    Some(raw_val) => {
+                        if raw_val.bytes().any(|b| b < 0x20 || b == 0x7F) {
+                            return Err(invalid_manifest_input(
+                                path.clone(),
+                                format!("{label} must not contain NUL or ASCII control characters"),
+                            ));
+                        }
+                        if raw_val.trim().is_empty() {
+                            Ok(None)
+                        } else {
+                            Ok(Some(raw_val))
+                        }
+                    }
+                }
+            };
+
+        let raw_id = normalize_raw_field(raw.mod_section.id, "[mod].id")?;
+        let raw_name = normalize_raw_field(raw.mod_section.name, "[mod].name")?;
 
         let (name, display_name) = match (raw_id, raw_name) {
             (Some(id), Some(name)) => {
-                let disp = (id != name).then_some(name);
+                let disp = (id != name).then_some(name.trim().to_string());
                 (id, disp)
             }
             (Some(id), None) => (id, None),
             (None, Some(name)) => (name, None),
             (None, None) => return Err(ManifestError::MissingModName { path }),
         };
+
+        if let Err(reason) = validate_mod_id(&name) {
+            return Err(invalid_manifest_input(
+                path,
+                format!("invalid [mod].id '{name}': {reason}"),
+            ));
+        }
 
         let version = semver::Version::parse(raw.mod_section.version.trim()).map_err(|source| {
             ManifestError::InvalidVersion {
@@ -134,12 +296,18 @@ impl ModTomlManifest {
             None => None,
         };
 
-        let entry = raw
-            .mod_section
-            .entry
-            .or(raw.mod_section.library)
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        let entry = match raw.mod_section.entry.or(raw.mod_section.library) {
+            Some(raw_entry) => {
+                if let Err(reason) = validate_manifest_entry_path(&raw_entry) {
+                    return Err(invalid_manifest_input(
+                        path,
+                        format!("invalid [mod].entry '{raw_entry}': {reason}"),
+                    ));
+                }
+                Some(raw_entry)
+            }
+            None => None,
+        };
 
         let language = raw
             .mod_section
@@ -149,6 +317,12 @@ impl ModTomlManifest {
 
         let mut dependencies = BTreeMap::new();
         for (dep, req_str) in raw.dependencies {
+            if let Err(reason) = validate_mod_id(&dep) {
+                return Err(invalid_manifest_input(
+                    path,
+                    format!("invalid dependency identifier '{dep}': {reason}"),
+                ));
+            }
             let req = semver::VersionReq::parse(req_str.trim()).map_err(|source| {
                 ManifestError::InvalidDependencyReq {
                     path: path.clone(),
@@ -163,6 +337,12 @@ impl ModTomlManifest {
 
         let mut optional_dependencies = BTreeMap::new();
         for (dep, req_str) in raw.optional_dependencies {
+            if let Err(reason) = validate_mod_id(&dep) {
+                return Err(invalid_manifest_input(
+                    path,
+                    format!("invalid optional dependency identifier '{dep}': {reason}"),
+                ));
+            }
             let req = semver::VersionReq::parse(req_str.trim()).map_err(|source| {
                 ManifestError::InvalidDependencyReq {
                     path: path.clone(),
@@ -188,12 +368,47 @@ impl ModTomlManifest {
         })
     }
 
-    /// Reads and parses a `mod.toml` file from disk.
+    /// Reads (bounded by [`MAX_MANIFEST_BYTES`]) and parses a `mod.toml` file from disk.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ManifestError> {
         let p = path.as_ref();
-        let contents = std::fs::read_to_string(p).map_err(|source| ManifestError::Io {
+        let file = std::fs::File::open(p).map_err(|source| ManifestError::Io {
             path: p.to_path_buf(),
             source,
+        })?;
+        let meta = file.metadata().map_err(|source| ManifestError::Io {
+            path: p.to_path_buf(),
+            source,
+        })?;
+        if !meta.is_file() {
+            return Err(invalid_manifest_input(
+                p.to_path_buf(),
+                "manifest path is not a regular file",
+            ));
+        }
+        if meta.len() > MAX_MANIFEST_BYTES {
+            return Err(invalid_manifest_input(
+                p.to_path_buf(),
+                format!(
+                    "manifest file size ({} bytes) exceeds maximum ({MAX_MANIFEST_BYTES} bytes)",
+                    meta.len()
+                ),
+            ));
+        }
+        let mut raw = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(4096));
+        file.take(MAX_MANIFEST_BYTES.saturating_add(1))
+            .read_to_end(&mut raw)
+            .map_err(|source| ManifestError::Io {
+                path: p.to_path_buf(),
+                source,
+            })?;
+        if raw.len() as u64 > MAX_MANIFEST_BYTES {
+            return Err(invalid_manifest_input(
+                p.to_path_buf(),
+                format!("manifest file exceeded maximum size ({MAX_MANIFEST_BYTES} bytes)"),
+            ));
+        }
+        let contents = String::from_utf8(raw).map_err(|_| {
+            invalid_manifest_input(p.to_path_buf(), "manifest file is not valid UTF-8")
         })?;
         Self::parse_str(&contents, p)
     }
@@ -214,8 +429,16 @@ impl ModTomlManifest {
         Ok(())
     }
 
-    /// Resolves the shared-library path for this manifest relative to `manifest_path.parent()`.
+    /// Resolves the shared-library path for this manifest relative to `manifest_path.parent()`,
+    /// rejecting path traversal, unsafe identifiers, symlinks, and escapes outside the mod root.
     pub fn resolve_library_path(&self) -> Result<PathBuf, ManifestError> {
+        if let Err(reason) = validate_mod_id(&self.name) {
+            return Err(invalid_manifest_input(
+                self.manifest_path.clone(),
+                format!("invalid [mod].id '{}': {reason}", self.name),
+            ));
+        }
+
         let base_dir = self
             .manifest_path
             .parent()
@@ -223,39 +446,66 @@ impl ModTomlManifest {
             .unwrap_or_else(|| Path::new("."));
 
         if let Some(ref entry) = self.entry {
-            let candidate = base_dir.join(entry);
-            if candidate.is_file() {
-                return Ok(candidate);
+            if let Err(reason) = validate_manifest_entry_path(entry) {
+                return Err(invalid_manifest_input(
+                    self.manifest_path.clone(),
+                    format!("invalid [mod].entry '{entry}': {reason}"),
+                ));
             }
-            return Err(ManifestError::MissingLibrary {
-                mod_name: self.name.clone(),
-                path: candidate,
-            });
+            let segments: Vec<&str> = entry.split('/').collect();
+            return resolve_confined_regular_file(base_dir, &segments, &self.name);
         }
 
         let ext = std::env::consts::DLL_EXTENSION;
         let prefix = std::env::consts::DLL_PREFIX;
-        let preferred_prefixed = base_dir.join(format!("{prefix}{}.{ext}", self.name));
-        if preferred_prefixed.is_file() {
-            return Ok(preferred_prefixed);
+        let preferred_prefixed_name = format!("{prefix}{}.{ext}", self.name);
+        match resolve_confined_regular_file(base_dir, &[&preferred_prefixed_name], &self.name) {
+            Ok(p) => return Ok(p),
+            Err(ManifestError::MissingLibrary { .. }) => {}
+            Err(err) => return Err(err),
         }
-        let preferred_plain = base_dir.join(format!("{}.{ext}", self.name));
-        if preferred_plain.is_file() {
-            return Ok(preferred_plain);
+
+        let preferred_plain_name = format!("{}.{ext}", self.name);
+        if preferred_plain_name != preferred_prefixed_name {
+            match resolve_confined_regular_file(base_dir, &[&preferred_plain_name], &self.name) {
+                Ok(p) => return Ok(p),
+                Err(ManifestError::MissingLibrary { .. }) => {}
+                Err(err) => return Err(err),
+            }
         }
 
         if let Ok(entries) = std::fs::read_dir(base_dir) {
-            let mut candidates: Vec<PathBuf> = entries
-                .filter_map(Result::ok)
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.is_file()
-                        && p.extension()
-                            .and_then(|e| e.to_str())
-                            .is_some_and(|e| e == ext)
-                })
-                .collect();
-            candidates.sort();
+            let mut candidates: Vec<PathBuf> = Vec::new();
+            let mut raw_paths: Vec<PathBuf> =
+                entries.filter_map(Result::ok).map(|e| e.path()).collect();
+            raw_paths.sort();
+
+            for candidate in raw_paths {
+                let has_ext = candidate
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e == ext);
+                if !has_ext {
+                    continue;
+                }
+                let meta = match std::fs::symlink_metadata(&candidate) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if meta.file_type().is_symlink() {
+                    return Err(permission_denied(
+                        candidate,
+                        format!(
+                            "mod '{}' library candidate is a symlink (rejected)",
+                            self.name
+                        ),
+                    ));
+                }
+                if meta.is_file() {
+                    verify_canonical_confinement(base_dir, &candidate, &self.name)?;
+                    candidates.push(candidate);
+                }
+            }
             if candidates.len() == 1 {
                 return Ok(candidates.remove(0));
             }
@@ -263,9 +513,86 @@ impl ModTomlManifest {
 
         Err(ManifestError::MissingLibrary {
             mod_name: self.name.clone(),
-            path: preferred_prefixed,
+            path: base_dir.join(preferred_prefixed_name),
         })
     }
+}
+
+fn verify_canonical_confinement(
+    base_dir: &Path,
+    candidate: &Path,
+    mod_name: &str,
+) -> Result<(), ManifestError> {
+    let canon_base = std::fs::canonicalize(base_dir).map_err(|source| ManifestError::Io {
+        path: base_dir.to_path_buf(),
+        source,
+    })?;
+    let canon_candidate = std::fs::canonicalize(candidate).map_err(|source| ManifestError::Io {
+        path: candidate.to_path_buf(),
+        source,
+    })?;
+    if !canon_candidate.starts_with(&canon_base) {
+        return Err(permission_denied(
+            candidate.to_path_buf(),
+            format!(
+                "mod '{mod_name}' resolved library '{}' escapes mod root '{}'",
+                canon_candidate.display(),
+                canon_base.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_confined_regular_file(
+    base_dir: &Path,
+    segments: &[&str],
+    mod_name: &str,
+) -> Result<PathBuf, ManifestError> {
+    let mut cur = base_dir.to_path_buf();
+    let mut last_meta: Option<std::fs::Metadata> = None;
+    for seg in segments {
+        cur.push(seg);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(permission_denied(
+                        cur,
+                        format!("mod '{mod_name}' library path traverses or points to a symlink"),
+                    ));
+                }
+                last_meta = Some(meta);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let mut full = base_dir.to_path_buf();
+                for s in segments {
+                    full.push(s);
+                }
+                return Err(ManifestError::MissingLibrary {
+                    mod_name: mod_name.to_owned(),
+                    path: full,
+                });
+            }
+            Err(source) => {
+                return Err(ManifestError::Io { path: cur, source });
+            }
+        }
+    }
+
+    let Some(meta) = last_meta else {
+        return Err(invalid_manifest_input(
+            base_dir.to_path_buf(),
+            format!("mod '{mod_name}' entry path has no segments"),
+        ));
+    };
+    if !meta.is_file() {
+        return Err(ManifestError::MissingLibrary {
+            mod_name: mod_name.to_owned(),
+            path: cur,
+        });
+    }
+    verify_canonical_confinement(base_dir, &cur, mod_name)?;
+    Ok(cur)
 }
 
 /// Pure manifest parsing, SemVer validation, and dependency DAG diagnostics.

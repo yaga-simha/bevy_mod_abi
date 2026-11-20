@@ -2,6 +2,7 @@
 
 use crate::CliError;
 use crate::sdk::{CPP17_HEADER, ZIG_SDK, c99_header};
+use bevy_abi_mod_manifest::validate_mod_id;
 use clap::ValueEnum;
 use std::fmt;
 use std::fs;
@@ -39,25 +40,15 @@ impl fmt::Display for ModLanguage {
 }
 
 fn validate_mod_name(raw: &str) -> Result<String, CliError> {
-    if raw.is_empty() {
-        return Err(CliError::InvalidArgument(
-            "mod name must not be empty".to_owned(),
-        ));
-    }
-    if !raw
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        return Err(CliError::InvalidArgument(format!(
-            "mod name '{raw}' may only contain ASCII letters, digits, '_' or '-'"
-        )));
-    }
-    if raw.starts_with('-') || raw.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+    validate_mod_id(raw).map_err(CliError::InvalidArgument)?;
+    if raw.chars().next().is_some_and(|c| c.is_ascii_digit()) {
         return Err(CliError::InvalidArgument(format!(
             "mod name '{raw}' must start with an ASCII letter or '_'"
         )));
     }
-    Ok(raw.replace('-', "_"))
+    let stem = raw.replace('-', "_");
+    validate_mod_id(&stem).map_err(CliError::InvalidArgument)?;
+    Ok(stem)
 }
 
 fn format_guest_sdk_dep(path: &Path) -> String {
@@ -70,14 +61,10 @@ fn default_guest_sdk_dep(guest_sdk_path: Option<&Path>) -> String {
     if let Some(p) = guest_sdk_path {
         return format_guest_sdk_dep(p);
     }
-    let workspace_guest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("bevy_abi_mod_guest");
-    if workspace_guest.is_dir() {
-        let canonical = fs::canonicalize(&workspace_guest).unwrap_or(workspace_guest);
-        return format_guest_sdk_dep(&canonical);
-    }
-    "bevy_abi_mod_guest = { version = \"0.2.0\", features = [\"derive\"] }".to_owned()
+    format!(
+        "bevy_abi_mod_guest = {{ version = \"{}\", features = [\"derive\"] }}",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 /// Scaffolds a new buildable `bevy_abi_mod` guest mod project in `parent_dir/<name>`.
@@ -96,7 +83,7 @@ pub fn scaffold_new_mod(
     fs::create_dir_all(project_dir.join("src"))?;
 
     let mod_toml = format!(
-        "[mod]\nid = \"{stem}\"\nname = \"{name}\"\nversion = \"0.2.0\"\nabi_version = \"0.3.0\"\nlanguage = \"{}\"\n\n[dependencies]\n",
+        "[mod]\nid = \"{stem}\"\nname = \"{name}\"\nversion = \"0.1.0\"\nabi_version = \"0.3.0\"\nlanguage = \"{}\"\n\n[dependencies]\n",
         lang.as_str()
     );
     fs::write(project_dir.join("mod.toml"), mod_toml)?;
@@ -105,7 +92,7 @@ pub fn scaffold_new_mod(
         ModLanguage::Rust => {
             let dep_line = default_guest_sdk_dep(guest_sdk_path);
             let cargo_toml = format!(
-                "[package]\nname = \"{stem}\"\nversion = \"0.2.0\"\nedition = \"2024\"\npublish = false\n\n[workspace]\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n[dependencies]\n{dep_line}\n"
+                "[package]\nname = \"{stem}\"\nversion = \"0.1.0\"\nedition = \"2024\"\npublish = false\n\n[workspace]\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n[dependencies]\n{dep_line}\n"
             );
             fs::write(project_dir.join("Cargo.toml"), cargo_toml)?;
 
@@ -115,17 +102,34 @@ pub fn scaffold_new_mod(
 use bevy_abi_mod_guest::prelude::*;
 use core::ffi::CStr;
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, AbiPod, GuestComponent)]
+#[guest_component(name = "{stem}::Counter")]
+pub struct Counter {{
+    pub ticks: u64,
+}}
+
 #[derive(Default)]
 pub struct ModPlugin;
 
 impl GuestPlugin for ModPlugin {{
     const NAME: &'static CStr = c"{stem}";
-    const VERSION: &'static CStr = c"0.2.0";
+    const VERSION: &'static CStr = c"0.1.0";
 
     fn build(&mut self, app: &mut GuestApp<'_>) -> FfiResult {{
-        app.system(c"heartbeat")
+        if let Err(err) = app.register_component::<Counter>() {{
+            return err;
+        }}
+        app.system(c"tick_counter")
+            .query_typed::<&mut Counter>()
             .schedule(ScheduleId::UPDATE)
-            .build(|_ctx| FfiResult::OK)
+            .build(|ctx| {{
+                ctx.single_query::<&mut Counter>().for_each(|counters| {{
+                    for counter in counters {{
+                        counter.ticks = counter.ticks.saturating_add(1);
+                    }}
+                }})
+            }})
     }}
 }}
 
@@ -145,13 +149,12 @@ export_mod!(plugin: ModPlugin);
                 r#"#include "bevy_abi_mod.h"
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 typedef struct ModState {{
     BamHostApi api;
 }} ModState;
-
-static ModState g_state;
 
 static BamResult heartbeat_cb(BamSystemCtx* sys_ctx, void* user_data) {{
     (void)sys_ctx;
@@ -163,7 +166,7 @@ static const BamManifest MANIFEST = {{
     (uint32_t)sizeof(BamManifest),
     BAM_ABI_VERSION,
     "{stem}",
-    "0.2.0",
+    "0.1.0",
     0u,
     0u,
     NULL,
@@ -179,10 +182,25 @@ BAM_EXPORT BamResult bevy_abi_mod_init(
     BamLoadCtx* load_ctx,
     BamInstance** instance_out
 ) {{
-    if (!api || !load_ctx || !instance_out || !api->register_system) {{
+    if (!api || !load_ctx || !instance_out) {{
         return BAM_RESULT_NULL_POINTER;
     }}
-    g_state.api = *api;
+    *instance_out = NULL;
+
+    ModState* state = (ModState*)calloc(1u, sizeof(ModState));
+    if (!state) {{
+        return BAM_RESULT_INTERNAL_ERROR;
+    }}
+
+    BamResult copy_res = bam_host_api_copy_bounded(&state->api, sizeof(state->api), api);
+    if (copy_res != BAM_RESULT_OK) {{
+        free(state);
+        return copy_res;
+    }}
+    if (!state->api.register_system) {{
+        free(state);
+        return BAM_RESULT_NULL_POINTER;
+    }}
 
     BamSystemDesc sys;
     memset(&sys, 0, sizeof(sys));
@@ -191,16 +209,17 @@ BAM_EXPORT BamResult bevy_abi_mod_init(
     sys.callback = heartbeat_cb;
     sys.schedule = BAM_SCHEDULE_UPDATE;
 
-    BamResult res = api->register_system(load_ctx, &sys);
+    BamResult res = state->api.register_system(load_ctx, &sys);
     if (res != BAM_RESULT_OK) {{
+        free(state);
         return res;
     }}
-    *instance_out = (BamInstance*)&g_state;
+    *instance_out = (BamInstance*)state;
     return BAM_RESULT_OK;
 }}
 
 BAM_EXPORT void bevy_abi_mod_shutdown(BamInstance* instance) {{
-    (void)instance;
+    free(instance);
 }}
 "#
             );
@@ -227,7 +246,7 @@ constexpr BamManifest kManifest = {{
     static_cast<uint32_t>(sizeof(BamManifest)),
     BAM_ABI_VERSION,
     "{stem}",
-    "0.2.0",
+    "0.1.0",
     0u,
     0u
 }};
@@ -269,8 +288,15 @@ BAM_EXPORT BamResult bevy_abi_mod_init(
     if (api == nullptr || load_ctx == nullptr || instance_out == nullptr) {{
         return BAM_RESULT_NULL_POINTER;
     }}
+    *instance_out = nullptr;
     return bam::guard_boundary([&]() -> BamResult {{
-        auto inst = std::make_unique<CppModInstance>(*api);
+        BamHostApi local_api{{}};
+        const BamResult copy_res =
+            bam_host_api_copy_bounded(&local_api, sizeof(local_api), api);
+        if (!bam::is_ok(copy_res)) {{
+            return copy_res;
+        }}
+        auto inst = std::make_unique<CppModInstance>(local_api);
         BamResult res = inst->init(load_ctx);
         if (!bam::is_ok(res)) {{
             return res;
@@ -354,7 +380,7 @@ const MANIFEST: c.BamManifest = .{{
     .struct_size = @sizeOf(c.BamManifest),
     .abi_version = c.BAM_ABI_VERSION,
     .name = "{stem}",
-    .version = "0.2.0",
+    .version = "0.1.0",
     .flags = 0,
     .reserved0 = 0,
     .save_state = null,
@@ -377,10 +403,17 @@ pub export fn bevy_abi_mod_init(
     const host_api = api orelse return c.BAM_RESULT_NULL_POINTER;
     const ctx = load_ctx orelse return c.BAM_RESULT_NULL_POINTER;
     const out = instance_out orelse return c.BAM_RESULT_NULL_POINTER;
-    const register_sys = host_api.register_system orelse return c.BAM_RESULT_NULL_POINTER;
+    out.* = null;
+
+    var local_api = std.mem.zeroes(c.BamHostApi);
+    const copy_rc = c.bam_host_api_copy_bounded(&local_api, @sizeOf(c.BamHostApi), host_api);
+    if (copy_rc != c.BAM_RESULT_OK) {{
+        return copy_rc;
+    }}
+    const register_sys = local_api.register_system orelse return c.BAM_RESULT_NULL_POINTER;
 
     const inst = std.heap.c_allocator.create(ZigModInstance) catch return c.BAM_RESULT_INTERNAL_ERROR;
-    inst.* = .{{ .api = host_api.* }};
+    inst.* = .{{ .api = local_api }};
 
     var sys = std.mem.zeroes(c.BamSystemDesc);
     sys.struct_size = @sizeOf(c.BamSystemDesc);

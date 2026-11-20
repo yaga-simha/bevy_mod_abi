@@ -12,14 +12,14 @@ pub mod sdk;
 pub mod signing;
 pub mod watch;
 
-use bevy_abi_mod_trust::ModTrustPolicy;
+use bevy_abi_mod_manifest::{validate_manifest_entry_path, validate_mod_id};
 use clap::{Parser, Subcommand};
 use dag::ValidatedModManifest;
 use scaffold::ModLanguage;
 use serde::Deserialize;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -69,6 +69,82 @@ pub(crate) fn dylib_naming() -> (&'static str, &'static str) {
     }
 }
 
+/// Reads a regular file from disk bounded by `max_bytes`, failing cleanly on directories/FIFOs
+/// or oversized files.
+pub(crate) fn read_file_bounded(
+    path: &Path,
+    max_bytes: u64,
+    label: &str,
+) -> Result<Vec<u8>, CliError> {
+    let file = fs::File::open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(CliError::InvalidArgument(format!(
+            "{label} '{}' is not a regular file",
+            path.display()
+        )));
+    }
+    if meta.len() > max_bytes {
+        return Err(CliError::InvalidArgument(format!(
+            "{label} '{}' ({} bytes) exceeds limit ({max_bytes} bytes)",
+            path.display(),
+            meta.len()
+        )));
+    }
+    let cap = usize::try_from(meta.len()).unwrap_or(0);
+    let mut buf = Vec::with_capacity(cap);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut buf)?;
+    if buf.len() as u64 > max_bytes {
+        return Err(CliError::InvalidArgument(format!(
+            "{label} '{}' exceeded limit ({max_bytes} bytes) while reading",
+            path.display()
+        )));
+    }
+    Ok(buf)
+}
+
+/// Validates `mod_id` and safely creates/verifies `<stage_root>/<mod_id>` without allowing
+/// traversal, unsafe identifiers, symlink escapes, or writes outside `stage_root`.
+pub(crate) fn validated_stage_dir(stage_root: &Path, mod_id: &str) -> Result<PathBuf, CliError> {
+    validate_mod_id(mod_id).map_err(|reason| {
+        CliError::InvalidManifest(format!(
+            "refusing to stage unsafe mod identifier '{mod_id}': {reason}"
+        ))
+    })?;
+
+    if let Ok(meta) = fs::symlink_metadata(stage_root)
+        && meta.file_type().is_symlink()
+    {
+        return Err(CliError::InvalidArgument(format!(
+            "staging root must not be a symlink: {}",
+            stage_root.display()
+        )));
+    }
+    fs::create_dir_all(stage_root)?;
+    let canon_root = fs::canonicalize(stage_root)?;
+
+    let stage_dir = stage_root.join(mod_id);
+    if let Ok(meta) = fs::symlink_metadata(&stage_dir)
+        && meta.file_type().is_symlink()
+    {
+        return Err(CliError::InvalidArgument(format!(
+            "staging directory must not be a symlink: {}",
+            stage_dir.display()
+        )));
+    }
+    fs::create_dir_all(&stage_dir)?;
+    let canon_stage = fs::canonicalize(&stage_dir)?;
+    if !canon_stage.starts_with(&canon_root) || canon_stage == canon_root {
+        return Err(CliError::InvalidManifest(format!(
+            "staging directory '{}' escapes staging root '{}'",
+            canon_stage.display(),
+            canon_root.display()
+        )));
+    }
+    Ok(stage_dir)
+}
+
 #[derive(Deserialize)]
 struct CargoTomlPartial {
     package: Option<CargoPackagePartial>,
@@ -85,8 +161,15 @@ struct CargoLibPartial {
     name: Option<String>,
 }
 
-fn detect_rust_crate_stem(cargo_toml: &Path) -> Result<String, CliError> {
-    let content = fs::read_to_string(cargo_toml)?;
+pub(crate) fn detect_rust_crate_stem(cargo_toml: &Path) -> Result<String, CliError> {
+    let raw = read_file_bounded(
+        cargo_toml,
+        bevy_abi_mod_manifest::MAX_MANIFEST_BYTES,
+        "Cargo.toml",
+    )?;
+    let content = String::from_utf8(raw).map_err(|_| {
+        CliError::InvalidManifest(format!("{} is not valid UTF-8", cargo_toml.display()))
+    })?;
     let parsed: CargoTomlPartial = toml::from_str(&content)
         .map_err(|e| CliError::InvalidManifest(format!("{}: {e}", cargo_toml.display())))?;
     let name = parsed
@@ -99,7 +182,14 @@ fn detect_rust_crate_stem(cargo_toml: &Path) -> Result<String, CliError> {
                 cargo_toml.display()
             ))
         })?;
-    Ok(name.replace('-', "_"))
+    let stem = name.replace('-', "_");
+    validate_mod_id(&stem).map_err(|reason| {
+        CliError::InvalidManifest(format!(
+            "{} has unsafe crate name '{name}': {reason}",
+            cargo_toml.display()
+        ))
+    })?;
+    Ok(stem)
 }
 
 fn parse_language_str(raw: &str) -> Option<ModLanguage> {
@@ -174,18 +264,38 @@ pub(crate) fn resolve_project_info(
         )));
     };
 
-    let mod_id = manifest.as_ref().map(|m| m.id.clone()).unwrap_or_else(|| {
-        project_dir
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("bam_mod")
-            .to_owned()
-    });
+    let mod_id = match manifest.as_ref() {
+        Some(m) => {
+            validate_mod_id(&m.id).map_err(|reason| {
+                CliError::InvalidManifest(format!("invalid [mod].id '{}': {reason}", m.id))
+            })?;
+            if let Some(ref entry) = m.entry {
+                validate_manifest_entry_path(entry).map_err(|reason| {
+                    CliError::InvalidManifest(format!("invalid [mod].entry '{entry}': {reason}"))
+                })?;
+            }
+            m.id.clone()
+        }
+        None => {
+            let derived = project_dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("bam_mod")
+                .to_owned();
+            validate_mod_id(&derived).map_err(|reason| {
+                CliError::InvalidManifest(format!(
+                    "derived mod identifier '{derived}' from '{}' is unsafe: {reason} (add an explicit [mod].id in mod.toml)",
+                    project_dir.display()
+                ))
+            })?;
+            derived
+        }
+    };
 
     let lib_stem = if language == ModLanguage::Rust && cargo_toml.is_file() {
         detect_rust_crate_stem(&cargo_toml)?
     } else {
-        manifest
+        let stem = manifest
             .as_ref()
             .and_then(|m| m.entry.clone())
             .map(|e| {
@@ -197,7 +307,11 @@ pub(crate) fn resolve_project_info(
                     .to_owned()
             })
             .unwrap_or_else(|| mod_id.clone())
-            .replace('-', "_")
+            .replace('-', "_");
+        validate_mod_id(&stem).map_err(|reason| {
+            CliError::InvalidManifest(format!("derived library stem '{stem}' is unsafe: {reason}"))
+        })?;
+        stem
     };
 
     Ok(ResolvedProject {
@@ -254,68 +368,6 @@ pub(crate) fn atomic_write_bytes(dest: &Path, bytes: &[u8]) -> Result<(), CliErr
         return Err(CliError::Io(err));
     }
     Ok(())
-}
-
-fn verify_loose_mod_with_trust(
-    mod_path: &Path,
-    sig_path: Option<&Path>,
-    pubkeys: &[PathBuf],
-    ca_keys: &[PathBuf],
-    principal: Option<&str>,
-    namespace: &str,
-) -> Result<String, CliError> {
-    if ca_keys.is_empty() && principal.is_none() {
-        let fp = signing::verify_mod_file(mod_path, sig_path, pubkeys, namespace)?;
-        return Ok(fp.to_string());
-    }
-    if pubkeys.is_empty() && ca_keys.is_empty() {
-        return Err(CliError::InvalidArgument(
-            "at least one `--pubkey <key.pub>` or `--ca <ca.pub>` is required".to_owned(),
-        ));
-    }
-    let mut policy = ModTrustPolicy::strict()
-        .with_namespace(namespace)
-        .map_err(|e| CliError::Crypto(e.to_string()))?;
-    for pk in pubkeys {
-        policy = policy
-            .add_public_key_file(pk)
-            .map_err(|e| CliError::Crypto(e.to_string()))?;
-    }
-    for ca in ca_keys {
-        policy = policy
-            .add_ca_file(ca)
-            .map_err(|e| CliError::Crypto(e.to_string()))?;
-    }
-    if let Some(req) = principal {
-        policy = policy.with_required_principal(req);
-    }
-
-    let binary_bytes = fs::read(mod_path)?;
-    if binary_bytes.is_empty() {
-        return Err(CliError::Crypto("mod binary is empty".to_owned()));
-    }
-    let receipt = match sig_path {
-        Some(explicit_sig) => {
-            let sig_bytes = fs::read(explicit_sig)?;
-            policy
-                .verify_bytes(&binary_bytes, &sig_bytes)
-                .map_err(|e| CliError::Crypto(e.to_string()))?
-        }
-        None => {
-            let default_sig = signing::default_sig_path(mod_path);
-            if default_sig.is_file() {
-                let sig_bytes = fs::read(&default_sig)?;
-                policy
-                    .verify_bytes(&binary_bytes, &sig_bytes)
-                    .map_err(|e| CliError::Crypto(e.to_string()))?
-            } else {
-                policy
-                    .verify_embedded_bam_sig(&binary_bytes)
-                    .map_err(|e| CliError::Crypto(e.to_string()))?
-            }
-        }
-    };
-    Ok(receipt.signer_fingerprint)
 }
 
 #[derive(Debug, Parser)]
@@ -479,6 +531,9 @@ enum Commands {
         /// Trusted OpenSSH Ed25519 Certificate Authority `.pub` key(s).
         #[arg(long = "ca")]
         ca_keys: Vec<PathBuf>,
+        /// Optional binary OpenSSH Key Revocation List (`.krl`) file(s).
+        #[arg(long = "krl")]
+        krls: Vec<PathBuf>,
         /// Optional required certificate principal when verifying CA-signed artifacts.
         #[arg(long)]
         principal: Option<String>,
@@ -704,6 +759,7 @@ where
         Commands::Verify {
             pubkeys,
             ca_keys,
+            krls,
             principal,
             sig,
             namespace,
@@ -719,10 +775,11 @@ where
                 let ns = namespace
                     .as_deref()
                     .unwrap_or(pack::DEFAULT_BAMPACK_NAMESPACE);
-                let verified = pack::verify_bampack_file(
+                let verified = pack::verify_bampack_file_with_krl(
                     &mod_path,
                     &pubkeys,
                     &ca_keys,
+                    &krls,
                     principal.as_deref(),
                     ns,
                 )?;
@@ -734,11 +791,12 @@ where
                 Ok(())
             } else {
                 let ns = namespace.as_deref().unwrap_or(signing::DEFAULT_NAMESPACE);
-                let fp = verify_loose_mod_with_trust(
+                let fp = signing::verify_mod_file_with_trust(
                     &mod_path,
                     sig.as_deref(),
                     &pubkeys,
                     &ca_keys,
+                    &krls,
                     principal.as_deref(),
                     ns,
                 )?;
@@ -761,391 +819,5 @@ where
             eprintln!("cargo-bam error: {err}");
             ExitCode::FAILURE
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use tempfile::TempDir;
-
-    #[test]
-    fn cli_export_sdk_writes_c_cpp_and_zig_headers() {
-        let tmp = TempDir::new().unwrap();
-        let out_dir = tmp.path().join("sdk");
-
-        run_cli([
-            "cargo-bam",
-            "export-sdk",
-            "--out",
-            out_dir.to_str().unwrap(),
-        ])
-        .unwrap();
-        assert!(out_dir.join("bevy_abi_mod.h").is_file());
-        assert!(out_dir.join("bevy_abi_mod.hpp").is_file());
-        assert!(out_dir.join("bevy_abi_mod.zig").is_file());
-
-        let h = fs::read_to_string(out_dir.join("bevy_abi_mod.h")).unwrap();
-        assert!(h.contains("BAM_ABI_VERSION"));
-    }
-
-    #[test]
-    fn cli_new_build_keygen_sign_and_verify_c99_and_cpp17_mods() {
-        let tmp = TempDir::new().unwrap();
-
-        // 1. Test `cargo bam new` (Cargo subcommand prefix stripping) for C99 & C++17
-        run_cli([
-            "cargo-bam",
-            "bam",
-            "new",
-            "sample_c_mod",
-            "--lang",
-            "c99",
-            "--dir",
-            tmp.path().to_str().unwrap(),
-        ])
-        .unwrap();
-        let c_proj = tmp.path().join("sample_c_mod");
-        assert!(c_proj.join("mod.toml").is_file());
-        assert!(c_proj.join("src/mod.c").is_file());
-
-        // 2. Build C99 mod & stage into `dist/sample_c_mod/`
-        let dist_dir = tmp.path().join("dist_c");
-        run_cli([
-            "cargo-bam",
-            "build",
-            "--manifest-path",
-            c_proj.join("mod.toml").to_str().unwrap(),
-            "--release",
-            "--out-dir",
-            dist_dir.to_str().unwrap(),
-        ])
-        .unwrap();
-        let staged_c_dir = dist_dir.join("sample_c_mod");
-        assert!(staged_c_dir.join("mod.toml").is_file());
-        let staged_c_lib = fs::read_dir(&staged_c_dir)
-            .unwrap()
-            .flatten()
-            .map(|e| e.path())
-            .find(|p| {
-                p.extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|e| matches!(e, "so" | "dylib" | "dll"))
-            })
-            .expect("staged C99 shared library must exist");
-
-        // 3. Keygen, sign, and verify the staged C99 mod binary
-        let key_prefix = tmp.path().join("keys/dev_signer");
-        run_cli([
-            "cargo-bam",
-            "keygen",
-            "--out",
-            key_prefix.to_str().unwrap(),
-            "--comment",
-            "ci-test",
-        ])
-        .unwrap();
-        assert!(key_prefix.is_file());
-        let pub_path = tmp.path().join("keys/dev_signer.pub");
-        assert!(pub_path.is_file());
-
-        run_cli([
-            "cargo-bam",
-            "sign",
-            "--key",
-            key_prefix.to_str().unwrap(),
-            staged_c_lib.to_str().unwrap(),
-        ])
-        .unwrap();
-        let sig_path = signing::default_sig_path(&staged_c_lib);
-        assert!(sig_path.is_file());
-
-        run_cli([
-            "cargo-bam",
-            "verify",
-            "--pubkey",
-            pub_path.to_str().unwrap(),
-            staged_c_lib.to_str().unwrap(),
-        ])
-        .unwrap();
-
-        // Tampering the binary must fail verification!
-        let mut tampered = fs::read(&staged_c_lib).unwrap();
-        tampered[0] ^= 0xff;
-        fs::write(&staged_c_lib, tampered).unwrap();
-        assert!(
-            run_cli([
-                "cargo-bam",
-                "verify",
-                "--pubkey",
-                pub_path.to_str().unwrap(),
-                staged_c_lib.to_str().unwrap(),
-            ])
-            .is_err()
-        );
-
-        // 4. Scaffold & build C++17 mod with `--sign-key` staged into `dist_cpp/sample_cpp_mod/`
-        run_cli([
-            "cargo-bam",
-            "new",
-            "sample_cpp_mod",
-            "--lang",
-            "cpp17",
-            "--dir",
-            tmp.path().to_str().unwrap(),
-        ])
-        .unwrap();
-        let cpp_proj = tmp.path().join("sample_cpp_mod");
-        let dist_cpp = tmp.path().join("dist_cpp");
-        run_cli([
-            "cargo-bam",
-            "build",
-            "--dir",
-            cpp_proj.to_str().unwrap(),
-            "--out-dir",
-            dist_cpp.to_str().unwrap(),
-            "--sign-key",
-            key_prefix.to_str().unwrap(),
-        ])
-        .unwrap();
-        let staged_cpp_dir = dist_cpp.join("sample_cpp_mod");
-        assert!(staged_cpp_dir.join("mod.toml").is_file());
-        let staged_cpp_lib = fs::read_dir(&staged_cpp_dir)
-            .unwrap()
-            .flatten()
-            .map(|e| e.path())
-            .find(|p| {
-                p.extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|e| matches!(e, "so" | "dylib" | "dll"))
-            })
-            .expect("staged C++17 shared library must exist");
-        assert!(signing::default_sig_path(&staged_cpp_lib).is_file());
-        run_cli([
-            "cargo-bam",
-            "verify",
-            "--pubkey",
-            pub_path.to_str().unwrap(),
-            staged_cpp_lib.to_str().unwrap(),
-        ])
-        .unwrap();
-    }
-
-    #[test]
-    fn cli_new_and_build_rust_cdylib_mod() {
-        let tmp = TempDir::new().unwrap();
-        run_cli([
-            "cargo-bam",
-            "new",
-            "sample_rust_mod",
-            "--lang",
-            "rust",
-            "--dir",
-            tmp.path().to_str().unwrap(),
-        ])
-        .unwrap();
-
-        let rust_proj = tmp.path().join("sample_rust_mod");
-        assert!(rust_proj.join("mod.toml").is_file());
-        assert!(rust_proj.join("Cargo.toml").is_file());
-        assert!(rust_proj.join("src/lib.rs").is_file());
-
-        let dist_rust = tmp.path().join("dist_rust");
-        run_cli([
-            "cargo-bam",
-            "build",
-            "--dir",
-            rust_proj.to_str().unwrap(),
-            "--out-dir",
-            dist_rust.to_str().unwrap(),
-        ])
-        .unwrap();
-        let staged_rust_dir = dist_rust.join("sample_rust_mod");
-        assert!(staged_rust_dir.join("mod.toml").is_file());
-        let has_lib = fs::read_dir(&staged_rust_dir).unwrap().flatten().any(|e| {
-            e.path()
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| matches!(ext, "so" | "dylib" | "dll"))
-        });
-        assert!(
-            has_lib,
-            "built Rust cdylib must be staged into dist_rust/<mod_id>/"
-        );
-    }
-
-    #[test]
-    fn cli_check_mods_validates_dag_semver_mismatch_and_cycles() {
-        let tmp = TempDir::new().unwrap();
-        let mods_dir = tmp.path().join("mods");
-        fs::create_dir_all(mods_dir.join("base")).unwrap();
-        fs::create_dir_all(mods_dir.join("addon")).unwrap();
-        fs::create_dir_all(mods_dir.join("ui")).unwrap();
-
-        fs::write(
-            mods_dir.join("base/mod.toml"),
-            "[mod]\nid = \"base\"\nversion = \"1.2.0\"\nabi_version = \"^0.3.0\"\n",
-        )
-        .unwrap();
-        fs::write(
-            mods_dir.join("addon/mod.toml"),
-            "[mod]\nid = \"addon\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n\n[dependencies]\nbase = \"^1.0\"\n",
-        )
-        .unwrap();
-        fs::write(
-            mods_dir.join("ui/mod.toml"),
-            "[mod]\nid = \"ui\"\nversion = \"0.5.0\"\n\n[dependencies]\naddon = \"^1.0\"\n",
-        )
-        .unwrap();
-
-        // Valid DAG returns topological order: base -> addon -> ui
-        let order = dag::check_mods_dir(&mods_dir).unwrap();
-        let ids: Vec<&str> = order.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, vec!["base", "addon", "ui"]);
-        run_cli(["cargo-bam", "check-mods", mods_dir.to_str().unwrap()]).unwrap();
-
-        // SemVer mismatch must fail!
-        fs::write(
-            mods_dir.join("addon/mod.toml"),
-            "[mod]\nid = \"addon\"\nversion = \"1.0.0\"\n\n[dependencies]\nbase = \"^2.0\"\n",
-        )
-        .unwrap();
-        let err = run_cli(["cargo-bam", "check-mods", mods_dir.to_str().unwrap()]).unwrap_err();
-        assert!(
-            err.to_string().contains("requires 'base' ^2.0"),
-            "unexpected error: {err}"
-        );
-
-        // Cycle must fail!
-        fs::write(
-            mods_dir.join("addon/mod.toml"),
-            "[mod]\nid = \"addon\"\nversion = \"1.0.0\"\n\n[dependencies]\nbase = \"^1.0\"\nui = \"^0.5\"\n",
-        )
-        .unwrap();
-        let cyc_err = run_cli(["cargo-bam", "check-mods", mods_dir.to_str().unwrap()]).unwrap_err();
-        assert!(
-            cyc_err.to_string().contains("dependency cycle"),
-            "unexpected error: {cyc_err}"
-        );
-    }
-
-    #[test]
-    fn cli_new_scaffolds_zig_mod() {
-        let tmp = TempDir::new().unwrap();
-        run_cli([
-            "cargo-bam",
-            "new",
-            "sample_zig_mod",
-            "--lang",
-            "zig",
-            "--dir",
-            tmp.path().to_str().unwrap(),
-        ])
-        .unwrap();
-        let zig_proj = tmp.path().join("sample_zig_mod");
-        assert!(zig_proj.join("mod.toml").is_file());
-        assert!(zig_proj.join("build.zig").is_file());
-        assert!(zig_proj.join("src/root.zig").is_file());
-        assert!(zig_proj.join("include/bevy_abi_mod.zig").is_file());
-    }
-
-    #[test]
-    fn cli_header_alias_and_doctor_validate_environment_and_mods() {
-        let tmp = TempDir::new().unwrap();
-        let out_dir = tmp.path().join("headers");
-        run_cli(["cargo", "bam", "header", "--out", out_dir.to_str().unwrap()]).unwrap();
-        assert!(out_dir.join("bevy_abi_mod.h").is_file());
-        assert!(out_dir.join("bevy_abi_mod.hpp").is_file());
-        assert!(out_dir.join("bevy_abi_mod.zig").is_file());
-
-        let mods_dir = tmp.path().join("mods");
-        fs::create_dir_all(mods_dir.join("core")).unwrap();
-        fs::write(
-            mods_dir.join("core/mod.toml"),
-            "[mod]\nid = \"core\"\nversion = \"0.2.0\"\nabi_version = \"^0.3.0\"\n",
-        )
-        .unwrap();
-
-        run_cli(["cargo-bam", "doctor", "--dir", mods_dir.to_str().unwrap()]).unwrap();
-
-        let report = doctor::run_doctor(Some(&mods_dir), false).unwrap();
-        assert!(report.ok);
-        assert_eq!(report.host_abi_version, "0.3.0");
-        assert!(
-            report
-                .tools
-                .iter()
-                .any(|t| t.name == "cargo" && t.available)
-        );
-        assert!(
-            report
-                .tools
-                .iter()
-                .any(|t| t.name == "rustc" && t.available)
-        );
-        assert!(
-            report
-                .tools
-                .iter()
-                .any(|t| t.name == "sdk_headers" && t.available)
-        );
-        assert_eq!(report.validated_mods.as_ref().map(Vec::len), Some(1));
-
-        // Corrupt ABI version in mod.toml must fail doctor --dir
-        fs::write(
-            mods_dir.join("core/mod.toml"),
-            "[mod]\nid = \"core\"\nversion = \"0.2.0\"\nabi_version = \"^99.0.0\"\n",
-        )
-        .unwrap();
-        let err =
-            run_cli(["cargo-bam", "doctor", "--dir", mods_dir.to_str().unwrap()]).unwrap_err();
-        assert!(
-            err.to_string().contains("0.3.0"),
-            "expected ABI compatibility error mentioning 0.3.0, got: {err}"
-        );
-    }
-
-    #[test]
-    fn cli_rejects_missing_sign_key_and_invalid_mod_id() {
-        let tmp = TempDir::new().unwrap();
-        let invalid_id_err = run_cli([
-            "cargo-bam",
-            "new",
-            "../escape",
-            "--dir",
-            tmp.path().to_str().unwrap(),
-        ])
-        .unwrap_err();
-        assert!(
-            matches!(invalid_id_err, CliError::InvalidArgument(_)),
-            "expected InvalidArgument, got {invalid_id_err:?}"
-        );
-
-        let proj = tmp.path().join("c_sample");
-        run_cli([
-            "cargo-bam",
-            "new",
-            "c_sample",
-            "--lang",
-            "c99",
-            "--dir",
-            tmp.path().to_str().unwrap(),
-        ])
-        .unwrap();
-        let missing_key = tmp.path().join("does_not_exist.key");
-        let build_err = run_cli([
-            "cargo-bam",
-            "build",
-            "--dir",
-            proj.to_str().unwrap(),
-            "--sign-key",
-            missing_key.to_str().unwrap(),
-        ])
-        .unwrap_err();
-        assert!(
-            matches!(build_err, CliError::Io(_) | CliError::Crypto(_)),
-            "expected missing key error, got {build_err:?}"
-        );
     }
 }
