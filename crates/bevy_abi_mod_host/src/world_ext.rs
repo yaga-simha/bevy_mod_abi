@@ -12,12 +12,14 @@ use crate::schedule_sets::{
 };
 pub use bevy_abi_mod_host_sys::loader::ModScoped;
 use bevy_abi_mod_host_sys::loader::{
-    ReloadColumnSnapshot, cleanup_orphaned_mod_scoped_entities,
+    ReloadColumnSnapshot, cleanup_orphaned_mod_scoped_entities, ensure_symbol_tables_in_world,
     excise_and_unload_mod_for_reload_in_world, migrate_mod_scoped_entities,
     restore_mod_dynamic_columns_after_reload, snapshot_mod_dynamic_columns_for_reload,
 };
+use bevy_abi_mod_host_sys::registry::catalog::ensure_relation_graph_in_world;
+use bevy_abi_mod_host_sys::schedule::ModScheduleSetRegistry;
 use bevy_abi_mod_host_sys::{
-    ComponentCollisionError, ComponentOptions, LoadOptions, LoadedMod, ModErrorPolicy,
+    ComponentCollisionError, ComponentOptions, GuestSystem, LoadOptions, LoadedMod, ModErrorPolicy,
     ModErrorPolicyConfig, ModHost, ModId, ModLoadError, ModQuarantine, ModRegistry,
     PersistentMessageCursors, WorldDropGuard, ensure_children_registered_in_world,
     ensure_dynamic_hook_map_in_world, excise_and_unload_mod_in_world, load_mod_in_world,
@@ -27,16 +29,19 @@ use bevy_abi_mod_host_sys::{
 #[cfg(feature = "signature-verification")]
 use bevy_abi_mod_host_sys::{ModTrustPolicy, default_signature_path_for, preverify_mod_on_disk};
 use bevy_abi_mod_sys::{
-    AbiPod, BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_SUMMARY_TICK,
+    AbiPod, BAM_COMPONENT_FLAG_SPARSE_SET, BAM_COMPONENT_FLAG_SUMMARY_TICK,
+    BAM_STORAGE_FLAG_IMMUTABLE, BAM_STORAGE_FLAG_SPARSE_SET, BAM_STORAGE_FLAG_SUMMARY_TICK,
     BamComponent, ModComponent, ScheduleId,
 };
 use bevy_ecs::component::{Component, StorageType};
 use bevy_ecs::entity::Entity;
+use bevy_ecs::entity_disabling::Disabled;
 use bevy_ecs::event::{EntityEvent, Event};
 use bevy_ecs::hierarchy::ChildOf;
 use bevy_ecs::message::{Message, Messages};
 use bevy_ecs::name::Name;
 use bevy_ecs::prelude::Resource;
+use bevy_ecs::query::Allow;
 use bevy_ecs::schedule::{ScheduleLabel, Schedules, SystemSet};
 use bevy_ecs::world::World;
 use std::collections::{BTreeMap, BTreeSet};
@@ -104,9 +109,7 @@ pub fn register_mod_unload_hook_in_world(
     key: &'static str,
     hook: ModUnloadHookFn,
 ) {
-    if !world.contains_resource::<ModUnloadHooks>() {
-        world.insert_resource(ModUnloadHooks::new());
-    }
+    world.init_resource::<ModUnloadHooks>();
     if let Some(mut hooks) = world.get_resource_mut::<ModUnloadHooks>() {
         hooks.register(key, hook);
     }
@@ -137,52 +140,27 @@ pub(crate) fn ensure_hierarchy_registered(world: &mut World) {
 }
 
 pub(crate) fn ensure_world_mod_resources(world: &mut World) {
-    if !world.contains_resource::<WorldDropGuard>() {
-        world.insert_resource(WorldDropGuard::new());
-    }
+    world.init_resource::<WorldDropGuard>();
     ensure_dynamic_hook_map_in_world(world);
-    if !world.contains_resource::<PersistentMessageCursors>() {
-        world.insert_resource(PersistentMessageCursors::default());
-    }
-    if !world.contains_resource::<ModRegistry>() {
-        world.insert_resource(ModRegistry::new());
-    }
-    if !world.contains_resource::<ModHost>() {
-        world.insert_resource(ModHost::new());
-    }
-    if !world.contains_resource::<ModQuarantine>() {
-        world.insert_resource(ModQuarantine::new());
-    }
-    if !world.contains_resource::<ModScheduleMap>() {
-        world.insert_resource(ModScheduleMap::new());
-    }
-    if !world.contains_resource::<ModVisibleSets>() {
-        world.insert_resource(ModVisibleSets::new());
-    }
-    if !world.contains_resource::<ModDependencyGraph>() {
-        world.insert_resource(ModDependencyGraph::new());
-    }
+    world.init_resource::<PersistentMessageCursors>();
+    world.init_resource::<ModRegistry>();
+    world.init_resource::<ModHost>();
+    world.init_resource::<ModQuarantine>();
+    world.init_resource::<ModScheduleMap>();
+    world.init_resource::<ModVisibleSets>();
+    world.init_resource::<ModScheduleSetRegistry>();
+    world.init_resource::<ModDependencyGraph>();
+    world.init_resource::<ModUnloadHooks>();
+    world.init_resource::<StartupCompleted>();
+    ensure_symbol_tables_in_world(world);
+    ensure_relation_graph_in_world(world);
     #[cfg(feature = "signature-verification")]
-    if !world.contains_resource::<ModTrustPolicy>() {
-        world.insert_resource(ModTrustPolicy::disabled());
-    }
+    world.init_resource::<ModTrustPolicy>();
     #[cfg(feature = "diagnostics")]
     ensure_diagnostics_resources(world);
-    if !world.contains_resource::<ModUnloadHooks>() {
-        world.insert_resource(ModUnloadHooks::new());
-    }
-    if !world.contains_resource::<StartupCompleted>() {
-        world.insert_resource(StartupCompleted(false));
-    }
-    if !world.contains_resource::<Messages<ModLoaded>>() {
-        world.init_resource::<Messages<ModLoaded>>();
-    }
-    if !world.contains_resource::<Messages<ModUnloaded>>() {
-        world.init_resource::<Messages<ModUnloaded>>();
-    }
-    if !world.contains_resource::<Messages<ModSystemFaulted>>() {
-        world.init_resource::<Messages<ModSystemFaulted>>();
-    }
+    world.init_resource::<Messages<ModLoaded>>();
+    world.init_resource::<Messages<ModUnloaded>>();
+    world.init_resource::<Messages<ModSystemFaulted>>();
     ensure_hierarchy_registered(world);
 }
 
@@ -198,16 +176,7 @@ fn with_world_registry<R>(world: &mut World, f: impl FnOnce(&mut ModRegistry) ->
 }
 
 fn despawn_loaded_mod_entities(world: &mut World, id: ModId) {
-    let mut query = world.query::<(Entity, &LoadedModInfo)>();
-    let matching_entities: Vec<Entity> = query
-        .iter(world)
-        .filter_map(|(entity, info)| (info.id == id).then_some(entity))
-        .collect();
-    for entity in matching_entities {
-        if let Ok(entity_mut) = world.get_entity_mut(entity) {
-            entity_mut.despawn();
-        }
-    }
+    world.despawn_all_where::<&LoadedModInfo, Allow<Disabled>>(|info| info.id == id);
 }
 
 fn emit_mod_unloaded_once(
@@ -281,13 +250,17 @@ fn finalize_mod_load_in_world(
     entity
 }
 
-fn load_mod_with_optional_state(
+fn rollback_and_cleanup_reload(
     world: &mut World,
-    path: &Path,
-    options: LoadOptions,
-    saved_state: Option<&[u8]>,
-) -> Result<ModId, ModLoadError> {
-    load_mod_with_optional_state_and_migration(world, path, options, saved_state, None)
+    mod_id: ModId,
+    systems: Vec<GuestSystem>,
+    orphan_old_id: Option<ModId>,
+) {
+    drop(systems);
+    rollback_unscheduled_mod_in_world(world, mod_id);
+    if let Some(old_id) = orphan_old_id {
+        cleanup_orphaned_mod_scoped_entities(world, old_id);
+    }
 }
 
 fn load_mod_with_optional_state_and_migration(
@@ -299,11 +272,12 @@ fn load_mod_with_optional_state_and_migration(
 ) -> Result<ModId, ModLoadError> {
     ensure_world_mod_resources(world);
     let path_buf = path.to_path_buf();
+    let orphan_old_id = reload_migration.as_ref().map(|(old_id, _)| *old_id);
 
     let (mod_id, systems) = match load_mod_in_world(world, &path_buf, &options) {
         Ok(res) => res,
         Err(err) => {
-            if let Some((old_id, _)) = reload_migration {
+            if let Some(old_id) = orphan_old_id {
                 cleanup_orphaned_mod_scoped_entities(world, old_id);
             }
             return Err(err);
@@ -322,11 +296,7 @@ fn load_mod_with_optional_state_and_migration(
         for sys in &systems {
             if let Err(missing) = sys.validate_against_registry(registry) {
                 let sys_name = sys.system_name().to_string();
-                drop(systems);
-                rollback_unscheduled_mod_in_world(world, mod_id);
-                if let Some((old_id, _)) = reload_migration {
-                    cleanup_orphaned_mod_scoped_entities(world, old_id);
-                }
+                rollback_and_cleanup_reload(world, mod_id, systems, orphan_old_id);
                 return Err(ModLoadError::MissingComponents {
                     path: path_buf,
                     system_name: sys_name,
@@ -343,30 +313,20 @@ fn load_mod_with_optional_state_and_migration(
         options.strict,
         &systems,
     ) {
-        drop(systems);
-        rollback_unscheduled_mod_in_world(world, mod_id);
-        if let Some((old_id, _)) = reload_migration {
-            cleanup_orphaned_mod_scoped_entities(world, old_id);
-        }
+        rollback_and_cleanup_reload(world, mod_id, systems, orphan_old_id);
         return Err(err);
     }
 
     if let Some(blob) = saved_state
         && let Err(err) = restore_mod_state_in_world(world, mod_id, blob)
     {
-        drop(systems);
-        rollback_unscheduled_mod_in_world(world, mod_id);
-        if let Some((old_id, _)) = reload_migration {
-            cleanup_orphaned_mod_scoped_entities(world, old_id);
-        }
+        rollback_and_cleanup_reload(world, mod_id, systems, orphan_old_id);
         return Err(err);
     }
 
     if let Some((old_id, col_snapshot)) = reload_migration {
         if let Err(err) = restore_mod_dynamic_columns_after_reload(world, mod_id, col_snapshot) {
-            drop(systems);
-            rollback_unscheduled_mod_in_world(world, mod_id);
-            cleanup_orphaned_mod_scoped_entities(world, old_id);
+            rollback_and_cleanup_reload(world, mod_id, systems, Some(old_id));
             return Err(err);
         }
         migrate_mod_scoped_entities(world, old_id, mod_id);
@@ -406,24 +366,20 @@ fn load_mod_with_optional_state_and_migration(
     Ok(mod_id)
 }
 
-fn unload_single_mod_in_world(world: &mut World, id: ModId) -> Result<(), ModLoadError> {
-    let (mod_name, unloaded_path, removed_systems) =
-        excise_and_unload_mod_in_world(world, id, |w| {
-            despawn_loaded_mod_entities(w, id);
-        })?;
-    run_mod_unload_hooks(world, id);
-    if let Some(mut dag) = world.get_resource_mut::<ModDependencyGraph>() {
-        dag.unregister_mod(id);
-    }
-    emit_mod_unloaded_once(world, id, &mod_name, unloaded_path, removed_systems);
-    Ok(())
-}
-
-fn unload_single_mod_for_reload_in_world(world: &mut World, id: ModId) -> Result<(), ModLoadError> {
-    let (mod_name, unloaded_path, removed_systems) =
+fn unload_single_mod_in_world(
+    world: &mut World,
+    id: ModId,
+    for_reload: bool,
+) -> Result<(), ModLoadError> {
+    let (mod_name, unloaded_path, removed_systems) = if for_reload {
         excise_and_unload_mod_for_reload_in_world(world, id, |w| {
             despawn_loaded_mod_entities(w, id);
-        })?;
+        })?
+    } else {
+        excise_and_unload_mod_in_world(world, id, |w| {
+            despawn_loaded_mod_entities(w, id);
+        })?
+    };
     run_mod_unload_hooks(world, id);
     if let Some(mut dag) = world.get_resource_mut::<ModDependencyGraph>() {
         dag.unregister_mod(id);
@@ -440,6 +396,22 @@ struct CascadeReloadEntry {
     dependencies: Vec<String>,
 }
 
+fn resolve_cascade_ids(world: &World, id: ModId) -> Result<Vec<ModId>, ModLoadError> {
+    let active_ids: BTreeSet<ModId> = {
+        let Some(host) = world
+            .get_resource::<ModHost>()
+            .filter(|h| h.contains_mod(id))
+        else {
+            return Err(ModLoadError::ModNotFound { id });
+        };
+        host.loaded_mods().iter().map(LoadedMod::id).collect()
+    };
+    Ok(world
+        .get_resource::<ModDependencyGraph>()
+        .map(|dag| dag.cascading_order(id, &active_ids))
+        .unwrap_or_else(|| vec![id]))
+}
+
 fn reload_mod_cascade(
     world: &mut World,
     id: ModId,
@@ -447,26 +419,15 @@ fn reload_mod_cascade(
     options: LoadOptions,
 ) -> Result<ModId, ModLoadError> {
     ensure_world_mod_resources(world);
-    let active_ids: BTreeSet<ModId> = {
-        let Some(host) = world.get_resource::<ModHost>() else {
-            return Err(ModLoadError::ModNotFound { id });
-        };
-        if !host.contains_mod(id) {
-            return Err(ModLoadError::ModNotFound { id });
-        }
-        host.loaded_mods().iter().map(LoadedMod::id).collect()
-    };
-
-    let forward_ids = world
-        .get_resource::<ModDependencyGraph>()
-        .map(|dag| dag.cascading_order(id, &active_ids))
-        .unwrap_or_else(|| vec![id]);
+    let forward_ids = resolve_cascade_ids(world, id)?;
 
     let mut plan = Vec::with_capacity(forward_ids.len());
     for tid in forward_ids {
         let (loaded_name, current_path) = {
-            let host = world.resource::<ModHost>();
-            let Some(loaded) = host.get_mod(tid) else {
+            let Some(loaded) = world
+                .get_resource::<ModHost>()
+                .and_then(|host| host.get_mod(tid))
+            else {
                 return Err(ModLoadError::ModNotFound { id: tid });
             };
             (
@@ -520,7 +481,7 @@ fn reload_mod_cascade(
     for idx in (0..plan.len()).rev() {
         let col_snap = snapshot_mod_dynamic_columns_for_reload(world, plan[idx].old_id)?;
         column_snapshots[idx] = Some(col_snap);
-        unload_single_mod_for_reload_in_world(world, plan[idx].old_id)?;
+        unload_single_mod_in_world(world, plan[idx].old_id, true)?;
     }
 
     // Reload in forward topological order (`A -> B -> C`), restoring state and migrating
@@ -558,7 +519,7 @@ fn reload_mod_cascade(
         }
     }
 
-    Ok(new_root_id.expect("target ModId must be present in cascade reload plan"))
+    new_root_id.ok_or(ModLoadError::ModNotFound { id })
 }
 
 /// Exclusive `&mut World` extension trait for exposing Bevy ECS types and managing native C-ABI
@@ -695,7 +656,31 @@ impl ModWorldExt for World {
     ) -> Result<BamComponent, ComponentCollisionError> {
         let comp_id = self.register_component::<T>();
         let mut inferred_flags = 0u32;
+        let wants_summary_tick = (options.extra_storage_flags() & BAM_STORAGE_FLAG_SUMMARY_TICK)
+            != 0
+            || (T::COMPONENT_FLAGS & BAM_COMPONENT_FLAG_SUMMARY_TICK) != 0;
+        let wants_sparse_set = (options.extra_storage_flags() & BAM_STORAGE_FLAG_SPARSE_SET) != 0
+            || (T::COMPONENT_FLAGS & BAM_COMPONENT_FLAG_SPARSE_SET) != 0;
         if let Some(info) = self.components().get_info(comp_id) {
+            if wants_summary_tick && (info.storage_type() != StorageType::Table || wants_sparse_set)
+            {
+                return Err(ComponentCollisionError::MetadataMismatch {
+                    name: T::CANONICAL_NAME.to_string(),
+                    reason: "BAM_STORAGE_FLAG_SUMMARY_TICK requires Table storage and cannot be combined with SparseSet".to_string(),
+                });
+            }
+            if wants_summary_tick && !info.summary_tick() {
+                return Err(ComponentCollisionError::MetadataMismatch {
+                    name: T::CANONICAL_NAME.to_string(),
+                    reason: "BAM_STORAGE_FLAG_SUMMARY_TICK requested, but Bevy Component does not enable #[component(summary_tick)]".to_string(),
+                });
+            }
+            if info.summary_tick() && wants_sparse_set {
+                return Err(ComponentCollisionError::MetadataMismatch {
+                    name: T::CANONICAL_NAME.to_string(),
+                    reason: "component enables #[component(summary_tick)] (Table storage) and cannot be registered with BAM_STORAGE_FLAG_SPARSE_SET".to_string(),
+                });
+            }
             if info.storage_type() == StorageType::SparseSet {
                 inferred_flags |= BAM_STORAGE_FLAG_SPARSE_SET;
             }
@@ -721,9 +706,7 @@ impl ModWorldExt for World {
     fn register_mod_message<M: Message + ModComponent + AbiPod>(
         &mut self,
     ) -> Result<BamComponent, ComponentCollisionError> {
-        if !self.contains_resource::<Messages<M>>() {
-            self.init_resource::<Messages<M>>();
-        }
+        self.init_resource::<Messages<M>>();
         let messages_res_id = self.register_component::<Messages<M>>();
         with_world_registry(self, |reg| reg.register_message::<M>(messages_res_id))
     }
@@ -731,9 +714,7 @@ impl ModWorldExt for World {
     fn register_mod_non_pod_message<M: Message + ModComponent + Default>(
         &mut self,
     ) -> Result<BamComponent, ComponentCollisionError> {
-        if !self.contains_resource::<Messages<M>>() {
-            self.init_resource::<Messages<M>>();
-        }
+        self.init_resource::<Messages<M>>();
         let messages_res_id = self.register_component::<Messages<M>>();
         with_world_registry(self, |reg| {
             reg.register_non_pod_message::<M>(messages_res_id)
@@ -771,15 +752,11 @@ impl ModWorldExt for World {
             return Err(ModLoadError::InvalidScheduleRegistration { schedule: id });
         }
         let interned = label.intern();
-        if !self.contains_resource::<Schedules>() {
-            self.insert_resource(Schedules::new());
-        }
+        self.init_resource::<Schedules>();
         if let Some(mut schedules) = self.get_resource_mut::<Schedules>() {
             let _ = schedules.entry(interned);
         }
-        if !self.contains_resource::<ModScheduleMap>() {
-            self.insert_resource(ModScheduleMap::new());
-        }
+        self.init_resource::<ModScheduleMap>();
         if let Some(mut map) = self.get_resource_mut::<ModScheduleMap>() {
             let ok = map.register(id, interned);
             debug_assert!(ok);
@@ -788,9 +765,7 @@ impl ModWorldExt for World {
     }
 
     fn register_mod_visible_set<S: SystemSet>(&mut self, name: &str, set: S) -> bool {
-        if !self.contains_resource::<ModVisibleSets>() {
-            self.insert_resource(ModVisibleSets::new());
-        }
+        self.init_resource::<ModVisibleSets>();
         self.get_resource_mut::<ModVisibleSets>()
             .is_some_and(|mut sets| sets.register(name, set))
     }
@@ -856,28 +831,14 @@ impl ModWorldExt for World {
         path: P,
         options: LoadOptions,
     ) -> Result<ModId, ModLoadError> {
-        load_mod_with_optional_state(self, path.as_ref(), options, None)
+        load_mod_with_optional_state_and_migration(self, path.as_ref(), options, None, None)
     }
 
     fn unload_mod(&mut self, id: ModId) -> Result<(), ModLoadError> {
         ensure_world_mod_resources(self);
-        let active_ids: BTreeSet<ModId> = {
-            let Some(host) = self.get_resource::<ModHost>() else {
-                return Err(ModLoadError::ModNotFound { id });
-            };
-            if !host.contains_mod(id) {
-                return Err(ModLoadError::ModNotFound { id });
-            }
-            host.loaded_mods().iter().map(LoadedMod::id).collect()
-        };
-
-        let forward_ids = self
-            .get_resource::<ModDependencyGraph>()
-            .map(|dag| dag.cascading_order(id, &active_ids))
-            .unwrap_or_else(|| vec![id]);
-
+        let forward_ids = resolve_cascade_ids(self, id)?;
         for target_id in forward_ids.into_iter().rev() {
-            unload_single_mod_in_world(self, target_id)?;
+            unload_single_mod_in_world(self, target_id, false)?;
         }
         Ok(())
     }
@@ -978,7 +939,13 @@ impl ModWorldExt for World {
                 }
             }
 
-            match load_mod_with_optional_state(self, &lib_path, options.clone(), None) {
+            match load_mod_with_optional_state_and_migration(
+                self,
+                &lib_path,
+                options.clone(),
+                None,
+                None,
+            ) {
                 Ok(mod_id) => {
                     if let Some(mut dag) = self.get_resource_mut::<ModDependencyGraph>() {
                         dag.register_loaded_mod(

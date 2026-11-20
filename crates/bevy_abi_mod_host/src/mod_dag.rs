@@ -134,77 +134,10 @@ pub enum ModDagError {
     },
 }
 
-impl From<ManifestError> for ModDagError {
-    fn from(err: ManifestError) -> Self {
-        match err {
-            ManifestError::Io { path, source } => Self::Io { path, source },
-            ManifestError::TomlParse { path, source } => Self::TomlParse { path, source },
-            ManifestError::MissingModName { path } => Self::MissingModName { path },
-            ManifestError::InvalidVersion { path, raw, source } => {
-                Self::InvalidVersion { path, raw, source }
-            }
-            ManifestError::InvalidAbiVersion { path, raw, source } => {
-                Self::InvalidAbiVersion { path, raw, source }
-            }
-            ManifestError::IncompatibleAbiVersion {
-                path,
-                mod_name,
-                required,
-                host_abi,
-            } => Self::IncompatibleAbiVersion {
-                path,
-                mod_name,
-                required,
-                host_abi,
-            },
-            ManifestError::InvalidDependencyReq {
-                path,
-                mod_name,
-                dependency,
-                raw,
-                source,
-            } => Self::InvalidDependencyReq {
-                path,
-                mod_name,
-                dependency,
-                raw,
-                source,
-            },
-            ManifestError::DuplicateModName {
-                mod_name,
-                first_path,
-                second_path,
-            } => Self::DuplicateModName {
-                mod_name,
-                first_path,
-                second_path,
-            },
-            ManifestError::MissingLibrary { mod_name, path } => {
-                Self::MissingLibrary { mod_name, path }
-            }
-            ManifestError::MissingDependency {
-                mod_name,
-                dependency,
-                required,
-            } => Self::MissingDependency {
-                mod_name,
-                dependency,
-                required,
-            },
-            ManifestError::IncompatibleDependencyVersion {
-                mod_name,
-                dependency,
-                required,
-                found,
-            } => Self::IncompatibleDependencyVersion {
-                mod_name,
-                dependency,
-                required,
-                found,
-            },
-            ManifestError::CycleQuarantined { cycle_members } => {
-                Self::CycleQuarantined { cycle_members }
-            }
+macro_rules! map_manifest_err {
+    ($err:expr, { $($v:ident { $($f:ident),+ }),+ $(,)? }) => {
+        match $err {
+            $(ManifestError::$v { $($f),+ } => Self::$v { $($f),+ },)+
             ManifestError::NoManifestsFound { dir } => Self::Io {
                 source: std::io::Error::new(
                     std::io::ErrorKind::NotFound,
@@ -213,6 +146,25 @@ impl From<ManifestError> for ModDagError {
                 path: dir,
             },
         }
+    };
+}
+
+impl From<ManifestError> for ModDagError {
+    fn from(err: ManifestError) -> Self {
+        map_manifest_err!(err, {
+            Io { path, source },
+            TomlParse { path, source },
+            MissingModName { path },
+            InvalidVersion { path, raw, source },
+            InvalidAbiVersion { path, raw, source },
+            IncompatibleAbiVersion { path, mod_name, required, host_abi },
+            InvalidDependencyReq { path, mod_name, dependency, raw, source },
+            DuplicateModName { mod_name, first_path, second_path },
+            MissingLibrary { mod_name, path },
+            MissingDependency { mod_name, dependency, required },
+            IncompatibleDependencyVersion { mod_name, dependency, required, found },
+            CycleQuarantined { cycle_members },
+        })
     }
 }
 
@@ -225,108 +177,86 @@ impl fmt::Display for ModDagError {
             Self::TomlParse { path, source } => {
                 write!(f, "failed to parse '{}': {source}", path.display())
             }
-            Self::MissingModName { path } => {
-                write!(
-                    f,
-                    "manifest '{}' is missing [mod].id / [mod].name",
-                    path.display()
-                )
-            }
-            Self::InvalidVersion { path, raw, source } => {
-                write!(
-                    f,
-                    "manifest '{}' has invalid SemVer version '{raw}': {source}",
-                    path.display()
-                )
-            }
-            Self::InvalidAbiVersion { path, raw, source } => {
-                write!(
-                    f,
-                    "manifest '{}' has invalid abi_version '{raw}': {source}",
-                    path.display()
-                )
-            }
+            Self::MissingModName { path } => write!(
+                f,
+                "manifest '{}' is missing [mod].id / [mod].name",
+                path.display()
+            ),
+            Self::InvalidVersion { path, raw, source } => write!(
+                f,
+                "manifest '{}' has invalid SemVer version '{raw}': {source}",
+                path.display()
+            ),
+            Self::InvalidAbiVersion { path, raw, source } => write!(
+                f,
+                "manifest '{}' has invalid abi_version '{raw}': {source}",
+                path.display()
+            ),
             Self::IncompatibleAbiVersion {
                 mod_name,
                 required,
                 host_abi,
                 ..
-            } => {
-                write!(
-                    f,
-                    "mod '{mod_name}' requires host ABI '{required}', but host ABI is '{host_abi}'"
-                )
-            }
+            } => write!(
+                f,
+                "mod '{mod_name}' requires host ABI '{required}', but host ABI is '{host_abi}'"
+            ),
             Self::InvalidDependencyReq {
                 mod_name,
                 dependency,
                 raw,
                 source,
                 ..
-            } => {
-                write!(
-                    f,
-                    "mod '{mod_name}' has invalid SemVer requirement '{raw}' for dependency '{dependency}': {source}"
-                )
-            }
+            } => write!(
+                f,
+                "mod '{mod_name}' has invalid SemVer requirement '{raw}' for dependency '{dependency}': {source}"
+            ),
             Self::DuplicateModName {
                 mod_name,
                 first_path,
                 second_path,
-            } => {
-                write!(
-                    f,
-                    "duplicate mod '{mod_name}' declared in '{}' and '{}'",
-                    first_path.display(),
-                    second_path.display()
-                )
-            }
-            Self::MissingLibrary { mod_name, path } => {
-                write!(
-                    f,
-                    "mod '{mod_name}' library not found at '{}'",
-                    path.display()
-                )
-            }
+            } => write!(
+                f,
+                "duplicate mod '{mod_name}' declared in '{}' and '{}'",
+                first_path.display(),
+                second_path.display()
+            ),
+            Self::MissingLibrary { mod_name, path } => write!(
+                f,
+                "mod '{mod_name}' library not found at '{}'",
+                path.display()
+            ),
             Self::MissingDependency {
                 mod_name,
                 dependency,
                 required,
-            } => {
-                write!(
-                    f,
-                    "mod '{mod_name}' is missing required dependency '{dependency}' ({required})"
-                )
-            }
+            } => write!(
+                f,
+                "mod '{mod_name}' is missing required dependency '{dependency}' ({required})"
+            ),
             Self::IncompatibleDependencyVersion {
                 mod_name,
                 dependency,
                 required,
                 found,
-            } => {
-                write!(
-                    f,
-                    "mod '{mod_name}' requires '{dependency}' {required}, found {found}"
-                )
-            }
-            Self::CycleQuarantined { cycle_members } => {
-                write!(
-                    f,
-                    "quarantined cyclic dependency subgraph: {}",
-                    cycle_members.join(", ")
-                )
-            }
+            } => write!(
+                f,
+                "mod '{mod_name}' requires '{dependency}' {required}, found {found}"
+            ),
+            Self::CycleQuarantined { cycle_members } => write!(
+                f,
+                "quarantined cyclic dependency subgraph: {}",
+                cycle_members.join(", ")
+            ),
             Self::LoadFailed {
                 mod_name,
                 path,
                 source,
-            } => {
-                write!(
-                    f,
-                    "failed to load mod '{mod_name}' from '{}': {source}",
-                    path.display()
-                )
-            }
+            } => write!(
+                f,
+                "failed to load mod '{mod_name}' from '{}': {source}",
+                path.display()
+            ),
             Self::ModNotFound { id } => write!(f, "mod {id:?} is not loaded"),
         }
     }

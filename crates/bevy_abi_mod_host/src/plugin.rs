@@ -15,27 +15,28 @@ use crate::budgets::{
     flush_mod_budgets, sync_mod_budget_policy,
 };
 use crate::commands_ext::{PendingModLifecycleOps, flush_pending_mod_lifecycle_ops};
-use crate::mod_dag::ModDependencyGraph;
 use crate::schedule_sets::ModSystemSet;
-use crate::world_ext::{ModUnloadHooks, register_mod_unload_hook_in_world};
+use crate::world_ext::{ensure_world_mod_resources, register_mod_unload_hook_in_world};
 #[cfg(feature = "signature-verification")]
 use bevy_abi_mod_host_sys::ModTrustPolicy;
-use bevy_abi_mod_host_sys::loader::ensure_symbol_tables_in_world;
-use bevy_abi_mod_host_sys::registry::catalog::ensure_relation_graph_in_world;
-use bevy_abi_mod_host_sys::schedule::ModScheduleSetRegistry;
 use bevy_abi_mod_host_sys::{
-    ModErrorPolicy, ModErrorPolicyConfig, ModHost, ModQuarantine, ModRegistry, ModSystemFaulted,
-    PersistentMessageCursors, StartupCompleted, WorldDropGuard, ensure_dynamic_hook_map_in_world,
+    ModErrorPolicy, ModErrorPolicyConfig, ModSystemFaulted, StartupCompleted,
     mark_startup_completed,
 };
 use bevy_app::{App, First, Last, Plugin, PostStartup, Update};
-use bevy_ecs::message::Messages;
+use bevy_ecs::message::{Message, Messages};
 use bevy_ecs::schedule::IntoScheduleConfigs;
 
 pub(crate) fn ensure_startup_tracker(app: &mut App) {
     if !app.world().contains_resource::<StartupCompleted>() {
         app.insert_resource(StartupCompleted(false));
         app.add_systems(PostStartup, mark_startup_completed);
+    }
+}
+
+fn ensure_app_message<M: Message>(app: &mut App) {
+    if !app.world().contains_resource::<Messages<M>>() {
+        app.add_message::<M>();
     }
 }
 
@@ -125,52 +126,24 @@ impl ConfiguredAbiModPlugin {
 
 impl Plugin for ConfiguredAbiModPlugin {
     fn build(&self, app: &mut App) {
-        if !app.world().contains_resource::<WorldDropGuard>() {
-            app.insert_resource(WorldDropGuard::new());
-        }
-        ensure_dynamic_hook_map_in_world(app.world_mut());
-        if !app.world().contains_resource::<PersistentMessageCursors>() {
-            app.insert_resource(PersistentMessageCursors::default());
-        }
-        if !app.world().contains_resource::<ModDependencyGraph>() {
-            app.insert_resource(ModDependencyGraph::new());
-        }
-        if !app.world().contains_resource::<ModRegistry>() {
-            app.insert_resource(ModRegistry::new());
-        }
-        if !app.world().contains_resource::<ModHost>() {
-            app.insert_resource(ModHost::new());
-        }
-        if !app.world().contains_resource::<ModQuarantine>() {
-            app.insert_resource(ModQuarantine::new());
-        }
-        if !app.world().contains_resource::<ModScheduleMap>() {
-            app.insert_resource(ModScheduleMap::new());
-        }
-        if !app.world().contains_resource::<ModVisibleSets>() {
-            app.insert_resource(ModVisibleSets::new());
-        }
-        if !app.world().contains_resource::<ModScheduleSetRegistry>() {
-            app.insert_resource(ModScheduleSetRegistry::new());
-        }
-        if !app.world().contains_resource::<ModUnloadHooks>() {
-            app.insert_resource(ModUnloadHooks::new());
-        }
-        ensure_symbol_tables_in_world(app.world_mut());
-        ensure_relation_graph_in_world(app.world_mut());
+        // Install `App`-level message update systems and `PostStartup` tracker BEFORE
+        // `ensure_world_mod_resources` initializes bare `World` resources.
+        ensure_app_message::<ModBudgetBreach>(app);
+        ensure_app_message::<ModLoaded>(app);
+        ensure_app_message::<ModUnloaded>(app);
+        ensure_app_message::<ModSystemFaulted>(app);
+        ensure_startup_tracker(app);
+
         #[cfg(feature = "signature-verification")]
         if let Some(policy) = &self.trust_policy {
             app.insert_resource(policy.clone());
-        } else if !app.world().contains_resource::<ModTrustPolicy>() {
-            app.insert_resource(ModTrustPolicy::disabled());
         }
         app.insert_resource(ModErrorPolicyConfig(self.error_policy));
         if let Some(policy) = &self.budget_policy {
             app.insert_resource(policy.clone());
         }
-        if !app.world().contains_resource::<Messages<ModBudgetBreach>>() {
-            app.add_message::<ModBudgetBreach>();
-        }
+
+        ensure_world_mod_resources(app.world_mut());
         ensure_budget_resources(app.world_mut());
         register_mod_unload_hook_in_world(
             app.world_mut(),
@@ -189,28 +162,9 @@ impl Plugin for ConfiguredAbiModPlugin {
         }
 
         #[cfg(feature = "diagnostics")]
-        {
-            crate::diagnostics::ensure_diagnostics_resources(app.world_mut());
-            app.add_systems(
-                Last,
-                crate::diagnostics::flush_mod_diagnostics.after(flush_mod_budgets),
-            );
-        }
-
-        ensure_startup_tracker(app);
-
-        if !app.world().contains_resource::<Messages<ModLoaded>>() {
-            app.add_message::<ModLoaded>();
-        }
-        if !app.world().contains_resource::<Messages<ModUnloaded>>() {
-            app.add_message::<ModUnloaded>();
-        }
-        if !app
-            .world()
-            .contains_resource::<Messages<ModSystemFaulted>>()
-        {
-            app.add_message::<ModSystemFaulted>();
-        }
-        crate::world_ext::ensure_hierarchy_registered(app.world_mut());
+        app.add_systems(
+            Last,
+            crate::diagnostics::flush_mod_diagnostics.after(flush_mod_budgets),
+        );
     }
 }
