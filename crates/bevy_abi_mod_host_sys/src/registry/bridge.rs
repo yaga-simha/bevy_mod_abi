@@ -25,10 +25,40 @@ use crate::{
     loader::ModId,
     registry::{
         ComponentCollisionError, EntityEventTriggerFn, InsertDefaultFn, InsertRawFn, ModRegistry,
-        RegisteredComponent, RegistrySnapshot, SymbolRecord, catalog::OwnedFieldStrings,
+        NewComponentBase, RegistrySnapshot, SymbolRecord, catalog::OwnedFieldStrings,
     },
     sync_ptr::SymbolAddress,
 };
+
+struct BridgedEntrySpec<'a> {
+    canonical_name: &'a str,
+    alias: Option<&'a str>,
+    uuid: ComponentUuid,
+    comp_id: ComponentId,
+    size: usize,
+    align: usize,
+    storage_flags: u32,
+    is_abi_pod: bool,
+    vtable_ptr: SymbolAddress,
+    insert_raw_fn: Option<InsertRawFn>,
+    insert_default_fn: Option<InsertDefaultFn>,
+    extract_relationship_targets_fn: Option<ExtractRelationshipTargetsFn>,
+}
+
+/// Bundled specification for atomically remapping a migrated dynamic component handle.
+pub(crate) struct MigratedComponentSpec {
+    pub(crate) handle: BamComponent,
+    pub(crate) new_comp_id: ComponentId,
+    pub(crate) new_uuid: ComponentUuid,
+    pub(crate) new_size: usize,
+    pub(crate) new_align: usize,
+    pub(crate) new_storage_flags: u32,
+    pub(crate) new_schema_fingerprint: u64,
+    pub(crate) new_fields: Arc<[BamFieldDesc]>,
+    pub(crate) new_owned_field_strings: Option<OwnedFieldStrings>,
+    pub(crate) new_vtable_ptr: *const c_void,
+    pub(crate) owner: Option<ModId>,
+}
 
 /// Safe compile-time bridge specification mapping an external `#[repr(Rust)]` Bevy `Component` or
 /// `Resource` `T` to a `#[repr(C)]` `AbiPod` wire type `Self::Wire` via [`MappedWireVTable`].
@@ -254,21 +284,20 @@ impl ModRegistry {
             storage_flags,
             Some(assets_res_id),
         )?;
-        let handle = self.insert_bridged_entry(
+        self.insert_bridged_entry(BridgedEntrySpec {
             canonical_name,
             alias,
             uuid,
-            assets_res_id,
-            0,
-            1,
+            comp_id: assets_res_id,
+            size: 0,
+            align: 1,
             storage_flags,
-            false,
-            SymbolAddress::NULL,
-            None,
-            None,
-            None,
-        );
-        Ok(handle)
+            is_abi_pod: false,
+            vtable_ptr: SymbolAddress::NULL,
+            insert_raw_fn: None,
+            insert_default_fn: None,
+            extract_relationship_targets_fn: None,
+        })
     }
 
     /// Registers an external `#[repr(Rust)]` Bevy [`Component`] `T` bridged via [`HostWireBridge`],
@@ -300,20 +329,20 @@ impl ModRegistry {
         )?;
         let vtable_ref: &'static MappedWireVTable<B::Wire> = &WireVTableFactory::<T, B>::VTABLE;
         let vtable_ptr = SymbolAddress::new(core::ptr::from_ref(vtable_ref).cast::<c_void>());
-        Ok(self.insert_bridged_entry(
-            B::CANONICAL_NAME,
-            B::ALIAS,
+        self.insert_bridged_entry(BridgedEntrySpec {
+            canonical_name: B::CANONICAL_NAME,
+            alias: B::ALIAS,
             uuid,
             comp_id,
             size,
             align,
             storage_flags,
-            false,
+            is_abi_pod: false,
             vtable_ptr,
-            None,
-            with_default,
-            None,
-        ))
+            insert_raw_fn: None,
+            insert_default_fn: with_default,
+            extract_relationship_targets_fn: None,
+        })
     }
 
     /// Helper returning `Some(insert_default_impl)` for `T: Component + Default` in `#![forbid(unsafe_code)]` callers.
@@ -347,20 +376,20 @@ impl ModRegistry {
         )?;
         let vtable_ref: &'static MappedWireVTable<B::Wire> = &WireVTableFactory::<R, B>::VTABLE;
         let vtable_ptr = SymbolAddress::new(core::ptr::from_ref(vtable_ref).cast::<c_void>());
-        Ok(self.insert_bridged_entry(
-            B::CANONICAL_NAME,
-            B::ALIAS,
+        self.insert_bridged_entry(BridgedEntrySpec {
+            canonical_name: B::CANONICAL_NAME,
+            alias: B::ALIAS,
             uuid,
             comp_id,
             size,
             align,
             storage_flags,
-            false,
+            is_abi_pod: false,
             vtable_ptr,
-            None,
-            None,
-            None,
-        ))
+            insert_raw_fn: None,
+            insert_default_fn: None,
+            extract_relationship_targets_fn: None,
+        })
     }
 
     /// Registers an external UTF-8 string Bevy [`Component`] `T` (such as `Name`) bridged via
@@ -391,20 +420,20 @@ impl ModRegistry {
         )?;
         let vtable_ref: &'static MappedStringVTable = &StringVTableFactory::<T, B>::VTABLE;
         let vtable_ptr = SymbolAddress::new(core::ptr::from_ref(vtable_ref).cast::<c_void>());
-        Ok(self.insert_bridged_entry(
-            B::CANONICAL_NAME,
-            B::ALIAS,
+        self.insert_bridged_entry(BridgedEntrySpec {
+            canonical_name: B::CANONICAL_NAME,
+            alias: B::ALIAS,
             uuid,
             comp_id,
             size,
             align,
             storage_flags,
-            false,
+            is_abi_pod: false,
             vtable_ptr,
-            None,
-            with_default,
-            None,
-        ))
+            insert_raw_fn: None,
+            insert_default_fn: with_default,
+            extract_relationship_targets_fn: None,
+        })
     }
 
     /// Registers an entity-only Bevy [`EntityEvent`] `E` implementing `From<Entity>` in `world`
@@ -458,20 +487,20 @@ impl ModRegistry {
             storage_flags,
             Some(comp_id),
         )?;
-        let handle = self.insert_bridged_entry(
+        let handle = self.insert_bridged_entry(BridgedEntrySpec {
             canonical_name,
             alias,
             uuid,
             comp_id,
-            core::mem::size_of::<FfiEntity>(),
-            core::mem::align_of::<FfiEntity>(),
+            size: core::mem::size_of::<FfiEntity>(),
+            align: core::mem::align_of::<FfiEntity>(),
             storage_flags,
-            true,
-            SymbolAddress::NULL,
-            None,
-            None,
-            None,
-        );
+            is_abi_pod: true,
+            vtable_ptr: SymbolAddress::NULL,
+            insert_raw_fn: None,
+            insert_default_fn: None,
+            extract_relationship_targets_fn: None,
+        })?;
         {
             let snap = Arc::make_mut(&mut self.snapshot);
             let idx = (handle.0 - 1) as usize;
@@ -522,7 +551,7 @@ impl ModRegistry {
             storage_flags,
             Some(comp_id),
         )?;
-        Ok(self.insert_bridged_entry(
+        self.insert_bridged_entry(BridgedEntrySpec {
             canonical_name,
             alias,
             uuid,
@@ -530,30 +559,32 @@ impl ModRegistry {
             size,
             align,
             storage_flags,
-            false,
-            SymbolAddress::NULL,
-            None,
-            None,
-            Some(extract_relationship_targets_impl::<RT>),
-        ))
+            is_abi_pod: false,
+            vtable_ptr: SymbolAddress::NULL,
+            insert_raw_fn: None,
+            insert_default_fn: None,
+            extract_relationship_targets_fn: Some(extract_relationship_targets_impl::<RT>),
+        })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn insert_bridged_entry(
         &mut self,
-        canonical_name: &str,
-        alias: Option<&str>,
-        uuid: ComponentUuid,
-        comp_id: ComponentId,
-        size: usize,
-        align: usize,
-        storage_flags: u32,
-        is_abi_pod: bool,
-        vtable_ptr: SymbolAddress,
-        insert_raw_fn: Option<InsertRawFn>,
-        insert_default_fn: Option<InsertDefaultFn>,
-        extract_relationship_targets_fn: Option<ExtractRelationshipTargetsFn>,
-    ) -> BamComponent {
+        spec: BridgedEntrySpec<'_>,
+    ) -> Result<BamComponent, ComponentCollisionError> {
+        let BridgedEntrySpec {
+            canonical_name,
+            alias,
+            uuid,
+            comp_id,
+            size,
+            align,
+            storage_flags,
+            is_abi_pod,
+            vtable_ptr,
+            insert_raw_fn,
+            insert_default_fn,
+            extract_relationship_targets_fn,
+        } = spec;
         let handle = {
             let snap = Arc::make_mut(&mut self.snapshot);
             let handle = if let Some(&existing_handle) = snap.by_name.get(canonical_name) {
@@ -568,48 +599,23 @@ impl ModRegistry {
                 snap.entries[idx].owner = None;
                 existing_handle
             } else {
-                let next_raw = u32::try_from(snap.entries.len() + 1)
-                    .expect("ModRegistry exceeded u32::MAX component handles");
-                let handle = BamComponent::from_raw(next_raw);
-                let arc_name: Arc<str> = Arc::from(canonical_name);
-                let entry = RegisteredComponent {
-                    handle,
-                    name: Arc::clone(&arc_name),
-                    uuid,
-                    component_id: comp_id,
-                    size,
-                    align,
-                    schema_fingerprint: 0,
-                    fields: Arc::from([]),
-                    owned_field_strings: None,
-                    storage_flags,
-                    is_abi_pod,
-                    is_dynamic: false,
-                    vtable_ptr,
-                    insert_raw_fn,
-                    insert_default_fn,
-                    drop_fn: None,
-                    drop_slot: None,
-                    has_on_add_hook: false,
-                    has_on_remove_hook: false,
-                    create_msg_cursor_fn: None,
-                    msg_read_batch_fn: None,
-                    msg_send_fn: None,
-                    msg_write_batch_fn: None,
-                    validates_entity_payload: false,
-                    synthesizes_ffi_entity_payload: false,
-                    event_key: None,
-                    entity_event_trigger_fn: None,
-                    trigger_event_fn: None,
-                    extract_event_target_fn: None,
-                    extract_relationship_targets_fn,
-                    owner: None,
-                };
-                snap.entries.push(entry);
-                snap.by_name.insert(arc_name, handle);
-                snap.by_uuid.insert(uuid, handle);
-                snap.by_component_id.insert(comp_id, handle);
-                handle
+                snap.alloc_handle_and_insert(
+                    NewComponentBase {
+                        name: canonical_name,
+                        uuid,
+                        component_id: comp_id,
+                        size,
+                        align,
+                        storage_flags,
+                        is_abi_pod,
+                    },
+                    |e| {
+                        e.vtable_ptr = vtable_ptr;
+                        e.insert_raw_fn = insert_raw_fn;
+                        e.insert_default_fn = insert_default_fn;
+                        e.extract_relationship_targets_fn = extract_relationship_targets_fn;
+                    },
+                )?
             };
 
             if let Some(short) = alias
@@ -640,7 +646,7 @@ impl ModRegistry {
             handle
         };
         self.publish_after_mutation();
-        handle
+        Ok(handle)
     }
 
     /// Attaches the internal world-table directory token (`world_id`) to this registry's snapshot
@@ -668,21 +674,23 @@ impl ModRegistry {
     /// Atomically remaps an existing dynamic [`BamComponent`] handle to a freshly migrated Bevy
     /// [`ComponentId`], layout `(size, align, storage_flags)`, `schema_fingerprint`, and retained
     /// `BamFieldDesc` reflection metadata, publishing a new CoW [`RegistrySnapshot`].
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn remap_migrated_component(
         &mut self,
-        handle: BamComponent,
-        new_comp_id: ComponentId,
-        new_uuid: ComponentUuid,
-        new_size: usize,
-        new_align: usize,
-        new_storage_flags: u32,
-        new_schema_fingerprint: u64,
-        new_fields: Arc<[BamFieldDesc]>,
-        new_owned_field_strings: Option<OwnedFieldStrings>,
-        new_vtable_ptr: *const c_void,
-        owner: Option<ModId>,
+        spec: MigratedComponentSpec,
     ) -> Result<(), ComponentCollisionError> {
+        let MigratedComponentSpec {
+            handle,
+            new_comp_id,
+            new_uuid,
+            new_size,
+            new_align,
+            new_storage_flags,
+            new_schema_fingerprint,
+            new_fields,
+            new_owned_field_strings,
+            new_vtable_ptr,
+            owner,
+        } = spec;
         let Some(existing) = self.snapshot.get_by_handle(handle) else {
             return Err(ComponentCollisionError::MetadataMismatch {
                 name: format!("BamComponent({})", handle.0),

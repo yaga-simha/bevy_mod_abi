@@ -3,16 +3,14 @@
 //! and rollback, entity relationships, symbol interning, named object binding, ancestor cascades,
 //! read-only parallel chunk iteration, schedule sets, and live component column migration.
 
-use crate::ffi::commands::HostCommands;
-use crate::ffi::iter::HostIter;
 use crate::ffi::register::{register_system_inner, validate_active_load_ctx};
 use crate::handle_header::{
-    COMMANDS_MAGIC, HOST_CTX_MAGIC, HostContext, ITER_MAGIC, validate_handle_mut,
-    validate_handle_ref,
+    decode_live_entity, ffi_try, validate_commands_mut, validate_host_ctx, validate_iter_mut,
+    validate_non_empty_cstr,
 };
 use crate::loader::ModHost;
 use crate::schedule::{
-    ModNamedSystemSet, ModScheduleSetRegistry, ScheduleSetMode,
+    ModNamedSystemSet, ModScheduleSetRegistry, ScheduleSetConfig, ScheduleSetMode,
     ensure_mod_schedule_set_pass_if_schedules_present, resolve_schedule_id_in_world,
 };
 use crate::system::error_policy::record_active_guest_fault;
@@ -23,8 +21,7 @@ use bevy_abi_mod_sys::{
     BamRowMigrateFn, BamScheduleSetDesc, BamSymbol, BamSystem, BamSystemDesc, BamSystemSet,
     ComponentDesc, ComponentUuid, FfiEntity, FfiResult, ScheduleId, StrView, read_descriptor,
 };
-use bevy_ecs::entity::Entity;
-use core::ffi::{CStr, c_char, c_void};
+use core::ffi::c_void;
 use core::ptr::null;
 use std::sync::Arc;
 
@@ -45,39 +42,21 @@ unsafe fn validate_non_empty_str_view<'a>(view: StrView) -> Result<&'a str, FfiR
 }
 
 #[inline]
-unsafe fn validate_non_empty_cstr<'a>(ptr: *const c_char) -> Result<&'a str, FfiResult> {
-    if ptr.is_null() {
-        return Err(FfiResult::NULL_POINTER);
+unsafe fn read_set_handles(ptr: *const BamSystemSet, count: u32) -> Vec<BamSystemSet> {
+    let n = count as usize;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        // SAFETY: Caller verified `ptr` is non-null when `count > 0` and holds `count` readable handles.
+        out.push(unsafe { core::ptr::read_unaligned(ptr.add(i)) });
     }
-    // SAFETY: Caller guarantees `ptr` points to a valid NUL-terminated C string.
-    let s = unsafe { CStr::from_ptr(ptr) }
-        .to_str()
-        .map_err(|_| FfiResult::INVALID_UTF8)?;
-    if s.is_empty() {
-        return Err(FfiResult::INVALID_ARGUMENT);
-    }
-    Ok(s)
-}
-
-#[inline]
-fn validate_non_null_entity(entity: FfiEntity) -> Result<Entity, FfiResult> {
-    if entity.is_null() {
-        return Err(FfiResult::INVALID_ENTITY);
-    }
-    let Some(e) = Entity::try_from_bits(entity.to_bits()) else {
-        return Err(FfiResult::INVALID_ENTITY);
-    };
-    if e == Entity::PLACEHOLDER {
-        return Err(FfiResult::INVALID_ENTITY);
-    }
-    Ok(e)
+    out
 }
 
 /// Emits a structured guest diagnostic message via the host's `tracing` subscriber (`BAM_LOG_*`)
 /// without clobbering `last_error`.
 ///
 /// # Safety
-/// - `ctx` must point to an active [`HostContext`] cast to [`BamHostCtx`], or null.
+/// - `ctx` must point to an active [`crate::HostContext`] cast to [`BamHostCtx`], or null.
 /// - When `message.len > 0`, `message.ptr` must point to `message.len` initialized readable bytes.
 pub unsafe extern "C" fn host_log_diagnostic(
     ctx: *const BamHostCtx,
@@ -85,18 +64,9 @@ pub unsafe extern "C" fn host_log_diagnostic(
     message: StrView,
 ) -> FfiResult {
     // SAFETY: Unconditionally validates `ctx` against `HOST_CTX_MAGIC`.
-    let host_ctx = match unsafe {
-        validate_handle_ref::<HostContext>(ctx.cast::<c_void>(), HOST_CTX_MAGIC, true)
-    } {
-        Ok(c) => c,
-        Err(err) => return err,
-    };
-
+    let host_ctx = ffi_try!(unsafe { validate_host_ctx(ctx) });
     // SAFETY: Caller guarantees `message.ptr` references `message.len` readable bytes when `len > 0`.
-    let Ok(msg) = (unsafe { validate_str_view(message) }) else {
-        // SAFETY: Re-evaluate to return exact error code (`NULL_POINTER`, `INVALID_ARGUMENT`, `INVALID_UTF8`).
-        return unsafe { validate_str_view(message) }.unwrap_err();
-    };
+    let msg = ffi_try!(unsafe { validate_str_view(message) });
 
     let ns = host_ctx.default_namespace().unwrap_or("<host>");
     match level {
@@ -126,25 +96,16 @@ pub unsafe extern "C" fn host_log_diagnostic(
 /// `FallbackErrorHandler`), and emits a structured `tracing::error!` event.
 ///
 /// # Safety
-/// - `ctx` must point to an active [`HostContext`] cast to [`BamHostCtx`], or null.
+/// - `ctx` must point to an active [`crate::HostContext`] cast to [`BamHostCtx`], or null.
 /// - When `message.len > 0`, `message.ptr` must point to `message.len` initialized readable bytes.
 pub unsafe extern "C" fn host_report_guest_fault(
     ctx: *const BamHostCtx,
     message: StrView,
 ) -> FfiResult {
     // SAFETY: Unconditionally validates `ctx` against `HOST_CTX_MAGIC`.
-    let host_ctx = match unsafe {
-        validate_handle_ref::<HostContext>(ctx.cast::<c_void>(), HOST_CTX_MAGIC, true)
-    } {
-        Ok(c) => c,
-        Err(err) => return err,
-    };
-
+    let host_ctx = ffi_try!(unsafe { validate_host_ctx(ctx) });
     // SAFETY: Caller guarantees `message.ptr` references `message.len` readable bytes when `len > 0`.
-    let msg = match unsafe { validate_str_view(message) } {
-        Ok(s) => s,
-        Err(err) => return err,
-    };
+    let msg = ffi_try!(unsafe { validate_str_view(message) });
 
     host_ctx.set_last_error(msg);
     let ns = host_ctx.default_namespace().unwrap_or("<host>");
@@ -167,7 +128,7 @@ pub unsafe extern "C" fn host_report_guest_fault(
 /// Resolves an existing registered component or resource handle by its deterministic 128-bit UUID.
 ///
 /// # Safety
-/// - `ctx` must point to an active [`HostContext`] cast to [`BamHostCtx`], or null.
+/// - `ctx` must point to an active [`crate::HostContext`] cast to [`BamHostCtx`], or null.
 /// - `uuid` must point to a readable [`ComponentUuid`], or null.
 /// - `out_component` must point to writable [`BamComponent`] storage, or null.
 pub unsafe extern "C" fn host_resolve_component_by_uuid(
@@ -179,12 +140,7 @@ pub unsafe extern "C" fn host_resolve_component_by_uuid(
         return FfiResult::NULL_POINTER;
     }
     // SAFETY: Unconditionally validates `ctx` against `HOST_CTX_MAGIC`.
-    let host_ctx = match unsafe {
-        validate_handle_ref::<HostContext>(ctx.cast::<c_void>(), HOST_CTX_MAGIC, true)
-    } {
-        Ok(c) => c,
-        Err(err) => return err,
-    };
+    let host_ctx = ffi_try!(unsafe { validate_host_ctx(ctx) });
     if uuid.is_null() {
         host_ctx.set_last_error("resolve_component_by_uuid requires a non-null `uuid` pointer");
         return FfiResult::NULL_POINTER;
@@ -210,7 +166,7 @@ pub unsafe extern "C" fn host_resolve_component_by_uuid(
 /// `BamFieldDesc` slice) for a registered [`BamComponent`] handle.
 ///
 /// # Safety
-/// - `ctx` must point to an active [`HostContext`] cast to [`BamHostCtx`], or null.
+/// - `ctx` must point to an active [`crate::HostContext`] cast to [`BamHostCtx`], or null.
 /// - `out_info` must point to writable [`BamLayoutInfo`] storage, or null.
 pub unsafe extern "C" fn host_component_layout_info(
     ctx: *const BamHostCtx,
@@ -221,12 +177,7 @@ pub unsafe extern "C" fn host_component_layout_info(
         return FfiResult::NULL_POINTER;
     }
     // SAFETY: Unconditionally validates `ctx` against `HOST_CTX_MAGIC`.
-    let host_ctx = match unsafe {
-        validate_handle_ref::<HostContext>(ctx.cast::<c_void>(), HOST_CTX_MAGIC, true)
-    } {
-        Ok(c) => c,
-        Err(err) => return err,
-    };
+    let host_ctx = ffi_try!(unsafe { validate_host_ctx(ctx) });
 
     let Some(entry) = host_ctx.snapshot().get_by_handle(component) else {
         host_ctx.set_last_error(format!(
@@ -257,22 +208,17 @@ pub unsafe extern "C" fn host_component_layout_info(
     FfiResult::OK
 }
 
-/// Counts all entities matching an active [`HostIter`] without mutating or advancing cursor state.
+/// Counts all entities matching an active [`crate::ffi::iter::HostIter`] without mutating or advancing cursor state.
 ///
 /// # Safety
-/// - `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
+/// - `iter` must point to an active [`crate::ffi::iter::HostIter`] cast to [`BamIter`], or null.
 /// - `out_count` must point to writable `usize` storage, or null.
 pub unsafe extern "C" fn host_iter_count(iter: *mut BamIter, out_count: *mut usize) -> FfiResult {
     if out_count.is_null() {
         return FfiResult::NULL_POINTER;
     }
     // SAFETY: Validating `iter` against `ITER_MAGIC` under `STRICT_FFI_CHECKS`.
-    let host_iter = match unsafe {
-        validate_handle_mut::<HostIter<'_>>(iter.cast::<c_void>(), ITER_MAGIC, false)
-    } {
-        Ok(it) => it,
-        Err(err) => return err,
-    };
+    let host_iter = ffi_try!(unsafe { validate_iter_mut(iter) });
 
     let count = host_iter.count_matching();
     // SAFETY: `out_count` was checked non-null and caller guarantees writable `usize` storage.
@@ -297,22 +243,18 @@ pub unsafe extern "C" fn host_register_system_handle(
         return FfiResult::NULL_POINTER;
     }
     // SAFETY: Caller upholds `load_ctx` and `desc_ptr` FFI contract.
-    match unsafe { register_system_inner(load_ctx, desc_ptr) } {
-        Ok(handle) => {
-            // SAFETY: `out_system` was checked non-null and caller guarantees writable `BamSystem` storage.
-            unsafe {
-                *out_system = handle;
-            }
-            FfiResult::OK
-        }
-        Err(err) => err,
+    let handle = ffi_try!(unsafe { register_system_inner(load_ctx, desc_ptr) });
+    // SAFETY: `out_system` was checked non-null and caller guarantees writable `BamSystem` storage.
+    unsafe {
+        *out_system = handle;
     }
+    FfiResult::OK
 }
 
-/// Captures an opaque checkpoint token from the active [`HostCommands`] queue.
+/// Captures an opaque checkpoint token from the active [`crate::ffi::commands::HostCommands`] queue.
 ///
 /// # Safety
-/// - `commands` must point to an active [`HostCommands`] cast to [`BamCommands`], or null.
+/// - `commands` must point to an active [`crate::ffi::commands::HostCommands`] cast to [`BamCommands`], or null.
 /// - `out_checkpoint` must point to writable `usize` storage, or null.
 pub unsafe extern "C" fn host_cmd_checkpoint(
     commands: *mut BamCommands,
@@ -322,17 +264,10 @@ pub unsafe extern "C" fn host_cmd_checkpoint(
         return FfiResult::NULL_POINTER;
     }
     // SAFETY: Validating `commands` against `COMMANDS_MAGIC` under `STRICT_FFI_CHECKS`.
-    let cmds = match unsafe {
-        validate_handle_mut::<HostCommands<'_>>(commands.cast::<c_void>(), COMMANDS_MAGIC, false)
-    } {
-        Ok(c) => c,
-        Err(err) => return err,
-    };
-
-    let token = cmds.checkpoint();
+    let cmds = ffi_try!(unsafe { validate_commands_mut(commands) });
     // SAFETY: `out_checkpoint` was checked non-null and caller guarantees writable `usize` storage.
     unsafe {
-        *out_checkpoint = token;
+        *out_checkpoint = cmds.checkpoint();
     }
     FfiResult::OK
 }
@@ -341,18 +276,13 @@ pub unsafe extern "C" fn host_cmd_checkpoint(
 /// destructors for uncommitted dynamic component payloads.
 ///
 /// # Safety
-/// `commands` must point to an active [`HostCommands`] cast to [`BamCommands`], or null.
+/// `commands` must point to an active [`crate::ffi::commands::HostCommands`] cast to [`BamCommands`], or null.
 pub unsafe extern "C" fn host_cmd_rollback(
     commands: *mut BamCommands,
     checkpoint: usize,
 ) -> FfiResult {
     // SAFETY: Validating `commands` against `COMMANDS_MAGIC` under `STRICT_FFI_CHECKS`.
-    let cmds = match unsafe {
-        validate_handle_mut::<HostCommands<'_>>(commands.cast::<c_void>(), COMMANDS_MAGIC, false)
-    } {
-        Ok(c) => c,
-        Err(err) => return err,
-    };
+    let cmds = ffi_try!(unsafe { validate_commands_mut(commands) });
     cmds.rollback_to_checkpoint(checkpoint)
 }
 
@@ -376,7 +306,7 @@ pub unsafe extern "C" fn host_register_relation(
 /// writing its stable [`BamSymbol`] handle (`BamSymbol(0)`, `BamSymbol(1)`, ...) into `*out_symbol`.
 ///
 /// # Safety
-/// - `ctx` must point to an active [`HostContext`] cast to [`BamHostCtx`], or null.
+/// - `ctx` must point to an active [`crate::HostContext`] cast to [`BamHostCtx`], or null.
 /// - When `symbol.len > 0`, `symbol.ptr` must point to `symbol.len` readable bytes.
 /// - `out_symbol` must point to writable [`BamSymbol`] storage, or null.
 pub unsafe extern "C" fn host_intern_symbol(
@@ -388,12 +318,7 @@ pub unsafe extern "C" fn host_intern_symbol(
         return FfiResult::NULL_POINTER;
     }
     // SAFETY: Unconditionally validates `ctx` against `HOST_CTX_MAGIC`.
-    let host_ctx = match unsafe {
-        validate_handle_ref::<HostContext>(ctx.cast::<c_void>(), HOST_CTX_MAGIC, true)
-    } {
-        Ok(c) => c,
-        Err(err) => return err,
-    };
+    let host_ctx = ffi_try!(unsafe { validate_host_ctx(ctx) });
     // SAFETY: Caller guarantees `symbol.ptr` references `symbol.len` readable bytes when `len > 0`.
     let sym_str = match unsafe { validate_non_empty_str_view(symbol) } {
         Ok(s) => s,
@@ -402,16 +327,14 @@ pub unsafe extern "C" fn host_intern_symbol(
             return err;
         }
     };
-    match crate::loader::symbols::intern_symbol_for_host_ctx(host_ctx, sym_str) {
-        Ok(handle) => {
-            // SAFETY: `out_symbol` was checked non-null and caller guarantees writable `BamSymbol`.
-            unsafe {
-                *out_symbol = handle;
-            }
-            FfiResult::OK
-        }
-        Err(err) => err,
+    let handle = ffi_try!(crate::loader::symbols::intern_symbol_for_host_ctx(
+        host_ctx, sym_str
+    ));
+    // SAFETY: `out_symbol` was checked non-null and caller guarantees writable `BamSymbol`.
+    unsafe {
+        *out_symbol = handle;
     }
+    FfiResult::OK
 }
 
 /// Binds or rebinds a canonical UTF-8 object/prefab `name` (and its deterministic 128-bit UUID
@@ -422,7 +345,7 @@ pub unsafe extern "C" fn host_intern_symbol(
 /// [`FfiResult::INVALID_ENTITY`].
 ///
 /// # Safety
-/// - `ctx` must point to an active [`HostContext`] cast to [`BamHostCtx`], or null.
+/// - `ctx` must point to an active [`crate::HostContext`] cast to [`BamHostCtx`], or null.
 /// - When `name.len > 0`, `name.ptr` must point to `name.len` readable bytes.
 pub unsafe extern "C" fn host_bind_named_object(
     ctx: *const BamHostCtx,
@@ -430,12 +353,7 @@ pub unsafe extern "C" fn host_bind_named_object(
     entity: FfiEntity,
 ) -> FfiResult {
     // SAFETY: Unconditionally validates `ctx` against `HOST_CTX_MAGIC`.
-    let host_ctx = match unsafe {
-        validate_handle_ref::<HostContext>(ctx.cast::<c_void>(), HOST_CTX_MAGIC, true)
-    } {
-        Ok(c) => c,
-        Err(err) => return err,
-    };
+    let host_ctx = ffi_try!(unsafe { validate_host_ctx(ctx) });
     // SAFETY: Caller guarantees `name.ptr` references `name.len` readable bytes when `len > 0`.
     let name_str = match unsafe { validate_non_empty_str_view(name) } {
         Ok(s) => s,
@@ -446,7 +364,7 @@ pub unsafe extern "C" fn host_bind_named_object(
             return err;
         }
     };
-    let bevy_entity = match validate_non_null_entity(entity) {
+    let bevy_entity = match decode_live_entity(entity) {
         Ok(e) => e,
         Err(err) => {
             host_ctx.set_last_error("bind_named_object requires a valid non-null entity");
@@ -468,7 +386,7 @@ pub unsafe extern "C" fn host_bind_named_object(
 /// `*out_owner` and returns [`FfiResult::NOT_FOUND`].
 ///
 /// # Safety
-/// - `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
+/// - `iter` must point to an active [`crate::ffi::iter::HostIter`] cast to [`BamIter`], or null.
 /// - `out_ptr` must point to aligned writable `*const c_void` storage, or null.
 /// - `out_owner` must point to aligned writable [`FfiEntity`] storage, or null.
 pub unsafe extern "C" fn host_iter_up_cascade(
@@ -494,7 +412,7 @@ pub unsafe extern "C" fn host_iter_up_cascade(
 /// sub-ranges with zero per-worker command-arena allocations.
 ///
 /// # Safety
-/// - `iter` must point to an active [`HostIter`] cast to [`BamIter`], or null.
+/// - `iter` must point to an active [`crate::ffi::iter::HostIter`] cast to [`BamIter`], or null.
 /// - If `chunk_fn` is `Some`, it must uphold [`BamChunkTaskFn`]'s thread-safety and nounwind
 ///   safety contract.
 pub unsafe extern "C" fn host_par_for_each_chunk_readonly(
@@ -525,10 +443,7 @@ pub unsafe extern "C" fn host_configure_schedule_set(
         return FfiResult::NULL_POINTER;
     }
     // SAFETY: Validates active `LoadContext` header and `in_init` state.
-    let ctx = match unsafe { validate_active_load_ctx(load_ctx) } {
-        Ok(c) => c,
-        Err(err) => return err,
-    };
+    let ctx = ffi_try!(unsafe { validate_active_load_ctx(load_ctx) });
     // SAFETY: `read_descriptor` checks null and `struct_size >= BamScheduleSetDesc::MIN_V0_3_SIZE`.
     let desc = match unsafe { read_descriptor::<BamScheduleSetDesc>(desc_ptr.cast::<c_void>()) } {
         Ok(d) => d,
@@ -574,21 +489,11 @@ pub unsafe extern "C" fn host_configure_schedule_set(
         return FfiResult::INVALID_STATE;
     }
 
-    let mut before_sets = Vec::with_capacity(desc.before_count as usize);
-    for i in 0..(desc.before_count as usize) {
-        // SAFETY: `desc.validate()` verified `!desc.before_sets.is_null()` when `before_count > 0`,
-        // and caller guarantees `before_count` readable `BamSystemSet` elements.
-        let handle = unsafe { core::ptr::read_unaligned(desc.before_sets.add(i)) };
-        before_sets.push(handle);
-    }
-
-    let mut after_sets = Vec::with_capacity(desc.after_count as usize);
-    for i in 0..(desc.after_count as usize) {
-        // SAFETY: `desc.validate()` verified `!desc.after_sets.is_null()` when `after_count > 0`,
-        // and caller guarantees `after_count` readable `BamSystemSet` elements.
-        let handle = unsafe { core::ptr::read_unaligned(desc.after_sets.add(i)) };
-        after_sets.push(handle);
-    }
+    // SAFETY: `desc.validate()` verified non-null pointers when counts > 0, and caller guarantees
+    // `before_count` / `after_count` readable `BamSystemSet` handles.
+    let before_sets = unsafe { read_set_handles(desc.before_sets, desc.before_count) };
+    // SAFETY: Same as above for `after_sets`.
+    let after_sets = unsafe { read_set_handles(desc.after_sets, desc.after_count) };
 
     // SAFETY: `ctx.world_ptr` was checked non-null and references the exclusively borrowed
     // `&mut World` for the duration of `bevy_abi_mod_init`.
@@ -606,27 +511,21 @@ pub unsafe extern "C" fn host_configure_schedule_set(
         .get_resource::<ModHost>()
         .map(|h| h.mod_generation(parsed.mod_name.as_ref()))
         .unwrap_or(0);
-    let mode = ScheduleSetMode::from_abi_flags(desc.flags);
-    let before_weak = (desc.flags & BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK) != 0;
-    let after_weak = (desc.flags & BAM_SCHEDULE_SET_FLAG_AFTER_WEAK) != 0;
-
-    if !world.contains_resource::<ModScheduleSetRegistry>() {
-        world.insert_resource(ModScheduleSetRegistry::new());
-    }
+    world.init_resource::<ModScheduleSetRegistry>();
     let handle = match world
         .resource_mut::<ModScheduleSetRegistry>()
-        .configure_set(
-            ctx.mod_id,
-            parsed.mod_name,
-            parsed.system_name,
+        .configure_set(ScheduleSetConfig {
+            mod_id: ctx.mod_id,
+            mod_name: parsed.mod_name,
+            set_name: parsed.system_name,
             generation,
-            desc.schedule,
-            mode,
+            schedule: desc.schedule,
+            mode: ScheduleSetMode::from_abi_flags(desc.flags),
             before_sets,
             after_sets,
-            before_weak,
-            after_weak,
-        ) {
+            before_weak: (desc.flags & BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK) != 0,
+            after_weak: (desc.flags & BAM_SCHEDULE_SET_FLAG_AFTER_WEAK) != 0,
+        }) {
         Ok(h) => h,
         Err((err, msg)) => {
             ctx.host_ctx.set_last_error(msg);
@@ -657,10 +556,7 @@ pub unsafe extern "C" fn host_mount_system_in_schedule(
     set: BamSystemSet,
 ) -> FfiResult {
     // SAFETY: Validates active `LoadContext` header and `in_init` state.
-    let ctx = match unsafe { validate_active_load_ctx(load_ctx) } {
-        Ok(c) => c,
-        Err(err) => return err,
-    };
+    let ctx = ffi_try!(unsafe { validate_active_load_ctx(load_ctx) });
     if !system.is_valid()
         || system.to_raw() == 0
         || (system.to_raw() as usize) > ctx.registered_systems.len()
@@ -683,6 +579,15 @@ pub unsafe extern "C" fn host_mount_system_in_schedule(
         );
         return FfiResult::INVALID_STATE;
     }
+
+    let apply_schedule = |sys: &mut crate::GuestSystem, manifest_name: &Option<Arc<str>>| {
+        sys.set_schedule(schedule);
+        if let Some(ns) = manifest_name.as_ref()
+            && sys.mod_namespace().is_none()
+        {
+            sys.set_mod_namespace(Some(Arc::clone(ns)));
+        }
+    };
 
     if !ctx.world_ptr.is_null() {
         // SAFETY: `ctx.world_ptr` was checked non-null and references the exclusively borrowed
@@ -719,14 +624,10 @@ pub unsafe extern "C" fn host_mount_system_in_schedule(
 
         // Pre-validate `set` before mutating `sys` or prior mounts so failures leave state intact.
         if set.is_valid() {
-            let Some(reg) = world.get_resource::<ModScheduleSetRegistry>() else {
-                ctx.host_ctx.set_last_error(format!(
-                    "mount_system_in_schedule set handle {} is not registered",
-                    set.0
-                ));
-                return FfiResult::NOT_FOUND;
-            };
-            let Some(entry) = reg.get(set) else {
+            let Some(entry) = world
+                .get_resource::<ModScheduleSetRegistry>()
+                .and_then(|reg| reg.get(set))
+            else {
                 ctx.host_ctx.set_last_error(format!(
                     "mount_system_in_schedule set handle {} is not registered",
                     set.0
@@ -759,12 +660,7 @@ pub unsafe extern "C" fn host_mount_system_in_schedule(
         }
 
         let sys = &mut ctx.registered_systems[sys_idx];
-        sys.set_schedule(schedule);
-        if let Some(ns) = ctx.manifest_name.as_ref()
-            && sys.mod_namespace().is_none()
-        {
-            sys.set_mod_namespace(Some(Arc::clone(ns)));
-        }
+        apply_schedule(sys, &ctx.manifest_name);
 
         if set.is_valid() {
             let canonical_set_name = match world
@@ -784,20 +680,14 @@ pub unsafe extern "C" fn host_mount_system_in_schedule(
         return FfiResult::OK;
     }
 
-    let sys = &mut ctx.registered_systems[sys_idx];
-    sys.set_schedule(schedule);
-    if let Some(ns) = ctx.manifest_name.as_ref()
-        && sys.mod_namespace().is_none()
-    {
-        sys.set_mod_namespace(Some(Arc::clone(ns)));
-    }
+    apply_schedule(&mut ctx.registered_systems[sys_idx], &ctx.manifest_name);
     FfiResult::OK
 }
 
 /// Enqueues deferred insertion of a typed entity relationship edge `(entity --relation--> target)`.
 ///
 /// # Safety
-/// - `commands` must point to an active [`HostCommands`] cast to [`BamCommands`], or null.
+/// - `commands` must point to an active [`crate::HostCommands`] cast to [`BamCommands`], or null.
 /// - When `data_size > 0`, `data` must point to at least `data_size` initialized readable bytes.
 pub unsafe extern "C" fn host_cmd_insert_relation(
     commands: *mut BamCommands,
@@ -818,7 +708,7 @@ pub unsafe extern "C" fn host_cmd_insert_relation(
 /// Enqueues deferred removal of a typed entity relationship edge `(entity --relation--> target)`.
 ///
 /// # Safety
-/// `commands` must point to an active [`HostCommands`] cast to [`BamCommands`], or null.
+/// `commands` must point to an active [`crate::HostCommands`] cast to [`BamCommands`], or null.
 pub unsafe extern "C" fn host_cmd_remove_relation(
     commands: *mut BamCommands,
     entity: FfiEntity,
@@ -846,10 +736,7 @@ pub unsafe extern "C" fn host_migrate_component_column(
     user_data: *mut c_void,
 ) -> FfiResult {
     // SAFETY: Validates active `LoadContext` header and `in_init` state.
-    let ctx = match unsafe { validate_active_load_ctx(load_ctx) } {
-        Ok(c) => c,
-        Err(err) => return err,
-    };
+    let ctx = ffi_try!(unsafe { validate_active_load_ctx(load_ctx) });
     if !component.is_valid() || ctx.registry.snapshot().get_by_handle(component).is_none() {
         ctx.host_ctx.set_last_error(format!(
             "migrate_component_column component handle {} is not registered",
@@ -894,1207 +781,5 @@ pub unsafe extern "C" fn host_migrate_component_column(
 /// Retains a single place checking the `host_cmd_*` imports used in unit tests cleanly while
 /// enforcing `host_cmd_insert` and `host_cmd_spawn_empty` integration paths.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ffi::commands::{
-        HostCommandsStorage, host_cmd_insert, host_cmd_spawn, host_cmd_spawn_empty,
-    };
-    use crate::ffi::iter::{QueryPlan, QueryTermMeta, host_iter_next_chunk};
-    use crate::ffi::register::{LoadContext, host_register_component};
-    use crate::loader::ModId;
-    use crate::registry::{ComponentOptions, ModRegistry};
-    use bevy_abi_mod_macros::ModComponent;
-    use bevy_abi_mod_sys::{AccessMode, BamFieldDesc, BamFieldKind, FfiBool, ModComponent as _};
-    use bevy_ecs::change_detection::Tick;
-    use bevy_ecs::prelude::Component;
-    use bevy_ecs::world::World;
-    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::Arc;
-
-    #[repr(C)]
-    #[derive(Component, Clone, Copy, Default, Debug, PartialEq, ModComponent)]
-    #[mod_component(name = "v03_test::Stats")]
-    struct TestStats {
-        hp: i32,
-        speed: f32,
-    }
-
-    #[test]
-    fn diagnostics_uuid_and_layout_introspection_work() {
-        let mut world = World::new();
-        let comp_id = world.register_component::<TestStats>();
-        let mut registry = ModRegistry::new();
-        let stats_handle = registry
-            .register_component::<TestStats>(comp_id, ComponentOptions::default())
-            .expect("register TestStats");
-        let snap = registry.snapshot_arc();
-        let host_ctx = HostContext::new(snap).with_namespace(Some(Arc::from("v03_test")));
-
-        // SAFETY: `host_ctx` and local output buffers are valid and aligned for every FFI call below.
-        unsafe {
-            // 1. `log_diagnostic` must emit without overwriting `last_error`.
-            host_ctx.set_last_error("prior error");
-            let ok_res = host_log_diagnostic(
-                host_ctx.as_ffi_ptr(),
-                BAM_LOG_INFO,
-                StrView::from_str("hello from guest"),
-            );
-            assert_eq!(ok_res, FfiResult::OK);
-            assert_eq!(host_ctx.last_error_message(), "prior error");
-            assert_eq!(
-                host_log_diagnostic(host_ctx.as_ffi_ptr(), 99, StrView::from_str("bad level")),
-                FfiResult::INVALID_ARGUMENT
-            );
-
-            // 2. `report_guest_fault` records into `last_error`.
-            assert_eq!(
-                host_report_guest_fault(host_ctx.as_ffi_ptr(), StrView::from_str("boom fault")),
-                FfiResult::OK
-            );
-            assert_eq!(host_ctx.last_error_message(), "boom fault");
-
-            // 3. `resolve_component_by_uuid`
-            let mut resolved = BamComponent::INVALID;
-            let uuid = TestStats::UUID;
-            assert_eq!(
-                host_resolve_component_by_uuid(host_ctx.as_ffi_ptr(), &uuid, &raw mut resolved),
-                FfiResult::OK
-            );
-            assert_eq!(resolved, stats_handle);
-
-            let missing_uuid = ComponentUuid::from_canonical_name("v03_test::DoesNotExist");
-            assert_eq!(
-                host_resolve_component_by_uuid(
-                    host_ctx.as_ffi_ptr(),
-                    &missing_uuid,
-                    &raw mut resolved,
-                ),
-                FfiResult::NOT_FOUND
-            );
-
-            // 4. `component_layout_info` for static host `#[derive(ModComponent)]`
-            let mut layout = BamLayoutInfo::empty();
-            assert_eq!(
-                host_component_layout_info(host_ctx.as_ffi_ptr(), stats_handle, &raw mut layout),
-                FfiResult::OK
-            );
-            assert_eq!(layout.uuid, TestStats::UUID);
-            assert_eq!(layout.schema_fingerprint, TestStats::SCHEMA_FINGERPRINT);
-            assert_eq!(layout.size, core::mem::size_of::<TestStats>());
-            assert_eq!(layout.align, core::mem::align_of::<TestStats>());
-            assert_eq!(layout.field_count, 2);
-            let fields_slice = core::slice::from_raw_parts(layout.fields, layout.field_count);
-            assert_eq!(fields_slice[0].name.as_str().unwrap(), "hp");
-            assert_eq!(fields_slice[0].kind, BamFieldKind::I32);
-            assert_eq!(fields_slice[1].name.as_str().unwrap(), "speed");
-            assert_eq!(fields_slice[1].kind, BamFieldKind::F32);
-
-            // 5. Dynamic component with owned copied `BamFieldDesc` survives source buffer drop
-            let mut load_ctx = LoadContext::with_manifest_name(
-                registry,
-                Arc::new(AtomicBool::new(true)),
-                (&raw mut world).cast::<World>(),
-                Some(ModId(3)),
-                Some(Arc::from("dyn_mod")),
-            );
-            let dyn_handle = {
-                let local_name = String::from("mana");
-                let local_tag = String::from("f32");
-                let local_fields = [BamFieldDesc::new(
-                    BamFieldKind::F32,
-                    StrView::from_str(&local_name),
-                    StrView::from_str(&local_tag),
-                    0,
-                    4,
-                    4,
-                )];
-                let desc = ComponentDesc::new(
-                    c"DynMana".as_ptr(),
-                    ComponentUuid::from_parts("dyn_mod::DynMana", 4, 4, 0),
-                    4,
-                    4,
-                )
-                .with_schema_fingerprint(0xDEAD_BEEF_CAFE_BABEu64)
-                .with_fields(local_fields.as_ptr(), local_fields.len());
-                let mut out = BamComponent::INVALID;
-                assert_eq!(
-                    host_register_component(load_ctx.as_ffi_ptr(), &desc, &raw mut out),
-                    FfiResult::OK
-                );
-                out
-            };
-            let mut dyn_layout = BamLayoutInfo::empty();
-            assert_eq!(
-                host_component_layout_info(
-                    load_ctx.host_ctx.as_ffi_ptr(),
-                    dyn_handle,
-                    &raw mut dyn_layout,
-                ),
-                FfiResult::OK
-            );
-            assert_eq!(dyn_layout.schema_fingerprint, 0xDEAD_BEEF_CAFE_BABEu64);
-            assert_eq!(dyn_layout.field_count, 1);
-            let dyn_fields = core::slice::from_raw_parts(dyn_layout.fields, dyn_layout.field_count);
-            assert_eq!(dyn_fields[0].name.as_str().unwrap(), "mana");
-            assert_eq!(dyn_fields[0].type_tag.as_str().unwrap(), "f32");
-            load_ctx.finish_init();
-        }
-    }
-
-    #[test]
-    fn iter_count_and_register_system_handle_work() {
-        let mut world = World::new();
-        let comp_id = world.register_component::<TestStats>();
-        world.spawn(TestStats { hp: 10, speed: 1.0 });
-        world.spawn(TestStats { hp: 20, speed: 2.0 });
-        world.spawn(TestStats { hp: 30, speed: 3.0 });
-
-        let mut registry = ModRegistry::new();
-        let stats_handle = registry
-            .register_component::<TestStats>(comp_id, ComponentOptions::default())
-            .expect("register TestStats");
-
-        let plan = QueryPlan::from_terms(vec![QueryTermMeta {
-            component: stats_handle,
-            component_id: comp_id,
-            mode: AccessMode::READ,
-            uuid: TestStats::UUID,
-            size: core::mem::size_of::<TestStats>(),
-            align: core::mem::align_of::<TestStats>(),
-            storage_flags: 0,
-            msg_read_batch_fn: None,
-            msg_send_fn: None,
-            msg_write_batch_fn: None,
-        }]);
-        let table_id = world
-            .archetypes()
-            .iter()
-            .find(|a| a.contains(comp_id))
-            .expect("archetype")
-            .table_id();
-        let matched = [table_id];
-        let mut iter = HostIter::new_dense(
-            &world.storages().tables,
-            &matched,
-            &plan,
-            Tick::new(0),
-            Tick::new(1),
-        );
-        let mut count = 0usize;
-        let mut chunk_len = 0usize;
-        // SAFETY: `iter` and local stack outputs are valid and aligned.
-        unsafe {
-            assert_eq!(
-                host_iter_count(iter.as_ffi_ptr(), &raw mut count),
-                FfiResult::OK
-            );
-            assert_eq!(count, 3);
-            // Non-destructive: `next_chunk` still yields all 3 entities.
-            assert_eq!(
-                host_iter_next_chunk(iter.as_ffi_ptr(), &raw mut chunk_len),
-                FfiBool::TRUE
-            );
-            assert_eq!(chunk_len, 3);
-            assert_eq!(
-                host_iter_count(iter.as_ffi_ptr(), &raw mut count),
-                FfiResult::OK
-            );
-            assert_eq!(count, 3);
-        }
-        drop(iter);
-
-        // `register_system_handle` returns a valid 1-based handle.
-        unsafe extern "C" fn noop_sys(
-            _ctx: *mut bevy_abi_mod_sys::BamSystemCtx,
-            _ud: *mut c_void,
-        ) -> FfiResult {
-            FfiResult::OK
-        }
-        let mut load_ctx = LoadContext::with_manifest_name(
-            registry,
-            Arc::new(AtomicBool::new(true)),
-            (&raw mut world).cast::<World>(),
-            None,
-            None,
-        );
-        let sys_desc = BamSystemDesc::new(
-            c"v03_test::count_sys".as_ptr(),
-            null(),
-            0,
-            noop_sys,
-            core::ptr::null_mut(),
-        );
-        let mut sys_handle = BamSystem::INVALID;
-        // SAFETY: `load_ctx`, `sys_desc`, and `sys_handle` are valid aligned pointers.
-        unsafe {
-            assert_eq!(
-                host_register_system_handle(load_ctx.as_ffi_ptr(), &sys_desc, &raw mut sys_handle),
-                FfiResult::OK
-            );
-        }
-        assert_eq!(sys_handle, BamSystem::from_raw(1));
-        assert_eq!(
-            // SAFETY: No-op test callback touches neither world nor ctx pointers.
-            unsafe { noop_sys(core::ptr::null_mut(), core::ptr::null_mut()) },
-            FfiResult::OK
-        );
-        load_ctx.finish_init();
-    }
-
-    static DROP_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-    unsafe extern "C" fn test_dyn_drop(_ptr: *mut c_void) {
-        DROP_COUNTER.fetch_add(1, Ordering::SeqCst);
-    }
-
-    #[test]
-    fn cmd_checkpoint_and_rollback_drop_uncommitted_payloads_once() {
-        let _serial = crate::drop_trampoline::TEST_DROP_SLAB_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        DROP_COUNTER.store(0, Ordering::SeqCst);
-        let mut world = World::new();
-        let mut registry = ModRegistry::new();
-        let dyn_uuid = ComponentUuid::from_parts("rollback_test::DynBox", 8, 8, 0);
-        let desc = ComponentDesc::new(c"rollback_test::DynBox".as_ptr(), dyn_uuid, 8, 8)
-            .with_drop(test_dyn_drop);
-
-        let mut dyn_handle = BamComponent::INVALID;
-        {
-            let mut load_ctx = LoadContext::with_manifest_name(
-                registry,
-                Arc::new(AtomicBool::new(true)),
-                (&raw mut world).cast::<World>(),
-                None,
-                None,
-            );
-            // SAFETY: `load_ctx`, `desc`, and `dyn_handle` are valid aligned pointers.
-            unsafe {
-                assert_eq!(
-                    host_register_component(load_ctx.as_ffi_ptr(), &desc, &raw mut dyn_handle),
-                    FfiResult::OK
-                );
-            }
-            registry = load_ctx.registry.clone();
-            load_ctx.finish_init();
-        }
-
-        let e_keep = world.spawn_empty().id();
-        let snap = registry.snapshot_arc();
-        let mut storage = HostCommandsStorage::new();
-        let mut cmds = HostCommands::new(&mut storage, world.entity_allocator(), &snap);
-        let cmd_ptr = cmds.as_ffi_ptr();
-
-        let keep_val = 111u64;
-        let roll_val = 222u64;
-        let batch_val = 333u64;
-        let batch_comps = [dyn_handle];
-        let batch_ptrs = [(&raw const batch_val).cast::<u8>()];
-        let mut cp = 0usize;
-        let mut temp_ent = FfiEntity::NULL;
-        let mut batch_ent = FfiEntity::NULL;
-
-        // SAFETY: `cmd_ptr` and all stack component buffers and out-pointers are valid for the active `HostCommands`.
-        unsafe {
-            assert_eq!(
-                host_cmd_insert(
-                    cmd_ptr,
-                    FfiEntity::from_bits(e_keep.to_bits()),
-                    dyn_handle,
-                    (&raw const keep_val).cast::<u8>(),
-                    8,
-                ),
-                FfiResult::OK
-            );
-            assert_eq!(host_cmd_checkpoint(cmd_ptr, &raw mut cp), FfiResult::OK);
-            assert_eq!(cp, 1);
-
-            assert_eq!(
-                host_cmd_spawn_empty(cmd_ptr, &raw mut temp_ent),
-                FfiResult::OK
-            );
-            assert_eq!(
-                host_cmd_insert(
-                    cmd_ptr,
-                    temp_ent,
-                    dyn_handle,
-                    (&raw const roll_val).cast::<u8>(),
-                    8,
-                ),
-                FfiResult::OK
-            );
-            assert_eq!(
-                host_cmd_spawn(
-                    cmd_ptr,
-                    batch_comps.as_ptr(),
-                    batch_ptrs.as_ptr(),
-                    1,
-                    &raw mut batch_ent,
-                ),
-                FfiResult::OK
-            );
-
-            // Rolling back out-of-range checkpoint fails without mutating queue.
-            assert_eq!(host_cmd_rollback(cmd_ptr, cp + 99), FfiResult::OUT_OF_RANGE);
-
-            // Roll back to `cp`: drops `roll_val` and `batch_val` (2 payloads), leaves `keep_val` intact.
-            assert_eq!(host_cmd_rollback(cmd_ptr, cp), FfiResult::OK);
-        }
-        assert_eq!(DROP_COUNTER.load(Ordering::SeqCst), 2);
-        assert_eq!(cmds.checkpoint(), 1);
-        drop(cmds);
-
-        storage.apply_to_world(&mut world, &snap);
-        assert!(
-            world
-                .get_entity(Entity::from_bits(batch_ent.to_bits()))
-                .is_err()
-        );
-        assert!(
-            world
-                .get_entity(Entity::from_bits(temp_ent.to_bits()))
-                .is_err()
-        );
-        let dyn_comp_id = snap.get_by_handle(dyn_handle).unwrap().component_id;
-        assert!(world.get_entity(e_keep).unwrap().contains_id(dyn_comp_id));
-        assert_eq!(DROP_COUNTER.load(Ordering::SeqCst), 2);
-        assert!(world.despawn(e_keep));
-        assert_eq!(DROP_COUNTER.load(Ordering::SeqCst), 3);
-    }
-
-    #[test]
-    fn reserved_v03_slots_validate_arguments_before_returning_unsupported() {
-        let mut world = World::new();
-        let comp_id = world.register_component::<TestStats>();
-        let mut registry = ModRegistry::new();
-        let stats_handle = registry
-            .register_component::<TestStats>(comp_id, ComponentOptions::default())
-            .expect("register TestStats");
-        let live_ent = FfiEntity::from_bits(world.spawn_empty().id().to_bits());
-        let mut load_ctx = LoadContext::with_manifest_name(
-            registry,
-            Arc::new(AtomicBool::new(true)),
-            (&raw mut world).cast::<World>(),
-            None,
-            None,
-        );
-        let host_ptr = load_ctx.host_ctx.as_ffi_ptr();
-
-        let rel_uuid = ComponentUuid::from_canonical_name("v03_test::Rel");
-        let rel_desc = BamRelationDesc::new(c"v03_test::Rel".as_ptr(), rel_uuid);
-        let mut rel_out = BamComponent::INVALID;
-        let mut sym = BamSymbol::INVALID;
-        let set_desc = BamScheduleSetDesc::new(c"v03_test::Set".as_ptr());
-        let mut set_out = BamSystemSet::INVALID;
-
-        unsafe extern "C" fn stub_migrate(
-            _src: *const c_void,
-            _dst: *mut c_void,
-            _ud: *mut c_void,
-        ) -> FfiResult {
-            FfiResult::OK
-        }
-        let mig_desc = ComponentDesc::new(c"v03_test::Stats".as_ptr(), TestStats::UUID, 8, 4);
-
-        // SAFETY: Valid `load_ctx`, `host_ctx`, descriptors, and stack out-pointers; intentional
-        // null descriptors test FFI null-pointer rejection.
-        unsafe {
-            assert_eq!(
-                host_register_relation(load_ctx.as_ffi_ptr(), &rel_desc, &raw mut rel_out),
-                FfiResult::OK
-            );
-            assert!(rel_out.is_valid());
-            assert_eq!(
-                host_register_relation(load_ctx.as_ffi_ptr(), null(), &raw mut rel_out),
-                FfiResult::NULL_POINTER
-            );
-
-            assert_eq!(
-                host_intern_symbol(host_ptr, StrView::from_str(""), &raw mut sym),
-                FfiResult::INVALID_ARGUMENT
-            );
-            assert_eq!(
-                host_intern_symbol(host_ptr, StrView::from_str("hp"), &raw mut sym),
-                FfiResult::OK
-            );
-            assert_eq!(sym, BamSymbol::from_raw(0));
-
-            assert_eq!(
-                host_bind_named_object(host_ptr, StrView::from_str("hero"), FfiEntity::NULL),
-                FfiResult::INVALID_ENTITY
-            );
-            assert_eq!(
-                host_bind_named_object(host_ptr, StrView::from_str("hero"), live_ent),
-                FfiResult::OK
-            );
-
-            assert_eq!(
-                host_configure_schedule_set(load_ctx.as_ffi_ptr(), &set_desc, &raw mut set_out),
-                FfiResult::OK
-            );
-            assert_eq!(set_out, BamSystemSet::from_raw(0));
-            assert_eq!(
-                host_mount_system_in_schedule(
-                    load_ctx.as_ffi_ptr(),
-                    BamSystem::INVALID,
-                    ScheduleId::UPDATE,
-                    BamSystemSet::INVALID,
-                ),
-                FfiResult::INVALID_ARGUMENT
-            );
-
-            assert_eq!(
-                host_migrate_component_column(
-                    load_ctx.as_ffi_ptr(),
-                    stats_handle,
-                    TestStats::SCHEMA_FINGERPRINT,
-                    &mig_desc,
-                    None,
-                    core::ptr::null_mut(),
-                ),
-                FfiResult::NULL_POINTER
-            );
-            assert_eq!(
-                host_migrate_component_column(
-                    load_ctx.as_ffi_ptr(),
-                    stats_handle,
-                    TestStats::SCHEMA_FINGERPRINT,
-                    &mig_desc,
-                    Some(stub_migrate),
-                    core::ptr::null_mut(),
-                ),
-                FfiResult::PERMISSION_DENIED
-            );
-        }
-
-        let mut storage = HostCommandsStorage::new();
-        let snap = load_ctx.registry.snapshot_arc();
-        let mut cmds = HostCommands::new(&mut storage, world.entity_allocator(), &snap);
-        // SAFETY: Valid `cmds` is active and valid on the stack; intentional null `data` with size 4 tests validation.
-        unsafe {
-            assert_eq!(
-                host_cmd_insert_relation(
-                    cmds.as_ffi_ptr(),
-                    live_ent,
-                    stats_handle,
-                    live_ent,
-                    null(),
-                    4,
-                ),
-                FfiResult::NULL_POINTER
-            );
-            assert_eq!(
-                host_cmd_insert_relation(
-                    cmds.as_ffi_ptr(),
-                    live_ent,
-                    stats_handle,
-                    live_ent,
-                    null(),
-                    0,
-                ),
-                FfiResult::INVALID_COMPONENT
-            );
-            assert_eq!(
-                host_cmd_insert_relation(cmds.as_ffi_ptr(), live_ent, rel_out, live_ent, null(), 0),
-                FfiResult::OK
-            );
-            assert_eq!(
-                host_cmd_remove_relation(cmds.as_ffi_ptr(), live_ent, stats_handle, live_ent),
-                FfiResult::INVALID_COMPONENT
-            );
-            assert_eq!(
-                host_cmd_remove_relation(cmds.as_ffi_ptr(), live_ent, rel_out, live_ent),
-                FfiResult::OK
-            );
-        }
-
-        load_ctx.finish_init();
-    }
-
-    #[test]
-    fn v03_all_null_invalid_handle_struct_size_and_schedule_set_guards() {
-        use crate::schedule::ModScheduleMap;
-        use crate::system::error_policy::ActiveGuestFaultGuard;
-        use bevy_abi_mod_sys::{
-            BAM_SCHEDULE_SET_FLAG_SEQUENCE, BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK,
-        };
-        use bevy_ecs::schedule::Schedule;
-        use core::ptr::null_mut;
-
-        let mut world = World::new();
-        let mut registry = ModRegistry::new();
-        let comp_id = world.register_component::<TestStats>();
-        let stats_handle = registry
-            .register_component::<TestStats>(comp_id, ComponentOptions::default())
-            .expect("register TestStats");
-        let unbound_ctx = HostContext::new(registry.snapshot_arc());
-        let mut poisoned_ctx = HostContext::new(registry.snapshot_arc());
-        poisoned_ctx.header.poison();
-        let poisoned_ctx_ptr = poisoned_ctx.as_ffi_ptr();
-
-        let bad_utf8_bytes = [0xFFu8, 0xFE, 0];
-        let bad_utf8_view = StrView {
-            ptr: bad_utf8_bytes.as_ptr(),
-            len: 2,
-        };
-
-        // 1. `log_diagnostic` (all 5 levels + guards) and `report_guest_fault` (with ActiveGuestFaultGuard).
-        // SAFETY: Valid/null/poisoned handles tested safely by FFI magic validation.
-        unsafe {
-            for lvl in [
-                BAM_LOG_TRACE,
-                BAM_LOG_DEBUG,
-                BAM_LOG_INFO,
-                BAM_LOG_WARN,
-                BAM_LOG_ERROR,
-            ] {
-                assert_eq!(
-                    host_log_diagnostic(
-                        unbound_ctx.as_ffi_ptr(),
-                        lvl,
-                        StrView::from_str("diag level")
-                    ),
-                    FfiResult::OK
-                );
-            }
-            assert_eq!(
-                host_log_diagnostic(null(), BAM_LOG_INFO, StrView::from_str("x")),
-                FfiResult::NULL_POINTER
-            );
-            assert_eq!(
-                host_log_diagnostic(poisoned_ctx_ptr, BAM_LOG_INFO, StrView::from_str("x")),
-                FfiResult::INVALID_STATE
-            );
-            assert_eq!(
-                host_log_diagnostic(unbound_ctx.as_ffi_ptr(), BAM_LOG_INFO, bad_utf8_view),
-                FfiResult::INVALID_UTF8
-            );
-
-            assert_eq!(
-                host_report_guest_fault(null(), StrView::from_str("x")),
-                FfiResult::NULL_POINTER
-            );
-            assert_eq!(
-                host_report_guest_fault(poisoned_ctx_ptr, StrView::from_str("x")),
-                FfiResult::INVALID_STATE
-            );
-            assert_eq!(
-                host_report_guest_fault(unbound_ctx.as_ffi_ptr(), bad_utf8_view),
-                FfiResult::INVALID_UTF8
-            );
-
-            let guard = ActiveGuestFaultGuard::enter(
-                unbound_ctx.as_ffi_ptr(),
-                Some(ModId(1)),
-                Some(Arc::from("fault_ns")),
-                2,
-                Arc::from("fault_sys"),
-            );
-            assert_eq!(
-                host_report_guest_fault(
-                    unbound_ctx.as_ffi_ptr(),
-                    StrView::from_str("inside system")
-                ),
-                FfiResult::OK
-            );
-            assert_eq!(guard.finish().as_deref(), Some("inside system"));
-
-            // 2. `resolve_component_by_uuid`, `component_layout_info`, `iter_count` guards.
-            let mut out_comp = BamComponent::INVALID;
-            let uuid = TestStats::UUID;
-            assert_eq!(
-                host_resolve_component_by_uuid(unbound_ctx.as_ffi_ptr(), &uuid, null_mut()),
-                FfiResult::NULL_POINTER
-            );
-            assert_eq!(
-                host_resolve_component_by_uuid(null(), &uuid, &raw mut out_comp),
-                FfiResult::NULL_POINTER
-            );
-            assert_eq!(
-                host_resolve_component_by_uuid(unbound_ctx.as_ffi_ptr(), null(), &raw mut out_comp),
-                FfiResult::NULL_POINTER
-            );
-
-            let mut out_info = BamLayoutInfo::empty();
-            assert_eq!(
-                host_component_layout_info(unbound_ctx.as_ffi_ptr(), stats_handle, null_mut()),
-                FfiResult::NULL_POINTER
-            );
-            assert_eq!(
-                host_component_layout_info(null(), stats_handle, &raw mut out_info),
-                FfiResult::NULL_POINTER
-            );
-            assert_eq!(
-                host_component_layout_info(
-                    unbound_ctx.as_ffi_ptr(),
-                    BamComponent::from_raw(999),
-                    &raw mut out_info
-                ),
-                FfiResult::INVALID_COMPONENT
-            );
-
-            let mut out_count = 0usize;
-            assert_eq!(
-                host_iter_count(core::ptr::null_mut(), null_mut()),
-                FfiResult::NULL_POINTER
-            );
-            assert_eq!(
-                host_iter_count(core::ptr::null_mut(), &raw mut out_count),
-                FfiResult::NULL_POINTER
-            );
-
-            // 3. `intern_symbol` and `bind_named_object` unbound-world & null guards.
-            let mut sym = BamSymbol::INVALID;
-            assert_eq!(
-                host_intern_symbol(
-                    unbound_ctx.as_ffi_ptr(),
-                    StrView::from_str("hp"),
-                    null_mut()
-                ),
-                FfiResult::NULL_POINTER
-            );
-            assert_eq!(
-                host_intern_symbol(null(), StrView::from_str("hp"), &raw mut sym),
-                FfiResult::NULL_POINTER
-            );
-            assert_eq!(
-                host_intern_symbol(
-                    unbound_ctx.as_ffi_ptr(),
-                    StrView::from_str("hp"),
-                    &raw mut sym
-                ),
-                FfiResult::INVALID_STATE
-            );
-
-            assert_eq!(
-                host_bind_named_object(null(), StrView::from_str("hero"), FfiEntity::NULL),
-                FfiResult::NULL_POINTER
-            );
-            assert_eq!(
-                host_bind_named_object(
-                    unbound_ctx.as_ffi_ptr(),
-                    StrView::from_str(""),
-                    FfiEntity::NULL
-                ),
-                FfiResult::INVALID_ARGUMENT
-            );
-            let live_e = world.spawn_empty().id();
-            assert_eq!(
-                host_bind_named_object(
-                    unbound_ctx.as_ffi_ptr(),
-                    StrView::from_str("hero"),
-                    FfiEntity::from_bits(live_e.to_bits())
-                ),
-                FfiResult::INVALID_STATE
-            );
-            assert_eq!(
-                host_bind_named_object(
-                    unbound_ctx.as_ffi_ptr(),
-                    StrView::from_str("bad_bits"),
-                    FfiEntity::from_bits(1u64 << 32)
-                ),
-                FfiResult::INVALID_ENTITY
-            );
-            assert_eq!(
-                host_bind_named_object(
-                    unbound_ctx.as_ffi_ptr(),
-                    StrView::from_str("placeholder"),
-                    FfiEntity::from_bits(Entity::PLACEHOLDER.to_bits())
-                ),
-                FfiResult::INVALID_ENTITY
-            );
-
-            // 4. `cmd_checkpoint` & `cmd_rollback` null/invalid handle + nested rollback.
-            let mut cp = 0usize;
-            assert_eq!(
-                host_cmd_checkpoint(core::ptr::null_mut(), null_mut()),
-                FfiResult::NULL_POINTER
-            );
-            assert_eq!(
-                host_cmd_checkpoint(core::ptr::null_mut(), &raw mut cp),
-                FfiResult::NULL_POINTER
-            );
-            assert_eq!(
-                host_cmd_rollback(core::ptr::null_mut(), 0),
-                FfiResult::NULL_POINTER
-            );
-        }
-
-        let snap = registry.snapshot_arc();
-        let mut storage = HostCommandsStorage::new();
-        let mut cmds = HostCommands::new(&mut storage, world.entity_allocator(), &snap);
-        let mut cp1 = 0usize;
-        let mut cp2 = 0usize;
-        let mut e_out = FfiEntity::NULL;
-        // SAFETY: Valid `cmds` and stack variables.
-        unsafe {
-            assert_eq!(
-                host_cmd_spawn_empty(cmds.as_ffi_ptr(), &raw mut e_out),
-                FfiResult::OK
-            );
-            assert_eq!(
-                host_cmd_checkpoint(cmds.as_ffi_ptr(), &raw mut cp1),
-                FfiResult::OK
-            );
-            assert_eq!(
-                host_cmd_spawn_empty(cmds.as_ffi_ptr(), &raw mut e_out),
-                FfiResult::OK
-            );
-            assert_eq!(
-                host_cmd_checkpoint(cmds.as_ffi_ptr(), &raw mut cp2),
-                FfiResult::OK
-            );
-            assert_eq!(
-                host_cmd_spawn_empty(cmds.as_ffi_ptr(), &raw mut e_out),
-                FfiResult::OK
-            );
-            assert_eq!(cp1, 1);
-            assert_eq!(cp2, 2);
-            assert_eq!(host_cmd_rollback(cmds.as_ffi_ptr(), cp2), FfiResult::OK);
-            assert_eq!(cmds.checkpoint(), 2);
-            assert_eq!(host_cmd_rollback(cmds.as_ffi_ptr(), cp1), FfiResult::OK);
-            assert_eq!(cmds.checkpoint(), 1);
-        }
-        drop(cmds);
-
-        // 5. `register_system_handle`, `configure_schedule_set`, `mount_system_in_schedule`, `migrate_component_column`
-        unsafe extern "C" fn test_sys_cb(
-            _ctx: *mut bevy_abi_mod_sys::BamSystemCtx,
-            _ud: *mut c_void,
-        ) -> FfiResult {
-            FfiResult::OK
-        }
-        unsafe extern "C" fn test_mig_cb(
-            src: *const c_void,
-            dst: *mut c_void,
-            _ud: *mut c_void,
-        ) -> FfiResult {
-            // SAFETY: Caller passes valid 4-byte source and 8-byte destination buffers.
-            unsafe {
-                let v = core::ptr::read_unaligned(src.cast::<u32>());
-                core::ptr::write_unaligned(dst.cast::<u64>(), u64::from(v) * 10);
-            }
-            FfiResult::OK
-        }
-
-        // Standalone LoadContext (`world_ptr.is_null()`)
-        let mut standalone = LoadContext::new(registry.clone());
-        let sys_desc = BamSystemDesc::new(c"sa::sys".as_ptr(), null(), 0, test_sys_cb, null_mut());
-        let mut sys_h = BamSystem::INVALID;
-        let set_desc = BamScheduleSetDesc::new(c"sa::Set".as_ptr());
-        let mut set_out = BamSystemSet::INVALID;
-
-        // SAFETY: Valid standalone `LoadContext` and stack descriptors/outputs; null/short checks test FFI validation.
-        unsafe {
-            assert_eq!(
-                host_register_system_handle(standalone.as_ffi_ptr(), &sys_desc, null_mut()),
-                FfiResult::NULL_POINTER
-            );
-            assert_eq!(
-                host_register_system_handle(null_mut(), &sys_desc, &raw mut sys_h),
-                FfiResult::NULL_POINTER
-            );
-            let mut short_sys = sys_desc;
-            short_sys.struct_size = 4;
-            assert_eq!(
-                host_register_system_handle(standalone.as_ffi_ptr(), &short_sys, &raw mut sys_h),
-                FfiResult::INVALID_VERSION
-            );
-            assert_eq!(
-                host_register_system_handle(standalone.as_ffi_ptr(), &sys_desc, &raw mut sys_h),
-                FfiResult::OK
-            );
-
-            // Standalone `mount_system_in_schedule`: built-in schedule + INVALID set succeeds (`787-794`),
-            // while custom schedule or valid set returns `INVALID_STATE` (`681-684`).
-            assert_eq!(
-                host_mount_system_in_schedule(
-                    standalone.as_ffi_ptr(),
-                    sys_h,
-                    ScheduleId::FIXED_UPDATE,
-                    BamSystemSet::INVALID,
-                ),
-                FfiResult::OK
-            );
-            assert_eq!(
-                host_mount_system_in_schedule(
-                    standalone.as_ffi_ptr(),
-                    sys_h,
-                    ScheduleId::custom(2048),
-                    BamSystemSet::INVALID,
-                ),
-                FfiResult::INVALID_STATE
-            );
-            assert_eq!(
-                host_mount_system_in_schedule(
-                    standalone.as_ffi_ptr(),
-                    sys_h,
-                    ScheduleId::UPDATE,
-                    BamSystemSet::from_raw(0),
-                ),
-                FfiResult::INVALID_STATE
-            );
-
-            // `configure_schedule_set` with null `world_ptr` -> `INVALID_STATE` (`571-574`) + header/name guards.
-            assert_eq!(
-                host_configure_schedule_set(standalone.as_ffi_ptr(), &set_desc, null_mut()),
-                FfiResult::NULL_POINTER
-            );
-            assert_eq!(
-                host_configure_schedule_set(null_mut(), &set_desc, &raw mut set_out),
-                FfiResult::NULL_POINTER
-            );
-            assert_eq!(
-                host_configure_schedule_set(standalone.as_ffi_ptr(), null(), &raw mut set_out),
-                FfiResult::NULL_POINTER
-            );
-            let mut short_set = set_desc;
-            short_set.struct_size = 4;
-            assert_eq!(
-                host_configure_schedule_set(standalone.as_ffi_ptr(), &short_set, &raw mut set_out),
-                FfiResult::INVALID_VERSION
-            );
-            let bad_flags_set = BamScheduleSetDesc::new(c"sa::Set".as_ptr()).with_flags(1 << 30);
-            assert_eq!(
-                host_configure_schedule_set(
-                    standalone.as_ffi_ptr(),
-                    &bad_flags_set,
-                    &raw mut set_out
-                ),
-                FfiResult::UNSUPPORTED
-            );
-            let empty_name_set = BamScheduleSetDesc::new(c"".as_ptr());
-            assert_eq!(
-                host_configure_schedule_set(
-                    standalone.as_ffi_ptr(),
-                    &empty_name_set,
-                    &raw mut set_out
-                ),
-                FfiResult::INVALID_ARGUMENT
-            );
-            let bad_utf8_set = BamScheduleSetDesc::new(bad_utf8_bytes.as_ptr().cast::<c_char>());
-            assert_eq!(
-                host_configure_schedule_set(
-                    standalone.as_ffi_ptr(),
-                    &bad_utf8_set,
-                    &raw mut set_out
-                ),
-                FfiResult::INVALID_UTF8
-            );
-            let bad_syntax_set = BamScheduleSetDesc::new(c"a::b::c".as_ptr());
-            assert_eq!(
-                host_configure_schedule_set(
-                    standalone.as_ffi_ptr(),
-                    &bad_syntax_set,
-                    &raw mut set_out
-                ),
-                FfiResult::INVALID_ARGUMENT
-            );
-            assert_eq!(
-                host_configure_schedule_set(standalone.as_ffi_ptr(), &set_desc, &raw mut set_out),
-                FfiResult::INVALID_STATE
-            );
-        }
-        standalone.finish_init();
-
-        // World-bound `LoadContext`: exercise `configure_schedule_set` (`before_sets`, `after_sets`,
-        // `BEFORE_WEAK`, `AFTER_WEAK`, missing schedule, unknown dependency set), `mount_system_in_schedule`
-        // (missing `ModScheduleSetRegistry`, mismatched schedule set, remounting across schedules),
-        // and `migrate_component_column` (null/version/dynamic 4B -> 8B migration).
-        world.insert_resource(ModScheduleMap::new());
-
-        let mut world_ctx = LoadContext::with_manifest_name(
-            registry,
-            Arc::new(AtomicBool::new(true)),
-            (&raw mut world).cast::<World>(),
-            Some(ModId(8)),
-            Some(Arc::from("sched_mod")),
-        );
-        let mut world_sys = BamSystem::INVALID;
-        let mut set_a = BamSystemSet::INVALID;
-        let mut set_b = BamSystemSet::INVALID;
-        let mut dyn_h = BamComponent::INVALID;
-
-        let dyn_uuid = ComponentUuid::from_parts("sched_mod::DynV1", 4, 4, 0);
-        let dyn_v1 = ComponentDesc::new(c"sched_mod::DynV".as_ptr(), dyn_uuid, 4, 4)
-            .with_schema_fingerprint(0x1111);
-        let dyn_v2 = ComponentDesc::new(c"sched_mod::DynV".as_ptr(), dyn_uuid, 8, 8)
-            .with_schema_fingerprint(0x2222);
-
-        // SAFETY: Valid world-bound `LoadContext` and stack descriptors/outputs.
-        unsafe {
-            assert_eq!(
-                host_register_system_handle(world_ctx.as_ffi_ptr(), &sys_desc, &raw mut world_sys),
-                FfiResult::OK
-            );
-
-            // Missing `ModScheduleSetRegistry` -> `NOT_FOUND` (`723-727`)
-            assert_eq!(
-                host_mount_system_in_schedule(
-                    world_ctx.as_ffi_ptr(),
-                    world_sys,
-                    ScheduleId::UPDATE,
-                    BamSystemSet::from_raw(0),
-                ),
-                FfiResult::NOT_FOUND
-            );
-            // Invalid `ScheduleId` / unregistered custom schedule / invalid `LoadContext`
-            assert_eq!(
-                host_mount_system_in_schedule(
-                    null_mut(),
-                    world_sys,
-                    ScheduleId::UPDATE,
-                    BamSystemSet::INVALID,
-                ),
-                FfiResult::NULL_POINTER
-            );
-            assert_eq!(
-                host_mount_system_in_schedule(
-                    world_ctx.as_ffi_ptr(),
-                    world_sys,
-                    ScheduleId(100),
-                    BamSystemSet::INVALID,
-                ),
-                FfiResult::INVALID_ARGUMENT
-            );
-            assert_eq!(
-                host_mount_system_in_schedule(
-                    world_ctx.as_ffi_ptr(),
-                    world_sys,
-                    ScheduleId::custom(2049),
-                    BamSystemSet::INVALID,
-                ),
-                FfiResult::NOT_FOUND
-            );
-
-            // Configure `set_a` (SEQUENCE on UPDATE) and `set_b` (SEQUENCE_WEAK + BEFORE_WEAK + AFTER_WEAK on FIXED_UPDATE)
-            let mut unknown_sched_set = BamScheduleSetDesc::new(c"MissingSchedSet".as_ptr());
-            unknown_sched_set.schedule = ScheduleId::custom(2049);
-            assert_eq!(
-                host_configure_schedule_set(
-                    world_ctx.as_ffi_ptr(),
-                    &unknown_sched_set,
-                    &raw mut set_a
-                ),
-                FfiResult::NOT_FOUND
-            );
-
-            let mut set_a_desc = BamScheduleSetDesc::new(c"PhaseA".as_ptr())
-                .with_flags(BAM_SCHEDULE_SET_FLAG_SEQUENCE);
-            set_a_desc.schedule = ScheduleId::UPDATE;
-            assert_eq!(
-                host_configure_schedule_set(world_ctx.as_ffi_ptr(), &set_a_desc, &raw mut set_a),
-                FfiResult::OK
-            );
-
-            let dep_bad = [BamSystemSet::from_raw(999)];
-            let mut bad_dep_desc = BamScheduleSetDesc::new(c"BadDep".as_ptr());
-            bad_dep_desc.schedule = ScheduleId::UPDATE;
-            bad_dep_desc.before_sets = dep_bad.as_ptr();
-            bad_dep_desc.before_count = 1;
-            assert_eq!(
-                host_configure_schedule_set(world_ctx.as_ffi_ptr(), &bad_dep_desc, &raw mut set_b),
-                FfiResult::NOT_FOUND
-            );
-
-            let dep_a = [set_a];
-            let mut cycle_desc = BamScheduleSetDesc::new(c"PhaseCycle".as_ptr());
-            cycle_desc.schedule = ScheduleId::UPDATE;
-            cycle_desc.before_sets = dep_a.as_ptr();
-            cycle_desc.before_count = 1;
-            cycle_desc.after_sets = dep_a.as_ptr();
-            cycle_desc.after_count = 1;
-            let mut set_cycle = BamSystemSet::INVALID;
-            assert_eq!(
-                host_configure_schedule_set(
-                    world_ctx.as_ffi_ptr(),
-                    &cycle_desc,
-                    &raw mut set_cycle
-                ),
-                FfiResult::CYCLE_DETECTED
-            );
-
-            let mut set_c_desc = BamScheduleSetDesc::new(c"PhaseC".as_ptr()).with_flags(
-                BAM_SCHEDULE_SET_FLAG_SEQUENCE_WEAK | BAM_SCHEDULE_SET_FLAG_BEFORE_WEAK,
-            );
-            set_c_desc.schedule = ScheduleId::UPDATE;
-            set_c_desc.before_sets = dep_a.as_ptr();
-            set_c_desc.before_count = 1;
-            let mut set_c = BamSystemSet::INVALID;
-            assert_eq!(
-                host_configure_schedule_set(world_ctx.as_ffi_ptr(), &set_c_desc, &raw mut set_c),
-                FfiResult::OK
-            );
-
-            let dep_c = [set_c];
-            let mut set_d_desc = BamScheduleSetDesc::new(c"PhaseD".as_ptr())
-                .with_flags(BAM_SCHEDULE_SET_FLAG_AFTER_WEAK);
-            set_d_desc.schedule = ScheduleId::UPDATE;
-            set_d_desc.after_sets = dep_c.as_ptr();
-            set_d_desc.after_count = 1;
-            let mut set_d = BamSystemSet::INVALID;
-            assert_eq!(
-                host_configure_schedule_set(world_ctx.as_ffi_ptr(), &set_d_desc, &raw mut set_d),
-                FfiResult::OK
-            );
-
-            let mut set_b_desc = BamScheduleSetDesc::new(c"PhaseB".as_ptr());
-            set_b_desc.schedule = ScheduleId::FIXED_UPDATE;
-            assert_eq!(
-                host_configure_schedule_set(world_ctx.as_ffi_ptr(), &set_b_desc, &raw mut set_b),
-                FfiResult::OK
-            );
-
-            // Unknown set handle / cross-schedule set mismatch
-            assert_eq!(
-                host_mount_system_in_schedule(
-                    world_ctx.as_ffi_ptr(),
-                    world_sys,
-                    ScheduleId::UPDATE,
-                    BamSystemSet::from_raw(999),
-                ),
-                FfiResult::NOT_FOUND
-            );
-            assert_eq!(
-                host_mount_system_in_schedule(
-                    world_ctx.as_ffi_ptr(),
-                    world_sys,
-                    ScheduleId::UPDATE,
-                    set_b,
-                ),
-                FfiResult::INVALID_ARGUMENT
-            );
-
-            // Mount into `set_a` on UPDATE, then remount onto `set_b` on FIXED_UPDATE (`schedule_changed` path).
-            assert_eq!(
-                host_mount_system_in_schedule(
-                    world_ctx.as_ffi_ptr(),
-                    world_sys,
-                    ScheduleId::UPDATE,
-                    set_a,
-                ),
-                FfiResult::OK
-            );
-            assert_eq!(
-                host_mount_system_in_schedule(
-                    world_ctx.as_ffi_ptr(),
-                    world_sys,
-                    ScheduleId::FIXED_UPDATE,
-                    set_b,
-                ),
-                FfiResult::OK
-            );
-
-            // `migrate_component_column` guards & live dynamic 4B -> 8B migration (`test_mig_cb`).
-            assert_eq!(
-                host_migrate_component_column(
-                    null_mut(),
-                    stats_handle,
-                    0,
-                    &dyn_v2,
-                    Some(test_mig_cb),
-                    null_mut(),
-                ),
-                FfiResult::NULL_POINTER
-            );
-            assert_eq!(
-                host_migrate_component_column(
-                    world_ctx.as_ffi_ptr(),
-                    BamComponent::from_raw(999),
-                    0,
-                    &dyn_v2,
-                    Some(test_mig_cb),
-                    null_mut(),
-                ),
-                FfiResult::INVALID_COMPONENT
-            );
-            assert_eq!(
-                host_migrate_component_column(
-                    world_ctx.as_ffi_ptr(),
-                    stats_handle,
-                    0,
-                    null(),
-                    Some(test_mig_cb),
-                    null_mut(),
-                ),
-                FfiResult::NULL_POINTER
-            );
-            let mut short_mig = dyn_v2;
-            short_mig.struct_size = 4;
-            assert_eq!(
-                host_migrate_component_column(
-                    world_ctx.as_ffi_ptr(),
-                    stats_handle,
-                    0,
-                    &short_mig,
-                    Some(test_mig_cb),
-                    null_mut(),
-                ),
-                FfiResult::INVALID_VERSION
-            );
-            let bad_mig = ComponentDesc::new(null(), dyn_uuid, 8, 8);
-            assert_eq!(
-                host_migrate_component_column(
-                    world_ctx.as_ffi_ptr(),
-                    stats_handle,
-                    0,
-                    &bad_mig,
-                    Some(test_mig_cb),
-                    null_mut(),
-                ),
-                FfiResult::NULL_POINTER
-            );
-
-            assert_eq!(
-                host_register_component(world_ctx.as_ffi_ptr(), &dyn_v1, &raw mut dyn_h),
-                FfiResult::OK
-            );
-        }
-
-        // Spawn an entity carrying `dyn_h` (4B `u32(7)`), then migrate it to 8B `u64(70)`.
-        let dyn_cid = world_ctx
-            .registry
-            .snapshot()
-            .get_by_handle(dyn_h)
-            .unwrap()
-            .component_id;
-        let mig_e = world.spawn_empty().id();
-        let mut v1_val: u32 = 7;
-        // SAFETY: `dyn_cid` has `(4, 4)` layout matching `u32`.
-        unsafe {
-            world.entity_mut(mig_e).insert_by_id(
-                dyn_cid,
-                bevy_ecs::ptr::OwningPtr::new(core::ptr::NonNull::from(&mut v1_val).cast()),
-            );
-            assert_eq!(
-                host_migrate_component_column(
-                    world_ctx.as_ffi_ptr(),
-                    dyn_h,
-                    0x1111,
-                    &dyn_v2,
-                    Some(test_mig_cb),
-                    null_mut(),
-                ),
-                FfiResult::OK
-            );
-        }
-        let v2_cid = world_ctx
-            .registry
-            .snapshot()
-            .get_by_handle(dyn_h)
-            .unwrap()
-            .component_id;
-        let migrated_ptr = world.entity(mig_e).get_by_id(v2_cid).unwrap();
-        // SAFETY: Migrated component now has 8-byte `u64` layout holding `70`.
-        let migrated_val =
-            unsafe { core::ptr::read_unaligned(migrated_ptr.as_ptr().cast::<u64>()) };
-        assert_eq!(migrated_val, 70);
-
-        // Run the registered system once so `test_sys_cb` executes as well.
-        let sys = world_ctx.registered_systems.pop().unwrap();
-        world_ctx.finish_init();
-        let mut sched = Schedule::default();
-        sched.add_systems(sys);
-        sched.run(&mut world);
-    }
-}
+#[path = "../../tests/unit/v03_ext_tests.rs"]
+mod tests;

@@ -47,8 +47,9 @@ use bevy_reflect::{Reflect, ReflectFromPtr};
 
 use crate::{
     ffi::register::DynamicComponentHookMap,
+    handle_header::AlignedBuf,
     loader::{ExportedFieldRecord, ModHost},
-    registry::{ModRegistry, RegisteredComponent},
+    registry::{DynamicComponentReg, ModRegistry, RegisteredComponent},
 };
 
 type BamFieldInfoFn = unsafe extern "C" fn(
@@ -57,19 +58,19 @@ type BamFieldInfoFn = unsafe extern "C" fn(
     out_type_tag: *mut StrView,
     out_offset: *mut usize,
 ) -> FfiBool;
-type BamInitDefaultFn = unsafe extern "C" fn(dst: *mut c_void) -> FfiResult;
-type BamExportFieldsSinkFn = unsafe extern "C" fn(
+pub(crate) type BamInitDefaultFn = unsafe extern "C" fn(dst: *mut c_void) -> FfiResult;
+pub(crate) type BamExportFieldsSinkFn = unsafe extern "C" fn(
     ctx: *mut c_void,
     field_name: StrView,
     type_tag: StrView,
     payload: FfiSlice<u8>,
 ) -> FfiResult;
-type BamExportFieldsFn = unsafe extern "C" fn(
+pub(crate) type BamExportFieldsFn = unsafe extern "C" fn(
     src_ptr: *const c_void,
     sink: Option<BamExportFieldsSinkFn>,
     sink_ctx: *mut c_void,
 ) -> FfiResult;
-type BamImportFieldFn = unsafe extern "C" fn(
+pub(crate) type BamImportFieldFn = unsafe extern "C" fn(
     dst_ptr: *mut c_void,
     field_name: StrView,
     type_tag: StrView,
@@ -87,60 +88,6 @@ pub struct WitnessFieldDescriptor {
     pub type_tag: String,
     /// Byte offset within the enclosing struct (`0` for enum descriptors).
     pub offset: usize,
-}
-
-struct AlignedScratchBuffer {
-    ptr: *mut u8,
-    layout: Layout,
-}
-
-impl AlignedScratchBuffer {
-    fn new_zeroed(size: usize, align: usize) -> Result<Self, FfiResult> {
-        let layout =
-            Layout::from_size_align(size, align.max(1)).map_err(|_| FfiResult::INVALID_ARGUMENT)?;
-        if layout.size() == 0 {
-            return Ok(Self {
-                ptr: NonNull::<u8>::dangling().as_ptr(),
-                layout,
-            });
-        }
-        // SAFETY: `layout.size() > 0` and `layout.align()` is a valid power of two.
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-        if ptr.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
-        Ok(Self { ptr, layout })
-    }
-
-    #[inline]
-    fn as_mut_c_void(&self) -> *mut c_void {
-        if self.layout.size() == 0 {
-            NonNull::<u8>::dangling().as_ptr().cast::<c_void>()
-        } else {
-            self.ptr.cast::<c_void>()
-        }
-    }
-
-    #[inline]
-    fn non_null_u8(&self) -> NonNull<u8> {
-        if self.layout.size() == 0 {
-            NonNull::<u8>::dangling()
-        } else {
-            // SAFETY: `self.ptr` was checked non-null on allocation.
-            unsafe { NonNull::new_unchecked(self.ptr) }
-        }
-    }
-}
-
-impl Drop for AlignedScratchBuffer {
-    fn drop(&mut self) {
-        if self.layout.size() > 0 {
-            // SAFETY: `self.ptr` was allocated with `std::alloc::alloc_zeroed(self.layout)`.
-            unsafe {
-                std::alloc::dealloc(self.ptr, self.layout);
-            }
-        }
-    }
 }
 
 fn resolve_witness_symbol_in_world(
@@ -171,7 +118,7 @@ fn resolve_witness_symbol_in_world(
     None
 }
 
-unsafe extern "C" fn collect_witness_export_sink(
+pub(crate) unsafe extern "C" fn collect_witness_export_sink(
     ctx: *mut c_void,
     field_name: StrView,
     type_tag: StrView,
@@ -541,7 +488,7 @@ pub fn insert_entity_component_from_fields(
         return apply_entity_component_fields(world, entity, component, fields);
     }
 
-    let buf = AlignedScratchBuffer::new_zeroed(entry.size, entry.align)?;
+    let buf = AlignedBuf::new_zeroed(entry.size, entry.align)?;
     let dst_ptr = buf.as_mut_c_void();
     if let Some(init_fn) = init_default_fn {
         // SAFETY: `dst_ptr` points to `entry.size` aligned bytes in `buf`.
@@ -577,7 +524,7 @@ pub fn insert_entity_component_from_fields(
     }
 
     if let Ok(mut ent_mut) = world.get_entity_mut(entity) {
-        let nn = buf.non_null_u8();
+        let nn = buf.non_null();
         // SAFETY: `nn` holds an initialized value matching `entry.component_id`; `insert_by_id`
         // moves the value into Bevy ECS storage without deallocating `buf`'s backing heap block.
         let owning = unsafe { OwningPtr::new(nn) };
@@ -678,11 +625,11 @@ pub fn write_entity_pod_bytes(
         entry
     };
 
-    let buf = AlignedScratchBuffer::new_zeroed(entry.size, entry.align)?;
+    let buf = AlignedBuf::new_zeroed(entry.size, entry.align)?;
     if entry.size > 0 {
-        // SAFETY: `bytes.len() == entry.size` and `buf.ptr` has `entry.size` writable bytes.
+        // SAFETY: `bytes.len() == entry.size` and `buf.as_mut_ptr()` has `entry.size` writable bytes.
         unsafe {
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.ptr, entry.size);
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.as_mut_ptr(), entry.size);
         }
     }
 
@@ -690,7 +637,7 @@ pub fn write_entity_pod_bytes(
         if let Some(insert_raw) = entry.insert_raw_fn {
             // SAFETY: `buf` holds `entry.size` aligned bytes for `RawInsertable` `T`.
             unsafe {
-                insert_raw(world, entity, buf.non_null_u8().as_ptr());
+                insert_raw(world, entity, buf.non_null().as_ptr());
             }
             return Ok(());
         }
@@ -700,7 +647,7 @@ pub fn write_entity_pod_bytes(
     let mut ent_mut = world
         .get_entity_mut(entity)
         .map_err(|_| FfiResult::INVALID_ENTITY)?;
-    let nn = buf.non_null_u8();
+    let nn = buf.non_null();
     // SAFETY: `nn` holds `entry.size` aligned POD bytes matching `entry.component_id`.
     let owning = unsafe { OwningPtr::new(nn) };
     // SAFETY: `entry.component_id` was registered in `world` with `(entry.size, entry.align)`.
@@ -1212,15 +1159,15 @@ pub fn insert_entity_pod_with_field_patches(
         entry
     };
 
-    let buf = AlignedScratchBuffer::new_zeroed(entry.size, entry.align)?;
+    let buf = AlignedBuf::new_zeroed(entry.size, entry.align)?;
     for patch in patches {
         if !patch.bytes.is_empty() && entry.size > 0 {
-            // SAFETY: Verified `patch.offset + patch.bytes.len() <= entry.size` above; `buf.ptr`
+            // SAFETY: Verified `patch.offset + patch.bytes.len() <= entry.size` above; `buf.as_mut_ptr()`
             // has `entry.size` writable bytes disjoint from `patch.bytes`.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     patch.bytes.as_ptr(),
-                    buf.ptr.add(patch.offset),
+                    buf.as_mut_ptr().add(patch.offset),
                     patch.bytes.len(),
                 );
             }
@@ -1231,7 +1178,7 @@ pub fn insert_entity_pod_with_field_patches(
         if let Some(insert_raw) = entry.insert_raw_fn {
             // SAFETY: `buf` holds `entry.size` aligned initialized POD bytes for `T`.
             unsafe {
-                insert_raw(world, entity, buf.non_null_u8().as_ptr());
+                insert_raw(world, entity, buf.non_null().as_ptr());
             }
             return Ok(());
         }
@@ -1241,7 +1188,7 @@ pub fn insert_entity_pod_with_field_patches(
     let mut ent_mut = world
         .get_entity_mut(entity)
         .map_err(|_| FfiResult::INVALID_ENTITY)?;
-    let nn = buf.non_null_u8();
+    let nn = buf.non_null();
     // SAFETY: `nn` holds `entry.size` aligned initialized POD bytes matching `entry.component_id`.
     let owning = unsafe { OwningPtr::new(nn) };
     // SAFETY: `entry.component_id` was registered in `world` with `(entry.size, entry.align)`.
@@ -1472,39 +1419,50 @@ mod bam_field_reflect_pool {
         }
     }
 
+    macro_rules! dispatch_non_bool_pod_kind {
+        ($kind:expr, $on_ty:ident) => {
+            match $kind {
+                BamFieldPodKind::Bool => $on_ty!(bool),
+                BamFieldPodKind::U8 => $on_ty!(u8),
+                BamFieldPodKind::I8 => $on_ty!(i8),
+                BamFieldPodKind::U16 => $on_ty!(u16),
+                BamFieldPodKind::I16 => $on_ty!(i16),
+                BamFieldPodKind::U32 | BamFieldPodKind::Component => $on_ty!(u32),
+                BamFieldPodKind::I32 => $on_ty!(i32),
+                BamFieldPodKind::U64 | BamFieldPodKind::Entity => $on_ty!(u64),
+                BamFieldPodKind::I64 => $on_ty!(i64),
+                BamFieldPodKind::F32 => $on_ty!(f32),
+                BamFieldPodKind::F64 => $on_ty!(f64),
+                BamFieldPodKind::Usize => $on_ty!(usize),
+                BamFieldPodKind::Isize => $on_ty!(isize),
+                BamFieldPodKind::Vec2 => $on_ty!([f32; 2]),
+                BamFieldPodKind::Vec3 => $on_ty!([f32; 3]),
+                BamFieldPodKind::Vec4 => $on_ty!([f32; 4]),
+                BamFieldPodKind::DVec2 => $on_ty!([f64; 2]),
+                BamFieldPodKind::DVec3 => $on_ty!([f64; 3]),
+                BamFieldPodKind::DVec4 => $on_ty!([f64; 4]),
+                BamFieldPodKind::UVec2 => $on_ty!([u32; 2]),
+                BamFieldPodKind::UVec3 => $on_ty!([u32; 3]),
+                BamFieldPodKind::UVec4 => $on_ty!([u32; 4]),
+                BamFieldPodKind::IVec2 => $on_ty!([i32; 2]),
+                BamFieldPodKind::IVec3 => $on_ty!([i32; 3]),
+                BamFieldPodKind::IVec4 => $on_ty!([i32; 4]),
+                BamFieldPodKind::Bytes2 => $on_ty!([u8; 2]),
+                BamFieldPodKind::Bytes3 => $on_ty!([u8; 3]),
+                BamFieldPodKind::Bytes4 => $on_ty!([u8; 4]),
+                BamFieldPodKind::Bytes8 => $on_ty!([u8; 8]),
+                BamFieldPodKind::Bytes16 => $on_ty!([u8; 16]),
+            }
+        };
+    }
+
     fn make_named_field(name: &'static str, kind: BamFieldPodKind) -> NamedField {
-        match kind {
-            BamFieldPodKind::Bool => NamedField::new::<bool>(name),
-            BamFieldPodKind::U8 => NamedField::new::<u8>(name),
-            BamFieldPodKind::I8 => NamedField::new::<i8>(name),
-            BamFieldPodKind::U16 => NamedField::new::<u16>(name),
-            BamFieldPodKind::I16 => NamedField::new::<i16>(name),
-            BamFieldPodKind::U32 | BamFieldPodKind::Component => NamedField::new::<u32>(name),
-            BamFieldPodKind::I32 => NamedField::new::<i32>(name),
-            BamFieldPodKind::U64 | BamFieldPodKind::Entity => NamedField::new::<u64>(name),
-            BamFieldPodKind::I64 => NamedField::new::<i64>(name),
-            BamFieldPodKind::F32 => NamedField::new::<f32>(name),
-            BamFieldPodKind::F64 => NamedField::new::<f64>(name),
-            BamFieldPodKind::Usize => NamedField::new::<usize>(name),
-            BamFieldPodKind::Isize => NamedField::new::<isize>(name),
-            BamFieldPodKind::Vec2 => NamedField::new::<[f32; 2]>(name),
-            BamFieldPodKind::Vec3 => NamedField::new::<[f32; 3]>(name),
-            BamFieldPodKind::Vec4 => NamedField::new::<[f32; 4]>(name),
-            BamFieldPodKind::DVec2 => NamedField::new::<[f64; 2]>(name),
-            BamFieldPodKind::DVec3 => NamedField::new::<[f64; 3]>(name),
-            BamFieldPodKind::DVec4 => NamedField::new::<[f64; 4]>(name),
-            BamFieldPodKind::UVec2 => NamedField::new::<[u32; 2]>(name),
-            BamFieldPodKind::UVec3 => NamedField::new::<[u32; 3]>(name),
-            BamFieldPodKind::UVec4 => NamedField::new::<[u32; 4]>(name),
-            BamFieldPodKind::IVec2 => NamedField::new::<[i32; 2]>(name),
-            BamFieldPodKind::IVec3 => NamedField::new::<[i32; 3]>(name),
-            BamFieldPodKind::IVec4 => NamedField::new::<[i32; 4]>(name),
-            BamFieldPodKind::Bytes2 => NamedField::new::<[u8; 2]>(name),
-            BamFieldPodKind::Bytes3 => NamedField::new::<[u8; 3]>(name),
-            BamFieldPodKind::Bytes4 => NamedField::new::<[u8; 4]>(name),
-            BamFieldPodKind::Bytes8 => NamedField::new::<[u8; 8]>(name),
-            BamFieldPodKind::Bytes16 => NamedField::new::<[u8; 16]>(name),
+        macro_rules! named {
+            ($ty:ty) => {
+                NamedField::new::<$ty>(name)
+            };
         }
+        dispatch_non_bool_pod_kind!(kind, named)
     }
 
     /// Borrows a single validated POD field at `field.offset` from `base[0..slot_size]`.
@@ -1512,7 +1470,10 @@ mod bam_field_reflect_pool {
     /// # Safety
     /// - `base` must point to a live `[MaybeUninit<u8>; slot_size]` buffer borrowed for `'a`.
     /// - Bytes in `field.offset..field.offset + field.size` must be initialized for the live component.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "runtime alignment verified via is_multiple_of(align) immediately before cast"
+    )]
     unsafe fn field_ref_from_raw<'a>(
         base: *const MaybeUninit<u8>,
         slot_size: usize,
@@ -1539,44 +1500,14 @@ mod bam_field_reflect_pool {
                 Some(&TRUE_VAL)
             };
         }
-        // SAFETY: Every POD primitive/array arm below verified exact `size == pod_kind.byte_size()`,
-        // bounds `field.offset + field.size <= slot_size`, and runtime alignment
-        // `(raw as usize).is_multiple_of(align)` for the live `'a` component borrow.
-        let r: &'a dyn PartialReflect = unsafe {
-            match field.pod_kind {
-                BamFieldPodKind::Bool => unreachable!(),
-                BamFieldPodKind::U8 => &*raw,
-                BamFieldPodKind::I8 => &*raw.cast::<i8>(),
-                BamFieldPodKind::U16 => &*raw.cast::<u16>(),
-                BamFieldPodKind::I16 => &*raw.cast::<i16>(),
-                BamFieldPodKind::U32 | BamFieldPodKind::Component => &*raw.cast::<u32>(),
-                BamFieldPodKind::I32 => &*raw.cast::<i32>(),
-                BamFieldPodKind::U64 | BamFieldPodKind::Entity => &*raw.cast::<u64>(),
-                BamFieldPodKind::I64 => &*raw.cast::<i64>(),
-                BamFieldPodKind::F32 => &*raw.cast::<f32>(),
-                BamFieldPodKind::F64 => &*raw.cast::<f64>(),
-                BamFieldPodKind::Usize => &*raw.cast::<usize>(),
-                BamFieldPodKind::Isize => &*raw.cast::<isize>(),
-                BamFieldPodKind::Vec2 => &*raw.cast::<[f32; 2]>(),
-                BamFieldPodKind::Vec3 => &*raw.cast::<[f32; 3]>(),
-                BamFieldPodKind::Vec4 => &*raw.cast::<[f32; 4]>(),
-                BamFieldPodKind::DVec2 => &*raw.cast::<[f64; 2]>(),
-                BamFieldPodKind::DVec3 => &*raw.cast::<[f64; 3]>(),
-                BamFieldPodKind::DVec4 => &*raw.cast::<[f64; 4]>(),
-                BamFieldPodKind::UVec2 => &*raw.cast::<[u32; 2]>(),
-                BamFieldPodKind::UVec3 => &*raw.cast::<[u32; 3]>(),
-                BamFieldPodKind::UVec4 => &*raw.cast::<[u32; 4]>(),
-                BamFieldPodKind::IVec2 => &*raw.cast::<[i32; 2]>(),
-                BamFieldPodKind::IVec3 => &*raw.cast::<[i32; 3]>(),
-                BamFieldPodKind::IVec4 => &*raw.cast::<[i32; 4]>(),
-                BamFieldPodKind::Bytes2 => &*raw.cast::<[u8; 2]>(),
-                BamFieldPodKind::Bytes3 => &*raw.cast::<[u8; 3]>(),
-                BamFieldPodKind::Bytes4 => &*raw.cast::<[u8; 4]>(),
-                BamFieldPodKind::Bytes8 => &*raw.cast::<[u8; 8]>(),
-                BamFieldPodKind::Bytes16 => &*raw.cast::<[u8; 16]>(),
-            }
-        };
-        Some(r)
+        macro_rules! cast_ref {
+            ($ty:ty) => {
+                // SAFETY: Verified `size == pod_kind.byte_size()`, `offset + size <= slot_size`,
+                // runtime alignment, and `Bool` already returned above.
+                unsafe { &*raw.cast::<$ty>() as &'a dyn PartialReflect }
+            };
+        }
+        Some(dispatch_non_bool_pod_kind!(field.pod_kind, cast_ref))
     }
 
     /// Mutably borrows a single validated POD field at `field.offset` from `base[0..slot_size]`.
@@ -1584,7 +1515,10 @@ mod bam_field_reflect_pool {
     /// # Safety
     /// - `base` must point to an exclusively borrowed `[MaybeUninit<u8>; slot_size]` buffer for `'a`.
     /// - Bytes in `field.offset..field.offset + field.size` must be initialized for the live component.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "runtime alignment verified via is_multiple_of(align) immediately before cast"
+    )]
     unsafe fn field_mut_from_raw<'a>(
         base: *mut MaybeUninit<u8>,
         slot_size: usize,
@@ -1609,44 +1543,14 @@ mod bam_field_reflect_pool {
                 &mut *raw.cast::<bool>()
             });
         }
-        // SAFETY: Every POD primitive/array arm below verified exact `size == pod_kind.byte_size()`,
-        // bounds `field.offset + field.size <= slot_size`, and runtime alignment
-        // `(raw as usize).is_multiple_of(align)` for the exclusively borrowed `'a` component buffer.
-        let r: &'a mut dyn PartialReflect = unsafe {
-            match field.pod_kind {
-                BamFieldPodKind::Bool => unreachable!(),
-                BamFieldPodKind::U8 => &mut *raw,
-                BamFieldPodKind::I8 => &mut *raw.cast::<i8>(),
-                BamFieldPodKind::U16 => &mut *raw.cast::<u16>(),
-                BamFieldPodKind::I16 => &mut *raw.cast::<i16>(),
-                BamFieldPodKind::U32 | BamFieldPodKind::Component => &mut *raw.cast::<u32>(),
-                BamFieldPodKind::I32 => &mut *raw.cast::<i32>(),
-                BamFieldPodKind::U64 | BamFieldPodKind::Entity => &mut *raw.cast::<u64>(),
-                BamFieldPodKind::I64 => &mut *raw.cast::<i64>(),
-                BamFieldPodKind::F32 => &mut *raw.cast::<f32>(),
-                BamFieldPodKind::F64 => &mut *raw.cast::<f64>(),
-                BamFieldPodKind::Usize => &mut *raw.cast::<usize>(),
-                BamFieldPodKind::Isize => &mut *raw.cast::<isize>(),
-                BamFieldPodKind::Vec2 => &mut *raw.cast::<[f32; 2]>(),
-                BamFieldPodKind::Vec3 => &mut *raw.cast::<[f32; 3]>(),
-                BamFieldPodKind::Vec4 => &mut *raw.cast::<[f32; 4]>(),
-                BamFieldPodKind::DVec2 => &mut *raw.cast::<[f64; 2]>(),
-                BamFieldPodKind::DVec3 => &mut *raw.cast::<[f64; 3]>(),
-                BamFieldPodKind::DVec4 => &mut *raw.cast::<[f64; 4]>(),
-                BamFieldPodKind::UVec2 => &mut *raw.cast::<[u32; 2]>(),
-                BamFieldPodKind::UVec3 => &mut *raw.cast::<[u32; 3]>(),
-                BamFieldPodKind::UVec4 => &mut *raw.cast::<[u32; 4]>(),
-                BamFieldPodKind::IVec2 => &mut *raw.cast::<[i32; 2]>(),
-                BamFieldPodKind::IVec3 => &mut *raw.cast::<[i32; 3]>(),
-                BamFieldPodKind::IVec4 => &mut *raw.cast::<[i32; 4]>(),
-                BamFieldPodKind::Bytes2 => &mut *raw.cast::<[u8; 2]>(),
-                BamFieldPodKind::Bytes3 => &mut *raw.cast::<[u8; 3]>(),
-                BamFieldPodKind::Bytes4 => &mut *raw.cast::<[u8; 4]>(),
-                BamFieldPodKind::Bytes8 => &mut *raw.cast::<[u8; 8]>(),
-                BamFieldPodKind::Bytes16 => &mut *raw.cast::<[u8; 16]>(),
-            }
-        };
-        Some(r)
+        macro_rules! cast_mut {
+            ($ty:ty) => {
+                // SAFETY: Verified `size == pod_kind.byte_size()`, `offset + size <= slot_size`,
+                // runtime alignment, and `Bool` already normalized & returned above.
+                unsafe { &mut *raw.cast::<$ty>() as &'a mut dyn PartialReflect }
+            };
+        }
+        Some(dispatch_non_bool_pod_kind!(field.pod_kind, cast_mut))
     }
 
     fn apply_struct_to_slot(
@@ -1662,7 +1566,7 @@ mod bam_field_reflect_pool {
                 continue;
             };
             let field_meta = &meta.fields[idx];
-            // SAFETY: Caller passed `self.0.as_mut_ptr()` from `&mut self` with length `slot_size`.
+            // SAFETY: Caller passed `base` from `&mut self` with length `slot_size`.
             if let Some(target_field) = unsafe { field_mut_from_raw(base, slot_size, field_meta) } {
                 if field_meta.pod_kind == BamFieldPodKind::Entity
                     && let Some(target_bits) = target_field.try_downcast_mut::<u64>()
@@ -1675,6 +1579,199 @@ mod bam_field_reflect_pool {
             }
         }
         Ok(())
+    }
+
+    macro_rules! impl_bam_field_struct_reflect {
+        (
+            generics: [$($gen:tt)*],
+            target: $ty:ty,
+            slot: |$s_slot:ident| $slot_expr:expr,
+            ptr: |$s_ptr:ident| $ptr_expr:expr,
+            mut_ptr: |$s_mut:ident| $mut_ptr_expr:expr,
+            len: |$s_len:ident| $len_expr:expr,
+            rep_type_info: |$s_ti:ident| $ti_expr:expr,
+            reflect_clone: |$s_cl:ident| $clone_expr:expr,
+            set: |$s_set:ident, $val:ident| $set_expr:expr,
+        ) => {
+            impl<$($gen)*> Struct for $ty {
+                fn field(&self, name: &str) -> Option<&dyn PartialReflect> {
+                    let $s_slot = self;
+                    let idx = slot_core_expect($slot_expr).field_indices.get(name).copied()?;
+                    self.field_at(idx)
+                }
+
+                fn field_mut(&mut self, name: &str) -> Option<&mut dyn PartialReflect> {
+                    let $s_slot = &*self;
+                    let idx = slot_core_expect($slot_expr).field_indices.get(name).copied()?;
+                    self.field_at_mut(idx)
+                }
+
+                fn field_at(&self, index: usize) -> Option<&dyn PartialReflect> {
+                    let $s_slot = self;
+                    let field = slot_core_expect($slot_expr).fields.get(index)?;
+                    let $s_ptr = self;
+                    let base = $ptr_expr;
+                    let $s_len = self;
+                    let len = $len_expr;
+                    // SAFETY: `base` points to `len` live `MaybeUninit<u8>` bytes borrowed for `'_`.
+                    unsafe { field_ref_from_raw(base, len, field) }
+                }
+
+                fn field_at_mut(&mut self, index: usize) -> Option<&mut dyn PartialReflect> {
+                    let $s_slot = &*self;
+                    let field = slot_core_expect($slot_expr).fields.get(index)?;
+                    let $s_len = &*self;
+                    let len = $len_expr;
+                    let $s_mut = self;
+                    let base = $mut_ptr_expr;
+                    // SAFETY: `base` points to `len` exclusively borrowed `MaybeUninit<u8>` bytes.
+                    unsafe { field_mut_from_raw(base, len, field) }
+                }
+
+                fn name_at(&self, index: usize) -> Option<&str> {
+                    let $s_slot = self;
+                    slot_core_expect($slot_expr).fields.get(index).map(|f| f.name)
+                }
+
+                fn index_of_name(&self, name: &str) -> Option<usize> {
+                    let $s_slot = self;
+                    slot_core_expect($slot_expr).field_indices.get(name).copied()
+                }
+
+                fn field_len(&self) -> usize {
+                    let $s_slot = self;
+                    slot_core_expect($slot_expr).fields.len()
+                }
+
+                fn iter_fields(&self) -> FieldIter<'_> {
+                    FieldIter::new(self)
+                }
+            }
+
+            impl<$($gen)*> PartialReflect for $ty {
+                #[inline]
+                fn get_represented_type_info(&self) -> Option<&'static TypeInfo> {
+                    let $s_ti = self;
+                    $ti_expr
+                }
+
+                #[inline]
+                fn into_partial_reflect(self: Box<Self>) -> Box<dyn PartialReflect> {
+                    self
+                }
+
+                #[inline]
+                fn as_partial_reflect(&self) -> &dyn PartialReflect {
+                    self
+                }
+
+                #[inline]
+                fn as_partial_reflect_mut(&mut self) -> &mut dyn PartialReflect {
+                    self
+                }
+
+                #[inline]
+                fn try_into_reflect(
+                    self: Box<Self>,
+                ) -> Result<Box<dyn Reflect>, Box<dyn PartialReflect>> {
+                    Ok(self)
+                }
+
+                #[inline]
+                fn try_as_reflect(&self) -> Option<&dyn Reflect> {
+                    Some(self)
+                }
+
+                #[inline]
+                fn try_as_reflect_mut(&mut self) -> Option<&mut dyn Reflect> {
+                    Some(self)
+                }
+
+                fn try_apply(&mut self, value: &dyn PartialReflect) -> Result<(), ApplyError> {
+                    let $s_slot = &*self;
+                    let slot = $slot_expr;
+                    let $s_len = &*self;
+                    let len = $len_expr;
+                    let $s_mut = self;
+                    apply_struct_to_slot(slot, $mut_ptr_expr, len, value)
+                }
+
+                #[inline]
+                fn reflect_kind(&self) -> ReflectKind {
+                    ReflectKind::Struct
+                }
+
+                #[inline]
+                fn reflect_ref(&self) -> ReflectRef<'_> {
+                    ReflectRef::Struct(self)
+                }
+
+                #[inline]
+                fn reflect_mut(&mut self) -> ReflectMut<'_> {
+                    ReflectMut::Struct(self)
+                }
+
+                #[inline]
+                fn reflect_owned(self: Box<Self>) -> ReflectOwned {
+                    ReflectOwned::Struct(self)
+                }
+
+                fn reflect_clone(&self) -> Result<Box<dyn Reflect>, ReflectCloneError> {
+                    let $s_cl = self;
+                    $clone_expr
+                }
+
+                fn reflect_partial_eq(&self, value: &dyn PartialReflect) -> Option<bool> {
+                    struct_partial_eq(self, value)
+                }
+
+                fn reflect_partial_cmp(&self, value: &dyn PartialReflect) -> Option<Ordering> {
+                    struct_partial_cmp(self, value)
+                }
+
+                fn debug(&self, f: &mut Formatter<'_>) -> fmt::Result {
+                    struct_debug(self, f)
+                }
+            }
+
+            impl<$($gen)*> Reflect for $ty {
+                #[inline]
+                fn into_any(self: Box<Self>) -> Box<dyn Any> {
+                    self
+                }
+
+                #[inline]
+                fn as_any(&self) -> &dyn Any {
+                    self
+                }
+
+                #[inline]
+                fn as_any_mut(&mut self) -> &mut dyn Any {
+                    self
+                }
+
+                #[inline]
+                fn into_reflect(self: Box<Self>) -> Box<dyn Reflect> {
+                    self
+                }
+
+                #[inline]
+                fn as_reflect(&self) -> &dyn Reflect {
+                    self
+                }
+
+                #[inline]
+                fn as_reflect_mut(&mut self) -> &mut dyn Reflect {
+                    self
+                }
+
+                fn set(&mut self, value: Box<dyn Reflect>) -> Result<(), Box<dyn Reflect>> {
+                    let $s_set = self;
+                    let $val = value;
+                    $set_expr
+                }
+            }
+        };
     }
 
     impl<const SLOT: usize, const SIZE: usize> TypePath for BamFieldReflectSlot<SLOT, SIZE> {
@@ -1705,179 +1802,41 @@ mod bam_field_reflect_pool {
         }
     }
 
-    impl<const SLOT: usize, const SIZE: usize> Struct for BamFieldReflectSlot<SLOT, SIZE> {
-        fn field(&self, name: &str) -> Option<&dyn PartialReflect> {
-            let idx = slot_core_expect(SLOT).field_indices.get(name).copied()?;
-            self.field_at(idx)
-        }
-
-        fn field_mut(&mut self, name: &str) -> Option<&mut dyn PartialReflect> {
-            let idx = slot_core_expect(SLOT).field_indices.get(name).copied()?;
-            self.field_at_mut(idx)
-        }
-
-        fn field_at(&self, index: usize) -> Option<&dyn PartialReflect> {
-            let field = slot_core_expect(SLOT).fields.get(index)?;
-            // SAFETY: `self.0` is a live `[MaybeUninit<u8>; SIZE]` borrowed for `'_`.
-            unsafe { field_ref_from_raw(self.0.as_ptr(), SIZE, field) }
-        }
-
-        fn field_at_mut(&mut self, index: usize) -> Option<&mut dyn PartialReflect> {
-            let field = slot_core_expect(SLOT).fields.get(index)?;
-            // SAFETY: `self.0` is an exclusively borrowed `[MaybeUninit<u8>; SIZE]` for `'_`.
-            unsafe { field_mut_from_raw(self.0.as_mut_ptr(), SIZE, field) }
-        }
-
-        fn name_at(&self, index: usize) -> Option<&str> {
-            slot_core_expect(SLOT).fields.get(index).map(|f| f.name)
-        }
-
-        fn index_of_name(&self, name: &str) -> Option<usize> {
-            slot_core_expect(SLOT).field_indices.get(name).copied()
-        }
-
-        fn field_len(&self) -> usize {
-            slot_core_expect(SLOT).fields.len()
-        }
-
-        fn iter_fields(&self) -> FieldIter<'_> {
-            FieldIter::new(self)
-        }
-    }
-
-    impl<const SLOT: usize, const SIZE: usize> PartialReflect for BamFieldReflectSlot<SLOT, SIZE> {
-        #[inline]
-        fn get_represented_type_info(&self) -> Option<&'static TypeInfo> {
-            Some(Self::type_info())
-        }
-
-        #[inline]
-        fn into_partial_reflect(self: Box<Self>) -> Box<dyn PartialReflect> {
-            self
-        }
-
-        #[inline]
-        fn as_partial_reflect(&self) -> &dyn PartialReflect {
-            self
-        }
-
-        #[inline]
-        fn as_partial_reflect_mut(&mut self) -> &mut dyn PartialReflect {
-            self
-        }
-
-        #[inline]
-        fn try_into_reflect(self: Box<Self>) -> Result<Box<dyn Reflect>, Box<dyn PartialReflect>> {
-            Ok(self)
-        }
-
-        #[inline]
-        fn try_as_reflect(&self) -> Option<&dyn Reflect> {
-            Some(self)
-        }
-
-        #[inline]
-        fn try_as_reflect_mut(&mut self) -> Option<&mut dyn Reflect> {
-            Some(self)
-        }
-
-        fn try_apply(&mut self, value: &dyn PartialReflect) -> Result<(), ApplyError> {
-            apply_struct_to_slot(SLOT, self.0.as_mut_ptr(), SIZE, value)
-        }
-
-        #[inline]
-        fn reflect_kind(&self) -> ReflectKind {
-            ReflectKind::Struct
-        }
-
-        #[inline]
-        fn reflect_ref(&self) -> ReflectRef<'_> {
-            ReflectRef::Struct(self)
-        }
-
-        #[inline]
-        fn reflect_mut(&mut self) -> ReflectMut<'_> {
-            ReflectMut::Struct(self)
-        }
-
-        #[inline]
-        fn reflect_owned(self: Box<Self>) -> ReflectOwned {
-            ReflectOwned::Struct(self)
-        }
-
-        fn reflect_clone(&self) -> Result<Box<dyn Reflect>, ReflectCloneError> {
+    impl_bam_field_struct_reflect! {
+        generics: [const SLOT: usize, const SIZE: usize],
+        target: BamFieldReflectSlot<SLOT, SIZE>,
+        slot: |_s| SLOT,
+        ptr: |s| s.0.as_ptr(),
+        mut_ptr: |s| s.0.as_mut_ptr(),
+        len: |_s| SIZE,
+        rep_type_info: |_s| Some(Self::type_info()),
+        reflect_clone: |s| {
             let meta = slot_core_expect(SLOT);
             if meta.is_abi_pod && !meta.has_drop {
-                // SAFETY: `self.0` holds `SIZE` live `MaybeUninit<u8>` bytes for `SLOT`.
-                let owned =
-                    unsafe { OwnedBamFieldStruct::from_raw_bytes(SLOT, self.0.as_ptr(), SIZE) };
+                // SAFETY: `s.0` holds `SIZE` live `MaybeUninit<u8>` bytes for `SLOT`.
+                let owned = unsafe { OwnedBamFieldStruct::from_raw_bytes(SLOT, s.0.as_ptr(), SIZE) };
                 Ok(Box::new(owned))
             } else {
                 Err(ReflectCloneError::NotCloneable {
                     type_path: meta.type_path.into(),
                 })
             }
-        }
-
-        fn reflect_partial_eq(&self, value: &dyn PartialReflect) -> Option<bool> {
-            struct_partial_eq(self, value)
-        }
-
-        fn reflect_partial_cmp(&self, value: &dyn PartialReflect) -> Option<Ordering> {
-            struct_partial_cmp(self, value)
-        }
-
-        fn debug(&self, f: &mut Formatter<'_>) -> fmt::Result {
-            struct_debug(self, f)
-        }
-    }
-
-    impl<const SLOT: usize, const SIZE: usize> Reflect for BamFieldReflectSlot<SLOT, SIZE> {
-        #[inline]
-        fn into_any(self: Box<Self>) -> Box<dyn Any> {
-            self
-        }
-
-        #[inline]
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        #[inline]
-        fn as_any_mut(&mut self) -> &mut dyn Any {
-            self
-        }
-
-        #[inline]
-        fn into_reflect(self: Box<Self>) -> Box<dyn Reflect> {
-            self
-        }
-
-        #[inline]
-        fn as_reflect(&self) -> &dyn Reflect {
-            self
-        }
-
-        #[inline]
-        fn as_reflect_mut(&mut self) -> &mut dyn Reflect {
-            self
-        }
-
-        fn set(&mut self, value: Box<dyn Reflect>) -> Result<(), Box<dyn Reflect>> {
+        },
+        set: |s, value| {
             match value.take::<Self>() {
                 Ok(concrete) => {
-                    *self = concrete;
+                    *s = concrete;
                     Ok(())
                 }
                 Err(other) => {
-                    if self.try_apply(other.as_partial_reflect()).is_ok() {
+                    if s.try_apply(other.as_partial_reflect()).is_ok() {
                         Ok(())
                     } else {
                         Err(other)
                     }
                 }
             }
-        }
+        },
     }
 
     /// Heap-owned, 8-byte-aligned reflected copy of a [`BamFieldReflectSlot`] component returned
@@ -1953,207 +1912,39 @@ mod bam_field_reflect_pool {
         }
     }
 
-    impl Struct for OwnedBamFieldStruct {
-        fn field(&self, name: &str) -> Option<&dyn PartialReflect> {
-            let idx = slot_core_expect(self.slot)
-                .field_indices
-                .get(name)
-                .copied()?;
-            self.field_at(idx)
-        }
-
-        fn field_mut(&mut self, name: &str) -> Option<&mut dyn PartialReflect> {
-            let idx = slot_core_expect(self.slot)
-                .field_indices
-                .get(name)
-                .copied()?;
-            self.field_at_mut(idx)
-        }
-
-        fn field_at(&self, index: usize) -> Option<&dyn PartialReflect> {
-            let field = slot_core_expect(self.slot).fields.get(index)?;
-            // SAFETY: `self.storage` is 8-byte aligned and owns at least `self.byte_len` bytes.
-            unsafe {
-                field_ref_from_raw(
-                    self.storage.as_ptr().cast::<MaybeUninit<u8>>(),
-                    self.byte_len,
-                    field,
-                )
-            }
-        }
-
-        fn field_at_mut(&mut self, index: usize) -> Option<&mut dyn PartialReflect> {
-            let field = slot_core_expect(self.slot).fields.get(index)?;
-            // SAFETY: `self.storage` is 8-byte aligned and exclusively borrowed for `'_`.
-            unsafe {
-                field_mut_from_raw(
-                    self.storage.as_mut_ptr().cast::<MaybeUninit<u8>>(),
-                    self.byte_len,
-                    field,
-                )
-            }
-        }
-
-        fn name_at(&self, index: usize) -> Option<&str> {
-            slot_core_expect(self.slot)
-                .fields
-                .get(index)
-                .map(|f| f.name)
-        }
-
-        fn index_of_name(&self, name: &str) -> Option<usize> {
-            slot_core_expect(self.slot).field_indices.get(name).copied()
-        }
-
-        fn field_len(&self) -> usize {
-            slot_core_expect(self.slot).fields.len()
-        }
-
-        fn iter_fields(&self) -> FieldIter<'_> {
-            FieldIter::new(self)
-        }
-    }
-
-    impl PartialReflect for OwnedBamFieldStruct {
-        #[inline]
-        fn get_represented_type_info(&self) -> Option<&'static TypeInfo> {
-            SLOT_CELLS[self.slot].type_info.get().copied()
-        }
-
-        #[inline]
-        fn into_partial_reflect(self: Box<Self>) -> Box<dyn PartialReflect> {
-            self
-        }
-
-        #[inline]
-        fn as_partial_reflect(&self) -> &dyn PartialReflect {
-            self
-        }
-
-        #[inline]
-        fn as_partial_reflect_mut(&mut self) -> &mut dyn PartialReflect {
-            self
-        }
-
-        #[inline]
-        fn try_into_reflect(self: Box<Self>) -> Result<Box<dyn Reflect>, Box<dyn PartialReflect>> {
-            Ok(self)
-        }
-
-        #[inline]
-        fn try_as_reflect(&self) -> Option<&dyn Reflect> {
-            Some(self)
-        }
-
-        #[inline]
-        fn try_as_reflect_mut(&mut self) -> Option<&mut dyn Reflect> {
-            Some(self)
-        }
-
-        fn try_apply(&mut self, value: &dyn PartialReflect) -> Result<(), ApplyError> {
-            apply_struct_to_slot(
-                self.slot,
-                self.storage.as_mut_ptr().cast::<MaybeUninit<u8>>(),
-                self.byte_len,
-                value,
-            )
-        }
-
-        #[inline]
-        fn reflect_kind(&self) -> ReflectKind {
-            ReflectKind::Struct
-        }
-
-        #[inline]
-        fn reflect_ref(&self) -> ReflectRef<'_> {
-            ReflectRef::Struct(self)
-        }
-
-        #[inline]
-        fn reflect_mut(&mut self) -> ReflectMut<'_> {
-            ReflectMut::Struct(self)
-        }
-
-        #[inline]
-        fn reflect_owned(self: Box<Self>) -> ReflectOwned {
-            ReflectOwned::Struct(self)
-        }
-
-        fn reflect_clone(&self) -> Result<Box<dyn Reflect>, ReflectCloneError> {
-            Ok(Box::new(self.clone_aligned()))
-        }
-
-        fn reflect_partial_eq(&self, value: &dyn PartialReflect) -> Option<bool> {
-            struct_partial_eq(self, value)
-        }
-
-        fn reflect_partial_cmp(&self, value: &dyn PartialReflect) -> Option<Ordering> {
-            struct_partial_cmp(self, value)
-        }
-
-        fn debug(&self, f: &mut Formatter<'_>) -> fmt::Result {
-            struct_debug(self, f)
-        }
-    }
-
-    impl DynamicTyped for OwnedBamFieldStruct {
-        #[inline]
-        fn reflect_type_info(&self) -> &'static TypeInfo {
-            SLOT_CELLS[self.slot]
-                .type_info
-                .get()
-                .expect("OwnedBamFieldStruct slot TypeInfo must be initialized")
-        }
-    }
-
-    impl Reflect for OwnedBamFieldStruct {
-        #[inline]
-        fn into_any(self: Box<Self>) -> Box<dyn Any> {
-            self
-        }
-
-        #[inline]
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        #[inline]
-        fn as_any_mut(&mut self) -> &mut dyn Any {
-            self
-        }
-
-        #[inline]
-        fn into_reflect(self: Box<Self>) -> Box<dyn Reflect> {
-            self
-        }
-
-        #[inline]
-        fn as_reflect(&self) -> &dyn Reflect {
-            self
-        }
-
-        #[inline]
-        fn as_reflect_mut(&mut self) -> &mut dyn Reflect {
-            self
-        }
-
-        fn set(&mut self, value: Box<dyn Reflect>) -> Result<(), Box<dyn Reflect>> {
+    impl_bam_field_struct_reflect! {
+        generics: [],
+        target: OwnedBamFieldStruct,
+        slot: |s| s.slot,
+        ptr: |s| s.storage.as_ptr().cast::<MaybeUninit<u8>>(),
+        mut_ptr: |s| s.storage.as_mut_ptr().cast::<MaybeUninit<u8>>(),
+        len: |s| s.byte_len,
+        rep_type_info: |s| SLOT_CELLS[s.slot].type_info.get().copied(),
+        reflect_clone: |s| Ok(Box::new(s.clone_aligned())),
+        set: |s, value| {
             match value.take::<Self>() {
                 Ok(concrete)
-                    if concrete.slot == self.slot && concrete.byte_len == self.byte_len =>
+                    if concrete.slot == s.slot && concrete.byte_len == s.byte_len =>
                 {
-                    *self = concrete;
+                    *s = concrete;
                     Ok(())
                 }
                 Ok(other) => Err(Box::new(other)),
                 Err(other) => {
-                    if self.try_apply(other.as_partial_reflect()).is_ok() {
+                    if s.try_apply(other.as_partial_reflect()).is_ok() {
                         Ok(())
                     } else {
                         Err(other)
                     }
                 }
             }
+        },
+    }
+
+    impl DynamicTyped for OwnedBamFieldStruct {
+        #[inline]
+        fn reflect_type_info(&self) -> &'static TypeInfo {
+            slot_type_info_expect(self.slot)
         }
     }
 
@@ -2181,13 +1972,12 @@ mod bam_field_reflect_pool {
         if !verify_world_component_info(entity.world(), meta) {
             return;
         }
-        let Ok(buf) = AlignedScratchBuffer::new_zeroed(meta.component_size, meta.component_align)
-        else {
+        let Ok(buf) = AlignedBuf::new_zeroed(meta.component_size, meta.component_align) else {
             return;
         };
         if apply_struct_to_slot(
             slot,
-            buf.ptr.cast::<MaybeUninit<u8>>(),
+            buf.as_mut_ptr().cast::<MaybeUninit<u8>>(),
             slot_size,
             reflected,
         )
@@ -2195,7 +1985,7 @@ mod bam_field_reflect_pool {
         {
             return;
         }
-        let nn = buf.non_null_u8();
+        let nn = buf.non_null();
         // SAFETY: `nn` holds `meta.component_size` aligned initialized POD bytes matching `meta.component_id`.
         let owning = unsafe { OwningPtr::new(nn) };
         // SAFETY: Verified `meta.component_id` layout & name match `entity.world()` above.
@@ -2228,22 +2018,21 @@ mod bam_field_reflect_pool {
         let Ok(src_ptr) = src_ref.get_by_id(meta.component_id) else {
             return;
         };
-        let Ok(buf) = AlignedScratchBuffer::new_zeroed(meta.component_size, meta.component_align)
-        else {
+        let Ok(buf) = AlignedBuf::new_zeroed(meta.component_size, meta.component_align) else {
             return;
         };
         if meta.component_size > 0 {
-            // SAFETY: Both `src_ptr` and `buf.ptr` hold `meta.component_size` bytes as `MaybeUninit<u8>`.
+            // SAFETY: Both `src_ptr` and `buf.as_mut_ptr()` hold `meta.component_size` bytes as `MaybeUninit<u8>`.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     src_ptr.as_ptr().cast::<MaybeUninit<u8>>(),
-                    buf.ptr.cast::<MaybeUninit<u8>>(),
+                    buf.as_mut_ptr().cast::<MaybeUninit<u8>>(),
                     meta.component_size,
                 );
             }
         }
         if let Ok(mut dst_mut) = dst_world.get_entity_mut(dst_ent) {
-            let nn = buf.non_null_u8();
+            let nn = buf.non_null();
             // SAFETY: `nn` holds `meta.component_size` aligned POD bytes matching `meta.component_id`.
             let owning = unsafe { OwningPtr::new(nn) };
             // SAFETY: Verified `meta.component_id` layout matches `dst_world` above.
@@ -2595,11 +2384,15 @@ mod bam_field_reflect_pool {
         entry: &RegisteredComponent,
         validated_fields: &[BamFieldDescriptor],
     ) -> Result<Option<TypeId>, FfiResult> {
-        let inplace_fields: Vec<&BamFieldDescriptor> = validated_fields
+        let inplace_fields: Vec<(&BamFieldDescriptor, BamFieldPodKind)> = validated_fields
             .iter()
-            .filter(|f| f.pod_kind.is_some())
+            .filter_map(|f| f.pod_kind.map(|pk| (f, pk)))
             .collect();
-        if inplace_fields.is_empty() || inplace_fields.iter().any(|f| !f.is_inplace_reflectable) {
+        if inplace_fields.is_empty()
+            || inplace_fields
+                .iter()
+                .any(|(f, _)| !f.is_inplace_reflectable)
+        {
             return Ok(None);
         }
 
@@ -2613,7 +2406,7 @@ mod bam_field_reflect_pool {
 
         let max_field_end = inplace_fields
             .iter()
-            .filter_map(|f| f.offset.checked_add(f.size))
+            .filter_map(|(f, _)| f.offset.checked_add(f.size))
             .max()
             .unwrap_or(0);
         if max_field_end > entry.size {
@@ -2632,14 +2425,12 @@ mod bam_field_reflect_pool {
             has_drop: entry.drop_fn.is_some() || entry.drop_slot.is_some(),
             fields: inplace_fields
                 .iter()
-                .map(|f| (f.name.clone(), f.pod_kind.unwrap(), f.offset, f.size))
+                .map(|(f, pk)| (f.name.clone(), *pk, f.offset, f.size))
                 .collect(),
         };
 
         let slot_idx = {
-            let mut guard = allocator()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut guard = crate::handle_header::lock_unpoison(allocator());
             if let Some(&existing) = guard.by_key.get(&key) {
                 Some(existing)
             } else {
@@ -2673,9 +2464,8 @@ mod bam_field_reflect_pool {
                     let mut slot_fields = Vec::with_capacity(inplace_fields.len());
                     let mut field_indices = HashMap::with_capacity(inplace_fields.len());
                     let mut named_fields = Vec::with_capacity(inplace_fields.len());
-                    for (field_ord, f) in inplace_fields.iter().enumerate() {
+                    for (field_ord, &(f, pk)) in inplace_fields.iter().enumerate() {
                         let name_static: &'static str = Box::leak(f.name.clone().into_boxed_str());
-                        let pk = f.pod_kind.unwrap();
                         slot_fields.push(BamReflectSlotField {
                             name: name_static,
                             pod_kind: pk,
@@ -2721,9 +2511,7 @@ mod bam_field_reflect_pool {
         let desc = &SLOT_DESCRIPTORS[idx];
         let type_id = (desc.type_id)();
 
-        if !world.contains_resource::<AppTypeRegistry>() {
-            world.insert_resource(AppTypeRegistry::default());
-        }
+        world.init_resource::<AppTypeRegistry>();
         let app_types = world.resource::<AppTypeRegistry>().clone();
         let mut types = app_types.write();
         if !types.contains(type_id) {
@@ -2902,9 +2690,7 @@ pub fn ensure_component_in_target_world(
         .cloned()
         .ok_or(FfiResult::INVALID_COMPONENT)?;
 
-    if !target_world.contains_resource::<ModRegistry>() {
-        target_world.insert_resource(ModRegistry::new());
-    }
+    target_world.init_resource::<ModRegistry>();
     if let Some(existing) = target_world
         .resource::<ModRegistry>()
         .get_by_uuid(&entry.uuid)
@@ -2965,7 +2751,17 @@ pub fn ensure_component_in_target_world(
     );
     let _ = target_world
         .resource_mut::<ModRegistry>()
-        .register_dynamic_component_owned(target_cid, &desc, &entry.name, entry.owner, None);
+        .register_dynamic_component(DynamicComponentReg {
+            comp_id: target_cid,
+            desc: &desc,
+            name: &entry.name,
+            owner: entry.owner,
+            drop_slot: None,
+            required_components: Box::new([]),
+            schema_fingerprint: 0,
+            fields: std::sync::Arc::from([]),
+            owned_field_strings: None,
+        });
     Ok(target_cid)
 }
 
@@ -3008,20 +2804,20 @@ pub fn extract_component_between_worlds(
         && entry.drop_fn.is_none()
         && let Some(insert_raw) = entry.insert_raw_fn
     {
-        let buf = AlignedScratchBuffer::new_zeroed(entry.size, entry.align)?;
+        let buf = AlignedBuf::new_zeroed(entry.size, entry.align)?;
         if entry.size > 0 {
             // SAFETY: Copying as `MaybeUninit<u8>` preserves any struct padding bytes without UB.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     src_ptr.as_ptr().cast::<MaybeUninit<u8>>(),
-                    buf.ptr.cast::<MaybeUninit<u8>>(),
+                    buf.as_mut_ptr().cast::<MaybeUninit<u8>>(),
                     entry.size,
                 );
             }
         }
         // SAFETY: `buf` holds `entry.size` aligned bytes copied from a live `T` in `source_world`.
         unsafe {
-            insert_raw(target_world, target_entity, buf.non_null_u8().as_ptr());
+            insert_raw(target_world, target_entity, buf.non_null().as_ptr());
         }
         return Ok(true);
     }
@@ -3029,7 +2825,7 @@ pub fn extract_component_between_worlds(
     let target_cid = ensure_component_in_target_world(source_world, target_world, component)?;
     let layout = Layout::from_size_align(entry.size, entry.align.max(1))
         .map_err(|_| FfiResult::INVALID_ARGUMENT)?;
-    let buf = AlignedScratchBuffer::new_zeroed(entry.size, entry.align)?;
+    let buf = AlignedBuf::new_zeroed(entry.size, entry.align)?;
 
     let active_clone: Option<(ComponentCloneFn, *mut c_void)> = source_world
         .get_resource::<DynamicComponentHookMap>()
@@ -3056,7 +2852,7 @@ pub fn extract_component_between_worlds(
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     src_ptr.as_ptr().cast::<MaybeUninit<u8>>(),
-                    buf.ptr.cast::<MaybeUninit<u8>>(),
+                    buf.as_mut_ptr().cast::<MaybeUninit<u8>>(),
                     entry.size,
                 );
             }
@@ -3068,7 +2864,7 @@ pub fn extract_component_between_worlds(
     let mut dst_ent = target_world
         .get_entity_mut(target_entity)
         .map_err(|_| FfiResult::INVALID_ENTITY)?;
-    let nn = buf.non_null_u8();
+    let nn = buf.non_null();
     // SAFETY: `nn` holds `entry.size` aligned initialized bytes matching `target_cid`.
     let owning = unsafe { OwningPtr::new(nn) };
     // SAFETY: `target_cid` was registered in `target_world` with `(entry.size, entry.align)`.
@@ -3106,13 +2902,13 @@ pub fn extract_resource_between_worlds(
     };
 
     let target_cid = ensure_component_in_target_world(source_world, target_world, resource)?;
-    let buf = AlignedScratchBuffer::new_zeroed(entry.size, entry.align)?;
+    let buf = AlignedBuf::new_zeroed(entry.size, entry.align)?;
     if entry.size > 0 {
         // SAFETY: `entry.is_abi_pod` with no `drop_fn` is bitwise copyable across `entry.size` bytes.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 src_ptr.as_ptr().cast::<MaybeUninit<u8>>(),
-                buf.ptr.cast::<MaybeUninit<u8>>(),
+                buf.as_mut_ptr().cast::<MaybeUninit<u8>>(),
                 entry.size,
             );
         }
@@ -3124,7 +2920,7 @@ pub fn extract_resource_between_worlds(
             // SAFETY: Both buffers have `entry.size` aligned POD bytes and do not overlap.
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    buf.ptr.cast::<MaybeUninit<u8>>(),
+                    buf.as_mut_ptr().cast::<MaybeUninit<u8>>(),
                     ptr_mut.as_ptr().cast::<MaybeUninit<u8>>(),
                     entry.size,
                 );
@@ -3137,7 +2933,7 @@ pub fn extract_resource_between_worlds(
     let mut ent_mut = target_world
         .get_entity_mut(res_ent)
         .map_err(|_| FfiResult::INVALID_STATE)?;
-    let nn = buf.non_null_u8();
+    let nn = buf.non_null();
     // SAFETY: `nn` holds `entry.size` aligned POD bytes matching `target_cid`.
     let owning = unsafe { OwningPtr::new(nn) };
     // SAFETY: `target_cid` was registered in `target_world` with `(entry.size, entry.align)`.
@@ -3148,695 +2944,5 @@ pub fn extract_resource_between_worlds(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::registry::ComponentOptions;
-    use bevy_abi_mod_macros::ModComponent;
-    use bevy_abi_mod_sys::{ComponentDesc, ComponentUuid};
-    use bevy_ecs::component::Component;
-
-    #[derive(Component, Default, Debug, PartialEq, ModComponent)]
-    #[mod_component(name = "bridge_test::BioCard")]
-    struct BioCard {
-        title: String,
-        level: u32,
-        active: bool,
-    }
-
-    #[repr(C)]
-    #[derive(Component, Clone, Copy, Default, Debug, PartialEq, ModComponent)]
-    #[mod_component(name = "bridge_test::TintUniform")]
-    struct TintUniform {
-        rgba: [f32; 4],
-    }
-
-    #[test]
-    fn witness_field_introspection_export_apply_and_insert_work_under_miri() {
-        let mut world = World::new();
-        let cid = world.register_component::<BioCard>();
-        let mut reg = ModRegistry::new();
-        let handle = reg
-            .register_component::<BioCard>(cid, ComponentOptions::new().with_default())
-            .unwrap();
-        world.insert_resource(reg);
-
-        let fields_meta = inspect_component_witness_fields(&world, handle).unwrap();
-        assert_eq!(fields_meta.len(), 3);
-        assert_eq!(fields_meta[0].name, "title");
-        assert_eq!(fields_meta[0].type_tag, "String");
-        assert_eq!(fields_meta[1].name, "level");
-        assert_eq!(fields_meta[1].type_tag, "u32");
-        assert_eq!(fields_meta[2].name, "active");
-        assert_eq!(fields_meta[2].type_tag, "bool");
-
-        let ent = world.spawn_empty().id();
-        let init_fields = vec![
-            ExportedFieldRecord {
-                field_name: "title".to_owned(),
-                type_tag: "String".to_owned(),
-                bytes: b"Alchemist".to_vec(),
-            },
-            ExportedFieldRecord {
-                field_name: "level".to_owned(),
-                type_tag: "u32".to_owned(),
-                bytes: 42u32.to_ne_bytes().to_vec(),
-            },
-            ExportedFieldRecord {
-                field_name: "active".to_owned(),
-                type_tag: "bool".to_owned(),
-                bytes: vec![1u8],
-            },
-        ];
-        insert_or_apply_entity_component_fields(&mut world, ent, handle, &init_fields).unwrap();
-        assert_eq!(
-            world.entity(ent).get::<BioCard>().unwrap(),
-            &BioCard {
-                title: "Alchemist".to_owned(),
-                level: 42,
-                active: true,
-            }
-        );
-
-        let exported = export_entity_component_fields(&world, ent, handle).unwrap();
-        assert_eq!(exported.len(), 3);
-        assert_eq!(exported[0].bytes, b"Alchemist");
-
-        let patch = vec![ExportedFieldRecord {
-            field_name: "level".to_owned(),
-            type_tag: "u16".to_owned(), // lossless numeric widening u16 -> u32
-            bytes: 99u16.to_ne_bytes().to_vec(),
-        }];
-        apply_entity_component_fields(&mut world, ent, handle, &patch).unwrap();
-        assert_eq!(world.entity(ent).get::<BioCard>().unwrap().level, 99);
-    }
-
-    #[test]
-    fn cross_world_extract_copies_host_and_dynamic_pod_components_and_resources() {
-        let mut main_world = World::new();
-        let mut sub_world = World::new();
-
-        let tint_cid = main_world.register_component::<TintUniform>();
-        let mut reg = ModRegistry::new();
-        let tint_h = reg
-            .register_component::<TintUniform>(tint_cid, ComponentOptions::new().with_raw_insert())
-            .unwrap();
-
-        // Register a dynamic POD component and dynamic POD resource in `main_world`.
-        let dyn_layout = Layout::from_size_align(8, 4).unwrap();
-        // SAFETY: Valid POD layout with `drop = None`.
-        let dyn_cid = main_world.register_component_with_descriptor(unsafe {
-            ComponentDescriptor::new_with_layout(
-                "bridge_test::DynUvScale".to_owned(),
-                StorageType::Table,
-                dyn_layout,
-                None,
-                true,
-                false,
-                ComponentCloneBehavior::Default,
-                None,
-            )
-        });
-        let dyn_desc = ComponentDesc::new(
-            c"bridge_test::DynUvScale".as_ptr(),
-            ComponentUuid::from_parts("bridge_test::DynUvScale", 8, 4, 0),
-            8,
-            4,
-        );
-        let dyn_h = reg
-            .register_dynamic_component_owned(
-                dyn_cid,
-                &dyn_desc,
-                "bridge_test::DynUvScale",
-                None,
-                None,
-            )
-            .unwrap();
-
-        main_world.insert_resource(reg);
-
-        let src_e = main_world
-            .spawn(TintUniform {
-                rgba: [0.25, 0.5, 0.75, 1.0],
-            })
-            .id();
-        write_entity_pod_bytes(&mut main_world, src_e, dyn_h, &[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
-
-        let dst_e = sub_world.spawn_empty().id();
-        assert!(
-            extract_component_between_worlds(&main_world, &mut sub_world, src_e, dst_e, tint_h)
-                .unwrap()
-        );
-        assert!(
-            extract_component_between_worlds(&main_world, &mut sub_world, src_e, dst_e, dyn_h)
-                .unwrap()
-        );
-
-        assert_eq!(
-            sub_world.entity(dst_e).get::<TintUniform>().unwrap().rgba,
-            [0.25, 0.5, 0.75, 1.0]
-        );
-        let sub_dyn_h = sub_world
-            .resource::<ModRegistry>()
-            .get_by_name("bridge_test::DynUvScale")
-            .unwrap()
-            .handle;
-        assert_eq!(
-            read_entity_pod_bytes(&sub_world, dst_e, sub_dyn_h).unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8]
-        );
-    }
-
-    #[test]
-    fn bam_field_desc_validation_rejects_oob_misaligned_duplicate_and_size_mismatch() {
-        use bevy_abi_mod_sys::{BamFieldDesc, BamFieldKind, StrView};
-
-        fn register_with_fields(
-            world: &mut World,
-            reg: &mut ModRegistry,
-            name: &'static str,
-            c_name: &'static core::ffi::CStr,
-            size: usize,
-            align: usize,
-            fields: &[BamFieldDesc],
-        ) -> BamComponent {
-            let layout = Layout::from_size_align(size, align).unwrap();
-            // SAFETY: Valid POD layout with `drop = None`.
-            let cid = world.register_component_with_descriptor(unsafe {
-                ComponentDescriptor::new_with_layout(
-                    name.to_owned(),
-                    StorageType::Table,
-                    layout,
-                    None,
-                    true,
-                    false,
-                    ComponentCloneBehavior::Default,
-                    None,
-                )
-            });
-            let desc = ComponentDesc::new(
-                c_name.as_ptr(),
-                ComponentUuid::from_parts(name, size, align, 0),
-                size,
-                align,
-            )
-            .with_fields(fields.as_ptr(), fields.len());
-            reg.register_dynamic_component_owned(cid, &desc, name, None, None)
-                .unwrap()
-        }
-
-        let mut world = World::new();
-        let mut reg = ModRegistry::new();
-
-        // 1. Out-of-bounds offset (`offset + size > entry.size`)
-        let oob_fields = [BamFieldDesc::new(
-            BamFieldKind::U32,
-            StrView::from_str("oob"),
-            StrView::from_str("u32"),
-            8,
-            4,
-            4,
-        )];
-        let h_oob = register_with_fields(
-            &mut world,
-            &mut reg,
-            "val_test::Oob",
-            c"val_test::Oob",
-            8,
-            4,
-            &oob_fields,
-        );
-        assert_eq!(
-            inspect_component_bam_fields_in_registry(&reg, h_oob),
-            Err(FfiResult::OUT_OF_RANGE)
-        );
-
-        // 2. Misaligned offset (`offset % align != 0`)
-        let misalign_fields = [BamFieldDesc::new(
-            BamFieldKind::U32,
-            StrView::from_str("bad_off"),
-            StrView::from_str("u32"),
-            2,
-            4,
-            4,
-        )];
-        let h_misaligned = register_with_fields(
-            &mut world,
-            &mut reg,
-            "val_test::Misaligned",
-            c"val_test::Misaligned",
-            8,
-            4,
-            &misalign_fields,
-        );
-        assert_eq!(
-            inspect_component_bam_fields_in_registry(&reg, h_misaligned),
-            Err(FfiResult::INVALID_ARGUMENT)
-        );
-
-        // 3. Primitive size mismatch (`U32` with size 2)
-        let bad_size_fields = [BamFieldDesc::new(
-            BamFieldKind::U32,
-            StrView::from_str("short_u32"),
-            StrView::from_str("u32"),
-            0,
-            2,
-            2,
-        )];
-        let h_sz = register_with_fields(
-            &mut world,
-            &mut reg,
-            "val_test::BadSize",
-            c"val_test::BadSize",
-            8,
-            4,
-            &bad_size_fields,
-        );
-        assert_eq!(
-            inspect_component_bam_fields_in_registry(&reg, h_sz),
-            Err(FfiResult::INVALID_ARGUMENT)
-        );
-
-        // 4. Duplicate field names
-        let dup_fields = [
-            BamFieldDesc::new(
-                BamFieldKind::F32,
-                StrView::from_str("x"),
-                StrView::from_str("f32"),
-                0,
-                4,
-                4,
-            ),
-            BamFieldDesc::new(
-                BamFieldKind::F32,
-                StrView::from_str("x"),
-                StrView::from_str("f32"),
-                4,
-                4,
-                4,
-            ),
-        ];
-        let h_dup = register_with_fields(
-            &mut world,
-            &mut reg,
-            "val_test::Dup",
-            c"val_test::Dup",
-            8,
-            4,
-            &dup_fields,
-        );
-        assert_eq!(
-            inspect_component_bam_fields_in_registry(&reg, h_dup),
-            Err(FfiResult::INVALID_ARGUMENT)
-        );
-
-        // 5. Valid descriptor with padding + Vec3 + Entity + Bool + OPAQUE
-        let valid_fields = [
-            BamFieldDesc::new(
-                BamFieldKind::U8,
-                StrView::from_str("tag"),
-                StrView::from_str("u8"),
-                0,
-                1,
-                1,
-            ),
-            BamFieldDesc::new(
-                BamFieldKind::F32,
-                StrView::from_str("score"),
-                StrView::from_str("f32"),
-                4,
-                4,
-                4,
-            ),
-            BamFieldDesc::new(
-                BamFieldKind::BOOL,
-                StrView::from_str("active"),
-                StrView::from_str("bool"),
-                8,
-                1,
-                1,
-            ),
-            BamFieldDesc::new(
-                BamFieldKind::NESTED,
-                StrView::from_str("vel"),
-                StrView::from_str("Vec3"),
-                12,
-                12,
-                4,
-            ),
-            BamFieldDesc::new(
-                BamFieldKind::U64,
-                StrView::from_str("target"),
-                StrView::from_str("Entity"),
-                24,
-                8,
-                8,
-            ),
-            BamFieldDesc::new(
-                BamFieldKind::OPAQUE,
-                StrView::from_str("reserved"),
-                StrView::from_str("Opaque"),
-                32,
-                8,
-                8,
-            ),
-        ];
-        let h_ok = register_with_fields(
-            &mut world,
-            &mut reg,
-            "val_test::Valid",
-            c"val_test::Valid",
-            40,
-            8,
-            &valid_fields,
-        );
-        let parsed = inspect_component_bam_fields_in_registry(&reg, h_ok)
-            .unwrap()
-            .unwrap();
-        assert_eq!(parsed.len(), 6);
-        assert_eq!(parsed[3].pod_kind, Some(BamFieldPodKind::Vec3));
-        assert!(parsed[3].is_inplace_reflectable);
-        assert_eq!(parsed[4].pod_kind, Some(BamFieldPodKind::Entity));
-        assert_eq!(parsed[5].pod_kind, None);
-    }
-
-    #[cfg(feature = "bridge-reflect")]
-    #[test]
-    fn bam_field_reflect_from_ptr_and_reflect_component_are_sound_under_miri() {
-        use bevy_abi_mod_sys::{BamFieldDesc, BamFieldKind, ModComponent, StrView};
-        use bevy_ecs::prelude::Resource;
-        use bevy_ecs::reflect::{AppTypeRegistry, ReflectComponent, ReflectResource};
-        use bevy_reflect::structs::DynamicStruct;
-        use bevy_reflect::{GetPath, ReflectFromPtr, TypeInfo};
-
-        #[repr(C)]
-        struct ForeignBody {
-            tag: u8,
-            // 3 bytes implicit padding!
-            score: f32,
-            active: u8, // raw C99 bool byte (test foreign value `2` -> truthy!)
-            // 3 bytes implicit padding!
-            vel: [f32; 3],
-            target_bits: u64,
-        }
-        assert_eq!(core::mem::size_of::<ForeignBody>(), 32);
-        assert_eq!(core::mem::align_of::<ForeignBody>(), 8);
-
-        #[repr(C)]
-        #[derive(Resource)]
-        struct MiriSimClock {
-            dt: f32,
-            tick: u32,
-        }
-
-        const CLOCK_FIELDS: &[BamFieldDesc] = &[
-            BamFieldDesc::new(
-                BamFieldKind::F32,
-                StrView::from_str("dt"),
-                StrView::from_str("f32"),
-                core::mem::offset_of!(MiriSimClock, dt),
-                4,
-                4,
-            ),
-            BamFieldDesc::new(
-                BamFieldKind::U32,
-                StrView::from_str("tick"),
-                StrView::from_str("u32"),
-                core::mem::offset_of!(MiriSimClock, tick),
-                4,
-                4,
-            ),
-        ];
-
-        impl ModComponent for MiriSimClock {
-            const CANONICAL_NAME: &'static str = "miri_c99::SimClock";
-            const COMPONENT_CSTR: &'static core::ffi::CStr = c"miri_c99::SimClock";
-            const UUID: ComponentUuid = ComponentUuid::from_parts("miri_c99::SimClock", 8, 4, 0);
-            const IS_ABI_POD: bool = true;
-            const BAM_FIELDS: &'static [BamFieldDesc] = CLOCK_FIELDS;
-            type VTable = ();
-            fn vtable() -> &'static Self::VTable {
-                &()
-            }
-            fn symbols() -> &'static [bevy_abi_mod_sys::SymbolEntry] {
-                &[]
-            }
-        }
-
-        let fields = [
-            BamFieldDesc::new(
-                BamFieldKind::U8,
-                StrView::from_str("tag"),
-                StrView::from_str("u8"),
-                core::mem::offset_of!(ForeignBody, tag),
-                1,
-                1,
-            ),
-            BamFieldDesc::new(
-                BamFieldKind::F32,
-                StrView::from_str("score"),
-                StrView::from_str("f32"),
-                core::mem::offset_of!(ForeignBody, score),
-                4,
-                4,
-            ),
-            BamFieldDesc::new(
-                BamFieldKind::BOOL,
-                StrView::from_str("active"),
-                StrView::from_str("bool"),
-                core::mem::offset_of!(ForeignBody, active),
-                1,
-                1,
-            ),
-            BamFieldDesc::new(
-                BamFieldKind::NESTED,
-                StrView::from_str("vel"),
-                StrView::from_str("Vec3"),
-                core::mem::offset_of!(ForeignBody, vel),
-                12,
-                4,
-            ),
-            BamFieldDesc::new(
-                BamFieldKind::U64,
-                StrView::from_str("target_bits"),
-                StrView::from_str("Entity"),
-                core::mem::offset_of!(ForeignBody, target_bits),
-                8,
-                8,
-            ),
-        ];
-
-        let mut world = World::new();
-        world.insert_resource(AppTypeRegistry::default());
-        let mut reg = ModRegistry::new();
-
-        // Register dynamic C99-style component (no Rust `ModComponent` / no witness VTable!)
-        let layout = Layout::from_size_align(32, 8).unwrap();
-        // SAFETY: Valid POD layout with `drop = None`.
-        let comp_id = world.register_component_with_descriptor(unsafe {
-            ComponentDescriptor::new_with_layout(
-                "miri_c99::ForeignBody".to_owned(),
-                StorageType::Table,
-                layout,
-                None,
-                true,
-                false,
-                ComponentCloneBehavior::Default,
-                None,
-            )
-        });
-        let desc = ComponentDesc::new(
-            c"miri_c99::ForeignBody".as_ptr(),
-            ComponentUuid::from_parts("miri_c99::ForeignBody", 32, 8, 0),
-            32,
-            8,
-        )
-        .with_fields(fields.as_ptr(), fields.len());
-        let handle = reg
-            .register_dynamic_component_owned(comp_id, &desc, "miri_c99::ForeignBody", None, None)
-            .unwrap();
-
-        // Also register a POD singleton resource carrying ONLY `BAM_FIELDS` (no `#[derive(Reflect)]`,
-        // no witness VTable!).
-        let res_cid = world.register_component::<MiriSimClock>();
-        let res_handle = reg.register_resource::<MiriSimClock>(res_cid).unwrap();
-        world.insert_resource(MiriSimClock {
-            dt: 0.016,
-            tick: 12,
-        });
-
-        world.insert_resource(reg);
-
-        // Register dynamic `StructInfo` + `ReflectFromPtr` + `ReflectComponent`/`ReflectResource`
-        let tid = register_bam_field_reflect_type(&mut world, handle)
-            .unwrap()
-            .expect("aligned POD struct must bind in-place ReflectFromPtr slot");
-        let res_tid = register_bam_field_reflect_type(&mut world, res_handle)
-            .unwrap()
-            .expect("aligned POD resource must bind in-place ReflectFromPtr slot");
-
-        // Verify `StructInfo`, `ReflectFromPtr`, `ReflectComponent`, `ReflectResource`
-        let (rfp, reflect_comp) = {
-            let app_types = world.resource::<AppTypeRegistry>().read();
-            let type_reg = app_types.get(tid).unwrap();
-            let TypeInfo::Struct(info) = type_reg.type_info() else {
-                panic!("expected TypeInfo::Struct");
-            };
-            assert_eq!(info.type_path(), "miri_c99::ForeignBody");
-            assert_eq!(info.type_path_table().ident(), Some("ForeignBody"));
-            assert_eq!(info.field_len(), 5);
-            assert!(type_reg.data::<ReflectResource>().is_none());
-
-            let res_reg = app_types.get(res_tid).unwrap();
-            assert!(res_reg.data::<ReflectResource>().is_some());
-            (
-                type_reg.data::<ReflectFromPtr>().unwrap().clone(),
-                type_reg.data::<ReflectComponent>().unwrap().clone(),
-            )
-        };
-
-        // Insert component with interior padding set to 0xAA and C99 truthy bool = 2
-        let ent = world.spawn_empty().id();
-        let mut raw_bytes = [0xAAu8; 32];
-        raw_bytes[0] = 7;
-        raw_bytes[4..8].copy_from_slice(&42.5f32.to_ne_bytes());
-        raw_bytes[8] = 2; // non-canonical C99 true!
-        raw_bytes[12..16].copy_from_slice(&1.0f32.to_ne_bytes());
-        raw_bytes[16..20].copy_from_slice(&2.0f32.to_ne_bytes());
-        raw_bytes[20..24].copy_from_slice(&3.0f32.to_ne_bytes());
-        raw_bytes[24..32].copy_from_slice(&0x0001_0002_0003_0004u64.to_ne_bytes());
-        write_entity_pod_bytes(&mut world, ent, handle, &raw_bytes).unwrap();
-
-        // 1. Read-only `ReflectFromPtr` borrow via `reflect_entity_component`
-        {
-            let ent_ref = world.entity(ent);
-            let r = reflect_entity_component(&world, ent_ref, comp_id, &rfp).unwrap();
-            let s = r.reflect_ref().as_struct().unwrap();
-            assert_eq!(
-                *s.field("tag").unwrap().try_downcast_ref::<u8>().unwrap(),
-                7
-            );
-            assert_eq!(
-                *s.field("score").unwrap().try_downcast_ref::<f32>().unwrap(),
-                42.5
-            );
-            assert!(
-                *s.field("active")
-                    .unwrap()
-                    .try_downcast_ref::<bool>()
-                    .unwrap()
-            );
-            assert_eq!(
-                *s.field("vel")
-                    .unwrap()
-                    .try_downcast_ref::<[f32; 3]>()
-                    .unwrap(),
-                [1.0, 2.0, 3.0]
-            );
-            assert_eq!(
-                *s.field("target_bits")
-                    .unwrap()
-                    .try_downcast_ref::<u64>()
-                    .unwrap(),
-                0x0001_0002_0003_0004u64
-            );
-            let dyn_val = r.to_dynamic().unwrap();
-            assert_eq!(
-                dyn_val.get_represented_type_info().unwrap().type_path(),
-                "miri_c99::ForeignBody"
-            );
-        }
-
-        // 2. Mutable `ReflectFromPtr` borrow via `reflect_entity_component_mut`
-        {
-            let mut ent_mut = world.entity_mut(ent);
-            let mut r = reflect_entity_component_mut(&mut ent_mut, comp_id, &rfp).unwrap();
-            *r.reflect_path_mut("score")
-                .unwrap()
-                .try_downcast_mut::<f32>()
-                .unwrap() = 99.25;
-            *r.reflect_path_mut("active")
-                .unwrap()
-                .try_downcast_mut::<bool>()
-                .unwrap() = false;
-            *r.reflect_path_mut("vel[1]")
-                .unwrap()
-                .try_downcast_mut::<f32>()
-                .unwrap() = -7.5;
-        }
-
-        // Verify byte-exact mutation in raw ECS storage & untouched padding bytes
-        let mutated_bytes = read_entity_pod_bytes(&world, ent, handle).unwrap();
-        assert_eq!(mutated_bytes[0], 7);
-        assert_eq!(&mutated_bytes[1..4], &[0xAA, 0xAA, 0xAA]);
-        assert_eq!(
-            f32::from_ne_bytes(mutated_bytes[4..8].try_into().unwrap()),
-            99.25
-        );
-        assert_eq!(mutated_bytes[8], 0);
-        assert_eq!(
-            f32::from_ne_bytes(mutated_bytes[16..20].try_into().unwrap()),
-            -7.5
-        );
-
-        // 3. `ReflectComponent::insert`, `reflect`, `take`, and `remove`
-        let ent2 = world.spawn_empty().id();
-        let mut init_dyn = DynamicStruct::default();
-        init_dyn.insert("tag", 11u8);
-        init_dyn.insert("score", 3.5f32);
-        init_dyn.insert("active", true);
-        init_dyn.insert("vel", [4.0f32, 5.0, 6.0]);
-        init_dyn.insert("target_bits", 77u64);
-        {
-            let app_types = world.resource::<AppTypeRegistry>().clone();
-            let types_guard = app_types.read();
-            let mut e2 = world.entity_mut(ent2);
-            reflect_comp.insert(&mut e2, &init_dyn, &types_guard);
-        }
-        let taken = {
-            let mut e2 = world.entity_mut(ent2);
-            reflect_comp
-                .take(&mut e2)
-                .expect("take should return boxed slot")
-        };
-        assert!(!world.entity(ent2).contains_id(comp_id));
-        let taken_s = taken.reflect_ref().as_struct().unwrap();
-        assert_eq!(
-            *taken_s
-                .field("score")
-                .unwrap()
-                .try_downcast_ref::<f32>()
-                .unwrap(),
-            3.5
-        );
-
-        // 4. Declarative `BamFieldDesc` resource reflection via `reflect_resource_component` / `_mut`
-        let res_rfp = world
-            .resource::<AppTypeRegistry>()
-            .read()
-            .get(res_tid)
-            .unwrap()
-            .data::<ReflectFromPtr>()
-            .unwrap()
-            .clone();
-        {
-            let r = reflect_resource_component(&world, res_cid, &res_rfp).unwrap();
-            assert_eq!(
-                *r.reflect_path("tick")
-                    .unwrap()
-                    .try_downcast_ref::<u32>()
-                    .unwrap(),
-                12
-            );
-        }
-        {
-            let mut r = reflect_resource_component_mut(&mut world, res_cid, &res_rfp).unwrap();
-            *r.reflect_path_mut("tick")
-                .unwrap()
-                .try_downcast_mut::<u32>()
-                .unwrap() = 55;
-        }
-        assert_eq!(world.resource::<MiriSimClock>().tick, 55);
-        let tick_bytes = read_resource_bam_field_bytes(&world, res_handle, 4, 4).unwrap();
-        assert_eq!(u32::from_ne_bytes(tick_bytes.try_into().unwrap()), 55);
-    }
-}
+#[path = "../../tests/unit/validation_tests.rs"]
+mod tests;

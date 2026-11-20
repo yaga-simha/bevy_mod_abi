@@ -312,7 +312,6 @@ unsafe fn msg_read_batch_non_pod_impl<M: Message>(
         let msg_ptr = core::ptr::from_ref(msg).cast::<c_void>();
         // SAFETY: `out_buf` is writable for `max_count * size_of::<*const c_void>()` bytes;
         // `write_unaligned` preserves full pointer provenance regardless of `out_buf` alignment.
-        #[allow(clippy::cast_ptr_alignment)]
         unsafe {
             core::ptr::write_unaligned(
                 out_buf
@@ -617,13 +616,18 @@ impl<T: Component + ModComponent> Default for ComponentOptions<T> {
 
 impl<T: Component + ModComponent> ComponentOptions<T> {
     /// Creates default options for `T`, automatically enabling raw byte insertion iff
-    /// `T::IS_RAW_INSERTABLE && !core::mem::needs_drop::<T>()`.
+    /// `T::IS_RAW_INSERTABLE && !core::mem::needs_drop::<T>()` and inheriting Bevy `0.20`
+    /// `T::HAS_SUMMARY_TICK` into `BAM_STORAGE_FLAG_SUMMARY_TICK`.
     #[inline]
     pub const fn new() -> Self {
+        let mut extra_storage_flags = component_flags_to_storage_flags(T::COMPONENT_FLAGS);
+        if T::HAS_SUMMARY_TICK {
+            extra_storage_flags |= BAM_STORAGE_FLAG_SUMMARY_TICK;
+        }
         Self {
             allow_raw_insert: T::IS_RAW_INSERTABLE && !core::mem::needs_drop::<T>(),
             insert_default_fn: None,
-            extra_storage_flags: component_flags_to_storage_flags(T::COMPONENT_FLAGS),
+            extra_storage_flags,
             _marker: PhantomData,
         }
     }
@@ -672,12 +676,18 @@ impl<T: Component + ModComponent> ComponentOptions<T> {
         self
     }
 
-    /// Marks this component registration as carrying a Bevy 0.20 per-table summary tick
+    /// Marks this component registration as carrying a Bevy `0.20` per-table summary tick
     /// (`BAM_STORAGE_FLAG_SUMMARY_TICK`).
     #[inline]
-    pub const fn summary_tick(mut self) -> Self {
+    pub const fn with_summary_tick(mut self) -> Self {
         self.extra_storage_flags |= BAM_STORAGE_FLAG_SUMMARY_TICK;
         self
+    }
+
+    /// Alias for [`Self::with_summary_tick`] retained for backwards compatibility.
+    #[inline]
+    pub const fn summary_tick(self) -> Self {
+        self.with_summary_tick()
     }
 
     /// Returns additional `BAM_STORAGE_FLAG_*` bits configured on these options.
@@ -960,6 +970,13 @@ impl RegisteredRelation {
         (self.flags & BAM_RELATION_FLAG_ACYCLIC) != 0
     }
 
+    /// Returns `true` if self-referential `(entity -> entity)` edges are permitted (all
+    /// non-`ACYCLIC` relations, aligning with Bevy `0.19`/`0.20` self-referential relations).
+    #[inline]
+    pub const fn allows_self_referential(&self) -> bool {
+        !self.is_acyclic()
+    }
+
     /// Returns `true` if `BAM_RELATION_FLAG_CLEANUP_REMOVE` is set.
     #[inline]
     pub const fn is_cleanup_remove(&self) -> bool {
@@ -989,6 +1006,84 @@ pub(crate) struct ExtendedDynamicFlags {
     pub(crate) has_clone_fn: bool,
 }
 
+/// Core layout & identity fields shared when inserting a fresh [`RegisteredComponent`].
+pub(crate) struct NewComponentBase<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) uuid: ComponentUuid,
+    pub(crate) component_id: ComponentId,
+    pub(crate) size: usize,
+    pub(crate) align: usize,
+    pub(crate) storage_flags: u32,
+    pub(crate) is_abi_pod: bool,
+}
+
+/// Bundled specification for registering a dynamic guest component into [`ModRegistry`].
+pub(crate) struct DynamicComponentReg<'a> {
+    pub(crate) comp_id: ComponentId,
+    pub(crate) desc: &'a ComponentDesc,
+    pub(crate) name: &'a str,
+    pub(crate) owner: Option<ModId>,
+    pub(crate) drop_slot: Option<usize>,
+    pub(crate) required_components: Box<[BamComponent]>,
+    pub(crate) schema_fingerprint: u64,
+    pub(crate) fields: Arc<[BamFieldDesc]>,
+    pub(crate) owned_field_strings: Option<OwnedFieldStrings>,
+}
+
+/// Bundled specification for registering a typed relationship entry into [`ModRegistry`].
+pub(crate) struct RelationRegSpec<'a> {
+    pub(crate) comp_id: ComponentId,
+    pub(crate) name: &'a str,
+    pub(crate) uuid: ComponentUuid,
+    pub(crate) flags: u32,
+    pub(crate) data_size: usize,
+    pub(crate) data_align: usize,
+    pub(crate) max_degree: u32,
+    pub(crate) owner: Option<ModId>,
+}
+
+impl RegisteredComponent {
+    pub(crate) fn new_base(
+        handle: BamComponent,
+        name: Arc<str>,
+        base: &NewComponentBase<'_>,
+    ) -> Self {
+        Self {
+            handle,
+            name,
+            uuid: base.uuid,
+            component_id: base.component_id,
+            size: base.size,
+            align: base.align,
+            schema_fingerprint: 0,
+            fields: Arc::from([]),
+            owned_field_strings: None,
+            storage_flags: base.storage_flags,
+            is_abi_pod: base.is_abi_pod,
+            is_dynamic: false,
+            vtable_ptr: SymbolAddress::NULL,
+            insert_raw_fn: None,
+            insert_default_fn: None,
+            drop_fn: None,
+            drop_slot: None,
+            has_on_add_hook: false,
+            has_on_remove_hook: false,
+            create_msg_cursor_fn: None,
+            msg_read_batch_fn: None,
+            msg_send_fn: None,
+            msg_write_batch_fn: None,
+            validates_entity_payload: false,
+            synthesizes_ffi_entity_payload: false,
+            event_key: None,
+            entity_event_trigger_fn: None,
+            trigger_event_fn: None,
+            extract_event_target_fn: None,
+            extract_relationship_targets_fn: None,
+            owner: None,
+        }
+    }
+}
+
 /// Immutable dense snapshot shared via `Arc` across `ModRegistry`, `HostContext`, and `GuestSystem`.
 #[derive(Clone, Default)]
 pub struct RegistrySnapshot {
@@ -1005,6 +1100,30 @@ pub struct RegistrySnapshot {
 }
 
 impl RegistrySnapshot {
+    /// Allocates the next 1-based [`BamComponent`] handle, constructs a base
+    /// [`RegisteredComponent`], runs `configure`, and inserts it into all 4 lookup indices.
+    pub(crate) fn alloc_handle_and_insert(
+        &mut self,
+        base: NewComponentBase<'_>,
+        configure: impl FnOnce(&mut RegisteredComponent),
+    ) -> Result<BamComponent, ComponentCollisionError> {
+        let next_raw = u32::try_from(self.entries.len() + 1).map_err(|_| {
+            ComponentCollisionError::MetadataMismatch {
+                name: base.name.to_owned(),
+                reason: "ModRegistry exceeded u32::MAX component handles".to_owned(),
+            }
+        })?;
+        let handle = BamComponent::from_raw(next_raw);
+        let arc_name: Arc<str> = Arc::from(base.name);
+        let mut entry = RegisteredComponent::new_base(handle, Arc::clone(&arc_name), &base);
+        configure(&mut entry);
+        self.entries.push(entry);
+        self.by_name.insert(arc_name, handle);
+        self.by_uuid.insert(base.uuid, handle);
+        self.by_component_id.insert(base.component_id, handle);
+        Ok(handle)
+    }
+
     /// Looks up a component or resource in `O(1)` by its 1-based [`BamComponent`] handle.
     #[inline]
     pub fn get_by_handle(&self, handle: BamComponent) -> Option<&RegisteredComponent> {
@@ -1547,48 +1666,26 @@ impl ModRegistry {
                 snap.entries[idx].msg_write_batch_fn = msg_write_batch_fn;
                 existing_handle
             } else {
-                let next_raw = u32::try_from(snap.entries.len() + 1)
-                    .expect("ModRegistry exceeded u32::MAX component handles");
-                let handle = BamComponent::from_raw(next_raw);
-                let arc_name: Arc<str> = Arc::from(name_str);
-                let entry = RegisteredComponent {
-                    handle,
-                    name: Arc::clone(&arc_name),
-                    uuid,
-                    component_id: messages_res_id,
-                    size: wire_size,
-                    align: wire_align,
-                    schema_fingerprint: M::SCHEMA_FINGERPRINT,
-                    fields: Arc::from(M::BAM_FIELDS),
-                    owned_field_strings: None,
-                    storage_flags,
-                    is_abi_pod,
-                    is_dynamic: false,
-                    vtable_ptr: sym_addr,
-                    insert_raw_fn: None,
-                    insert_default_fn: None,
-                    drop_fn: None,
-                    drop_slot: None,
-                    has_on_add_hook: false,
-                    has_on_remove_hook: false,
-                    create_msg_cursor_fn: Some(create_msg_cursor_impl::<M>),
-                    msg_read_batch_fn,
-                    msg_send_fn,
-                    msg_write_batch_fn,
-                    validates_entity_payload: false,
-                    synthesizes_ffi_entity_payload: false,
-                    event_key: None,
-                    entity_event_trigger_fn: None,
-                    trigger_event_fn: None,
-                    extract_event_target_fn: None,
-                    extract_relationship_targets_fn: None,
-                    owner: None,
-                };
-                snap.entries.push(entry);
-                snap.by_name.insert(arc_name, handle);
-                snap.by_uuid.insert(uuid, handle);
-                snap.by_component_id.insert(messages_res_id, handle);
-                handle
+                snap.alloc_handle_and_insert(
+                    NewComponentBase {
+                        name: name_str,
+                        uuid,
+                        component_id: messages_res_id,
+                        size: wire_size,
+                        align: wire_align,
+                        storage_flags,
+                        is_abi_pod,
+                    },
+                    |e| {
+                        e.schema_fingerprint = M::SCHEMA_FINGERPRINT;
+                        e.fields = Arc::from(M::BAM_FIELDS);
+                        e.vtable_ptr = sym_addr;
+                        e.create_msg_cursor_fn = Some(create_msg_cursor_impl::<M>);
+                        e.msg_read_batch_fn = msg_read_batch_fn;
+                        e.msg_send_fn = msg_send_fn;
+                        e.msg_write_batch_fn = msg_write_batch_fn;
+                    },
+                )?
             };
             Self::insert_mod_component_symbols::<M>(snap);
             if !is_abi_pod {
@@ -1639,48 +1736,21 @@ impl ModRegistry {
                 snap.entries[idx].owner = None;
                 existing_handle
             } else {
-                let next_raw = u32::try_from(snap.entries.len() + 1)
-                    .expect("ModRegistry exceeded u32::MAX component handles");
-                let handle = BamComponent::from_raw(next_raw);
-                let arc_name: Arc<str> = Arc::from(BAM_CHILD_OF_NAME);
-                let entry = RegisteredComponent {
-                    handle,
-                    name: Arc::clone(&arc_name),
-                    uuid,
-                    component_id: child_of_id,
-                    size: core::mem::size_of::<FfiChildOf>(),
-                    align: core::mem::align_of::<FfiChildOf>(),
-                    schema_fingerprint: 0,
-                    fields: Arc::from([]),
-                    owned_field_strings: None,
-                    storage_flags,
-                    is_abi_pod: true,
-                    is_dynamic: false,
-                    vtable_ptr: SymbolAddress::NULL,
-                    insert_raw_fn: Some(insert_child_of_raw),
-                    insert_default_fn: None,
-                    drop_fn: None,
-                    drop_slot: None,
-                    has_on_add_hook: false,
-                    has_on_remove_hook: false,
-                    create_msg_cursor_fn: None,
-                    msg_read_batch_fn: None,
-                    msg_send_fn: None,
-                    msg_write_batch_fn: None,
-                    validates_entity_payload: true,
-                    synthesizes_ffi_entity_payload: false,
-                    event_key: None,
-                    entity_event_trigger_fn: None,
-                    trigger_event_fn: None,
-                    extract_event_target_fn: None,
-                    extract_relationship_targets_fn: None,
-                    owner: None,
-                };
-                snap.entries.push(entry);
-                snap.by_name.insert(arc_name, handle);
-                snap.by_uuid.insert(uuid, handle);
-                snap.by_component_id.insert(child_of_id, handle);
-                handle
+                snap.alloc_handle_and_insert(
+                    NewComponentBase {
+                        name: BAM_CHILD_OF_NAME,
+                        uuid,
+                        component_id: child_of_id,
+                        size: core::mem::size_of::<FfiChildOf>(),
+                        align: core::mem::align_of::<FfiChildOf>(),
+                        storage_flags,
+                        is_abi_pod: true,
+                    },
+                    |e| {
+                        e.insert_raw_fn = Some(insert_child_of_raw);
+                        e.validates_entity_payload = true;
+                    },
+                )?
             };
             if !snap.by_name.contains_key("ChildOf") {
                 snap.by_name.insert(Arc::from("ChildOf"), handle);
@@ -1761,48 +1831,25 @@ impl ModRegistry {
                 snap.entries[idx].extract_event_target_fn = extract_event_target_fn;
                 existing_handle
             } else {
-                let next_raw = u32::try_from(snap.entries.len() + 1)
-                    .expect("ModRegistry exceeded u32::MAX component handles");
-                let handle = BamComponent::from_raw(next_raw);
-                let arc_name: Arc<str> = Arc::from(name_str);
-                let entry = RegisteredComponent {
-                    handle,
-                    name: Arc::clone(&arc_name),
-                    uuid,
-                    component_id: comp_id,
-                    size: E::size(),
-                    align: E::align(),
-                    schema_fingerprint: E::SCHEMA_FINGERPRINT,
-                    fields: Arc::from(E::BAM_FIELDS),
-                    owned_field_strings: None,
-                    storage_flags,
-                    is_abi_pod: E::IS_ABI_POD,
-                    is_dynamic: false,
-                    vtable_ptr: sym_addr,
-                    insert_raw_fn: None,
-                    insert_default_fn: None,
-                    drop_fn: None,
-                    drop_slot: None,
-                    has_on_add_hook: false,
-                    has_on_remove_hook: false,
-                    create_msg_cursor_fn: None,
-                    msg_read_batch_fn: None,
-                    msg_send_fn: None,
-                    msg_write_batch_fn: None,
-                    validates_entity_payload: false,
-                    synthesizes_ffi_entity_payload: false,
-                    event_key: Some(event_key),
-                    entity_event_trigger_fn: None,
-                    trigger_event_fn,
-                    extract_event_target_fn,
-                    extract_relationship_targets_fn: None,
-                    owner: None,
-                };
-                snap.entries.push(entry);
-                snap.by_name.insert(arc_name, handle);
-                snap.by_uuid.insert(uuid, handle);
-                snap.by_component_id.insert(comp_id, handle);
-                handle
+                snap.alloc_handle_and_insert(
+                    NewComponentBase {
+                        name: name_str,
+                        uuid,
+                        component_id: comp_id,
+                        size: E::size(),
+                        align: E::align(),
+                        storage_flags,
+                        is_abi_pod: E::IS_ABI_POD,
+                    },
+                    |e| {
+                        e.schema_fingerprint = E::SCHEMA_FINGERPRINT;
+                        e.fields = Arc::from(E::BAM_FIELDS);
+                        e.vtable_ptr = sym_addr;
+                        e.event_key = Some(event_key);
+                        e.trigger_event_fn = trigger_event_fn;
+                        e.extract_event_target_fn = extract_event_target_fn;
+                    },
+                )?
             };
             Self::insert_mod_component_symbols::<E>(snap);
             handle
@@ -1846,48 +1893,24 @@ impl ModRegistry {
                 snap.entries[idx].owner = None;
                 existing_handle
             } else {
-                let next_raw = u32::try_from(snap.entries.len() + 1)
-                    .expect("ModRegistry exceeded u32::MAX component handles");
-                let handle = BamComponent::from_raw(next_raw);
-                let arc_name: Arc<str> = Arc::from(name_str);
-                let entry = RegisteredComponent {
-                    handle,
-                    name: Arc::clone(&arc_name),
-                    uuid,
-                    component_id: comp_id,
-                    size: T::size(),
-                    align: T::align(),
-                    schema_fingerprint: T::SCHEMA_FINGERPRINT,
-                    fields: Arc::from(T::BAM_FIELDS),
-                    owned_field_strings: None,
-                    storage_flags,
-                    is_abi_pod: T::IS_ABI_POD,
-                    is_dynamic: false,
-                    vtable_ptr: sym_addr,
-                    insert_raw_fn,
-                    insert_default_fn,
-                    drop_fn: None,
-                    drop_slot: None,
-                    has_on_add_hook: false,
-                    has_on_remove_hook: false,
-                    create_msg_cursor_fn: None,
-                    msg_read_batch_fn: None,
-                    msg_send_fn: None,
-                    msg_write_batch_fn: None,
-                    validates_entity_payload: false,
-                    synthesizes_ffi_entity_payload: false,
-                    event_key: None,
-                    entity_event_trigger_fn: None,
-                    trigger_event_fn: None,
-                    extract_event_target_fn: None,
-                    extract_relationship_targets_fn: None,
-                    owner: None,
-                };
-                snap.entries.push(entry);
-                snap.by_name.insert(arc_name, handle);
-                snap.by_uuid.insert(uuid, handle);
-                snap.by_component_id.insert(comp_id, handle);
-                handle
+                snap.alloc_handle_and_insert(
+                    NewComponentBase {
+                        name: name_str,
+                        uuid,
+                        component_id: comp_id,
+                        size: T::size(),
+                        align: T::align(),
+                        storage_flags,
+                        is_abi_pod: T::IS_ABI_POD,
+                    },
+                    |e| {
+                        e.schema_fingerprint = T::SCHEMA_FINGERPRINT;
+                        e.fields = Arc::from(T::BAM_FIELDS);
+                        e.vtable_ptr = sym_addr;
+                        e.insert_raw_fn = insert_raw_fn;
+                        e.insert_default_fn = insert_default_fn;
+                    },
+                )?
             };
 
             Self::insert_mod_component_symbols::<T>(snap);
@@ -1930,52 +1953,13 @@ impl ModRegistry {
         self.publish_after_mutation();
     }
 
-    /// Registers a guest-owned dynamic component from a validated [`ComponentDesc`], returning its
-    /// 1-based [`BamComponent`] handle.
-    #[allow(dead_code)]
-    pub(crate) fn register_dynamic_component_owned(
+    /// Registers a guest-owned dynamic component described by `reg`, returning its 1-based
+    /// [`BamComponent`] handle.
+    pub(crate) fn register_dynamic_component(
         &mut self,
-        comp_id: ComponentId,
-        desc: &ComponentDesc,
-        name: &str,
-        owner: Option<ModId>,
-        drop_slot: Option<usize>,
+        reg: DynamicComponentReg<'_>,
     ) -> Result<BamComponent, ComponentCollisionError> {
-        self.register_dynamic_component_owned_with_required(
-            comp_id,
-            desc,
-            name,
-            owner,
-            drop_slot,
-            Box::new([]),
-        )
-    }
-
-    /// Registers a guest-owned dynamic component with optional validated `required_components`,
-    /// returning its 1-based [`BamComponent`] handle.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn register_dynamic_component_owned_with_required(
-        &mut self,
-        comp_id: ComponentId,
-        desc: &ComponentDesc,
-        name: &str,
-        owner: Option<ModId>,
-        drop_slot: Option<usize>,
-        required_components: Box<[BamComponent]>,
-    ) -> Result<BamComponent, ComponentCollisionError> {
-        let fallback_fp = if desc.covers_slot(
-            core::mem::offset_of!(ComponentDesc, schema_fingerprint),
-            core::mem::size_of::<u64>(),
-        ) {
-            desc.schema_fingerprint
-        } else {
-            0
-        };
-        // SAFETY: Validated `ComponentDesc` passed from host helpers or FFI boundary.
-        let (schema_fingerprint, fields, owned_field_strings) =
-            unsafe { extract_owned_dynamic_fields(desc) }
-                .unwrap_or_else(|_| (fallback_fp, Arc::from([]), None));
-        self.register_dynamic_component_owned_with_schema(
+        let DynamicComponentReg {
             comp_id,
             desc,
             name,
@@ -1985,24 +1969,7 @@ impl ModRegistry {
             schema_fingerprint,
             fields,
             owned_field_strings,
-        )
-    }
-
-    /// Registers a guest-owned dynamic component with pre-extracted `schema_fingerprint` and
-    /// host-retained `fields`, returning its 1-based [`BamComponent`] handle.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn register_dynamic_component_owned_with_schema(
-        &mut self,
-        comp_id: ComponentId,
-        desc: &ComponentDesc,
-        name: &str,
-        owner: Option<ModId>,
-        drop_slot: Option<usize>,
-        required_components: Box<[BamComponent]>,
-        schema_fingerprint: u64,
-        fields: Arc<[BamFieldDesc]>,
-        owned_field_strings: Option<OwnedFieldStrings>,
-    ) -> Result<BamComponent, ComponentCollisionError> {
+        } = reg;
         let storage_flags = component_flags_to_storage_flags(desc.flags);
         let expected_comp_id = self
             .snapshot
@@ -2056,50 +2023,32 @@ impl ModRegistry {
                 }
                 existing_handle
             } else {
-                let next_raw = u32::try_from(snap.entries.len() + 1)
-                    .expect("ModRegistry exceeded u32::MAX component handles");
-                let handle = BamComponent::from_raw(next_raw);
-                let arc_name: Arc<str> = Arc::from(name);
-                let entry = RegisteredComponent {
-                    handle,
-                    name: Arc::clone(&arc_name),
-                    uuid: desc.uuid,
-                    component_id: comp_id,
-                    size: desc.size,
-                    align: desc.align,
-                    schema_fingerprint,
-                    fields,
-                    owned_field_strings,
-                    storage_flags,
-                    is_abi_pod: desc.is_pod(),
-                    is_dynamic: true,
-                    vtable_ptr: sym_addr,
-                    insert_raw_fn: None,
-                    insert_default_fn: None,
-                    drop_fn: desc.drop_fn,
-                    drop_slot,
-                    has_on_add_hook: ext_flags.has_on_add_effective,
-                    has_on_remove_hook: ext_flags.has_on_remove,
-                    create_msg_cursor_fn: None,
-                    msg_read_batch_fn: None,
-                    msg_send_fn: None,
-                    msg_write_batch_fn: None,
-                    validates_entity_payload: false,
-                    synthesizes_ffi_entity_payload: false,
-                    // SAFETY: `comp_id` was registered via `world.register_component_with_descriptor`
-                    // with layout `(desc.size, desc.align)` and is safe for dynamic event dispatch.
-                    event_key: Some(unsafe { EventKey::new(comp_id) }),
-                    entity_event_trigger_fn: None,
-                    trigger_event_fn: None,
-                    extract_event_target_fn: None,
-                    extract_relationship_targets_fn: None,
-                    owner,
-                };
-                snap.entries.push(entry);
-                snap.by_name.insert(arc_name, handle);
-                snap.by_uuid.insert(desc.uuid, handle);
-                snap.by_component_id.insert(comp_id, handle);
-                handle
+                snap.alloc_handle_and_insert(
+                    NewComponentBase {
+                        name,
+                        uuid: desc.uuid,
+                        component_id: comp_id,
+                        size: desc.size,
+                        align: desc.align,
+                        storage_flags,
+                        is_abi_pod: desc.is_pod(),
+                    },
+                    |e| {
+                        e.schema_fingerprint = schema_fingerprint;
+                        e.fields = fields;
+                        e.owned_field_strings = owned_field_strings;
+                        e.is_dynamic = true;
+                        e.vtable_ptr = sym_addr;
+                        e.drop_fn = desc.drop_fn;
+                        e.drop_slot = drop_slot;
+                        e.has_on_add_hook = ext_flags.has_on_add_effective;
+                        e.has_on_remove_hook = ext_flags.has_on_remove;
+                        // SAFETY: `comp_id` was registered via `world.register_component_with_descriptor`
+                        // with layout `(desc.size, desc.align)` and is safe for dynamic event dispatch.
+                        e.event_key = Some(unsafe { EventKey::new(comp_id) });
+                        e.owner = owner;
+                    },
+                )?
             };
 
             if let Some((old_comp_id, new_comp_id)) = replaced_comp_id {
@@ -2301,18 +2250,20 @@ impl ModRegistry {
 
     /// Registers (or idempotently re-registers) a typed entity relationship entry in this registry,
     /// returning its 1-based [`BamComponent`] handle and stored [`RegisteredRelation`] metadata.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn register_relation_entry(
         &mut self,
-        comp_id: ComponentId,
-        name: &str,
-        uuid: ComponentUuid,
-        flags: u32,
-        data_size: usize,
-        data_align: usize,
-        max_degree: u32,
-        owner: Option<ModId>,
+        spec: RelationRegSpec<'_>,
     ) -> Result<RegisteredRelation, ComponentCollisionError> {
+        let RelationRegSpec {
+            comp_id,
+            name,
+            uuid,
+            flags,
+            data_size,
+            data_align,
+            max_degree,
+            owner,
+        } = spec;
         let existing_rel = self.check_relation_registration_collision(
             name, uuid, flags, data_size, data_align, max_degree,
         )?;
@@ -2325,48 +2276,26 @@ impl ModRegistry {
                 snap.entries[idx].owner = owner;
                 prev
             } else {
-                let next_raw = u32::try_from(snap.entries.len() + 1)
-                    .expect("ModRegistry exceeded u32::MAX component handles");
-                let handle = BamComponent::from_raw(next_raw);
-                let arc_name: Arc<str> = Arc::from(name);
-                let entry = RegisteredComponent {
-                    handle,
-                    name: Arc::clone(&arc_name),
-                    uuid,
-                    component_id: comp_id,
-                    // Marker component in Bevy ECS is zero-sized `(0, 1)`; edge payload layout is
-                    // tracked on `RegisteredRelation::{data_size, data_align}`.
-                    size: 0,
-                    align: 1,
-                    schema_fingerprint: 0,
-                    fields: Arc::from([]),
-                    owned_field_strings: None,
-                    storage_flags,
-                    is_abi_pod: false,
-                    is_dynamic: false,
-                    vtable_ptr: SymbolAddress::NULL,
-                    insert_raw_fn: None,
-                    insert_default_fn: None,
-                    drop_fn: None,
-                    drop_slot: None,
-                    has_on_add_hook: false,
-                    has_on_remove_hook: true,
-                    create_msg_cursor_fn: None,
-                    msg_read_batch_fn: None,
-                    msg_send_fn: None,
-                    msg_write_batch_fn: None,
-                    validates_entity_payload: false,
-                    synthesizes_ffi_entity_payload: false,
-                    event_key: None,
-                    entity_event_trigger_fn: None,
-                    trigger_event_fn: None,
-                    extract_event_target_fn: None,
-                    extract_relationship_targets_fn: None,
-                    owner,
-                };
+                // Marker component in Bevy ECS is zero-sized `(0, 1)`; edge payload layout is
+                // tracked on `RegisteredRelation::{data_size, data_align}`.
+                let handle = snap.alloc_handle_and_insert(
+                    NewComponentBase {
+                        name,
+                        uuid,
+                        component_id: comp_id,
+                        size: 0,
+                        align: 1,
+                        storage_flags,
+                        is_abi_pod: false,
+                    },
+                    |e| {
+                        e.has_on_remove_hook = true;
+                        e.owner = owner;
+                    },
+                )?;
                 let rel = RegisteredRelation {
                     handle,
-                    name: Arc::clone(&arc_name),
+                    name: Arc::clone(&snap.entries[(handle.0 - 1) as usize].name),
                     uuid,
                     component_id: comp_id,
                     flags,
@@ -2374,10 +2303,6 @@ impl ModRegistry {
                     data_align,
                     max_degree,
                 };
-                snap.entries.push(entry);
-                snap.by_name.insert(arc_name, handle);
-                snap.by_uuid.insert(uuid, handle);
-                snap.by_component_id.insert(comp_id, handle);
                 snap.relations.insert(handle, rel.clone());
                 rel
             }

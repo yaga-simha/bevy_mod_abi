@@ -8,7 +8,7 @@
 //!   ([`ComponentUuid::from_parts(name, 0, 0, 0)`]) to persistent (`!ModScoped`) Bevy [`Entity`]
 //!   handles that survive hot-reload and mod unload.
 
-use crate::handle_header::HostContext;
+use crate::handle_header::{HostContext, read_unpoison, write_unpoison};
 use crate::loader::mod_host::ModScoped;
 use crate::registry::ModRegistry;
 use bevy_abi_mod_sys::{BamSymbol, ComponentUuid, FfiEntity, FfiResult};
@@ -67,7 +67,7 @@ fn cleanup_world_table_slot(world_id: usize) {
         return;
     }
     if let Some(reg) = WORLD_TABLE_REGISTRY.get() {
-        let mut guard = reg.write().unwrap_or_else(|e| e.into_inner());
+        let mut guard = write_unpoison(reg);
         let should_remove = guard.get(&world_id).is_some_and(|entry| {
             entry.symbols.strong_count() == 0 && entry.named_objects.strong_count() == 0
         });
@@ -140,14 +140,11 @@ impl BamSymbolTable {
             return Err(FfiResult::INVALID_ARGUMENT);
         }
         let shard = &self.inner.shards[shard_index_for(symbol)];
-        {
-            let read_guard = shard.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(&existing) = read_guard.get(symbol) {
-                return Ok(existing);
-            }
+        if let Some(&existing) = read_unpoison(shard).get(symbol) {
+            return Ok(existing);
         }
 
-        let mut write_guard = shard.write().unwrap_or_else(|e| e.into_inner());
+        let mut write_guard = write_unpoison(shard);
         if let Some(&existing) = write_guard.get(symbol) {
             return Ok(existing);
         }
@@ -184,9 +181,9 @@ impl BamSymbolTable {
         if symbol.is_empty() {
             return None;
         }
-        let shard = &self.inner.shards[shard_index_for(symbol)];
-        let read_guard = shard.read().unwrap_or_else(|e| e.into_inner());
-        read_guard.get(symbol).copied()
+        read_unpoison(&self.inner.shards[shard_index_for(symbol)])
+            .get(symbol)
+            .copied()
     }
 
     /// Resolves an interned [`BamSymbol`] back to its UTF-8 string slice (lock-free).
@@ -285,7 +282,7 @@ impl ModNamedObjects {
     pub fn bind(&self, name: &str, entity: Entity) -> ComponentUuid {
         let uuid = Self::uuid_for_name(name);
         let name_arc: Arc<str> = Arc::from(name);
-        let mut guard = self.inner.state.write().unwrap_or_else(|e| e.into_inner());
+        let mut guard = write_unpoison(&self.inner.state);
         guard.by_name.insert(Arc::clone(&name_arc), entity);
         guard.by_uuid.insert(uuid, (name_arc, entity));
         uuid
@@ -339,7 +336,7 @@ impl ModNamedObjects {
     /// Unbinds `name` and its deterministic UUID, returning the previously bound [`Entity`] if any.
     pub fn unbind(&self, name: &str) -> Option<Entity> {
         let uuid = Self::uuid_for_name(name);
-        let mut guard = self.inner.state.write().unwrap_or_else(|e| e.into_inner());
+        let mut guard = write_unpoison(&self.inner.state);
         let prev = guard.by_name.remove(name);
         guard.by_uuid.remove(&uuid);
         prev
@@ -348,7 +345,7 @@ impl ModNamedObjects {
     /// Unbinds an object by its deterministic [`ComponentUuid`], returning the previously bound
     /// [`Entity`] if any.
     pub fn unbind_by_uuid(&self, uuid: ComponentUuid) -> Option<Entity> {
-        let mut guard = self.inner.state.write().unwrap_or_else(|e| e.into_inner());
+        let mut guard = write_unpoison(&self.inner.state);
         let (name_arc, prev) = guard.by_uuid.remove(&uuid)?;
         guard.by_name.remove(name_arc.as_ref());
         Some(prev)
@@ -356,8 +353,7 @@ impl ModNamedObjects {
 
     /// Looks up the bound [`Entity`] for `name`.
     pub fn get(&self, name: &str) -> Option<Entity> {
-        let guard = self.inner.state.read().unwrap_or_else(|e| e.into_inner());
-        guard.by_name.get(name).copied()
+        read_unpoison(&self.inner.state).by_name.get(name).copied()
     }
 
     /// Looks up the bound [`FfiEntity`] for `name`.
@@ -368,14 +364,18 @@ impl ModNamedObjects {
 
     /// Looks up the bound [`Entity`] by its deterministic 128-bit [`ComponentUuid`].
     pub fn get_by_uuid(&self, uuid: ComponentUuid) -> Option<Entity> {
-        let guard = self.inner.state.read().unwrap_or_else(|e| e.into_inner());
-        guard.by_uuid.get(&uuid).map(|(_, ent)| *ent)
+        read_unpoison(&self.inner.state)
+            .by_uuid
+            .get(&uuid)
+            .map(|(_, ent)| *ent)
     }
 
     /// Looks up the canonical UTF-8 name associated with a bound [`ComponentUuid`].
     pub fn get_name_by_uuid(&self, uuid: ComponentUuid) -> Option<Arc<str>> {
-        let guard = self.inner.state.read().unwrap_or_else(|e| e.into_inner());
-        guard.by_uuid.get(&uuid).map(|(name, _)| Arc::clone(name))
+        read_unpoison(&self.inner.state)
+            .by_uuid
+            .get(&uuid)
+            .map(|(name, _)| Arc::clone(name))
     }
 
     /// Looks up `name` and verifies the bound [`Entity`] is still alive in `world`.
@@ -393,14 +393,12 @@ impl ModNamedObjects {
 
     /// Returns `true` if `name` is currently bound.
     pub fn contains_name(&self, name: &str) -> bool {
-        let guard = self.inner.state.read().unwrap_or_else(|e| e.into_inner());
-        guard.by_name.contains_key(name)
+        read_unpoison(&self.inner.state).by_name.contains_key(name)
     }
 
     /// Returns the number of bound named objects.
     pub fn len(&self) -> usize {
-        let guard = self.inner.state.read().unwrap_or_else(|e| e.into_inner());
-        guard.by_name.len()
+        read_unpoison(&self.inner.state).by_name.len()
     }
 
     /// Returns `true` if no named objects are bound.
@@ -411,8 +409,7 @@ impl ModNamedObjects {
 
     /// Returns a cloned snapshot of all `(name, uuid, entity)` bindings.
     pub fn entries(&self) -> Vec<(Arc<str>, ComponentUuid, Entity)> {
-        let guard = self.inner.state.read().unwrap_or_else(|e| e.into_inner());
-        guard
+        read_unpoison(&self.inner.state)
             .by_uuid
             .iter()
             .map(|(&uuid, (name, entity))| (Arc::clone(name), uuid, *entity))
@@ -422,7 +419,7 @@ impl ModNamedObjects {
     /// Removes any bindings whose [`Entity`] has been despawned in `world`, returning the number
     /// of pruned entries.
     pub fn prune_despawned(&self, world: &World) -> usize {
-        let mut guard = self.inner.state.write().unwrap_or_else(|e| e.into_inner());
+        let mut guard = write_unpoison(&self.inner.state);
         let before = guard.by_name.len();
         guard
             .by_name
@@ -447,11 +444,7 @@ impl ModNamedObjects {
             let Some(objects) = world.get_resource::<Self>() else {
                 return 0;
             };
-            let guard = objects
-                .inner
-                .state
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
+            let guard = read_unpoison(&objects.inner.state);
             if guard.by_name.is_empty() {
                 return 0;
             }
@@ -497,12 +490,8 @@ pub fn ensure_symbol_tables_in_world(world: &mut World) -> usize {
         }
     };
 
-    if !world.contains_resource::<BamSymbolTable>() {
-        world.insert_resource(BamSymbolTable::new());
-    }
-    if !world.contains_resource::<ModNamedObjects>() {
-        world.insert_resource(ModNamedObjects::new());
-    }
+    world.init_resource::<BamSymbolTable>();
+    world.init_resource::<ModNamedObjects>();
 
     let sym_weak = {
         let sym = world.resource::<BamSymbolTable>();
@@ -515,18 +504,13 @@ pub fn ensure_symbol_tables_in_world(world: &mut World) -> usize {
         Arc::downgrade(&obj.inner)
     };
 
-    {
-        let mut guard = world_table_registry()
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.insert(
-            world_id,
-            WorldTableEntry {
-                symbols: sym_weak,
-                named_objects: obj_weak,
-            },
-        );
-    }
+    write_unpoison(world_table_registry()).insert(
+        world_id,
+        WorldTableEntry {
+            symbols: sym_weak,
+            named_objects: obj_weak,
+        },
+    );
 
     if let Some(mut registry) = world.get_resource_mut::<ModRegistry>() {
         registry.attach_world_tables_id(world_id);
@@ -539,10 +523,10 @@ pub(crate) fn lookup_symbol_table_by_id(world_id: usize) -> Option<BamSymbolTabl
     if world_id == 0 {
         return None;
     }
-    let guard = world_table_registry()
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
-    let inner = guard.get(&world_id)?.symbols.upgrade()?;
+    let inner = read_unpoison(world_table_registry())
+        .get(&world_id)?
+        .symbols
+        .upgrade()?;
     Some(BamSymbolTable { inner })
 }
 
@@ -550,10 +534,10 @@ pub(crate) fn lookup_named_objects_by_id(world_id: usize) -> Option<ModNamedObje
     if world_id == 0 {
         return None;
     }
-    let guard = world_table_registry()
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
-    let inner = guard.get(&world_id)?.named_objects.upgrade()?;
+    let inner = read_unpoison(world_table_registry())
+        .get(&world_id)?
+        .named_objects
+        .upgrade()?;
     Some(ModNamedObjects { inner })
 }
 
@@ -594,200 +578,5 @@ pub(crate) fn bind_named_object_for_host_ctx(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::loader::mod_host::ModId;
-
-    #[test]
-    fn symbol_table_monotonic_dedup_and_lock_free_resolve() {
-        let table = BamSymbolTable::new();
-        assert!(table.is_empty());
-        assert_eq!(table.intern(""), Err(FfiResult::INVALID_ARGUMENT));
-        assert_eq!(table.resolve_symbol_str(BamSymbol::INVALID), None);
-        assert_eq!(table.resolve_symbol_str(BamSymbol::from_raw(0)), None);
-
-        let s0 = table.intern("combat::crit").expect("intern s0");
-        let s1 = table.intern("combat::burn").expect("intern s1");
-        let s0_dup = table.intern("combat::crit").expect("dedup s0");
-        assert_eq!(s0, BamSymbol::from_raw(0));
-        assert_eq!(s1, BamSymbol::from_raw(1));
-        assert_eq!(s0_dup, s0);
-        assert_eq!(table.len(), 2);
-
-        // Borrow `&str` directly while concurrently interning additional symbols.
-        let borrowed = table.resolve_symbol_str(s0).expect("resolve s0");
-        let s2 = table.intern("ai::patrol").expect("intern s2");
-        assert_eq!(borrowed, "combat::crit");
-        assert_eq!(table.resolve_symbol_str(s1), Some("combat::burn"));
-        assert_eq!(table.resolve_symbol_str(s2), Some("ai::patrol"));
-        assert_eq!(table.lookup("ai::patrol"), Some(s2));
-        assert_eq!(table.lookup("missing"), None);
-    }
-
-    #[test]
-    fn named_objects_uuid_binding_rebind_and_mod_scoped_stripping() {
-        let mut world = World::new();
-        let e1 = world.spawn(ModScoped(ModId(7))).id();
-        let e2 = world.spawn_empty().id();
-
-        let uuid = ModNamedObjects::bind_persistent(&mut world, "prefab::Hero", e1)
-            .expect("bind_persistent succeeds");
-        assert_eq!(uuid, ComponentUuid::from_parts("prefab::Hero", 0, 0, 0));
-        assert!(
-            !world.entity(e1).contains::<ModScoped>(),
-            "bind_persistent must strip ModScoped"
-        );
-
-        let objs = world.resource::<ModNamedObjects>();
-        assert_eq!(objs.get("prefab::Hero"), Some(e1));
-        assert_eq!(objs.get_by_uuid(uuid), Some(e1));
-        assert_eq!(objs.get_alive(&world, "prefab::Hero"), Some(e1));
-        assert_eq!(objs.get_name_by_uuid(uuid).as_deref(), Some("prefab::Hero"));
-
-        // Rebind to e2.
-        objs.bind("prefab::Hero", e2);
-        assert_eq!(objs.get("prefab::Hero"), Some(e2));
-        assert_eq!(objs.get_by_uuid(uuid), Some(e2));
-
-        // Despawning e2 makes `get_alive` return None and `prune_despawned` cleans it up.
-        assert!(world.despawn(e2));
-        let objs = world.resource::<ModNamedObjects>();
-        assert_eq!(objs.get_alive(&world, "prefab::Hero"), None);
-        assert_eq!(objs.prune_despawned(&world), 1);
-        assert!(objs.is_empty());
-
-        // `get_or_spawn_persistent` materializes a fresh persistent entity.
-        let spawned = ModNamedObjects::get_or_spawn_persistent(&mut world, "prefab::Boss");
-        assert!(world.entities().contains(spawned));
-        assert!(!world.entity(spawned).contains::<ModScoped>());
-        assert_eq!(
-            ModNamedObjects::get_or_spawn_persistent(&mut world, "prefab::Boss"),
-            spawned
-        );
-    }
-
-    #[test]
-    fn world_drop_cleans_up_registry_slot_without_leaks() {
-        let world_id = {
-            let mut world = World::new();
-            world.insert_resource(ModRegistry::new());
-            let id = ensure_symbol_tables_in_world(&mut world);
-            assert!(lookup_symbol_table_by_id(id).is_some());
-            assert!(lookup_named_objects_by_id(id).is_some());
-            id
-        };
-        assert!(lookup_symbol_table_by_id(world_id).is_none());
-        assert!(lookup_named_objects_by_id(world_id).is_none());
-    }
-
-    #[test]
-    fn named_object_survives_full_excise_unload_and_symbols_persist_across_reload() {
-        use crate::drop_trampoline::WorldDropGuard;
-        use crate::ffi::register::{LoadContext, host_load_host_ctx};
-        use crate::ffi::v03_ext::{host_bind_named_object, host_intern_symbol};
-        use crate::loader::mod_host::{LoadedMod, ModHost, excise_and_unload_mod_in_world};
-        use crate::system::ModQuarantine;
-        use bevy_abi_mod_sys::{BamInstance, FfiEntity, StrView};
-        use core::sync::atomic::AtomicBool;
-
-        unsafe extern "C" fn noop_shutdown(_inst: *mut BamInstance) {}
-
-        let mut world = World::new();
-        world.insert_resource(WorldDropGuard::new());
-        world.insert_resource(ModHost::new());
-        world.insert_resource(ModRegistry::new());
-        world.insert_resource(ModQuarantine::new());
-
-        let active_1 = Arc::new(AtomicBool::new(true));
-        let mod_1 = LoadedMod::register_mock_for_test(
-            &mut world,
-            "prefab_unload_mod",
-            Arc::clone(&active_1),
-            noop_shutdown,
-            None,
-            core::ptr::null_mut(),
-        );
-
-        let bound_ent = world.spawn(ModScoped(mod_1)).id();
-        let unbound_ent = world.spawn(ModScoped(mod_1)).id();
-
-        let mut sym_before = BamSymbol::INVALID;
-        {
-            let reg = world.resource::<ModRegistry>().clone();
-            let world_ptr = &raw mut world;
-            let mut load_ctx =
-                LoadContext::with_world_and_mod_id(reg, active_1, world_ptr, Some(mod_1));
-            // SAFETY: `load_ctx` is live.
-            let host_ctx = unsafe { host_load_host_ctx(load_ctx.as_ffi_ptr()) };
-            assert_eq!(
-                // SAFETY: Valid `host_ctx`, UTF-8 string, and entity bits.
-                unsafe {
-                    host_bind_named_object(
-                        host_ctx,
-                        StrView::from_str("world::spawn_point"),
-                        FfiEntity::from_bits(bound_ent.to_bits()),
-                    )
-                },
-                FfiResult::OK
-            );
-            assert_eq!(
-                // SAFETY: Valid `host_ctx`, UTF-8 string, and out pointer.
-                unsafe {
-                    host_intern_symbol(
-                        host_ctx,
-                        StrView::from_str("event::portal"),
-                        &raw mut sym_before,
-                    )
-                },
-                FfiResult::OK
-            );
-            load_ctx.finish_init();
-        }
-
-        // Full unload despawns unbound ModScoped entities, while bound entity is stripped of
-        // ModScoped and survives!
-        excise_and_unload_mod_in_world(&mut world, mod_1, |_| {}).expect("unload succeeds");
-        assert!(world.entities().contains(bound_ent));
-        assert!(world.get::<ModScoped>(bound_ent).is_none());
-        assert!(!world.entities().contains(unbound_ent));
-
-        // Reloaded mod sees the exact same symbol ID and named entity!
-        let active_2 = Arc::new(AtomicBool::new(true));
-        let mod_2 = LoadedMod::register_mock_for_test(
-            &mut world,
-            "prefab_unload_mod",
-            Arc::clone(&active_2),
-            noop_shutdown,
-            None,
-            core::ptr::null_mut(),
-        );
-        let mut sym_after = BamSymbol::INVALID;
-        {
-            let reg = world.resource::<ModRegistry>().clone();
-            let world_ptr = &raw mut world;
-            let mut load_ctx =
-                LoadContext::with_world_and_mod_id(reg, active_2, world_ptr, Some(mod_2));
-            // SAFETY: `load_ctx` is live.
-            let host_ctx = unsafe { host_load_host_ctx(load_ctx.as_ffi_ptr()) };
-            assert_eq!(
-                // SAFETY: Valid `host_ctx`, UTF-8 string, and out pointer.
-                unsafe {
-                    host_intern_symbol(
-                        host_ctx,
-                        StrView::from_str("event::portal"),
-                        &raw mut sym_after,
-                    )
-                },
-                FfiResult::OK
-            );
-            load_ctx.finish_init();
-        }
-        assert_eq!(sym_after, sym_before);
-        assert_eq!(
-            world
-                .resource::<ModNamedObjects>()
-                .get_alive(&world, "world::spawn_point"),
-            Some(bound_ent)
-        );
-    }
-}
+#[path = "../../tests/unit/symbols_tests.rs"]
+mod tests;

@@ -305,6 +305,32 @@ impl ConfiguredScheduleSet {
     }
 }
 
+/// Parameters for configuring a new decoupled [`BamSystemSet`] container in
+/// [`ModScheduleSetRegistry::configure_set`].
+#[derive(Debug, Clone)]
+pub struct ScheduleSetConfig {
+    /// Owning [`ModId`], if configured during a tracked mod load session.
+    pub mod_id: Option<ModId>,
+    /// Logical module namespace scoping the set.
+    pub mod_name: Arc<str>,
+    /// Logical set name within `mod_name`.
+    pub set_name: Arc<str>,
+    /// Reload generation of `mod_name` at configuration time.
+    pub generation: u64,
+    /// Target ABI [`ScheduleId`] where this container lives.
+    pub schedule: ScheduleId,
+    /// Intra-set execution ordering mode (`Parallel`, `Sequence`, or `SequenceWeak`).
+    pub mode: ScheduleSetMode,
+    /// Sets ordered after this set (`before` / `before_weak`).
+    pub before_sets: Vec<BamSystemSet>,
+    /// Sets ordered before this set (`after` / `after_weak`).
+    pub after_sets: Vec<BamSystemSet>,
+    /// When `true`, `before_sets` edges use weak ordering.
+    pub before_weak: bool,
+    /// When `true`, `after_sets` edges use weak ordering.
+    pub after_weak: bool,
+}
+
 /// World resource tracking all dynamically configured ABI `0.3` [`BamSystemSet`] containers,
 /// their scoped [`ModNamedSystemSet`] mappings, inter-set ordering edges, and mounted member
 /// system sequences.
@@ -379,20 +405,22 @@ impl ModScheduleSetRegistry {
     /// Allocates a monotonic [`BamSystemSet`] handle (`0, 1, ...`) mapped to a scoped
     /// [`ModNamedSystemSet`] container and validates all inter-set ordering edges for existence,
     /// same-schedule consistency, and acyclicity.
-    #[allow(clippy::too_many_arguments)]
     pub fn configure_set(
         &mut self,
-        mod_id: Option<ModId>,
-        mod_name: Arc<str>,
-        set_name: Arc<str>,
-        generation: u64,
-        schedule: ScheduleId,
-        mode: ScheduleSetMode,
-        before_sets: Vec<BamSystemSet>,
-        after_sets: Vec<BamSystemSet>,
-        before_weak: bool,
-        after_weak: bool,
+        cfg: ScheduleSetConfig,
     ) -> Result<BamSystemSet, (FfiResult, String)> {
+        let ScheduleSetConfig {
+            mod_id,
+            mod_name,
+            set_name,
+            generation,
+            schedule,
+            mode,
+            before_sets,
+            after_sets,
+            before_weak,
+            after_weak,
+        } = cfg;
         if self.next_handle == u32::MAX {
             return Err((
                 FfiResult::CAPACITY_EXCEEDED,
@@ -566,7 +594,9 @@ impl ModScheduleSetRegistry {
             return Err(FfiResult::CYCLE_DETECTED);
         }
 
-        let entry = self.get_mut(handle).expect("checked present above");
+        let Some(entry) = self.get_mut(handle) else {
+            return Err(FfiResult::NOT_FOUND);
+        };
         entry.before_sets = dedup_before;
         entry.after_sets = dedup_after;
         entry.before_weak = before_weak;
@@ -1273,9 +1303,7 @@ pub fn mount_mod_systems_in_world(
     generation: u64,
     systems: Vec<GuestSystem>,
 ) -> Result<(), ScheduleBuildError> {
-    if !world.contains_resource::<Schedules>() {
-        world.insert_resource(Schedules::new());
-    }
+    world.init_resource::<Schedules>();
     let mut touched: Vec<(ScheduleId, InternedScheduleLabel)> = Vec::new();
     for sys in systems {
         let sched_id = sys.schedule();
@@ -1333,9 +1361,7 @@ pub fn rewire_mod_schedule_sets_in_world(
     let Some(label) = resolve_schedule_id_in_world(world, schedule_id) else {
         return Ok(None);
     };
-    if !world.contains_resource::<Schedules>() {
-        world.insert_resource(Schedules::new());
-    }
+    world.init_resource::<Schedules>();
     let mut schedule = world
         .get_resource_mut::<Schedules>()
         .and_then(|mut s| s.remove_temporarily(label))

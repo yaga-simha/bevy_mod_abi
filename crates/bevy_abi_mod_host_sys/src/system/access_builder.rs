@@ -33,6 +33,152 @@ use bevy_ecs::world::World;
 use bevy_platform::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+enum AccessPlanError {
+    TooManyTerms {
+        q_idx: usize,
+    },
+    TermValidation {
+        q_idx: usize,
+        t_idx: usize,
+        code: FfiResult,
+    },
+    InvalidMode {
+        q_idx: usize,
+        t_idx: usize,
+        mode: AccessMode,
+        or_group: u8,
+    },
+    UnknownComponent {
+        q_idx: usize,
+        t_idx: usize,
+        handle: u32,
+    },
+    KindMismatch {
+        q_idx: usize,
+        t_idx: usize,
+        name: String,
+        mode: AccessMode,
+    },
+    ImmutableWrite {
+        q_idx: usize,
+        t_idx: usize,
+        name: String,
+    },
+    IntraConflict {
+        name: String,
+        detail: &'static str,
+    },
+    InterConflict {
+        name: String,
+    },
+    ResourceConflict {
+        name: String,
+    },
+}
+
+impl AccessPlanError {
+    fn into_ffi(self) -> (FfiResult, String) {
+        match self {
+            Self::TooManyTerms { q_idx } => (
+                FfiResult::CAPACITY_EXCEEDED,
+                format!("query {q_idx} exceeds MAX_TERMS_PER_QUERY (32)"),
+            ),
+            Self::TermValidation { q_idx, t_idx, code } => (
+                code,
+                format!("query {q_idx} term {t_idx} failed validation ({code})"),
+            ),
+            Self::InvalidMode {
+                q_idx,
+                t_idx,
+                mode,
+                or_group,
+            } if or_group != 0 => (
+                FfiResult::INVALID_ARGUMENT,
+                format!(
+                    "query {q_idx} term {t_idx} uses invalid mode {mode:?} inside or_group={or_group}"
+                ),
+            ),
+            Self::InvalidMode { mode, .. } => (
+                FfiResult::INVALID_ARGUMENT,
+                format!("invalid AccessMode({})", mode.0),
+            ),
+            Self::UnknownComponent {
+                q_idx,
+                t_idx,
+                handle,
+            } => (
+                FfiResult::INVALID_COMPONENT,
+                format!("query {q_idx} term {t_idx} references unknown BamComponent({handle})"),
+            ),
+            Self::KindMismatch {
+                q_idx,
+                t_idx,
+                name,
+                mode,
+            } => (
+                FfiResult::INVALID_COMPONENT,
+                format!(
+                    "query {q_idx} term {t_idx} ('{name}') kind mismatch between mode {mode:?} and registration"
+                ),
+            ),
+            Self::ImmutableWrite { q_idx, t_idx, name } => (
+                FfiResult::PERMISSION_DENIED,
+                format!(
+                    "query {q_idx} term {t_idx} requests mutable access on immutable component '{name}'"
+                ),
+            ),
+            Self::IntraConflict { name, detail } => {
+                (FfiResult::ACCESS_CONFLICT, format!("{detail} '{name}'"))
+            }
+            Self::InterConflict { name } => (
+                FfiResult::ACCESS_CONFLICT,
+                format!("inter-query borrow conflict on '{name}'"),
+            ),
+            Self::ResourceConflict { name } => (
+                FfiResult::ACCESS_CONFLICT,
+                format!("resource access conflict on '{name}'"),
+            ),
+        }
+    }
+
+    fn into_init_error(self) -> SystemInitError {
+        match self {
+            Self::TooManyTerms { .. } => SystemInitError::TooManyTerms,
+            Self::TermValidation { t_idx, .. } | Self::InvalidMode { t_idx, .. } => {
+                SystemInitError::InvalidMode { index: t_idx }
+            }
+            Self::UnknownComponent { handle, .. } => {
+                SystemInitError::UnknownComponent(format!("BamComponent({handle})"))
+            }
+            Self::KindMismatch { name, .. } => SystemInitError::KindMismatch(name),
+            Self::ImmutableWrite { name, .. } => SystemInitError::ImmutableWrite(name),
+            Self::IntraConflict { name, .. }
+            | Self::InterConflict { name }
+            | Self::ResourceConflict { name } => SystemInitError::SelfConflict {
+                a: name.clone(),
+                b: name,
+            },
+        }
+    }
+}
+
+#[derive(Default)]
+struct SystemAccessAccumulator {
+    access_set: FilteredAccessSet,
+    res_reads: HashSet<ComponentId>,
+    res_writes: HashSet<ComponentId>,
+    res_order: Vec<(ComponentId, Arc<str>)>,
+    id_to_name: HashMap<ComponentId, Arc<str>>,
+}
+
+struct ValidatedGroup {
+    has_entity_terms: bool,
+    write_components: HashSet<ComponentId>,
+    term_metas: Vec<QueryTermMeta>,
+    term_or_groups: Vec<u8>,
+    or_group_order: Vec<u8>,
+}
+
 fn find_conflicting_name(
     id_to_name: &HashMap<ComponentId, Arc<str>>,
     existing: &FilteredAccessSet,
@@ -53,70 +199,72 @@ fn find_conflicting_name(
     "unknown".to_string()
 }
 
-/// Validates a set of [`BamQuerySpecOwned`] clauses synchronously during `host_register_system`
-/// against `snapshot`, checking handle existence, immutability, component/resource kind match,
-/// and intra/inter-query `FilteredAccessSet` borrow compatibility.
-pub(crate) fn validate_system_queries_against_snapshot(
-    snapshot: &RegistrySnapshot,
-    groups: &[BamQuerySpecOwned],
-) -> Result<(), (FfiResult, String)> {
-    let mut access_set = FilteredAccessSet::new();
-    let mut system_res_reads: HashSet<ComponentId> = HashSet::new();
-    let mut system_res_writes: HashSet<ComponentId> = HashSet::new();
-    let mut system_res_order: Vec<(ComponentId, Arc<str>)> = Vec::new();
-    let mut id_to_name: HashMap<ComponentId, Arc<str>> = HashMap::new();
+fn build_or_branch_access(
+    terms: impl Iterator<Item = (ComponentId, AccessMode)>,
+    write_components: &HashSet<ComponentId>,
+) -> FilteredAccess {
+    let mut or_access = FilteredAccess::matches_nothing();
+    for (comp_id, mode) in terms {
+        let mut branch = FilteredAccess::default();
+        match mode {
+            AccessMode::FILTER_ONLY => {
+                branch.and_with(comp_id);
+            }
+            AccessMode::WITHOUT => {
+                branch.and_without(comp_id);
+            }
+            AccessMode::CHANGED | AccessMode::ADDED => {
+                if write_components.contains(&comp_id) {
+                    branch.and_with(comp_id);
+                } else {
+                    branch.add_read(comp_id);
+                }
+            }
+            _ => {}
+        }
+        or_access.append_or(&branch);
+        or_access.extend_access(&branch);
+    }
+    or_access
+}
 
-    for (q_idx, group) in groups.iter().enumerate() {
-        if group.terms.len() > MAX_TERMS_PER_QUERY {
-            return Err((
-                FfiResult::CAPACITY_EXCEEDED,
-                format!("query {q_idx} exceeds MAX_TERMS_PER_QUERY (32)"),
-            ));
+impl SystemAccessAccumulator {
+    fn validate_group(
+        &mut self,
+        q_idx: usize,
+        spec: &BamQuerySpecOwned,
+        snapshot: &RegistrySnapshot,
+        world: Option<&World>,
+        strict_term_validate: bool,
+    ) -> Result<ValidatedGroup, AccessPlanError> {
+        if spec.terms.len() > MAX_TERMS_PER_QUERY {
+            return Err(AccessPlanError::TooManyTerms { q_idx });
         }
 
         let mut read_components: HashSet<ComponentId> = HashSet::new();
         let mut write_components: HashSet<ComponentId> = HashSet::new();
         let mut has_entity_terms = false;
-        let mut resolved: Vec<(ComponentId, AccessMode, u8)> =
-            Vec::with_capacity(group.terms.len());
-        let mut or_group_order: Vec<u8> = Vec::new();
+        let mut term_metas = Vec::with_capacity(spec.terms.len());
+        let mut term_or_groups = Vec::with_capacity(spec.terms.len());
+        let mut or_group_order = Vec::new();
 
-        for (t_idx, term) in group.terms.iter().enumerate() {
-            let v = term.validate();
-            if v.is_err() {
-                return Err((
-                    v,
-                    format!("query {q_idx} term {t_idx} failed validation ({v})"),
-                ));
-            }
-            let Some(reg) = snapshot.get_by_handle(term.component) else {
-                return Err((
-                    FfiResult::INVALID_COMPONENT,
-                    format!(
-                        "query {q_idx} term {t_idx} references unknown BamComponent({})",
-                        term.component.0
-                    ),
-                ));
-            };
-            if term.mode.is_resource() != reg.is_resource()
-                || term.mode.is_message() != reg.is_message()
-            {
-                return Err((
-                    FfiResult::INVALID_COMPONENT,
-                    format!(
-                        "query {q_idx} term {t_idx} ('{}') kind mismatch between mode {:?} and registration",
-                        reg.name, term.mode
-                    ),
-                ));
-            }
-            if reg.is_immutable() && term.mode.is_mutable() {
-                return Err((
-                    FfiResult::PERMISSION_DENIED,
-                    format!(
-                        "query {q_idx} term {t_idx} requests mutable access on immutable component '{}'",
-                        reg.name
-                    ),
-                ));
+        for (t_idx, term) in spec.terms.iter().enumerate() {
+            if strict_term_validate {
+                let v = term.validate();
+                if v.is_err() {
+                    return Err(AccessPlanError::TermValidation {
+                        q_idx,
+                        t_idx,
+                        code: v,
+                    });
+                }
+            } else if !term.mode.is_valid() {
+                return Err(AccessPlanError::InvalidMode {
+                    q_idx,
+                    t_idx,
+                    mode: term.mode,
+                    or_group: 0,
+                });
             }
 
             if term.or_group != 0 {
@@ -127,21 +275,59 @@ pub(crate) fn validate_system_queries_against_snapshot(
                         | AccessMode::CHANGED
                         | AccessMode::ADDED
                 ) {
-                    return Err((
-                        FfiResult::INVALID_ARGUMENT,
-                        format!(
-                            "query {q_idx} term {t_idx} uses invalid mode {:?} inside or_group={}",
-                            term.mode, term.or_group
-                        ),
-                    ));
+                    return Err(AccessPlanError::InvalidMode {
+                        q_idx,
+                        t_idx,
+                        mode: term.mode,
+                        or_group: term.or_group,
+                    });
                 }
                 if !or_group_order.contains(&term.or_group) {
                     or_group_order.push(term.or_group);
                 }
             }
 
+            let Some(reg) = snapshot.get_by_handle(term.component) else {
+                return Err(AccessPlanError::UnknownComponent {
+                    q_idx,
+                    t_idx,
+                    handle: term.component.0,
+                });
+            };
+            if term.mode.is_resource() != reg.is_resource()
+                || term.mode.is_message() != reg.is_message()
+            {
+                return Err(AccessPlanError::KindMismatch {
+                    q_idx,
+                    t_idx,
+                    name: reg.name.to_string(),
+                    mode: term.mode,
+                });
+            }
+
             let comp_id = reg.component_id;
-            id_to_name
+            let mut storage_flags = reg.storage_flags;
+            if let Some(w) = world
+                && !reg.is_resource()
+                && !reg.is_message()
+                && let Some(info) = w.components().get_info(comp_id)
+            {
+                if info.storage_type() == StorageType::SparseSet {
+                    storage_flags |= BAM_STORAGE_FLAG_SPARSE_SET;
+                }
+                if !info.mutable() {
+                    storage_flags |= BAM_STORAGE_FLAG_IMMUTABLE;
+                }
+            }
+            if (storage_flags & BAM_STORAGE_FLAG_IMMUTABLE) != 0 && term.mode.is_mutable() {
+                return Err(AccessPlanError::ImmutableWrite {
+                    q_idx,
+                    t_idx,
+                    name: reg.name.to_string(),
+                });
+            }
+
+            self.id_to_name
                 .entry(comp_id)
                 .or_insert_with(|| Arc::clone(&reg.name));
 
@@ -149,23 +335,20 @@ pub(crate) fn validate_system_queries_against_snapshot(
                 AccessMode::READ | AccessMode::OPTIONAL_READ => {
                     has_entity_terms = true;
                     if write_components.contains(&comp_id) {
-                        return Err((
-                            FfiResult::ACCESS_CONFLICT,
-                            format!(
-                                "intra-query read/write conflict on component '{}'",
-                                reg.name
-                            ),
-                        ));
+                        return Err(AccessPlanError::IntraConflict {
+                            name: reg.name.to_string(),
+                            detail: "intra-query read/write conflict on component",
+                        });
                     }
                     read_components.insert(comp_id);
                 }
                 AccessMode::WRITE | AccessMode::OPTIONAL_WRITE => {
                     has_entity_terms = true;
                     if read_components.contains(&comp_id) || write_components.contains(&comp_id) {
-                        return Err((
-                            FfiResult::ACCESS_CONFLICT,
-                            format!("intra-query write conflict on component '{}'", reg.name),
-                        ));
+                        return Err(AccessPlanError::IntraConflict {
+                            name: reg.name.to_string(),
+                            detail: "intra-query write conflict on component",
+                        });
                     }
                     write_components.insert(comp_id);
                 }
@@ -179,44 +362,117 @@ pub(crate) fn validate_system_queries_against_snapshot(
                 }
                 AccessMode::REMOVED_READ => {}
                 AccessMode::RESOURCE_READ | AccessMode::MESSAGE_READ => {
-                    if system_res_writes.contains(&comp_id) {
-                        return Err((
-                            FfiResult::ACCESS_CONFLICT,
-                            format!("conflicting resource/message read/write on '{}'", reg.name),
-                        ));
+                    if self.res_writes.contains(&comp_id) {
+                        return Err(AccessPlanError::IntraConflict {
+                            name: reg.name.to_string(),
+                            detail: "conflicting resource/message read/write on",
+                        });
                     }
-                    if system_res_reads.insert(comp_id) {
-                        system_res_order.push((comp_id, Arc::clone(&reg.name)));
+                    if self.res_reads.insert(comp_id) {
+                        self.res_order.push((comp_id, Arc::clone(&reg.name)));
                     }
                 }
                 AccessMode::RESOURCE_WRITE | AccessMode::MESSAGE_WRITE => {
-                    if system_res_reads.contains(&comp_id) || system_res_writes.contains(&comp_id) {
-                        return Err((
-                            FfiResult::ACCESS_CONFLICT,
-                            format!("conflicting resource/message write on '{}'", reg.name),
-                        ));
+                    if self.res_reads.contains(&comp_id) || self.res_writes.contains(&comp_id) {
+                        return Err(AccessPlanError::IntraConflict {
+                            name: reg.name.to_string(),
+                            detail: "conflicting resource/message write on",
+                        });
                     }
-                    system_res_writes.insert(comp_id);
-                    system_res_order.push((comp_id, Arc::clone(&reg.name)));
+                    self.res_writes.insert(comp_id);
+                    self.res_order.push((comp_id, Arc::clone(&reg.name)));
                 }
                 _ => {
-                    return Err((
-                        FfiResult::INVALID_ARGUMENT,
-                        format!("invalid AccessMode({})", term.mode.0),
-                    ));
+                    return Err(AccessPlanError::InvalidMode {
+                        q_idx,
+                        t_idx,
+                        mode: term.mode,
+                        or_group: 0,
+                    });
                 }
             }
 
-            resolved.push((comp_id, term.mode, term.or_group));
+            term_or_groups.push(term.or_group);
+            term_metas.push(QueryTermMeta {
+                component: reg.handle,
+                component_id: comp_id,
+                mode: term.mode,
+                uuid: reg.uuid,
+                size: reg.size,
+                align: reg.align,
+                storage_flags,
+                msg_read_batch_fn: reg.msg_read_batch_fn,
+                msg_send_fn: reg.msg_send_fn,
+                msg_write_batch_fn: reg.msg_write_batch_fn,
+            });
         }
 
-        if group.terms.is_empty() || has_entity_terms {
+        Ok(ValidatedGroup {
+            has_entity_terms,
+            write_components,
+            term_metas,
+            term_or_groups,
+            or_group_order,
+        })
+    }
+
+    fn add_entity_access(&mut self, fa: FilteredAccess) -> Result<(), AccessPlanError> {
+        let mut candidate_set = FilteredAccessSet::new();
+        candidate_set.add(fa.clone());
+        if !self.access_set.is_compatible(&candidate_set) {
+            let name = find_conflicting_name(&self.id_to_name, &self.access_set, &fa);
+            return Err(AccessPlanError::InterConflict { name });
+        }
+        self.access_set.add(fa);
+        Ok(())
+    }
+
+    fn finalize_resources(mut self) -> Result<FilteredAccessSet, AccessPlanError> {
+        for (res_id, res_name) in self.res_order {
+            let writable = self.res_writes.contains(&res_id);
+            let mut candidate_set = FilteredAccessSet::new();
+            if writable {
+                candidate_set.add_resource_write(res_id);
+            } else {
+                candidate_set.add_resource_read(res_id);
+            }
+            if !self.access_set.is_compatible(&candidate_set) {
+                return Err(AccessPlanError::ResourceConflict {
+                    name: res_name.to_string(),
+                });
+            }
+            if writable {
+                self.access_set.add_resource_write(res_id);
+            } else {
+                self.access_set.add_resource_read(res_id);
+            }
+        }
+        Ok(self.access_set)
+    }
+}
+
+/// Validates a set of [`BamQuerySpecOwned`] clauses synchronously during `host_register_system`
+/// against `snapshot`, checking handle existence, immutability, component/resource kind match,
+/// and intra/inter-query `FilteredAccessSet` borrow compatibility.
+pub(crate) fn validate_system_queries_against_snapshot(
+    snapshot: &RegistrySnapshot,
+    groups: &[BamQuerySpecOwned],
+) -> Result<(), (FfiResult, String)> {
+    let mut acc = SystemAccessAccumulator::default();
+
+    for (q_idx, group) in groups.iter().enumerate() {
+        let vg = acc
+            .validate_group(q_idx, group, snapshot, None, true)
+            .map_err(AccessPlanError::into_ffi)?;
+
+        if group.terms.is_empty() || vg.has_entity_terms {
             let mut fa = FilteredAccess::matches_everything();
-            for &(comp_id, mode, or_group) in &resolved {
+            for (meta, &or_group) in vg.term_metas.iter().zip(&vg.term_or_groups) {
                 if or_group != 0 {
                     continue;
                 }
-                match mode {
+                let comp_id = meta.component_id;
+                match meta.mode {
                     AccessMode::READ => {
                         fa.add_read(comp_id);
                     }
@@ -236,7 +492,7 @@ pub(crate) fn validate_system_queries_against_snapshot(
                         fa.and_without(comp_id);
                     }
                     AccessMode::CHANGED | AccessMode::ADDED => {
-                        if write_components.contains(&comp_id) {
+                        if vg.write_components.contains(&comp_id) {
                             fa.and_with(comp_id);
                         } else {
                             fa.add_read(comp_id);
@@ -248,70 +504,51 @@ pub(crate) fn validate_system_queries_against_snapshot(
                     _ => {}
                 }
             }
-            for &group_id in &or_group_order {
-                let mut or_access = FilteredAccess::matches_nothing();
-                for &(comp_id, mode, og) in &resolved {
-                    if og != group_id {
-                        continue;
-                    }
-                    let mut branch = FilteredAccess::default();
-                    match mode {
-                        AccessMode::FILTER_ONLY => {
-                            branch.and_with(comp_id);
-                        }
-                        AccessMode::WITHOUT => {
-                            branch.and_without(comp_id);
-                        }
-                        AccessMode::CHANGED | AccessMode::ADDED => {
-                            if write_components.contains(&comp_id) {
-                                branch.and_with(comp_id);
-                            } else {
-                                branch.add_read(comp_id);
-                            }
-                        }
-                        _ => {}
-                    }
-                    or_access.append_or(&branch);
-                    or_access.extend_access(&branch);
-                }
+            for &group_id in &vg.or_group_order {
+                let or_access = build_or_branch_access(
+                    vg.term_metas
+                        .iter()
+                        .zip(&vg.term_or_groups)
+                        .filter(|&(_, &og)| og == group_id)
+                        .map(|(m, _)| (m.component_id, m.mode)),
+                    &vg.write_components,
+                );
                 fa.extend(&or_access);
             }
-
-            let mut candidate_set = FilteredAccessSet::new();
-            candidate_set.add(fa.clone());
-            if !access_set.is_compatible(&candidate_set) {
-                let conflict = find_conflicting_name(&id_to_name, &access_set, &fa);
-                return Err((
-                    FfiResult::ACCESS_CONFLICT,
-                    format!("inter-query borrow conflict on '{conflict}'"),
-                ));
-            }
-            access_set.add(fa);
+            acc.add_entity_access(fa)
+                .map_err(AccessPlanError::into_ffi)?;
         }
     }
 
-    for (res_id, res_name) in system_res_order {
-        let writable = system_res_writes.contains(&res_id);
-        let mut candidate_set = FilteredAccessSet::new();
-        if writable {
-            candidate_set.add_resource_write(res_id);
-        } else {
-            candidate_set.add_resource_read(res_id);
-        }
-        if !access_set.is_compatible(&candidate_set) {
-            return Err((
-                FfiResult::ACCESS_CONFLICT,
-                format!("resource access conflict on '{res_name}'"),
-            ));
-        }
-        if writable {
-            access_set.add_resource_write(res_id);
-        } else {
-            access_set.add_resource_read(res_id);
-        }
-    }
+    acc.finalize_resources()
+        .map(|_| ())
+        .map_err(AccessPlanError::into_ffi)
+}
 
-    Ok(())
+fn restore_or_init_cursor(
+    group: &mut CachedQueryGroup,
+    query_idx: usize,
+    col_idx: usize,
+    uuid: bevy_abi_mod_sys::ComponentUuid,
+    group_store: Option<&crate::system::query_group::SharedCursorStore>,
+    fallback: impl FnOnce() -> Option<Box<dyn core::any::Any + Send + Sync>>,
+) {
+    group.cursor_uuids[col_idx] = Some(uuid);
+    if group.msg_cursors[col_idx].is_none()
+        && let (Some((mod_ns, sys_name)), Some(store)) = (&group.owner_system_key, group_store)
+    {
+        let key = PersistentCursorKey {
+            mod_namespace: mod_ns.clone(),
+            system_name: Arc::clone(sys_name),
+            query_idx,
+            term_idx: col_idx,
+            component_uuid: uuid,
+        };
+        group.msg_cursors[col_idx] = PersistentMessageCursors::take_from_store(store, &key);
+    }
+    if group.msg_cursors[col_idx].is_none() {
+        group.msg_cursors[col_idx] = fallback();
+    }
 }
 
 /// Resolves all query groups against `snapshot` and `world`, precomputing [`QueryPlan`]s,
@@ -321,11 +558,7 @@ pub(crate) fn initialize_query_groups_in_world(
     snapshot: &RegistrySnapshot,
     query_groups: &mut [CachedQueryGroup],
 ) -> Result<FilteredAccessSet, SystemInitError> {
-    let mut access_set = FilteredAccessSet::new();
-    let mut system_res_reads: HashSet<ComponentId> = HashSet::new();
-    let mut system_res_writes: HashSet<ComponentId> = HashSet::new();
-    let mut system_res_order: Vec<(ComponentId, Arc<str>)> = Vec::new();
-    let mut id_to_name: HashMap<ComponentId, Arc<str>> = HashMap::new();
+    let mut acc = SystemAccessAccumulator::default();
     let mut persistent_store = None;
 
     for (query_idx, group) in query_groups.iter_mut().enumerate() {
@@ -346,188 +579,45 @@ pub(crate) fn initialize_query_groups_in_world(
             None
         };
 
-        if group.spec.terms.len() > MAX_TERMS_PER_QUERY {
-            return Err(SystemInitError::TooManyTerms);
+        let vg = acc
+            .validate_group(query_idx, &group.spec, snapshot, Some(world), false)
+            .map_err(AccessPlanError::into_init_error)?;
+
+        if group.msg_cursors.len() < vg.term_metas.len() {
+            group.msg_cursors.resize_with(vg.term_metas.len(), || None);
         }
-
-        let mut read_components: HashSet<ComponentId> = HashSet::new();
-        let mut write_components: HashSet<ComponentId> = HashSet::new();
-        let mut has_entity_terms = false;
-        let mut term_metas: Vec<QueryTermMeta> = Vec::with_capacity(group.spec.terms.len());
-        let mut term_or_groups: Vec<u8> = Vec::with_capacity(group.spec.terms.len());
-
-        for (col_idx, term) in group.spec.terms.iter().enumerate() {
-            if !term.mode.is_valid() {
-                return Err(SystemInitError::InvalidMode { index: col_idx });
-            }
-            if term.or_group != 0
-                && !matches!(
-                    term.mode,
-                    AccessMode::FILTER_ONLY
-                        | AccessMode::WITHOUT
-                        | AccessMode::CHANGED
-                        | AccessMode::ADDED
-                )
-            {
-                return Err(SystemInitError::InvalidMode { index: col_idx });
-            }
-            let Some(reg) = snapshot.get_by_handle(term.component) else {
-                return Err(SystemInitError::UnknownComponent(format!(
-                    "BamComponent({})",
-                    term.component.0
-                )));
-            };
-            if term.mode.is_resource() != reg.is_resource()
-                || term.mode.is_message() != reg.is_message()
-            {
-                return Err(SystemInitError::KindMismatch(reg.name.to_string()));
-            }
-
-            let comp_id = reg.component_id;
-            let mut storage_flags = reg.storage_flags;
-            if !reg.is_resource()
-                && !reg.is_message()
-                && let Some(info) = world.components().get_info(comp_id)
-            {
-                if info.storage_type() == StorageType::SparseSet {
-                    storage_flags |= BAM_STORAGE_FLAG_SPARSE_SET;
-                }
-                if !info.mutable() {
-                    storage_flags |= BAM_STORAGE_FLAG_IMMUTABLE;
-                }
-            }
-            if (storage_flags & BAM_STORAGE_FLAG_IMMUTABLE) != 0 && term.mode.is_mutable() {
-                return Err(SystemInitError::ImmutableWrite(reg.name.to_string()));
-            }
-
-            id_to_name
-                .entry(comp_id)
-                .or_insert_with(|| Arc::clone(&reg.name));
-
-            match term.mode {
-                AccessMode::READ | AccessMode::OPTIONAL_READ => {
-                    has_entity_terms = true;
-                    if write_components.contains(&comp_id) {
-                        return Err(SystemInitError::SelfConflict {
-                            a: reg.name.to_string(),
-                            b: reg.name.to_string(),
-                        });
-                    }
-                    read_components.insert(comp_id);
-                }
-                AccessMode::WRITE | AccessMode::OPTIONAL_WRITE => {
-                    has_entity_terms = true;
-                    if read_components.contains(&comp_id) || write_components.contains(&comp_id) {
-                        return Err(SystemInitError::SelfConflict {
-                            a: reg.name.to_string(),
-                            b: reg.name.to_string(),
-                        });
-                    }
-                    write_components.insert(comp_id);
-                }
-                AccessMode::FILTER_ONLY
-                | AccessMode::WITHOUT
-                | AccessMode::CHANGED
-                | AccessMode::ADDED
-                | AccessMode::ALLOW
-                | AccessMode::HAS => {
-                    has_entity_terms = true;
-                }
-                AccessMode::REMOVED_READ => {}
-                AccessMode::RESOURCE_READ | AccessMode::MESSAGE_READ => {
-                    if system_res_writes.contains(&comp_id) {
-                        return Err(SystemInitError::SelfConflict {
-                            a: reg.name.to_string(),
-                            b: reg.name.to_string(),
-                        });
-                    }
-                    if system_res_reads.insert(comp_id) {
-                        system_res_order.push((comp_id, Arc::clone(&reg.name)));
-                    }
-                }
-                AccessMode::RESOURCE_WRITE | AccessMode::MESSAGE_WRITE => {
-                    if system_res_reads.contains(&comp_id) || system_res_writes.contains(&comp_id) {
-                        return Err(SystemInitError::SelfConflict {
-                            a: reg.name.to_string(),
-                            b: reg.name.to_string(),
-                        });
-                    }
-                    system_res_writes.insert(comp_id);
-                    system_res_order.push((comp_id, Arc::clone(&reg.name)));
-                }
-                _ => {
-                    return Err(SystemInitError::InvalidMode { index: col_idx });
-                }
-            }
-
-            if group.msg_cursors.len() <= col_idx {
-                group.msg_cursors.resize_with(col_idx + 1, || None);
-            }
-            if term.mode.is_message() {
-                group.cursor_uuids[col_idx] = Some(reg.uuid);
-                if group.msg_cursors[col_idx].is_none()
-                    && let (Some((mod_ns, sys_name)), Some(store)) =
-                        (&group.owner_system_key, &group_store)
-                {
-                    let key = PersistentCursorKey {
-                        mod_namespace: mod_ns.clone(),
-                        system_name: Arc::clone(sys_name),
-                        query_idx,
-                        term_idx: col_idx,
-                        component_uuid: reg.uuid,
-                    };
-                    group.msg_cursors[col_idx] =
-                        PersistentMessageCursors::take_from_store(store, &key);
-                }
-                if group.msg_cursors[col_idx].is_none()
-                    && let Some(create_fn) = reg.create_msg_cursor_fn
-                {
-                    group.msg_cursors[col_idx] = Some(create_fn());
-                }
-            } else if term.mode == AccessMode::REMOVED_READ {
-                group.cursor_uuids[col_idx] = Some(reg.uuid);
-                if group.msg_cursors[col_idx].is_none()
-                    && let (Some((mod_ns, sys_name)), Some(store)) =
-                        (&group.owner_system_key, &group_store)
-                {
-                    let key = PersistentCursorKey {
-                        mod_namespace: mod_ns.clone(),
-                        system_name: Arc::clone(sys_name),
-                        query_idx,
-                        term_idx: col_idx,
-                        component_uuid: reg.uuid,
-                    };
-                    group.msg_cursors[col_idx] =
-                        PersistentMessageCursors::take_from_store(store, &key);
-                }
-                if group.msg_cursors[col_idx].is_none() {
-                    group.msg_cursors[col_idx] =
-                        Some(Box::new(MessageCursor::<RemovedComponentEntity>::default()));
-                }
+        for (col_idx, meta) in vg.term_metas.iter().enumerate() {
+            if meta.mode.is_message() {
+                let create_fn = snapshot
+                    .get_by_handle(meta.component)
+                    .and_then(|r| r.create_msg_cursor_fn);
+                restore_or_init_cursor(
+                    group,
+                    query_idx,
+                    col_idx,
+                    meta.uuid,
+                    group_store.as_ref(),
+                    || create_fn.map(|f| f()),
+                );
+            } else if meta.mode == AccessMode::REMOVED_READ {
+                restore_or_init_cursor(
+                    group,
+                    query_idx,
+                    col_idx,
+                    meta.uuid,
+                    group_store.as_ref(),
+                    || Some(Box::new(MessageCursor::<RemovedComponentEntity>::default())),
+                );
             } else {
                 group.cursor_uuids[col_idx] = None;
                 group.msg_cursors[col_idx] = None;
             }
-
-            term_or_groups.push(term.or_group);
-            term_metas.push(QueryTermMeta {
-                component: reg.handle,
-                component_id: comp_id,
-                mode: term.mode,
-                uuid: reg.uuid,
-                size: reg.size,
-                align: reg.align,
-                storage_flags,
-                msg_read_batch_fn: reg.msg_read_batch_fn,
-                msg_send_fn: reg.msg_send_fn,
-                msg_write_batch_fn: reg.msg_write_batch_fn,
-            });
         }
 
-        let plan = QueryPlan::from_terms_with_or_groups(term_metas, &term_or_groups);
+        let plan = QueryPlan::from_terms_with_or_groups(vg.term_metas, &vg.term_or_groups);
         group.sparse_scratch.ensure_terms(plan.terms.len());
 
-        if group.spec.terms.is_empty() || has_entity_terms {
+        if group.spec.terms.is_empty() || vg.has_entity_terms {
             let mut builder = QueryBuilder::<()>::new(world);
             for (idx, t) in plan.terms.iter().enumerate() {
                 if (plan.or_term_mask & (1u32 << idx)) != 0 {
@@ -557,7 +647,7 @@ pub(crate) fn initialize_query_groups_in_world(
                         builder.without_id(t.component_id);
                     }
                     AccessMode::CHANGED | AccessMode::ADDED => {
-                        if write_components.contains(&t.component_id) {
+                        if vg.write_components.contains(&t.component_id) {
                             builder.with_id(t.component_id);
                         } else {
                             builder.ref_id(t.component_id);
@@ -572,28 +662,10 @@ pub(crate) fn initialize_query_groups_in_world(
                 }
             }
             for or_group in &plan.or_groups {
-                let mut or_access = FilteredAccess::matches_nothing();
-                for clause in &or_group.terms {
-                    let mut branch = FilteredAccess::default();
-                    match clause.mode {
-                        AccessMode::FILTER_ONLY => {
-                            branch.and_with(clause.component_id);
-                        }
-                        AccessMode::WITHOUT => {
-                            branch.and_without(clause.component_id);
-                        }
-                        AccessMode::CHANGED | AccessMode::ADDED => {
-                            if write_components.contains(&clause.component_id) {
-                                branch.and_with(clause.component_id);
-                            } else {
-                                branch.add_read(clause.component_id);
-                            }
-                        }
-                        _ => {}
-                    }
-                    or_access.append_or(&branch);
-                    or_access.extend_access(&branch);
-                }
+                let or_access = build_or_branch_access(
+                    or_group.terms.iter().map(|c| (c.component_id, c.mode)),
+                    &vg.write_components,
+                );
                 builder.extend_access(or_access);
             }
 
@@ -614,17 +686,8 @@ pub(crate) fn initialize_query_groups_in_world(
 
             let filtered_access = state.component_access().clone();
             group.query_state = Some(state);
-
-            let mut candidate_set = FilteredAccessSet::new();
-            candidate_set.add(filtered_access.clone());
-            if !access_set.is_compatible(&candidate_set) {
-                let conflict = find_conflicting_name(&id_to_name, &access_set, &filtered_access);
-                return Err(SystemInitError::SelfConflict {
-                    a: conflict.clone(),
-                    b: conflict,
-                });
-            }
-            access_set.add(filtered_access);
+            acc.add_entity_access(filtered_access)
+                .map_err(AccessPlanError::into_init_error)?;
         } else {
             group.is_dense = true;
             group.query_state = None;
@@ -633,516 +696,10 @@ pub(crate) fn initialize_query_groups_in_world(
         group.plan = plan;
     }
 
-    for (res_id, res_name) in system_res_order {
-        let writable = system_res_writes.contains(&res_id);
-        let mut candidate_set = FilteredAccessSet::new();
-        if writable {
-            candidate_set.add_resource_write(res_id);
-        } else {
-            candidate_set.add_resource_read(res_id);
-        }
-        if !access_set.is_compatible(&candidate_set) {
-            return Err(SystemInitError::SelfConflict {
-                a: res_name.to_string(),
-                b: res_name.to_string(),
-            });
-        }
-        if writable {
-            access_set.add_resource_write(res_id);
-        } else {
-            access_set.add_resource_read(res_id);
-        }
-    }
-
-    Ok(access_set)
+    acc.finalize_resources()
+        .map_err(AccessPlanError::into_init_error)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::registry::ModRegistry;
-    use bevy_abi_mod_macros::ModComponent;
-    use bevy_abi_mod_sys::BamTermDesc;
-    use bevy_ecs::message::{Message, Messages};
-
-    #[repr(C)]
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, ModComponent)]
-    struct ReloadPing {
-        seq: u32,
-    }
-
-    impl Message for ReloadPing {}
-
-    #[test]
-    fn persistent_message_cursor_survives_query_group_reload() {
-        let mut world = World::new();
-        world.init_resource::<Messages<ReloadPing>>();
-        let res_id = world
-            .components()
-            .component_id::<Messages<ReloadPing>>()
-            .expect("Messages<ReloadPing> resource id");
-
-        let mut registry = ModRegistry::new();
-        let handle = registry
-            .register_message::<ReloadPing>(res_id)
-            .expect("register ReloadPing message");
-        let snapshot = registry.snapshot();
-
-        let term = BamTermDesc::new(handle, AccessMode::MESSAGE_READ);
-        let spec = BamQuerySpecOwned::new(vec![term]);
-
-        // Write 3 messages before initial load.
-        {
-            let mut msgs = world.resource_mut::<Messages<ReloadPing>>();
-            msgs.write(ReloadPing { seq: 1 });
-            msgs.write(ReloadPing { seq: 2 });
-            msgs.write(ReloadPing { seq: 3 });
-        }
-
-        // First mod generation reads 2 of 3 messages (or all 3) and drops on unload.
-        {
-            let mut group = CachedQueryGroup::new(spec.clone());
-            group.set_system_identity(Some(Arc::from("mod_a")), "tick_pings");
-            let mut groups = [group];
-            initialize_query_groups_in_world(&mut world, snapshot, &mut groups)
-                .expect("init gen 1");
-
-            let cursor = groups[0].msg_cursors[0]
-                .as_mut()
-                .expect("cursor initialized")
-                .downcast_mut::<MessageCursor<ReloadPing>>()
-                .expect("MessageCursor<ReloadPing>");
-            let messages = world.resource::<Messages<ReloadPing>>();
-            let batch: Vec<u32> = cursor.read(messages).take(2).map(|m| m.seq).collect();
-            assert_eq!(batch, vec![1, 2]);
-        }
-
-        // Write one more message while unloaded.
-        world
-            .resource_mut::<Messages<ReloadPing>>()
-            .write(ReloadPing { seq: 4 });
-
-        // Second mod generation with identical (mod_namespace, system_name, query_idx, term_idx, uuid)
-        // resumes cleanly at seq=3 without re-reading seq=1,2!
-        {
-            let mut group = CachedQueryGroup::new(spec.clone());
-            group.set_system_identity(Some(Arc::from("mod_a")), "tick_pings");
-            let mut groups = [group];
-            initialize_query_groups_in_world(&mut world, snapshot, &mut groups)
-                .expect("init gen 2");
-
-            let cursor = groups[0].msg_cursors[0]
-                .as_mut()
-                .expect("cursor restored")
-                .downcast_mut::<MessageCursor<ReloadPing>>()
-                .expect("MessageCursor<ReloadPing>");
-            let messages = world.resource::<Messages<ReloadPing>>();
-            let batch: Vec<u32> = cursor.read(messages).map(|m| m.seq).collect();
-            assert_eq!(batch, vec![3, 4]);
-        }
-
-        // Different system_name gets an independent fresh cursor starting from seq=1.
-        {
-            let mut other = CachedQueryGroup::new(spec);
-            other.set_system_identity(Some(Arc::from("mod_a")), "other_system");
-            let mut groups = [other];
-            initialize_query_groups_in_world(&mut world, snapshot, &mut groups)
-                .expect("init other");
-
-            let cursor = groups[0].msg_cursors[0]
-                .as_mut()
-                .expect("fresh cursor")
-                .downcast_mut::<MessageCursor<ReloadPing>>()
-                .expect("MessageCursor<ReloadPing>");
-            let messages = world.resource::<Messages<ReloadPing>>();
-            let batch: Vec<u32> = cursor.read(messages).map(|m| m.seq).collect();
-            assert_eq!(batch, vec![1, 2, 3, 4]);
-        }
-    }
-
-    #[test]
-    fn persistent_removed_cursor_survives_query_group_reload() {
-        #[repr(C)]
-        #[derive(bevy_ecs::component::Component, Clone, Copy, ModComponent)]
-        struct EphemeralTag;
-
-        let mut world = World::new();
-        let cid = world.register_component::<EphemeralTag>();
-        let mut registry = ModRegistry::new();
-        let handle = registry
-            .register_component::<EphemeralTag>(cid, Default::default())
-            .expect("register EphemeralTag");
-        let snapshot = registry.snapshot();
-
-        let e1 = world.spawn(EphemeralTag).id();
-        let e2 = world.spawn(EphemeralTag).id();
-        let e3 = world.spawn(EphemeralTag).id();
-        world.despawn(e1);
-        world.despawn(e2);
-
-        let term = BamTermDesc::new(handle, AccessMode::REMOVED_READ);
-        let spec = BamQuerySpecOwned::new(vec![term]);
-
-        {
-            let mut group = CachedQueryGroup::new(spec.clone());
-            group.set_system_identity(Some(Arc::from("mod_b")), "watch_removals");
-            let mut groups = [group];
-            initialize_query_groups_in_world(&mut world, snapshot, &mut groups)
-                .expect("init removed gen 1");
-
-            let cursor = groups[0].msg_cursors[0]
-                .as_mut()
-                .expect("removed cursor initialized")
-                .downcast_mut::<MessageCursor<RemovedComponentEntity>>()
-                .expect("MessageCursor<RemovedComponentEntity>");
-            let removed = world.removed_components().get(cid).expect("removed stream");
-            let first: Vec<bevy_ecs::entity::Entity> = cursor
-                .read(removed)
-                .take(1)
-                .map(|ev| ev.clone().into())
-                .collect();
-            assert_eq!(first, vec![e1]);
-        }
-
-        world.despawn(e3);
-
-        {
-            let mut group = CachedQueryGroup::new(spec);
-            group.set_system_identity(Some(Arc::from("mod_b")), "watch_removals");
-            let mut groups = [group];
-            initialize_query_groups_in_world(&mut world, snapshot, &mut groups)
-                .expect("init removed gen 2");
-
-            let cursor = groups[0].msg_cursors[0]
-                .as_mut()
-                .expect("removed cursor restored")
-                .downcast_mut::<MessageCursor<RemovedComponentEntity>>()
-                .expect("MessageCursor<RemovedComponentEntity>");
-            let removed = world.removed_components().get(cid).expect("removed stream");
-            let rest: Vec<bevy_ecs::entity::Entity> =
-                cursor.read(removed).map(|ev| ev.clone().into()).collect();
-            assert_eq!(rest, vec![e2, e3]);
-        }
-    }
-
-    #[repr(C)]
-    #[derive(bevy_ecs::component::Component, Clone, Copy, ModComponent)]
-    struct AccCompA(u32);
-
-    #[repr(C)]
-    #[derive(bevy_ecs::component::Component, Clone, Copy, ModComponent)]
-    #[component(immutable)]
-    struct AccImm(u32);
-
-    #[repr(C)]
-    #[derive(bevy_ecs::component::Component, Clone, Copy, ModComponent)]
-    #[component(storage = "SparseSet")]
-    struct AccSparse(u32);
-
-    #[repr(C)]
-    #[derive(bevy_ecs::prelude::Resource, Clone, Copy, ModComponent)]
-    struct AccRes(u32);
-
-    #[test]
-    fn access_builder_validation_conflicts_or_groups_and_find_conflicting_name() {
-        use bevy_abi_mod_sys::{BamComponent, FfiResult, ModComponent as _};
-
-        let mut world = World::new();
-        let a_cid = world.register_component::<AccCompA>();
-        let imm_cid = world.register_component::<AccImm>();
-        let sp_cid = world.register_component::<AccSparse>();
-        let res_cid = world.register_component::<AccRes>();
-
-        let mut reg = ModRegistry::new();
-        let a_h = reg
-            .register_component::<AccCompA>(a_cid, Default::default())
-            .unwrap();
-        let imm_h = reg
-            .register_component::<AccImm>(
-                imm_cid,
-                crate::registry::ComponentOptions::default().immutable(),
-            )
-            .unwrap();
-        let sp_h = reg
-            .register_component::<AccSparse>(sp_cid, Default::default())
-            .unwrap();
-        let res_h = reg.register_resource::<AccRes>(res_cid).unwrap();
-        let snap = reg.snapshot();
-
-        // 1. `find_conflicting_name` `"unknown"` fallback when `id_to_name` lacks ID.
-        let mut set_a = FilteredAccessSet::new();
-        let mut fa_a = bevy_ecs::query::FilteredAccess::default();
-        fa_a.add_write(a_cid);
-        set_a.add(fa_a.clone());
-        let empty_names = HashMap::new();
-        assert_eq!(
-            find_conflicting_name(&empty_names, &set_a, &fa_a),
-            "unknown"
-        );
-
-        // 2. `validate_system_queries_against_snapshot` error cases:
-        // > 32 terms
-        let too_many = vec![BamTermDesc::new(a_h, AccessMode::READ); MAX_TERMS_PER_QUERY + 1];
-        assert_eq!(
-            validate_system_queries_against_snapshot(snap, &[BamQuerySpecOwned::new(too_many)])
-                .unwrap_err()
-                .0,
-            FfiResult::CAPACITY_EXCEEDED
-        );
-        // Invalid mode
-        let mut bad_mode = BamTermDesc::new(a_h, AccessMode::READ);
-        bad_mode.mode = AccessMode(255);
-        assert_eq!(
-            validate_system_queries_against_snapshot(
-                snap,
-                &[BamQuerySpecOwned::new(vec![bad_mode])]
-            )
-            .unwrap_err()
-            .0,
-            FfiResult::INVALID_ARGUMENT
-        );
-        // Unknown component
-        assert_eq!(
-            validate_system_queries_against_snapshot(
-                snap,
-                &[BamQuerySpecOwned::new(vec![BamTermDesc::new(
-                    BamComponent::from_raw(999),
-                    AccessMode::READ
-                )])]
-            )
-            .unwrap_err()
-            .0,
-            FfiResult::INVALID_COMPONENT
-        );
-        // Kind mismatch
-        assert_eq!(
-            validate_system_queries_against_snapshot(
-                snap,
-                &[BamQuerySpecOwned::new(vec![BamTermDesc::new(
-                    a_h,
-                    AccessMode::RESOURCE_READ
-                )])]
-            )
-            .unwrap_err()
-            .0,
-            FfiResult::INVALID_COMPONENT
-        );
-        // Immutable write
-        assert_eq!(
-            validate_system_queries_against_snapshot(
-                snap,
-                &[BamQuerySpecOwned::new(vec![BamTermDesc::new(
-                    imm_h,
-                    AccessMode::WRITE
-                )])]
-            )
-            .unwrap_err()
-            .0,
-            FfiResult::PERMISSION_DENIED
-        );
-        // Invalid `or_group` mode
-        let mut bad_or = BamTermDesc::new(a_h, AccessMode::READ);
-        bad_or.or_group = 1;
-        assert_eq!(
-            validate_system_queries_against_snapshot(snap, &[BamQuerySpecOwned::new(vec![bad_or])])
-                .unwrap_err()
-                .0,
-            FfiResult::INVALID_ARGUMENT
-        );
-        // Intra-query read/write & write/write conflicts
-        assert_eq!(
-            validate_system_queries_against_snapshot(
-                snap,
-                &[BamQuerySpecOwned::new(vec![
-                    BamTermDesc::new(a_h, AccessMode::WRITE),
-                    BamTermDesc::new(a_h, AccessMode::READ),
-                ])]
-            )
-            .unwrap_err()
-            .0,
-            FfiResult::ACCESS_CONFLICT
-        );
-        assert_eq!(
-            validate_system_queries_against_snapshot(
-                snap,
-                &[BamQuerySpecOwned::new(vec![
-                    BamTermDesc::new(a_h, AccessMode::READ),
-                    BamTermDesc::new(a_h, AccessMode::WRITE),
-                ])]
-            )
-            .unwrap_err()
-            .0,
-            FfiResult::ACCESS_CONFLICT
-        );
-        // Resource conflicts (write->read and read->write)
-        assert_eq!(
-            validate_system_queries_against_snapshot(
-                snap,
-                &[BamQuerySpecOwned::new(vec![
-                    BamTermDesc::new(res_h, AccessMode::RESOURCE_WRITE),
-                    BamTermDesc::new(res_h, AccessMode::RESOURCE_READ),
-                ])]
-            )
-            .unwrap_err()
-            .0,
-            FfiResult::ACCESS_CONFLICT
-        );
-        assert_eq!(
-            validate_system_queries_against_snapshot(
-                snap,
-                &[BamQuerySpecOwned::new(vec![
-                    BamTermDesc::new(res_h, AccessMode::RESOURCE_READ),
-                    BamTermDesc::new(res_h, AccessMode::RESOURCE_WRITE),
-                ])]
-            )
-            .unwrap_err()
-            .0,
-            FfiResult::ACCESS_CONFLICT
-        );
-        // Inter-query borrow conflict
-        assert_eq!(
-            validate_system_queries_against_snapshot(
-                snap,
-                &[
-                    BamQuerySpecOwned::new(vec![BamTermDesc::new(a_h, AccessMode::WRITE)]),
-                    BamQuerySpecOwned::new(vec![BamTermDesc::new(a_h, AccessMode::OPTIONAL_READ)]),
-                ]
-            )
-            .unwrap_err()
-            .0,
-            FfiResult::ACCESS_CONFLICT
-        );
-
-        // Valid complex combination covering `OPTIONAL_READ`, `OPTIONAL_WRITE`, `FILTER_ONLY`,
-        // `WITHOUT`, `ALLOW`, `HAS`, `CHANGED`/`ADDED` (both inside and outside `or_group`,
-        // with and without `WRITE`).
-        let mut or_with = BamTermDesc::new(sp_h, AccessMode::FILTER_ONLY);
-        or_with.or_group = 1;
-        let mut or_without = BamTermDesc::new(imm_h, AccessMode::WITHOUT);
-        or_without.or_group = 1;
-        let mut or_changed_ro = BamTermDesc::new(imm_h, AccessMode::CHANGED);
-        or_changed_ro.or_group = 2;
-        let mut or_added_wr = BamTermDesc::new(a_h, AccessMode::ADDED);
-        or_added_wr.or_group = 2;
-
-        let valid_groups = [BamQuerySpecOwned::new(vec![
-            BamTermDesc::new(a_h, AccessMode::WRITE),
-            BamTermDesc::new(imm_h, AccessMode::OPTIONAL_READ),
-            BamTermDesc::new(sp_h, AccessMode::ALLOW),
-            BamTermDesc::new(res_h, AccessMode::RESOURCE_READ),
-            or_with,
-            or_without,
-            or_changed_ro,
-            or_added_wr,
-        ])];
-        assert!(validate_system_queries_against_snapshot(snap, &valid_groups).is_ok());
-
-        let mut cached: Vec<CachedQueryGroup> = valid_groups
-            .iter()
-            .cloned()
-            .map(CachedQueryGroup::new)
-            .collect();
-        let fas = initialize_query_groups_in_world(&mut world, snap, &mut cached).unwrap();
-        assert!(fas.combined_access().has_read(res_cid));
-
-        // 3. `initialize_query_groups_in_world` error variants:
-        let err_cases: Vec<(Vec<BamQuerySpecOwned>, SystemInitError)> = vec![
-            (
-                vec![BamQuerySpecOwned::new(vec![
-                    BamTermDesc::new(
-                        a_h,
-                        AccessMode::READ
-                    );
-                    MAX_TERMS_PER_QUERY + 1
-                ])],
-                SystemInitError::TooManyTerms,
-            ),
-            (
-                vec![BamQuerySpecOwned::new(vec![bad_mode])],
-                SystemInitError::InvalidMode { index: 0 },
-            ),
-            (
-                vec![BamQuerySpecOwned::new(vec![bad_or])],
-                SystemInitError::InvalidMode { index: 0 },
-            ),
-            (
-                vec![BamQuerySpecOwned::new(vec![BamTermDesc::new(
-                    BamComponent::from_raw(999),
-                    AccessMode::READ,
-                )])],
-                SystemInitError::UnknownComponent(String::from("BamComponent(999)")),
-            ),
-            (
-                vec![BamQuerySpecOwned::new(vec![BamTermDesc::new(
-                    a_h,
-                    AccessMode::RESOURCE_READ,
-                )])],
-                SystemInitError::KindMismatch(String::from(AccCompA::CANONICAL_NAME)),
-            ),
-            (
-                vec![BamQuerySpecOwned::new(vec![BamTermDesc::new(
-                    imm_h,
-                    AccessMode::WRITE,
-                )])],
-                SystemInitError::ImmutableWrite(String::from(AccImm::CANONICAL_NAME)),
-            ),
-            (
-                vec![BamQuerySpecOwned::new(vec![
-                    BamTermDesc::new(a_h, AccessMode::WRITE),
-                    BamTermDesc::new(a_h, AccessMode::READ),
-                ])],
-                SystemInitError::SelfConflict {
-                    a: String::from(AccCompA::CANONICAL_NAME),
-                    b: String::from(AccCompA::CANONICAL_NAME),
-                },
-            ),
-            (
-                vec![BamQuerySpecOwned::new(vec![
-                    BamTermDesc::new(a_h, AccessMode::READ),
-                    BamTermDesc::new(a_h, AccessMode::WRITE),
-                ])],
-                SystemInitError::SelfConflict {
-                    a: String::from(AccCompA::CANONICAL_NAME),
-                    b: String::from(AccCompA::CANONICAL_NAME),
-                },
-            ),
-            (
-                vec![BamQuerySpecOwned::new(vec![
-                    BamTermDesc::new(res_h, AccessMode::RESOURCE_WRITE),
-                    BamTermDesc::new(res_h, AccessMode::RESOURCE_READ),
-                ])],
-                SystemInitError::SelfConflict {
-                    a: String::from(AccRes::CANONICAL_NAME),
-                    b: String::from(AccRes::CANONICAL_NAME),
-                },
-            ),
-            (
-                vec![BamQuerySpecOwned::new(vec![
-                    BamTermDesc::new(res_h, AccessMode::RESOURCE_READ),
-                    BamTermDesc::new(res_h, AccessMode::RESOURCE_WRITE),
-                ])],
-                SystemInitError::SelfConflict {
-                    a: String::from(AccRes::CANONICAL_NAME),
-                    b: String::from(AccRes::CANONICAL_NAME),
-                },
-            ),
-            (
-                vec![
-                    BamQuerySpecOwned::new(vec![BamTermDesc::new(a_h, AccessMode::WRITE)]),
-                    BamQuerySpecOwned::new(vec![BamTermDesc::new(a_h, AccessMode::OPTIONAL_WRITE)]),
-                ],
-                SystemInitError::SelfConflict {
-                    a: String::from(AccCompA::CANONICAL_NAME),
-                    b: String::from(AccCompA::CANONICAL_NAME),
-                },
-            ),
-        ];
-
-        for (specs, expected) in err_cases {
-            let mut groups: Vec<CachedQueryGroup> =
-                specs.into_iter().map(CachedQueryGroup::new).collect();
-            let got = initialize_query_groups_in_world(&mut world, snap, &mut groups).unwrap_err();
-            assert_eq!(got, expected);
-        }
-    }
-}
+#[path = "../../tests/unit/access_builder_tests.rs"]
+mod tests;

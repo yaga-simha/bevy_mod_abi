@@ -125,6 +125,37 @@ impl From<ModTrustPolicy> for bevy_abi_mod_trust::ModTrustPolicy {
     }
 }
 
+macro_rules! delegate_policy_methods {
+    (
+        $(
+            $(#[$meta:meta])*
+            fn $name:ident($($arg:ident : $arg_ty:ty),* $(,)?) -> Result<Self>;
+        )*
+    ) => {
+        $(
+            $(#[$meta])*
+            pub fn $name(self, $($arg: $arg_ty),*) -> Result<Self, ModTrustConfigError> {
+                self.0.$name($($arg),*).map(Self)
+            }
+        )*
+    };
+    (
+        infallible
+        $(
+            $(#[$meta:meta])*
+            fn $name:ident($($arg:ident : $arg_ty:ty),* $(,)?) -> Self;
+        )*
+    ) => {
+        $(
+            $(#[$meta])*
+            #[must_use]
+            pub fn $name(self, $($arg: $arg_ty),*) -> Self {
+                Self(self.0.$name($($arg),*))
+            }
+        )*
+    };
+}
+
 impl ModTrustPolicy {
     /// Borrows the underlying pure-Rust [`bevy_abi_mod_trust::ModTrustPolicy`].
     #[inline]
@@ -162,127 +193,53 @@ impl ModTrustPolicy {
         bevy_abi_mod_trust::ModTrustPolicy::from_public_key_openssh(openssh_pub).map(Self)
     }
 
-    /// Adds a trusted OpenSSH Ed25519 CA public key (deduplicated) and marks enforcement required.
-    pub fn add_ca_openssh(self, openssh_pub: &str) -> Result<Self, ModTrustConfigError> {
-        self.0.add_ca_openssh(openssh_pub).map(Self)
+    delegate_policy_methods! {
+        /// Adds a trusted OpenSSH Ed25519 CA public key (deduplicated) and marks enforcement required.
+        fn add_ca_openssh(openssh_pub: &str) -> Result<Self>;
+        /// Reads and adds a trusted OpenSSH Ed25519 CA `.pub` file from disk.
+        fn add_ca_file(path: impl AsRef<Path>) -> Result<Self>;
+        /// Adds a pinned OpenSSH Ed25519 public key (deduplicated) and marks enforcement required.
+        fn add_public_key_openssh(openssh_pub: &str) -> Result<Self>;
+        /// Reads and adds a pinned OpenSSH Ed25519 `.pub` file from disk.
+        fn add_public_key_file(path: impl AsRef<Path>) -> Result<Self>;
+        /// Sets the expected `SSHSIG` domain-separation namespace (rejects empty strings).
+        fn with_namespace(namespace: impl Into<String>) -> Result<Self>;
+        /// Revokes an inclusive certificate serial range `[min, max]` across all trusted CAs.
+        fn revoke_serial_range(min: u64, max: u64) -> Result<Self>;
+        /// Revokes a leaf or CA OpenSSH Ed25519 public key.
+        fn revoke_key_openssh(openssh_pub: &str) -> Result<Self>;
+        /// Revokes a SHA-256 OpenSSH key fingerprint (`"SHA256:..."`).
+        fn revoke_fingerprint(fingerprint: &str) -> Result<Self>;
+        /// Merges revocations from a binary OpenSSH Key Revocation List (`SSHKRL`).
+        fn add_krl_bytes(krl_bytes: &[u8]) -> Result<Self>;
+        /// Reads and merges a binary `SSHKRL` file from disk.
+        fn add_krl_file(path: impl AsRef<Path>) -> Result<Self>;
+        /// Verifies and merges a signed `SSHKRL` along with its OpenSSH `SSHSIG` envelope.
+        fn add_signed_krl_bytes(krl_bytes: &[u8], sig_pem_bytes: &[u8]) -> Result<Self>;
+        /// Reads, verifies, and merges a signed `SSHKRL` and its `.sig` sidecar from disk.
+        fn add_signed_krl_file(krl_path: impl AsRef<Path>, sig_path: Option<&Path>) -> Result<Self>;
+        /// Parses and merges an OpenSSH KRL text revocation specification (`serial:`, `key:`, `sha256:`, `id:`).
+        fn add_revocation_spec_str(spec: &str) -> Result<Self>;
     }
 
-    /// Reads and adds a trusted OpenSSH Ed25519 CA `.pub` file from disk.
-    pub fn add_ca_file(self, path: impl AsRef<Path>) -> Result<Self, ModTrustConfigError> {
-        self.0.add_ca_file(path).map(Self)
-    }
-
-    /// Adds a pinned OpenSSH Ed25519 public key (deduplicated) and marks enforcement required.
-    pub fn add_public_key_openssh(self, openssh_pub: &str) -> Result<Self, ModTrustConfigError> {
-        self.0.add_public_key_openssh(openssh_pub).map(Self)
-    }
-
-    /// Reads and adds a pinned OpenSSH Ed25519 `.pub` file from disk.
-    pub fn add_public_key_file(self, path: impl AsRef<Path>) -> Result<Self, ModTrustConfigError> {
-        self.0.add_public_key_file(path).map(Self)
-    }
-
-    /// Sets [`SignatureEnforcement`] explicitly.
-    #[must_use]
-    pub fn with_enforcement(self, enforcement: SignatureEnforcement) -> Self {
-        Self(self.0.with_enforcement(enforcement))
-    }
-
-    /// Sets the expected `SSHSIG` domain-separation namespace (rejects empty strings).
-    pub fn with_namespace(self, namespace: impl Into<String>) -> Result<Self, ModTrustConfigError> {
-        self.0.with_namespace(namespace).map(Self)
-    }
-
-    /// Requires certificate-backed signatures to authorize `principal` in `valid_principals`.
-    #[must_use]
-    pub fn with_required_principal(self, principal: impl Into<String>) -> Self {
-        Self(self.0.with_required_principal(principal))
-    }
-
-    /// Requires `BamManifest::name` to appear in certificate `valid_principals`.
-    #[must_use]
-    pub fn with_manifest_name_principal_binding(self, enabled: bool) -> Self {
-        Self(self.0.with_manifest_name_principal_binding(enabled))
-    }
-
-    /// Sets the certificate validity time-checking policy.
-    #[must_use]
-    pub fn with_validity_policy(self, policy: CertificateValidityPolicy) -> Self {
-        Self(self.0.with_validity_policy(policy))
-    }
-
-    /// Sets the maximum mod shared-library file size buffered into memory for verification.
-    #[must_use]
-    pub fn with_max_binary_bytes(self, max_bytes: u64) -> Self {
-        Self(self.0.with_max_binary_bytes(max_bytes))
-    }
-
-    /// Revokes a certificate serial number across all trusted CAs.
-    #[must_use]
-    pub fn revoke_serial(self, serial: u64) -> Self {
-        Self(self.0.revoke_serial(serial))
-    }
-
-    /// Revokes an inclusive certificate serial range `[min, max]` across all trusted CAs.
-    pub fn revoke_serial_range(self, min: u64, max: u64) -> Result<Self, ModTrustConfigError> {
-        self.0.revoke_serial_range(min, max).map(Self)
-    }
-
-    /// Revokes a certificate `key_id` across all trusted CAs.
-    #[must_use]
-    pub fn revoke_key_id(self, key_id: impl Into<String>) -> Self {
-        Self(self.0.revoke_key_id(key_id))
-    }
-
-    /// Revokes a leaf or CA OpenSSH Ed25519 public key.
-    pub fn revoke_key_openssh(self, openssh_pub: &str) -> Result<Self, ModTrustConfigError> {
-        self.0.revoke_key_openssh(openssh_pub).map(Self)
-    }
-
-    /// Revokes a SHA-256 OpenSSH key fingerprint (`"SHA256:..."`).
-    pub fn revoke_fingerprint(self, fingerprint: &str) -> Result<Self, ModTrustConfigError> {
-        self.0.revoke_fingerprint(fingerprint).map(Self)
-    }
-
-    /// Enforces a minimum rollback version on signed KRLs applied via [`Self::add_signed_krl_bytes`].
-    #[must_use]
-    pub fn with_min_krl_version(self, min_version: u64) -> Self {
-        Self(self.0.with_min_krl_version(min_version))
-    }
-
-    /// Merges revocations from a binary OpenSSH Key Revocation List (`SSHKRL`).
-    pub fn add_krl_bytes(self, krl_bytes: &[u8]) -> Result<Self, ModTrustConfigError> {
-        self.0.add_krl_bytes(krl_bytes).map(Self)
-    }
-
-    /// Reads and merges a binary `SSHKRL` file from disk.
-    pub fn add_krl_file(self, path: impl AsRef<Path>) -> Result<Self, ModTrustConfigError> {
-        self.0.add_krl_file(path).map(Self)
-    }
-
-    /// Verifies and merges a signed `SSHKRL` along with its OpenSSH `SSHSIG` envelope.
-    pub fn add_signed_krl_bytes(
-        self,
-        krl_bytes: &[u8],
-        sig_pem_bytes: &[u8],
-    ) -> Result<Self, ModTrustConfigError> {
-        self.0
-            .add_signed_krl_bytes(krl_bytes, sig_pem_bytes)
-            .map(Self)
-    }
-
-    /// Reads, verifies, and merges a signed `SSHKRL` and its `.sig` sidecar from disk.
-    pub fn add_signed_krl_file(
-        self,
-        krl_path: impl AsRef<Path>,
-        sig_path: Option<&Path>,
-    ) -> Result<Self, ModTrustConfigError> {
-        self.0.add_signed_krl_file(krl_path, sig_path).map(Self)
-    }
-
-    /// Parses and merges an OpenSSH KRL text revocation specification (`serial:`, `key:`, `sha256:`, `id:`).
-    pub fn add_revocation_spec_str(self, spec: &str) -> Result<Self, ModTrustConfigError> {
-        self.0.add_revocation_spec_str(spec).map(Self)
+    delegate_policy_methods! {
+        infallible
+        /// Sets [`SignatureEnforcement`] explicitly.
+        fn with_enforcement(enforcement: SignatureEnforcement) -> Self;
+        /// Requires certificate-backed signatures to authorize `principal` in `valid_principals`.
+        fn with_required_principal(principal: impl Into<String>) -> Self;
+        /// Requires `BamManifest::name` to appear in certificate `valid_principals`.
+        fn with_manifest_name_principal_binding(enabled: bool) -> Self;
+        /// Sets the certificate validity time-checking policy.
+        fn with_validity_policy(policy: CertificateValidityPolicy) -> Self;
+        /// Sets the maximum mod shared-library file size buffered into memory for verification.
+        fn with_max_binary_bytes(max_bytes: u64) -> Self;
+        /// Revokes a certificate serial number across all trusted CAs.
+        fn revoke_serial(serial: u64) -> Self;
+        /// Revokes a certificate `key_id` across all trusted CAs.
+        fn revoke_key_id(key_id: impl Into<String>) -> Self;
+        /// Enforces a minimum rollback version on signed KRLs applied via [`Self::add_signed_krl_bytes`].
+        fn with_min_krl_version(min_version: u64) -> Self;
     }
 
     /// Verifies `binary_bytes` against detached `sig_pem_bytes`.
@@ -317,22 +274,6 @@ impl ModTrustPolicy {
             .map(VerifiedModSignature::from)
     }
 
-    /// Verifies a `.bampack` archive in memory under this policy.
-    pub fn verify_bampack_bytes(
-        &self,
-        pack_bytes: &[u8],
-    ) -> Result<VerifiedBamPack, SignatureVerificationError> {
-        self.0.verify_bampack_bytes(pack_bytes)
-    }
-
-    /// Reads and verifies a `.bampack` archive from disk under this policy.
-    pub fn verify_bampack_file(
-        &self,
-        path: impl AsRef<Path>,
-    ) -> Result<VerifiedBamPack, SignatureVerificationError> {
-        self.0.verify_bampack_file(path)
-    }
-
     /// Re-validates an already-issued [`VerifiedModSignature`] receipt against active anchors/KRLs.
     pub fn verify_receipt_still_trusted(
         &self,
@@ -355,25 +296,5 @@ impl ModTrustPolicy {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use bevy_ecs::world::World;
-    use ssh_key::{Algorithm, PrivateKey, rand_core::OsRng};
-
-    #[test]
-    fn host_sys_trust_ecs_adapters_store_and_verify() {
-        let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
-        let pub_str = key.public_key().to_openssh().unwrap();
-        let policy = ModTrustPolicy::from_public_key_openssh(&pub_str).unwrap();
-        let payload = b"host-sys-adapter-payload";
-        let sig = sign_mod_bytes_with_key(&key, DEFAULT_SIGNATURE_NAMESPACE, payload).unwrap();
-        let receipt = policy.verify_bytes(payload, sig.as_bytes()).unwrap();
-        policy.verify_receipt_still_trusted(&receipt).unwrap();
-
-        let mut world = World::new();
-        world.insert_resource(policy);
-        let entity = world.spawn(receipt.clone()).id();
-        assert_eq!(world.get::<VerifiedModSignature>(entity), Some(&receipt));
-        assert!(world.resource::<ModTrustPolicy>().has_trust_anchors());
-    }
-}
+#[path = "../../tests/unit/signing_tests.rs"]
+mod tests;
