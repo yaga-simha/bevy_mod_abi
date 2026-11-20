@@ -17,28 +17,6 @@ fn local_guest_sdk_path() -> PathBuf {
         .join("bevy_abi_mod_guest")
 }
 
-/// Minimal B3-independent Rust guest mod body for testing `cargo bam build` compilation before
-/// B3's `#[derive(GuestComponent)]` lands in this worktree.
-const MINIMAL_BUILD_TEST_LIB_RS: &str = r#"use bevy_abi_mod_guest::prelude::*;
-use core::ffi::CStr;
-
-#[derive(Default)]
-pub struct ModPlugin;
-
-impl GuestPlugin for ModPlugin {
-    const NAME: &'static CStr = c"sample_rust_mod";
-    const VERSION: &'static CStr = c"0.1.0";
-
-    fn build(&mut self, app: &mut GuestApp<'_>) -> FfiResult {
-        app.system(c"heartbeat")
-            .schedule(ScheduleId::UPDATE)
-            .build(|_ctx| FfiResult::OK)
-    }
-}
-
-export_mod!(plugin: ModPlugin);
-"#;
-
 #[test]
 fn cli_export_sdk_writes_c_cpp_and_zig_headers() {
     let tmp = TempDir::new().unwrap();
@@ -279,10 +257,11 @@ fn cli_new_and_build_rust_cdylib_mod() {
     assert!(cargo_toml.contains("path = "));
     assert!(cargo_toml.contains("features = [\"derive\"]"));
 
-    // Stage 1 note: B3 is landing `#[derive(GuestComponent)]` concurrently in another worktree;
-    // swap in a B3-independent minimal `GuestPlugin` body to verify `cargo bam build` end-to-end
-    // without blocking on B3's merge.
-    fs::write(rust_proj.join("src/lib.rs"), MINIMAL_BUILD_TEST_LIB_RS).unwrap();
+    // Compile the unmodified zero-boilerplate `#[derive(..., AbiPod, GuestComponent)]` +
+    // `query_typed` scaffold template end-to-end against the local workspace `bevy_abi_mod_guest`.
+    let scaffold_lib = fs::read_to_string(rust_proj.join("src/lib.rs")).unwrap();
+    assert!(scaffold_lib.contains("AbiPod, GuestComponent"));
+    assert!(scaffold_lib.contains(".query_typed::<&mut Counter>()"));
 
     let dist_rust = tmp.path().join("dist_rust");
     run_cli([

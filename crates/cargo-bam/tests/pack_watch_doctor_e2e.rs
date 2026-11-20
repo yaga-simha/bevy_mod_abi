@@ -437,36 +437,10 @@ fn e2e_pack_custom_assets_dir_and_rust_cdylib() {
     .unwrap();
     let proj = tmp.path().join("rust_pack_demo");
 
-    // Verify scaffolded template uses locked zero-boilerplate B3 API.
+    // Verify scaffolded template uses locked zero-boilerplate B3 API and compile it unmodified.
     let scaffold_lib = fs::read_to_string(proj.join("src/lib.rs")).unwrap();
     assert!(scaffold_lib.contains("GuestComponent"));
     assert!(scaffold_lib.contains("query_typed"));
-
-    // Stage 1 note: B3 is landing `#[derive(GuestComponent)]` concurrently in another worktree;
-    // swap in a B3-independent minimal `GuestPlugin` body to test `cargo bam pack` end-to-end.
-    fs::write(
-        proj.join("src/lib.rs"),
-        r#"use bevy_abi_mod_guest::prelude::*;
-use core::ffi::CStr;
-
-#[derive(Default)]
-pub struct ModPlugin;
-
-impl GuestPlugin for ModPlugin {
-    const NAME: &'static CStr = c"rust_pack_demo";
-    const VERSION: &'static CStr = c"0.1.0";
-
-    fn build(&mut self, app: &mut GuestApp<'_>) -> FfiResult {
-        app.system(c"heartbeat")
-            .schedule(ScheduleId::UPDATE)
-            .build(|_ctx| FfiResult::OK)
-    }
-}
-
-export_mod!(plugin: ModPlugin);
-"#,
-    )
-    .unwrap();
 
     let custom_assets = tmp.path().join("external_assets");
     fs::create_dir_all(custom_assets.join("shaders")).unwrap();
