@@ -472,7 +472,7 @@ jobs:
           BAM_FIXTURE_DIR="${{ github.workspace }}/target/fixtures" \
             cargo test -p bevy_abi_mod_host --test e2e --all-features
           BAM_FIXTURE_DIR="${{ github.workspace }}/target/fixtures" \
-            cargo test -p bevy_abi_mod --test bridges_integration --all-features
+            cargo test -p bevy_mod_abi --test bridges_integration --all-features
           cargo run -p example_07_cpp17_guest
           cargo run -p example_08_zig_guest
 
