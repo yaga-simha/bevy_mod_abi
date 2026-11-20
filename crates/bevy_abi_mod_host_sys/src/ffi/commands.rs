@@ -1377,7 +1377,7 @@ impl<'a> HostCommands<'a> {
         if let Some(limit) = self.quota_limits.max_spawns_per_frame {
             if let Some(shared) = self.shared_frame_spawns {
                 if shared
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                         cur.checked_add(count).filter(|&next| next <= limit)
                     })
                     .is_err()
