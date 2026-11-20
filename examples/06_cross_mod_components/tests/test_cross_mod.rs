@@ -8,9 +8,9 @@
 //!    the same archetype columns deterministically after Mod A's recharge system.
 //! 4. Unloading both mods leaves entity data intact and frozen on subsequent ticks.
 
-use bevy_abi_mod::prelude::*;
 use bevy_app::App;
 use bevy_ecs::message::Messages;
+use bevy_mod_abi::prelude::*;
 use std::path::{Path, PathBuf};
 
 #[repr(C)]

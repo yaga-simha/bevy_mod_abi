@@ -19,14 +19,13 @@
 //!     disabled.
 
 use bevy_abi_mod_guest::prelude::*;
-use core::ffi::CStr;
 
 /// Guest mirror of the host's persistent `"companion::Beacon"` component.
 ///
 /// Layout: 24 bytes, 4-byte alignment, zero implicit padding.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, ModComponent)]
-#[mod_component(name = "companion::Beacon")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, AbiPod, GuestComponent)]
+#[guest_component(name = "companion::Beacon")]
 pub struct CompanionBeacon {
     /// Stable application-assigned beacon identifier (`1`, `2`, `3`, ...).
     pub beacon_id: u32,
@@ -40,11 +39,6 @@ pub struct CompanionBeacon {
     pub active_tab_index: u32,
     /// Cumulative `FfiValueChange` UI events handled by the guest observer.
     pub ui_events: u32,
-}
-
-impl GuestComponent for CompanionBeacon {
-    const NAME: &'static CStr = c"companion::Beacon";
-    const UUID: ComponentUuid = <Self as ModComponent>::UUID;
 }
 
 #[cfg(not(feature = "mod-b"))]
@@ -63,7 +57,7 @@ mod mod_a {
     /// Layout: 16 bytes, 4-byte alignment, zero implicit padding.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, PartialEq, ModComponent)]
-    #[mod_component(name = "companion_core_mod::OrbitalBeacon")]
+    #[mod_component(name = "companion_core_mod::OrbitalBeacon", guest)]
     pub struct OrbitalBeacon {
         /// Orbital phase accumulator in radians.
         pub orbit_phase: f32,
@@ -75,15 +69,10 @@ mod mod_a {
         pub pick_boosts: u32,
     }
 
-    impl GuestComponent for OrbitalBeacon {
-        const NAME: &'static CStr = c"companion_core_mod::OrbitalBeacon";
-        const UUID: ComponentUuid = <Self as ModComponent>::UUID;
-    }
-
     /// Guest mirror of `bevy_abi_mod::camera_light::FfiPointLight` (44 bytes, align 4).
     #[repr(C)]
-    #[derive(Clone, Copy, Debug, Default, PartialEq, ModComponent)]
-    #[mod_component(name = "bevy_abi_mod::camera_light::FfiPointLight")]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, AbiPod, GuestComponent)]
+    #[guest_component(name = "bevy_abi_mod::camera_light::FfiPointLight")]
     pub struct GuestPointLight {
         pub color: [f32; 4],
         pub intensity: f32,
@@ -96,11 +85,6 @@ mod mod_a {
         pub contact_shadows_enabled: FfiBool,
         pub affects_lightmapped_mesh_diffuse: FfiBool,
         pub reserved0: u8,
-    }
-
-    impl GuestComponent for GuestPointLight {
-        const NAME: &'static CStr = c"bevy_abi_mod::camera_light::FfiPointLight";
-        const UUID: ComponentUuid = <Self as ModComponent>::UUID;
     }
 
     /// Zero-padding `AbiPod` mirror of `bevy_picking::events::PointerPress` (`FfiPointerPress`).
@@ -190,22 +174,23 @@ mod mod_a {
 
             let rc = app
                 .system(c"bootstrap_beacons_and_observers")
-                .query(|q| q.read::<CompanionBeacon>().optional_read::<OrbitalBeacon>())
+                .query_typed::<(FfiEntity, &CompanionBeacon, Option<&OrbitalBeacon>)>()
                 .schedule(ScheduleId::UPDATE)
                 .build(move |ctx| {
                     let mut newly_discovered: Vec<(FfiEntity, CompanionBeacon, bool)> = Vec::new();
-                    while let Some(chunk) = ctx.iter().next_chunk_view() {
-                        let entities = chunk.entities();
-                        let Some(beacons) = chunk.component::<CompanionBeacon>(0) else {
-                            return FfiResult::TYPE_MISMATCH;
-                        };
-                        let orbitals = chunk.optional_component::<OrbitalBeacon>(1);
-                        for (idx, (&entity, &beacon)) in
-                            entities.iter().zip(beacons.iter()).enumerate()
-                        {
-                            let missing_orbital = orbitals.is_none_or(|slice| idx >= slice.len());
-                            newly_discovered.push((entity, beacon, missing_orbital));
-                        }
+                    let status = ctx
+                        .single_query::<(FfiEntity, &CompanionBeacon, Option<&OrbitalBeacon>)>()
+                        .for_each(|(entities, beacons, orbitals)| {
+                            for (idx, (&entity, &beacon)) in
+                                entities.iter().zip(beacons.iter()).enumerate()
+                            {
+                                let missing_orbital =
+                                    orbitals.is_none_or(|slice| idx >= slice.len());
+                                newly_discovered.push((entity, beacon, missing_orbital));
+                            }
+                        });
+                    if !status.is_ok() {
+                        return status;
                     }
 
                     {
@@ -314,37 +299,32 @@ mod mod_a {
             let tick_state = Arc::clone(&shared_state);
             let rc = app
                 .system(c"tick_orbital_beacons")
-                .query(|q| q.write::<CompanionBeacon>().write::<OrbitalBeacon>())
+                .query_typed::<(FfiEntity, &mut CompanionBeacon, &mut OrbitalBeacon)>()
                 .after(c"bootstrap_beacons_and_observers")
                 .schedule(ScheduleId::UPDATE)
                 .build(move |ctx| {
                     let Ok(mut st) = tick_state.lock() else {
                         return FfiResult::INTERNAL_ERROR;
                     };
-                    while let Some(mut chunk) = ctx.iter().next_chunk_view() {
-                        let entity_bits: Vec<u64> =
-                            chunk.entities().iter().map(|e| e.to_bits()).collect();
-                        let Some((beacons, orbitals)) =
-                            chunk.component_write_2::<CompanionBeacon, OrbitalBeacon>(0, 1)
-                        else {
-                            return FfiResult::TYPE_MISMATCH;
-                        };
-                        for ((bits, beacon), orbital) in entity_bits
-                            .into_iter()
-                            .zip(beacons.iter_mut())
-                            .zip(orbitals.iter_mut())
-                        {
-                            if let Some(boosts) = st.pending_pick_boosts.remove(&bits) {
-                                orbital.pick_boosts = orbital.pick_boosts.saturating_add(boosts);
+                    ctx.single_query::<(FfiEntity, &mut CompanionBeacon, &mut OrbitalBeacon)>()
+                        .for_each(|(entities, beacons, orbitals)| {
+                            for ((&entity, beacon), orbital) in entities
+                                .iter()
+                                .zip(beacons.iter_mut())
+                                .zip(orbitals.iter_mut())
+                            {
+                                let bits = entity.to_bits();
+                                if let Some(boosts) = st.pending_pick_boosts.remove(&bits) {
+                                    orbital.pick_boosts =
+                                        orbital.pick_boosts.saturating_add(boosts);
+                                }
+                                orbital.ticks = orbital.ticks.saturating_add(1);
+                                orbital.orbit_phase += 0.25;
+                                orbital.harmonic_gain = 1.0 + 0.1 * (orbital.pick_boosts as f32);
+                                beacon.energy += 1.0;
+                                st.beacons.insert(bits, *beacon);
                             }
-                            orbital.ticks = orbital.ticks.saturating_add(1);
-                            orbital.orbit_phase += 0.25;
-                            orbital.harmonic_gain = 1.0 + 0.1 * (orbital.pick_boosts as f32);
-                            beacon.energy += 1.0;
-                            st.beacons.insert(bits, *beacon);
-                        }
-                    }
-                    FfiResult::OK
+                        })
                 });
             if !rc.is_ok() {
                 return rc;
@@ -354,19 +334,16 @@ mod mod_a {
             // `ModCameraLightBridgePlugin` pushes live guest mutations into Bevy's `PointLight`.
             let mut light_step: u32 = 0;
             app.system(c"pulse_companion_lights")
-                .query(|q| q.write::<GuestPointLight>())
+                .query_typed::<&mut GuestPointLight>()
                 .schedule(ScheduleId::UPDATE)
                 .build(move |ctx| {
                     light_step = light_step.saturating_add(1);
-                    while let Some(mut chunk) = ctx.iter().next_chunk_view() {
-                        let Some(lights) = chunk.component_mut::<GuestPointLight>(0) else {
-                            return FfiResult::TYPE_MISMATCH;
-                        };
-                        for light in lights {
-                            light.intensity = 2_400.0 + 125.0 * (light_step as f32);
-                        }
-                    }
-                    FfiResult::OK
+                    ctx.single_query::<&mut GuestPointLight>()
+                        .for_each(|lights| {
+                            for light in lights {
+                                light.intensity = 2_400.0 + 125.0 * (light_step as f32);
+                            }
+                        })
                 })
         }
     }
@@ -390,7 +367,7 @@ mod mod_b {
     /// Layout: 16 bytes, 4-byte alignment, zero implicit padding.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, PartialEq, ModComponent)]
-    #[mod_component(name = "companion_fx_mod::PlasmaAura")]
+    #[mod_component(name = "companion_fx_mod::PlasmaAura", guest)]
     pub struct PlasmaAura {
         /// Emissive plasma aura intensity.
         pub intensity: f32,
@@ -400,11 +377,6 @@ mod mod_b {
         pub pulse_count: u32,
         /// Beacon tier mirror.
         pub tier: u32,
-    }
-
-    impl GuestComponent for PlasmaAura {
-        const NAME: &'static CStr = c"companion_fx_mod::PlasmaAura";
-        const UUID: ComponentUuid = <Self as ModComponent>::UUID;
     }
 
     /// Per-World guest plugin instance for Mod B (`companion_fx_mod`).
@@ -423,26 +395,27 @@ mod mod_b {
             let mut spawned_ephemeral = false;
             let rc = app
                 .system(c"attach_plasma_auras")
-                .query(|q| q.read::<CompanionBeacon>().without::<PlasmaAura>())
+                .query_typed::<(FfiEntity, &CompanionBeacon, Without<PlasmaAura>)>()
                 .schedule(ScheduleId::UPDATE)
                 .build(move |ctx| {
                     let mut to_attach: Vec<(FfiEntity, PlasmaAura)> = Vec::new();
-                    while let Some(chunk) = ctx.iter().next_chunk_view() {
-                        let entities = chunk.entities();
-                        let Some(beacons) = chunk.component::<CompanionBeacon>(0) else {
-                            return FfiResult::TYPE_MISMATCH;
-                        };
-                        for (&entity, &beacon) in entities.iter().zip(beacons.iter()) {
-                            to_attach.push((
-                                entity,
-                                PlasmaAura {
-                                    intensity: 1.5,
-                                    frequency_hz: 440.0 + 55.0 * (beacon.beacon_id as f32),
-                                    pulse_count: 0,
-                                    tier: beacon.beacon_id,
-                                },
-                            ));
-                        }
+                    let status = ctx
+                        .single_query::<(FfiEntity, &CompanionBeacon, Without<PlasmaAura>)>()
+                        .for_each(|(entities, beacons, ())| {
+                            for (&entity, &beacon) in entities.iter().zip(beacons.iter()) {
+                                to_attach.push((
+                                    entity,
+                                    PlasmaAura {
+                                        intensity: 1.5,
+                                        frequency_hz: 440.0 + 55.0 * (beacon.beacon_id as f32),
+                                        pulse_count: 0,
+                                        tier: beacon.beacon_id,
+                                    },
+                                ));
+                            }
+                        });
+                    if !status.is_ok() {
+                        return status;
                     }
 
                     let cmds = ctx.commands();
@@ -478,20 +451,16 @@ mod mod_b {
             }
 
             app.system(c"pulse_plasma_auras")
-                .query(|q| q.write::<PlasmaAura>())
+                .query_typed::<&mut PlasmaAura>()
                 .after(c"attach_plasma_auras")
                 .schedule(ScheduleId::UPDATE)
                 .build(|ctx| {
-                    while let Some(mut chunk) = ctx.iter().next_chunk_view() {
-                        let Some(auras) = chunk.component_mut::<PlasmaAura>(0) else {
-                            return FfiResult::TYPE_MISMATCH;
-                        };
+                    ctx.single_query::<&mut PlasmaAura>().for_each(|auras| {
                         for aura in auras {
                             aura.pulse_count = aura.pulse_count.saturating_add(1);
                             aura.intensity += 0.125;
                         }
-                    }
-                    FfiResult::OK
+                    })
                 })
         }
     }

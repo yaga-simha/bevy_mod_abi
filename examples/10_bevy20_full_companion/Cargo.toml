@@ -7,7 +7,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
-bevy_abi_mod = { path = "../../crates/bevy_abi_mod", features = [
+bevy_mod_abi = { path = "../../crates/bevy_mod_abi", features = [
     "bridge-std-types",
     "bridge-asset",
     "bridge-state",

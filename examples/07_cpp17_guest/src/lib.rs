@@ -1,10 +1,10 @@
 #![forbid(unsafe_code)]
 //! Shared `#[repr(C)]` `ModComponent` types for Example 07 (C++17 Guest Mod).
 
-use bevy_abi_mod::prelude::*;
 use bevy_abi_mod_sys::{FfiBool, FfiOption, ModComponent as ModComponentTrait};
 use bevy_ecs::component::Component;
 use bevy_ecs::resource::Resource;
+use bevy_mod_abi::prelude::*;
 use std::env;
 use std::ffi::OsString;
 use std::fs;

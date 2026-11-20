@@ -17,8 +17,6 @@ use std::process::Command;
 #[cfg(windows)]
 use std::sync::OnceLock;
 
-use bevy_abi_mod::prelude::*;
-use bevy_abi_mod::{RegisteredComponent, read_entity_pod_bytes};
 use bevy_abi_mod_host_sys::loader::{BamSymbolTable, ModNamedObjects};
 use bevy_abi_mod_sys::{
     BAM_STORAGE_FLAG_ENTITY_EVENT, BAM_STORAGE_FLAG_EVENT, BAM_STORAGE_FLAG_MESSAGE,
@@ -30,6 +28,8 @@ use bevy_ecs::entity::Entity;
 use bevy_ecs::message::Messages;
 use bevy_ecs::prelude::Resource;
 use bevy_ecs::world::World;
+use bevy_mod_abi::prelude::*;
+use bevy_mod_abi::{RegisteredComponent, read_entity_pod_bytes};
 use bevy_reflect::ReflectRef;
 use bevy_reflect::structs::Struct;
 use sha2::{Digest, Sha256};

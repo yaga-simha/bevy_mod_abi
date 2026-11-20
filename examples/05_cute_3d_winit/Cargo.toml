@@ -12,7 +12,7 @@ bevy_ecs = { version = "0.20.1", default-features = false, features = ["std", "a
 bevy_math = "0.20.1"
 bevy_time = "0.20.1"
 bevy_transform = "0.20.1"
-bevy_abi_mod = { workspace = true }
+bevy_mod_abi = { workspace = true }
 bevy_abi_mod_sys = { workspace = true }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "dx12", "metal", "vulkan", "wgsl"] }

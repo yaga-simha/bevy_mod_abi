@@ -5,10 +5,10 @@
 //! demonstrates C++ exception containment (`try / catch (...) -> BAM_RESULT_PANIC_CAUGHT`), and
 //! verifies per-`World` RAII `CppModInstance` cleanup on unload.
 
-use bevy_abi_mod::prelude::*;
 use bevy_abi_mod_sys::{FfiBool, FfiResult};
 use bevy_app::App;
 use bevy_ecs::message::Messages;
+use bevy_mod_abi::prelude::*;
 use example_07_cpp17_guest::{Position, SimConfig, Velocity, resolve_or_build_cpp17_mod};
 
 fn main() {

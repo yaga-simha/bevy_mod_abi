@@ -11,10 +11,10 @@ mod arena;
 mod components;
 mod ui;
 
-use bevy_abi_mod::prelude::*;
 use bevy_app::{App, PostUpdate};
 use bevy_ecs::message::MessageReader;
 use bevy_ecs::system::ResMut;
+use bevy_mod_abi::prelude::*;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};

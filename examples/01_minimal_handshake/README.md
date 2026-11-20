@@ -6,9 +6,9 @@
 
 ## What It Shows
 
-1. **Host component registration (`bevy_abi_mod`):** Exposes `Position` (`#[mod_component(name = "example::Position")]`) via `app.register_mod_component::<Position>(ComponentOptions::new().with_raw_insert().with_default())`.
-2. **Guest manifest & per-World lifecycle (`bevy_abi_mod_guest`):** `export_mod!(plugin: MinimalHandshakeMod)` exports `bevy_abi_mod_manifest`, `bevy_abi_mod_init`, and `bevy_abi_mod_shutdown` without process-global state or `bevy` dependencies.
-3. **Unified system builder & UUID-checked views:** Registers `position_nudge` via `app.system(c"position_nudge").query(|q| q.write::<Position>()).build(...)` and mutates `Chunk::component_mut::<Position>(0)` in place.
+1. **Host component registration (`bevy_mod_abi`):** Exposes `Position` (`#[mod_component(name = "example::Position")]`) via `app.register_mod_component::<Position>(ComponentOptions::new().with_raw_insert().with_default())`.
+2. **Guest manifest & zero-boilerplate derive (`bevy_abi_mod_guest`):** Derives `#[derive(..., AbiPod, GuestComponent)]` with `#[guest_component(name = "example::Position")]` and uses `export_mod!(plugin: MinimalHandshakeMod)` to export `bevy_abi_mod_manifest`, `bevy_abi_mod_init`, and `bevy_abi_mod_shutdown` without process-global state or `bevy` dependencies.
+3. **Unified system builder & typed queries:** Registers `position_nudge` via `app.system(c"position_nudge").query_typed::<&mut Position>().schedule(ScheduleId::UPDATE).build(|ctx| ctx.single_query::<&mut Position>().for_each(...))` with zero positional column indices.
 4. **Shadow-copy load & deterministic unload:** Loads with `LoadOptions { shadow_copy: true, strict: true, .. }`, observes `Messages<ModLoaded>` / `Messages<ModUnloaded>`, runs 3 Bevy `Update` ticks, and unloads cleanly via `app.unload_mod(mod_id)`.
 
 ## Commands

@@ -6,8 +6,8 @@
 
 use std::sync::OnceLock;
 
-use bevy_abi_mod::prelude::*;
 use bevy_app::FixedUpdate;
+use bevy_mod_abi::prelude::*;
 use example_09_bql_wire_parity::{
     DEFAULT_MIGRATE_FRAME, DEFAULT_TOTAL_FRAMES, EXPECTED_ORDER_TRACE, FrameAccumulator,
     ParityDsos, SimClock, TOTAL_HIERARCHY_NODES, assert_reflect_parity,

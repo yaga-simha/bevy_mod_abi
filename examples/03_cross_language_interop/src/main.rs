@@ -8,12 +8,12 @@
 /// Exposed ECS components for Example 3.
 pub mod components;
 
-use bevy_abi_mod::prelude::*;
 use bevy_app::{App, Update};
 use bevy_ecs::entity::Entity;
 use bevy_ecs::message::Messages;
 use bevy_ecs::query::{Changed, Or};
 use bevy_ecs::system::Query;
+use bevy_mod_abi::prelude::*;
 use components::{ColorRgba, Position, Velocity};
 use std::env;
 use std::ffi::OsString;

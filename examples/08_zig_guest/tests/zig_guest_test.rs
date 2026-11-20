@@ -5,10 +5,10 @@
 //! `zig` is installed (e.g., CI via `goto-bus-stop/setup-zig`), and verifies host registration
 //! cleanly when `zig` is absent on a local machine.
 
-use bevy_abi_mod::prelude::*;
 use bevy_abi_mod_sys::{FfiBool, FfiOption, FfiResult, ModComponent as ModComponentTrait};
 use bevy_app::App;
 use bevy_ecs::message::Messages;
+use bevy_mod_abi::prelude::*;
 use example_08_zig_guest::{
     Position, Velocity, ZigActorStats, ZigBehaviorMode, ZigSimConfig, ZigTelemetry,
     render_example_zig_components, try_resolve_or_build_zig_mod,
