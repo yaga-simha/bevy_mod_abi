@@ -1,7 +1,13 @@
 //! Safe (`#![forbid(unsafe_code)]`) multi-world `SubApp` (`RenderApp`, `AudioApp`, custom sub-apps)
 //! extraction via `bevy_extract`, data-driven `.wesl` [`Shader`] assets, [`AlignedVec`]-backed
 //! [`ShaderBuffer`] storage assets, and Bevy `0.20` 2D/3D material management.
+//!
+//! Aligned with Bevy `0.20`'s system-driven rendering architecture: `ModSubAppPlugin<RenderApp>`
+//! plugs directly into `ExtractSchedule` while preserving `RenderPlugin`'s `Render`,
+//! `RenderStartup`, root `RenderGraph` (`RenderGraphSystems`), and camera `Core2d` / `Core3d`
+//! schedules.
 
+use crate::recovery::ModRenderRecoveryPolicy;
 use crate::sprite_mesh_shaders::{
     ModExtendedSpriteMaterial2d, ModWeslExtendedMaterialEntry, ModWeslSpriteExtension2d,
     ModWeslSpriteExtensionEntry, evict_wesl_sprite_specializations_for_scope,
@@ -245,7 +251,10 @@ impl<L: AppLabel> Default for ExtractedSubState<L> {
 /// [`ExtractPlugin<L>`] using [`ModSubAppSchedule`] and sets the sub-app's `update_schedule` so
 /// `app.update()` drives sync and extraction out of the box. If `L` already exists (for instance
 /// when `RenderPlugin` or a custom [`ExtractPlugin<L>`] was added earlier), it preserves the
-/// existing `SubApp` and augments its [`ExtractSchedule`].
+/// existing `SubApp` — including Bevy `0.20`'s system-driven `Render`, `RenderStartup`,
+/// `RenderGraph`, `Core2d`, and `Core3d` schedules — and augments its [`ExtractSchedule`].
+/// Host or bridge render systems can then read extracted mod components/resources directly inside
+/// `Render`, `RenderGraph` (`RenderGraphSystems`), `Core2d`, or `Core3d` schedules.
 #[derive(Clone, Debug)]
 pub struct ModSubAppPlugin<L: AppLabel + Default + Copy + Eq> {
     config: ModSubAppConfig,
@@ -913,7 +922,15 @@ pub struct ModShaderBufferSpec {
     pub data: ModShaderBufferInit,
     /// Legal wgpu [`BufferUsages`] flags (defaults to `STORAGE | COPY_SRC | COPY_DST`).
     pub buffer_usage: BufferUsages,
-    /// Bevy [`RenderAssetUsages`] flags.
+    /// Bevy [`RenderAssetUsages`] flags (defaults to `MAIN_WORLD | RENDER_WORLD`).
+    ///
+    /// **Device-loss recovery caveat:** Omitting [`RenderAssetUsages::MAIN_WORLD`] lets Bevy drop
+    /// the CPU byte payload after first GPU upload, making automatic re-upload impossible after
+    /// `RenderErrorPolicy::Recover` (`ErrorType::DeviceLost`). When
+    /// [`ModRenderRecoveryPlugin`](crate::ModRenderRecoveryPlugin) is installed with
+    /// [`ModRenderRecoveryPolicy::preserve_shader_buffer_cpu_copy`] enabled (the default),
+    /// [`register_mod_shader_buffer_in_world`] automatically preserves
+    /// [`RenderAssetUsages::MAIN_WORLD`].
     pub asset_usage: RenderAssetUsages,
     /// Whether existing GPU contents are copied on buffer resize.
     pub copy_on_resize: bool,
@@ -971,9 +988,26 @@ impl ModShaderBufferSpec {
     }
 
     /// Overrides [`RenderAssetUsages`].
+    ///
+    /// Prefer keeping [`RenderAssetUsages::MAIN_WORLD`] set (or calling
+    /// [`Self::with_device_loss_recovery`]) so Bevy can re-upload the buffer after GPU device loss.
     pub fn with_asset_usage(mut self, usage: RenderAssetUsages) -> Self {
         self.asset_usage = usage;
         self
+    }
+
+    /// Ensures [`RenderAssetUsages::MAIN_WORLD`] is set so this [`ShaderBuffer`] retains its CPU
+    /// copy for Bevy `0.20` [`RenderStartup`](bevy_render::RenderStartup) re-extraction after
+    /// `ErrorType::DeviceLost` recovery.
+    pub fn with_device_loss_recovery(mut self) -> Self {
+        self.asset_usage |= RenderAssetUsages::MAIN_WORLD;
+        self
+    }
+
+    /// Returns `true` if [`Self::asset_usage`] retains [`RenderAssetUsages::MAIN_WORLD`] so Bevy
+    /// can re-upload this buffer after GPU device-loss recovery.
+    pub fn retains_main_world_for_recovery(&self) -> bool {
+        self.asset_usage.contains(RenderAssetUsages::MAIN_WORLD)
     }
 
     /// Sets [`ShaderBuffer::copy_on_resize`].
@@ -1096,9 +1130,20 @@ pub struct ModSpriteMaterialSpec {
     pub image_mode: SpriteImageMode,
     /// Linear/sRGBA tint channels (`[r, g, b, a]`).
     pub color_rgba: [f32; 4],
-    /// Optional custom `.wesl` shader associated with this material.
+    /// Optional `.wesl` shader handle recorded as registry metadata on [`ModSpriteMaterialEntry`].
+    ///
+    /// Note: stock [`SpriteMeshMaterial`] does not accept custom per-instance shader overrides in
+    /// [`Self::build_material`]. For active runtime `.wesl` shader and `@binding(100)`
+    /// [`ShaderBuffer`] binding on 2D sprites, use
+    /// [`ModWeslSpriteExtension2d`],
+    /// [`ModExtendedSpriteMaterial2d`], or
+    /// [`ModSpriteExtension2d`].
     pub shader: Option<Handle<Shader>>,
-    /// Optional [`ShaderBuffer`] associated with this material.
+    /// Optional [`ShaderBuffer`] handle recorded as registry metadata on [`ModSpriteMaterialEntry`].
+    ///
+    /// See [`Self::shader`] — active GPU buffer binding uses [`ModWeslSpriteExtension2d`],
+    /// [`ModExtendedSpriteMaterial2d`], or
+    /// [`ModSpriteExtension2d`].
     pub shader_buffer: Option<Handle<ShaderBuffer>>,
     /// Optional full native [`SpriteMeshMaterial`] override.
     pub override_material: Option<SpriteMeshMaterial>,
@@ -1210,9 +1255,18 @@ pub struct ModStandardMaterialSpec {
     pub base_color_rgba: [f32; 4],
     /// Linear emissive RGBA channels.
     pub emissive_rgba: [f32; 4],
-    /// Optional custom `.wesl` shader associated with this material.
+    /// Optional `.wesl` shader handle recorded as registry metadata on
+    /// [`ModStandardMaterialEntry`].
+    ///
+    /// Note: stock [`StandardMaterial`] does not accept custom per-instance shader overrides in
+    /// [`Self::build_material`]; this handle is preserved on [`ModStandardMaterialEntry`] for
+    /// host lookup and mod-unload tracking.
     pub shader: Option<Handle<Shader>>,
-    /// Optional [`ShaderBuffer`] associated with this material.
+    /// Optional [`ShaderBuffer`] handle recorded as registry metadata on
+    /// [`ModStandardMaterialEntry`].
+    ///
+    /// Preserved on [`ModStandardMaterialEntry`] for host lookup and mod-unload tracking rather
+    /// than bound into stock [`StandardMaterial`].
     pub shader_buffer: Option<Handle<ShaderBuffer>>,
     /// Optional full native [`StandardMaterial`] override.
     pub override_material: Option<StandardMaterial>,
@@ -1669,13 +1723,31 @@ pub fn register_mod_wesl_shader_in_world(
 
 /// Registers a [`ModId`]-owned [`ShaderBuffer`] backed by [`AlignedVec`] in `world` and returns
 /// its strong [`Handle<ShaderBuffer>`].
+///
+/// When [`ModRenderRecoveryPolicy`] is present with
+/// [`ModRenderRecoveryPolicy::preserve_shader_buffer_cpu_copy`] enabled and `spec.asset_usage`
+/// omits [`RenderAssetUsages::MAIN_WORLD`], this function logs a warning and retains
+/// [`RenderAssetUsages::MAIN_WORLD`] so Bevy can re-upload the buffer after GPU device loss.
 pub fn register_mod_shader_buffer_in_world(
     world: &mut World,
     mod_id: ModId,
-    spec: ModShaderBufferSpec,
+    mut spec: ModShaderBufferSpec,
 ) -> Result<Handle<ShaderBuffer>, ModMaterialError> {
     ensure_material_registry(world);
     ensure_asset_store_in_world::<ShaderBuffer>(world);
+
+    if !spec.retains_main_world_for_recovery()
+        && world
+            .get_resource::<ModRenderRecoveryPolicy>()
+            .is_some_and(|policy| policy.preserve_shader_buffer_cpu_copy)
+    {
+        tracing::warn!(
+            ?mod_id,
+            label = %spec.label,
+            "preserving RenderAssetUsages::MAIN_WORLD on mod ShaderBuffer so it can re-upload after GPU device-loss recovery"
+        );
+        spec.asset_usage |= RenderAssetUsages::MAIN_WORLD;
+    }
 
     let buffer = spec.build_shader_buffer()?;
     let handle = world.resource_mut::<Assets<ShaderBuffer>>().add(buffer);
