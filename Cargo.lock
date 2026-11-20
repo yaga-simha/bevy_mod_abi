@@ -588,6 +588,7 @@ dependencies = [
  "bevy_abi_mod_macros",
  "bevy_abi_mod_sys",
  "bevy_app",
+ "bevy_asset",
  "bevy_ecs",
  "bevy_platform",
  "bevy_reflect",

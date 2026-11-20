@@ -22,6 +22,7 @@ bevy_abi_mod_sys = { workspace = true }
 bevy_abi_mod_host_sys = { workspace = true, features = ["bridge-reflect"] }
 bevy_abi_mod_host = { workspace = true }
 bevy_app = { workspace = true, features = ["bevy_reflect"] }
+bevy_asset = { workspace = true }
 bevy_ecs = { workspace = true, features = ["bevy_reflect"] }
 bevy_platform = { workspace = true }
 bevy_reflect = { workspace = true }

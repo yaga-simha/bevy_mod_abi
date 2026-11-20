@@ -12,6 +12,7 @@ use bevy_abi_mod_sys::{FfiBool, FfiResult};
 use bevy_app::{App, Plugin};
 use bevy_camera::visibility::Visibility;
 use bevy_ecs::entity_disabling::Disabled;
+use bevy_ecs::error::{ErrorContext, error as log_ecs_error};
 use bevy_ecs::name::Name;
 use bevy_ecs::world::World;
 use bevy_input::ButtonInput;
@@ -849,8 +850,14 @@ pub struct StdTypesBridgePlugin;
 
 impl Plugin for StdTypesBridgePlugin {
     fn build(&self, app: &mut App) {
-        register_std_types_bridges(app.world_mut())
-            .expect("StdTypesBridgePlugin registration collided in ModRegistry");
+        if let Err(err) = register_std_types_bridges(app.world_mut()) {
+            log_ecs_error(
+                err.into(),
+                ErrorContext::Command {
+                    name: "StdTypesBridgePlugin::build".into(),
+                },
+            );
+        }
     }
 }
 

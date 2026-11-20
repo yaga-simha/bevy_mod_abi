@@ -29,6 +29,7 @@ use bevy_audio::{
 use bevy_ecs::change_detection::{DetectChanges, DetectChangesMut};
 use bevy_ecs::component::Component;
 use bevy_ecs::entity::Entity;
+use bevy_ecs::error::{ErrorContext, error as log_ecs_error};
 use bevy_ecs::query::{Changed, Has, Or, With, Without};
 use bevy_ecs::schedule::{IntoScheduleConfigs, SystemSet};
 use bevy_ecs::system::{Commands, Query, Res, ResMut};
@@ -123,8 +124,14 @@ impl Plugin for ModAudioBridgePlugin {
         {
             app.init_asset::<AudioSource>();
         }
-        register_audio_bridges(app.world_mut())
-            .expect("ModAudioBridgePlugin registration collided in ModRegistry");
+        if let Err(err) = register_audio_bridges(app.world_mut()) {
+            log_ecs_error(
+                err.into(),
+                ErrorContext::Command {
+                    name: "ModAudioBridgePlugin::build".into(),
+                },
+            );
+        }
 
         app.configure_sets(
             PostUpdate,

@@ -15,6 +15,7 @@ use bevy_abi_mod_host_sys::{ComponentCollisionError, ModRegistry};
 use bevy_abi_mod_macros::ModComponent;
 use bevy_abi_mod_sys::assert_abi_pod;
 use bevy_app::{App, Plugin, PreUpdate};
+use bevy_ecs::error::{ErrorContext, error as log_ecs_error};
 use bevy_ecs::prelude::Resource;
 use bevy_ecs::schedule::{IntoScheduleConfigs, SystemSet};
 use bevy_ecs::system::{Res, ResMut};
@@ -624,8 +625,14 @@ impl Plugin for ModInputExtBridgePlugin {
             }
         }
 
-        register_input_ext_bridges(app.world_mut())
-            .expect("ModInputExtBridgePlugin registration collided in ModRegistry");
+        if let Err(err) = register_input_ext_bridges(app.world_mut()) {
+            log_ecs_error(
+                err.into(),
+                ErrorContext::Command {
+                    name: "ModInputExtBridgePlugin::build".into(),
+                },
+            );
+        }
 
         app.configure_sets(
             PreUpdate,

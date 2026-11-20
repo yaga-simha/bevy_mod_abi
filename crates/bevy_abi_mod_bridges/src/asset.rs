@@ -13,7 +13,7 @@ use bevy_abi_mod_host_sys::{
 };
 use bevy_abi_mod_sys::{BamComponent, ComponentUuid, FfiAssetHandle, FfiAssetLoadState, FfiResult};
 use bevy_app::{App, Plugin, PreUpdate};
-use bevy_asset::io::file::FileAssetReader;
+use bevy_asset::io::memory::{Dir, MemoryAssetReader};
 use bevy_asset::io::{
     AssetReader, AssetReaderError, AssetSourceBuilder, PathStream, Reader, VecReader,
 };
@@ -1211,6 +1211,50 @@ fn append_meta_extension(path: &Path) -> PathBuf {
     meta_path
 }
 
+fn collect_dir_entries_into_virtual_dir(
+    root_dir: &Path,
+    canonical_dir: &Path,
+    virtual_prefix: &Path,
+    virtual_root: &Dir,
+    seen: &mut BTreeSet<std::ffi::OsString>,
+) -> Result<(), AssetReaderError> {
+    let read_dir =
+        std::fs::read_dir(canonical_dir).map_err(|err| AssetReaderError::Io(Arc::new(err)))?;
+    for entry_res in read_dir {
+        let Ok(entry) = entry_res else {
+            continue;
+        };
+        let entry_path = entry.path();
+        if entry_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("meta"))
+        {
+            continue;
+        }
+        let file_name = entry.file_name();
+        if file_name.to_str().is_some_and(|name| name.starts_with('.')) {
+            continue;
+        }
+        let Ok(canonical_entry) = std::fs::canonicalize(&entry_path) else {
+            continue;
+        };
+        if !canonical_entry.starts_with(root_dir) {
+            continue;
+        }
+        if !seen.insert(file_name.clone()) {
+            continue;
+        }
+        let virtual_entry_path = virtual_prefix.join(&file_name);
+        if canonical_entry.is_dir() {
+            virtual_root.get_or_insert_dir(&virtual_entry_path);
+        } else {
+            virtual_root.insert_asset(&virtual_entry_path, &[] as &[u8]);
+        }
+    }
+    Ok(())
+}
+
 impl AssetReader for ModAssetReader {
     async fn read<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
         let (_, _, resolved) = self.resolve_existing_path(path, false)?;
@@ -1240,12 +1284,74 @@ impl AssetReader for ModAssetReader {
         &'a self,
         path: &'a Path,
     ) -> Result<Box<PathStream>, AssetReaderError> {
-        let (root_dir, subpath, _) = self.resolve_existing_path(path, false)?;
-        let reader = FileAssetReader::new(&root_dir);
-        reader.read_directory(&subpath).await
+        let (mod_name, subpath) = Self::split_mod_subpath(path)?;
+        let virtual_prefix = if subpath.as_os_str().is_empty() {
+            PathBuf::from(mod_name)
+        } else {
+            Path::new(mod_name).join(&subpath)
+        };
+        let virtual_root = Dir::default();
+        let mut seen = BTreeSet::new();
+
+        if mod_name == OVERLAY_NAMESPACE {
+            let (policy, layers) = self.inner.active_overlay_layers();
+            if !policy.is_enabled() {
+                return Err(permission_denied_error(
+                    "mod://overlay/ resolution is disabled by AssetOverlayPolicy::Disabled",
+                ));
+            }
+            let mut found_any_dir = false;
+            for (_owner, root_dir) in layers {
+                match Self::resolve_within_root(&root_dir, &subpath) {
+                    Ok(canonical_target) if canonical_target.is_dir() => {
+                        found_any_dir = true;
+                        virtual_root.get_or_insert_dir(&virtual_prefix);
+                        collect_dir_entries_into_virtual_dir(
+                            &root_dir,
+                            &canonical_target,
+                            &virtual_prefix,
+                            &virtual_root,
+                            &mut seen,
+                        )?;
+                    }
+                    Ok(_) | Err(AssetReaderError::NotFound(_)) => continue,
+                    Err(err) => return Err(err),
+                }
+            }
+            if !found_any_dir {
+                return Err(AssetReaderError::NotFound(path.to_path_buf()));
+            }
+            let reader = MemoryAssetReader { root: virtual_root };
+            return reader.read_directory(&virtual_prefix).await;
+        }
+
+        let (root_dir, _, canonical_target) = self.resolve_existing_path(path, false)?;
+        if !canonical_target.is_dir() {
+            return Err(AssetReaderError::NotFound(path.to_path_buf()));
+        }
+        virtual_root.get_or_insert_dir(&virtual_prefix);
+        collect_dir_entries_into_virtual_dir(
+            &root_dir,
+            &canonical_target,
+            &virtual_prefix,
+            &virtual_root,
+            &mut seen,
+        )?;
+        let reader = MemoryAssetReader { root: virtual_root };
+        reader.read_directory(&virtual_prefix).await
     }
 
     async fn is_directory<'a>(&'a self, path: &'a Path) -> Result<bool, AssetReaderError> {
+        let (mod_name, subpath) = Self::split_mod_subpath(path)?;
+        if mod_name == OVERLAY_NAMESPACE && subpath.as_os_str().is_empty() {
+            let (policy, layers) = self.inner.active_overlay_layers();
+            if !policy.is_enabled() {
+                return Err(permission_denied_error(
+                    "mod://overlay/ resolution is disabled by AssetOverlayPolicy::Disabled",
+                ));
+            }
+            return Ok(!layers.is_empty());
+        }
         let (_, _, resolved) = self.resolve_existing_path(path, false)?;
         Ok(resolved.is_dir())
     }
@@ -1529,360 +1635,5 @@ impl HostAssetBackend for BevyHostAssetBackend {
         if let Ok(mut retained) = self.inner.retained.lock() {
             retained.remove(&Some(owner_namespace.to_string()));
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bevy_abi_mod_host::AbiModPlugin;
-    use bevy_app::TaskPoolPlugin;
-    use bevy_asset::AssetPlugin;
-    use core::sync::atomic::{AtomicUsize, Ordering};
-    use std::fs;
-    use std::time::Duration;
-
-    static TEMP_DIR_SEQ: AtomicUsize = AtomicUsize::new(0);
-
-    struct TempTestDir {
-        path: PathBuf,
-    }
-
-    impl TempTestDir {
-        fn new(prefix: &str) -> Self {
-            let seq = TEMP_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "bam_asset_test_{prefix}_{}_{}",
-                std::process::id(),
-                seq
-            ));
-            let _ = fs::remove_dir_all(&path);
-            fs::create_dir_all(&path).unwrap();
-            Self { path }
-        }
-    }
-
-    impl Drop for TempTestDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
-
-    #[test]
-    fn mod_asset_reader_sandboxing_and_path_normalization() {
-        let alpha_dir = TempTestDir::new("reader_alpha");
-        let beta_dir = TempTestDir::new("reader_beta");
-        let outside_dir = TempTestDir::new("reader_outside");
-
-        fs::create_dir_all(alpha_dir.path.join("sub")).unwrap();
-        fs::write(alpha_dir.path.join("sub/ok.txt"), b"ok").unwrap();
-        fs::write(beta_dir.path.join("secret.txt"), b"secret").unwrap();
-        fs::write(outside_dir.path.join("escape.txt"), b"escape").unwrap();
-
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(
-            outside_dir.path.join("escape.txt"),
-            alpha_dir.path.join("sym_escape.txt"),
-        )
-        .unwrap();
-
-        let reg = ModAssetRegistry::new();
-        reg.mount_mod_asset_dir("alpha_mod", &alpha_dir.path)
-            .unwrap();
-        reg.mount_mod_asset_dir("beta_mod", &beta_dir.path).unwrap();
-
-        // Reserved "overlay" namespace cannot be hijacked by a mod mount.
-        assert!(
-            reg.mount_mod_asset_dir(OVERLAY_NAMESPACE, &alpha_dir.path)
-                .is_err()
-        );
-
-        let reader = ModAssetReader::new(Arc::clone(&reg.inner));
-        assert!(
-            reader
-                .resolve_existing_path(Path::new("alpha_mod/sub/ok.txt"), false)
-                .is_ok()
-        );
-        assert!(
-            reader
-                .resolve_existing_path(Path::new("alpha_mod/../beta_mod/secret.txt"), false)
-                .is_err()
-        );
-        assert!(
-            reader
-                .resolve_existing_path(Path::new("/etc/passwd"), false)
-                .is_err()
-        );
-        // Overlay is disabled by default.
-        assert!(
-            reader
-                .resolve_existing_path(Path::new("overlay/sub/ok.txt"), false)
-                .is_err()
-        );
-        #[cfg(unix)]
-        assert!(
-            reader
-                .resolve_existing_path(Path::new("alpha_mod/sym_escape.txt"), false)
-                .is_err()
-        );
-
-        let backend = BevyHostAssetBackend {
-            inner: Arc::clone(&reg.inner),
-        };
-        assert_eq!(
-            backend
-                .normalize_asset_path(Some("alpha_mod"), "sub/ok.txt")
-                .unwrap(),
-            "mod://alpha_mod/sub/ok.txt"
-        );
-        assert_eq!(
-            backend
-                .normalize_asset_path(Some("alpha_mod"), "mod://alpha_mod/sub/ok.txt")
-                .unwrap(),
-            "mod://alpha_mod/sub/ok.txt"
-        );
-        assert_eq!(
-            backend
-                .normalize_asset_path(Some("alpha_mod"), "mod://beta_mod/secret.txt")
-                .unwrap_err()
-                .0,
-            FfiResult::PERMISSION_DENIED
-        );
-        assert_eq!(
-            backend
-                .normalize_asset_path(Some("alpha_mod"), "mod://overlay/sub/ok.txt")
-                .unwrap_err()
-                .0,
-            FfiResult::PERMISSION_DENIED
-        );
-        assert_eq!(
-            backend
-                .normalize_asset_path(Some("alpha_mod"), "../beta_mod/secret.txt")
-                .unwrap_err()
-                .0,
-            FfiResult::PERMISSION_DENIED
-        );
-
-        // Opting into `LoadOrderPriority` enables `mod://overlay/...` while keeping cross-mod & traversal blocked.
-        reg.set_overlay_policy(AssetOverlayPolicy::LoadOrderPriority);
-        assert_eq!(
-            backend
-                .normalize_asset_path(Some("alpha_mod"), "mod://overlay/sub/ok.txt")
-                .unwrap(),
-            "mod://overlay/sub/ok.txt"
-        );
-        assert_eq!(
-            backend
-                .normalize_asset_path(Some("alpha_mod"), "mod://overlay/../beta_mod/secret.txt")
-                .unwrap_err()
-                .0,
-            FfiResult::PERMISSION_DENIED
-        );
-        assert_eq!(
-            backend
-                .normalize_asset_path(Some("alpha_mod"), "mod://beta_mod/secret.txt")
-                .unwrap_err()
-                .0,
-            FfiResult::PERMISSION_DENIED
-        );
-    }
-
-    #[test]
-    fn real_async_mod_asset_load_isolation_traversal_and_unload_release() {
-        use bevy_asset::io::Reader;
-        use bevy_asset::{AssetLoader, LoadContext};
-        use bevy_reflect::TypePath;
-
-        #[derive(Asset, TypePath, Debug, Clone)]
-        struct TextAsset(String);
-
-        #[derive(Default, TypePath)]
-        struct TextAssetLoader;
-
-        impl AssetLoader for TextAssetLoader {
-            type Asset = TextAsset;
-            type Settings = ();
-            type Error = std::io::Error;
-
-            async fn load(
-                &self,
-                reader: &mut dyn Reader,
-                _settings: &(),
-                _load_context: &mut LoadContext<'_>,
-            ) -> Result<Self::Asset, Self::Error> {
-                let mut bytes = Vec::new();
-                reader.read_to_end(&mut bytes).await?;
-                Ok(TextAsset(String::from_utf8_lossy(&bytes).into_owned()))
-            }
-
-            fn extensions(&self) -> &[&str] {
-                &["txt"]
-            }
-        }
-
-        let default_dir = TempTestDir::new("default");
-        let alpha_dir = TempTestDir::new("alpha");
-        let beta_dir = TempTestDir::new("beta");
-        let outside_dir = TempTestDir::new("outside");
-
-        fs::create_dir_all(alpha_dir.path.join("data")).unwrap();
-        fs::write(alpha_dir.path.join("data/hello.txt"), b"hello from alpha").unwrap();
-        fs::write(beta_dir.path.join("secret.txt"), b"beta secret").unwrap();
-        fs::write(outside_dir.path.join("escape.txt"), b"outside").unwrap();
-
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(
-            outside_dir.path.join("escape.txt"),
-            alpha_dir.path.join("link_escape.txt"),
-        )
-        .unwrap();
-
-        let mut app = App::new();
-        app.add_plugins((
-            TaskPoolPlugin::default(),
-            AbiModPlugin,
-            ModAssetPlugin,
-            AssetPlugin {
-                file_path: default_dir.path.to_string_lossy().into_owned(),
-                meta_check: bevy_asset::AssetMetaCheck::Never,
-                ..Default::default()
-            },
-        ));
-        app.init_asset::<TextAsset>();
-        app.register_asset_loader(TextAssetLoader);
-        app.finish();
-
-        app.mount_mod_asset_dir("alpha_mod", &alpha_dir.path)
-            .unwrap();
-        app.mount_mod_asset_dir("beta_mod", &beta_dir.path).unwrap();
-        let text_bam = app.register_mod_asset::<TextAsset>().unwrap();
-
-        let snap = app.world().resource::<ModRegistry>().snapshot_arc();
-        let backend = snap.asset_backend().unwrap().clone();
-
-        // 1. Bare relative path normalizes to `mod://alpha_mod/data/hello.txt` and loads async.
-        let h_alpha = backend
-            .load_asset(&snap, Some("alpha_mod"), text_bam, "data/hello.txt")
-            .unwrap();
-        assert!(h_alpha.is_some());
-        assert_eq!(
-            app.world()
-                .resource::<ModAssetRegistry>()
-                .retained_count_for_owner(Some("alpha_mod")),
-            1
-        );
-
-        let mut state = FfiAssetLoadState::NOT_LOADED;
-        for _ in 0..40 {
-            app.update();
-            state = backend.get_load_state(&snap, &h_alpha).unwrap();
-            if state == FfiAssetLoadState::LOADED {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert_eq!(state, FfiAssetLoadState::LOADED);
-
-        let bits = h_alpha.to_index_bits().unwrap();
-        let typed_id = bevy_asset::AssetId::<TextAsset>::from(AssetIndex::from_bits(bits));
-        let loaded_asset = app
-            .world()
-            .resource::<Assets<TextAsset>>()
-            .get(typed_id)
-            .unwrap();
-        assert_eq!(loaded_asset.0, "hello from alpha");
-
-        // 2. Untyped load (`BamComponent::INVALID`) succeeds and transitions to `LOADED`.
-        let h_untyped = backend
-            .load_asset(
-                &snap,
-                Some("alpha_mod"),
-                BamComponent::INVALID,
-                "mod://alpha_mod/data/hello.txt",
-            )
-            .unwrap();
-        assert!(h_untyped.is_some());
-        let mut untyped_state = FfiAssetLoadState::NOT_LOADED;
-        for _ in 0..40 {
-            app.update();
-            untyped_state = backend.get_load_state(&snap, &h_untyped).unwrap();
-            if untyped_state == FfiAssetLoadState::LOADED {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert_eq!(untyped_state, FfiAssetLoadState::LOADED);
-
-        // 3. Cross-mod access (`alpha_mod` -> `mod://beta_mod/...`) and `..` traversal are rejected.
-        assert_eq!(
-            backend
-                .load_asset(
-                    &snap,
-                    Some("alpha_mod"),
-                    text_bam,
-                    "mod://beta_mod/secret.txt"
-                )
-                .unwrap_err()
-                .0,
-            FfiResult::PERMISSION_DENIED
-        );
-        assert_eq!(
-            backend
-                .load_asset(
-                    &snap,
-                    Some("alpha_mod"),
-                    text_bam,
-                    "mod://alpha_mod/../beta_mod/secret.txt"
-                )
-                .unwrap_err()
-                .0,
-            FfiResult::PERMISSION_DENIED
-        );
-        assert_eq!(
-            backend
-                .load_asset(&snap, Some("alpha_mod"), text_bam, "../outside.txt")
-                .unwrap_err()
-                .0,
-            FfiResult::PERMISSION_DENIED
-        );
-
-        // 4. Symlink escape inside `alpha_dir` fails inside `ModAssetReader` with `FAILED`.
-        #[cfg(unix)]
-        {
-            let h_sym = backend
-                .load_asset(&snap, Some("alpha_mod"), text_bam, "link_escape.txt")
-                .unwrap();
-            let mut sym_state = FfiAssetLoadState::NOT_LOADED;
-            for _ in 0..40 {
-                app.update();
-                sym_state = backend.get_load_state(&snap, &h_sym).unwrap();
-                if sym_state == FfiAssetLoadState::FAILED {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            assert_eq!(sym_state, FfiAssetLoadState::FAILED);
-        }
-
-        // 5. Foreign mod cannot release `alpha_mod`'s handle; `alpha_mod` release + bulk unload work.
-        assert_eq!(
-            backend
-                .release_asset(&snap, Some("beta_mod"), &h_alpha)
-                .unwrap_err()
-                .0,
-            FfiResult::PERMISSION_DENIED
-        );
-        assert!(
-            backend
-                .release_asset(&snap, Some("alpha_mod"), &h_alpha)
-                .is_ok()
-        );
-        backend.release_all_for_owner("alpha_mod");
-        assert_eq!(
-            app.world()
-                .resource::<ModAssetRegistry>()
-                .retained_count_for_owner(Some("alpha_mod")),
-            0
-        );
     }
 }

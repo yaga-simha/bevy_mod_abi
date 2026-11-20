@@ -46,7 +46,12 @@ bridge-audio = [
     "dep:bevy_math",
     "bridge-asset",
 ]
+bridge-camera-2d = [
+    "dep:bevy_camera",
+    "dep:bevy_color",
+]
 bridge-light = [
+    "bridge-camera-2d",
     "dep:bevy_light",
     "dep:bevy_camera",
     "dep:bevy_color",
@@ -66,6 +71,7 @@ bridge-ui = [
 bridge-feathers = [
     "bridge-ui",
     "dep:bevy_feathers",
+    "dep:bevy_scene",
 ]
 bridge-camera-controller = [
     "dep:bevy_camera_controller",
@@ -79,6 +85,35 @@ bridge-solari = [
     "dep:bevy_solari",
     "dep:bevy_image",
     "bevy_image/zstd_rust",
+]
+
+# Curated presets
+preset-2d = [
+    "bridge-std-types",
+    "bridge-asset",
+    "bridge-state",
+    "bridge-picking",
+    "bridge-audio",
+    "bridge-camera-2d",
+    "bridge-ui",
+]
+preset-3d = [
+    "preset-2d",
+    "bridge-light",
+    "bridge-camera-controller",
+    "bridge-bsn",
+]
+preset-ui = [
+    "bridge-std-types",
+    "bridge-asset",
+    "bridge-picking",
+    "bridge-ui",
+    "bridge-feathers",
+]
+preset-full = [
+    "preset-3d",
+    "preset-ui",
+    "bridge-solari",
 ]
 
 [dependencies]
@@ -118,6 +153,11 @@ bevy_solari = { workspace = true, optional = true }
 bevy_abi_mod_host_sys = { workspace = true, features = ["test-utils"] }
 bevy_reflect = { workspace = true }
 rodio = { version = "0.22", default-features = false }
+
+[[test]]
+name = "bridge_asset"
+path = "tests/bridge_asset.rs"
+required-features = ["bridge-asset"]
 
 [[test]]
 name = "bridge_bsn"
