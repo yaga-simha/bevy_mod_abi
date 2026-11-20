@@ -1,6 +1,6 @@
 # `bevy_abi_mod_watcher`
 
-Safe (`#![forbid(unsafe_code)]`) debounced filesystem hot-reload watcher for [`bevy_abi_mod`](../bevy_abi_mod) (`ABI 0.3.0`, `v0.3.0`).
+Safe (`#![forbid(unsafe_code)]`) debounced filesystem hot-reload watcher for [`bevy_mod_abi`](../bevy_mod_abi) (`ABI 0.3.0`, `v0.3.0`).
 
 ## Overview
 

@@ -1,6 +1,6 @@
 # `bevy_abi_mod_guest_sys`
 
-Low-level, **zero-Bevy-dependency** guest FFI runtime for Rust `.cdylib` mods targeting [`bevy_abi_mod`](../bevy_abi_mod) (`ABI 0.3.0`, `v0.3.0`).
+Low-level, **zero-Bevy-dependency** guest FFI runtime for Rust `.cdylib` mods targeting [`bevy_mod_abi`](../bevy_mod_abi) (`ABI 0.3.0`, `v0.3.0`).
 
 Isolates all guest-side `unsafe` code (`#![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks, clippy::missing_safety_doc)]`) so [`bevy_abi_mod_guest`](../bevy_abi_mod_guest) enforces `#![forbid(unsafe_code)]`:
 

@@ -1,6 +1,6 @@
 # `cargo-bam`
 
-Standalone, `#![forbid(unsafe_code)]`, zero-Bevy CLI toolchain (`cargo bam` / `cargo-bam`) for scaffolding, building, watching, packaging, validating, signing, and diagnosing `bevy_abi_mod` guest mods targeting host ABI `0.3.0` (`v0.3.0`).
+Standalone, `#![forbid(unsafe_code)]`, zero-Bevy CLI toolchain (`cargo bam` / `cargo-bam`) for scaffolding, building, watching, packaging, validating, signing, and diagnosing [`bevy_mod_abi`](../bevy_mod_abi) guest mods targeting host ABI `0.3.0` (`v0.3.0`).
 
 ## Installation
 
@@ -13,7 +13,7 @@ Once installed, run either `cargo bam <subcommand>` or `cargo-bam <subcommand>`.
 ## Commands
 
 ### `new`
-Scaffold a complete, buildable guest mod project in Rust, C99, C++17, or Zig:
+Scaffold a complete, buildable guest mod project in Rust (using zero-boilerplate `#[derive(..., AbiPod, GuestComponent)]` + `.query_typed::<&mut T>()`), C99, C++17, or Zig:
 
 ```bash
 cargo bam new my_mod --lang rust --dir ./mods

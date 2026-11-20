@@ -1,6 +1,6 @@
 # `bevy_abi_mod_sdk_gen`
 
-Deterministic C99, C++17, Zig, and component header generator (`#![forbid(unsafe_code)]`, zero Bevy dependencies) for [`bevy_abi_mod`](../bevy_abi_mod) (`ABI 0.3.0`, `v0.3.0`).
+Deterministic C99, C++17, Zig, and component header generator (`#![forbid(unsafe_code)]`, zero Bevy dependencies) for [`bevy_mod_abi`](../bevy_mod_abi) (`ABI 0.3.0`, `v0.3.0`).
 
 ## Responsibilities
 

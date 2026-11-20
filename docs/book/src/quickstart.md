@@ -6,7 +6,7 @@ This walkthrough builds a minimal Bevy `0.20+` host and a decoupled Rust `.cdyli
 
 ---
 
-## 1. Host Application (`bevy_mod_abi` / `bevy_abi_mod`)
+## 1. Host Application (`bevy_mod_abi`)
 
 `Cargo.toml`:
 ```toml
@@ -93,17 +93,12 @@ use bevy_abi_mod_guest::prelude::*;
 use core::ffi::CStr;
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, ModComponent)]
-#[mod_component(name = "my_game::Position")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, AbiPod, GuestComponent)]
+#[guest_component(name = "my_game::Position")]
 pub struct Position {
     pub x: f32,
     pub y: f32,
     pub z: f32,
-}
-
-impl GuestComponent for Position {
-    const NAME: &'static CStr = c"my_game::Position";
-    const UUID: ComponentUuid = <Self as ModComponent>::UUID;
 }
 
 #[derive(Default)]
@@ -115,20 +110,16 @@ impl GuestPlugin for MyGuestMod {
 
     fn build(&mut self, app: &mut GuestApp<'_>) -> FfiResult {
         app.system(c"nudge_positions")
-            .query(|q| q.write::<Position>())
+            .query_typed::<&mut Position>()
             .schedule(ScheduleId::UPDATE)
             .build(|ctx| {
-                while let Some(mut chunk) = ctx.iter().next_chunk_view() {
-                    let Some(positions) = chunk.component_mut::<Position>(0) else {
-                        return FfiResult::TYPE_MISMATCH;
-                    };
+                ctx.single_query::<&mut Position>().for_each(|positions| {
                     for p in positions {
                         p.x += 1.0;
                         p.y += 2.0;
                         p.z += 3.0;
                     }
-                }
-                FfiResult::OK
+                })
             })
     }
 }

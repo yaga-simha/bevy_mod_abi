@@ -1,6 +1,6 @@
 # Host Integration, Budgets & Schedules (`bevy_mod_abi` / `bevy_abi_mod_host`)
 
-`bevy_mod_abi` (umbrella alias for `bevy_abi_mod`) and the slim headless `bevy_abi_mod_host` crate expose a 100% safe (`#![forbid(unsafe_code)]`) host API across `App`, `&mut World`, and deferred `Commands`. `bevy_abi_mod_host` pulls in **zero** `bevy_render`, `bevy_reflect`, `bevy_scene`, `bevy_asset`, or `notify` dependencies, so headless dedicated servers pay only for `bevy_ecs` + `bevy_app`.
+**`bevy_mod_abi`** (canonical host facade; legacy `bevy_abi_mod` is a deprecated compatibility shim) and the slim headless `bevy_abi_mod_host` crate expose a 100% safe (`#![forbid(unsafe_code)]`) host API across `App`, `&mut World`, and deferred `Commands`. `bevy_abi_mod_host` pulls in **zero** `bevy_render`, `bevy_reflect`, `bevy_scene`, `bevy_asset`, or `notify` dependencies, so headless dedicated servers pay only for `bevy_ecs` + `bevy_app`.
 
 ---
 
@@ -17,7 +17,7 @@ app.add_plugins(AbiModPlugin::with_error_policy(ModErrorPolicy::Quarantine));
 Available `ModErrorPolicy` modes when a guest system returns a non-`OK` `FfiResult` (including `PANIC_CAUGHT` or faults reported via `host_report_guest_fault`):
 - **`ModErrorPolicy::Quarantine` *(Default)*:** Quarantines the faulting guest system (`enabled = false`), discards uncommitted commands from that invocation, logs via `tracing::warn!`, emits `Messages<ModSystemFaulted>` (including `mod_namespace`, `generation`, and `last_error`), and returns `Ok(())` so the rest of the mod and game keep running. Quarantined systems can be re-enabled at runtime via `world.resource::<ModQuarantine>().reenable(mod_id, "system_name")`.
 - **`ModErrorPolicy::Log`:** Quarantines the faulting guest system (`enabled = false`), discards uncommitted commands, escalates logging to `tracing::error!`, emits `Messages<ModSystemFaulted>`, and returns `Ok(())` (also re-enableable via `ModQuarantine::reenable`).
-- **`ModErrorPolicy::ReportToBevy`:** Quarantines the faulting guest system, logs via `tracing::error!`, emits `Messages<ModSystemFaulted>`, and forwards `ModSystemError` into Bevy `0.20`'s `FallbackErrorHandler` with `ErrorContext::System`.
+- **`ModErrorPolicy::ReportToBevy`:** Quarantines the faulting guest system, logs via `tracing::error!`, emits `Messages<ModSystemFaulted>`, and forwards `ModSystemError` into Bevy `0.20`'s `FallbackErrorHandler` with `ErrorContext::System` (guest observer faults likewise discard uncommitted commands and route to `FallbackErrorHandler` with `ErrorContext::Observer`).
 - **`ModErrorPolicy::DelegateToBevyFallback`:** Discards uncommitted commands, emits `Messages<ModSystemFaulted>`, and delegates a contextualized `BevyError` directly to Bevy's world `FallbackErrorHandler` without auto-quarantining the system.
 
 ---
@@ -77,9 +77,9 @@ app.register_mod_event::<WaveStarted>()?;
 app.register_mod_entity_event::<HitEntity>()?;
 ```
 
-Additional `ComponentOptions` modifiers include `.opaque()` (disables raw byte insertion so mutations go only through VTables or `Default`) and `.summary_tick()` (`BAM_STORAGE_FLAG_SUMMARY_TICK` per-table change-tick acceleration for `Table`-stored components).
+Additional `ComponentOptions` modifiers include `.opaque()` (disables raw byte insertion so mutations go only through VTables or `Default`) and `.with_summary_tick()` (`BAM_STORAGE_FLAG_SUMMARY_TICK` per-table change-tick acceleration, validated against `StorageType::Table`).
 
-Because `CommandArena` flushes deferred spawns, inserts, relation mutations, and removals through Bevy's `EntityWorldMut` (`insert_by_ids` / `remove_by_id`), host `ComponentHooks` (`on_add` / `on_insert` / `on_replace` / `on_remove`), `#[require(...)]` Required Components, and `ChildOf` / `Children` relationships automatically stay consistent when mutated by guest mods.
+Because `CommandArena` flushes deferred spawns, inserts, relation mutations, and removals through Bevy's `EntityWorldMut` (`insert_by_ids` / `remove_by_id`), host `ComponentHooks` (`on_add` / `on_insert` / `on_replace` / `on_remove`), `#[require(...)]` Required Components, and `ChildOf` / `Children` relationships automatically stay consistent when mutated by guest mods. On unload, the host cleans up mod-scoped and `LoadedModInfo` entities via Bevy `0.20.1`'s `despawn_all_where` (including `Allow<Disabled>` entities).
 
 ---
 

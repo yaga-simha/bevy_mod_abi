@@ -31,8 +31,8 @@ export_mod!(plugin: PhysicsMod);
 
 ## 2. `AbiPod` vs. VTable-Accessed Opaque Components
 
-- **`#[repr(C)]` `AbiPod` Types (`#[derive(ModComponent)]` or `#[derive(AbiPod)]`):**
-  Eligible for zero-copy `&[T]` / `&mut [T]` slice iteration (`Chunk::component`, `Chunk::component_mut`, `Chunk::read_write`) and raw byte commands (`GuestCommands::insert`, batched `GuestCommands::spawn`). Both derives verify at compile time that structs have zero implicit compiler padding (`size_of::<Self>() == sum(size_of::<Fields>())`), and `#[derive(ModComponent)]` automatically stamps `SCHEMA_FINGERPRINT` and `BAM_FIELDS` for zero-copy reload retention, `migrate_component_column`, and declarative `ReflectFromPtr`/BRP reflection.
+- **`#[repr(C)]` `AbiPod` Types (`#[derive(AbiPod, GuestComponent)]` or `#[derive(ModComponent)]`):**
+  Eligible for zero-copy `&[T]` / `&mut [T]` slice iteration (typed `query_typed` / `ctx.single_query::<&mut T>().for_each(...)` or `Chunk::component`, `Chunk::component_mut`, `Chunk::read_write`) and raw byte commands (`GuestCommands::insert`, batched `GuestCommands::spawn`). Pair `#[derive(AbiPod, GuestComponent)]` with `#[guest_component(name = "...", sparse_set, immutable, summary_tick)]` for zero-boilerplate guest components (or use `#[mod_component(name = "...", guest)]` when sharing a `ModComponent` definition). Both derives verify at compile time that structs have zero implicit compiler padding (`size_of::<Self>() == sum(size_of::<Fields>())`), and `#[derive(ModComponent)]` automatically stamps `SCHEMA_FINGERPRINT` and `BAM_FIELDS` for zero-copy reload retention, `migrate_component_column`, and declarative `ReflectFromPtr`/BRP reflection.
   - Allowed primitives: `u8`/`i8`, `u16`/`i16`, `u32`/`i32`, `u64`/`i64`, `f32`, `f64`, `FfiBool`, `FfiOption<T>`, `BamComponent`, `BamSystem`, `BamSystemSet`, `BamSymbol`, `FfiEntity`, `FfiChildOf`, `BamChangeTicks`, `FfiAssetHandle`, `FfiAssetLoadState`, `BamEventKind`, `BamFieldKind`, `ComponentUuid`, `[T; N]`.
   - Disallowed in `AbiPod`: `bool`, `char`, non-`#[repr(C)]`/untagged Rust `enum`s, references (invalid bit patterns = UB), padded structs without explicit padding fields, and `usize`/`isize`/`u128`/`i128` (architecture/compiler layout divergence).
 - **Opaque Host Components (`#[repr(Rust)]`, `String`, `Vec<T>`, `bool`):**
@@ -102,7 +102,7 @@ Instead of binding a system to a schedule immediately, call `.register_handle()`
   - `app.bind_named_object("world.director", entity)` binds a canonical name and strips `ModScoped` so the entity survives reload/unload.
   - `guest_log!(ctx, info, "tick {}", n)` / `app.log_diagnostic(...)` emits structured host `tracing` diagnostics without clobbering `last_error`; `app.report_fault(...)` reports structured faults into `ModSystemFaulted` and Bevy's `FallbackErrorHandler`.
   - `app.migrate_pod_component_column::<Old, New>(handle, old_fp, &new_desc, |old| New::from(old))` upgrades live rows across schema versions with zero per-entity heap allocations.
-- **Buffered `Messages<M>` & Dynamic Observers:** Declare `.message_read::<M>()` / `.message_write::<M>()` on `SystemBuilder` and drain/emit batches via `ctx.read_messages` / `ctx.send_messages`. Emit immediate triggers via `cmds.trigger(&ev)` / `cmds.trigger_entity(entity, &ev)` and subscribe via `app.observe` / `app.observe_entity` / `ObserverBuilder`.
+- **Buffered `Messages<M>` & Dynamic Observers:** Declare `.message_read::<M>()` / `.message_write::<M>()` on `SystemBuilder` and drain/emit batches via `ctx.read_messages` / `ctx.send_messages`. Emit immediate triggers via `cmds.trigger(&ev)` / `cmds.trigger_entity(entity, &ev)` and subscribe via `app.observe` / `app.observe_entity` / `ObserverBuilder` (which also supports composable `.run_if(...)` / `.run_if_fn(...)` predicates).
 
 ```rust
 let cmds = ctx.commands();
