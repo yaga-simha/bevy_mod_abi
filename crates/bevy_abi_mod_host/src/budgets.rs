@@ -379,12 +379,6 @@ pub struct ModBudgetSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum ModSpawnKey {
-    ModId(ModId),
-    Namespace(Arc<str>),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SystemBudgetKey {
     mod_id: Option<ModId>,
     mod_name: Arc<str>,
@@ -534,7 +528,8 @@ impl SystemBudgetEntry {
 
 struct BudgetRuntimeState {
     policy: RwLock<ModBudgetPolicy>,
-    spawn_counters: RwLock<HashMap<ModSpawnKey, Arc<AtomicUsize>>>,
+    spawn_counters_by_mod: RwLock<HashMap<ModId, Arc<AtomicUsize>>>,
+    spawn_counters_by_ns: RwLock<HashMap<Arc<str>, Arc<AtomicUsize>>>,
     systems: Mutex<HashMap<SystemBudgetKey, SystemBudgetEntry>>,
     pending_breaches: Mutex<Vec<ModBudgetBreach>>,
 }
@@ -543,7 +538,8 @@ impl BudgetRuntimeState {
     fn new(initial_policy: ModBudgetPolicy) -> Self {
         Self {
             policy: RwLock::new(initial_policy),
-            spawn_counters: RwLock::new(HashMap::default()),
+            spawn_counters_by_mod: RwLock::new(HashMap::default()),
+            spawn_counters_by_ns: RwLock::new(HashMap::default()),
             systems: Mutex::new(HashMap::default()),
             pending_breaches: Mutex::new(Vec::new()),
         }
@@ -564,27 +560,45 @@ impl BudgetRuntimeState {
         mod_id: Option<ModId>,
         mod_name: &str,
     ) -> Arc<AtomicUsize> {
-        let key = match mod_id {
-            Some(id) => ModSpawnKey::ModId(id),
-            None => ModSpawnKey::Namespace(Arc::from(mod_name)),
-        };
+        if let Some(id) = mod_id {
+            if let Some(existing) = self
+                .spawn_counters_by_mod
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&id)
+            {
+                return Arc::clone(existing);
+            }
+            let mut guard = self
+                .spawn_counters_by_mod
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            return Arc::clone(
+                guard
+                    .entry(id)
+                    .or_insert_with(|| Arc::new(AtomicUsize::new(0))),
+            );
+        }
+
+        // Borrow `&str` on read lookup so unscoped steady-state runs perform zero heap allocations.
         if let Some(existing) = self
-            .spawn_counters
+            .spawn_counters_by_ns
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
+            .get(mod_name)
         {
             return Arc::clone(existing);
         }
         let mut guard = self
-            .spawn_counters
+            .spawn_counters_by_ns
             .write()
             .unwrap_or_else(|e| e.into_inner());
-        Arc::clone(
-            guard
-                .entry(key)
-                .or_insert_with(|| Arc::new(AtomicUsize::new(0))),
-        )
+        if let Some(existing) = guard.get(mod_name) {
+            return Arc::clone(existing);
+        }
+        let counter = Arc::new(AtomicUsize::new(0));
+        guard.insert(Arc::from(mod_name), Arc::clone(&counter));
+        counter
     }
 
     fn push_breaches(&self, breaches: [Option<ModBudgetBreach>; 3]) {
@@ -627,20 +641,31 @@ impl BudgetRuntimeState {
                 }
             }
         }
-        let counters = self
-            .spawn_counters
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        for counter in counters.values() {
-            counter.store(0, Ordering::Release);
+        {
+            let counters = self
+                .spawn_counters_by_mod
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            for counter in counters.values() {
+                counter.store(0, Ordering::Release);
+            }
+        }
+        {
+            let counters = self
+                .spawn_counters_by_ns
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            for counter in counters.values() {
+                counter.store(0, Ordering::Release);
+            }
         }
     }
 
     fn cleanup_mod(&self, mod_id: ModId) {
-        self.spawn_counters
+        self.spawn_counters_by_mod
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&ModSpawnKey::ModId(mod_id));
+            .remove(&mod_id);
         self.systems
             .lock()
             .unwrap_or_else(|e| e.into_inner())

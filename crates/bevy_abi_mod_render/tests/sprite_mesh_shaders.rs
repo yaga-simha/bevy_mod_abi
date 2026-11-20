@@ -1367,3 +1367,102 @@ fn shared_shader_def_specialization_slot_preserved_for_surviving_mod_on_unload()
         "specialization slot must be evicted once all referencing mods unload"
     );
 }
+
+#[test]
+fn independent_worlds_with_colliding_shader_asset_indices_do_not_evict_each_other() {
+    let dylib = TempDylibCopy::new(&fixture_dylib("ordered_sets_mod"), "multi_world_isolation");
+
+    let mut app_a = App::new();
+    app_a.add_plugins((AbiModPlugin, ModSpriteMaterialPlugin::default()));
+    let mut app_b = App::new();
+    app_b.add_plugins((AbiModPlugin, ModSpriteMaterialPlugin::default()));
+
+    let mod_a = app_a
+        .load_mod_with(dylib.path(), LoadOptions::new().with_shadow_copy(true))
+        .expect("load mod_a");
+    let mod_b = app_b
+        .load_mod_with(dylib.path(), LoadOptions::new().with_shadow_copy(true))
+        .expect("load mod_b");
+
+    let frag_src = "@fragment fn fs_isolated() -> @location(0) vec4<f32> { return vec4<f32>(0.1, 0.2, 0.3, 1.0); }";
+    let shader_a = app_a
+        .register_mod_wesl_shader(
+            mod_a,
+            WeslShaderAssetSpec::from_wesl("fs_shared_idx", "mods/a/fs.wesl", frag_src),
+        )
+        .expect("register shader_a");
+    let shader_b = app_b
+        .register_mod_wesl_shader(
+            mod_b,
+            WeslShaderAssetSpec::from_wesl("fs_shared_idx", "mods/b/fs.wesl", frag_src),
+        )
+        .expect("register shader_b");
+    assert_eq!(
+        shader_a.id(),
+        shader_b.id(),
+        "independent Worlds allocate matching AssetId<Shader> indices"
+    );
+
+    let ext_a = app_a
+        .register_mod_wesl_sprite_extension(
+            mod_a,
+            ModWeslSpriteExtensionSpec::new("ext_a")
+                .with_fragment_shader(shader_a.clone())
+                .with_fragment_entry_point("fs_isolated"),
+        )
+        .expect("register ext_a");
+    let ext_b = app_b
+        .register_mod_wesl_sprite_extension(
+            mod_b,
+            ModWeslSpriteExtensionSpec::new("ext_b")
+                .with_fragment_shader(shader_b)
+                .with_fragment_entry_point("fs_isolated"),
+        )
+        .expect("register ext_b");
+
+    let key_a = app_a
+        .world()
+        .resource::<Assets<ModWeslSpriteExtension2d>>()
+        .get(&ext_a)
+        .unwrap()
+        .bind_group_data();
+    let key_b = app_b
+        .world()
+        .resource::<Assets<ModWeslSpriteExtension2d>>()
+        .get(&ext_b)
+        .unwrap()
+        .bind_group_data();
+    assert_ne!(
+        key_a.specialization_slot, key_b.specialization_slot,
+        "independent Worlds must receive isolated specialization slots even on colliding shader handles"
+    );
+
+    // Unloading mod_b and dropping app_b MUST NOT evict app_a's live specialization slot!
+    app_b.unload_mod(mod_b).expect("unload mod_b");
+    drop(app_b);
+
+    assert!(
+        resolve_wesl_sprite_specialization(&key_b).is_none(),
+        "dropped app_b's specialization slot should be cleaned up"
+    );
+    assert!(
+        resolve_wesl_sprite_specialization(&key_a).is_some(),
+        "app_a specialization slot must survive app_b mod unload and World drop"
+    );
+
+    let quad_mesh = build_quad_mesh_2d(1.0, 1.0).expect("build quad mesh");
+    let mat2d_pipeline = headless_material2d_pipeline(Handle::default());
+    let (mut desc, layout, mesh_key) =
+        specialize_base_mesh2d_descriptor(&mat2d_pipeline, &quad_mesh);
+    <ModWeslSpriteExtension2d as MaterialExtension2d>::specialize(
+        &mat2d_pipeline,
+        &mut desc,
+        &layout,
+        Material2dKey {
+            mesh_key,
+            bind_group_data: key_a,
+        },
+    )
+    .expect("specialize surviving app_a extension");
+    assert_eq!(desc.fragment.as_ref().unwrap().shader, shader_a);
+}

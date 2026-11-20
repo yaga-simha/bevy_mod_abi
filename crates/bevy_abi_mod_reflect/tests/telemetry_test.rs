@@ -10,9 +10,10 @@ use bevy_abi_mod_reflect::telemetry::{
     BRP_METHOD_BAM_COMPONENT_SCHEMAS, BRP_METHOD_BAM_HOT_RELOAD, BRP_METHOD_BAM_LIST_MODS,
     BRP_METHOD_BAM_SYSTEM_METRICS, HotReloadOutcome, ModHotReloadQueue, ModTelemetryEndpoint,
     ModTelemetryPlugin, ModTelemetryRecorder, ModTelemetryWorldExt, SYSTEM_TELEMETRY_DIGEST_SIZE,
-    SYSTEM_TELEMETRY_DIGEST_VERSION, SYSTEM_TELEMETRY_MAGIC, SystemExecutionSample,
-    SystemMetricSnapshot, SystemTelemetryDigest64, TELEMETRY_FLAG_QUARANTINED,
-    TELEMETRY_FLAG_SUMMARY_TICK_ACTIVE, fnv1a_64_hash_system, probe_summary_tick_tables,
+    SYSTEM_TELEMETRY_DIGEST_VERSION, SYSTEM_TELEMETRY_MAGIC, SummaryTickTableStats,
+    SystemExecutionSample, SystemMetricSnapshot, SystemTelemetryDigest64,
+    TELEMETRY_FLAG_QUARANTINED, TELEMETRY_FLAG_SUMMARY_TICK_ACTIVE, fnv1a_64_hash_system,
+    probe_summary_tick_tables,
 };
 use bevy_abi_mod_sys::{
     BAM_COMPONENT_FLAG_SUMMARY_TICK, BamComponent, BamFieldDesc, BamFieldKind, ComponentDesc,
@@ -34,7 +35,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 #[cfg(unix)]
 static SOCK_SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -500,43 +503,11 @@ fn brp_all_four_bam_methods_end_to_end_via_remote_methods() {
     assert_eq!(bad_params.code, error_codes::INVALID_PARAMS);
 }
 
-#[cfg(unix)]
-#[test]
-fn live_unix_socket_streams_64b_digests_with_real_summary_tick_skips_and_nonblocking_backpressure()
-{
-    let sock_path = temp_socket_path("live_stream");
-
-    // 1. Verify stale socket cleanup on bind: create a UnixListener then drop it leaving the
-    //    stale socket file behind on disk.
-    {
-        let _stale = UnixListener::bind(&sock_path).expect("bind stale socket");
-    }
-    assert!(
-        sock_path.exists(),
-        "stale socket file should exist before bind_unix cleanup"
-    );
-
-    // Also verify bind_unix refuses to clobber a regular non-socket file.
-    let reg_file = temp_socket_path("regular_file");
-    std::fs::write(&reg_file, b"keep-me").unwrap();
-    let clobber_err = ModTelemetryEndpoint::bind_unix(&reg_file).unwrap_err();
-    assert_eq!(clobber_err.kind(), std::io::ErrorKind::AlreadyExists);
-    assert_eq!(std::fs::read(&reg_file).unwrap(), b"keep-me");
-    let _ = std::fs::remove_file(&reg_file);
-
-    // 2. Build App with ModTelemetryPlugin bound to the cleaned-up Unix socket.
-    let mut app = App::new();
-    app.add_plugins((
-        AbiModPlugin,
-        ModTelemetryPlugin::new()
-            .with_unix_socket(&sock_path)
-            .with_percentile_window(100),
-    ));
-
+fn run_summary_tick_probe(app: &mut App, mod_id: ModId) -> SummaryTickTableStats {
     let k_fields = kinetic_fields();
     let kinetic_h = register_dynamic_c99_component(
         app.world_mut(),
-        ModId(77),
+        mod_id,
         "sim_mod::Kinetic",
         c"sim_mod::Kinetic",
         core::mem::size_of::<Kinetic>(),
@@ -581,6 +552,51 @@ fn live_unix_socket_streams_64b_digests_with_real_summary_tick_skips_and_nonbloc
     assert_eq!(stats.skipped_summary_tick_tables, 4);
     assert_eq!(stats.visited_tables, 1);
     assert_eq!(stats.matched_entities, 10);
+    stats
+}
+
+#[test]
+fn summary_tick_probe_reports_real_table_skips() {
+    let mut app = App::new();
+    app.add_plugins((AbiModPlugin, ModTelemetryPlugin::new()));
+    let stats = run_summary_tick_probe(&mut app, ModId(77));
+    assert_eq!(stats.visited_tables, 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn live_unix_socket_streams_64b_digests_with_real_summary_tick_skips_and_nonblocking_backpressure()
+{
+    let sock_path = temp_socket_path("live_stream");
+
+    // 1. Verify stale socket cleanup on bind: create a UnixListener then drop it leaving the
+    //    stale socket file behind on disk.
+    {
+        let _stale = UnixListener::bind(&sock_path).expect("bind stale socket");
+    }
+    assert!(
+        sock_path.exists(),
+        "stale socket file should exist before bind_unix cleanup"
+    );
+
+    // Also verify bind_unix refuses to clobber a regular non-socket file.
+    let reg_file = temp_socket_path("regular_file");
+    std::fs::write(&reg_file, b"keep-me").unwrap();
+    let clobber_err = ModTelemetryEndpoint::bind_unix(&reg_file).unwrap_err();
+    assert_eq!(clobber_err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(std::fs::read(&reg_file).unwrap(), b"keep-me");
+    let _ = std::fs::remove_file(&reg_file);
+
+    // 2. Build App with ModTelemetryPlugin bound to the cleaned-up Unix socket.
+    let mut app = App::new();
+    app.add_plugins((
+        AbiModPlugin,
+        ModTelemetryPlugin::new()
+            .with_unix_socket(&sock_path)
+            .with_percentile_window(100),
+    ));
+
+    let stats = run_summary_tick_probe(&mut app, ModId(77));
 
     // Seed 100 duration samples (10..=1000 us -> exact p50=500, p99=990) paired with live stats.
     for d in 1u64..=100u64 {

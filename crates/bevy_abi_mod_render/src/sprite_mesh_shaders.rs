@@ -169,8 +169,8 @@ impl ModWeslSpriteSpecialization {
 
 struct WeslSpecializationTable {
     next_slot: u64,
-    by_slot: HashMap<u64, ModWeslSpriteSpecialization>,
-    by_spec: HashMap<ModWeslSpriteSpecialization, u64>,
+    by_slot: HashMap<u64, (u64, ModWeslSpriteSpecialization)>,
+    by_spec: HashMap<(u64, ModWeslSpriteSpecialization), u64>,
 }
 
 impl WeslSpecializationTable {
@@ -188,26 +188,27 @@ fn wesl_specialization_table() -> &'static RwLock<WeslSpecializationTable> {
     TABLE.get_or_init(|| RwLock::new(WeslSpecializationTable::new()))
 }
 
-fn intern_wesl_specialization(spec: ModWeslSpriteSpecialization) -> u64 {
+fn intern_wesl_specialization(scope_id: u64, spec: ModWeslSpriteSpecialization) -> u64 {
     if spec.is_empty() {
         return 0;
     }
+    let key = (scope_id, spec);
     let table = wesl_specialization_table();
     if let Ok(read) = table.read()
-        && let Some(&slot) = read.by_spec.get(&spec)
+        && let Some(&slot) = read.by_spec.get(&key)
     {
         return slot;
     }
     let mut write = table
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(&slot) = write.by_spec.get(&spec) {
+    if let Some(&slot) = write.by_spec.get(&key) {
         return slot;
     }
     let slot = write.next_slot;
     write.next_slot = write.next_slot.saturating_add(1).max(1);
-    write.by_spec.insert(spec.clone(), slot);
-    write.by_slot.insert(slot, spec);
+    write.by_spec.insert(key.clone(), slot);
+    write.by_slot.insert(slot, key);
     slot
 }
 
@@ -221,7 +222,9 @@ pub fn resolve_wesl_sprite_specialization(
     let read = wesl_specialization_table()
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    read.by_slot.get(&key.specialization_slot).cloned()
+    read.by_slot
+        .get(&key.specialization_slot)
+        .map(|(_, spec)| spec.clone())
 }
 
 pub(crate) fn lookup_wesl_specialization_slot(ext: &ModWeslSpriteExtension2d) -> u64 {
@@ -235,13 +238,15 @@ pub(crate) fn lookup_wesl_specialization_slot(ext: &ModWeslSpriteExtension2d) ->
     if spec.is_empty() {
         return 0;
     }
+    let key = (ext.registry_scope_id, spec);
     let read = wesl_specialization_table()
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    read.by_spec.get(&spec).copied().unwrap_or(0)
+    read.by_spec.get(&key).copied().unwrap_or(0)
 }
 
 pub(crate) fn evict_wesl_sprite_specializations_for_shaders(
+    scope_id: u64,
     shader_ids: &[AssetId<Shader>],
     candidate_slots: &[u64],
     live_slots: &HashSet<u64>,
@@ -255,7 +260,10 @@ pub(crate) fn evict_wesl_sprite_specializations_for_shaders(
     let to_remove: Vec<u64> = write
         .by_slot
         .iter()
-        .filter_map(|(&slot, spec)| {
+        .filter_map(|(&slot, (entry_scope_id, spec))| {
+            if *entry_scope_id != scope_id {
+                return None;
+            }
             let matches_candidate = candidate_slots.contains(&slot) && !live_slots.contains(&slot);
             let matches_vertex = spec
                 .vertex_shader
@@ -270,8 +278,26 @@ pub(crate) fn evict_wesl_sprite_specializations_for_shaders(
         .collect();
     let count = to_remove.len();
     for slot in to_remove {
-        if let Some(spec) = write.by_slot.remove(&slot) {
-            write.by_spec.remove(&spec);
+        if let Some(key) = write.by_slot.remove(&slot) {
+            write.by_spec.remove(&key);
+        }
+    }
+    count
+}
+
+pub(crate) fn evict_wesl_sprite_specializations_for_scope(scope_id: u64) -> usize {
+    let mut write = wesl_specialization_table()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let to_remove: Vec<u64> = write
+        .by_slot
+        .iter()
+        .filter_map(|(&slot, (entry_scope_id, _))| (*entry_scope_id == scope_id).then_some(slot))
+        .collect();
+    let count = to_remove.len();
+    for slot in to_remove {
+        if let Some(key) = write.by_slot.remove(&slot) {
+            write.by_spec.remove(&key);
         }
     }
     count
@@ -326,6 +352,7 @@ pub struct ModWeslSpriteExtension2d {
     pub depth_bias: Option<f32>,
     /// Additional preprocessor definitions applied during specialization.
     pub shader_defs: Vec<ModShaderDef>,
+    pub(crate) registry_scope_id: u64,
 }
 
 impl ModWeslSpriteExtension2d {
@@ -398,7 +425,7 @@ impl From<&ModWeslSpriteExtension2d> for ModWeslSpriteExtension2dKey {
             fragment_entry_point: ext.fragment_entry_point.clone(),
             shader_defs: ext.shader_defs.clone(),
         };
-        let specialization_slot = intern_wesl_specialization(spec);
+        let specialization_slot = intern_wesl_specialization(ext.registry_scope_id, spec);
         Self {
             vertex_shader_id: ext.vertex_shader.as_ref().map(Handle::id),
             fragment_shader_id: ext.fragment_shader.as_ref().map(Handle::id),
@@ -1106,12 +1133,15 @@ pub fn register_mod_wesl_sprite_extension_in_world(
     ensure_material_registry(world);
     ensure_asset_store_in_world::<ModWeslSpriteExtension2d>(world);
 
-    let entry_vertex = spec.extension.vertex_shader.clone();
-    let entry_fragment = spec.extension.fragment_shader.clone();
-    let entry_buffer = spec.extension.buffer.clone();
+    let scope_id = world.resource::<ModWeslMaterialRegistry>().scope_id;
+    let mut extension = spec.extension;
+    extension.registry_scope_id = scope_id;
+    let entry_vertex = extension.vertex_shader.clone();
+    let entry_fragment = extension.fragment_shader.clone();
+    let entry_buffer = extension.buffer.clone();
     let handle = world
         .resource_mut::<Assets<ModWeslSpriteExtension2d>>()
-        .add(spec.extension);
+        .add(extension);
 
     world
         .resource_mut::<ModWeslMaterialRegistry>()
@@ -1144,7 +1174,9 @@ pub fn register_mod_wesl_extended_sprite_material_in_world(
     ensure_material_registry(world);
     ensure_asset_store_in_world::<ModExtendedSpriteMaterial2d>(world);
 
-    let material = spec.build_material();
+    let scope_id = world.resource::<ModWeslMaterialRegistry>().scope_id;
+    let mut material = spec.build_material();
+    material.extension.registry_scope_id = scope_id;
     let entry_vertex = material.extension.vertex_shader.clone();
     let entry_fragment = material.extension.fragment_shader.clone();
     let entry_buffer = material.extension.buffer.clone();

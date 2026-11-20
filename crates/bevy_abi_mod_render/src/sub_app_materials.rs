@@ -4,8 +4,8 @@
 
 use crate::sprite_mesh_shaders::{
     ModExtendedSpriteMaterial2d, ModWeslExtendedMaterialEntry, ModWeslSpriteExtension2d,
-    ModWeslSpriteExtensionEntry, evict_wesl_sprite_specializations_for_shaders,
-    lookup_wesl_specialization_slot,
+    ModWeslSpriteExtensionEntry, evict_wesl_sprite_specializations_for_scope,
+    evict_wesl_sprite_specializations_for_shaders, lookup_wesl_specialization_slot,
 };
 use bevy_abi_mod_host::register_mod_unload_hook_in_world;
 use bevy_abi_mod_host_sys::{
@@ -36,6 +36,7 @@ use bevy_sprite_render::{
 };
 use core::fmt;
 use core::marker::PhantomData;
+use core::sync::atomic::{AtomicU64, Ordering};
 use std::borrow::Cow;
 use std::path::Path;
 
@@ -1354,14 +1355,17 @@ type CustomAssetCleanupFn = Box<dyn FnOnce(&mut World) + Send + Sync>;
 type Extended2dMaterialHandle =
     Handle<ExtendedMaterial2d<SpriteMeshMaterial, ModSpriteExtension2d>>;
 
+static NEXT_MATERIAL_REGISTRY_SCOPE: AtomicU64 = AtomicU64::new(1);
+
 /// Host [`Resource`] tracking all [`ModId`]-scoped `.wesl` [`Shader`]s, [`ShaderBuffer`]s,
 /// [`SpriteMeshMaterial`]s, [`StandardMaterial`]s, and custom asset handles.
 ///
 /// Automatically purged during [`ModWorldExt::unload_mod`](bevy_abi_mod_host::ModWorldExt::unload_mod),
 /// [`ModWorldExt::unload_all_mods`](bevy_abi_mod_host::ModWorldExt::unload_all_mods), and cascading
 /// [`ModWorldExt::reload_mod`](bevy_abi_mod_host::ModWorldExt::reload_mod).
-#[derive(Resource, Default)]
+#[derive(Resource)]
 pub struct ModWeslMaterialRegistry {
+    pub(crate) scope_id: u64,
     shaders: HashMap<ModId, Vec<(String, Handle<Shader>)>>,
     buffers: HashMap<ModId, Vec<(String, Handle<ShaderBuffer>)>>,
     sprite_materials: HashMap<ModId, Vec<ModSpriteMaterialEntry>>,
@@ -1371,6 +1375,29 @@ pub struct ModWeslMaterialRegistry {
     pub(crate) wesl_sprite_extensions: HashMap<ModId, Vec<ModWeslSpriteExtensionEntry>>,
     pub(crate) wesl_extended_2d_materials: HashMap<ModId, Vec<ModWeslExtendedMaterialEntry>>,
     custom_cleanups: HashMap<ModId, Vec<CustomAssetCleanupFn>>,
+}
+
+impl Default for ModWeslMaterialRegistry {
+    fn default() -> Self {
+        Self {
+            scope_id: NEXT_MATERIAL_REGISTRY_SCOPE.fetch_add(1, Ordering::Relaxed),
+            shaders: HashMap::default(),
+            buffers: HashMap::default(),
+            sprite_materials: HashMap::default(),
+            standard_materials: HashMap::default(),
+            sprite_extensions: HashMap::default(),
+            extended_2d_materials: HashMap::default(),
+            wesl_sprite_extensions: HashMap::default(),
+            wesl_extended_2d_materials: HashMap::default(),
+            custom_cleanups: HashMap::default(),
+        }
+    }
+}
+
+impl Drop for ModWeslMaterialRegistry {
+    fn drop(&mut self) {
+        let _ = evict_wesl_sprite_specializations_for_scope(self.scope_id);
+    }
 }
 
 impl ModWeslMaterialRegistry {
@@ -1828,6 +1855,7 @@ pub fn register_mod_custom_asset_in_world<A: Asset>(
 /// and custom typed assets owned by `mod_id` from `world`'s [`Assets`] stores, returning the
 /// number of cleaned assets.
 pub fn cleanup_mod_wesl_materials_in_world(world: &mut World, mod_id: ModId) -> usize {
+    let scope_id;
     let shaders;
     let buffers;
     let sprite_mats;
@@ -1841,6 +1869,7 @@ pub fn cleanup_mod_wesl_materials_in_world(world: &mut World, mod_id: ModId) -> 
         let Some(mut reg) = world.get_resource_mut::<ModWeslMaterialRegistry>() else {
             return 0;
         };
+        scope_id = reg.scope_id;
         shaders = reg.shaders.remove(&mod_id).unwrap_or_default();
         buffers = reg.buffers.remove(&mod_id).unwrap_or_default();
         sprite_mats = reg.sprite_materials.remove(&mod_id).unwrap_or_default();
@@ -1957,6 +1986,7 @@ pub fn cleanup_mod_wesl_materials_in_world(world: &mut World, mod_id: ModId) -> 
         }
     }
     let _ = evict_wesl_sprite_specializations_for_shaders(
+        scope_id,
         &removed_shader_ids,
         &removed_spec_slots,
         &live_slots,
