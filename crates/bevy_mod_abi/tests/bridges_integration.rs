@@ -21,12 +21,6 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use bevy_abi_mod::bridges::ModBridgesPlugin;
-use bevy_abi_mod::bridges::asset::ModAssetAppExt;
-#[cfg(feature = "bridge-reflect")]
-use bevy_abi_mod::bridges::asset::ModAssetRegistry;
-use bevy_abi_mod::bridges::state::ModStateExt;
-use bevy_abi_mod::prelude::*;
 use bevy_app::{App, TaskPoolPlugin};
 #[cfg(feature = "bridge-reflect")]
 use bevy_asset::AssetApp;
@@ -39,6 +33,12 @@ use bevy_ecs::query::Has;
 use bevy_input::ButtonInput;
 use bevy_input::keyboard::KeyCode;
 use bevy_input::mouse::MouseButton;
+use bevy_mod_abi::bridges::ModBridgesPlugin;
+use bevy_mod_abi::bridges::asset::ModAssetAppExt;
+#[cfg(feature = "bridge-reflect")]
+use bevy_mod_abi::bridges::asset::ModAssetRegistry;
+use bevy_mod_abi::bridges::state::ModStateExt;
+use bevy_mod_abi::prelude::*;
 use bevy_state::state::{State, States};
 use bevy_state::state_scoped::{DespawnOnEnter, DespawnOnExit};
 use bevy_time::{Fixed, Real, Time, Virtual};
@@ -1236,13 +1236,13 @@ fn cross_bridge_cdylib_mods_drive_std_types_isolated_assets_and_state_machine() 
 #[cfg(all(feature = "bridge-bsn", feature = "bridge-reflect"))]
 #[test]
 fn bridge_cdylib_bsn_scene_ready_observer_unload_cleanup_and_reflect_brp() {
-    use bevy_abi_mod::bridges::bsn::{ModBsnAppExt, ModBsnPlugin};
-    use bevy_abi_mod::bridges::reflect::{
+    use bevy_ecs::entity::Entity;
+    use bevy_ecs::hierarchy::Children;
+    use bevy_mod_abi::bridges::bsn::{ModBsnAppExt, ModBsnPlugin};
+    use bevy_mod_abi::bridges::reflect::{
         BRP_METHOD_GET_COMPONENTS, BRP_METHOD_MUTATE_COMPONENTS, ModReflectPlugin,
         ModReflectWorldExt, handle_mod_brp_request,
     };
-    use bevy_ecs::entity::Entity;
-    use bevy_ecs::hierarchy::Children;
     use bevy_remote::BrpRequest;
     use bevy_scene::bsn;
     use serde_json::json;
