@@ -36,4 +36,5 @@ fn ui_compile_fail_and_pass_suite() {
     t.pass("tests/ui/pass_*.rs");
     t.compile_fail("tests/ui/abi_pod_*.rs");
     t.compile_fail("tests/ui/mod_component_*.rs");
+    t.compile_fail("tests/ui/guest_component_*.rs");
 }

@@ -10,10 +10,12 @@ use bevy_abi_mod_sys::{
 };
 
 use crate::{
-    app::builder::GuestApp,
+    app::{builder::GuestApp, context::RunConditionContext},
     commands::GuestCommands,
     component::{GuestComponent, resolve_guest_component},
 };
+
+pub(crate) type RunIfPredicate = Box<dyn FnMut(&RunConditionContext<'_>) -> bool + Send + 'static>;
 
 const READY_CANONICAL_CSTR: &CStr = c"bevy_scene::Ready";
 const READY_ALIAS_CSTR: &CStr = c"Ready";
@@ -83,6 +85,21 @@ impl<'a> GuestApp<'a> {
         }
     }
 
+    #[inline]
+    fn observe_component_lifecycle<C, F>(
+        &mut self,
+        name: &str,
+        kind: BamEventKind,
+        callback: F,
+    ) -> Result<&mut Self, FfiResult>
+    where
+        C: GuestComponent,
+        F: FnMut(FfiEntity, &mut GuestCommands<'_>) + Send + 'static,
+    {
+        let comp = self.resolve_component::<C>()?;
+        self.observe_lifecycle(name, kind, &[comp], FfiEntity::NULL, callback)
+    }
+
     /// Registers a dynamic `Add<C>` lifecycle observer invoked when `C` is newly added to any entity.
     #[inline]
     pub fn observe_add<C, F>(&mut self, name: &str, callback: F) -> Result<&mut Self, FfiResult>
@@ -90,8 +107,7 @@ impl<'a> GuestApp<'a> {
         C: GuestComponent,
         F: FnMut(FfiEntity, &mut GuestCommands<'_>) + Send + 'static,
     {
-        let comp = self.resolve_component::<C>()?;
-        self.observe_lifecycle(name, BamEventKind::ADD, &[comp], FfiEntity::NULL, callback)
+        self.observe_component_lifecycle::<C, _>(name, BamEventKind::ADD, callback)
     }
 
     /// Registers a dynamic `Insert<C>` lifecycle observer invoked whenever `C` is inserted or overwritten.
@@ -101,14 +117,7 @@ impl<'a> GuestApp<'a> {
         C: GuestComponent,
         F: FnMut(FfiEntity, &mut GuestCommands<'_>) + Send + 'static,
     {
-        let comp = self.resolve_component::<C>()?;
-        self.observe_lifecycle(
-            name,
-            BamEventKind::INSERT,
-            &[comp],
-            FfiEntity::NULL,
-            callback,
-        )
+        self.observe_component_lifecycle::<C, _>(name, BamEventKind::INSERT, callback)
     }
 
     /// Registers a dynamic `Discard<C>` lifecycle observer invoked before `C` is overwritten or removed.
@@ -118,14 +127,7 @@ impl<'a> GuestApp<'a> {
         C: GuestComponent,
         F: FnMut(FfiEntity, &mut GuestCommands<'_>) + Send + 'static,
     {
-        let comp = self.resolve_component::<C>()?;
-        self.observe_lifecycle(
-            name,
-            BamEventKind::DISCARD,
-            &[comp],
-            FfiEntity::NULL,
-            callback,
-        )
+        self.observe_component_lifecycle::<C, _>(name, BamEventKind::DISCARD, callback)
     }
 
     /// Registers a dynamic `Remove<C>` lifecycle observer invoked before `C` is removed from an entity.
@@ -135,14 +137,7 @@ impl<'a> GuestApp<'a> {
         C: GuestComponent,
         F: FnMut(FfiEntity, &mut GuestCommands<'_>) + Send + 'static,
     {
-        let comp = self.resolve_component::<C>()?;
-        self.observe_lifecycle(
-            name,
-            BamEventKind::REMOVE,
-            &[comp],
-            FfiEntity::NULL,
-            callback,
-        )
+        self.observe_component_lifecycle::<C, _>(name, BamEventKind::REMOVE, callback)
     }
 
     /// Registers a dynamic `Despawn<C>` lifecycle observer invoked when an entity with `C` despawns.
@@ -152,14 +147,7 @@ impl<'a> GuestApp<'a> {
         C: GuestComponent,
         F: FnMut(FfiEntity, &mut GuestCommands<'_>) + Send + 'static,
     {
-        let comp = self.resolve_component::<C>()?;
-        self.observe_lifecycle(
-            name,
-            BamEventKind::DESPAWN,
-            &[comp],
-            FfiEntity::NULL,
-            callback,
-        )
+        self.observe_component_lifecycle::<C, _>(name, BamEventKind::DESPAWN, callback)
     }
 
     /// Registers a dynamic scene/hierarchy `Ready` observer (`FfiEntity::NULL` for all scenes, or
@@ -526,7 +514,8 @@ impl<'a> GuestCommands<'a> {
 
 /// Fluent `#![forbid(unsafe_code)]` builder for Bevy 0.20 `Ready` and lifecycle observers,
 /// supporting entity scoping (`.with_target(...)`), upward hierarchy propagation
-/// (`.with_propagate(true)`), and custom propagation relationships.
+/// (`.with_propagate(true)`), custom propagation relationships, and chainable `.run_if(...)`
+/// predicates.
 pub struct ObserverBuilder<'app, 'a> {
     app: &'app mut GuestApp<'a>,
     name: String,
@@ -535,6 +524,7 @@ pub struct ObserverBuilder<'app, 'a> {
     target: FfiEntity,
     flags: u32,
     propagate_relationship: BamComponent,
+    conditions: Vec<RunIfPredicate>,
     first_error: Option<FfiResult>,
 }
 
@@ -560,6 +550,7 @@ impl<'app, 'a> ObserverBuilder<'app, 'a> {
             target: FfiEntity::NULL,
             flags: 0,
             propagate_relationship: BamComponent::INVALID,
+            conditions: Vec::new(),
             first_error: None,
         }
     }
@@ -632,6 +623,34 @@ impl<'app, 'a> ObserverBuilder<'app, 'a> {
         self
     }
 
+    /// Appends a run-condition predicate `|ctx: &RunConditionContext<'_>| -> bool`.
+    ///
+    /// Multiple `.run_if(...)` / `.run_if_fn(...)` calls compose with short-circuit logical AND
+    /// semantics in registration order. When any predicate returns `false`, the observer callback
+    /// is skipped (and for [`Self::build_stoppable`], `*propagate` is left untouched so upward
+    /// propagation continues). Panics inside predicates are caught cleanly by the guest
+    /// trampoline.
+    #[inline]
+    pub fn run_if<F>(mut self, predicate: F) -> Self
+    where
+        F: FnMut(&RunConditionContext<'_>) -> bool + Send + 'static,
+    {
+        self.conditions.push(Box::new(predicate));
+        self
+    }
+
+    /// Appends a zero-argument run-condition predicate `|| -> bool`.
+    ///
+    /// Composes with any preceding `.run_if(...)` / `.run_if_fn(...)` predicates using
+    /// short-circuit logical AND semantics.
+    #[inline]
+    pub fn run_if_fn<F>(self, mut predicate: F) -> Self
+    where
+        F: FnMut() -> bool + Send + 'static,
+    {
+        self.run_if(move |_ctx| predicate())
+    }
+
     /// Registers the configured observer with a read-only `(target, &mut GuestCommands<'_>)`
     /// callback.
     pub fn build<F>(self, mut callback: F) -> Result<&'app mut GuestApp<'a>, FfiResult>
@@ -641,6 +660,7 @@ impl<'app, 'a> ObserverBuilder<'app, 'a> {
         if let Some(err) = self.first_error {
             return Err(err);
         }
+        let mut conditions = self.conditions;
         let status = self.app.load_ctx.register_lifecycle_observer(
             self.app.instance,
             &self.name,
@@ -650,6 +670,12 @@ impl<'app, 'a> ObserverBuilder<'app, 'a> {
             self.flags,
             self.propagate_relationship,
             move |tgt, validated_cmds| {
+                if !conditions.is_empty() {
+                    let cond_ctx = RunConditionContext::new(validated_cmds.host());
+                    if !conditions.iter_mut().all(|pred| pred(&cond_ctx)) {
+                        return FfiResult::OK;
+                    }
+                }
                 with_guest_commands(validated_cmds, |cmds| callback(tgt, cmds));
                 FfiResult::OK
             },
@@ -675,13 +701,22 @@ impl<'app, 'a> ObserverBuilder<'app, 'a> {
         }
         let ready_handle = resolve_component(self.app.host(), Some(READY_CANONICAL_CSTR), None)
             .or_else(|_| resolve_component(self.app.host(), Some(READY_ALIAS_CSTR), None))?;
+        let mut conditions = self.conditions;
         self.app.observe_mut_handle::<FfiEntity, _>(
             &self.name,
             ready_handle,
             self.target,
             self.flags,
             self.propagate_relationship,
-            move |tgt, _ev, prop, cmds| callback(tgt, prop, cmds),
+            move |tgt, _ev, prop, cmds| {
+                if !conditions.is_empty() {
+                    let cond_ctx = RunConditionContext::new(cmds.host());
+                    if !conditions.iter_mut().all(|pred| pred(&cond_ctx)) {
+                        return;
+                    }
+                }
+                callback(tgt, prop, cmds);
+            },
         )?;
         Ok(self.app)
     }
@@ -706,9 +741,12 @@ mod tests {
             .observe_ready_with("ready_prop")
             .with_target(entity)
             .with_propagate(true)
+            .run_if(|ctx| ctx.host_api().struct_size > 0)
+            .run_if_fn(|| true)
             .build(|_tgt, _cmds| {});
         let _ = ObserverBuilder::ready(app, "ready_custom_rel")
             .with_relationship::<FfiChildOf>()
+            .run_if_fn(|| true)
             .build_stoppable(|_tgt, prop, _cmds| {
                 *prop = false;
             });

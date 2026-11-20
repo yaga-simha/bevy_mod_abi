@@ -572,41 +572,65 @@ impl<'a> GuestApp<'a> {
     }
 }
 
+macro_rules! impl_v03_host_forwarders {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl<'a> $ty {
+                /// Binds a canonical UTF-8 lookup `name` to `entity` in the host symbol registry
+                /// via `BamHostApi::bind_named_object` (slot 56).
+                #[inline]
+                pub fn bind_named_object(&self, name: &str, entity: FfiEntity) -> FfiResult {
+                    self.host().bind_named_object(name, entity)
+                }
+
+                /// Interns a UTF-8 symbol string into an `O(1)` comparable [`BamSymbol`] handle
+                /// via `BamHostApi::intern_symbol` (slot 55).
+                #[inline]
+                pub fn intern_symbol(&self, symbol: &str) -> Result<BamSymbol, FfiResult> {
+                    self.host().intern_symbol(symbol)
+                }
+
+                /// Resolves a registered component or resource strictly by its 128-bit
+                /// [`ComponentUuid`] via `BamHostApi::resolve_component_by_uuid` (slot 52).
+                #[inline]
+                pub fn resolve_component_by_uuid(
+                    &self,
+                    uuid: ComponentUuid,
+                ) -> Result<BamComponent, FfiResult> {
+                    self.host().resolve_component_by_uuid(uuid)
+                }
+
+                /// Queries ABI `0.3.0` [`BamLayoutInfo`] metadata for `component` via
+                /// `BamHostApi::component_layout_info` (slot 53).
+                #[inline]
+                pub fn component_layout_info(
+                    &self,
+                    component: BamComponent,
+                ) -> Result<BamLayoutInfo, FfiResult> {
+                    self.host().component_layout_info(component)
+                }
+
+                /// Emits a structured guest diagnostic message via `BamHostApi::log_diagnostic`
+                /// (slot 50).
+                #[inline]
+                pub fn log_diagnostic(&self, level: u32, message: &str) -> FfiResult {
+                    self.host().log_diagnostic(level, message)
+                }
+
+                /// Records a guest-side fault message on this world's host context via
+                /// `BamHostApi::report_guest_fault` (slot 51).
+                #[inline]
+                pub fn report_fault(&self, message: &str) -> FfiResult {
+                    self.host().report_guest_fault(message)
+                }
+            }
+        )+
+    };
+}
+
+impl_v03_host_forwarders!(SystemContext<'a>, RunConditionContext<'a>);
+
 impl<'a> SystemContext<'a> {
-    /// Binds a canonical UTF-8 lookup `name` to `entity` in the host symbol registry via
-    /// `BamHostApi::bind_named_object` (slot 56).
-    #[inline]
-    pub fn bind_named_object(&self, name: &str, entity: FfiEntity) -> FfiResult {
-        self.host().bind_named_object(name, entity)
-    }
-
-    /// Interns a UTF-8 symbol string into an `O(1)` comparable [`BamSymbol`] handle via
-    /// `BamHostApi::intern_symbol` (slot 55).
-    #[inline]
-    pub fn intern_symbol(&self, symbol: &str) -> Result<BamSymbol, FfiResult> {
-        self.host().intern_symbol(symbol)
-    }
-
-    /// Resolves a registered component or resource strictly by its 128-bit [`ComponentUuid`] via
-    /// `BamHostApi::resolve_component_by_uuid` (slot 52).
-    #[inline]
-    pub fn resolve_component_by_uuid(
-        &self,
-        uuid: ComponentUuid,
-    ) -> Result<BamComponent, FfiResult> {
-        self.host().resolve_component_by_uuid(uuid)
-    }
-
-    /// Queries ABI `0.3.0` [`BamLayoutInfo`] metadata for `component` via
-    /// `BamHostApi::component_layout_info` (slot 53).
-    #[inline]
-    pub fn component_layout_info(
-        &self,
-        component: BamComponent,
-    ) -> Result<BamLayoutInfo, FfiResult> {
-        self.host().component_layout_info(component)
-    }
-
     /// Resolves `T: ModComponent` and verifies its registered `size`, `align`, and
     /// `SCHEMA_FINGERPRINT` against the host.
     #[inline]
@@ -622,19 +646,6 @@ impl<'a> SystemContext<'a> {
         component: BamComponent,
     ) -> Result<BamLayoutInfo, FfiResult> {
         verify_layout_for_host::<T>(self.host(), component)
-    }
-
-    /// Emits a structured guest diagnostic message via `BamHostApi::log_diagnostic` (slot 50).
-    #[inline]
-    pub fn log_diagnostic(&self, level: u32, message: &str) -> FfiResult {
-        self.host().log_diagnostic(level, message)
-    }
-
-    /// Records a guest-side fault message on this world's host context via
-    /// `BamHostApi::report_guest_fault` (slot 51).
-    #[inline]
-    pub fn report_fault(&self, message: &str) -> FfiResult {
-        self.host().report_guest_fault(message)
     }
 
     /// Processes primary query `0` chunks in parallel across the host `ComputeTaskPool` in
@@ -659,49 +670,5 @@ impl<'a> SystemContext<'a> {
         R: IntoSystemResult,
     {
         self.iter().par_try_for_each_chunk_readonly(f)
-    }
-}
-
-impl<'a> RunConditionContext<'a> {
-    /// Binds a canonical UTF-8 lookup `name` to `entity` in the host symbol registry.
-    #[inline]
-    pub fn bind_named_object(&self, name: &str, entity: FfiEntity) -> FfiResult {
-        self.host().bind_named_object(name, entity)
-    }
-
-    /// Interns a UTF-8 symbol string into an `O(1)` comparable [`BamSymbol`] handle.
-    #[inline]
-    pub fn intern_symbol(&self, symbol: &str) -> Result<BamSymbol, FfiResult> {
-        self.host().intern_symbol(symbol)
-    }
-
-    /// Resolves a registered component or resource strictly by its 128-bit [`ComponentUuid`].
-    #[inline]
-    pub fn resolve_component_by_uuid(
-        &self,
-        uuid: ComponentUuid,
-    ) -> Result<BamComponent, FfiResult> {
-        self.host().resolve_component_by_uuid(uuid)
-    }
-
-    /// Queries ABI `0.3.0` [`BamLayoutInfo`] metadata for `component`.
-    #[inline]
-    pub fn component_layout_info(
-        &self,
-        component: BamComponent,
-    ) -> Result<BamLayoutInfo, FfiResult> {
-        self.host().component_layout_info(component)
-    }
-
-    /// Emits a structured guest diagnostic message via `BamHostApi::log_diagnostic`.
-    #[inline]
-    pub fn log_diagnostic(&self, level: u32, message: &str) -> FfiResult {
-        self.host().log_diagnostic(level, message)
-    }
-
-    /// Records a guest-side fault message on this world's host context.
-    #[inline]
-    pub fn report_fault(&self, message: &str) -> FfiResult {
-        self.host().report_guest_fault(message)
     }
 }

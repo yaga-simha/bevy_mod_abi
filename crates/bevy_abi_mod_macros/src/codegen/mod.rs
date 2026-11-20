@@ -10,8 +10,8 @@ mod vtable;
 pub(crate) mod witness;
 
 use crate::attrs::{
-    parse_component_attrs, parse_field_attr, parse_repr_flags, resolve_sys_crate_path,
-    sanitize_symbol_segment,
+    parse_component_attrs, parse_field_attr, parse_repr_flags, resolve_guest_crate_path,
+    resolve_sys_crate_path, sanitize_symbol_segment,
 };
 use crate::classify::{
     FieldKind, canonical_field_type_tag, canonical_kind_type_tag, classify_type,
@@ -199,6 +199,8 @@ fn infer_bam_field_kind_ident(kind: &FieldKind, ty: &syn::Type) -> &'static str 
 
 pub(crate) struct CodegenState {
     pub(crate) sys_crate: TokenStream,
+    /// Present when `#[mod_component(..., guest)]` is enabled, holding the resolved path to `bevy_abi_mod_guest`.
+    pub(crate) guest_crate: Option<TokenStream>,
     pub(crate) struct_ident: Ident,
     pub(crate) canonical_name: CanonicalNameSpec,
     pub(crate) export_fn_prefix: String,
@@ -386,6 +388,9 @@ pub(crate) fn expand_mod_component_with_crate(
     }
 
     let sys_crate = resolve_sys_crate_path(comp_attrs.crate_override.as_ref());
+    let guest_crate = comp_attrs
+        .emit_guest
+        .then(|| resolve_guest_crate_path(comp_attrs.guest_crate_override.as_ref()));
     let struct_ident = input.ident.clone();
     let struct_ident_str = struct_ident.to_string();
     let vtable_ident = format_ident!("{}VTable", struct_ident);
@@ -467,6 +472,7 @@ pub(crate) fn expand_mod_component_with_crate(
 
     let mut state = CodegenState {
         sys_crate: sys_crate.clone(),
+        guest_crate,
         struct_ident,
         canonical_name,
         export_fn_prefix,
@@ -636,6 +642,13 @@ pub(crate) fn expand_mod_component_with_crate(
         };
 
         state.emit_accessor(field, &field_name, spec)?;
+    }
+
+    if state.guest_crate.is_some() && !(state.can_impl_raw_insertable && state.can_impl_abi_pod) {
+        return Err(syn::Error::new_spanned(
+            &input.ident,
+            "`#[mod_component(guest)]` requires an `AbiPod` struct (`#[repr(C)]` or `#[repr(transparent)]`, no `no_pod`/`opaque`, no skipped fields, and all fields `AbiPod`) because `GuestComponent: AbiPod`",
+        ));
     }
 
     witness::emit_struct_witnesses(&mut state);

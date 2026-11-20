@@ -93,6 +93,40 @@ impl RuntimeAllocTracker {
     }
 }
 
+struct OwnedRuntimeAllocs(*mut RuntimeAllocTracker);
+
+// SAFETY: `OwnedRuntimeAllocs` uniquely owns a heap-allocated `RuntimeAllocTracker` created via
+// `Box::into_raw` (avoiding `Box` `Unique` retagging when `GuestInstance` moves) and freed
+// exclusively in `OwnedRuntimeAllocs::drop` after all `Host` copies inside `GuestInstance`
+// closures/hooks have already finished dropping.
+unsafe impl Send for OwnedRuntimeAllocs {}
+
+impl OwnedRuntimeAllocs {
+    fn new() -> Self {
+        Self(Box::into_raw(Box::new(RuntimeAllocTracker::new())))
+    }
+
+    #[inline]
+    const fn as_ptr(&self) -> *const RuntimeAllocTracker {
+        self.0.cast_const()
+    }
+
+    #[inline]
+    fn tracker(&self) -> &RuntimeAllocTracker {
+        // SAFETY: `self.0` was allocated via `Box::into_raw` in `OwnedRuntimeAllocs::new` and
+        // remains alive and immutable (internally `Mutex`-synchronized) until `Drop`.
+        unsafe { &*self.0 }
+    }
+}
+
+impl Drop for OwnedRuntimeAllocs {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` was allocated via `Box::into_raw(Box::new(RuntimeAllocTracker))` and
+        // `GuestInstance::drop` already tore down every closure/hook holding a `Host` pointer to it.
+        drop(unsafe { Box::from_raw(self.0) });
+    }
+}
+
 struct OwnedManifestBytes {
     ptr: *mut u8,
     len: usize,
@@ -156,7 +190,7 @@ pub struct GuestInstance {
     symbols: HashMap<String, GuestSymbolPtr>,
     // Declared last so field drop runs strictly after `GuestInstance::drop` tears down every
     // closure/hook holding a copy of `host`.
-    _runtime_allocs: Box<RuntimeAllocTracker>,
+    _runtime_allocs: OwnedRuntimeAllocs,
     _manifest_bytes: OwnedManifestBytes,
 }
 
@@ -164,14 +198,15 @@ impl GuestInstance {
     /// Creates an empty [`GuestInstance`] bound to `host` and `manifest_name`.
     pub fn new(host: Host, manifest_name: impl Into<String>) -> Self {
         let manifest_bytes = OwnedManifestBytes::new(manifest_name.into());
-        let runtime_allocs = Box::new(RuntimeAllocTracker::new());
+        let runtime_allocs = OwnedRuntimeAllocs::new();
         // SAFETY: When `manifest_bytes.len > 0`, `manifest_bytes.ptr` points to immutable, valid
         // UTF-8 heap bytes that remain pinned at stable provenance until `_manifest_bytes` drops
         // after all `shutdown_hooks`, `_runtime_allocs`, and `allocations`. Similarly,
-        // `runtime_allocs` stays heap-pinned until after all closures holding `host` finish dropping.
+        // `runtime_allocs.as_ptr()` was created via `Box::into_raw` and never retags on move,
+        // staying valid until `_runtime_allocs` drops after all closures holding `host` finish.
         let host = unsafe {
             host.with_manifest_name(manifest_bytes.ptr.cast_const(), manifest_bytes.len)
-                .with_runtime_allocs(core::ptr::from_ref(&*runtime_allocs))
+                .with_runtime_allocs(runtime_allocs.as_ptr())
         };
         Self {
             host,
@@ -239,7 +274,7 @@ impl GuestInstance {
     /// Returns the number of tracked heap allocations owned by this instance.
     #[inline]
     pub fn allocation_count(&self) -> usize {
-        self.allocations.len() + self._runtime_allocs.len()
+        self.allocations.len() + self._runtime_allocs.tracker().len()
     }
 
     /// Invokes all registered per-instance shutdown hooks in LIFO order, catching any panics.
@@ -272,7 +307,7 @@ impl Drop for GuestInstance {
         self.save_state_hook = None;
         self.restore_state_hook = None;
         self.symbols.clear();
-        self._runtime_allocs.drain_lifo();
+        self._runtime_allocs.tracker().drain_lifo();
         while let Some(alloc) = self.allocations.pop() {
             drop(alloc);
         }

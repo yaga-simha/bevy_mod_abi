@@ -881,107 +881,70 @@ pub type GuestKeyboardInputBridge = GuestWireBridge<FfiKeyboardInput>;
 pub type GuestMouseInputBridge = GuestWireBridge<FfiMouseInput>;
 
 #[cfg(feature = "derive")]
-impl GuestTransformBridge {
-    /// Resolves the host `Transform` VTable (`"bam.v0.Transform.vtable"`).
-    pub fn resolve_std(host: &Host) -> Result<Self, FfiResult> {
-        Self::resolve(
-            host,
-            CANONICAL_TRANSFORM_NAME,
-            c"bam.v0.bevy_transform::components::transform::Transform.vtable",
-            Some(c"bam.v0.Transform.vtable"),
-        )
-    }
+macro_rules! impl_std_wire_bridge {
+    ($( $bridge:ident => ($canonical:ident, $primary:literal, $fallback:literal, $doc:literal) );* $(;)?) => {
+        $(
+            #[cfg(feature = "derive")]
+            impl $bridge {
+                #[doc = $doc]
+                pub fn resolve_std(host: &Host) -> Result<Self, FfiResult> {
+                    Self::resolve(host, $canonical, $primary, Some($fallback))
+                }
+            }
+        )*
+    };
 }
 
 #[cfg(feature = "derive")]
-impl GuestGlobalTransformBridge {
-    /// Resolves the host `GlobalTransform` VTable (`"bam.v0.GlobalTransform.vtable"`).
-    pub fn resolve_std(host: &Host) -> Result<Self, FfiResult> {
-        Self::resolve(
-            host,
-            CANONICAL_GLOBAL_TRANSFORM_NAME,
-            c"bam.v0.bevy_transform::components::global_transform::GlobalTransform.vtable",
-            Some(c"bam.v0.GlobalTransform.vtable"),
-        )
-    }
-}
-
-#[cfg(feature = "derive")]
-impl GuestVisibilityBridge {
-    /// Resolves the host `Visibility` VTable (`"bam.v0.Visibility.vtable"`).
-    pub fn resolve_std(host: &Host) -> Result<Self, FfiResult> {
-        Self::resolve(
-            host,
-            CANONICAL_VISIBILITY_NAME,
-            c"bam.v0.bevy_camera::visibility::Visibility.vtable",
-            Some(c"bam.v0.Visibility.vtable"),
-        )
-    }
-}
-
-#[cfg(feature = "derive")]
-impl GuestTimeVirtualBridge {
-    /// Resolves the host `Time<Virtual>` VTable.
-    pub fn resolve_std(host: &Host) -> Result<Self, FfiResult> {
-        Self::resolve(
-            host,
-            CANONICAL_TIME_VIRTUAL_NAME,
-            c"bam.v0.bevy_time::Time<Virtual>.vtable",
-            Some(c"bam.v0.Time<Virtual>.vtable"),
-        )
-    }
-}
-
-#[cfg(feature = "derive")]
-impl GuestTimeFixedBridge {
-    /// Resolves the host `Time<Fixed>` VTable.
-    pub fn resolve_std(host: &Host) -> Result<Self, FfiResult> {
-        Self::resolve(
-            host,
-            CANONICAL_TIME_FIXED_NAME,
-            c"bam.v0.bevy_time::Time<Fixed>.vtable",
-            Some(c"bam.v0.Time<Fixed>.vtable"),
-        )
-    }
-}
-
-#[cfg(feature = "derive")]
-impl GuestTimeRealBridge {
-    /// Resolves the host `Time<Real>` VTable.
-    pub fn resolve_std(host: &Host) -> Result<Self, FfiResult> {
-        Self::resolve(
-            host,
-            CANONICAL_TIME_REAL_NAME,
-            c"bam.v0.bevy_time::Time<Real>.vtable",
-            Some(c"bam.v0.Time<Real>.vtable"),
-        )
-    }
-}
-
-#[cfg(feature = "derive")]
-impl GuestKeyboardInputBridge {
-    /// Resolves the host `ButtonInput<KeyCode>` VTable.
-    pub fn resolve_std(host: &Host) -> Result<Self, FfiResult> {
-        Self::resolve(
-            host,
-            CANONICAL_KEYBOARD_INPUT_NAME,
-            c"bam.v0.bevy_input::ButtonInput<KeyCode>.vtable",
-            Some(c"bam.v0.ButtonInput<KeyCode>.vtable"),
-        )
-    }
-}
-
-#[cfg(feature = "derive")]
-impl GuestMouseInputBridge {
-    /// Resolves the host `ButtonInput<MouseButton>` VTable.
-    pub fn resolve_std(host: &Host) -> Result<Self, FfiResult> {
-        Self::resolve(
-            host,
-            CANONICAL_MOUSE_INPUT_NAME,
-            c"bam.v0.bevy_input::ButtonInput<MouseButton>.vtable",
-            Some(c"bam.v0.ButtonInput<MouseButton>.vtable"),
-        )
-    }
+impl_std_wire_bridge! {
+    GuestTransformBridge => (
+        CANONICAL_TRANSFORM_NAME,
+        c"bam.v0.bevy_transform::components::transform::Transform.vtable",
+        c"bam.v0.Transform.vtable",
+        "Resolves the host `Transform` VTable (`\"bam.v0.Transform.vtable\"`)."
+    );
+    GuestGlobalTransformBridge => (
+        CANONICAL_GLOBAL_TRANSFORM_NAME,
+        c"bam.v0.bevy_transform::components::global_transform::GlobalTransform.vtable",
+        c"bam.v0.GlobalTransform.vtable",
+        "Resolves the host `GlobalTransform` VTable (`\"bam.v0.GlobalTransform.vtable\"`)."
+    );
+    GuestVisibilityBridge => (
+        CANONICAL_VISIBILITY_NAME,
+        c"bam.v0.bevy_camera::visibility::Visibility.vtable",
+        c"bam.v0.Visibility.vtable",
+        "Resolves the host `Visibility` VTable (`\"bam.v0.Visibility.vtable\"`)."
+    );
+    GuestTimeVirtualBridge => (
+        CANONICAL_TIME_VIRTUAL_NAME,
+        c"bam.v0.bevy_time::Time<Virtual>.vtable",
+        c"bam.v0.Time<Virtual>.vtable",
+        "Resolves the host `Time<Virtual>` VTable."
+    );
+    GuestTimeFixedBridge => (
+        CANONICAL_TIME_FIXED_NAME,
+        c"bam.v0.bevy_time::Time<Fixed>.vtable",
+        c"bam.v0.Time<Fixed>.vtable",
+        "Resolves the host `Time<Fixed>` VTable."
+    );
+    GuestTimeRealBridge => (
+        CANONICAL_TIME_REAL_NAME,
+        c"bam.v0.bevy_time::Time<Real>.vtable",
+        c"bam.v0.Time<Real>.vtable",
+        "Resolves the host `Time<Real>` VTable."
+    );
+    GuestKeyboardInputBridge => (
+        CANONICAL_KEYBOARD_INPUT_NAME,
+        c"bam.v0.bevy_input::ButtonInput<KeyCode>.vtable",
+        c"bam.v0.ButtonInput<KeyCode>.vtable",
+        "Resolves the host `ButtonInput<KeyCode>` VTable."
+    );
+    GuestMouseInputBridge => (
+        CANONICAL_MOUSE_INPUT_NAME,
+        c"bam.v0.bevy_input::ButtonInput<MouseButton>.vtable",
+        c"bam.v0.ButtonInput<MouseButton>.vtable",
+        "Resolves the host `ButtonInput<MouseButton>` VTable."
+    );
 }
 
 /// Resolves a `MappedStringVTable` directly via `Host::resolve_mapped_string_vtable` for custom
@@ -1024,127 +987,35 @@ pub trait GuestStdQueryBuilderExt {
     fn read_mouse_input(self) -> Self;
 }
 
+macro_rules! impl_std_query_methods {
+    ($( $method:ident => ($cstr:literal, $canonical:ident, $mode:ident) );* $(;)?) => {
+        $(
+            #[inline]
+            fn $method(self) -> Self {
+                self.term_named(
+                    $cstr,
+                    Some(ComponentUuid::from_canonical_name($canonical)),
+                    AccessMode::$mode,
+                )
+            }
+        )*
+    };
+}
+
 impl GuestStdQueryBuilderExt for QueryBuilder<'_> {
-    #[inline]
-    fn read_transform(self) -> Self {
-        self.term_named(
-            c"bevy_transform::components::transform::Transform",
-            Some(ComponentUuid::from_canonical_name(CANONICAL_TRANSFORM_NAME)),
-            AccessMode::READ,
-        )
-    }
-
-    #[inline]
-    fn write_transform(self) -> Self {
-        self.term_named(
-            c"bevy_transform::components::transform::Transform",
-            Some(ComponentUuid::from_canonical_name(CANONICAL_TRANSFORM_NAME)),
-            AccessMode::WRITE,
-        )
-    }
-
-    #[inline]
-    fn read_global_transform(self) -> Self {
-        self.term_named(
-            c"bevy_transform::components::global_transform::GlobalTransform",
-            Some(ComponentUuid::from_canonical_name(
-                CANONICAL_GLOBAL_TRANSFORM_NAME,
-            )),
-            AccessMode::READ,
-        )
-    }
-
-    #[inline]
-    fn read_visibility(self) -> Self {
-        self.term_named(
-            c"bevy_camera::visibility::Visibility",
-            Some(ComponentUuid::from_canonical_name(
-                CANONICAL_VISIBILITY_NAME,
-            )),
-            AccessMode::READ,
-        )
-    }
-
-    #[inline]
-    fn write_visibility(self) -> Self {
-        self.term_named(
-            c"bevy_camera::visibility::Visibility",
-            Some(ComponentUuid::from_canonical_name(
-                CANONICAL_VISIBILITY_NAME,
-            )),
-            AccessMode::WRITE,
-        )
-    }
-
-    #[inline]
-    fn read_name(self) -> Self {
-        self.term_named(
-            c"bevy_ecs::name::Name",
-            Some(ComponentUuid::from_canonical_name(CANONICAL_NAME_NAME)),
-            AccessMode::READ,
-        )
-    }
-
-    #[inline]
-    fn write_name(self) -> Self {
-        self.term_named(
-            c"bevy_ecs::name::Name",
-            Some(ComponentUuid::from_canonical_name(CANONICAL_NAME_NAME)),
-            AccessMode::WRITE,
-        )
-    }
-
-    #[inline]
-    fn read_time_virtual(self) -> Self {
-        self.term_named(
-            c"bevy_time::Time<Virtual>",
-            Some(ComponentUuid::from_canonical_name(
-                CANONICAL_TIME_VIRTUAL_NAME,
-            )),
-            AccessMode::RESOURCE_READ,
-        )
-    }
-
-    #[inline]
-    fn read_time_fixed(self) -> Self {
-        self.term_named(
-            c"bevy_time::Time<Fixed>",
-            Some(ComponentUuid::from_canonical_name(
-                CANONICAL_TIME_FIXED_NAME,
-            )),
-            AccessMode::RESOURCE_READ,
-        )
-    }
-
-    #[inline]
-    fn read_time_real(self) -> Self {
-        self.term_named(
-            c"bevy_time::Time<Real>",
-            Some(ComponentUuid::from_canonical_name(CANONICAL_TIME_REAL_NAME)),
-            AccessMode::RESOURCE_READ,
-        )
-    }
-
-    #[inline]
-    fn read_keyboard_input(self) -> Self {
-        self.term_named(
-            c"bevy_input::ButtonInput<KeyCode>",
-            Some(ComponentUuid::from_canonical_name(
-                CANONICAL_KEYBOARD_INPUT_NAME,
-            )),
-            AccessMode::RESOURCE_READ,
-        )
-    }
-
-    #[inline]
-    fn read_mouse_input(self) -> Self {
-        self.term_named(
-            c"bevy_input::ButtonInput<MouseButton>",
-            Some(ComponentUuid::from_canonical_name(
-                CANONICAL_MOUSE_INPUT_NAME,
-            )),
-            AccessMode::RESOURCE_READ,
-        )
+    impl_std_query_methods! {
+        read_transform => (c"bevy_transform::components::transform::Transform", CANONICAL_TRANSFORM_NAME, READ);
+        write_transform => (c"bevy_transform::components::transform::Transform", CANONICAL_TRANSFORM_NAME, WRITE);
+        read_global_transform => (c"bevy_transform::components::global_transform::GlobalTransform", CANONICAL_GLOBAL_TRANSFORM_NAME, READ);
+        read_visibility => (c"bevy_camera::visibility::Visibility", CANONICAL_VISIBILITY_NAME, READ);
+        write_visibility => (c"bevy_camera::visibility::Visibility", CANONICAL_VISIBILITY_NAME, WRITE);
+        read_name => (c"bevy_ecs::name::Name", CANONICAL_NAME_NAME, READ);
+        write_name => (c"bevy_ecs::name::Name", CANONICAL_NAME_NAME, WRITE);
+        read_time_virtual => (c"bevy_time::Time<Virtual>", CANONICAL_TIME_VIRTUAL_NAME, RESOURCE_READ);
+        read_time_fixed => (c"bevy_time::Time<Fixed>", CANONICAL_TIME_FIXED_NAME, RESOURCE_READ);
+        read_time_real => (c"bevy_time::Time<Real>", CANONICAL_TIME_REAL_NAME, RESOURCE_READ);
+        read_keyboard_input => (c"bevy_input::ButtonInput<KeyCode>", CANONICAL_KEYBOARD_INPUT_NAME, RESOURCE_READ);
+        read_mouse_input => (c"bevy_input::ButtonInput<MouseButton>", CANONICAL_MOUSE_INPUT_NAME, RESOURCE_READ);
     }
 }
 

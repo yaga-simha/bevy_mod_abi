@@ -1,0 +1,5 @@
+error: `#[derive(GuestComponent)]` can only be applied to structs (`GuestComponent` requires `AbiPod`)
+ --> tests/ui/guest_component_enum_rejected.rs:5:10
+  |
+5 | pub enum NotAStruct {
+  |          ^^^^^^^^^^

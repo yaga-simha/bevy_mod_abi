@@ -1,0 +1,5 @@
+error: cannot combine `#[guest_component(sparse_set)]` with `#[guest_component(summary_tick)]` (`summary_tick` requires `Table` storage)
+ --> tests/ui/guest_component_sparse_summary_tick.rs:6:12
+  |
+6 | pub struct SparseSummary {
+  |            ^^^^^^^^^^^^^
